@@ -70,32 +70,33 @@ OXYLABS_PROXIES = [
 st.sidebar.header("⚙️ Engine Control Panel")
 
 with st.sidebar.form("config_form"):
-    workers = st.slider("Workers Start:", min_value=1, max_value=50, value=10)
-    deadline = st.slider("Deadline (s):", min_value=5, max_value=120, value=25)
-    max_acc = st.slider("Max Accounts:", min_value=0, max_value=5000, value=100)
-    timeout = st.slider("Timeout (s):", min_value=2, max_value=30, value=10)
-    blacklist_cf = st.slider("BlacklistCF:", min_value=0, max_value=500, value=100)
+    workers = st.slider("Workers Start:", min_value=1, max_value=50, value=10, help="Initial number of concurrent worker threads spawned to validate incoming accounts.")
+    deadline = st.slider("Deadline (s):", min_value=5, max_value=120, value=25, help="Maximum execution time allotted per validation batch task.")
+    max_acc = st.slider("Max Accounts:", min_value=0, max_value=5000, value=100, help="Maximum number of accounts to check in a single live run (0 for unlimited).")
+    timeout = st.slider("Timeout (s):", min_value=2, max_value=30, value=10, help="Socket communication timeout threshold for server responses.")
+    blacklist_cf = st.slider("BlacklistCF:", min_value=0, max_value=500, value=100, help="Connection failure threshold before blacklisting specific error signatures.")
     
     st.markdown("---")
     st.markdown("### 🌐 Proxy / Pool Configuration")
-    min_proxy_score = st.slider("Min proxy score:", min_value=0, max_value=100, value=40, help="Only proxies with score ≥ this will be used.")
-    pool_mode = st.selectbox("Pool mode", options=["us_only", "all", "country", "mix"], index=0, help="Which proxies enter the pool.")
-    country_code = st.text_input("Country code (when Pool mode = country):", value="US", help="Example: US, GB, DE")
-    mix_list = st.text_input("Mix list (when Pool mode = mix):", value="US,GB,DE", help="Comma-separated country list.")
+    min_proxy_score = st.slider("Min proxy score:", min_value=0, max_value=100, value=40, help="Only proxies with a smart health score greater than or equal to this value will be utilized.")
+    pool_mode = st.selectbox("Pool mode", options=["us_only", "all", "country", "mix"], index=0, help="Defines how proxies are filtered and loaded into the active rotation pool.")
+    country_code = st.text_input("Country code (when Pool mode = country):", value="US", help="Target country specification code (e.g., US, GB, DE).")
+    mix_list = st.text_input("Mix list (when Pool mode = mix):", value="US,GB,DE", help="Comma-separated country list for blended regional proxy routing.")
 
     st.markdown("---")
-    secret_portals = st.checkbox("Secret Portals", value=True)
-    use_proxy = st.checkbox("Use Proxy", value=True)
-    retry_cf = st.checkbox("Retry CF", value=True)
-    self_signed = st.checkbox("Allow Self-Signed", value=True)
-    proxy_test_flight = st.checkbox("Test Flight", value=True)
-    skip_app = st.checkbox("Skip Strict App-Only Providers", value=True)
-    debug_mode = st.checkbox("Enable Debug Mode", value=False)
+    secret_portals = st.checkbox("Secret Portals", value=True, help="Enable automatic discovery routes for non-standard provider ports.")
+    use_proxy = st.checkbox("Use Proxy", value=True, help="Route all checker requests through proxy nodes to prevent IP rate-limiting.")
+    retry_cf = st.checkbox("Retry CF", value=True, help="Automatically retry connection failures using alternative fallback paths.")
+    self_signed = st.checkbox("Allow Self-Signed", value=True, help="Bypass strict SSL certificate validation errors for secure connections.")
+    proxy_test_flight = st.checkbox("Test Flight", value=True, help="Perform an initial health and latency probe on proxies prior to live execution.")
+    skip_app = st.checkbox("Skip Strict App-Only Providers", value=True, help="Filter out accounts requiring explicit app passwords or token generation upfront.")
+    debug_mode = st.checkbox("Enable Debug Mode", value=False, help="Stream verbose logs and error tracing directly into the UI interface.")
     
     resolved_proxy_mode = st.selectbox(
         "PROXY_MODE:",
         options=["aggressive", "fallback", "sticky", "off"],
-        index=0
+        index=0,
+        help="Proxy routing strategy: 'aggressive' rotates per request, 'fallback' switches on failure, 'sticky' keeps one proxy per thread, 'off' disables proxy routing."
     )
     
     submitted = st.form_submit_button("Apply Settings")
@@ -236,13 +237,20 @@ def parse_proxy(proxy_str):
         pass
     return None
 
-def compute_real_score(success_count, fail_count):
+def compute_real_score(success_count, fail_count, initial_latency_score=80):
     total = success_count + fail_count
     if total == 0:
-        return 50  # Default neutral score for untested proxies
-    base_ratio = (success_count / total) * 100
-    # Apply penalty for cumulative fails
-    score = int(base_ratio - (fail_count * 10))
+        return initial_latency_score
+    
+    # Laplace smoothing to prevent 0 or 100 binary jumps on small sample sizes
+    smoothed_success = success_count + 2
+    smoothed_fail = fail_count + 1
+    smoothed_total = smoothed_success + smoothed_fail
+    
+    success_rate = (smoothed_success / smoothed_total) * 100
+    
+    # Linear penalty scaled by absolute failure count
+    score = int(success_rate - (fail_count * 5))
     return max(0, min(100, score))
 
 def test_single_proxy(proxy_str):
@@ -276,6 +284,9 @@ def test_single_proxy(proxy_str):
                 except Exception: pass
             
     latency = int((time.time() - start) * 1000)
+    # Smart latency scoring calculation
+    initial_score = max(0, min(100, 100 - int(latency / 15)))
+    
     country = proxy_meta.get(proxy_str, {}).get("country", "Unknown")
     region = proxy_meta.get(proxy_str, {}).get("region", "Unknown")
 
@@ -300,7 +311,7 @@ def test_single_proxy(proxy_str):
         else:
             m["fails"] = m.get("fails", 0) + 1
             
-        m["score"] = compute_real_score(m.get("success", 0), m.get("fails", 0))
+        m["score"] = compute_real_score(m.get("success", 0), m.get("fails", 0), initial_latency_score=initial_score)
         m["country"] = country
         m["region"] = region
     save_proxy_meta()
@@ -639,7 +650,7 @@ def update_proxy_score(proxy_str, success=True):
                 if m["fails"] >= 3:
                     bad_proxies.add(proxy_str)
             
-            # Recalculate using real success/failure ratio
+            # Recalculate using real success/failure ratio with smoothing
             m["score"] = compute_real_score(m.get("success", 0), m.get("fails", 0))
         save_proxy_meta()
     except Exception:
