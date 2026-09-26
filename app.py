@@ -135,7 +135,7 @@ instant_help("deadline", "Maximum execution time allotted per validation batch t
 deadline = st.sidebar.slider("Deadline Slider", min_value=5, max_value=120, value=25, step=5, label_visibility="collapsed")
 
 instant_help("max_acc", "Maximum number of accounts to check in a single live run (0 for unlimited).", "Max Accounts:")
-max_acc = st.sidebar.slider("Max Accounts Slider", min_value=0, max_value=5000, value=100, step=25, label_visibility="collapsed")
+max_acc = st.sidebar.slider("Max Accounts Slider", min_value=0, max_value=5000, value=5000, step=100, label_visibility="collapsed")
 
 instant_help("timeout", "Socket communication timeout threshold for server responses.", "Timeout (s):")
 timeout = st.sidebar.slider("Timeout Slider", min_value=2, max_value=30, value=10, step=1, label_visibility="collapsed")
@@ -162,7 +162,7 @@ st.sidebar.markdown("---")
 
 secret_portals = instant_help("secret_portals", "Enable automatic discovery routes for non-standard provider ports.", "Secret Portals", widget_type="checkbox", value=True)
 use_proxy = instant_help("use_proxy", "Route all checker requests through proxy nodes to prevent IP rate-limiting.", "Use Proxy", widget_type="checkbox", value=True)
-retry_cf = instant_help("retry_cf", "Automatically retry connection failures using alternative fallback paths.", "Retry CF", widget_type="checkbox", value=True)
+retry_cf = instant_help("retry_cf", "Automatically retry connection failures using alternative fallback paths.", "Retry CF", widget_type="checkbox", value=False)
 self_signed = instant_help("self_signed", "Bypass strict SSL certificate validation errors for secure connections.", "Allow Self-Signed", widget_type="checkbox", value=True)
 proxy_test_flight = instant_help("proxy_test_flight", "Perform an initial health and latency probe on proxies prior to live execution.", "Test Flight", widget_type="checkbox", value=True)
 skip_app = instant_help("skip_app", "Filter out accounts requiring explicit app passwords or token generation upfront.", "Skip Strict App-Only Providers", widget_type="checkbox", value=True)
@@ -175,6 +175,10 @@ resolved_proxy_mode = st.sidebar.selectbox(
     index=0,
     label_visibility="collapsed"
 )
+
+# --- Apply Settings Button ---
+if st.sidebar.button("💾 Apply Settings", type="primary"):
+    st.sidebar.success("Settings applied successfully!")
 
 CFG = {
     "MAX_WORKERS_START": workers,
