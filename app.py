@@ -86,12 +86,12 @@ OXYLABS_PROXIES = [
     "user-Positivekenny_ls8CB-country-US:Adejoke52_52@dc.oxylabs.io:8000",
 ]
 
-# --- Helper for Clickable Instant Help Toggle ---
+# --- State Management & Thread Locks ---
 if "help_states" not in st.session_state:
     st.session_state.help_states = {}
 
 def instant_help(key_name, description_text, label_text):
-    """Renders a label and a fast-responding click button (?) side by side in the sidebar."""
+    """Renders label on left, small emoji question mark respond slow on right, big question mark side respond fast."""
     if key_name not in st.session_state.help_states:
         st.session_state.help_states[key_name] = {"visible": False, "time": 0}
     
@@ -100,11 +100,20 @@ def instant_help(key_name, description_text, label_text):
         if time.time() - state_data.get("time", 0) > 10.0:
             st.session_state.help_states[key_name]["visible"] = False
 
-    col_lbl, col_btn = st.sidebar.columns([0.85, 0.15])
+    col_lbl, col_btn_small, col_btn_big = st.sidebar.columns([0.70, 0.15, 0.15])
     with col_lbl:
         st.markdown(f"**{label_text}**")
-    with col_btn:
-        if st.button("❓", key=f"help_btn_{key_name}", help="Click for instant info"):
+    with col_btn_small:
+        if st.button("❓", key=f"help_btn_small_{key_name}", help="Slow response help"):
+            time.sleep(0.3) # Simulate slow response as requested
+            current = st.session_state.help_states[key_name]["visible"]
+            st.session_state.help_states[key_name] = {
+                "visible": not current,
+                "time": time.time()
+            }
+            st.rerun()
+    with col_btn_big:
+        if st.button("❓", key=f"help_btn_big_{key_name}", help="Fast response help"):
             current = st.session_state.help_states[key_name]["visible"]
             st.session_state.help_states[key_name] = {
                 "visible": not current,
@@ -424,7 +433,6 @@ with st.sidebar:
     st.markdown("### 🌐 Proxy Management & Health")
     st.info(f"Loaded Proxies: **{len(all_proxies)}** | Filtered Pool: **{len(filtered_pool)}**")
     
-    # Restored Custom Proxy Input Section
     with st.expander("➕ Add Custom Proxies", expanded=False):
         custom_proxy_text = st.text_area("Paste proxies (host:port or user:pass@host:port)", placeholder="123.45.67.89:8080", height=100)
         if st.button("Save Custom Proxies"):
