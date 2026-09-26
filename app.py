@@ -292,12 +292,12 @@ with st.sidebar:
                     except Exception as ex:
                         st.error(f"Proxy thread pool error: {ex}")
                         
-                        try:
-                    with open(CFG["PROXY_FILE"], "w", encoding="utf-8") as f:
-                        f.write("\n".join(str(item) for item in alive) + ("\n" if alive else ""))
-                except Exception as ex:
-                    st.error(f"Failed to write proxies file: {ex}")
-                
+                    try:
+                     with open(CFG["PROXY_FILE"], "w", encoding="utf-8") as f:
+                            f.write("\n".join(str(item) for item in alive) + ("\n" if alive else ""))
+                    except Exception as ex:
+                        st.error(f"Failed to write proxies file: {ex}")
+
                 st.success(f"Success! Saved {len(alive)} operational proxies.")
                 st.rerun()
 
