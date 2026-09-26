@@ -45,7 +45,7 @@ st.set_page_config(
     layout="wide"
 )
 
-# --- Custom CSS for Slider Sensitivity & Smooth Touch Feedback ---
+# --- Custom CSS for Slider Sensitivity & Instant Click Tooltips ---
 st.markdown("""
 <style>
     /* Reduce slider track sensitivity feel and make thumb easier to grab without accidental jumping */
@@ -53,9 +53,21 @@ st.markdown("""
         accent-color: #ff4b4b;
         cursor: pointer;
     }
-    /* Style tooltips / help descriptions for instant responsiveness */
-    .stTooltipIcon {
-        cursor: pointer !important;
+    
+    /* Custom styling for instant click help boxes */
+    .help-box {
+        background-color: #1e1e2f;
+        border-left: 3px solid #ff4b4b;
+        padding: 8px 12px;
+        margin: 4px 0 10px 0;
+        font-size: 0.85em;
+        color: #d1d5db;
+        border-radius: 4px;
+        animation: fadeIn 0.2s ease-in-out;
+    }
+    @keyframes fadeIn {
+        from { opacity: 0; transform: translateY(-4px); }
+        to { opacity: 1; transform: translateY(0); }
     }
 </style>
 """, unsafe_allow_html=True)
@@ -81,23 +93,79 @@ OXYLABS_PROXIES = [
     "user-Positivekenny_ls8CB-country-US:Adejoke52_52@dc.oxylabs.io:8000",
 ]
 
+# --- Helper for Clickable Instant Help Toggle ---
+def instant_help(key_name, description_text):
+    """Renders a fast-responding click button (?) that toggles description text instantly."""
+    if "help_states" not in st.session_state:
+        st.session_state.help_states = {}
+    
+    # Check if timeout expired (10 seconds)
+    if key_name in st.session_state.help_states:
+        state_data = st.session_state.help_states[key_name]
+        if state_data.get("visible", False):
+            if time.time() - state_data.get("time", 0) > 10.0:
+                st.session_state.help_states[key_name]["visible"] = False
+
+    is_visible = st.session_state.help_states.get(key_name, {}).get("visible", False)
+    
+    # Render small inline button
+    col_lbl, col_btn = st.columns([0.88, 0.12])
+    with col_btn:
+        if st.button("❓", key=f"help_btn_{key_name}", help="Click for instant info"):
+            current = st.session_state.help_states.get(key_name, {}).get("visible", False)
+            st.session_state.help_states[key_name] = {
+                "visible": not current,
+                "time": time.time()
+            }
+            st.rerun()
+            
+    if st.session_state.help_states.get(key_name, {}).get("visible", False):
+        st.markdown(f'<div class="help-box">💡 {description_text}</div>', unsafe_allow_html=True)
+    return col_lbl
+
 # --- Sidebar Control Panel ---
 st.sidebar.header("⚙️ Engine Control Panel")
 
 with st.sidebar.form("config_form"):
-    # Using explicit steps to prevent overly sensitive/jumpy slider sliding
-    workers = st.slider("Workers Start:", min_value=1, max_value=50, value=10, step=1, help="Initial number of concurrent worker threads spawned to validate incoming accounts.")
-    deadline = st.slider("Deadline (s):", min_value=5, max_value=120, value=25, step=5, help="Maximum execution time allotted per validation batch task.")
-    max_acc = st.slider("Max Accounts:", min_value=0, max_value=5000, value=100, step=25, help="Maximum number of accounts to check in a single live run (0 for unlimited).")
-    timeout = st.slider("Timeout (s):", min_value=2, max_value=30, value=10, step=1, help="Socket communication timeout threshold for server responses.")
-    blacklist_cf = st.slider("BlacklistCF:", min_value=0, max_value=500, value=100, step=10, help="Connection failure threshold before blacklisting specific error signatures.")
+    # Sliders with reduced touch sensitivity & custom click help
+    st.markdown("**Workers Start:**")
+    instant_help("workers", "Initial number of concurrent worker threads spawned to validate incoming accounts.")
+    workers = st.slider("Workers Start Slider", min_value=1, max_value=50, value=10, step=1, label_visibility="collapsed")
+
+    st.markdown("**Deadline (s):**")
+    instant_help("deadline", "Maximum execution time allotted per validation batch task.")
+    deadline = st.slider("Deadline Slider", min_value=5, max_value=120, value=25, step=5, label_visibility="collapsed")
+
+    st.markdown("**Max Accounts:**")
+    instant_help("max_acc", "Maximum number of accounts to check in a single live run (0 for unlimited).")
+    max_acc = st.slider("Max Accounts Slider", min_value=0, max_value=5000, value=100, step=25, label_visibility="collapsed")
+
+    st.markdown("**Timeout (s):**")
+    instant_help("timeout", "Socket communication timeout threshold for server responses.")
+    timeout = st.slider("Timeout Slider", min_value=2, max_value=30, value=10, step=1, label_visibility="collapsed")
+
+    st.markdown("**BlacklistCF:**")
+    instant_help("blacklist_cf", "Connection failure threshold before blacklisting specific error signatures.")
+    blacklist_cf = st.slider("BlacklistCF Slider", min_value=0, max_value=500, value=100, step=10, label_visibility="collapsed")
     
     st.markdown("---")
     st.markdown("### 🌐 Proxy / Pool Configuration")
-    min_proxy_score = st.slider("Min proxy score:", min_value=0, max_value=100, value=40, step=5, help="Only proxies with a smart health score greater than or equal to this value will be utilized.")
-    pool_mode = st.selectbox("Pool mode", options=["us_only", "all", "country", "mix"], index=0, help="Defines how proxies are filtered and loaded into the active rotation pool.")
-    country_code = st.text_input("Country code (when Pool mode = country):", value="US", help="Target country specification code (e.g., US, GB, DE).")
-    mix_list = st.text_input("Mix list (when Pool mode = mix):", value="US,GB,DE", help="Comma-separated country list for blended regional proxy routing.")
+    
+    st.markdown("**Min proxy score:**")
+    instant_help("min_proxy_score", "Only proxies with a smart health score greater than or equal to this value will be utilized.")
+    min_proxy_score = st.slider("Min proxy score Slider", min_value=0, max_value=100, value=40, step=5, label_visibility="collapsed")
+    
+    st.markdown("**Pool mode:**")
+    instant_help("pool_mode", "Defines how proxies are filtered and loaded into the active rotation pool.")
+    pool_mode = st.selectbox("Pool mode select", options=["us_only", "all", "country", "mix"], index=0, label_visibility="collapsed")
+    
+    st.markdown("**Country code (when Pool mode = country):**")
+    instant_help("country_code", "Target country specification code (e.g., US, GB, DE).")
+    country_code = st.text_input("Country code input", value="US", label_visibility="collapsed")
+    
+    st.markdown("**Mix list (when Pool mode = mix):**")
+    instant_help("mix_list", "Comma-separated country list for blended regional proxy routing.")
+    mix_list = st.text_input("Mix list input", value="US,GB,DE", label_visibility="collapsed")
 
     st.markdown("---")
     secret_portals = st.checkbox("Secret Portals", value=True, help="Enable automatic discovery routes for non-standard provider ports.")
