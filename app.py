@@ -264,7 +264,7 @@ with st.sidebar:
     if st.button("📥 Fetch & Test All Proxies"):
         if requests is None:
             st.error("Missing 'requests' library.")
-                    else:
+        else:
                 with st.spinner("Fetching from Webshare & Oxylabs..."):
                     all_raw = []
                     for key in WEBSHARE_KEYS:
