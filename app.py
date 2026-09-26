@@ -91,7 +91,7 @@ if "help_states" not in st.session_state:
     st.session_state.help_states = {}
 
 def instant_help(key_name, description_text, label_text, widget_type="label", **kwargs):
-    """Universal helper renderer ensuring label/widget and ❓ buttons align properly."""
+    """Universal helper renderer ensuring label/widget and a single ❓ button align properly."""
     if key_name not in st.session_state.help_states:
         st.session_state.help_states[key_name] = {"visible": False, "time": 0}
     
@@ -100,7 +100,7 @@ def instant_help(key_name, description_text, label_text, widget_type="label", **
         if time.time() - state_data.get("time", 0) > 10.0:
             st.session_state.help_states[key_name]["visible"] = False
 
-    col_lbl, col_btn_small, col_btn_big = st.sidebar.columns([0.70, 0.15, 0.15])
+    col_lbl, col_btn = st.sidebar.columns([0.85, 0.15])
     
     with col_lbl:
         if widget_type == "label":
@@ -112,15 +112,8 @@ def instant_help(key_name, description_text, label_text, widget_type="label", **
         elif widget_type == "selectbox":
             st.markdown(f"**{label_text}**")
 
-    with col_btn_small:
-        if st.button("❓", key=f"help_btn_small_{key_name}", help="Slow response help"):
-            time.sleep(0.3)
-            current = st.session_state.help_states[key_name]["visible"]
-            st.session_state.help_states[key_name] = {"visible": not current, "time": time.time()}
-            st.rerun()
-            
-    with col_btn_big:
-        if st.button("❓", key=f"help_btn_big_{key_name}", help="Fast response help"):
+    with col_btn:
+        if st.button("❓", key=f"help_btn_{key_name}", help="Toggle help description"):
             current = st.session_state.help_states[key_name]["visible"]
             st.session_state.help_states[key_name] = {"visible": not current, "time": time.time()}
             st.rerun()
