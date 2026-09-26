@@ -236,17 +236,29 @@ def parse_proxy(proxy_str):
         pass
     return None
 
+def compute_real_score(success_count, fail_count):
+    total = success_count + fail_count
+    if total == 0:
+        return 50  # Default neutral score for untested proxies
+    base_ratio = (success_count / total) * 100
+    # Apply penalty for cumulative fails
+    score = int(base_ratio - (fail_count * 10))
+    return max(0, min(100, score))
+
 def test_single_proxy(proxy_str):
     info = parse_proxy(proxy_str)
     if not info or not SOCKS_OK: return False, "Invalid Format", "Unknown", 0
     start = time.time()
     sock = None
+    test_success = False
+    
     try:
         sock = socks.create_connection(
             ("8.8.8.8", 53), timeout=3.0,
             proxy_type=socks.SOCKS5, proxy_addr=info["host"], proxy_port=info["port"],
             proxy_username=info["user"], proxy_password=info["pass"])
         sock.close()
+        test_success = True
     except Exception:
         if sock:
             try: sock.close()
@@ -257,17 +269,17 @@ def test_single_proxy(proxy_str):
                 proxy_type=socks.HTTP, proxy_addr=info["host"], proxy_port=info["port"],
                 proxy_username=info["user"], proxy_password=info["pass"])
             sock.close()
+            test_success = True
         except Exception as e:
             if sock:
                 try: sock.close()
                 except Exception: pass
-            return False, str(e)[:30], "Unknown", 0
-
+            
     latency = int((time.time() - start) * 1000)
     country = proxy_meta.get(proxy_str, {}).get("country", "Unknown")
     region = proxy_meta.get(proxy_str, {}).get("region", "Unknown")
 
-    if country == "Unknown" and requests:
+    if test_success and country == "Unknown" and requests:
         try:
             r = requests.get(f"http://ip-api.com/json/{info['host']}?fields=status,country,regionName", timeout=2.5)
             if r.status_code == 200:
@@ -280,13 +292,24 @@ def test_single_proxy(proxy_str):
 
     with proxy_lock:
         if proxy_str not in proxy_meta:
-            proxy_meta[proxy_str] = {"score": 80, "fails": 0, "success": 1, "country": country, "region": region}
+            proxy_meta[proxy_str] = {"fails": 0, "success": 0, "country": country, "region": region}
+        
+        m = proxy_meta[proxy_str]
+        if test_success:
+            m["success"] = m.get("success", 0) + 1
         else:
-            proxy_meta[proxy_str]["country"] = country
-            proxy_meta[proxy_str]["region"] = region
+            m["fails"] = m.get("fails", 0) + 1
+            
+        m["score"] = compute_real_score(m.get("success", 0), m.get("fails", 0))
+        m["country"] = country
+        m["region"] = region
     save_proxy_meta()
 
-    return True, f"{latency}ms", f"{country}, {region}", proxy_meta[proxy_str]["score"]
+    current_score = proxy_meta[proxy_str]["score"]
+    if test_success:
+        return True, f"{latency}ms", f"{country}, {region}", current_score
+    else:
+        return False, "Connection Failed", f"{country}, {region}", current_score
 
 def load_webshare(api_key):
     if requests is None or not api_key.strip():
@@ -380,11 +403,12 @@ with st.sidebar:
                     "Country": meta.get("country", "Unknown"),
                     "Region": meta.get("region", "Unknown"),
                     "Score": meta.get("score", 50),
-                    "Fails": meta.get("fails", 0)
+                    "Fails": meta.get("fails", 0),
+                    "Successes": meta.get("success", 0)
                 })
             import pandas as pd
             df_proxies = pd.DataFrame(proxy_data_list)
-            st.dataframe(df_proxies, use_container_width=True)
+            st.dataframe(df_proxies, width="stretch" if hasattr(st, "dataframe") else True)
             if st.button("🧹 Clear Dead / Low-Score Proxies"):
                 with proxy_lock:
                     for k, m in list(proxy_meta.items()):
@@ -610,13 +634,13 @@ def update_proxy_score(proxy_str, success=True):
             m = proxy_meta[proxy_str]
             if success:
                 m["success"] = m.get("success", 0) + 1
-                m["score"] = min(100, m.get("score", 50) + 3)
-                m["fails"] = 0
             else:
                 m["fails"] = m.get("fails", 0) + 1
-                m["score"] = max(5, m.get("score", 50) - 20)
                 if m["fails"] >= 3:
                     bad_proxies.add(proxy_str)
+            
+            # Recalculate using real success/failure ratio
+            m["score"] = compute_real_score(m.get("success", 0), m.get("fails", 0))
         save_proxy_meta()
     except Exception:
         pass
@@ -708,7 +732,6 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state):
         proxy_mode = CFG.get("PROXY_MODE", "aggressive")
         prefer_insecure = CFG.get("ALLOW_SELF_SIGNED", True)
         
-        # Determine proxy based on proxy_mode
         px = None
         if proxy_pool and proxy_mode != "off":
             if proxy_mode == "sticky":
@@ -720,10 +743,9 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state):
 
         proxies_to_try = [px] if px else [None]
         if proxy_mode == "fallback" and px:
-            proxies_to_try.append(None) # Fallback to direct
+            proxies_to_try.append(None)
 
         for current_px in proxies_to_try:
-            # Try IMAP
             for server in conf.get("imap", [])[:3]:
                 try:
                     imap_once(email, password, server, current_px, insecure=prefer_insecure)
@@ -735,7 +757,6 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state):
                     if st in ("wrong_password", "need_app_password"):
                         return None, st, f"IMAP {server} -> {st}", current_px
 
-            # Try POP3
             for server in conf.get("pop3", [])[:3]:
                 try:
                     pop_once(email, password, server, current_px, insecure=prefer_insecure)
@@ -786,7 +807,6 @@ if st.button("🔥 Start Live Checking Engine", type="primary"):
                 domain = email.split("@")[-1].lower()
                 conf = get_servers(email)
                 
-                t_state = {}
                 if not hasattr(thread_local, "state"):
                     thread_local.state = {}
                 
@@ -795,9 +815,7 @@ if st.button("🔥 Start Live Checking Engine", type="primary"):
             except Exception as ex:
                 return {"line": f"{line} | Error: {ex}", "email": line, "status": "connection_failed", "detail": str(ex)}
 
-        # Dynamic Worker Scaling implementation
         current_workers = CFG["MAX_WORKERS_START"]
-        max_limit = CFG.get("MAX_WORKERS_MAX", 25)
 
         try:
             with ThreadPoolExecutor(max_workers=current_workers) as executor:
