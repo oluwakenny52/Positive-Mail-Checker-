@@ -149,7 +149,8 @@ def load_json(path, default=None):
         try:
             with open(path, encoding="utf-8") as f:
                 return json.load(f)
-        except Exception:
+        except Exception as e:
+            print(f"Error loading JSON {path}: {e}")
             return default
     return default
 
@@ -161,16 +162,16 @@ def save_domain_cache():
         with cache_lock:
             with open(CFG["CACHE_FILE"], "w", encoding="utf-8") as f:
                 json.dump(domain_cache, f, indent=2)
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"Error saving domain cache: {e}")
 
 def save_proxy_meta():
     try:
         with proxy_lock:
             with open(CFG["PROXY_META_FILE"], "w", encoding="utf-8") as f:
                 json.dump(proxy_meta, f, indent=2)
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"Error saving proxy meta: {e}")
 
 def load_proxies():
     if not os.path.exists(CFG["PROXY_FILE"]): return []
@@ -179,7 +180,8 @@ def load_proxies():
         with open(CFG["PROXY_FILE"], encoding="utf-8", errors="ignore") as f:
             raw_list = [l.strip() for l in f if l.strip() and not l.startswith("#")]
         return [p for p in raw_list if dead_node_signature not in p]
-    except Exception:
+    except Exception as e:
+        print(f"Error reading proxies file: {e}")
         return []
 
 def get_filtered_active_proxies():
@@ -233,8 +235,8 @@ def parse_proxy(proxy_str):
             return {"host": parts[0], "port": int(parts[1]), "user": parts[2], "pass": parts[3]}
         if len(parts) == 2:
             return {"host": parts[0], "port": int(parts[1]), "user": None, "pass": None}
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"Proxy parse error for '{proxy_str}': {e}")
     return None
 
 def compute_real_score(success_count, fail_count, initial_latency_score=80):
@@ -242,7 +244,7 @@ def compute_real_score(success_count, fail_count, initial_latency_score=80):
     if total == 0:
         return initial_latency_score
     
-    # Laplace smoothing to prevent 0 or 100 binary jumps on small sample sizes
+    # Laplace smoothing to prevent extreme 0 or 100 binary jumps on small sample sizes
     smoothed_success = success_count + 2
     smoothed_fail = fail_count + 1
     smoothed_total = smoothed_success + smoothed_fail
@@ -284,7 +286,6 @@ def test_single_proxy(proxy_str):
                 except Exception: pass
             
     latency = int((time.time() - start) * 1000)
-    # Smart latency scoring calculation
     initial_score = max(0, min(100, 100 - int(latency / 15)))
     
     country = proxy_meta.get(proxy_str, {}).get("country", "Unknown")
@@ -348,7 +349,8 @@ def load_webshare(api_key):
                 break
             page += 1
         return out
-    except Exception:
+    except Exception as e:
+        print(f"Webshare fetch error: {e}")
         return []
 
 # Startup test flight if meta is empty
@@ -523,8 +525,8 @@ def process_accounts(text, previous_valid):
                 skipped_bad += 1
                 continue
             lines.append(f"{email}:{password}")
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"Account processing error: {e}")
 
     seen_email, clean = set(), []
     for line in lines:
@@ -650,11 +652,10 @@ def update_proxy_score(proxy_str, success=True):
                 if m["fails"] >= 3:
                     bad_proxies.add(proxy_str)
             
-            # Recalculate using real success/failure ratio with smoothing
             m["score"] = compute_real_score(m.get("success", 0), m.get("fails", 0))
         save_proxy_meta()
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"Proxy score update error: {e}")
 
 def proxy_connect(host, port, proxy_str, timeout=None):
     base_timeout = timeout or CFG["PROXY_CONNECT_TIMEOUT"]
@@ -801,7 +802,11 @@ if st.button("🔥 Start Live Checking Engine", type="primary"):
         
         progress_bar = st.progress(0)
         status_text = st.empty()
-        debug_box = st.expander("Live Debug Log Stream", expanded=CFG.get("DEBUG", False)) if CFG.get("DEBUG", False) else None
+        
+        # Always available full log & error stream expander
+        log_expander = st.expander("📝 Live Execution & Error Log Stream", expanded=True)
+        log_container = log_expander.empty()
+        log_lines = []
         
         accounts_to_check = clean_lines[:CFG["MAX_ACCOUNTS"]] if CFG["MAX_ACCOUNTS"] > 0 else clean_lines
         total_accs = len(accounts_to_check)
@@ -847,11 +852,18 @@ if st.button("🔥 Start Live Checking Engine", type="primary"):
                             else:
                                 conn_results.append(res["line"])
                             
-                            if debug_box:
-                                with debug_box:
-                                    st.text(f"Processed: {res.get('email', '')} -> {st_val}")
+                            # Append to full log display
+                            log_msg = f"[{st_val.upper()}] {res.get('email', '')} -> {res.get('detail', '')}"
+                            log_lines.append(log_msg)
+                            if len(log_lines) > 50:  # keep recent logs
+                                log_lines.pop(0)
+                            log_container.code("\n".join(log_lines), language="text")
+                            
                     except Exception as ex:
-                        conn_results.append(str(ex))
+                        err_msg = f"[EXCEPTION] {str(ex)}"
+                        conn_results.append(err_msg)
+                        log_lines.append(err_msg)
+                        log_container.code("\n".join(log_lines), language="text")
                     
                     if total_accs > 0:
                         progress_bar.progress(min(1.0, checked_count / total_accs))
