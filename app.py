@@ -276,14 +276,20 @@ with st.sidebar:
                 alive = []
                 
                 try:
-                    with ThreadPoolExecutor(max_workers=15) as ex:
-                        results = list(ex.map(test_single_proxy, all_raw))
-                        for res in results:
-                            if not res:
-                                continue
-                            p, is_alive, geo, score = res
-                            if is_alive:
-                                alive.append(p)
+                                with ThreadPoolExecutor(max_workers=15) as ex:
+                future_to_proxy = {ex.submit(test_single_proxy, proxy): proxy for proxy in all_raw}
+                for future in future_to_proxy:
+                    proxy_str = future_to_proxy[future]
+                    try:
+                        res = future.result()
+                        if not res:
+                            continue
+                        is_alive, latency_str, geo, score = res
+                        if is_alive:
+                            alive.append(proxy_str)
+                    except Exception:
+                        continue
+
                 except Exception as ex:
                     st.error(f"Proxy thread pool error: {ex}")
 
