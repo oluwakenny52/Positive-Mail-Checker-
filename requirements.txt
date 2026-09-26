@@ -1,2 +1,8 @@
 streamlit
 dnspython
+requests
+PySocks
+playwright
+nest_asyncio
+aiohttp
+
