@@ -265,41 +265,41 @@ with st.sidebar:
         if requests is None:
             st.error("Missing 'requests' library.")
         else:
-                with st.spinner("Fetching from Webshare & Oxylabs..."):
-                    all_raw = []
-                    for key in WEBSHARE_KEYS:
-                        all_raw.extend(load_webshare(key))
-                    for ox in OXYLABS_PROXIES:
-                        all_raw.append(ox)
-                    
-                    all_raw = list(dict.fromkeys(all_raw))
-                    alive = []
-                    
-                    try:
-                        with ThreadPoolExecutor(max_workers=15) as ex:
-                            future_to_proxy = {ex.submit(test_single_proxy, proxy): proxy for proxy in all_raw}
-                            for future in future_to_proxy:
-                                proxy_str = future_to_proxy[future]
-                                try:
-                                    res = future.result()
-                                    if not res:
-                                        continue
-                                    is_alive, latency_str, geo, score = res
-                                    if is_alive:
-                                        alive.append(proxy_str)
-                                except Exception:
+            with st.spinner("Fetching from Webshare & Oxylabs..."):
+                all_raw = []
+                for key in WEBSHARE_KEYS:
+                    all_raw.extend(load_webshare(key))
+                for ox in OXYLABS_PROXIES:
+                    all_raw.append(ox)
+                
+                all_raw = list(dict.fromkeys(all_raw))
+                alive = []
+                
+                try:
+                    with ThreadPoolExecutor(max_workers=15) as ex:
+                        future_to_proxy = {ex.submit(test_single_proxy, proxy): proxy for proxy in all_raw}
+                        for future in future_to_proxy:
+                            proxy_str = future_to_proxy[future]
+                            try:
+                                res = future.result()
+                                if not res:
                                     continue
-                    except Exception as ex:
-                        st.error(f"Proxy thread pool error: {ex}")
-                        
-                    try:
-                     with open(CFG["PROXY_FILE"], "w", encoding="utf-8") as f:
-                            f.write("\n".join(str(item) for item in alive) + ("\n" if alive else ""))
-                    except Exception as ex:
-                        st.error(f"Failed to write proxies file: {ex}")
+                                is_alive, latency_str, geo, score = res
+                                if is_alive:
+                                    alive.append(proxy_str)
+                            except Exception:
+                                continue
+                except Exception as ex:
+                    st.error(f"Proxy thread pool error: {ex}")
+                    
+                try:
+                    with open(CFG["PROXY_FILE"], "w", encoding="utf-8") as f:
+                        f.write("\n".join(str(item) for item in alive) + ("\n" if alive else ""))
+                except Exception as ex:
+                    st.error(f"Failed to write proxies file: {ex}")
 
-                st.success(f"Success! Saved {len(alive)} operational proxies.")
-                st.rerun()
+            st.success(f"Success! Saved {len(alive)} operational proxies.")
+            st.rerun()
 
 # --- Pre-filter Engine ---
 DISPOSABLE = {
