@@ -53,14 +53,14 @@ st.markdown("""
         accent-color: #ff4b4b;
         cursor: pointer;
     }
-    
+
     /* Custom styling for instant click help boxes */
     .help-box {
         background-color: #1e1e2f;
         border-left: 3px solid #ff4b4b;
         padding: 8px 12px;
         margin: 4px 0 10px 0;
-        font-size: 0.85em;
+        font-size: 0.85rem;
         color: #d1d5db;
         border-radius: 4px;
         animation: fadeIn 0.2s ease-in-out;
@@ -94,10 +94,13 @@ OXYLABS_PROXIES = [
 ]
 
 # --- Helper for Clickable Instant Help Toggle ---
+if "help_states" not in st.session_state:
+    st.session_state.help_states = {}
+
 def instant_help(key_name, description_text):
     """Renders a fast-responding click button (?) that toggles description text instantly."""
-    if "help_states" not in st.session_state:
-        st.session_state.help_states = {}
+    if key_name not in st.session_state.help_states:
+        st.session_state.help_states[key_name] = {"visible": False, "time": 0}
     
     # Check if timeout expired (10 seconds)
     if key_name in st.session_state.help_states:
@@ -107,8 +110,8 @@ def instant_help(key_name, description_text):
                 st.session_state.help_states[key_name]["visible"] = False
 
     is_visible = st.session_state.help_states.get(key_name, {}).get("visible", False)
-    
-    # Render small inline button
+
+    # Render small inline button outside forms to avoid layout crashes
     col_lbl, col_btn = st.columns([0.88, 0.12])
     with col_btn:
         if st.button("❓", key=f"help_btn_{key_name}", help="Click for instant info"):
@@ -118,72 +121,70 @@ def instant_help(key_name, description_text):
                 "time": time.time()
             }
             st.rerun()
-            
+
     if st.session_state.help_states.get(key_name, {}).get("visible", False):
-        st.markdown(f'<div class="help-box">💡 {description_text}</div>', unsafe_allow_html=True)
+        st.markdown(f"<div class='help-box'>💡 {description_text}</div>", unsafe_allow_html=True)
     return col_lbl
 
 # --- Sidebar Control Panel ---
 st.sidebar.header("⚙️ Engine Control Panel")
 
-with st.sidebar.form("config_form"):
-    # Sliders with reduced touch sensitivity & custom click help
-    st.markdown("**Workers Start:**")
-    instant_help("workers", "Initial number of concurrent worker threads spawned to validate incoming accounts.")
-    workers = st.slider("Workers Start Slider", min_value=1, max_value=50, value=10, step=1, label_visibility="collapsed")
+# FIXED: We run the controls *outside* of `st.sidebar.form` so that `st.columns` and `st.rerun()` 
+# inside `instant_help` do not trigger Streamlit's `StreamlitInvalidLayoutContextError`.
+st.sidebar.markdown("**Workers Start:**")
+instant_help("workers", "Initial number of concurrent worker threads spawned to validate incoming accounts.")
+workers = st.sidebar.slider("Workers Start Slider", min_value=1, max_value=50, value=10, step=1, label_visibility="collapsed")
 
-    st.markdown("**Deadline (s):**")
-    instant_help("deadline", "Maximum execution time allotted per validation batch task.")
-    deadline = st.slider("Deadline Slider", min_value=5, max_value=120, value=25, step=5, label_visibility="collapsed")
+st.sidebar.markdown("**Deadline (s):**")
+instant_help("deadline", "Maximum execution time allotted per validation batch task.")
+deadline = st.sidebar.slider("Deadline Slider", min_value=5, max_value=120, value=25, step=5, label_visibility="collapsed")
 
-    st.markdown("**Max Accounts:**")
-    instant_help("max_acc", "Maximum number of accounts to check in a single live run (0 for unlimited).")
-    max_acc = st.slider("Max Accounts Slider", min_value=0, max_value=5000, value=100, step=25, label_visibility="collapsed")
+st.sidebar.markdown("**Max Accounts:**")
+instant_help("max_acc", "Maximum number of accounts to check in a single live run (0 for unlimited).")
+max_acc = st.sidebar.slider("Max Accounts Slider", min_value=0, max_value=5000, value=100, step=25, label_visibility="collapsed")
 
-    st.markdown("**Timeout (s):**")
-    instant_help("timeout", "Socket communication timeout threshold for server responses.")
-    timeout = st.slider("Timeout Slider", min_value=2, max_value=30, value=10, step=1, label_visibility="collapsed")
+st.sidebar.markdown("**Timeout (s):**")
+instant_help("timeout", "Socket communication timeout threshold for server responses.")
+timeout = st.sidebar.slider("Timeout Slider", min_value=2, max_value=30, value=10, step=1, label_visibility="collapsed")
 
-    st.markdown("**BlacklistCF:**")
-    instant_help("blacklist_cf", "Connection failure threshold before blacklisting specific error signatures.")
-    blacklist_cf = st.slider("BlacklistCF Slider", min_value=0, max_value=500, value=100, step=10, label_visibility="collapsed")
-    
-    st.markdown("---")
-    st.markdown("### 🌐 Proxy / Pool Configuration")
-    
-    st.markdown("**Min proxy score:**")
-    instant_help("min_proxy_score", "Only proxies with a smart health score greater than or equal to this value will be utilized.")
-    min_proxy_score = st.slider("Min proxy score Slider", min_value=0, max_value=100, value=40, step=5, label_visibility="collapsed")
-    
-    st.markdown("**Pool mode:**")
-    instant_help("pool_mode", "Defines how proxies are filtered and loaded into the active rotation pool.")
-    pool_mode = st.selectbox("Pool mode select", options=["us_only", "all", "country", "mix"], index=0, label_visibility="collapsed")
-    
-    st.markdown("**Country code (when Pool mode = country):**")
-    instant_help("country_code", "Target country specification code (e.g., US, GB, DE).")
-    country_code = st.text_input("Country code input", value="US", label_visibility="collapsed")
-    
-    st.markdown("**Mix list (when Pool mode = mix):**")
-    instant_help("mix_list", "Comma-separated country list for blended regional proxy routing.")
-    mix_list = st.text_input("Mix list input", value="US,GB,DE", label_visibility="collapsed")
+st.sidebar.markdown("**BlacklistCF:**")
+instant_help("blacklist_cf", "Connection failure threshold before blacklisting specific error signatures.")
+blacklist_cf = st.sidebar.slider("BlacklistCF Slider", min_value=0, max_value=500, value=100, step=10, label_visibility="collapsed")
 
-    st.markdown("---")
-    secret_portals = st.checkbox("Secret Portals", value=True, help="Enable automatic discovery routes for non-standard provider ports.")
-    use_proxy = st.checkbox("Use Proxy", value=True, help="Route all checker requests through proxy nodes to prevent IP rate-limiting.")
-    retry_cf = st.checkbox("Retry CF", value=True, help="Automatically retry connection failures using alternative fallback paths.")
-    self_signed = st.checkbox("Allow Self-Signed", value=True, help="Bypass strict SSL certificate validation errors for secure connections.")
-    proxy_test_flight = st.checkbox("Test Flight", value=True, help="Perform an initial health and latency probe on proxies prior to live execution.")
-    skip_app = st.checkbox("Skip Strict App-Only Providers", value=True, help="Filter out accounts requiring explicit app passwords or token generation upfront.")
-    debug_mode = st.checkbox("Enable Debug Mode", value=False, help="Stream verbose logs and error tracing directly into the UI interface.")
-    
-    resolved_proxy_mode = st.selectbox(
-        "PROXY_MODE:",
-        options=["aggressive", "fallback", "sticky", "off"],
-        index=0,
-        help="Proxy routing strategy: 'aggressive' rotates per request, 'fallback' switches on failure, 'sticky' keeps one proxy per thread, 'off' disables proxy routing."
-    )
-    
-    submitted = st.form_submit_button("Apply Settings")
+st.sidebar.markdown("---")
+st.sidebar.markdown("### 🌐 Proxy / Pool Configuration")
+
+st.sidebar.markdown("**Min proxy score:**")
+instant_help("min_proxy_score", "Only proxies with a smart health score greater than or equal to this value will be utilized.")
+min_proxy_score = st.sidebar.slider("Min proxy score Slider", min_value=0, max_value=100, value=40, step=5, label_visibility="collapsed")
+
+st.sidebar.markdown("**Pool mode:**")
+instant_help("pool_mode", "Defines how proxies are filtered and loaded into the active rotation pool.")
+pool_mode = st.sidebar.selectbox("Pool mode select", options=["us_only", "all", "country", "mix"], index=0, label_visibility="collapsed")
+
+st.sidebar.markdown("**Country code (when Pool mode = country):**")
+instant_help("country_code", "Target country specification code (e.g., US, GB, DE).")
+country_code = st.sidebar.text_input("Country code input", value="US", label_visibility="collapsed")
+
+st.sidebar.markdown("**Mix list (when Pool mode = mix):**")
+instant_help("mix_list", "Comma-separated country list for blended regional proxy routing.")
+mix_list = st.sidebar.text_input("Mix list input", value="US,GB,DE", label_visibility="collapsed")
+
+st.sidebar.markdown("---")
+secret_portals = st.sidebar.checkbox("Secret Portals", value=True, help="Enable automatic discovery routes for non-standard provider ports.")
+use_proxy = st.sidebar.checkbox("Use Proxy", value=True, help="Route all checker requests through proxy nodes to prevent IP rate-limiting.")
+retry_cf = st.sidebar.checkbox("Retry CF", value=True, help="Automatically retry connection failures using alternative fallback paths.")
+self_signed = st.sidebar.checkbox("Allow Self-Signed", value=True, help="Bypass strict SSL certificate validation errors for secure connections.")
+proxy_test_flight = st.sidebar.checkbox("Test Flight", value=True, help="Perform an initial health and latency probe on proxies prior to live execution.")
+skip_app = st.sidebar.checkbox("Skip Strict App-Only Providers", value=True, help="Filter out accounts requiring explicit app passwords or token generation upfront.")
+debug_mode = st.sidebar.checkbox("Enable Debug Mode", value=False, help="Stream verbose logs and error tracing directly into the UI interface.")
+
+resolved_proxy_mode = st.sidebar.selectbox(
+    "PROXY_MODE:",
+    options=["aggressive", "fallback", "sticky", "off"],
+    index=0,
+    help="Proxy routing strategy: 'aggressive' rotates per request, 'fallback' switches on failure, 'sticky' keeps one proxy per thread, 'off' disables proxy routing."
+)
 
 CFG = {
     "MAX_WORKERS_START": workers,
@@ -215,9 +216,6 @@ try:
     os.makedirs(CFG["RESULTS_DIR"], exist_ok=True)
 except Exception:
     pass
-
-if submitted:
-    st.sidebar.success("✅ Settings Applied Successfully!")
 
 with st.sidebar.expander("🔍 View Active Configuration State", expanded=False):
     st.json(CFG)
