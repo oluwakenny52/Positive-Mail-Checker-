@@ -90,8 +90,8 @@ OXYLABS_PROXIES = [
 if "help_states" not in st.session_state:
     st.session_state.help_states = {}
 
-def instant_help(key_name, description_text, label_text):
-    """Renders label on left, small emoji question mark respond slow on right, big question mark side respond fast."""
+def instant_help(key_name, description_text, label_text, widget_type="label", **kwargs):
+    """Universal helper renderer ensuring label/widget and ❓ buttons align properly."""
     if key_name not in st.session_state.help_states:
         st.session_state.help_states[key_name] = {"visible": False, "time": 0}
     
@@ -101,28 +101,36 @@ def instant_help(key_name, description_text, label_text):
             st.session_state.help_states[key_name]["visible"] = False
 
     col_lbl, col_btn_small, col_btn_big = st.sidebar.columns([0.70, 0.15, 0.15])
+    
     with col_lbl:
-        st.markdown(f"**{label_text}**")
+        if widget_type == "label":
+            st.markdown(f"**{label_text}**")
+        elif widget_type == "checkbox":
+            val = st.checkbox(label_text, value=kwargs.get("value", False), key=f"chk_{key_name}")
+        elif widget_type == "text":
+            st.markdown(f"**{label_text}**")
+        elif widget_type == "selectbox":
+            st.markdown(f"**{label_text}**")
+
     with col_btn_small:
         if st.button("❓", key=f"help_btn_small_{key_name}", help="Slow response help"):
-            time.sleep(0.3) # Simulate slow response as requested
+            time.sleep(0.3)
             current = st.session_state.help_states[key_name]["visible"]
-            st.session_state.help_states[key_name] = {
-                "visible": not current,
-                "time": time.time()
-            }
+            st.session_state.help_states[key_name] = {"visible": not current, "time": time.time()}
             st.rerun()
+            
     with col_btn_big:
         if st.button("❓", key=f"help_btn_big_{key_name}", help="Fast response help"):
             current = st.session_state.help_states[key_name]["visible"]
-            st.session_state.help_states[key_name] = {
-                "visible": not current,
-                "time": time.time()
-            }
+            st.session_state.help_states[key_name] = {"visible": not current, "time": time.time()}
             st.rerun()
 
     if st.session_state.help_states[key_name]["visible"]:
         st.sidebar.markdown(f"<div class='help-box'>💡 {description_text}</div>", unsafe_allow_html=True)
+
+    if widget_type == "checkbox":
+        return val
+    return None
 
 # --- Sidebar Control Panel ---
 st.sidebar.header("⚙️ Engine Control Panel")
@@ -148,29 +156,31 @@ st.sidebar.markdown("### 🌐 Proxy / Pool Configuration")
 instant_help("min_proxy_score", "Only proxies with a smart health score greater than or equal to this value will be utilized.", "Min proxy score:")
 min_proxy_score = st.sidebar.slider("Min proxy score Slider", min_value=0, max_value=100, value=40, step=5, label_visibility="collapsed")
 
-instant_help("pool_mode", "Defines how proxies are filtered and loaded into the active rotation pool.", "Pool mode:")
+instant_help("pool_mode", "Defines how proxies are filtered and loaded into the active rotation pool.", "Pool mode:", widget_type="selectbox")
 pool_mode = st.sidebar.selectbox("Pool mode select", options=["us_only", "all", "country", "mix"], index=0, label_visibility="collapsed")
 
-instant_help("country_code", "Target country specification code (e.g., US, GB, DE).", "Country code:")
+instant_help("country_code", "Target country specification code (e.g., US, GB, DE).", "Country code:", widget_type="text")
 country_code = st.sidebar.text_input("Country code input", value="US", label_visibility="collapsed")
 
-instant_help("mix_list", "Comma-separated country list for blended regional proxy routing.", "Mix list:")
+instant_help("mix_list", "Comma-separated country list for blended regional proxy routing.", "Mix list:", widget_type="text")
 mix_list = st.sidebar.text_input("Mix list input", value="US,GB,DE", label_visibility="collapsed")
 
 st.sidebar.markdown("---")
-secret_portals = st.sidebar.checkbox("Secret Portals", value=True, help="Enable automatic discovery routes for non-standard provider ports.")
-use_proxy = st.sidebar.checkbox("Use Proxy", value=True, help="Route all checker requests through proxy nodes to prevent IP rate-limiting.")
-retry_cf = st.sidebar.checkbox("Retry CF", value=True, help="Automatically retry connection failures using alternative fallback paths.")
-self_signed = st.sidebar.checkbox("Allow Self-Signed", value=True, help="Bypass strict SSL certificate validation errors for secure connections.")
-proxy_test_flight = st.sidebar.checkbox("Test Flight", value=True, help="Perform an initial health and latency probe on proxies prior to live execution.")
-skip_app = st.sidebar.checkbox("Skip Strict App-Only Providers", value=True, help="Filter out accounts requiring explicit app passwords or token generation upfront.")
-debug_mode = st.sidebar.checkbox("Enable Debug Mode", value=False, help="Stream verbose logs and error tracing directly into the UI interface.")
 
+secret_portals = instant_help("secret_portals", "Enable automatic discovery routes for non-standard provider ports.", "Secret Portals", widget_type="checkbox", value=True)
+use_proxy = instant_help("use_proxy", "Route all checker requests through proxy nodes to prevent IP rate-limiting.", "Use Proxy", widget_type="checkbox", value=True)
+retry_cf = instant_help("retry_cf", "Automatically retry connection failures using alternative fallback paths.", "Retry CF", widget_type="checkbox", value=True)
+self_signed = instant_help("self_signed", "Bypass strict SSL certificate validation errors for secure connections.", "Allow Self-Signed", widget_type="checkbox", value=True)
+proxy_test_flight = instant_help("proxy_test_flight", "Perform an initial health and latency probe on proxies prior to live execution.", "Test Flight", widget_type="checkbox", value=True)
+skip_app = instant_help("skip_app", "Filter out accounts requiring explicit app passwords or token generation upfront.", "Skip Strict App-Only Providers", widget_type="checkbox", value=True)
+debug_mode = instant_help("debug_mode", "Stream verbose logs and error tracing directly into the UI interface.", "Enable Debug Mode", widget_type="checkbox", value=False)
+
+instant_help("proxy_mode_help", "Proxy routing strategy: 'aggressive' rotates per request, 'fallback' switches on failure, 'sticky' keeps one proxy per thread, 'off' disables proxy routing.", "PROXY_MODE:", widget_type="selectbox")
 resolved_proxy_mode = st.sidebar.selectbox(
     "PROXY_MODE:",
     options=["aggressive", "fallback", "sticky", "off"],
     index=0,
-    help="Proxy routing strategy: 'aggressive' rotates per request, 'fallback' switches on failure, 'sticky' keeps one proxy per thread, 'off' disables proxy routing."
+    label_visibility="collapsed"
 )
 
 CFG = {
