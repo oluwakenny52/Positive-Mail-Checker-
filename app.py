@@ -17,6 +17,7 @@ from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from urllib.parse import urlparse
 from collections import defaultdict
+import pandas as pd
 
 # Optional network libs
 try:
@@ -45,29 +46,21 @@ st.set_page_config(
     layout="wide"
 )
 
-# --- Custom CSS for Slider Sensitivity & Instant Click Tooltips ---
+# --- Custom CSS for Styling ---
 st.markdown("""
 <style>
-    /* Reduce slider track sensitivity feel and make thumb easier to grab without accidental jumping */
     .stSlider input[type=range] {
         accent-color: #ff4b4b;
         cursor: pointer;
     }
-
-    /* Custom styling for instant click help boxes */
     .help-box {
         background-color: #1e1e2f;
         border-left: 3px solid #ff4b4b;
-        padding: 8px 12px;
-        margin: 4px 0 10px 0;
-        font-size: 0.85rem;
+        padding: 6px 10px;
+        margin: 2px 0 8px 0;
+        font-size: 0.8rem;
         color: #d1d5db;
         border-radius: 4px;
-        animation: fadeIn 0.2s ease-in-out;
-    }
-    @keyframes fadeIn {
-        from { opacity: 0; transform: translateY(-4px); }
-        to { opacity: 1; transform: translateY(0); }
     }
 </style>
 """, unsafe_allow_html=True)
@@ -97,77 +90,62 @@ OXYLABS_PROXIES = [
 if "help_states" not in st.session_state:
     st.session_state.help_states = {}
 
-def instant_help(key_name, description_text):
-    """Renders a fast-responding click button (?) that toggles description text instantly."""
+def instant_help(key_name, description_text, label_text):
+    """Renders a label and a fast-responding click button (?) side by side in the sidebar."""
     if key_name not in st.session_state.help_states:
         st.session_state.help_states[key_name] = {"visible": False, "time": 0}
     
-    # Check if timeout expired (10 seconds)
-    if key_name in st.session_state.help_states:
-        state_data = st.session_state.help_states[key_name]
-        if state_data.get("visible", False):
-            if time.time() - state_data.get("time", 0) > 10.0:
-                st.session_state.help_states[key_name]["visible"] = False
+    state_data = st.session_state.help_states[key_name]
+    if state_data.get("visible", False):
+        if time.time() - state_data.get("time", 0) > 10.0:
+            st.session_state.help_states[key_name]["visible"] = False
 
-    is_visible = st.session_state.help_states.get(key_name, {}).get("visible", False)
-
-    # Render small inline button outside forms to avoid layout crashes
-    col_lbl, col_btn = st.columns([0.88, 0.12])
+    col_lbl, col_btn = st.sidebar.columns([0.85, 0.15])
+    with col_lbl:
+        st.markdown(f"**{label_text}**")
     with col_btn:
         if st.button("❓", key=f"help_btn_{key_name}", help="Click for instant info"):
-            current = st.session_state.help_states.get(key_name, {}).get("visible", False)
+            current = st.session_state.help_states[key_name]["visible"]
             st.session_state.help_states[key_name] = {
                 "visible": not current,
                 "time": time.time()
             }
             st.rerun()
 
-    if st.session_state.help_states.get(key_name, {}).get("visible", False):
-        st.markdown(f"<div class='help-box'>💡 {description_text}</div>", unsafe_allow_html=True)
-    return col_lbl
+    if st.session_state.help_states[key_name]["visible"]:
+        st.sidebar.markdown(f"<div class='help-box'>💡 {description_text}</div>", unsafe_allow_html=True)
 
 # --- Sidebar Control Panel ---
 st.sidebar.header("⚙️ Engine Control Panel")
 
-# FIXED: We run the controls *outside* of `st.sidebar.form` so that `st.columns` and `st.rerun()` 
-# inside `instant_help` do not trigger Streamlit's `StreamlitInvalidLayoutContextError`.
-st.sidebar.markdown("**Workers Start:**")
-instant_help("workers", "Initial number of concurrent worker threads spawned to validate incoming accounts.")
+instant_help("workers", "Initial number of concurrent worker threads spawned to validate incoming accounts.", "Workers Start:")
 workers = st.sidebar.slider("Workers Start Slider", min_value=1, max_value=50, value=10, step=1, label_visibility="collapsed")
 
-st.sidebar.markdown("**Deadline (s):**")
-instant_help("deadline", "Maximum execution time allotted per validation batch task.")
+instant_help("deadline", "Maximum execution time allotted per validation batch task.", "Deadline (s):")
 deadline = st.sidebar.slider("Deadline Slider", min_value=5, max_value=120, value=25, step=5, label_visibility="collapsed")
 
-st.sidebar.markdown("**Max Accounts:**")
-instant_help("max_acc", "Maximum number of accounts to check in a single live run (0 for unlimited).")
+instant_help("max_acc", "Maximum number of accounts to check in a single live run (0 for unlimited).", "Max Accounts:")
 max_acc = st.sidebar.slider("Max Accounts Slider", min_value=0, max_value=5000, value=100, step=25, label_visibility="collapsed")
 
-st.sidebar.markdown("**Timeout (s):**")
-instant_help("timeout", "Socket communication timeout threshold for server responses.")
+instant_help("timeout", "Socket communication timeout threshold for server responses.", "Timeout (s):")
 timeout = st.sidebar.slider("Timeout Slider", min_value=2, max_value=30, value=10, step=1, label_visibility="collapsed")
 
-st.sidebar.markdown("**BlacklistCF:**")
-instant_help("blacklist_cf", "Connection failure threshold before blacklisting specific error signatures.")
+instant_help("blacklist_cf", "Connection failure threshold before blacklisting specific error signatures.", "BlacklistCF:")
 blacklist_cf = st.sidebar.slider("BlacklistCF Slider", min_value=0, max_value=500, value=100, step=10, label_visibility="collapsed")
 
 st.sidebar.markdown("---")
 st.sidebar.markdown("### 🌐 Proxy / Pool Configuration")
 
-st.sidebar.markdown("**Min proxy score:**")
-instant_help("min_proxy_score", "Only proxies with a smart health score greater than or equal to this value will be utilized.")
+instant_help("min_proxy_score", "Only proxies with a smart health score greater than or equal to this value will be utilized.", "Min proxy score:")
 min_proxy_score = st.sidebar.slider("Min proxy score Slider", min_value=0, max_value=100, value=40, step=5, label_visibility="collapsed")
 
-st.sidebar.markdown("**Pool mode:**")
-instant_help("pool_mode", "Defines how proxies are filtered and loaded into the active rotation pool.")
+instant_help("pool_mode", "Defines how proxies are filtered and loaded into the active rotation pool.", "Pool mode:")
 pool_mode = st.sidebar.selectbox("Pool mode select", options=["us_only", "all", "country", "mix"], index=0, label_visibility="collapsed")
 
-st.sidebar.markdown("**Country code (when Pool mode = country):**")
-instant_help("country_code", "Target country specification code (e.g., US, GB, DE).")
+instant_help("country_code", "Target country specification code (e.g., US, GB, DE).", "Country code:")
 country_code = st.sidebar.text_input("Country code input", value="US", label_visibility="collapsed")
 
-st.sidebar.markdown("**Mix list (when Pool mode = mix):**")
-instant_help("mix_list", "Comma-separated country list for blended regional proxy routing.")
+instant_help("mix_list", "Comma-separated country list for blended regional proxy routing.", "Mix list:")
 mix_list = st.sidebar.text_input("Mix list input", value="US,GB,DE", label_visibility="collapsed")
 
 st.sidebar.markdown("---")
@@ -446,6 +424,22 @@ with st.sidebar:
     st.markdown("### 🌐 Proxy Management & Health")
     st.info(f"Loaded Proxies: **{len(all_proxies)}** | Filtered Pool: **{len(filtered_pool)}**")
     
+    # Restored Custom Proxy Input Section
+    with st.expander("➕ Add Custom Proxies", expanded=False):
+        custom_proxy_text = st.text_area("Paste proxies (host:port or user:pass@host:port)", placeholder="123.45.67.89:8080", height=100)
+        if st.button("Save Custom Proxies"):
+            if custom_proxy_text.strip():
+                try:
+                    new_proxies = [l.strip() for l in custom_proxy_text.splitlines() if l.strip() and not l.startswith("#")]
+                    existing = load_proxies()
+                    combined = list(dict.fromkeys(existing + new_proxies))
+                    with open(CFG["PROXY_FILE"], "w", encoding="utf-8") as f:
+                        f.write("\n".join(combined) + "\n")
+                    st.success(f"Added {len(new_proxies)} custom proxies successfully!")
+                    st.rerun()
+                except Exception as ex:
+                    st.error(f"Error saving custom proxies: {ex}")
+    
     if st.button("📥 Fetch & Test All Proxies"):
         if requests is None:
             st.error("Missing 'requests' library.")
@@ -497,9 +491,8 @@ with st.sidebar:
                     "Fails": meta.get("fails", 0),
                     "Successes": meta.get("success", 0)
                 })
-            import pandas as pd
             df_proxies = pd.DataFrame(proxy_data_list)
-            st.dataframe(df_proxies, width="stretch" if hasattr(st, "dataframe") else True)
+            st.dataframe(df_proxies, use_container_width=True)
             if st.button("🧹 Clear Dead / Low-Score Proxies"):
                 with proxy_lock:
                     for k, m in list(proxy_meta.items()):
