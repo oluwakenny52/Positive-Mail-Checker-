@@ -45,6 +45,21 @@ st.set_page_config(
     layout="wide"
 )
 
+# --- Custom CSS for Slider Sensitivity & Smooth Touch Feedback ---
+st.markdown("""
+<style>
+    /* Reduce slider track sensitivity feel and make thumb easier to grab without accidental jumping */
+    .stSlider input[type=range] {
+        accent-color: #ff4b4b;
+        cursor: pointer;
+    }
+    /* Style tooltips / help descriptions for instant responsiveness */
+    .stTooltipIcon {
+        cursor: pointer !important;
+    }
+</style>
+""", unsafe_allow_html=True)
+
 st.title("⚡ Mega Ultimate Mail Checker v10 (Full Colab-Parity Edition)")
 st.markdown("Asynchronous multi-threaded proxy-backed mail validation engine with advanced proxy modes, geo-filtering, and automated ZIP archiving.")
 
@@ -70,15 +85,16 @@ OXYLABS_PROXIES = [
 st.sidebar.header("⚙️ Engine Control Panel")
 
 with st.sidebar.form("config_form"):
-    workers = st.slider("Workers Start:", min_value=1, max_value=50, value=10, help="Initial number of concurrent worker threads spawned to validate incoming accounts.")
-    deadline = st.slider("Deadline (s):", min_value=5, max_value=120, value=25, help="Maximum execution time allotted per validation batch task.")
-    max_acc = st.slider("Max Accounts:", min_value=0, max_value=5000, value=100, help="Maximum number of accounts to check in a single live run (0 for unlimited).")
-    timeout = st.slider("Timeout (s):", min_value=2, max_value=30, value=10, help="Socket communication timeout threshold for server responses.")
-    blacklist_cf = st.slider("BlacklistCF:", min_value=0, max_value=500, value=100, help="Connection failure threshold before blacklisting specific error signatures.")
+    # Using explicit steps to prevent overly sensitive/jumpy slider sliding
+    workers = st.slider("Workers Start:", min_value=1, max_value=50, value=10, step=1, help="Initial number of concurrent worker threads spawned to validate incoming accounts.")
+    deadline = st.slider("Deadline (s):", min_value=5, max_value=120, value=25, step=5, help="Maximum execution time allotted per validation batch task.")
+    max_acc = st.slider("Max Accounts:", min_value=0, max_value=5000, value=100, step=25, help="Maximum number of accounts to check in a single live run (0 for unlimited).")
+    timeout = st.slider("Timeout (s):", min_value=2, max_value=30, value=10, step=1, help="Socket communication timeout threshold for server responses.")
+    blacklist_cf = st.slider("BlacklistCF:", min_value=0, max_value=500, value=100, step=10, help="Connection failure threshold before blacklisting specific error signatures.")
     
     st.markdown("---")
     st.markdown("### 🌐 Proxy / Pool Configuration")
-    min_proxy_score = st.slider("Min proxy score:", min_value=0, max_value=100, value=40, help="Only proxies with a smart health score greater than or equal to this value will be utilized.")
+    min_proxy_score = st.slider("Min proxy score:", min_value=0, max_value=100, value=40, step=5, help="Only proxies with a smart health score greater than or equal to this value will be utilized.")
     pool_mode = st.selectbox("Pool mode", options=["us_only", "all", "country", "mix"], index=0, help="Defines how proxies are filtered and loaded into the active rotation pool.")
     country_code = st.text_input("Country code (when Pool mode = country):", value="US", help="Target country specification code (e.g., US, GB, DE).")
     mix_list = st.text_input("Mix list (when Pool mode = mix):", value="US,GB,DE", help="Comma-separated country list for blended regional proxy routing.")
@@ -244,14 +260,11 @@ def compute_real_score(success_count, fail_count, initial_latency_score=80):
     if total == 0:
         return initial_latency_score
     
-    # Laplace smoothing to prevent extreme 0 or 100 binary jumps on small sample sizes
     smoothed_success = success_count + 2
     smoothed_fail = fail_count + 1
     smoothed_total = smoothed_success + smoothed_fail
     
     success_rate = (smoothed_success / smoothed_total) * 100
-    
-    # Linear penalty scaled by absolute failure count
     score = int(success_rate - (fail_count * 5))
     return max(0, min(100, score))
 
@@ -353,7 +366,6 @@ def load_webshare(api_key):
         print(f"Webshare fetch error: {e}")
         return []
 
-# Startup test flight if meta is empty
 if not proxy_meta and CFG.get("PROXY_TEST_FLIGHT", True) and requests:
     initial_raw = load_proxies()[:10]
     if initial_raw:
@@ -803,7 +815,6 @@ if st.button("🔥 Start Live Checking Engine", type="primary"):
         progress_bar = st.progress(0)
         status_text = st.empty()
         
-        # Always available full log & error stream expander
         log_expander = st.expander("📝 Live Execution & Error Log Stream", expanded=True)
         log_container = log_expander.empty()
         log_lines = []
@@ -852,10 +863,9 @@ if st.button("🔥 Start Live Checking Engine", type="primary"):
                             else:
                                 conn_results.append(res["line"])
                             
-                            # Append to full log display
                             log_msg = f"[{st_val.upper()}] {res.get('email', '')} -> {res.get('detail', '')}"
                             log_lines.append(log_msg)
-                            if len(log_lines) > 50:  # keep recent logs
+                            if len(log_lines) > 50:
                                 log_lines.pop(0)
                             log_container.code("\n".join(log_lines), language="text")
                             
@@ -874,7 +884,6 @@ if st.button("🔥 Start Live Checking Engine", type="primary"):
         progress_bar.empty()
         status_text.success("🎉 Check Complete!")
         
-        # --- File Writes & Archive Generation ---
         try:
             stamp = datetime.now().strftime('%Y%m%d_%H%M%S')
             valid_path = os.path.join(CFG["RESULTS_DIR"], f"valid_{stamp}.txt")
