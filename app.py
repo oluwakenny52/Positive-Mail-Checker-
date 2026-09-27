@@ -400,8 +400,28 @@ def load_webshare(api_key):
     if requests is None or not api_key.strip():
         return []
     out = []
+    headers = {"Authorization": f"Token {api_key.strip()}"}
+    
+    # Try download endpoint first (Webshare v2 format)
     try:
-        headers = {"Authorization": f"Token {api_key.strip()}"}
+        url = "https://proxy.webshare.io/api/v2/proxy/list/download/"
+        r = requests.get(url, headers=headers, timeout=10)
+        if r.status_code == 200:
+            lines = r.text.strip().split("\n")
+            for line in lines:
+                if line.strip():
+                    parts = line.strip().split(":")
+                    if len(parts) == 4:
+                        ip, port, user, pwd = parts
+                        out.append(f"{user}:{pwd}@{ip}:{port}")
+    except Exception:
+        pass
+
+    if out:
+        return out
+
+    # Fallback to direct json pagination list if download endpoint fails
+    try:
         page = 1
         while page <= 5:
             url = f"https://proxy.webshare.io/api/v2/proxy/list/?mode=direct&page={page}&page_size=100"
@@ -423,7 +443,7 @@ def load_webshare(api_key):
             page += 1
         return out
     except Exception as e:
-        print(f"Webshare fetch error: {e}")
+        print(f"Webshare json fetch error: {e}")
         return []
 
 if not proxy_meta and CFG.get("PROXY_TEST_FLIGHT", True) and requests:
