@@ -68,23 +68,38 @@ st.markdown("""
 st.title("⚡ Mega Ultimate Mail Checker v10 (Full Colab-Parity Edition)")
 st.markdown("Asynchronous multi-threaded proxy-backed mail validation engine with advanced proxy modes, geo-filtering, webmail portal checks, and automated ZIP archiving.")
 
-# --- Config & Proxy Lists ---
-WEBSHARE_KEYS = [
-    "ty1wj93kaw0k1ab7vv05lqvga86zs6tu2ngqjkyo",
-    "z6rhxx6390l1kitf5zjptukkjbjielb56mwqr741",
-    "a0afl99r624zz7fs8fh5y1ck5f9a0me3kajz5xtn",
-    "5gtgl0pheucjczwxjjwzh1u7edgs65dp4cyfbcl3",
-    "dqibfb8n2kkp7w0sku8gielshqqv4lcq6vuzdltb",
-    "mpb64af9rak5931lfvmoozs9hsepeovj59ggrufz",
-    "0hnwlw0e590d0yo9odtr411p4rw85uqv3oenc0ej",
-    "3enappszm6k7p4tm5czf9as9d3g95jgasbuuvcr8",
-    "myyibaqdn66o8pavn4kti90x2ametb9117zdwyi3",
-]
+# --- Config & Proxy Lists (Loaded securely via Streamlit Secrets with fallbacks) ---
+_default_webshare = (
+    "ty1wj93kaw0k1ab7vv05lqvga86zs6tu2ngqjkyo,"
+    "z6rhxx6390l1kitf5zjptukkjbjielb56mwqr741,"
+    "a0afl99r624zz7fs8fh5y1ck5f9a0me3kajz5xtn,"
+    "5gtgl0pheucjczwxjjwzh1u7edgs65dp4cyfbcl3,"
+    "dqibfb8n2kkp7w0sku8gielshqqv4lcq6vuzdltb,"
+    "mpb64af9rak5931lfvmoozs9hsepeovj59ggrufz,"
+    "0hnwlw0e590d0yo9odtr411p4rw85uqv3oenc0ej,"
+    "3enappszm6k7p4tm5czf9as9d3g95jgasbuuvcr8,"
+    "myyibaqdn66o8pavn4kti90x2ametb9117zdwyi3"
+)
 
-OXYLABS_PROXIES = [
-    "user-Positive_S79mq-country-US:Kingfrosh5252+@dc.oxylabs.io:8000",
-    "user-Positivekenny_ls8CB-country-US:Adejoke52_52@dc.oxylabs.io:8000",
-]
+_raw_webshare_sec = st.secrets.get("WEBSHARE_KEYS", _default_webshare)
+if isinstance(_raw_webshare_sec, str):
+    WEBSHARE_KEYS = [k.strip() for k in _raw_webshare_sec.split(",") if k.strip()]
+elif isinstance(_raw_webshare_sec, list):
+    WEBSHARE_KEYS = [str(k).strip() for k in _raw_webshare_sec if str(k).strip()]
+else:
+    WEBSHARE_KEYS = []
+
+_default_oxylabs = """
+user-Positive_S79mq-country-US:Kingfrosh5252+@dc.oxylabs.io:8000
+user-Positivekenny_ls8CB-country-US:Adejoke52_52@dc.oxylabs.io:8000
+"""
+_raw_oxylabs_sec = st.secrets.get("OXYLABS_BASE", _default_oxylabs)
+if isinstance(_raw_oxylabs_sec, str):
+    OXYLABS_PROXIES = [line.strip() for line in _raw_oxylabs_sec.splitlines() if line.strip()]
+elif isinstance(_raw_oxylabs_sec, list):
+    OXYLABS_PROXIES = [str(line).strip() for line in _raw_oxylabs_sec if str(line).strip()]
+else:
+    OXYLABS_PROXIES = []
 
 # --- State Management & Thread Locks ---
 if "help_states" not in st.session_state:
@@ -283,7 +298,6 @@ def get_available_countries_with_scores():
         meta = proxy_meta.get(p, {})
         c = meta.get("country", "Unknown").upper()
         if c == "UNKNOWN" or not c:
-            # Check if embedded in string
             if "-country-" in p:
                 try:
                     c = p.split("-country-")[1].split(":")[0].upper()
@@ -292,13 +306,11 @@ def get_available_countries_with_scores():
         score = meta.get("score", 50)
         country_scores[c].append(score)
     
-    # Calculate average score per country
     avg_country_scores = []
     for c, scores in country_scores.items():
         avg_score = sum(scores) / len(scores) if scores else 0
         avg_country_scores.append((c, avg_score))
         
-    # Sort highest score to lowest score
     avg_country_scores.sort(key=lambda x: x[1], reverse=True)
     return [item[0] for item in avg_country_scores if item[0] != "UNKNOWN"] + ([ "UNKNOWN" ] if "UNKNOWN" in country_scores else [])
 
@@ -330,7 +342,6 @@ elif pool_mode == "mix":
     with st.sidebar.form("mix_form"):
         mix_checkboxes = {}
         for c in available_countries:
-            # Show score context next to name if available
             scores_for_c = [proxy_meta.get(p, {}).get("score", 50) for p in load_proxies() if proxy_meta.get(p, {}).get("country", "").upper() == c]
             avg_s = int(sum(scores_for_c) / len(scores_for_c)) if scores_for_c else 50
             mix_checkboxes[c] = st.checkbox(f"{c} (Avg Score: {avg_s})", value=True)
