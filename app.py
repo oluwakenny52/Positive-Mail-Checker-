@@ -79,11 +79,16 @@ _default_webshare = (
     "0hnwlw0e590d0yo9odtr411p4rw85uqv3oenc0ej,"
     "3enappszm6k7p4tm5czf9as9d3g95jgasbuuvcr8,"
     "myyibaqdn66o8pavn4kti90x2ametb9117zdwyi3"
-)
+]
 
 _raw_webshare_sec = st.secrets.get("WEBSHARE_KEYS", _default_webshare)
 if isinstance(_raw_webshare_sec, str):
-    WEBSHARE_KEYS = [k.strip() for k in _raw_webshare_sec.split(",") if k.strip()]
+    # Properly split by comma or newline if pasted as a block
+    WEBSHARE_KEYS = []
+    for chunk in _raw_webshare_sec.replace("\n", ",").split(","):
+        cleaned = chunk.strip()
+        if cleaned:
+            WEBSHARE_KEYS.append(cleaned)
 elif isinstance(_raw_webshare_sec, list):
     WEBSHARE_KEYS = [str(k).strip() for k in _raw_webshare_sec if str(k).strip()]
 else:
