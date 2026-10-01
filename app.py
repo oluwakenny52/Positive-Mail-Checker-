@@ -186,6 +186,31 @@ def load_proxies():
         print(f"Error reading proxies file: {e}")
         return []
 
+def load_webshare(key):
+    if not requests:
+        return []
+    url = "https://proxy.webshare.io/api/v2/proxy/list/?mode=direct&page=1&page_size=250"
+    headers = {"Authorization": f"Token {key}"}
+    try:
+        response = requests.get(url, headers=headers, timeout=10)
+        if response.status_code == 200:
+            data = response.json()
+            proxies = []
+            for item in data.get("results", []):
+                ip = item.get("proxy_address")
+                port = item.get("port")
+                user = item.get("username")
+                pwd = item.get("password")
+                if ip and port:
+                    if user and pwd:
+                        proxies.append(f"{user}:{pwd}@{ip}:{port}")
+                    else:
+                        proxies.append(f"{ip}:{port}")
+            return proxies
+    except Exception as e:
+        print(f"Error fetching Webshare proxies for key {key[:5]}...: {e}")
+    return []
+
 def parse_proxy(proxy_str):
     if not proxy_str: return None
     try:
@@ -493,7 +518,7 @@ with st.sidebar:
             with st.spinner("Fetching from Webshare & Oxylabs..."):
                 all_raw = []
                 for key in WEBSHARE_KEYS:
-                    all_raw.extend(load_webshare(key) if 'load_webshare' in globals() else [])
+                    all_raw.extend(load_webshare(key))
                 for ox in OXYLABS_PROXIES:
                     all_raw.append(ox)
                 
