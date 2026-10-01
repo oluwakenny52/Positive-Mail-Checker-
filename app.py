@@ -91,7 +91,6 @@ if "help_states" not in st.session_state:
     st.session_state.help_states = {}
 
 def instant_help(key_name, description_text, label_text, widget_type="label", **kwargs):
-    """Universal helper renderer ensuring label/widget and a single ❓ button align properly."""
     if key_name not in st.session_state.help_states:
         st.session_state.help_states[key_name] = {"visible": False, "time": 0}
     
@@ -107,9 +106,7 @@ def instant_help(key_name, description_text, label_text, widget_type="label", **
             st.markdown(f"**{label_text}**")
         elif widget_type == "checkbox":
             val = st.checkbox(label_text, value=kwargs.get("value", False), key=f"chk_{key_name}")
-        elif widget_type == "text":
-            st.markdown(f"**{label_text}**")
-        elif widget_type == "selectbox":
+        elif widget_type in ["text", "selectbox"]:
             st.markdown(f"**{label_text}**")
 
     with col_btn:
@@ -176,7 +173,6 @@ resolved_proxy_mode = st.sidebar.selectbox(
     label_visibility="collapsed"
 )
 
-# --- Apply Settings Button ---
 if st.sidebar.button("💾 Apply Settings", type="primary"):
     st.sidebar.success("Settings applied successfully!")
 
@@ -353,7 +349,7 @@ def test_single_proxy(proxy_str):
                 proxy_username=info["user"], proxy_password=info["pass"])
             sock.close()
             test_success = True
-        except Exception as e:
+        except Exception:
             if sock:
                 try: sock.close()
                 except Exception: pass
@@ -764,13 +760,11 @@ def proxy_connect(host, port, proxy_str, timeout=None):
                 proxy_username=info["user"], proxy_password=info["pass"])
             sock.settimeout(CFG["TIMEOUT"])
             return sock
-        except Exception as e:
+        except Exception:
             if sock:
                 try: sock.close()
                 except Exception: pass
-            err_str = str(e).lower()
-            if any(x in err_str for x in ["407", "0x02", "connection not allow", "refused", "timed out"]):
-                bad_proxies.add(proxy_str)
+            bad_proxies.add(proxy_str)
     raise RuntimeError("proxy connect failed")
 
 def ssl_wrap(sock, host, insecure=False):
