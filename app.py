@@ -125,19 +125,19 @@ def instant_help(key_name, description_text, label_text, widget_type="label", **
 # --- Sidebar Control Panel ---
 st.sidebar.header("⚙️ Engine Control Panel")
 
-workers = st.sidebar.slider("Workers Start Slider", min_value=1, max_value=50, value=10, step=1, label_visibility="collapsed")
-deadline = st.sidebar.slider("Deadline Slider", min_value=5, max_value=120, value=25, step=5, label_visibility="collapsed")
-max_acc = st.sidebar.slider("Max Accounts Slider", min_value=0, max_value=5000, value=5000, step=100, label_visibility="collapsed")
-timeout = st.sidebar.slider("Timeout Slider", min_value=2, max_value=30, value=10, step=1, label_visibility="collapsed")
-blacklist_cf = st.sidebar.slider("BlacklistCF Slider", min_value=0, max_value=500, value=100, step=10, label_visibility="collapsed")
+workers = st.sidebar.slider("Workers Start", min_value=1, max_value=50, value=10, step=1)
+deadline = st.sidebar.slider("Deadline (Seconds)", min_value=5, max_value=120, value=25, step=5)
+max_acc = st.sidebar.slider("Max Accounts", min_value=0, max_value=5000, value=5000, step=100)
+timeout = st.sidebar.slider("Timeout", min_value=2, max_value=30, value=10, step=1)
+blacklist_cf = st.sidebar.slider("Blacklist CF", min_value=0, max_value=500, value=100, step=10)
 
 st.sidebar.markdown("---")
 st.sidebar.markdown("### 🌐 Proxy / Pool Configuration")
 
-min_proxy_score = st.sidebar.slider("Min proxy score Slider", min_value=0, max_value=100, value=40, step=5, label_visibility="collapsed")
-pool_mode = st.sidebar.selectbox("Pool mode select", options=["us_only", "all", "country", "mix"], index=0, label_visibility="collapsed")
-country_code = st.sidebar.text_input("Country code input", value="US", label_visibility="collapsed")
-mix_list = st.sidebar.text_input("Mix list input", value="US,GB,DE", label_visibility="collapsed")
+min_proxy_score = st.sidebar.slider("Min Proxy Score", min_value=0, max_value=100, value=40, step=5)
+pool_mode = st.sidebar.selectbox("Pool Mode", options=["us_only", "all", "country", "mix"], index=0)
+country_code = st.sidebar.text_input("Country Code", value="US")
+mix_list = st.sidebar.text_input("Mix List", value="US,GB,DE")
 
 st.sidebar.markdown("---")
 
@@ -150,10 +150,9 @@ skip_app = instant_help("skip_app", "Filter out accounts requiring explicit app 
 debug_mode = instant_help("debug_mode", "Stream verbose logs and error tracing directly into the UI interface.", "Enable Debug Mode", widget_type="checkbox", value=False)
 
 resolved_proxy_mode = st.sidebar.selectbox(
-    "PROXY_MODE:",
+    "Proxy Mode Engine:",
     options=["aggressive", "fallback", "sticky", "off"],
-    index=0,
-    label_visibility="collapsed"
+    index=0
 )
 
 if st.sidebar.button("💾 Apply Settings", type="primary"):
@@ -800,10 +799,6 @@ def pop_once(email, password, server, proxy_str=None, insecure=False):
     mail.quit()
 
 def find_best_webmail_portal(domain, proxies_dict=None):
-    """
-    Intelligently discover and score potential webmail HTTP portals for a given domain
-    before falling back to brute-force pattern checks.
-    """
     if not requests:
         return []
         
@@ -824,7 +819,6 @@ def find_best_webmail_portal(domain, proxies_dict=None):
             if resp.status_code < 400:
                 text_lower = resp.text.lower()
                 score = 0
-                # Heuristics to verify if it's an actual login page
                 if any(kw in text_lower for kw in ["password", "passwd", "login", "signin", "username"]):
                     score += 50
                 if any(brand in text_lower for brand in ["roundcube", "horde", "sogo", "zimbra", "outlook", "microsoft"]):
@@ -836,7 +830,6 @@ def find_best_webmail_portal(domain, proxies_dict=None):
         except Exception:
             continue
             
-    # Sort by highest score descending
     scored_portals.sort(key=lambda x: x[0], reverse=True)
     return [portal[1] for portal in scored_portals if portal[0] > 0]
 
@@ -851,10 +844,8 @@ def check_webmail_portal(email, password, domain, proxy_str=None):
             p_url = f"http://{p_info['user']}:{p_info['pass']}@{p_info['host']}:{p_info['port']}" if p_info['user'] else f"http://{p_info['host']}:{p_info['port']}"
             proxies_dict = {"http": p_url, "https": p_url}
 
-    # Discover best portal dynamically first
     dynamic_portals = find_best_webmail_portal(domain, proxies_dict)
     
-    # Fallback default candidates if discovery returns none
     fallback_candidates = [
         f"https://{domain}/webmail",
         f"https://mail.{domain}/login",
@@ -913,7 +904,6 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state):
         if proxy_mode == "fallback" and px:
             proxies_to_try.append(None)
 
-        # --- OPTIMIZED WEBMAIL PORTAL FINDER CHECK FIRST ---
         if CFG.get("ENABLE_SECRET_PORTALS", True):
             for current_px in proxies_to_try:
                 portal_srv, portal_st, portal_det = check_webmail_portal(email, password, domain, current_px)
