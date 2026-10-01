@@ -67,8 +67,8 @@ str_lit.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-str_lit.title("⚡ Mega Ultimate Mail Checker v10 (Full Colab-Parity Edition)")
-str_lit.markdown("Asynchronous multi-threaded proxy-backed mail validation engine with advanced proxy modes, geo-filtering, webmail portal checks, and automated ZIP archiving.")
+str_lit.title("⚡ Mega Ultimate Mail Checker v10 (Secrets-Integrated Edition)")
+str_lit.markdown("Asynchronous multi-threaded proxy-backed mail validation engine with automatic Streamlit Secrets key bridge and proxy latency metrics.")
 
 # --- Persistent Session State Initialization ---
 if "engine_has_run" not in str_lit.session_state:
@@ -101,7 +101,24 @@ bad_proxies = set()
 def file_write_log_lock():
     return file_write_lock
 
-# --- Config & Proxy Lists ---
+# --- Automatic Streamlit Secrets-to-Env Bridge ---
+def _secret_to_env(k, v):
+    if v is None:
+        return
+    if isinstance(v, (list, tuple)):
+        os.environ[str(k)] = "\n".join(str(x) for x in v if x is not None)
+        return
+    if isinstance(v, dict):
+        return
+    os.environ[str(k)] = str(v)
+
+try:
+    for k, v in str_lit.secrets.items():
+        _secret_to_env(k, v)
+except Exception:
+    pass
+
+# --- Config & Proxy Key Loaders ---
 _default_webshare = [
     "ty1wj93kaw0k1ab7vv05lqvga86zs6tu2ngqjkyo",
     "z6rhxx6390l1kitf5zjptukkjbjielb56mwqr741",
@@ -114,29 +131,22 @@ _default_webshare = [
     "myyibaqdn66o8pavn4kti90x2ametb9117zdwyi3"
 ]
 
-_raw_webshare_sec = str_lit.secrets.get("WEBSHARE_KEYS", _default_webshare)
-if isinstance(_raw_webshare_sec, str):
-    WEBSHARE_KEYS = []
-    for chunk in _raw_webshare_sec.replace("\n", ",").split(","):
-        cleaned = chunk.strip()
-        if cleaned:
-            WEBSHARE_KEYS.append(cleaned)
-elif isinstance(_raw_webshare_sec, list):
-    WEBSHARE_KEYS = [str(k).strip() for k in _raw_webshare_sec if str(k).strip()]
+# Pull from environment / secrets mapped via bridge
+_raw_ws_env = os.getenv("WEBSHARE_KEYS")
+if _raw_ws_env:
+    WEBSHARE_KEYS = [line.strip() for line in _raw_ws_env.splitlines() if line.strip()]
 else:
-    WEBSHARE_KEYS = []
+    WEBSHARE_KEYS = _default_webshare
 
 _default_oxylabs = [
     "user-Positive_S79mq-country-US:Kingfrosh5252+@dc.oxylabs.io:8000",
     "user-Positivekenny_ls8CB-country-US:Adejoke52_52@dc.oxylabs.io:8000"
 ]
-_raw_oxylabs_sec = str_lit.secrets.get("OXYLABS_BASE", _default_oxylabs)
-if isinstance(_raw_oxylabs_sec, str):
-    OXYLABS_PROXIES = [line.strip() for line in _raw_oxylabs_sec.splitlines() if line.strip()]
-elif isinstance(_raw_oxylabs_sec, list):
-    OXYLABS_PROXIES = [str(line).strip() for line in _raw_oxylabs_sec if str(line).strip()]
+_raw_ox_env = os.getenv("OXYLABS_BASE") or os.getenv("OXYLABS_PROXIES")
+if _raw_ox_env:
+    OXYLABS_PROXIES = [line.strip() for line in _raw_ox_env.splitlines() if line.strip()]
 else:
-    OXYLABS_PROXIES = []
+    OXYLABS_PROXIES = _default_oxylabs
 
 if "help_states" not in str_lit.session_state:
     str_lit.session_state.help_states = {}
@@ -213,10 +223,9 @@ def load_proxies():
 def load_webshare(key):
     if not requests:
         return []
-    url = "https://proxy.webshare.io/api/v2/proxy/list/?mode=direct&page=1&page_size=250"
+    url = f"https://proxy.webshare.io/api/v2/proxy/list/?mode=direct&page=1&page_size=250"
     headers = {"Authorization": f"Token {key}"}
     try:
-        # Added a strict timeout so it never hangs indefinitely
         response = requests.get(url, headers=headers, timeout=5)
         if response.status_code == 200:
             data = response.json()
