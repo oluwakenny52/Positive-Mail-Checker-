@@ -135,64 +135,9 @@ st.sidebar.markdown("---")
 st.sidebar.markdown("### 🌐 Proxy / Pool Configuration")
 
 min_proxy_score = st.sidebar.slider("Min Proxy Score", min_value=0, max_value=100, value=40, step=5)
-pool_mode = st.sidebar.selectbox("Pool Mode", options=["us_only", "all", "country", "mix"], index=0)
-country_code = st.sidebar.text_input("Country Code", value="US")
-mix_list = st.sidebar.text_input("Mix List", value="US,GB,DE")
+pool_mode = st.sidebar.selectbox("Pool Mode", options=["all", "us_only", "country", "mix"], index=0)
 
-st.sidebar.markdown("---")
-
-secret_portals = instant_help("secret_portals", "Enable automatic discovery routes for non-standard provider ports and webmail HTTP portals.", "Secret Portals", widget_type="checkbox", value=True)
-use_proxy = instant_help("use_proxy", "Route all checker requests through proxy nodes to prevent IP rate-limiting.", "Use Proxy", widget_type="checkbox", value=True)
-retry_cf = instant_help("retry_cf", "Automatically retry connection failures using alternative fallback paths.", "Retry CF", widget_type="checkbox", value=False)
-self_signed = instant_help("self_signed", "Bypass strict SSL certificate validation errors for secure connections.", "Allow Self-Signed", widget_type="checkbox", value=True)
-proxy_test_flight = instant_help("proxy_test_flight", "Perform an initial health and latency probe on proxies prior to live execution.", "Test Flight", widget_type="checkbox", value=True)
-skip_app = instant_help("skip_app", "Filter out accounts requiring explicit app passwords or token generation upfront.", "Skip Strict App-Only Providers", widget_type="checkbox", value=True)
-debug_mode = instant_help("debug_mode", "Stream verbose logs and error tracing directly into the UI interface.", "Enable Debug Mode", widget_type="checkbox", value=False)
-
-resolved_proxy_mode = st.sidebar.selectbox(
-    "Proxy Mode Engine:",
-    options=["aggressive", "fallback", "sticky", "off"],
-    index=0
-)
-
-if st.sidebar.button("💾 Apply Settings", type="primary"):
-    st.sidebar.success("Settings applied successfully!")
-
-CFG = {
-    "MAX_WORKERS_START": workers,
-    "MAX_WORKERS_MAX": max(workers * 2, 25),
-    "TIMEOUT": timeout,
-    "ACCOUNT_DEADLINE": deadline,
-    "MAX_ACCOUNTS": max_acc,
-    "BLACKLIST_CF": blacklist_cf,
-    "ENABLE_SECRET_PORTALS": secret_portals,
-    "PROXY_MODE": "off" if not use_proxy else resolved_proxy_mode,
-    "RETRY_CONNECTION_FAILED": 1 if retry_cf else 0,
-    "ALLOW_SELF_SIGNED": self_signed,
-    "PROXY_TEST_FLIGHT": proxy_test_flight,
-    "SKIP_STRICT_APP_PROVIDERS": skip_app,
-    "DEBUG": debug_mode,
-    "MIN_PROXY_SCORE": min_proxy_score,
-    "POOL_MODE": pool_mode,
-    "COUNTRY_CODE": country_code.strip().upper(),
-    "MIX_LIST": [c.strip().upper() for c in mix_list.split(",") if c.strip()],
-    "PROXY_FILE": "proxies.txt",
-    "RESULTS_DIR": "mail_results",
-    "CACHE_FILE": "domain_cache.json",
-    "PROXY_META_FILE": "proxy_meta.json",
-    "MAX_PROXY_TRIES": 3,
-    "PROXY_CONNECT_TIMEOUT": 4.0
-}
-
-try:
-    os.makedirs(CFG["RESULTS_DIR"], exist_ok=True)
-except Exception:
-    pass
-
-with st.sidebar.expander("🔍 View Active Configuration State", expanded=False):
-    st.json(CFG)
-
-# --- State Management & Thread Locks ---
+# --- Helper Functions & State for Proxy Files ---
 cache_lock = threading.Lock()
 proxy_lock = threading.Lock()
 bad_proxies = set()
@@ -208,69 +153,19 @@ def load_json(path, default=None):
             return default
     return default
 
-domain_cache = load_json(CFG["CACHE_FILE"], {})
-proxy_meta = load_json(CFG["PROXY_META_FILE"], {})
-
-def save_domain_cache():
-    try:
-        with cache_lock:
-            with open(CFG["CACHE_FILE"], "w", encoding="utf-8") as f:
-                json.dump(domain_cache, f, indent=2)
-    except Exception as e:
-        print(f"Error saving domain cache: {e}")
-
-def save_proxy_meta():
-    try:
-        with proxy_lock:
-            with open(CFG["PROXY_META_FILE"], "w", encoding="utf-8") as f:
-                json.dump(proxy_meta, f, indent=2)
-    except Exception as e:
-        print(f"Error saving proxy meta: {e}")
+domain_cache = load_json("domain_cache.json", {})
+proxy_meta = load_json("proxy_meta.json", {})
 
 def load_proxies():
-    if not os.path.exists(CFG["PROXY_FILE"]): return []
+    if not os.path.exists("proxies.txt"): return []
     dead_node_signature = "vhbigkpo"
     try:
-        with open(CFG["PROXY_FILE"], encoding="utf-8", errors="ignore") as f:
+        with open("proxies.txt", encoding="utf-8", errors="ignore") as f:
             raw_list = [l.strip() for l in f if l.strip() and not l.startswith("#")]
         return [p for p in raw_list if dead_node_signature not in p]
     except Exception as e:
         print(f"Error reading proxies file: {e}")
         return []
-
-def get_filtered_active_proxies():
-    raw = load_proxies()
-    filtered = []
-    min_score = CFG.get("MIN_PROXY_SCORE", 40)
-    pool_mode = CFG.get("POOL_MODE", "us_only")
-    target_country = CFG.get("COUNTRY_CODE", "US")
-    mix_countries = CFG.get("MIX_LIST", ["US", "GB", "DE"])
-
-    for p in raw:
-        if p in bad_proxies:
-            continue
-        meta = proxy_meta.get(p, {})
-        score = meta.get("score", 50)
-        country = meta.get("country", "Unknown").upper()
-
-        if score < min_score:
-            continue
-
-        if pool_mode == "us_only":
-            if "US" in country or "UNITED STATES" in country or "-country-US" in p:
-                filtered.append(p)
-        elif pool_mode == "all":
-            filtered.append(p)
-        elif pool_mode == "country":
-            if target_country in country or target_country in p.upper():
-                filtered.append(p)
-        elif pool_mode == "mix":
-            if any(mc in country or mc in p.upper() for mc in mix_countries):
-                filtered.append(p)
-        else:
-            filtered.append(p)
-
-    return filtered if filtered else raw
 
 def parse_proxy(proxy_str):
     if not proxy_str: return None
@@ -366,7 +261,12 @@ def test_single_proxy(proxy_str):
         m["score"] = compute_real_score(m.get("success", 0), m.get("fails", 0), initial_latency_score=initial_score)
         m["country"] = country
         m["region"] = region
-    save_proxy_meta()
+    
+    try:
+        with open("proxy_meta.json", "w", encoding="utf-8") as f:
+            json.dump(proxy_meta, f, indent=2)
+    except Exception:
+        pass
 
     current_score = proxy_meta[proxy_str]["score"]
     if test_success:
@@ -374,35 +274,174 @@ def test_single_proxy(proxy_str):
     else:
         return False, "Connection Failed", f"{country}, {region}", current_score
 
-def load_webshare(api_key):
-    if requests is None or not api_key.strip():
-        return []
-    out = []
-    try:
-        headers = {"Authorization": f"Token {api_key.strip()}"}
-        page = 1
-        while page <= 5:
-            url = f"https://proxy.webshare.io/api/v2/proxy/list/?mode=direct&page={page}&page_size=100"
-            r = requests.get(url, headers=headers, timeout=10)
-            if r.status_code != 200:
-                break
-            data = r.json()
-            items = data.get("results", [])
-            if not items:
-                break
-            for it in items:
+# Extract available countries and rank them by average score
+def get_available_countries_with_scores():
+    raw = load_proxies()
+    country_scores = defaultdict(list)
+    
+    for p in raw:
+        meta = proxy_meta.get(p, {})
+        c = meta.get("country", "Unknown").upper()
+        if c == "UNKNOWN" or not c:
+            # Check if embedded in string
+            if "-country-" in p:
                 try:
-                    line = f"{it['username']}:{it['password']}@{it['proxy_address']}:{it['port']}"
-                    out.append(line)
+                    c = p.split("-country-")[1].split(":")[0].upper()
                 except Exception:
-                    continue
-            if not data.get("next"):
-                break
-            page += 1
-        return out
+                    c = "UNKNOWN"
+        score = meta.get("score", 50)
+        country_scores[c].append(score)
+    
+    # Calculate average score per country
+    avg_country_scores = []
+    for c, scores in country_scores.items():
+        avg_score = sum(scores) / len(scores) if scores else 0
+        avg_country_scores.append((c, avg_score))
+        
+    # Sort highest score to lowest score
+    avg_country_scores.sort(key=lambda x: x[1], reverse=True)
+    return [item[0] for item in avg_country_scores if item[0] != "UNKNOWN"] + ([ "UNKNOWN" ] if "UNKNOWN" in country_scores else [])
+
+selected_countries = []
+selected_mix_countries = []
+
+if pool_mode == "country":
+    st.sidebar.markdown("#### Select Countries")
+    available_countries = get_available_countries_with_scores()
+    if not available_countries:
+        available_countries = ["US", "GB", "DE", "CA", "FR"]
+    
+    with st.sidebar.form("country_form"):
+        country_checkboxes = {}
+        for c in available_countries:
+            country_checkboxes[c] = st.checkbox(c, value=(c == "US"))
+        
+        country_done = st.form_submit_button("Done")
+        if country_done:
+            selected_countries = [c for c, checked in country_checkboxes.items() if checked]
+            st.sidebar.success(f"Selected countries: {', '.join(selected_countries)}")
+
+elif pool_mode == "mix":
+    st.sidebar.markdown("#### Select Mix Countries (Ranked by Score)")
+    available_countries = get_available_countries_with_scores()
+    if not available_countries:
+        available_countries = ["US", "GB", "DE", "CA", "FR"]
+        
+    with st.sidebar.form("mix_form"):
+        mix_checkboxes = {}
+        for c in available_countries:
+            # Show score context next to name if available
+            scores_for_c = [proxy_meta.get(p, {}).get("score", 50) for p in load_proxies() if proxy_meta.get(p, {}).get("country", "").upper() == c]
+            avg_s = int(sum(scores_for_c) / len(scores_for_c)) if scores_for_c else 50
+            mix_checkboxes[c] = st.checkbox(f"{c} (Avg Score: {avg_s})", value=True)
+            
+        mix_done = st.form_submit_button("Done")
+        if mix_done:
+            selected_mix_countries = [c.split(" ")[0] for c, checked in mix_checkboxes.items() if checked]
+            st.sidebar.success(f"Selected mix pool: {', '.join(selected_mix_countries)}")
+
+st.sidebar.markdown("---")
+
+secret_portals = instant_help("secret_portals", "Enable automatic discovery routes for non-standard provider ports and webmail HTTP portals.", "Secret Portals", widget_type="checkbox", value=True)
+use_proxy = instant_help("use_proxy", "Route all checker requests through proxy nodes to prevent IP rate-limiting.", "Use Proxy", widget_type="checkbox", value=True)
+retry_cf = instant_help("retry_cf", "Automatically retry connection failures using alternative fallback paths.", "Retry CF", widget_type="checkbox", value=False)
+self_signed = instant_help("self_signed", "Bypass strict SSL certificate validation errors for secure connections.", "Allow Self-Signed", widget_type="checkbox", value=True)
+proxy_test_flight = instant_help("proxy_test_flight", "Perform an initial health and latency probe on proxies prior to live execution.", "Test Flight", widget_type="checkbox", value=True)
+skip_app = instant_help("skip_app", "Filter out accounts requiring explicit app passwords or token generation upfront.", "Skip Strict App-Only Providers", widget_type="checkbox", value=True)
+debug_mode = instant_help("debug_mode", "Stream verbose logs and error tracing directly into the UI interface.", "Enable Debug Mode", widget_type="checkbox", value=False)
+
+resolved_proxy_mode = st.sidebar.selectbox(
+    "Proxy Mode Engine:",
+    options=["aggressive", "fallback", "sticky", "off"],
+    index=0
+)
+
+if st.sidebar.button("💾 Apply Settings", type="primary"):
+    st.sidebar.success("Settings applied successfully!")
+
+CFG = {
+    "MAX_WORKERS_START": workers,
+    "MAX_WORKERS_MAX": max(workers * 2, 25),
+    "TIMEOUT": timeout,
+    "ACCOUNT_DEADLINE": deadline,
+    "MAX_ACCOUNTS": max_acc,
+    "BLACKLIST_CF": blacklist_cf,
+    "ENABLE_SECRET_PORTALS": secret_portals,
+    "PROXY_MODE": "off" if not use_proxy else resolved_proxy_mode,
+    "RETRY_CONNECTION_FAILED": 1 if retry_cf else 0,
+    "ALLOW_SELF_SIGNED": self_signed,
+    "PROXY_TEST_FLIGHT": proxy_test_flight,
+    "SKIP_STRICT_APP_PROVIDERS": skip_app,
+    "DEBUG": debug_mode,
+    "MIN_PROXY_SCORE": min_proxy_score,
+    "POOL_MODE": pool_mode,
+    "SELECTED_COUNTRIES": selected_countries,
+    "SELECTED_MIX_COUNTRIES": selected_mix_countries,
+    "PROXY_FILE": "proxies.txt",
+    "RESULTS_DIR": "mail_results",
+    "CACHE_FILE": "domain_cache.json",
+    "PROXY_META_FILE": "proxy_meta.json",
+    "MAX_PROXY_TRIES": 3,
+    "PROXY_CONNECT_TIMEOUT": 4.0
+}
+
+try:
+    os.makedirs(CFG["RESULTS_DIR"], exist_ok=True)
+except Exception:
+    pass
+
+with st.sidebar.expander("🔍 View Active Configuration State", expanded=False):
+    st.json(CFG)
+
+def save_domain_cache():
+    try:
+        with cache_lock:
+            with open(CFG["CACHE_FILE"], "w", encoding="utf-8") as f:
+                json.dump(domain_cache, f, indent=2)
     except Exception as e:
-        print(f"Webshare fetch error: {e}")
-        return []
+        print(f"Error saving domain cache: {e}")
+
+def save_proxy_meta():
+    try:
+        with proxy_lock:
+            with open(CFG["PROXY_META_FILE"], "w", encoding="utf-8") as f:
+                json.dump(proxy_meta, f, indent=2)
+    except Exception as e:
+        print(f"Error saving proxy meta: {e}")
+
+def get_filtered_active_proxies():
+    raw = load_proxies()
+    filtered = []
+    min_score = CFG.get("MIN_PROXY_SCORE", 40)
+    mode = CFG.get("POOL_MODE", "all")
+    chosen_countries = CFG.get("SELECTED_COUNTRIES", [])
+    chosen_mix = CFG.get("SELECTED_MIX_COUNTRIES", [])
+
+    for p in raw:
+        if p in bad_proxies:
+            continue
+        meta = proxy_meta.get(p, {})
+        score = meta.get("score", 50)
+        country = meta.get("country", "Unknown").upper()
+
+        if score < min_score:
+            continue
+
+        if mode == "all":
+            filtered.append(p)
+        elif mode == "us_only":
+            if "US" in country or "UNITED STATES" in country or "-country-US" in p:
+                filtered.append(p)
+        elif mode == "country":
+            if any(cc in country or cc in p.upper() for cc in chosen_countries):
+                filtered.append(p)
+        elif mode == "mix":
+            if any(mc in country or mc in p.upper() for mc in chosen_mix):
+                filtered.append(p)
+        else:
+            filtered.append(p)
+
+    return filtered if filtered else raw
 
 if not proxy_meta and CFG.get("PROXY_TEST_FLIGHT", True) and requests:
     initial_raw = load_proxies()[:10]
@@ -440,7 +479,7 @@ with st.sidebar:
             with st.spinner("Fetching from Webshare & Oxylabs..."):
                 all_raw = []
                 for key in WEBSHARE_KEYS:
-                    all_raw.extend(load_webshare(key))
+                    all_raw.extend(load_webshare(key) if 'load_webshare' in globals() else [])
                 for ox in OXYLABS_PROXIES:
                     all_raw.append(ox)
                 
