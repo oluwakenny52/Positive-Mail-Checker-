@@ -69,21 +69,20 @@ st.title("⚡ Mega Ultimate Mail Checker v10 (Full Colab-Parity Edition)")
 st.markdown("Asynchronous multi-threaded proxy-backed mail validation engine with advanced proxy modes, geo-filtering, webmail portal checks, and automated ZIP archiving.")
 
 # --- Config & Proxy Lists (Loaded securely via Streamlit Secrets with fallbacks) ---
-_default_webshare = (
-    "ty1wj93kaw0k1ab7vv05lqvga86zs6tu2ngqjkyo,"
-    "z6rhxx6390l1kitf5zjptukkjbjielb56mwqr741,"
-    "a0afl99r624zz7fs8fh5y1ck5f9a0me3kajz5xtn,"
-    "5gtgl0pheucjczwxjjwzh1u7edgs65dp4cyfbcl3,"
-    "dqibfb8n2kkp7w0sku8gielshqqv4lcq6vuzdltb,"
-    "mpb64af9rak5931lfvmoozs9hsepeovj59ggrufz,"
-    "0hnwlw0e590d0yo9odtr411p4rw85uqv3oenc0ej,"
-    "3enappszm6k7p4tm5czf9as9d3g95jgasbuuvcr8,"
+_default_webshare = [
+    "ty1wj93kaw0k1ab7vv05lqvga86zs6tu2ngqjkyo",
+    "z6rhxx6390l1kitf5zjptukkjbjielb56mwqr741",
+    "a0afl99r624zz7fs8fh5y1ck5f9a0me3kajz5xtn",
+    "5gtgl0pheucjczwxjjwzh1u7edgs65dp4cyfbcl3",
+    "dqibfb8n2kkp7w0sku8gielshqqv4lcq6vuzdltb",
+    "mpb64af9rak5931lfvmoozs9hsepeovj59ggrufz",
+    "0hnwlw0e590d0yo9odtr411p4rw85uqv3oenc0ej",
+    "3enappszm6k7p4tm5czf9as9d3g95jgasbuuvcr8",
     "myyibaqdn66o8pavn4kti90x2ametb9117zdwyi3"
 ]
 
 _raw_webshare_sec = st.secrets.get("WEBSHARE_KEYS", _default_webshare)
 if isinstance(_raw_webshare_sec, str):
-    # Properly split by comma or newline if pasted as a block
     WEBSHARE_KEYS = []
     for chunk in _raw_webshare_sec.replace("\n", ",").split(","):
         cleaned = chunk.strip()
@@ -94,10 +93,10 @@ elif isinstance(_raw_webshare_sec, list):
 else:
     WEBSHARE_KEYS = []
 
-_default_oxylabs = """
-user-Positive_S79mq-country-US:Kingfrosh5252+@dc.oxylabs.io:8000
-user-Positivekenny_ls8CB-country-US:Adejoke52_52@dc.oxylabs.io:8000
-"""
+_default_oxylabs = [
+    "user-Positive_S79mq-country-US:Kingfrosh5252+@dc.oxylabs.io:8000",
+    "user-Positivekenny_ls8CB-country-US:Adejoke52_52@dc.oxylabs.io:8000"
+]
 _raw_oxylabs_sec = st.secrets.get("OXYLABS_BASE", _default_oxylabs)
 if isinstance(_raw_oxylabs_sec, str):
     OXYLABS_PROXIES = [line.strip() for line in _raw_oxylabs_sec.splitlines() if line.strip()]
@@ -294,7 +293,6 @@ def test_single_proxy(proxy_str):
     else:
         return False, "Connection Failed", f"{country}, {region}", current_score
 
-# Extract available countries and rank them by average score
 def get_available_countries_with_scores():
     raw = load_proxies()
     country_scores = defaultdict(list)
