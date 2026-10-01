@@ -947,7 +947,9 @@ def check_webmail_portal(email, password, domain, proxy_str=None):
                 ]
                 for pl in post_payloads:
                     try:
-                        r_post = requests.post(portal_url, data=pl, proxies=proxies_dict, timeout=5, verify=False, allow_redirects=True)
+                        r_post = requests.post(portal_url, data=pl, proxies=proxies_dict, timeout=5, verify=False, allow_redirects=False)
+                        if r_post.status_code in [301, 302, 303, 307]:
+                            return portal_url, "valid", f"Portal (Smart Discovery) | {portal_url}"
                         body_lower = r_post.text.lower()
                         if any(k in body_lower for k in ["logout", "inbox", "welcome", "mailbox", "session"]):
                             return portal_url, "valid", f"Portal (Smart Discovery) | {portal_url}"
