@@ -18,6 +18,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from urllib.parse import urlparse
 from collections import defaultdict
 import pandas as pd
+import concurrent.futures
 
 # Optional network libs
 try:
@@ -223,27 +224,27 @@ def load_proxies():
 def load_webshare(key):
     if not requests:
         return []
-    url = f"https://proxy.webshare.io/api/v2/proxy/list/?mode=direct&page=1&page_size=250"
-    headers = {"Authorization": f"Token {key}"}
+    proxies = []
     try:
-        response = requests.get(url, headers=headers, timeout=5)
+        url = "https://proxy.webshare.io/api/v2/proxy/list/download/"
+        headers = {"Authorization": f"Token {key}"}
+        response = requests.get(url, headers=headers, timeout=10)
         if response.status_code == 200:
-            data = response.json()
-            proxies = []
-            for item in data.get("results", []):
-                ip = item.get("proxy_address")
-                port = item.get("port")
-                user = item.get("username")
-                pwd = item.get("password")
-                if ip and port:
-                    if user and pwd:
-                        proxies.append(f"{user}:{pwd}@{ip}:{port}")
-                    else:
-                        proxies.append(f"{ip}:{port}")
-            return proxies
+            lines = response.text.strip().split("\n")
+            for line in lines:
+                if ":" in line:
+                    parts = line.strip().split(":")
+                    if len(parts) >= 4:
+                        ip, port, user, pwd = parts[0], parts[1], parts[2], parts[3]
+                        proxy_str = f"{user}:{pwd}@{ip}:{port}"
+                        proxies.append(proxy_str)
+                    elif len(parts) == 2:
+                        ip, port = parts[0], parts[1]
+                        proxy_str = f"{ip}:{port}"
+                        proxies.append(proxy_str)
     except Exception:
         pass
-    return []
+    return proxies
 
 def parse_proxy(proxy_str):
     if not proxy_str: return None
@@ -552,8 +553,16 @@ with str_lit.sidebar:
         else:
             with str_lit.spinner("Fetching from Webshare & Oxylabs..."):
                 all_raw = []
-                for key in WEBSHARE_KEYS:
-                    all_raw.extend(load_webshare(key))
+                
+                # Fetch Webshare keys concurrently with ThreadPoolExecutor
+                def fetch_ws(key):
+                    return load_webshare(key)
+                
+                with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
+                    ws_results = executor.map(fetch_ws, WEBSHARE_KEYS)
+                    for res in ws_results:
+                        all_raw.extend(res)
+
                 for ox in OXYLABS_PROXIES:
                     all_raw.append(ox)
                 all_raw = list(dict.fromkeys(all_raw))
