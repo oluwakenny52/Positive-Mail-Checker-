@@ -183,7 +183,7 @@ def instant_help(key_name, description_text, label_text, widget_type="label", **
     return None
 
 # --- Sidebar Control Panel ---
-str_lit.sidebar.header("⚙️ Engine Control Panel")
+str_lit.sidebar.header("⚙️️ Engine Control Panel")
 
 workers = str_lit.sidebar.slider("Workers Start", min_value=1, max_value=50, value=10, step=1)
 deadline = str_lit.sidebar.slider("Deadline (Seconds)", min_value=5, max_value=120, value=25, step=5)
@@ -211,7 +211,6 @@ domain_cache = load_json("domain_cache.json", {})
 proxy_meta = load_json("proxy_meta.json", {})
 
 def load_proxies():
-    # Auto-seed default proxies if file is missing or empty so it never shows 0 loaded proxies on start
     if not os.path.exists("proxies.txt") or os.path.getsize("proxies.txt") == 0:
         default_seed = OXYLABS_PROXIES[:]
         try:
@@ -574,7 +573,7 @@ with str_lit.sidebar:
                             except Exception:
                                 continue
                 except Exception:
-                    alive = all_raw[:20] # Fallback to prevent hang
+                    alive = all_raw[:20]
                     
                 if not alive:
                     alive = OXYLABS_PROXIES[:]
