@@ -90,6 +90,15 @@ if "zip_name" not in st.session_state:
 if "clean_valid_count" not in st.session_state:
     st.session_state.clean_valid_count = 0
 
+# --- State Management & Thread Locks ---
+cache_lock = threading.Lock()
+proxy_lock = threading.Lock()
+file_write_lock = threading.Lock()
+bad_proxies = set()
+
+def file_write_log_lock():
+    return file_write_lock
+
 # --- Config & Proxy Lists ---
 _default_webshare = [
     "ty1wj93kaw0k1ab7vv05lqvga86zs6tu2ngqjkyo",
@@ -127,7 +136,6 @@ elif isinstance(_raw_oxylabs_sec, list):
 else:
     OXYLABS_PROXIES = []
 
-# --- State Management & Thread Locks ---
 if "help_states" not in st.session_state:
     st.session_state.help_states = {}
 
@@ -154,7 +162,6 @@ def instant_help(key_name, description_text, label_text, widget_type="label", **
         if st.button("❓", key=f"help_btn_{key_name}", help="Toggle help description"):
             current = st.session_state.help_states[key_name]["visible"]
             st.session_state.help_states[key_name] = {"visible": not current, "time": time.time()}
-            st.rerun()
 
     if st.session_state.help_states[key_name]["visible"]:
         st.sidebar.markdown(f"<div class='help-box'>💡 {description_text}</div>", unsafe_allow_html=True)
@@ -177,10 +184,6 @@ st.sidebar.markdown("### 🌐 Proxy / Pool Configuration")
 
 min_proxy_score = st.sidebar.slider("Min Proxy Score", min_value=0, max_value=100, value=40, step=5)
 pool_mode = st.sidebar.selectbox("Pool Mode", options=["all", "us_only", "country", "mix"], index=0)
-
-cache_lock = threading.Lock()
-proxy_lock = threading.Lock()
-bad_proxies = set()
 
 def load_json(path, default=None):
     if default is None: default = {}
@@ -269,10 +272,15 @@ def test_single_proxy(proxy_str):
     sock = None
     test_success = False
     try:
-        sock = socks.create_connection(
-            ("8.8.8.8", 53), timeout=3.0,
-            proxy_type=socks.SOCKS5, proxy_addr=info["host"], proxy_port=info["port"],
-            proxy_username=info["user"], proxy_password=info["pass"])
+        kwargs = {
+            "proxy_type": socks.SOCKS5,
+            "proxy_addr": info["host"],
+            "proxy_port": info["port"]
+        }
+        if info["user"]:
+            kwargs["proxy_username"] = info["user"]
+            kwargs["proxy_password"] = info["pass"]
+        sock = socks.create_connection(("8.8.8.8", 53), timeout=3.0, **kwargs)
         sock.close()
         test_success = True
     except Exception:
@@ -280,10 +288,15 @@ def test_single_proxy(proxy_str):
             try: sock.close()
             except Exception: pass
         try:
-            sock = socks.create_connection(
-                ("8.8.8.8", 53), timeout=3.0,
-                proxy_type=socks.HTTP, proxy_addr=info["host"], proxy_port=info["port"],
-                proxy_username=info["user"], proxy_password=info["pass"])
+            kwargs = {
+                "proxy_type": socks.HTTP,
+                "proxy_addr": info["host"],
+                "proxy_port": info["port"]
+            }
+            if info["user"]:
+                kwargs["proxy_username"] = info["user"]
+                kwargs["proxy_password"] = info["pass"]
+            sock = socks.create_connection(("8.8.8.8", 53), timeout=3.0, **kwargs)
             sock.close()
             test_success = True
         except Exception:
@@ -309,7 +322,7 @@ def test_single_proxy(proxy_str):
 
     with proxy_lock:
         if proxy_str not in proxy_meta:
-            proxy_meta[proxy_str] = {"fails": 0, "success": 0, "country": country, "region": region}
+            proxy_meta[proxy_str] = {"fails": 0, "success": 0, "country": country, "region": region, "latency_ms": latency}
         m = proxy_meta[proxy_str]
         if test_success:
             m["success"] = m.get("success", 0) + 1
@@ -318,12 +331,15 @@ def test_single_proxy(proxy_str):
         m["score"] = compute_real_score(m.get("success", 0), m.get("fails", 0), initial_latency_score=initial_score)
         m["country"] = country
         m["region"] = region
+        m["latency_ms"] = latency
     
-    try:
-        with open("proxy_meta.json", "w", encoding="utf-8") as f:
-            json.dump(proxy_meta, f, indent=2)
-    except Exception:
-        pass
+    with file_write_log_lock():
+        try:
+            with file_write_lock:
+                with open("proxy_meta.json", "w", encoding="utf-8") as f:
+                    json.dump(proxy_meta, f, indent=2)
+        except Exception:
+            pass
 
     current_score = proxy_meta[proxy_str]["score"]
     if test_success:
@@ -438,17 +454,19 @@ except Exception:
 
 def save_domain_cache():
     try:
-        with cache_lock:
-            with open(CFG["CACHE_FILE"], "w", encoding="utf-8") as f:
-                json.dump(domain_cache, f, indent=2)
+        with file_write_lock:
+            with cache_lock:
+                with open(CFG["CACHE_FILE"], "w", encoding="utf-8") as f:
+                    json.dump(domain_cache, f, indent=2)
     except Exception:
         pass
 
 def save_proxy_meta():
     try:
-        with proxy_lock:
-            with open(CFG["PROXY_META_FILE"], "w", encoding="utf-8") as f:
-                json.dump(proxy_meta, f, indent=2)
+        with file_write_lock:
+            with proxy_lock:
+                with open(CFG["PROXY_META_FILE"], "w", encoding="utf-8") as f:
+                    json.dump(proxy_meta, f, indent=2)
     except Exception:
         pass
 
@@ -508,8 +526,9 @@ with st.sidebar:
                     new_proxies = [l.strip() for l in custom_proxy_text.splitlines() if l.strip() and not l.startswith("#")]
                     existing = load_proxies()
                     combined = list(dict.fromkeys(existing + new_proxies))
-                    with open(CFG["PROXY_FILE"], "w", encoding="utf-8") as f:
-                        f.write("\n".join(combined) + "\n")
+                    with file_write_lock:
+                        with open(CFG["PROXY_FILE"], "w", encoding="utf-8") as f:
+                            f.write("\n".join(combined) + "\n")
                     st.success(f"Added {len(new_proxies)} custom proxies successfully!")
                     st.rerun()
                 except Exception as ex:
@@ -542,8 +561,9 @@ with st.sidebar:
                     st.error(f"Proxy thread pool error: {ex}")
                     
                 try:
-                    with open(CFG["PROXY_FILE"], "w", encoding="utf-8") as f:
-                        f.write("\n".join(str(item) for item in alive) + ("\n" if alive else ""))
+                    with file_write_lock:
+                        with open(CFG["PROXY_FILE"], "w", encoding="utf-8") as f:
+                            f.write("\n".join(str(item) for item in alive) + ("\n" if alive else ""))
                 except Exception as ex:
                     st.error(f"Failed to write proxies file: {ex}")
 
@@ -551,13 +571,36 @@ with st.sidebar:
             st.rerun()
 
     with st.expander("📊 Proxy Health & Geo Dashboard", expanded=False):
+        if proxy_meta and requests:
+            updated_any = False
+            for p_str, meta in proxy_meta.items():
+                if meta.get("country", "Unknown") == "Unknown":
+                    try:
+                        info = parse_proxy(p_str)
+                        if info and info.get("host"):
+                            r = requests.get(f"http://ip-api.com/json/{info['host']}?fields=status,country,regionName", timeout=2.0)
+                            if r.status_code == 200:
+                                data = r.json()
+                                if data.get("status") == "success":
+                                    meta["country"] = data.get("country", "Unknown")
+                                    meta["region"] = data.get("regionName", "Unknown")
+                                    updated_any = True
+                    except Exception:
+                        pass
+            if updated_any:
+                save_proxy_meta()
+
         if proxy_meta:
             proxy_data_list = []
             for p_str, meta in proxy_meta.items():
                 info = parse_proxy(p_str)
                 host_port = f"{info['host']}:{info['port']}" if info else "Unknown"
+                lat_ms = meta.get("latency_ms", "N/A")
+                latency_display = f"{lat_ms} ms" if isinstance(lat_ms, int) else "N/A"
+
                 proxy_data_list.append({
                     "Proxy": host_port,
+                    "Latency": latency_display,
                     "Country": meta.get("country", "Unknown"),
                     "Region": meta.get("region", "Unknown"),
                     "Score": meta.get("score", 50),
@@ -566,14 +609,20 @@ with st.sidebar:
                 })
             df_proxies = pd.DataFrame(proxy_data_list)
             st.dataframe(df_proxies, use_container_width=True)
-            if st.button("🧹 Clean Dead / Low-Score Proxies"):
-                with proxy_lock:
-                    for k, m in list(proxy_meta.items()):
-                        if m.get("score", 50) < 20 or m.get("fails", 0) >= 5:
-                            proxy_meta.pop(k, None)
-                save_proxy_meta()
-                st.success("Cleaned low-scoring proxies!")
-                st.rerun()
+            
+            col_ref1, col_ref2 = st.columns(2)
+            with col_ref1:
+                if st.button("🔄 Refresh Dashboard"):
+                    st.rerun()
+            with col_ref2:
+                if st.button("🧹 Clean Dead / Low-Score"):
+                    with proxy_lock:
+                        for k, m in list(proxy_meta.items()):
+                            if m.get("score", 50) < 20 or m.get("fails", 0) >= 5:
+                                proxy_meta.pop(k, None)
+                    save_proxy_meta()
+                    st.success("Cleaned!")
+                    st.rerun()
         else:
             st.info("No proxy metadata recorded yet.")
 
@@ -814,10 +863,17 @@ def proxy_connect(host, port, proxy_str, timeout=None):
     sock = None
     for ptype in (socks.SOCKS5, socks.HTTP):
         try:
+            kwargs = {
+                "proxy_type": ptype,
+                "proxy_addr": info["host"],
+                "proxy_port": info["port"]
+            }
+            if info["user"]:
+                kwargs["proxy_username"] = info["user"]
+                kwargs["proxy_password"] = info["pass"]
             sock = socks.create_connection(
-                (host, port), timeout=effective_timeout,
-                proxy_type=ptype, proxy_addr=info["host"], proxy_port=info["port"],
-                proxy_username=info["user"], proxy_password=info["pass"])
+                (host, port), timeout=effective_timeout, **kwargs
+            )
             sock.settimeout(CFG["TIMEOUT"])
             return sock
         except Exception:
@@ -1155,28 +1211,30 @@ if st.button("🔥 Start Live Checking Engine", type="primary"):
             need_path = os.path.join(CFG["RESULTS_DIR"], f"need_app_{stamp}.txt")
             failed_path = os.path.join(CFG["RESULTS_DIR"], f"failed_{stamp}.txt")
 
-            with open(valid_path, "w", encoding="utf-8") as f:
-                f.write("\n".join(str(item) for item in st.session_state.valid_results) + ("\n" if st.session_state.valid_results else ""))
-            with open(wrong_path, "w", encoding="utf-8") as f:
-                f.write("\n".join(str(item) for item in st.session_state.wrong_results) + ("\n" if st.session_state.wrong_results else ""))
-            with open(need_path, "w", encoding="utf-8") as f:
-                f.write("\n".join(str(item) for item in st.session_state.need_app_results) + ("\n" if st.session_state.need_app_results else ""))
-            with open(failed_path, "w", encoding="utf-8") as f:
-                f.write("\n".join(str(item) for item in st.session_state.conn_results) + ("\n" if st.session_state.conn_results else ""))
+            with file_write_lock:
+                with open(valid_path, "w", encoding="utf-8") as f:
+                    f.write("\n".join(str(item) for item in st.session_state.valid_results) + ("\n" if st.session_state.valid_results else ""))
+                with open(wrong_path, "w", encoding="utf-8") as f:
+                    f.write("\n".join(str(item) for item in st.session_state.wrong_results) + ("\n" if st.session_state.wrong_results else ""))
+                with open(need_path, "w", encoding="utf-8") as f:
+                    f.write("\n".join(str(item) for item in st.session_state.need_app_results) + ("\n" if st.session_state.need_app_results else ""))
+                with open(failed_path, "w", encoding="utf-8") as f:
+                    f.write("\n".join(str(item) for item in st.session_state.conn_results) + ("\n" if st.session_state.conn_results else ""))
 
             clean_valid_path = "clean_valid_accounts.txt"
             st.session_state.clean_valid_count = 0
-            with open(clean_valid_path, "w", encoding="utf-8") as outfile:
-                for line in st.session_state.valid_results:
-                    try:
-                        parts = line.split(":")
-                        if len(parts) >= 2:
-                            email = parts[0].strip()
-                            password_part = parts[1].split("|")[0].strip()
-                            outfile.write(f"{email}:{password_part}\n")
-                            st.session_state.clean_valid_count += 1
-                    except Exception:
-                        continue
+            with file_write_lock:
+                with open(clean_valid_path, "w", encoding="utf-8") as outfile:
+                    for line in st.session_state.valid_results:
+                        try:
+                            parts = line.split(":")
+                            if len(parts) >= 2:
+                                email = parts[0].strip()
+                                password_part = parts[1].split("|")[0].strip()
+                                outfile.write(f"{email}:{password_part}\n")
+                                st.session_state.clean_valid_count += 1
+                        except Exception:
+                            continue
 
             st.session_state.zip_name = f"mail_results_{stamp}.zip"
             with zipfile.ZipFile(st.session_state.zip_name, "w", zipfile.ZIP_DEFLATED) as z:
