@@ -1018,7 +1018,7 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state):
 
     return None, "connection_failed", "all hosts failed", None
 
-# --- Execution Trigger & Export Integration ---
+# --- Execution Trigger & Dual-Tab Report Log Integration ---
 st.markdown("---")
 st.markdown("### 🚀 Execute Live Checking Engine")
 
@@ -1036,9 +1036,18 @@ if st.button("🔥 Start Live Checking Engine", type="primary"):
         progress_bar = st.progress(0)
         status_text = st.empty()
         
-        log_expander = st.expander("📝 Live Execution & Error Log Stream", expanded=True)
-        log_container = log_expander.empty()
+        # Dedicated Tabs for Execution Display and Detailed Live Report Log
+        exec_tab1, exec_tab2 = st.tabs(["⚡ Live Execution Stream", "📊 Live Report Log & Analytics"])
+        
+        with exec_tab1:
+            log_container = st.empty()
+        
+        with exec_tab2:
+            report_metrics_placeholder = st.empty()
+            report_log_container = st.empty()
+
         log_lines = []
+        report_entries = []
         
         accounts_to_check = clean_lines[:CFG["MAX_ACCOUNTS"]] if CFG["MAX_ACCOUNTS"] > 0 else clean_lines
         total_accs = len(accounts_to_check)
@@ -1089,6 +1098,24 @@ if st.button("🔥 Start Live Checking Engine", type="primary"):
                             if len(log_lines) > 50:
                                 log_lines.pop(0)
                             log_container.code("\n".join(log_lines), language="text")
+
+                            # Update Dedicated Report Log Tab
+                            report_entries.append({
+                                "Time": datetime.now().strftime("%H:%M:%S"),
+                                "Email": res.get("email", ""),
+                                "Status": st_val.upper(),
+                                "Detail": res.get("detail", "")
+                            })
+                            
+                            with report_metrics_placeholder.container():
+                                r_col1, r_col2, r_col3, r_col4 = st.columns(4)
+                                r_col1.metric("✅ Valid", len(valid_results))
+                                r_col2.metric("❌ Wrong", len(wrong_results))
+                                r_col3.metric("🔑 AppPass", len(need_app_results))
+                                r_col4.metric("⚠️ Failed", len(conn_results))
+
+                            df_report = pd.DataFrame(report_entries[::-1]) # Latest first
+                            report_log_container.dataframe(df_report, width='stretch', height=250)
                             
                     except Exception as ex:
                         err_msg = f"[EXCEPTION] {str(ex)}"
