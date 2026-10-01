@@ -68,8 +68,8 @@ str_lit.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-str_lit.title("⚡ Mega Ultimate Mail Checker v10 (Secrets-Integrated Edition)")
-str_lit.markdown("Asynchronous multi-threaded proxy-backed mail validation engine with automatic Streamlit Secrets key bridge and proxy latency metrics.")
+str_lit.title("⚡ Mega Ultimate Mail Checker v10.1 (Proxy-Fixed Edition)")
+str_lit.markdown("Asynchronous multi-threaded proxy-backed mail validation engine with robust Webshare API integration.")
 
 # --- Persistent Session State Initialization ---
 if "engine_has_run" not in str_lit.session_state:
@@ -98,9 +98,6 @@ cache_lock = threading.Lock()
 proxy_lock = threading.Lock()
 file_write_lock = threading.Lock()
 bad_proxies = set()
-
-def file_write_log_lock():
-    return file_write_lock
 
 # --- Automatic Streamlit Secrets-to-Env Bridge ---
 def _secret_to_env(k, v):
@@ -183,7 +180,7 @@ def instant_help(key_name, description_text, label_text, widget_type="label", **
     return None
 
 # --- Sidebar Control Panel ---
-str_lit.sidebar.header("⚙️️ Engine Control Panel")
+str_lit.sidebar.header("⚙ Engine Control Panel")
 
 workers = str_lit.sidebar.slider("Workers Start", min_value=1, max_value=50, value=10, step=1)
 deadline = str_lit.sidebar.slider("Deadline (Seconds)", min_value=5, max_value=120, value=25, step=5)
@@ -194,7 +191,7 @@ blacklist_cf = str_lit.sidebar.slider("Blacklist CF", min_value=0, max_value=500
 str_lit.sidebar.markdown("---")
 str_lit.sidebar.markdown("### 🌐 Proxy / Pool Configuration")
 
-min_proxy_score = str_lit.sidebar.slider("Min Proxy Score", min_value=0, max_value=100, value=40, step=5)
+min_proxy_score = str_lit.sidebar.slider("Min Proxy Score", min_value=0, max_value=100, value=10, step=5)
 pool_mode = str_lit.sidebar.selectbox("Pool Mode", options=["all", "us_only", "country", "mix"], index=0)
 
 def load_json(path, default=None):
@@ -219,11 +216,10 @@ def load_proxies():
         except Exception:
             pass
 
-    dead_node_signature = "vhbigkpo"
     try:
         with open("proxies.txt", encoding="utf-8", errors="ignore") as f:
             raw_list = [l.strip() for l in f if l.strip() and not l.startswith("#")]
-        return [p for p in raw_list if dead_node_signature not in p]
+        return raw_list if raw_list else OXYLABS_PROXIES
     except Exception:
         return OXYLABS_PROXIES
 
@@ -232,22 +228,23 @@ def load_webshare(key):
         return []
     proxies = []
     try:
-        url = "https://proxy.webshare.io/api/v2/proxy/list/download/"
+        # Fixed Webshare API endpoint pagination query
+        url = "https://proxy.webshare.io/api/v2/proxy/list/?mode=direct&page=1&page_size=250"
         headers = {"Authorization": f"Token {key}"}
-        response = requests.get(url, headers=headers, timeout=5)
+        response = requests.get(url, headers=headers, timeout=8)
         if response.status_code == 200:
-            lines = response.text.strip().split("\n")
-            for line in lines:
-                if ":" in line:
-                    parts = line.strip().split(":")
-                    if len(parts) >= 4:
-                        ip, port, user, pwd = parts[0], parts[1], parts[2], parts[3]
-                        proxy_str = f"{user}:{pwd}@{ip}:{port}"
-                        proxies.append(proxy_str)
-                    elif len(parts) == 2:
-                        ip, port = parts[0], parts[1]
-                        proxy_str = f"{ip}:{port}"
-                        proxies.append(proxy_str)
+            data = response.json()
+            results = data.get("results", [])
+            for item in results:
+                ip = item.get("proxy_address")
+                port = item.get("port")
+                user = item.get("username")
+                pwd = item.get("password")
+                if ip and port:
+                    if user and pwd:
+                        proxies.append(f"{user}:{pwd}@{ip}:{port}")
+                    else:
+                        proxies.append(f"{ip}:{port}")
     except Exception:
         pass
     return proxies
@@ -299,7 +296,7 @@ def test_single_proxy(proxy_str):
         if info["user"]:
             kwargs["proxy_username"] = info["user"]
             kwargs["proxy_password"] = info["pass"]
-        sock = socks.create_connection(("8.8.8.8", 53), timeout=2.0, **kwargs)
+        sock = socks.create_connection(("8.8.8.8", 53), timeout=2.5, **kwargs)
         sock.close()
         test_success = True
     except Exception:
@@ -315,7 +312,7 @@ def test_single_proxy(proxy_str):
             if info["user"]:
                 kwargs["proxy_username"] = info["user"]
                 kwargs["proxy_password"] = info["pass"]
-            sock = socks.create_connection(("8.8.8.8", 53), timeout=2.0, **kwargs)
+            sock = socks.create_connection(("8.8.8.8", 53), timeout=2.5, **kwargs)
             sock.close()
             test_success = True
         except Exception:
@@ -484,7 +481,7 @@ def save_proxy_meta():
 def get_filtered_active_proxies():
     raw = load_proxies()
     filtered = []
-    min_score = CFG.get("MIN_PROXY_SCORE", 40)
+    min_score = CFG.get("MIN_PROXY_SCORE", 10)
     mode = CFG.get("POOL_MODE", "all")
     chosen_countries = CFG.get("SELECTED_COUNTRIES", [])
     chosen_mix = CFG.get("SELECTED_MIX_COUNTRIES", [])
@@ -560,6 +557,11 @@ with str_lit.sidebar:
                 for ox in OXYLABS_PROXIES:
                     all_raw.append(ox)
                 all_raw = list(dict.fromkeys(all_raw))
+                
+                # Fallback if API fails to hit keys
+                if not all_raw:
+                    all_raw = OXYLABS_PROXIES[:]
+
                 alive = []
                 try:
                     with ThreadPoolExecutor(max_workers=10) as ex:
@@ -576,7 +578,7 @@ with str_lit.sidebar:
                     alive = all_raw[:20]
                     
                 if not alive:
-                    alive = OXYLABS_PROXIES[:]
+                    alive = all_raw[:20] if all_raw else OXYLABS_PROXIES[:]
 
                 try:
                     with file_write_lock:
@@ -617,7 +619,7 @@ with str_lit.sidebar:
                 if str_lit.button("🧹 Clean Dead / Low-Score"):
                     with proxy_lock:
                         for k, m in list(proxy_meta.items()):
-                            if m.get("score", 50) < 20 or m.get("fails", 0) >= 5:
+                            if m.get("score", 50) < 5 or m.get("fails", 0) >= 10:
                                 proxy_meta.pop(k, None)
                     save_proxy_meta()
                     str_lit.success("Cleaned!")
@@ -830,23 +832,6 @@ def get_servers(email):
     except Exception:
         return {"imap": [email.split("@")[-1]], "pop3": [email.split("@")[-1]]}
 
-def update_proxy_score(proxy_str, success=True):
-    try:
-        with proxy_lock:
-            if proxy_str not in proxy_meta:
-                proxy_meta[proxy_str] = {"score": 50, "fails": 0, "success": 0}
-            m = proxy_meta[proxy_str]
-            if success:
-                m["success"] = m.get("success", 0) + 1
-            else:
-                m["fails"] = m.get("fails", 0) + 1
-                if m["fails"] >= 3:
-                    bad_proxies.add(proxy_str)
-            m["score"] = compute_real_score(m.get("success", 0), m.get("fails", 0))
-        save_proxy_meta()
-    except Exception:
-        pass
-
 def proxy_connect(host, port, proxy_str, timeout=None):
     base_timeout = timeout or CFG["PROXY_CONNECT_TIMEOUT"]
     try:
@@ -855,7 +840,7 @@ def proxy_connect(host, port, proxy_str, timeout=None):
     except Exception:
         fails = 0
         
-    effective_timeout = max(2.0, base_timeout - (fails * 0.5))
+    effective_timeout = max(2.0, base_timeout - (fails * 0.2))
     info = parse_proxy(proxy_str)
     if not info or not SOCKS_OK: raise RuntimeError("bad proxy format or socks unavailable")
 
@@ -879,7 +864,6 @@ def proxy_connect(host, port, proxy_str, timeout=None):
             if sock:
                 try: sock.close()
                 except Exception: pass
-            bad_proxies.add(proxy_str)
     raise RuntimeError("proxy connect failed")
 
 def ssl_wrap(sock, host, insecure=False):
@@ -1058,13 +1042,11 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, 
                 trace_logs.append(f"Attempting IMAP Protocol -> Host: {server}:993 (Proxy: {bool(current_px)})")
                 try:
                     imap_once(email, password, server, current_px, insecure=prefer_insecure)
-                    if current_px: update_proxy_score(current_px, True)
                     trace_logs.append(f"-> SUCCESS: IMAP authenticated successfully on {server}")
                     return server, "valid", f"IMAP | Host: {server} | Port: 993", current_px, trace_logs
                 except Exception as e:
                     st_val = classify_error(str(e), domain)
                     trace_logs.append(f"-> FAILED IMAP on {server}: {str(e)[:50]} [Classified: {st_val}]")
-                    if current_px: update_proxy_score(current_px, False)
                     if st_val in ("wrong_password", "need_app_password"):
                         return None, st_val, f"IMAP {server} -> {st_val}", current_px, trace_logs
 
@@ -1072,13 +1054,11 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, 
                 trace_logs.append(f"Attempting POP3 Protocol -> Host: {server}:995 (Proxy: {bool(current_px)})")
                 try:
                     pop_once(email, password, server, current_px, insecure=prefer_insecure)
-                    if current_px: update_proxy_score(current_px, True)
                     trace_logs.append(f"-> SUCCESS: POP3 authenticated successfully on {server}")
                     return server, "valid", f"POP3 | Host: {server} | Port: 995", current_px, trace_logs
                 except Exception as e:
                     st_val = classify_error(str(e), domain)
                     trace_logs.append(f"-> FAILED POP3 on {server}: {str(e)[:50]} [Classified: {st_val}]")
-                    if current_px: update_proxy_score(current_px, False)
                     if st_val in ("wrong_password", "need_app_password"):
                         return None, st_val, f"POP3 {server} -> {st_val}", current_px, trace_logs
 
@@ -1107,7 +1087,8 @@ if str_lit.button("🔥 Start Live Checking Engine", type="primary"):
         str_lit.session_state.log_lines = []
         str_lit.session_state.engine_has_run = True
         
-        progress_bar = str_lit.progress(0)
+        # Prominent Live Progress Bar and Status Header
+        progress_bar = str_lit.progress(0, text="Initializing checking engine...")
         status_text = str_lit.empty()
         
         exec_tab1, exec_tab2 = str_lit.tabs(["⚡ Live Execution Stream", "📊 Live Report Log & Analytics"])
@@ -1195,12 +1176,13 @@ if str_lit.button("🔥 Start Live Checking Engine", type="primary"):
                         log_container.code("\n".join(str_lit.session_state.log_lines), language="text")
                     
                     if total_accs > 0:
-                        progress_bar.progress(min(1.0, checked_count / total_accs))
-                    status_text.text(f"Checking... {checked_count}/{total_accs} | Valid: {len(str_lit.session_state.valid_results)} | Wrong: {len(str_lit.session_state.wrong_results)}")
+                        pct = min(1.0, checked_count / total_accs)
+                        progress_bar.progress(pct, text=f"Checking accounts: {checked_count}/{total_accs} completed ({int(pct*100)}%)")
+                    status_text.text(f"Progress: {checked_count}/{total_accs} | Valid: {len(str_lit.session_state.valid_results)} | Wrong: {len(str_lit.session_state.wrong_results)}")
         except Exception as ex:
             str_lit.error(f"Execution thread block error: {ex}")
 
-        progress_bar.empty()
+        progress_bar.progress(1.0, text="Checking complete!")
         status_text.success("🎉 Check Complete!")
         
         try:
