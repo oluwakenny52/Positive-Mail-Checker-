@@ -390,16 +390,16 @@ st.sidebar.markdown("---")
 
 secret_portals = instant_help("secret_portals", "Enable automatic discovery routes for non-standard provider ports and webmail HTTP portals.", "Secret Portals", widget_type="checkbox", value=True)
 use_proxy = instant_help("use_proxy", "Route all checker requests through proxy nodes to prevent IP rate-limiting.", "Use Proxy", widget_type="checkbox", value=True)
-retry_cf = instant_help("retry_cf", "Automatically retry connection failures using alternative fallback paths.", "Retry CF", widget_type="checkbox", value=True)
+retry_cf = instant_help("retry_cf", "Automatically retry connection failures using alternative fallback paths.", "Retry CF", widget_type="checkbox", value=False)
 self_signed = instant_help("self_signed", "Bypass strict SSL certificate validation errors for secure connections.", "Allow Self-Signed", widget_type="checkbox", value=True)
 proxy_test_flight = instant_help("proxy_test_flight", "Perform an initial health and latency probe on proxies prior to live execution.", "Test Flight", widget_type="checkbox", value=True)
 skip_app = instant_help("skip_app", "Filter out accounts requiring explicit app passwords or token generation upfront.", "Skip Strict App-Only Providers", widget_type="checkbox", value=True)
-debug_mode = instant_help("debug_mode", "Stream verbose logs and error tracing directly into the UI interface.", "Enable Debug Mode", widget_type="checkbox", value=False)
+debug_mode = instant_help("debug_mode", "Stream verbose logs and error tracing directly into the UI interface.", "Enable Debug Mode", widget_type="checkbox", value=True)
 
 resolved_proxy_mode = st.sidebar.selectbox(
     "Proxy Mode Engine:",
     options=["aggressive", "fallback", "sticky", "off"],
-    index=0
+    index=1
 )
 
 if st.sidebar.button("💾 Apply Settings", type="primary"):
