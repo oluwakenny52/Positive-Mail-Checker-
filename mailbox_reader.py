@@ -1,5 +1,4 @@
-# Let's draft the complete standalone mailbox reader code to make sure it's clean and adheres to guidelines.
-code_content = """import streamlit as st
+import streamlit as st
 import imaplib
 import email
 from email.header import decode_header
@@ -164,7 +163,6 @@ if st.button("📥 Connect & Read Inbox", type="primary"):
                         
         except Exception as ex:
             st.error(f"Connection / Authentication Error: {ex}")
-"""
 
 with open("mailbox_reader.py", "w", encoding="utf-8") as f:
     f.write(code_content)
