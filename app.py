@@ -1057,8 +1057,8 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, 
         for current_px in proxies_to_try:
             if current_px:
                 p_info = parse_proxy(current_px)
-                if p_info and not is_proxy_alive(p_info["host"], p_info["port"], timeout=2):
-                    trace_logs.append(f"Proxy {p_info['host']}:{p_info['port']} is dead. Skipping.")
+                if p_info and not is_proxy_alive(p_info["host"], p_info["port"], timeout=2.0):
+                    trace_logs.append(f"Proxy {p_info['host']}:{p_info['port']} failed pre-flight TCP check. Skipping.")
                     continue
 
             for server in conf.get("imap", [])[:3]:
