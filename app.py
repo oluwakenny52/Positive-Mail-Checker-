@@ -191,7 +191,7 @@ blacklist_cf = str_lit.sidebar.slider("Blacklist CF", min_value=0, max_value=500
 str_lit.sidebar.markdown("---")
 str_lit.sidebar.markdown("### 🌐 Proxy / Pool Configuration")
 
-min_proxy_score = str_lit.sidebar.slider("Min Proxy Score", min_value=0, max_value=100, value=10, step=5)
+min_proxy_score = str_lit.sidebar.slider("Min Proxy Score", min_value=0, max_value=100, value=40, step=10)
 pool_mode = str_lit.sidebar.selectbox("Pool Mode", options=["all", "us_only", "country", "mix"], index=0)
 
 def load_json(path, default=None):
