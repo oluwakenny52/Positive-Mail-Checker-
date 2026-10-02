@@ -9,6 +9,21 @@ import warnings
 
 warnings.filterwarnings("ignore")
 
+# Keep-Alive Injector Script
+st.markdown(
+    """
+    <script>
+    // Simple Streamlit Keep-Alive Poller
+    setInterval(function() {
+        fetch('/_stcore/health').then(function(res) {
+            // Ping to maintain connection
+        }).catch(function(err) {});
+    }, 25000);
+    </script>
+    """,
+    unsafe_allow_html=True
+)
+
 def load_valid_accounts():
     accounts = []
     paths = sorted(glob.glob("mail_results/valid_*.txt"), reverse=True)
@@ -92,7 +107,12 @@ def render():
     search_keyword = st.sidebar.text_input("Keyword Filter (Optional)", value="", placeholder="e.g. Netflix, Reset, Code", key="mb_search_keyword")
     max_msgs = st.sidebar.slider("Max Messages to Fetch", min_value=1, max_value=50, value=10, key="mb_max_msgs")
 
-    # Smart Webmail / Portal Quick Action Section
+    # Main Action Controls
+    connect_col, _ = st.columns([1, 1])
+    with connect_col:
+        connect_pressed = st.button("📥 Connect & Read IMAP Inbox", type="primary", key="mb_connect_btn")
+
+    # Smart Webmail / Portal Quick Action Section placed right below controls
     if target_email:
         portal_url = get_webmail_portal_url(target_email)
         st.markdown("---")
@@ -103,10 +123,10 @@ def render():
             st.link_button("🔗 Open Webmail Portal in New Tab", portal_url, use_container_width=True)
         with col_w2:
             st.markdown(f"**Selected Combo:** `{target_email}:{target_pass}`")
-            st.info("💡 Tip: Click the webmail button above to open the login portal. You can copy your password directly from the details above.")
+            st.info("💡 Tip: Click the webmail button to open the login portal. You can copy your password directly from the details above.")
         st.markdown("---")
 
-    if st.button("📥 Connect & Read IMAP Inbox", type="primary", key="mb_connect_btn"):
+    if connect_pressed:
         if not target_email or not target_pass:
             st.warning("⚠️ Please select or enter a valid email and password.")
         else:
