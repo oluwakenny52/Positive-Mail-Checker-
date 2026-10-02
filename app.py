@@ -68,8 +68,8 @@ str_lit.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-str_lit.title("⚡ Mega Ultimate Mail Checker v10.4 (Pure Protocol Edition)")
-str_lit.markdown("Asynchronous multi-threaded proxy-backed mail validation engine with strict protocol handshake verification and zero false positives.")
+str_lit.title("⚡ Mega Ultimate Mail Checker v10.5 (MX-Intelligence Edition)")
+str_lit.markdown("Asynchronous multi-threaded proxy-backed mail validation engine with strict protocol handshake verification and automated MX record fallback routing.")
 
 # --- Persistent Session State Initialization ---
 if "engine_has_run" not in str_lit.session_state:
@@ -752,7 +752,7 @@ if raw_text:
     col_m4.metric("Resume Skipped", resume)
     col_m5.metric("App-Skipped", app_skip)
 
-# --- Checking Protocol Functions ---
+# --- Checking Protocol Functions (With MX-Intelligence & Fallbacks) ---
 PROVIDER_MAP = {
     "gmail.com": {"imap": ["imap.gmail.com"], "pop3": ["pop.gmail.com"]},
     "googlemail.com": {"imap": ["imap.gmail.com"], "pop3": ["pop.gmail.com"]},
@@ -768,7 +768,8 @@ PROVIDER_MAP = {
 PUBLIC_PROVIDERS = set(PROVIDER_MAP.keys())
 
 def get_mx_hosts(domain):
-    if not dns: return []
+    if not dns: 
+        return []
     try:
         answers = dns.resolver.resolve(domain, "MX")
         return [str(r.exchange).lower().rstrip(".") for r in answers]
@@ -788,21 +789,30 @@ def get_servers(email):
         if domain in PROVIDER_MAP:
             return PROVIDER_MAP[domain]
 
+        # MX-Intelligence: Query live MX records to map enterprise/custom hosts accurately
         mx = get_mx_hosts(domain)
         servers = {"imap": [], "pop3": []}
+        
+        provider_detected = False
         for m in mx:
             if "google" in m or "gmail" in m:
                 servers["imap"].append("imap.gmail.com")
                 servers["pop3"].append("pop.gmail.com")
-            elif "outlook" in m or "protection.outlook" in m:
+                provider_detected = True
+            elif "outlook" in m or "protection.outlook" in m or "prod.outlook.com" in m:
                 servers["imap"].append("outlook.office365.com")
                 servers["pop3"].append("outlook.office365.com")
+                provider_detected = True
             elif "yahoo" in m:
                 servers["imap"].append("imap.mail.yahoo.com")
                 servers["pop3"].append("pop.mail.yahoo.com")
+                provider_detected = True
 
-        servers["imap"].extend([f"imap.{domain}", f"mail.{domain}", domain])
-        servers["pop3"].extend([f"pop.{domain}", f"mail.{domain}", domain])
+        # If no cloud provider match found through MX, attempt conventional patterns or fast-fail if non-existent
+        if not provider_detected:
+            servers["imap"].extend([f"imap.{domain}", f"mail.{domain}", domain])
+            servers["pop3"].extend([f"pop.{domain}", f"mail.{domain}", domain])
+            
         servers["imap"] = list(dict.fromkeys(servers["imap"]))
         servers["pop3"] = list(dict.fromkeys(servers["pop3"]))
         
@@ -861,7 +871,7 @@ def classify_error(err, domain=""):
         err = (err or "").lower()
         if domain in ZERO_ACCESS_PROVIDERS or any(k in err for k in ["zero-access", "bridge", "local connection"]):
             return "need_app_password"
-        if any(keyword in err for keyword in ["application-specific password", "app password", "two-factor", "mfa", "web login"]):
+        if any(keyword in err for keyword in ["application-specific password", "app password", "two-factor", "mfa", "web login", "basic authentication is disabled"]):
             return "need_app_password"
         if any(x in err for x in ["authentication failed", "login failed", "invalid credentials", "auth failed", "invalid login", "bad username", "command error", "logon failure", "-err [auth]", "no [authenticationfailed]"]):
             return "need_app_password" if domain in PUBLIC_PROVIDERS else "wrong_password"
