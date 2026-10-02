@@ -1214,7 +1214,7 @@ if str_lit.button("🔥 Start Live Checking Engine", type="primary"):
                                 r_col1.metric("✅ Valid", len(str_lit.session_state.valid_results))
                                 r_col2.metric("❌ Wrong", len(str_lit.session_state.wrong_results))
                                 r_col3.metric("🔑 AppPass", len(str_lit.session_state.need_app_results))
-                                r_col4.metric("⚠️ Failed", len(str_lit.session_state.conn_results))
+                                r_col4.metric("⚠️️ Failed", len(str_lit.session_state.conn_results))
 
                             df_report = pd.DataFrame(str_lit.session_state.report_entries[::-1])
                             report_log_container.dataframe(df_report, use_container_width=True, height=300)
