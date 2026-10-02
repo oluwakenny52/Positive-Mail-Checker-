@@ -228,7 +228,6 @@ def load_webshare(key):
         return []
     proxies = []
     try:
-        # Fixed Webshare API endpoint pagination query
         url = "https://proxy.webshare.io/api/v2/proxy/list/?mode=direct&page=1&page_size=250"
         headers = {"Authorization": f"Token {key}"}
         response = requests.get(url, headers=headers, timeout=8)
@@ -558,7 +557,6 @@ with str_lit.sidebar:
                     all_raw.append(ox)
                 all_raw = list(dict.fromkeys(all_raw))
                 
-                # Fallback if API fails to hit keys
                 if not all_raw:
                     all_raw = OXYLABS_PROXIES[:]
 
@@ -584,6 +582,7 @@ with str_lit.sidebar:
                     with file_write_lock:
                         with open(CFG["PROXY_FILE"], "w", encoding="utf-8") as f:
                             f.write("\n".join(str(item) for item in alive) + ("\n" if alive else ""))
+                    save_proxy_meta()  # Fixed: ensure proxy metadata is persisted immediately on disk
                 except Exception as ex:
                     str_lit.error(f"Failed to write proxies file: {ex}")
 
@@ -929,6 +928,8 @@ def find_best_webmail_portal(domain, proxies_dict=None):
     ]
     scored_portals = []
     for url in candidates:
+        if "/-/" in url or "logout" in url:
+            continue
         try:
             resp = requests.get(url, proxies=proxies_dict, timeout=3, verify=False, allow_redirects=True)
             if resp.status_code < 400:
@@ -970,6 +971,8 @@ def check_webmail_portal(email, password, domain, proxy_str=None):
         portal_candidates.insert(0, "https://empas.com/webmail")
 
     for portal_url in portal_candidates:
+        if "/-/" in portal_url or "logout" in portal_url:
+            continue
         try:
             resp = requests.get(portal_url, proxies=proxies_dict, timeout=3, verify=False, allow_redirects=True)
             if resp.status_code < 400:
@@ -1087,7 +1090,6 @@ if str_lit.button("🔥 Start Live Checking Engine", type="primary"):
         str_lit.session_state.log_lines = []
         str_lit.session_state.engine_has_run = True
         
-        # Prominent Live Progress Bar and Status Header
         progress_bar = str_lit.progress(0, text="Initializing checking engine...")
         status_text = str_lit.empty()
         
