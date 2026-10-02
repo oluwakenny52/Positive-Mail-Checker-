@@ -234,9 +234,20 @@ def compute_real_score(success_count, fail_count, initial_latency_score=80):
     score = int(success_rate - (fail_count * 5))
     return max(0, min(100, score))
 
+def is_proxy_alive(proxy_ip, proxy_port, timeout=3):
+    try:
+        with socket.create_connection((proxy_ip, int(proxy_port)), timeout=timeout):
+            return True
+    except (socket.timeout, socket.error):
+        return False
+
 def test_single_proxy(proxy_str):
     info = parse_proxy(proxy_str)
     if not info or not SOCKS_OK: return False, "Invalid Format", "Unknown", 0
+    
+    if not is_proxy_alive(info["host"], info["port"], timeout=2.0):
+        return False, "TCP Connection Timeout", "Unknown", 0
+
     start = time.time()
     sock = None
     test_success = False
@@ -771,7 +782,8 @@ def get_mx_hosts(domain):
     if not dns: return []
     try:
         answers = dns.resolver.resolve(domain, "MX")
-        return [str(r.exchange).lower().rstrip(".") for r in answers]
+        sorted_records = sorted(answers, key=lambda x: x.preference)
+        return [str(r.exchange).lower().rstrip(".") for r in sorted_records]
     except Exception:
         return []
 
@@ -801,6 +813,11 @@ def get_servers(email):
                 servers["imap"].append("imap.mail.yahoo.com")
                 servers["pop3"].append("pop.mail.yahoo.com")
 
+        for m in mx:
+            if m not in servers["imap"]:
+                servers["imap"].append(m)
+                servers["pop3"].append(m)
+
         servers["imap"].extend([f"imap.{domain}", f"mail.{domain}", domain])
         servers["pop3"].extend([f"pop.{domain}", f"mail.{domain}", domain])
         servers["imap"] = list(dict.fromkeys(servers["imap"]))
@@ -811,7 +828,7 @@ def get_servers(email):
         save_domain_cache()
         return servers
     except Exception:
-        return {"imap": [email.split("@")[-1]], "pop3": [email.split("@")[-1]]}
+        return {"imap": [f"imap.{email.split('@')[-1]}", email.split("@")[-1]], "pop3": [f"pop.{email.split('@')[-1]}", email.split("@")[-1]]}
 
 def proxy_connect(host, port, proxy_str, timeout=None):
     base_timeout = timeout or CFG["PROXY_CONNECT_TIMEOUT"]
@@ -861,10 +878,14 @@ def classify_error(err, domain=""):
         err = (err or "").lower()
         if domain in ZERO_ACCESS_PROVIDERS or any(k in err for k in ["zero-access", "bridge", "local connection"]):
             return "need_app_password"
+        if "basic authentication is disabled" in err:
+            return "need_app_password"
         if any(keyword in err for keyword in ["application-specific password", "app password", "two-factor", "mfa", "web login"]):
             return "need_app_password"
         if any(x in err for x in ["authentication failed", "login failed", "invalid credentials", "auth failed", "invalid login", "bad username", "command error", "logon failure", "-err [auth]", "no [authenticationfailed]"]):
             return "need_app_password" if domain in PUBLIC_PROVIDERS else "wrong_password"
+        if any(x in err for x in ["gaierror", "timed out", "timeout", "connection refused", "network is unreachable", "name or service not known", "proxy connect failed"]):
+            return "connection_failed"
     except Exception:
         pass
     return "connection_failed"
