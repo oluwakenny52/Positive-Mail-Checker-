@@ -88,127 +88,127 @@ def get_webmail_portal_url(email_addr):
     except Exception:
         return "https://google.com"
 
-def render():
-    st.title("📥 Mailbox Reader & Webmail Portal Hub")
-    st.markdown("Connects to verified valid IMAP inboxes or launches direct Webmail portal access with smart credential helpers.")
+# Main Page Interface
+st.title("📥 Mailbox Reader & Webmail Portal Hub")
+st.markdown("Connects to verified valid IMAP inboxes or launches direct Webmail portal access with smart credential helpers.")
 
-    valid_accs = load_valid_accounts()
+valid_accs = load_valid_accounts()
 
-    st.sidebar.header("⚙ Reader & Portal Configuration")
-    selected_account = st.sidebar.selectbox("Select Valid Account", options=valid_accs if valid_accs else ["No valid accounts found"], key="mb_selected_account")
+st.sidebar.header("⚙ Reader & Portal Configuration")
+selected_account = st.sidebar.selectbox("Select Valid Account", options=valid_accs if valid_accs else ["No valid accounts found"], key="mb_selected_account")
 
-    custom_email = st.sidebar.text_input("Or enter custom email", key="mb_custom_email")
-    custom_pass = st.sidebar.text_input("Or enter custom password", type="password", key="mb_custom_pass")
+custom_email = st.sidebar.text_input("Or enter custom email", key="mb_custom_email")
+custom_pass = st.sidebar.text_input("Or enter custom password", type="password", key="mb_custom_pass")
 
-    target_email = custom_email.strip() if custom_email.strip() else (selected_account.split(":")[0] if ":" in selected_account else "")
-    target_pass = custom_pass.strip() if custom_pass.strip() else (selected_account.split(":")[1] if ":" in selected_account else "")
+target_email = custom_email.strip() if custom_email.strip() else (selected_account.split(":")[0] if ":" in selected_account else "")
+target_pass = custom_pass.strip() if custom_pass.strip() else (selected_account.split(":")[1] if ":" in selected_account else "")
 
-    server_host = st.sidebar.text_input("IMAP Server Host (Leave blank for auto-detect)", value="", key="mb_server_host")
-    search_keyword = st.sidebar.text_input("Keyword Filter (Optional)", value="", placeholder="e.g. Netflix, Reset, Code", key="mb_search_keyword")
-    max_msgs = st.sidebar.slider("Max Messages to Fetch", min_value=1, max_value=50, value=10, key="mb_max_msgs")
+server_host = st.sidebar.text_input("IMAP Server Host (Leave blank for auto-detect)", value="", key="mb_server_host")
+search_keyword = st.sidebar.text_input("Keyword Filter (Optional)", value="", placeholder="e.g. Netflix, Reset, Code", key="mb_search_keyword")
+max_msgs = st.sidebar.slider("Max Messages to Fetch", min_value=1, max_value=50, value=10, key="mb_max_msgs")
 
-    # Main Action Controls
-    connect_col, _ = st.columns([1, 1])
-    with connect_col:
-        connect_pressed = st.button("📥 Connect & Read IMAP Inbox", type="primary", key="mb_connect_btn")
+# Main Action Controls
+connect_col, _ = st.columns([1, 1])
+with connect_col:
+    connect_pressed = st.button("📥 Connect & Read IMAP Inbox", type="primary", key="mb_connect_btn")
 
-    # Smart Webmail / Portal Quick Action Section placed right below controls
-    if target_email:
-        portal_url = get_webmail_portal_url(target_email)
-        st.markdown("---")
-        st.subheader("🌐 Webmail & Portal Quick Access")
-        col_w1, col_w2 = st.columns([2, 2])
-        with col_w1:
-            st.markdown(f"**Target Webmail URL:** `{portal_url}`")
-            st.link_button("🔗 Open Webmail Portal in New Tab", portal_url, use_container_width=True)
-        with col_w2:
-            st.markdown(f"**Selected Combo:** `{target_email}:{target_pass}`")
-            st.info("💡 Tip: Click the webmail button to open the login portal. You can copy your password directly from the details above.")
-        st.markdown("---")
+# Smart Webmail / Portal Quick Action Section
+if target_email:
+    portal_url = get_webmail_portal_url(target_email)
+    st.markdown("---")
+    st.subheader("🌐 Webmail & Portal Quick Access")
+    col_w1, col_w2 = st.columns([2, 2])
+    with col_w1:
+        st.markdown(f"**Target Webmail URL:** `{portal_url}`")
+        st.link_button("🔗 Open Webmail Portal in New Tab", portal_url, use_container_width=True)
+    with col_w2:
+        st.markdown(f"**Selected Combo:** `{target_email}:{target_pass}`")
+        st.info("💡 Tip: Click the webmail button to open the login portal. You can copy your password directly from the details above.")
+    st.markdown("---")
 
-    if connect_pressed:
-        if not target_email or not target_pass:
-            st.warning("⚠️ Please select or enter a valid email and password.")
-        else:
-            host = server_host.strip() if server_host.strip() else guess_imap_server(target_email)
-            st.info(f"Connecting to IMAP server **{host}:993** for **{target_email}**...")
+if connect_pressed:
+    if not target_email or not target_pass:
+        st.warning("⚠️ Please select or enter a valid email and password.")
+    else:
+        host = server_host.strip() if server_host.strip() else guess_imap_server(target_email)
+        st.info(f"Connecting to IMAP server **{host}:993** for **{target_email}**...")
+        
+        try:
+            mail = imaplib.IMAP4_SSL(host, 993, timeout=10)
+            mail.login(target_email, target_pass)
+            mail.select("INBOX")
             
-            try:
-                mail = imaplib.IMAP4_SSL(host, 993, timeout=10)
-                mail.login(target_email, target_pass)
-                mail.select("INBOX")
+            if search_keyword.strip():
+                status, response = mail.search(None, f'(SUBJECT "{search_keyword.strip()}")')
+            else:
+                status, response = mail.search(None, "ALL")
                 
-                if search_keyword.strip():
-                    status, response = mail.search(None, f'(SUBJECT "{search_keyword.strip()}")')
+            if status != "OK":
+                st.error("Failed to search mailbox messages.")
+            else:
+                msg_nums = response[0].split()
+                if not msg_nums:
+                    st.warning("No messages found matching criteria.")
                 else:
-                    status, response = mail.search(None, "ALL")
+                    latest_nums = msg_nums[-max_msgs:][::-1]
+                    table_data = []
                     
-                if status != "OK":
-                    st.error("Failed to search mailbox messages.")
-                else:
-                    msg_nums = response[0].split()
-                    if not msg_nums:
-                        st.warning("No messages found matching criteria.")
+                    for num in latest_nums:
+                        st_fetch, msg_data = mail.fetch(num, "(RFC822)")
+                        if st_fetch != "OK":
+                            continue
+                        for response_part in msg_data:
+                            if isinstance(response_part, tuple):
+                                msg = email.message_from_bytes(response_part[1])
+                                
+                                # Subject
+                                sub_hdr = decode_header(msg.get("Subject", "No Subject"))[0]
+                                subject = sub_hdr[0].decode(sub_hdr[1] or "utf-8", errors="ignore") if isinstance(sub_hdr[0], bytes) else str(sub_hdr[0])
+                                
+                                # Sender
+                                from_hdr = decode_header(msg.get("From", "Unknown"))[0]
+                                sender = from_hdr[0].decode(from_hdr[1] or "utf-8", errors="ignore") if isinstance(from_hdr[0], bytes) else str(from_hdr[0])
+                                
+                                date_str = msg.get("Date", "Unknown")
+                                
+                                body = ""
+                                if msg.is_multipart():
+                                    for part in msg.walk():
+                                        if part.get_content_type() == "text/plain":
+                                            payload = part.get_payload(decode=True)
+                                            if payload:
+                                                body = payload.decode("utf-8", errors="ignore")
+                                                break
+                                else:
+                                    payload = msg.get_payload(decode=True)
+                                    if payload:
+                                        body = payload.decode("utf-8", errors="ignore")
+                                        
+                                table_data.append({
+                                    "ID": num.decode(),
+                                    "Date": date_str,
+                                    "From": sender,
+                                    "Subject": subject,
+                                    "Snippet": body[:300].strip()
+                                })
+                                
+                    mail.logout()
+                    
+                    if table_data:
+                        st.success(f"Successfully retrieved {len(table_data)} messages!")
+                        df = pd.DataFrame(table_data)
+                        st.dataframe(df, use_container_width=True)
+                        
+                        # Expandable message view
+                        for idx, row in df.iterrows():
+                            with st.expander(f"✉ [{row['Date']}] {row['From']} - {row['Subject']}"):
+                                st.markdown(f"**From:** {row['From']}")
+                                st.markdown(f"**Subject:** {row['Subject']}")
+                                st.markdown(f"**Date:** {row['Date']}")
+                                st.markdown("---")
+                                st.text(row['Snippet'])
                     else:
-                        latest_nums = msg_nums[-max_msgs:][::-1]
-                        table_data = []
+                        st.info("No readable messages extracted.")
                         
-                        for num in latest_nums:
-                            st_fetch, msg_data = mail.fetch(num, "(RFC822)")
-                            if st_fetch != "OK":
-                                continue
-                            for response_part in msg_data:
-                                if isinstance(response_part, tuple):
-                                    msg = email.message_from_bytes(response_part[1])
-                                    
-                                    # Subject
-                                    sub_hdr = decode_header(msg.get("Subject", "No Subject"))[0]
-                                    subject = sub_hdr[0].decode(sub_hdr[1] or "utf-8", errors="ignore") if isinstance(sub_hdr[0], bytes) else str(sub_hdr[0])
-                                    
-                                    # Sender
-                                    from_hdr = decode_header(msg.get("From", "Unknown"))[0]
-                                    sender = from_hdr[0].decode(from_hdr[1] or "utf-8", errors="ignore") if isinstance(from_hdr[0], bytes) else str(from_hdr[0])
-                                    
-                                    date_str = msg.get("Date", "Unknown")
-                                    
-                                    body = ""
-                                    if msg.is_multipart():
-                                        for part in msg.walk():
-                                            if part.get_content_type() == "text/plain":
-                                                payload = part.get_payload(decode=True)
-                                                if payload:
-                                                    body = payload.decode("utf-8", errors="ignore")
-                                                    break
-                                    else:
-                                        payload = msg.get_payload(decode=True)
-                                        if payload:
-                                            body = payload.decode("utf-8", errors="ignore")
-                                            
-                                    table_data.append({
-                                        "ID": num.decode(),
-                                        "Date": date_str,
-                                        "From": sender,
-                                        "Subject": subject,
-                                        "Snippet": body[:300].strip()
-                                    })
-                                    
-                        mail.logout()
-                        
-                        if table_data:
-                            st.success(f"Successfully retrieved {len(table_data)} messages!")
-                            df = pd.DataFrame(table_data)
-                            st.dataframe(df, use_container_width=True)
-                            
-                            # Expandable message view
-                            for idx, row in df.iterrows():
-                                with st.expander(f"✉ [{row['Date']}] {row['From']} - {row['Subject']}"):
-                                    st.markdown(f"**From:** {row['From']}")
-                                    st.markdown(f"**Subject:** {row['Subject']}")
-                                    st.markdown(f"**Date:** {row['Date']}")
-                                    st.markdown("---")
-                                    st.text(row['Snippet'])
-                        else:
-                            st.info("No readable messages extracted.")
-                            
-            except Exception as ex:
-                st.error(f"Connection / Authentication Error: {ex}")
+        except Exception as ex:
+            st.error(f"Connection / Authentication Error: {ex}")
