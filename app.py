@@ -194,6 +194,7 @@ str_lit.sidebar.markdown("---")
 str_lit.sidebar.markdown("### 🌐 Proxy / Pool Configuration")
 
 min_proxy_score = str_lit.sidebar.slider("Min Proxy Score", min_value=0, max_value=100, value=40, step=10)
+proxy_precheck_timeout = str_lit.sidebar.slider("Proxy Pre-Check Timeout (Sec)", min_value=1, max_value=10, value=3, step=1)
 pool_mode = str_lit.sidebar.selectbox("Pool Mode", options=["all", "us_only", "country", "mix"], index=0)
 
 def load_json(path, default=None):
@@ -433,6 +434,7 @@ CFG = {
     "SKIP_STRICT_APP_PROVIDERS": skip_app,
     "DEBUG": debug_mode,
     "MIN_PROXY_SCORE": min_proxy_score,
+    "PROXY_PRECHECK_TIMEOUT": proxy_precheck_timeout,
     "POOL_MODE": pool_mode,
     "SELECTED_COUNTRIES": selected_countries,
     "SELECTED_MIX_COUNTRIES": selected_mix_countries,
@@ -840,6 +842,26 @@ def get_servers(email):
     except Exception:
         return {"imap": [f"imap.{email.split('@')[-1]}", email.split("@")[-1]], "pop3": [f"pop.{email.split('@')[-1]}", email.split("@")[-1]]}
 
+def precheck_proxy_fast(proxy_str):
+    """Fast Health Check & Circuit Breaker validation before routing."""
+    if not proxy_str:
+        return True
+    
+    now = time.time()
+    if proxy_str in circuit_breaker_until and now < circuit_breaker_until[proxy_str]:
+        return False
+
+    info = parse_proxy(proxy_str)
+    if not info or not SOCKS_OK:
+        return False
+
+    precheck_timeout = float(CFG.get("PROXY_PRECHECK_TIMEOUT", 3))
+    if not is_proxy_alive(info["host"], info["port"], timeout=precheck_timeout):
+        record_proxy_attempt(proxy_str, success=False, is_network_error=True)
+        return False
+
+    return True
+
 def proxy_connect(host, port, proxy_str, timeout=None):
     base_timeout = timeout or CFG["PROXY_CONNECT_TIMEOUT"]
     try:
@@ -1039,13 +1061,17 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, 
         px = None
         if proxy_pool and proxy_mode != "off":
             if proxy_mode == "sticky":
-                if not thread_state.get("sticky_proxy") or thread_state.get("sticky_proxy") in bad_proxies:
-                    thread_state["sticky_proxy"] = random.choice(proxy_pool)
+                if not thread_state.get("sticky_proxy") or not precheck_proxy_fast(thread_state.get("sticky_proxy")):
+                    available_candidates = [p for p in proxy_pool if precheck_proxy_fast(p)]
+                    thread_state["sticky_proxy"] = random.choice(available_candidates) if available_candidates else None
                 px = thread_state["sticky_proxy"]
-                trace_logs.append(f"Proxy [Sticky Mode]: {px.split('@')[-1]}")
+                if px:
+                    trace_logs.append(f"Proxy [Sticky Mode]: {px.split('@')[-1]}")
             else:
-                px = random.choice(proxy_pool)
-                trace_logs.append(f"Proxy [Random Pool]: {px.split('@')[-1]}")
+                available_candidates = [p for p in proxy_pool if precheck_proxy_fast(p)]
+                px = random.choice(available_candidates) if available_candidates else None
+                if px:
+                    trace_logs.append(f"Proxy [Random Pool + Pre-Check]: {px.split('@')[-1]}")
         else:
             trace_logs.append("Proxy Engine: Disabled or Direct Connection.")
 
@@ -1055,11 +1081,9 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, 
             trace_logs.append("Proxy Mode: Fallback enabled (will try direct if proxy fails).")
 
         for current_px in proxies_to_try:
-            if current_px:
-                p_info = parse_proxy(current_px)
-                if p_info and not is_proxy_alive(p_info["host"], p_info["port"], timeout=2.0):
-                    trace_logs.append(f"Proxy {p_info['host']}:{p_info['port']} failed pre-flight TCP check. Skipping.")
-                    continue
+            if current_px and not precheck_proxy_fast(current_px):
+                trace_logs.append(f"Proxy failed fast health check / circuit breaker. Skipping.")
+                continue
 
             for server in conf.get("imap", [])[:3]:
                 trace_logs.append(f"Attempting IMAP Protocol -> Host: {server}:993 (Proxy: {bool(current_px)})")
