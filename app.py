@@ -98,6 +98,8 @@ cache_lock = threading.Lock()
 proxy_lock = threading.Lock()
 file_write_lock = threading.Lock()
 bad_proxies = set()
+consecutive_proxy_failures = defaultdict(int)
+circuit_breaker_until = {}
 
 # --- Automatic Streamlit Secrets-to-Env Bridge ---
 def _secret_to_env(k, v):
@@ -308,8 +310,10 @@ def test_single_proxy(proxy_str):
         m = proxy_meta[proxy_str]
         if test_success:
             m["success"] = m.get("success", 0) + 1
+            consecutive_proxy_failures[proxy_str] = 0
         else:
             m["fails"] = m.get("fails", 0) + 1
+            consecutive_proxy_failures[proxy_str] += 1
         m["score"] = compute_real_score(m.get("success", 0), m.get("fails", 0), initial_latency_score=initial_score)
         m["country"] = country
         m["region"] = region
@@ -470,9 +474,12 @@ def get_filtered_active_proxies():
     mode = CFG.get("POOL_MODE", "all")
     chosen_countries = CFG.get("SELECTED_COUNTRIES", [])
     chosen_mix = CFG.get("SELECTED_MIX_COUNTRIES", [])
+    now = time.time()
 
     for p in raw:
         if p in bad_proxies:
+            continue
+        if p in circuit_breaker_until and now < circuit_breaker_until[p]:
             continue
         meta = proxy_meta.get(p, {})
         score = meta.get("score", 50)
@@ -801,6 +808,9 @@ def get_servers(email):
             return PROVIDER_MAP[domain]
 
         mx = get_mx_hosts(domain)
+        if dns and not mx:
+            return {"imap": [], "pop3": [], "type": "invalid_domain"}
+
         servers = {"imap": [], "pop3": []}
         for m in mx:
             if "google" in m or "gmail" in m:
@@ -875,20 +885,38 @@ def ssl_wrap(sock, host, insecure=False):
 
 def classify_error(err, domain=""):
     try:
-        err = (err or "").lower()
-        if domain in ZERO_ACCESS_PROVIDERS or any(k in err for k in ["zero-access", "bridge", "local connection"]):
-            return "need_app_password"
-        if "basic authentication is disabled" in err:
-            return "need_app_password"
-        if any(keyword in err for keyword in ["application-specific password", "app password", "two-factor", "mfa", "web login"]):
-            return "need_app_password"
-        if any(x in err for x in ["authentication failed", "login failed", "invalid credentials", "auth failed", "invalid login", "bad username", "command error", "logon failure", "-err [auth]", "no [authenticationfailed]"]):
-            return "need_app_password" if domain in PUBLIC_PROVIDERS else "wrong_password"
-        if any(x in err for x in ["gaierror", "timed out", "timeout", "connection refused", "network is unreachable", "name or service not known", "proxy connect failed"]):
+        err_str = str(err).lower()
+        if any(x in err_str for x in ["proxy connect failed", "timed out", "timeout", "connection refused", "network is unreachable", "name or service not known", "gaierror", "sockatmark", "reset by peer", "broken pipe"]):
             return "connection_failed"
+        if domain in ZERO_ACCESS_PROVIDERS or any(k in err_str for k in ["zero-access", "bridge", "local connection"]):
+            return "need_app_password"
+        if "basic authentication is disabled" in err_str:
+            return "need_app_password"
+        if any(keyword in err_str for keyword in ["application-specific password", "app password", "two-factor", "mfa", "web login"]):
+            return "need_app_password"
+        if any(x in err_str for x in ["authentication failed", "login failed", "invalid credentials", "auth failed", "invalid login", "bad username", "command error", "logon failure", "-err [auth]", "no [authenticationfailed]"]):
+            return "need_app_password" if domain in PUBLIC_PROVIDERS else "wrong_password"
     except Exception:
         pass
     return "connection_failed"
+
+def record_proxy_attempt(proxy_str, success, is_network_error=False):
+    if not proxy_str:
+        return
+    with proxy_lock:
+        if proxy_str not in proxy_meta:
+            proxy_meta[proxy_str] = {"fails": 0, "success": 0, "country": "Unknown", "region": "Unknown", "latency_ms": 0}
+        m = proxy_meta[proxy_str]
+        if success:
+            m["success"] = m.get("success", 0) + 1
+            consecutive_proxy_failures[proxy_str] = 0
+        else:
+            m["fails"] = m.get("fails", 0) + 1
+            if is_network_error:
+                consecutive_proxy_failures[proxy_str] += 1
+                if consecutive_proxy_failures[proxy_str] >= 3:
+                    circuit_breaker_until[proxy_str] = time.time() + 60.0
+        m["score"] = compute_real_score(m.get("success", 0), m.get("fails", 0))
 
 def imap_once(email, password, server, proxy_str=None, insecure=False):
     class PIMAP(imaplib.IMAP4_SSL):
@@ -998,6 +1026,9 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, 
         if conf.get("type") == "zero_access":
             trace_logs.append("Architecture: Zero-Access / Bridge detected.")
             return None, "need_app_password", "Zero-Access Architecture | Protocol: Local API / Bridge", None, trace_logs
+        if conf.get("type") == "invalid_domain":
+            trace_logs.append("DNS/MX Pre-check: Fast-fail domain has no valid MX records.")
+            return None, "connection_failed", "Fast-Fail: No MX records found", None, trace_logs
 
         proxy_mode = CFG.get("PROXY_MODE", "aggressive")
         prefer_insecure = CFG.get("ALLOW_SELF_SIGNED", True)
@@ -1005,7 +1036,7 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, 
         px = None
         if proxy_pool and proxy_mode != "off":
             if proxy_mode == "sticky":
-                if not thread_state.get("sticky_proxy"):
+                if not thread_state.get("sticky_proxy") or thread_state.get("sticky_proxy") in bad_proxies:
                     thread_state["sticky_proxy"] = random.choice(proxy_pool)
                 px = thread_state["sticky_proxy"]
                 trace_logs.append(f"Proxy [Sticky Mode]: {px.split('@')[-1]}")
@@ -1025,10 +1056,13 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, 
                 trace_logs.append(f"Attempting IMAP Protocol -> Host: {server}:993 (Proxy: {bool(current_px)})")
                 try:
                     imap_once(email, password, server, current_px, insecure=prefer_insecure)
+                    record_proxy_attempt(current_px, success=True)
                     trace_logs.append(f"-> SUCCESS: IMAP authenticated successfully on {server}")
                     return server, "valid", f"IMAP | Host: {server} | Port: 993", current_px, trace_logs
                 except Exception as e:
                     st_val = classify_error(str(e), domain)
+                    is_net = (st_val == "connection_failed")
+                    record_proxy_attempt(current_px, success=False, is_network_error=is_net)
                     trace_logs.append(f"-> FAILED IMAP on {server}: {str(e)[:50]} [Classified: {st_val}]")
                     if st_val in ("wrong_password", "need_app_password"):
                         return None, st_val, f"IMAP {server} -> {st_val}", current_px, trace_logs
@@ -1037,10 +1071,13 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, 
                 trace_logs.append(f"Attempting POP3 Protocol -> Host: {server}:995 (Proxy: {bool(current_px)})")
                 try:
                     pop_once(email, password, server, current_px, insecure=prefer_insecure)
+                    record_proxy_attempt(current_px, success=True)
                     trace_logs.append(f"-> SUCCESS: POP3 authenticated successfully on {server}")
                     return server, "valid", f"POP3 | Host: {server} | Port: 995", current_px, trace_logs
                 except Exception as e:
                     st_val = classify_error(str(e), domain)
+                    is_net = (st_val == "connection_failed")
+                    record_proxy_attempt(current_px, success=False, is_network_error=is_net)
                     trace_logs.append(f"-> FAILED POP3 on {server}: {str(e)[:50]} [Classified: {st_val}]")
                     if st_val in ("wrong_password", "need_app_password"):
                         return None, st_val, f"POP3 {server} -> {st_val}", current_px, trace_logs
