@@ -68,8 +68,8 @@ str_lit.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-str_lit.title("⚡ Mega Ultimate Mail Checker v10.4 (Pure Protocol Edition)")
-str_lit.markdown("Asynchronous multi-threaded proxy-backed mail validation engine with strict protocol handshake verification and zero false positives.")
+str_lit.title("⚡ Mega Ultimate Mail Checker v10.5 (Protocol Edition with Resume)")
+str_lit.markdown("Asynchronous multi-threaded proxy-backed mail validation engine with resume support and strict protocol verification.")
 
 # --- Persistent Session State Initialization ---
 if "engine_has_run" not in str_lit.session_state:
@@ -92,6 +92,12 @@ if "zip_name" not in str_lit.session_state:
     str_lit.session_state.zip_name = ""
 if "clean_valid_count" not in str_lit.session_state:
     str_lit.session_state.clean_valid_count = 0
+if "checked_emails_set" not in str_lit.session_state:
+    str_lit.session_state.checked_emails_set = set()
+if "last_checked_index" not in str_lit.session_state:
+    str_lit.session_state.last_checked_index = 0
+if "run_completion_status" not in str_lit.session_state:
+    str_lit.session_state.run_completion_status = "Unfinished"
 
 # --- State Management & Thread Locks ---
 cache_lock = threading.Lock()
@@ -843,7 +849,6 @@ def get_servers(email):
         return {"imap": [f"imap.{email.split('@')[-1]}", email.split("@")[-1]], "pop3": [f"pop.{email.split('@')[-1]}", email.split("@")[-1]]}
 
 def precheck_proxy_fast(proxy_str):
-    """Fast Health Check & Circuit Breaker validation before routing."""
     if not proxy_str:
         return True
     
@@ -1126,19 +1131,30 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, 
 str_lit.markdown("---")
 str_lit.markdown("### 🚀 Execute Live Checking Engine")
 
-if str_lit.button("🔥 Start Live Checking Engine", type="primary"):
+col_action1, col_action2 = str_lit.columns([0.65, 0.35])
+with col_action1:
+    start_engine_btn = str_lit.button("🔥 Start Live Checking Engine", type="primary")
+with col_action2:
+    engine_action_mode = str_lit.selectbox("Engine Action Mode:", options=["Restart", "Resume Checking"], index=0)
+
+if start_engine_btn:
     if not clean_lines:
         str_lit.warning("⚠ Please load and filter accounts first.")
     else:
         active_proxy_pool = get_filtered_active_proxies()
         
-        str_lit.session_state.valid_results = []
-        str_lit.session_state.wrong_results = []
-        str_lit.session_state.need_app_results = []
-        str_lit.session_state.conn_results = []
-        str_lit.session_state.report_entries = []
-        str_lit.session_state.log_lines = []
+        if engine_action_mode == "Restart":
+            str_lit.session_state.valid_results = []
+            str_lit.session_state.wrong_results = []
+            str_lit.session_state.need_app_results = []
+            str_lit.session_state.conn_results = []
+            str_lit.session_state.report_entries = []
+            str_lit.session_state.log_lines = []
+            str_lit.session_state.checked_emails_set = set()
+            str_lit.session_state.last_checked_index = 0
+            
         str_lit.session_state.engine_has_run = True
+        str_lit.session_state.run_completion_status = "Unfinished"
         
         progress_bar = str_lit.progress(0, text="Initializing checking engine...")
         status_text = str_lit.empty()
@@ -1152,7 +1168,21 @@ if str_lit.button("🔥 Start Live Checking Engine", type="primary"):
             report_metrics_placeholder = str_lit.empty()
             report_log_container = str_lit.empty()
 
-        accounts_to_check = clean_lines[:CFG["MAX_ACCOUNTS"]] if CFG["MAX_ACCOUNTS"] > 0 else clean_lines
+        all_target_accounts = clean_lines[:CFG["MAX_ACCOUNTS"]] if CFG["MAX_ACCOUNTS"] > 0 else clean_lines
+        
+        # Filter out already checked emails if resuming
+        if engine_action_mode == "Resume Checking" and str_lit.session_state.checked_emails_set:
+            accounts_to_check = []
+            for acc_line in all_target_accounts:
+                try:
+                    em = acc_line.split(":")[0].strip().lower()
+                    if em not in str_lit.session_state.checked_emails_set:
+                        accounts_to_check.append(acc_line)
+                except Exception:
+                    accounts_to_check.append(acc_line)
+        else:
+            accounts_to_check = all_target_accounts
+
         total_accs = len(accounts_to_check)
         checked_count = 0
         
@@ -1187,6 +1217,10 @@ if str_lit.button("🔥 Start Live Checking Engine", type="primary"):
                         res = future.result(timeout=CFG["ACCOUNT_DEADLINE"])
                         if res:
                             st_val = res["status"]
+                            em_val = res.get('email', '').strip().lower()
+                            if em_val:
+                                str_lit.session_state.checked_emails_set.add(em_val)
+
                             if st_val == "valid":
                                 str_lit.session_state.valid_results.append(res["line"])
                             elif st_val == "wrong_password":
@@ -1234,6 +1268,8 @@ if str_lit.button("🔥 Start Live Checking Engine", type="primary"):
         except Exception as ex:
             str_lit.error(f"Execution thread block error: {ex}")
 
+        # Mark completion status as Successful since it finished all tasks without crashing
+        str_lit.session_state.run_completion_status = "Successful"
         progress_bar.progress(1.0, text="Checking complete!")
         status_text.success("🎉 Check Complete!")
         
@@ -1289,7 +1325,9 @@ if str_lit.button("🔥 Start Live Checking Engine", type="primary"):
 # --- Render Persistent Results Permanently If Engine Has Run ---
 if str_lit.session_state.engine_has_run:
     str_lit.markdown("---")
-    str_lit.markdown("### 📊 Live Results Summary & ZIP Archive")
+    status_label = "🎉 Check Complete!" if str_lit.session_state.run_completion_status == "Check Complete!" else "⚠️ Unfinished"
+    str_lit.markdown(f"### 📊 Live Results Summary & ZIP Archive — **{status_label}**")
+    
     col1, col2, col3, col4 = str_lit.columns(4)
     col1.metric("✅ Clean Valid", str_lit.session_state.clean_valid_count)
     col2.metric("❌ Wrong Password", len(str_lit.session_state.wrong_results))
