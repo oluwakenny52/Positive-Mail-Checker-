@@ -236,9 +236,9 @@ def compute_real_score(success_count, fail_count, initial_latency_score=80):
     score = int(success_rate - (fail_count * 5))
     return max(0, min(100, score))
 
-def is_proxy_alive(proxy_ip, proxy_port, timeout=3):
+def is_proxy_alive(proxy_host, proxy_port, timeout=2):
     try:
-        with socket.create_connection((proxy_ip, int(proxy_port)), timeout=timeout):
+        with socket.create_connection((proxy_host, int(proxy_port)), timeout=timeout):
             return True
     except (socket.timeout, socket.error):
         return False
@@ -852,6 +852,9 @@ def proxy_connect(host, port, proxy_str, timeout=None):
     info = parse_proxy(proxy_str)
     if not info or not SOCKS_OK: raise RuntimeError("bad proxy format or socks unavailable")
 
+    if not is_proxy_alive(info["host"], info["port"], timeout=2):
+        raise RuntimeError("proxy connect failed")
+
     sock = None
     for ptype in (socks.SOCKS5, socks.HTTP):
         try:
@@ -1052,6 +1055,12 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, 
             trace_logs.append("Proxy Mode: Fallback enabled (will try direct if proxy fails).")
 
         for current_px in proxies_to_try:
+            if current_px:
+                p_info = parse_proxy(current_px)
+                if p_info and not is_proxy_alive(p_info["host"], p_info["port"], timeout=2):
+                    trace_logs.append(f"Proxy {p_info['host']}:{p_info['port']} is dead. Skipping.")
+                    continue
+
             for server in conf.get("imap", [])[:3]:
                 trace_logs.append(f"Attempting IMAP Protocol -> Host: {server}:993 (Proxy: {bool(current_px)})")
                 try:
