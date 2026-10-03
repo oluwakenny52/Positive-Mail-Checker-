@@ -80,8 +80,8 @@ str_lit.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-str_lit.title("⚡ Mega Ultimate Mail Checker v11.0 (Dynamic Controls & Filtering Edition)")
-str_lit.markdown("Asynchronous multi-threaded proxy-backed mail validation engine with custom domain rules and dynamic worker auto-scaling.")
+str_lit.title("⚡ Mega Ultimate Mail Checker v11.1 (Fixed & Hardened Edition)")
+str_lit.markdown("Asynchronous multi-threaded proxy-backed mail validation engine with robust socket cleanup, DNS pre-filtering, and dynamic worker auto-scaling.")
 
 # --- Persistent Session State Initialization ---
 if "engine_has_run" not in str_lit.session_state:
@@ -610,7 +610,7 @@ def get_filtered_active_proxies():
 all_proxies = load_proxies()
 filtered_pool = get_filtered_active_proxies()
 
-# --- 🖥️ NEW SCREEN: Startup & Under-The-Hood Display Panel ---
+# --- 🖥️ Startup & Under-The-Hood Display Panel ---
 str_lit.markdown("---")
 str_lit.markdown("### 🖥️ Startup & Under-The-Hood Display Panel")
 str_lit.markdown("Real-time inspection of app entries, startup parameters, proxy pools, and background engine diagnostic checks.")
@@ -795,6 +795,39 @@ def is_disposable(email):
     except Exception:
         return False
 
+def check_domain_resolvable(domain):
+    """Audits and caches domain resolution status to filter out dead/mistyped domains natively."""
+    with cache_lock:
+        if domain in domain_cache and "resolvable" in domain_cache[domain]:
+            return domain_cache[domain]["resolvable"]
+
+    resolvable = False
+    try:
+        if dns:
+            try:
+                answers = dns.resolver.resolve(domain, "MX")
+                if answers:
+                    resolvable = True
+            except Exception:
+                try:
+                    answers = dns.resolver.resolve(domain, "A")
+                    if answers:
+                        resolvable = True
+                except Exception:
+                    pass
+        if not resolvable:
+            socket.gethostbyname(domain)
+            resolvable = True
+    except Exception:
+        resolvable = False
+
+    with cache_lock:
+        if domain not in domain_cache:
+            domain_cache[domain] = {}
+        domain_cache[domain]["resolvable"] = resolvable
+    save_domain_cache()
+    return resolvable
+
 def load_previous_valid():
     seen = set()
     try:
@@ -820,7 +853,7 @@ def load_previous_valid():
     return seen
 
 def process_accounts(text, previous_valid):
-    lines, skipped_disp, skipped_typo, skipped_resume, skipped_app_skip, skipped_bad, skipped_custom = [], 0, 0, 0, 0, 0, 0
+    lines, skipped_disp, skipped_typo, skipped_resume, skipped_app_skip, skipped_bad, skipped_custom, skipped_dns = [], 0, 0, 0, 0, 0, 0, 0
     whitelist = CFG.get("CUSTOM_WHITELIST", [])
     blacklist = CFG.get("CUSTOM_BLACKLIST", [])
 
@@ -863,6 +896,12 @@ def process_accounts(text, previous_valid):
             if ".." in email or email.count("@") != 1:
                 skipped_bad += 1
                 continue
+            
+            # Audit and filter dead or unresolvable domains (Fixes DNS & Host Resolution Errors)
+            if not check_domain_resolvable(domain):
+                skipped_dns += 1
+                continue
+
             lines.append(f"{email}:{password}")
     except Exception as e:
         log_startup(f"WARNING: Error processing accounts input: {e}")
@@ -877,8 +916,8 @@ def process_accounts(text, previous_valid):
         except Exception:
             continue
 
-    log_startup(f"Processed account input. Clean valid count ready: {len(clean)}")
-    return clean, skipped_disp, skipped_typo, skipped_resume, skipped_app_skip, skipped_bad, skipped_custom
+    log_startup(f"Processed account input. Clean valid count ready: {len(clean)} (Filtered DNS failures: {skipped_dns})")
+    return clean, skipped_disp, skipped_typo, skipped_resume, skipped_app_skip, skipped_bad, skipped_custom, skipped_dns
 
 # --- Main Input Section ---
 str_lit.markdown("---")
@@ -917,15 +956,16 @@ with input_tab2:
 clean_lines = []
 if raw_text:
     previous_valid = load_previous_valid()
-    clean_lines, disp, typo, resume, app_skip, bad, custom_skipped = process_accounts(raw_text, previous_valid)
+    clean_lines, disp, typo, resume, app_skip, bad, custom_skipped, dns_skipped = process_accounts(raw_text, previous_valid)
     
-    col_m1, col_m2, col_m3, col_m4, col_m5, col_m6 = str_lit.columns(6)
+    col_m1, col_m2, col_m3, col_m4, col_m5, col_m6, col_m7 = str_lit.columns(7)
     col_m1.metric("Ready to Check", len(clean_lines))
-    col_m2.metric("Disposables Dropped", disp)
-    col_m3.metric("Typos Dropped", typo)
+    col_m2.metric("Disposables", disp)
+    col_m3.metric("Typos", typo)
     col_m4.metric("Resume Skipped", resume)
     col_m5.metric("App-Skipped", app_skip)
     col_m6.metric("Custom Filtered", custom_skipped)
+    col_m7.metric("DNS Failed", dns_skipped)
 
 # --- Checking Protocol Functions ---
 PROVIDER_MAP = {
@@ -959,7 +999,7 @@ def get_servers(email):
             return {"imap": [], "pop3": [], "type": "zero_access"}
         
         with cache_lock:
-            if domain in domain_cache:
+            if domain in domain_cache and "imap" in domain_cache[domain]:
                 return domain_cache[domain]
                 
         if domain in PROVIDER_MAP:
@@ -989,7 +1029,10 @@ def get_servers(email):
         servers["pop3"] = list(dict.fromkeys(servers["pop3"]))
         
         with cache_lock:
-            domain_cache[domain] = servers
+            if domain not in domain_cache:
+                domain_cache[domain] = {}
+            domain_cache[domain]["imap"] = servers["imap"]
+            domain_cache[domain]["pop3"] = servers["pop3"]
         save_domain_cache()
         return servers
     except Exception as e:
@@ -1073,14 +1116,27 @@ def proxy_connect(host, port, proxy_str, timeout=None):
     raise RuntimeError("proxy connect failed")
 
 def ssl_wrap(sock, host, insecure=False):
+    """Hardened SSL wrapper preventing socket leaks and Bad file descriptor errors."""
+    if sock is None:
+        raise RuntimeError("SSL wrap failed completely: socket is None")
+    
+    ctx = ssl._create_unverified_context() if (insecure or CFG.get("ALLOW_SELF_SIGNED")) else ssl.create_default_context()
+    
+    # Ensure socket file descriptor is valid before wrapping
     try:
-        ctx = ssl._create_unverified_context() if (insecure or CFG.get("ALLOW_SELF_SIGNED")) else ssl.create_default_context()
+        fileno = sock.fileno()
+        if fileno < 0:
+            raise ValueError("Invalid socket file descriptor")
+    except Exception as fd_err:
+        raise RuntimeError(f"SSL wrap failed completely: [Errno 9] Bad file descriptor ({fd_err})")
+
+    try:
         return ctx.wrap_socket(sock, server_hostname=host)
     except Exception as e:
         warnings.warn(f"Standard SSL wrap failed, falling back to unverified context: {e}")
         try:
-            ctx = ssl._create_unverified_context()
-            return ctx.wrap_socket(sock, server_hostname=host)
+            ctx_unverified = ssl._create_unverified_context()
+            return ctx_unverified.wrap_socket(sock, server_hostname=host)
         except Exception as inner_e:
             if sock:
                 try: 
@@ -1698,7 +1754,7 @@ else:
                 imap_hosts = conf_servers.get("imap", [])
                 
                 if not imap_hosts:
-                    str_lit.error("No IMAP host available for this provider domain.")
+                    str_lit.error("No IMAP host available for this provider domain name.")
                 else:
                     with str_lit.spinner(f"Connecting to IMAP and fetching inbox for {acc_email}..."):
                         success_read = False
