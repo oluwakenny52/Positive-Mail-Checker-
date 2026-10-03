@@ -836,9 +836,24 @@ def get_servers(email):
                 servers["imap"].append(m)
                 servers["pop3"].append(m)
 
-        # Prioritize mail.{domain} right at the top for generic domain patterns
-        servers["imap"].extend([f"mail.{domain}", f"imap.{domain}", domain])
-        servers["pop3"].extend([f"mail.{domain}", f"pop.{domain}", domain])
+        # Added requested server patterns (imap, pop3, mail, inbound, mx, secure, etc.)
+        servers["imap"].extend([
+            f"mail.{domain}", 
+            f"imap.{domain}", 
+            f"inbound.{domain}", 
+            f"secure.{domain}", 
+            f"mx.{domain}", 
+            f"mx1.{domain}", 
+            f"mx2.{domain}", 
+            domain
+        ])
+        servers["pop3"].extend([
+            f"mail.{domain}", 
+            f"pop.{domain}", 
+            f"pop3.{domain}", 
+            f"secure.{domain}", 
+            domain
+        ])
         
         servers["imap"] = list(dict.fromkeys(servers["imap"]))
         servers["pop3"] = list(dict.fromkeys(servers["pop3"]))
@@ -848,7 +863,11 @@ def get_servers(email):
         save_domain_cache()
         return servers
     except Exception:
-        return {"imap": [f"mail.{email.split('@')[-1]}", f"imap.{email.split('@')[-1]}", email.split("@")[-1]], "pop3": [f"mail.{email.split('@')[-1]}", f"pop.{email.split('@')[-1]}", email.split("@")[-1]}
+        d = email.split('@')[-1]
+        return {
+            "imap": [f"mail.{d}", f"imap.{d}", f"inbound.{d}", f"secure.{d}", f"mx.{d}", d], 
+            "pop3": [f"mail.{d}", f"pop.{d}", f"pop3.{d}", f"secure.{d}", d]
+        }
 
 def precheck_proxy_fast(proxy_str):
     if not proxy_str:
@@ -1088,7 +1107,7 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, 
                 trace_logs.append(f"Proxy failed fast health check / circuit breaker. Skipping.")
                 continue
 
-            for server in conf.get("imap", [])[:4]:
+            for server in conf.get("imap", [])[:5]:
                 trace_logs.append(f"Attempting IMAP Protocol -> Host: {server}:993 (Proxy: {bool(current_px)})")
                 try:
                     imap_once(email, password, server, current_px, insecure=prefer_insecure)
@@ -1103,7 +1122,7 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, 
                     if st_val in ("wrong_password", "need_app_password"):
                         return None, st_val, f"IMAP {server} -> {st_val}", current_px, trace_logs
 
-            for server in conf.get("pop3", [])[:4]:
+            for server in conf.get("pop3", [])[:5]:
                 trace_logs.append(f"Attempting POP3 Protocol -> Host: {server}:995 (Proxy: {bool(current_px)})")
                 try:
                     pop_once(email, password, server, current_px, insecure=prefer_insecure)
