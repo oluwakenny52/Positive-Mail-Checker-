@@ -848,7 +848,7 @@ def get_servers(email):
         save_domain_cache()
         return servers
     except Exception:
-        return {"imap": [f"mail.{email.split('@')[-1]}", f"imap.{email.split('@')[-1]}", email.split("@")[-1]], "pop3": [f"mail.{email.split('@')[-1]}", f"pop.{email.split('@')[-1]}", email.split("@")[-1]]}
+        return {"imap": [f"mail.{email.split('@')[-1]}", f"imap.{email.split('@')[-1]}", email.split("@")[-1]], "pop3": [f"mail.{email.split('@')[-1]}", f"pop.{email.split('@')[-1]}", email.split("@")[-1]}
 
 def precheck_proxy_fast(proxy_str):
     if not proxy_str:
@@ -946,8 +946,9 @@ def record_proxy_attempt(proxy_str, success, is_network_error=False):
             m["fails"] = m.get("fails", 0) + 1
             if is_network_error:
                 consecutive_proxy_failures[proxy_str] += 1
-                if consecutive_proxy_failures[proxy_str] >= 3:
-                    circuit_breaker_until[proxy_str] = time.time() + 60.0
+                # FIXED: Relaxed proxy failure threshold from 3 to 6 to prevent premature circuit-breaker blocks on flaky network nodes
+                if consecutive_proxy_failures[proxy_str] >= 6:
+                    circuit_breaker_until[proxy_str] = time.time() + 30.0
         m["score"] = compute_real_score(m.get("success", 0), m.get("fails", 0))
 
 def imap_once(email, password, server, proxy_str=None, insecure=False):
@@ -956,10 +957,8 @@ def imap_once(email, password, server, proxy_str=None, insecure=False):
             raw = proxy_connect(host, port, proxy_str) if proxy_str else socket.create_connection((host, port), timeout=timeout)
             raw.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
             self.sock = ssl_wrap(raw, host, insecure=insecure)
-            try:
-                self.file = self.sock.makefile("rb")
-            except Exception:
-                pass
+            # FIXED: Removed manual `self.file = self.sock.makefile("rb")` overriding 
+            # which caused Python's built-in imaplib to throw `Unknown IMAP4 command: '_file'`.
     mail = PIMAP(server, timeout=CFG["TIMEOUT"])
     mail.login(email, password)
     try:
@@ -996,10 +995,7 @@ def verify_and_connect(target_email, target_pass, hosts, proxy_str=None):
                     raw = proxy_connect(host, port, proxy_str) if proxy_str else socket.create_connection((host, port), timeout=timeout)
                     raw.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
                     self.sock = ssl_wrap(raw, host, insecure=True)
-                    try:
-                        self.file = self.sock.makefile("rb")
-                    except Exception:
-                        pass
+                    # FIXED: Removed manual `self.file` override here as well to prevent IMAP protocol stream corruption.
             mail = PIMAPVerify(h, timeout=10)
             mail.login(target_email, target_pass)
             return True, mail, h
