@@ -52,6 +52,18 @@ def load_valid_accounts():
 def guess_imap_server(email_addr):
     try:
         domain = email_addr.split("@")[-1].lower()
+        
+        # Explicit Provider Configurations for custom and major hosts
+        PROVIDER_CONFIGS = {
+            "mideon.nir.jp": {
+                "imap_host": "imap.cyberhome.ne.jp",
+                "imap_port": 993,
+            }
+        }
+        
+        if domain in PROVIDER_CONFIGS:
+            return PROVIDER_CONFIGS[domain]["imap_host"]
+            
         mapping = {
             "gmail.com": "imap.gmail.com",
             "googlemail.com": "imap.gmail.com",
@@ -70,6 +82,15 @@ def guess_imap_server(email_addr):
 def get_webmail_portal_url(email_addr):
     try:
         domain = email_addr.split("@")[-1].lower()
+        
+        # Explicit Portal URL Configurations
+        PORTAL_CONFIGS = {
+            "mideon.nir.jp": "https://wmail.cyberhome.ne.jp"
+        }
+        
+        if domain in PORTAL_CONFIGS:
+            return PORTAL_CONFIGS[domain]
+            
         mapping = {
             "gmail.com": "https://mail.google.com",
             "googlemail.com": "https://mail.google.com",
@@ -103,6 +124,10 @@ custom_pass = st.sidebar.text_input("Or enter custom password", type="password",
 target_email = custom_email.strip() if custom_email.strip() else (selected_account.split(":")[0] if ":" in selected_account else "")
 target_pass = custom_pass.strip() if custom_pass.strip() else (selected_account.split(":")[1] if ":" in selected_account else "")
 
+# Sync session state with target inputs so other modules or background checks can reuse them
+st.session_state['email'] = target_email
+st.session_state['password'] = target_pass
+
 server_host = st.sidebar.text_input("IMAP Server Host (Leave blank for auto-detect)", value="", key="mb_server_host")
 search_keyword = st.sidebar.text_input("Keyword Filter (Optional)", value="", placeholder="e.g. Netflix, Reset, Code", key="mb_search_keyword")
 max_msgs = st.sidebar.slider("Max Messages to Fetch", min_value=1, max_value=50, value=10, key="mb_max_msgs")
@@ -128,9 +153,11 @@ if target_email:
 
 if connect_pressed:
     if not target_email or not target_pass:
-        st.warning("⚠️ Please select or enter a valid email and password.")
+        st.warning("⚠️️ Please select or enter a valid email and password.")
     else:
         host = server_host.strip() if server_host.strip() else guess_imap_server(target_email)
+        st.session_state['imap_host'] = host
+        
         st.info(f"Connecting to IMAP server **{host}:993** for **{target_email}**...")
         
         try:
