@@ -915,7 +915,8 @@ def load_previous_valid():
     return seen
 
 def process_accounts(text, previous_valid):
-    lines, skipped_disp, skipped_typo, skipped_resume, skipped_app_skip, skipped_bad, skipped_custom, skipped_dns = [], 0, 0, 0, 0, 0, 0, 0
+    lines = []
+    disp_list, typo_list, resume_list, app_skip_list, custom_list, dns_fail_list = [], [], [], [], [], []
     whitelist = CFG.get("CUSTOM_WHITELIST", [])
     blacklist = CFG.get("CUSTOM_BLACKLIST", [])
 
@@ -925,48 +926,43 @@ def process_accounts(text, previous_valid):
             if not line or line.startswith("#"):
                 continue
             if ":" not in line:
-                skipped_bad += 1
                 continue
             parts = line.split(":", 1)
             email = parts[0].strip().lower()
             password = parts[1].strip() if len(parts) > 1 else ""
 
             if not email or "@" not in email or not password:
-                skipped_bad += 1
                 continue
                 
-            # Fast-fail syntax check
             if CFG.get("FAST_MODE", True) and not EMAIL_REGEX.match(email):
-                skipped_bad += 1
                 continue
 
             domain = email.split("@")[-1].lower()
 
             if whitelist and domain not in whitelist:
-                skipped_custom += 1
+                custom_list.append(line)
                 continue
             if blacklist and domain in blacklist:
-                skipped_custom += 1
+                custom_list.append(line)
                 continue
 
             if CFG.get("SKIP_STRICT_APP_PROVIDERS", False) and domain in STRICT_APP_PROVIDERS:
-                skipped_app_skip += 1
+                app_skip_list.append(line)
                 continue
             if is_disposable(email):
-                skipped_disp += 1
+                disp_list.append(line)
                 continue
             if domain in COMMON_TYPOS:
-                skipped_typo += 1
+                typo_list.append(line)
                 continue
             if email in previous_valid:
-                skipped_resume += 1
+                resume_list.append(line)
                 continue
             if ".." in email or email.count("@") != 1:
-                skipped_bad += 1
                 continue
             
             if not check_domain_resolvable(domain):
-                skipped_dns += 1
+                dns_fail_list.append(line)
                 continue
 
             lines.append(f"{email}:{password}")
@@ -983,8 +979,8 @@ def process_accounts(text, previous_valid):
         except Exception:
             continue
 
-    log_startup(f"Processed account input. Clean valid count ready: {len(clean)} (Filtered DNS failures: {skipped_dns})")
-    return clean, skipped_disp, skipped_typo, skipped_resume, skipped_app_skip, skipped_bad, skipped_custom, skipped_dns
+    log_startup(f"Processed account input. Clean valid count ready: {len(clean)} (Filtered DNS failures: {len(dns_fail_list)})")
+    return clean, disp_list, typo_list, resume_list, app_skip_list, custom_list, dns_fail_list
 
 # --- Main Input Section ---
 str_lit.markdown("---")
@@ -1021,18 +1017,51 @@ with input_tab2:
             raw_text = ""
 
 clean_lines = []
+disp, typo, resume, app_skip, custom_skipped, dns_skipped = [], [], [], [], [], []
 if raw_text:
     previous_valid = load_previous_valid()
-    clean_lines, disp, typo, resume, app_skip, bad, custom_skipped, dns_skipped = process_accounts(raw_text, previous_valid)
+    clean_lines, disp, typo, resume, app_skip, custom_skipped, dns_skipped = process_accounts(raw_text, previous_valid)
     
     col_m1, col_m2, col_m3, col_m4, col_m5, col_m6, col_m7 = str_lit.columns(7)
     col_m1.metric("Ready to Check", len(clean_lines))
-    col_m2.metric("Disposables", disp)
-    col_m3.metric("Typos", typo)
-    col_m4.metric("Resume Skipped", resume)
-    col_m5.metric("App-Skipped", app_skip)
-    col_m6.metric("Custom Filtered", custom_skipped)
-    col_m7.metric("DNS Failed", dns_skipped)
+    col_m2.metric("Disposables", len(disp))
+    col_m3.metric("Typos", len(typo))
+    col_m4.metric("Resume Skipped", len(resume))
+    col_m5.metric("App-Skipped", len(app_skip))
+    col_m6.metric("Custom Filtered", len(custom_skipped))
+    col_m7.metric("DNS Failed", len(dns_skipped))
+
+    # --- Dropdown Inspector for Filtered Categories ---
+    str_lit.markdown("#### 🔍 Filter Categories Content Inspector")
+    filter_category_choice = str_lit.selectbox(
+        "Select category to inspect contents:",
+        options=[
+            "Ready to Check",
+            "Disposables",
+            "Typos",
+            "Resume Skipped",
+            "App-Skipped",
+            "Custom Filtered",
+            "DNS Failed"
+        ]
+    )
+
+    category_map = {
+        "Ready to Check": clean_lines,
+        "Disposables": disp,
+        "Typos": typo,
+        "Resume Skipped": resume,
+        "App-Skipped": app_skip,
+        "Custom Filtered": custom_skipped,
+        "DNS Failed": dns_skipped
+    }
+
+    selected_list_items = category_map.get(filter_category_choice, [])
+    if selected_list_items:
+        str_lit.info(f"Showing **{len(selected_list_items)}** items for **{filter_category_choice}**:")
+        str_lit.code("\n".join(selected_list_items), language="text")
+    else:
+        str_lit.info(f"No items in **{filter_category_choice}**.")
 
 # --- Checking Protocol Functions (IMAP, POP, POP3 Pattern Integration) ---
 PROVIDER_MAP = {
@@ -1421,7 +1450,6 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, 
     if trace_logs is None:
         trace_logs = []
         
-    # Fast Mode failure domain blacklist short-circuit check
     if CFG.get("FAST_MODE", True):
         ts = failed_domain_cache.get(domain)
         cooldown_period = CFG.get("FAILURE_COOLDOWN", 60.0)
@@ -1531,7 +1559,6 @@ if start_engine_btn:
             str_lit.session_state.engine_has_run = True
             str_lit.session_state.run_completion_status = "Unfinished"
             
-            # --- Record Start Timestamp ---
             start_dt = datetime.now()
             str_lit.session_state.start_timestamp = start_dt.strftime("%Y-%m-%d %H:%M:%S")
             str_lit.session_state.end_timestamp = None
@@ -1674,7 +1701,6 @@ if start_engine_btn:
         except Exception as ex:
             str_lit.error(f"Execution thread block error: {ex}")
 
-        # --- Record End Timestamp & Duration ---
         end_dt = datetime.now()
         duration = end_dt - start_dt
 
