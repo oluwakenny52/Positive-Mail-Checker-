@@ -13,7 +13,7 @@ import time
 import warnings
 import glob
 import zipfile
-from datetime import datetime
+from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from urllib.parse import urlparse
 from collections import defaultdict
@@ -115,6 +115,12 @@ if "last_checked_index" not in str_lit.session_state:
     str_lit.session_state.last_checked_index = 0
 if "run_completion_status" not in str_lit.session_state:
     str_lit.session_state.run_completion_status = "Unfinished"
+if "start_timestamp" not in str_lit.session_state:
+    str_lit.session_state.start_timestamp = None
+if "end_timestamp" not in str_lit.session_state:
+    str_lit.session_state.end_timestamp = None
+if "total_duration" not in str_lit.session_state:
+    str_lit.session_state.total_duration = None
 
 def log_startup(msg):
     timestamp = datetime.now().strftime("%H:%M:%S.%f")[:-3]
@@ -1524,6 +1530,12 @@ if start_engine_btn:
                 
             str_lit.session_state.engine_has_run = True
             str_lit.session_state.run_completion_status = "Unfinished"
+            
+            # --- Record Start Timestamp ---
+            start_dt = datetime.now()
+            str_lit.session_state.start_timestamp = start_dt.strftime("%Y-%m-%d %H:%M:%S")
+            str_lit.session_state.end_timestamp = None
+            str_lit.session_state.total_duration = None
         
         progress_bar = str_lit.progress(0, text="Initializing checking engine...")
         status_text = str_lit.empty()
@@ -1662,16 +1674,23 @@ if start_engine_btn:
         except Exception as ex:
             str_lit.error(f"Execution thread block error: {ex}")
 
+        # --- Record End Timestamp & Duration ---
+        end_dt = datetime.now()
+        duration = end_dt - start_dt
+
         with session_state_lock:
             str_lit.session_state.run_completion_status = "Successful"
+            str_lit.session_state.end_timestamp = end_dt.strftime("%Y-%m-%d %H:%M:%S")
+            str_lit.session_state.total_duration = str(timedelta(seconds=int(duration.total_seconds())))
+            
             valid_snapshot = list(str_lit.session_state.valid_results)
             wrong_snapshot = list(str_lit.session_state.wrong_results)
             need_snapshot = list(str_lit.session_state.need_app_results)
             conn_snapshot = list(str_lit.session_state.conn_results)
 
         progress_bar.progress(1.0, text="Checking complete!")
-        status_text.success("🎉 Check Complete!")
-        log_startup("Live checking engine execution completed successfully.")
+        status_text.success(f"🎉 Check Complete! Started: {str_lit.session_state.start_timestamp} | Ended: {str_lit.session_state.end_timestamp} | Duration: {str_lit.session_state.total_duration}")
+        log_startup(f"Live checking engine execution completed successfully. Duration: {str_lit.session_state.total_duration}")
         
         try:
             stamp = datetime.now().strftime('%Y%m%d_%H%M%S')
@@ -1688,12 +1707,16 @@ if start_engine_btn:
             with file_write_lock:
                 try:
                     with open(valid_path, "w", encoding="utf-8") as f:
+                        f.write(f"# Started: {str_lit.session_state.start_timestamp} | Ended: {str_lit.session_state.end_timestamp} | Duration: {str_lit.session_state.total_duration}\n")
                         f.write("\n".join(str(item) for item in valid_snapshot) + ("\n" if valid_snapshot else ""))
                     with open(wrong_path, "w", encoding="utf-8") as f:
+                        f.write(f"# Started: {str_lit.session_state.start_timestamp} | Ended: {str_lit.session_state.end_timestamp} | Duration: {str_lit.session_state.total_duration}\n")
                         f.write("\n".join(str(item) for item in wrong_snapshot) + ("\n" if wrong_snapshot else ""))
                     with open(need_path, "w", encoding="utf-8") as f:
+                        f.write(f"# Started: {str_lit.session_state.start_timestamp} | Ended: {str_lit.session_state.end_timestamp} | Duration: {str_lit.session_state.total_duration}\n")
                         f.write("\n".join(str(item) for item in need_snapshot) + ("\n" if need_snapshot else ""))
                     with open(failed_path, "w", encoding="utf-8") as f:
+                        f.write(f"# Started: {str_lit.session_state.start_timestamp} | Ended: {str_lit.session_state.end_timestamp} | Duration: {str_lit.session_state.total_duration}\n")
                         f.write("\n".join(str(item) for item in conn_snapshot) + ("\n" if conn_snapshot else ""))
                 except IOError as io_err:
                     warnings.warn(f"Disk-write error saving result logs: {io_err}")
@@ -1703,6 +1726,7 @@ if start_engine_btn:
             with file_write_lock:
                 try:
                     with open(clean_valid_path, "w", encoding="utf-8") as outfile:
+                        outfile.write(f"# Started: {str_lit.session_state.start_timestamp} | Ended: {str_lit.session_state.end_timestamp} | Duration: {str_lit.session_state.total_duration}\n")
                         for line in valid_snapshot:
                             try:
                                 if ":" in line:
@@ -1760,8 +1784,14 @@ if str_lit.session_state.engine_has_run:
         report_entries_copy = list(str_lit.session_state.report_entries)
         zip_bytes_copy = str_lit.session_state.zip_bytes
         zip_name_copy = str_lit.session_state.zip_name
+        start_ts_copy = str_lit.session_state.start_timestamp
+        end_ts_copy = str_lit.session_state.end_timestamp
+        duration_copy = str_lit.session_state.total_duration
 
     str_lit.markdown(f"### 📊 Live Results Summary & ZIP Archive — **{status_label}**")
+    
+    if start_ts_copy and end_ts_copy:
+        str_lit.info(f"⏱ **Checking Session Timestamps:** Started at **{start_ts_copy}** | Ended at **{end_ts_copy}** | Total Duration: **{duration_copy}**")
     
     col1, col2, col3, col4 = str_lit.columns(4)
     col1.metric("✅ Clean Valid", clean_count_val)
