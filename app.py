@@ -642,7 +642,7 @@ with str_lit.sidebar:
                     "Fails": meta.get("fails", 0),
                     "Successes": meta.get("success", 0)
                 })
-            str_lit.dataframe(pd.DataFrame(proxy_data_list), use_container_width=True)
+            str_lit.dataframe(pd.DataFrame(proxy_data_list), width='stretch')
             
             col_ref1, col_ref2 = str_lit.columns(2)
             with col_ref1:
@@ -1276,7 +1276,10 @@ if start_engine_btn:
                                 current_logs = list(str_lit.session_state.log_lines)
                                 current_reports = list(str_lit.session_state.report_entries)
 
-                            if index % 5 == 0 or checked_count == total_accs:
+                            # Yield thread execution time to flush UI updates smoothly
+                            time.sleep(0.01)
+
+                            if index % 1 == 0 or checked_count == total_accs:
                                 log_container.code("\n".join(current_logs), language="text")
                                 
                                 with report_metrics_placeholder.container():
@@ -1287,7 +1290,7 @@ if start_engine_btn:
                                     r_col4.metric("⚠ Failed", conn_len)
 
                                 df_report = pd.DataFrame(current_reports[::-1])
-                                report_log_container.dataframe(df_report, use_container_width=True, height=300)
+                                report_log_container.dataframe(df_report, width='stretch', height=300)
                             
                     except Exception as ex:
                         err_msg = f"[EXCEPTION] {str(ex)}"
@@ -1409,7 +1412,7 @@ if str_lit.session_state.engine_has_run:
     with exec_tab2_p:
         if report_entries_copy:
             df_report_persisted = pd.DataFrame(report_entries_copy[::-1])
-            str_lit.dataframe(df_report_persisted, use_container_width=True, height=300)
+            str_lit.dataframe(df_report_persisted, width='stretch', height=300)
         else:
             str_lit.info("No report logs available.")
 
