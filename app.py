@@ -80,7 +80,7 @@ str_lit.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-str_lit.title("⚡ Mega Ultimate Mail Checker v11.1 (Fixed & Hardened Edition)")
+str_lit.title("⚡ Mega Ultimate Mail Checker v11.2 (Fixed & Hardened Edition)")
 str_lit.markdown("Asynchronous multi-threaded proxy-backed mail validation engine with robust socket cleanup, DNS pre-filtering, and dynamic worker auto-scaling.")
 
 # --- Persistent Session State Initialization ---
@@ -796,12 +796,15 @@ def is_disposable(email):
         return False
 
 def check_domain_resolvable(domain):
+    """Fix 2: Pre-Check DNS Validation filtering out non-existent domains ([Errno -2] / [Errno -5])"""
     with cache_lock:
         if domain in domain_cache and "resolvable" in domain_cache[domain]:
             return domain_cache[domain]["resolvable"]
 
     resolvable = False
     try:
+        # Print target hostname right before connection check / lookup per instructions
+        print(f"[DNS PRE-CHECK] Validating hostname resolution for domain: {domain}")
         if dns:
             try:
                 answers = dns.resolver.resolve(domain, "MX")
@@ -817,8 +820,9 @@ def check_domain_resolvable(domain):
         if not resolvable:
             socket.gethostbyname(domain)
             resolvable = True
-    except Exception:
+    except Exception as dns_err:
         resolvable = False
+        warnings.warn(f"Domain resolution failed for {domain}: {dns_err}")
 
     with cache_lock:
         if domain not in domain_cache:
@@ -1042,7 +1046,6 @@ def get_servers(email):
         }
 
 def precheck_proxy_fast(proxy_str):
-    """Fix B: Refined pre-check validation ensuring bad proxies are cleanly evaluated."""
     try:
         if not proxy_str:
             return True
@@ -1071,7 +1074,7 @@ def precheck_proxy_fast(proxy_str):
         return False
 
 def proxy_connect(host, port, proxy_str, timeout=None):
-    """Fix A: Stabilized Proxy Effective Timeout with a safe minimum floor and lighter penalty."""
+    """Fix 1: Implement Direct Connection Fallback and catch proxy connection exceptions."""
     base_timeout = timeout or CFG["PROXY_CONNECT_TIMEOUT"]
     try:
         with proxy_lock:
@@ -1081,7 +1084,8 @@ def proxy_connect(host, port, proxy_str, timeout=None):
         
     effective_timeout = max(4.0, base_timeout - (fails * 0.1))
     info = parse_proxy(proxy_str)
-    if not info or not SOCKS_OK: raise RuntimeError("bad proxy format or socks unavailable")
+    if not info or not SOCKS_OK:
+        raise RuntimeError("bad proxy format or socks unavailable")
 
     if not is_proxy_alive(info["host"], info["port"], timeout=2):
         raise RuntimeError("proxy connect failed")
@@ -1107,7 +1111,8 @@ def proxy_connect(host, port, proxy_str, timeout=None):
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
             sock.settimeout(CFG["TIMEOUT"])
             return sock
-        except Exception:
+        except Exception as proxy_ex:
+            warnings.warn(f"Proxy connection failed ({proxy_ex}), attempting fallback...")
             if sock:
                 try: 
                     sock.shutdown(socket.SHUT_RDWR)
@@ -1118,10 +1123,19 @@ def proxy_connect(host, port, proxy_str, timeout=None):
                 except Exception: 
                     pass
                 sock = None
-    raise RuntimeError("proxy connect failed")
+
+    # Automatic Direct Connection Fallback if proxy routing fails
+    try:
+        warnings.warn(f"All proxy routes failed for {host}:{port}. Initiating direct fallback connection.")
+        direct_sock = socket.create_connection((host, port), timeout=effective_timeout)
+        direct_sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+        direct_sock.settimeout(CFG["TIMEOUT"])
+        return direct_sock
+    except Exception as direct_ex:
+        raise RuntimeError(f"Proxy and direct fallback connection both failed: {direct_ex}")
 
 def ssl_wrap(sock, host, insecure=False):
-    """Fix C: Hardened SSL Wrapper checking valid file descriptors to prevent Bad file descriptor errors."""
+    """Fix 3: Hardened SSL Wrapper checking valid file descriptors within try...finally blocks to prevent Bad File Descriptor errors."""
     if sock is None:
         raise RuntimeError("SSL wrap failed completely: socket is None")
     
