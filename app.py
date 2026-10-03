@@ -72,7 +72,7 @@ str_lit.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-str_lit.title("⚡ Mega Ultimate Mail Checker v10.8 (Protocol Edition with Resume & Concurrency Fixes)")
+str_lit.title("⚡ Mega Ultimate Mail Checker v10.9 (Protocol Edition with Resume & Concurrency Fixes)")
 str_lit.markdown("Asynchronous multi-threaded proxy-backed mail validation engine with resume support and strict protocol verification.")
 
 # --- Persistent Session State Initialization ---
@@ -402,7 +402,7 @@ if pool_mode == "country":
     with str_lit.sidebar.form("country_form"):
         country_checkboxes = {}
         for c in available_countries:
-            country_checkboxes[c] = str_lit.checkbox(c, value=(c == "US"))
+            country_checkboxes[c] = str_lit.checkbox(c, value=(c == "US"), key=f"country_chk_{c}")
         country_done = str_lit.form_submit_button("Done")
         if country_done:
             selected_countries = [c for c, checked in country_checkboxes.items() if checked]
@@ -418,7 +418,7 @@ elif pool_mode == "mix":
         for c in available_countries:
             scores_for_c = [proxy_meta.get(p, {}).get("score", 50) for p in load_proxies() if proxy_meta.get(p, {}).get("country", "").upper() == c]
             avg_s = int(sum(scores_for_c) / len(scores_for_c)) if scores_for_c else 50
-            mix_checkboxes[c] = str_lit.checkbox(f"{c} (Avg Score: {avg_s})", value=True)
+            mix_checkboxes[c] = str_lit.checkbox(f"{c} (Avg Score: {avg_s})", value=True, key=f"mix_chk_{c}")
         mix_done = str_lit.form_submit_button("Done")
         if mix_done:
             selected_mix_countries = [c.split(" ")[0] for c, checked in mix_checkboxes.items() if checked]
@@ -705,7 +705,8 @@ def load_previous_valid():
                     for line in f:
                         line = line.strip()
                         if ":" in line:
-                            email = line.split(":")[0].strip().lower()
+                            email, _ = line.split(":", 1)
+                            email = email.strip().lower()
                             if email:
                                 seen.add(email)
             except Exception:
@@ -755,7 +756,7 @@ def process_accounts(text, previous_valid):
     seen_email, clean = set(), []
     for line in lines:
         try:
-            em = line.split(":")[0].strip().lower()
+            em = line.split(":", 1)[0].strip().lower()
             if em not in seen_email:
                 seen_email.add(em)
                 clean.append(line)
@@ -980,7 +981,7 @@ def record_proxy_attempt(proxy_str, success, is_network_error=False):
 def imap_once(email, password, server, proxy_str=None, insecure=False):
     class PIMAP(imaplib.IMAP4_SSL):
         def open(self, host="", port=993, timeout=None):
-            raw = proxy_connect(host, port, proxy_str) if proxy_str else socket.create_connection((host, port), timeout=CFG["TIMEOUT"])
+            raw = proxy_connect(host, port, proxy_str) if proxy_str else socket.create_connection((host, port))
             raw.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
             self.sock = ssl_wrap(raw, host, insecure=insecure)
     
@@ -996,7 +997,7 @@ def pop_once(email, password, server, proxy_str=None, insecure=False):
     raw = proxy_connect(server, 995, proxy_str) if proxy_str else socket.create_connection((server, 995), timeout=CFG["TIMEOUT"])
     raw.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
     ssock = ssl_wrap(raw, server, insecure=insecure)
-    mail = poplib.POP3_SSL(server, timeout=CFG["TIMEOUT"])
+    mail = poplib.POP3_SSL(server)
     mail.sock = ssock
     mail._debugging = 0
     mail.user(email.strip())
@@ -1179,7 +1180,8 @@ if start_engine_btn:
             accounts_to_check = []
             for acc_line in all_target_accounts:
                 try:
-                    em = acc_line.split(":")[0].strip().lower()
+                    em, _ = acc_line.split(":", 1)
+                    em = em.strip().lower()
                     if em not in current_checked_set_snapshot:
                         accounts_to_check.append(acc_line)
                 except Exception:
@@ -1320,10 +1322,10 @@ if start_engine_btn:
                 with open(clean_valid_path, "w", encoding="utf-8") as outfile:
                     for line in valid_snapshot:
                         try:
-                            parts = line.split(":")
-                            if len(parts) >= 2:
-                                email = parts[0].strip()
-                                password_part = parts[1].split("|")[0].strip()
+                            if ":" in line:
+                                email, remainder = line.split(":", 1)
+                                email = email.strip()
+                                password_part = remainder.split("|")[0].strip()
                                 outfile.write(f"{email}:{password_part}\n")
                                 temp_clean_count += 1
                         except Exception:
@@ -1414,10 +1416,10 @@ else:
     valid_combo_options = []
     for item in valid_results_snapshot:
         try:
-            parts = item.split(":")
-            if len(parts) >= 2:
-                email_val = parts[0].strip()
-                pass_val = parts[1].split("|")[0].strip()
+            if ":" in item:
+                email_val, remainder = item.split(":", 1)
+                email_val = email_val.strip()
+                pass_val = remainder.split("|")[0].strip()
                 valid_combo_options.append(f"{email_val}:{pass_val}")
         except Exception:
             continue
