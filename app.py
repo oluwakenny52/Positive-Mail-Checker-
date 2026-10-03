@@ -1424,4 +1424,4 @@ else:
                                 str_lit.markdown(f"**Message {idx}:**")
                                 str_lit.code(m_content, language="text")
                         else:
-                        str_lit.warning(f"Could not read mailbox: {fetched_msgs}")
+                            str_lit.warning(f"Could not read mailbox: {fetched_msgs}")
