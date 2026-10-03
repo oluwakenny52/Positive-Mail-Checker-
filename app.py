@@ -796,7 +796,6 @@ def is_disposable(email):
         return False
 
 def check_domain_resolvable(domain):
-    """Audits and caches domain resolution status to filter out dead/mistyped domains natively."""
     with cache_lock:
         if domain in domain_cache and "resolvable" in domain_cache[domain]:
             return domain_cache[domain]["resolvable"]
@@ -897,7 +896,6 @@ def process_accounts(text, previous_valid):
                 skipped_bad += 1
                 continue
             
-            # Audit and filter dead or unresolvable domains (Fixes DNS & Host Resolution Errors)
             if not check_domain_resolvable(domain):
                 skipped_dns += 1
                 continue
@@ -1044,6 +1042,7 @@ def get_servers(email):
         }
 
 def precheck_proxy_fast(proxy_str):
+    """Fix B: Refined pre-check validation ensuring bad proxies are cleanly evaluated."""
     try:
         if not proxy_str:
             return True
@@ -1051,22 +1050,28 @@ def precheck_proxy_fast(proxy_str):
         now = time.time()
         with proxy_lock:
             if proxy_str in circuit_breaker_until and now < circuit_breaker_until[proxy_str]:
+                bad_proxies.add(proxy_str)
                 return False
 
         info = parse_proxy(proxy_str)
         if not info or not SOCKS_OK:
+            bad_proxies.add(proxy_str)
             return False
 
         precheck_timeout = float(CFG.get("PROXY_PRECHECK_TIMEOUT", 3))
         if not is_proxy_alive(info["host"], info["port"], timeout=precheck_timeout):
             record_proxy_attempt(proxy_str, success=False, is_network_error=True)
+            bad_proxies.add(proxy_str)
             return False
 
         return True
     except Exception:
+        if proxy_str:
+            bad_proxies.add(proxy_str)
         return False
 
 def proxy_connect(host, port, proxy_str, timeout=None):
+    """Fix A: Stabilized Proxy Effective Timeout with a safe minimum floor and lighter penalty."""
     base_timeout = timeout or CFG["PROXY_CONNECT_TIMEOUT"]
     try:
         with proxy_lock:
@@ -1074,7 +1079,7 @@ def proxy_connect(host, port, proxy_str, timeout=None):
     except Exception:
         fails = 0
         
-    effective_timeout = max(2.0, base_timeout - (fails * 0.2))
+    effective_timeout = max(4.0, base_timeout - (fails * 0.1))
     info = parse_proxy(proxy_str)
     if not info or not SOCKS_OK: raise RuntimeError("bad proxy format or socks unavailable")
 
@@ -1116,13 +1121,12 @@ def proxy_connect(host, port, proxy_str, timeout=None):
     raise RuntimeError("proxy connect failed")
 
 def ssl_wrap(sock, host, insecure=False):
-    """Hardened SSL wrapper preventing socket leaks and Bad file descriptor errors."""
+    """Fix C: Hardened SSL Wrapper checking valid file descriptors to prevent Bad file descriptor errors."""
     if sock is None:
         raise RuntimeError("SSL wrap failed completely: socket is None")
     
     ctx = ssl._create_unverified_context() if (insecure or CFG.get("ALLOW_SELF_SIGNED")) else ssl.create_default_context()
     
-    # Ensure socket file descriptor is valid before wrapping
     try:
         fileno = sock.fileno()
         if fileno < 0:
@@ -1183,6 +1187,7 @@ def record_proxy_attempt(proxy_str, success, is_network_error=False):
                     consecutive_proxy_failures[proxy_str] += 1
                     if consecutive_proxy_failures[proxy_str] >= 6:
                         circuit_breaker_until[proxy_str] = time.time() + 30.0
+                        bad_proxies.add(proxy_str)
             m["score"] = compute_real_score(m.get("success", 0), m.get("fails", 0))
     except Exception as e:
         warnings.warn(f"Error recording proxy attempt: {e}")
