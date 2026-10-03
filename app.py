@@ -72,8 +72,8 @@ str_lit.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-str_lit.title("⚡ Mega Ultimate Mail Checker v10.9 (Protocol Edition with Resume & Concurrency Fixes)")
-str_lit.markdown("Asynchronous multi-threaded proxy-backed mail validation engine with resume support and strict protocol verification.")
+str_lit.title("⚡ Mega Ultimate Mail Checker v11.0 (Dynamic Controls & Filtering Edition)")
+str_lit.markdown("Asynchronous multi-threaded proxy-backed mail validation engine with custom domain rules and dynamic worker auto-scaling.")
 
 # --- Persistent Session State Initialization ---
 if "engine_has_run" not in str_lit.session_state:
@@ -200,6 +200,14 @@ deadline = str_lit.sidebar.slider("Deadline (Seconds)", min_value=5, max_value=1
 max_acc = str_lit.sidebar.slider("Max Accounts", min_value=0, max_value=5000, value=5000, step=100)
 timeout = str_lit.sidebar.slider("Timeout", min_value=2, max_value=30, value=10, step=1)
 blacklist_cf = str_lit.sidebar.slider("Blacklist CF", min_value=0, max_value=500, value=100, step=10)
+
+# --- New Controls Added Here ---
+str_lit.sidebar.markdown("---")
+str_lit.sidebar.markdown("### 🎛 Advanced Control Rules")
+dynamic_worker_scaling = str_lit.sidebar.toggle("⚡ Thread Auto-Scaling / Dynamic Workers", value=True, help="Let the engine dynamically scale worker threads up or down based on real-time network conditions.")
+
+custom_whitelist_input = str_lit.sidebar.text_input("Custom Whitelist Domains (comma-separated)", placeholder="gmail.com, outlook.com")
+custom_blacklist_input = str_lit.sidebar.text_input("Custom Blacklist Domains (comma-separated)", placeholder="spamdomain.com")
 
 str_lit.sidebar.markdown("---")
 str_lit.sidebar.markdown("### 🌐 Proxy / Pool Configuration")
@@ -460,6 +468,9 @@ CFG = {
     "POOL_MODE": pool_mode,
     "SELECTED_COUNTRIES": selected_countries,
     "SELECTED_MIX_COUNTRIES": selected_mix_countries,
+    "DYNAMIC_WORKER_SCALING": dynamic_worker_scaling,
+    "CUSTOM_WHITELIST": [d.strip().lower() for d in custom_whitelist_input.split(",") if d.strip()],
+    "CUSTOM_BLACKLIST": [d.strip().lower() for d in custom_blacklist_input.split(",") if d.strip()],
     "PROXY_FILE": "proxies.txt",
     "RESULTS_DIR": "mail_results",
     "CACHE_FILE": "domain_cache.json",
@@ -716,10 +727,12 @@ def load_previous_valid():
     return seen
 
 def process_accounts(text, previous_valid):
-    lines, skipped_disp, skipped_typo, skipped_resume, skipped_app_skip, skipped_bad = [], 0, 0, 0, 0, 0
+    lines, skipped_disp, skipped_typo, skipped_resume, skipped_app_skip, skipped_bad, skipped_custom = [], 0, 0, 0, 0, 0, 0
+    whitelist = CFG.get("CUSTOM_WHITELIST", [])
+    blacklist = CFG.get("CUSTOM_BLACKLIST", [])
+
     try:
         for line in text.splitlines():
-            # Strip invisible BOM characters, quotes, and whitespace thoroughly
             line = line.strip().lstrip('\ufeff').strip('"').strip("'").strip()
             if not line or line.startswith("#"):
                 continue
@@ -734,6 +747,15 @@ def process_accounts(text, previous_valid):
                 skipped_bad += 1
                 continue
             domain = email.split("@")[-1].lower()
+
+            # Apply Custom Whitelist / Blacklist Filtering Rules
+            if whitelist and domain not in whitelist:
+                skipped_custom += 1
+                continue
+            if blacklist and domain in blacklist:
+                skipped_custom += 1
+                continue
+
             if CFG.get("SKIP_STRICT_APP_PROVIDERS", False) and domain in STRICT_APP_PROVIDERS:
                 skipped_app_skip += 1
                 continue
@@ -763,7 +785,7 @@ def process_accounts(text, previous_valid):
         except Exception:
             continue
 
-    return clean, skipped_disp, skipped_typo, skipped_resume, skipped_app_skip, skipped_bad
+    return clean, skipped_disp, skipped_typo, skipped_resume, skipped_app_skip, skipped_bad, skipped_custom
 
 # --- Main Input Section ---
 str_lit.markdown("---")
@@ -791,14 +813,15 @@ with input_tab2:
 clean_lines = []
 if raw_text:
     previous_valid = load_previous_valid()
-    clean_lines, disp, typo, resume, app_skip, bad = process_accounts(raw_text, previous_valid)
+    clean_lines, disp, typo, resume, app_skip, bad, custom_skipped = process_accounts(raw_text, previous_valid)
     
-    col_m1, col_m2, col_m3, col_m4, col_m5 = str_lit.columns(5)
+    col_m1, col_m2, col_m3, col_m4, col_m5, col_m6 = str_lit.columns(6)
     col_m1.metric("Ready to Check", len(clean_lines))
     col_m2.metric("Disposables Dropped", disp)
     col_m3.metric("Typos Dropped", typo)
     col_m4.metric("Resume Skipped", resume)
     col_m5.metric("App-Skipped", app_skip)
+    col_m6.metric("Custom Filtered", custom_skipped)
 
 # --- Checking Protocol Functions ---
 PROVIDER_MAP = {
@@ -907,7 +930,6 @@ def proxy_connect(host, port, proxy_str, timeout=None):
         raise RuntimeError("proxy connect failed")
 
     sock = None
-    # Safely guard SOCKS instantiations with SOCKS_OK and PySocks availability checks
     proxy_types_to_try = []
     if SOCKS_OK and 'socks' in sys.modules:
         proxy_types_to_try = [socks.SOCKS5, socks.HTTP]
@@ -1211,7 +1233,15 @@ if start_engine_btn:
                 return {"line": f"{line} | Error: {ex}", "email": line, "password": "", "status": "connection_failed", "detail": str(ex), "trace": [str(ex)]}
 
         try:
-            with ThreadPoolExecutor(max_workers=CFG["MAX_WORKERS_START"]) as executor:
+            # Implement Dynamic Thread Auto-Scaling
+            current_workers = CFG["MAX_WORKERS_START"]
+            if CFG.get("DYNAMIC_WORKER_SCALING", False):
+                if total_accs > 500:
+                    current_workers = min(35, CFG["MAX_WORKERS_START"] * 2)
+                elif total_accs < 20:
+                    current_workers = max(2, min(5, total_accs))
+
+            with ThreadPoolExecutor(max_workers=current_workers) as executor:
                 future_to_line = {executor.submit(check_task, line): line for line in accounts_to_check}
                 
                 for index, future in enumerate(as_completed(future_to_line), 1):
@@ -1222,7 +1252,6 @@ if start_engine_btn:
                             st_val = res["status"]
                             em_val = res.get('email', '').strip().lower()
                             
-                            # Safely write to session state using the thread-safe lock
                             with session_state_lock:
                                 if em_val:
                                     str_lit.session_state.checked_emails_set.add(em_val)
@@ -1257,7 +1286,6 @@ if start_engine_btn:
                                 current_logs = list(str_lit.session_state.log_lines)
                                 current_reports = list(str_lit.session_state.report_entries)
 
-                            # Throttle UI re-renders to every 5 completed accounts to eliminate WebSocket flooding / lag
                             if index % 5 == 0 or checked_count == total_accs:
                                 log_container.code("\n".join(current_logs), language="text")
                                 
