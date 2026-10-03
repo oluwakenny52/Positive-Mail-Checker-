@@ -83,8 +83,8 @@ str_lit.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-str_lit.title("⚡ Mega Ultimate Mail Checker v11.4 (Fast Mode & Normal Mode Edition)")
-str_lit.markdown("Asynchronous multi-threaded proxy-backed mail validation engine with toggleable Fast Mode optimization, fast-fail DNS checks, and robust socket cleanup.")
+str_lit.title("⚡ Mega Ultimate Mail Checker v11.5 (Tri-Mode Edition)")
+str_lit.markdown("Asynchronous proxy-backed mail validation engine featuring Fast Mode, Normal Mode, and Deep/Aggressive Mode with DNS MX pre-filtering and adaptive circuit breakers.")
 
 # --- Persistent Session State Initialization ---
 if "engine_has_run" not in str_lit.session_state:
@@ -134,15 +134,16 @@ consecutive_proxy_failures = defaultdict(int)
 circuit_breaker_until = {}
 failed_domain_cache = {}
 
-# --- Configuration Dataclass for Fast Mode ---
+# --- Configuration Dataclass for Tri-Mode Support ---
 @dataclass
 class CheckerConfig:
-    fast_mode: bool = True
-    max_concurrent_checks: int = 100
-    connect_timeout: float = 3.0
-    read_timeout: float = 3.0
-    max_retries: int = 1
-    failure_cooldown: float = 60.0
+    mode_name: str = "Normal"
+    fast_mode: bool = False
+    max_concurrent_checks: int = 50
+    connect_timeout: float = 5.0
+    read_timeout: float = 5.0
+    max_retries: int = 2
+    failure_cooldown: float = 30.0
 
 # --- Automatic Streamlit Secrets-to-Env Bridge ---
 def _secret_to_env(k, v):
@@ -239,14 +240,20 @@ def instant_help(key_name, description_text, label_text, widget_type="label", **
         warnings.warn(f"Error rendering instant help widget {key_name}: {e}")
     return None
 
-# --- Sidebar Control Panel ---
+# --- Sidebar Control Panel & Tri-Mode Selector ---
 str_lit.sidebar.header("⚙ Engine Control Panel")
 
-# --- Fast Mode Toggle Implementation ---
-fast_mode_enabled = str_lit.sidebar.toggle("⚡ Fast Mode (Aggressive Timeouts & Caching)", value=True, help="Enable Fast Mode for high concurrency, 3s timeouts, fast retries, and domain failure short-circuiting.")
+# --- Mode Selection (3 Modes: Normal Mode [Default], Fast Mode, Deep / Aggressive Mode) ---
+checker_mode = str_lit.sidebar.selectbox(
+    "⚡ Select Engine Mode:",
+    options=["Normal Mode", "Fast Mode", "Deep / Aggressive Mode"],
+    index=0,
+    help="Normal Mode: Balanced performance and deep checks. Fast Mode: Lightweight syntax, DNS MX pre-filtering, and rapid port checking. Deep/Aggressive Mode: Maximum depth checks, multiple fallbacks, and strict validation."
+)
 
-if fast_mode_enabled:
+if checker_mode == "Fast Mode":
     engine_config = CheckerConfig(
+        mode_name="Fast",
         fast_mode=True,
         max_concurrent_checks=100,
         connect_timeout=3.0,
@@ -254,21 +261,35 @@ if fast_mode_enabled:
         max_retries=1,
         failure_cooldown=60.0
     )
-    workers = str_lit.sidebar.slider("Workers Start", min_value=1, max_value=100, value=50, step=5)
+    workers = str_lit.sidebar.slider("Workers Start", min_value=1, max_value=100, value=60, step=5)
     deadline = str_lit.sidebar.slider("Deadline (Seconds)", min_value=3, max_value=60, value=15, step=5)
     timeout = str_lit.sidebar.slider("Timeout", min_value=1, max_value=15, value=3, step=1)
-else:
+elif checker_mode == "Deep / Aggressive Mode":
     engine_config = CheckerConfig(
+        mode_name="Deep",
         fast_mode=False,
-        max_concurrent_checks=20,
+        max_concurrent_checks=30,
         connect_timeout=15.0,
         read_timeout=15.0,
-        max_retries=3,
-        failure_cooldown=0.0
+        max_retries=4,
+        failure_cooldown=10.0
     )
-    workers = str_lit.sidebar.slider("Workers Start", min_value=1, max_value=50, value=10, step=1)
-    deadline = str_lit.sidebar.slider("Deadline (Seconds)", min_value=5, max_value=120, value=25, step=5)
-    timeout = str_lit.sidebar.slider("Timeout", min_value=2, max_value=30, value=10, step=1)
+    workers = str_lit.sidebar.slider("Workers Start", min_value=1, max_value=50, value=15, step=1)
+    deadline = str_lit.sidebar.slider("Deadline (Seconds)", min_value=10, max_value=180, value=45, step=5)
+    timeout = str_lit.sidebar.slider("Timeout", min_value=5, max_value=45, value=15, step=1)
+else:  # Normal Mode (Default)
+    engine_config = CheckerConfig(
+        mode_name="Normal",
+        fast_mode=False,
+        max_concurrent_checks=50,
+        connect_timeout=8.0,
+        read_timeout=8.0,
+        max_retries=2,
+        failure_cooldown=30.0
+    )
+    workers = str_lit.sidebar.slider("Workers Start", min_value=1, max_value=75, value=30, step=5)
+    deadline = str_lit.sidebar.slider("Deadline (Seconds)", min_value=5, max_value=90, value=25, step=5)
+    timeout = str_lit.sidebar.slider("Timeout", min_value=2, max_value=20, value=8, step=1)
 
 max_acc = str_lit.sidebar.slider("Max Accounts", min_value=0, max_value=5000, value=5000, step=100)
 blacklist_cf = str_lit.sidebar.slider("Blacklist CF", min_value=0, max_value=500, value=100, step=10)
@@ -540,6 +561,7 @@ if str_lit.sidebar.button("💾 Apply Settings", type="primary"):
     log_startup("User applied new configuration settings via sidebar control panel.")
 
 CFG = {
+    "MODE_NAME": engine_config.mode_name,
     "MAX_WORKERS_START": workers,
     "MAX_WORKERS_MAX": max(workers * 2, 25),
     "TIMEOUT": timeout,
@@ -1396,7 +1418,8 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, 
     # Fast Mode failure domain blacklist short-circuit check
     if CFG.get("FAST_MODE", True):
         ts = failed_domain_cache.get(domain)
-        if ts and (time.time() - ts) < 60.0:
+        cooldown_period = CFG.get("FAILURE_COOLDOWN", 60.0)
+        if ts and (time.time() - ts) < cooldown_period:
             trace_logs.append(f"Fast Mode: Domain '{domain}' is in cooldown cache. Skipping immediately.")
             return None, "connection_failed", "skipped_cooldown", None, trace_logs
         elif ts:
@@ -1482,7 +1505,7 @@ with col_action2:
 active_proxy_pool = get_filtered_active_proxies()
 
 if start_engine_btn:
-    log_startup("Live checking engine execution triggered by user.")
+    log_startup(f"Live checking engine execution triggered in [{CFG['MODE_NAME']}] mode.")
     if not clean_lines:
         str_lit.warning("⚠ Please load and filter accounts first.")
     else:
