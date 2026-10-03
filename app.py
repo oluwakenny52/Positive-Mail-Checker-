@@ -80,8 +80,8 @@ str_lit.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-str_lit.title("⚡ Mega Ultimate Mail Checker v11.2 (Fixed & Hardened Edition)")
-str_lit.markdown("Asynchronous multi-threaded proxy-backed mail validation engine with robust socket cleanup, DNS pre-filtering, and dynamic worker auto-scaling.")
+str_lit.title("⚡ Mega Ultimate Mail Checker v11.3 (Optimized Host Fallback & Fast-Fail Edition)")
+str_lit.markdown("Asynchronous multi-threaded proxy-backed mail validation engine with explicit pattern templates, fast-fail DNS checks, and robust socket cleanup.")
 
 # --- Persistent Session State Initialization ---
 if "engine_has_run" not in str_lit.session_state:
@@ -1006,33 +1006,40 @@ def get_servers(email):
             return PROVIDER_MAP[domain]
 
         mx = get_mx_hosts(domain)
-        servers = {"imap": [], "pop": [], "pop3": []}
+        imap_list = []
+        pop_list = []
+        pop3_list = []
         
         for m in mx:
             if "google" in m or "gmail" in m:
-                servers["imap"].append("imap.gmail.com")
-                servers["pop"].append("pop.gmail.com")
-                servers["pop3"].append("pop.gmail.com")
+                imap_list.append("imap.gmail.com")
+                pop_list.append("pop.gmail.com")
+                pop3_list.append("pop.gmail.com")
             elif "outlook" in m or "protection.outlook" in m:
-                servers["imap"].append("outlook.office365.com")
-                servers["pop"].append("outlook.office365.com")
-                servers["pop3"].append("outlook.office365.com")
+                imap_list.append("outlook.office365.com")
+                pop_list.append("outlook.office365.com")
+                pop3_list.append("outlook.office365.com")
             elif "yahoo" in m:
-                servers["imap"].append("imap.mail.yahoo.com")
-                servers["pop"].append("pop.mail.yahoo.com")
-                servers["pop3"].append("pop.mail.yahoo.com")
+                imap_list.append("imap.mail.yahoo.com")
+                pop_list.append("pop.mail.yahoo.com")
+                pop3_list.append("pop.mail.yahoo.com")
             else:
-                servers["imap"].append(m)
-                servers["pop"].append(m)
-                servers["pop3"].append(m)
+                imap_list.append(m)
+                pop_list.append(m)
+                pop3_list.append(m)
 
-        servers["imap"].extend([f"mail.{domain}", domain])
-        servers["pop"].extend([f"mail.{domain}", domain])
-        servers["pop3"].extend([f"mail.{domain}", domain])
+        # Optimization 1: Explicit pattern templates appended right after mail.<domain>
+        base_patterns = [f"mail.{domain}", f"imap.{domain}", f"pop.{domain}", f"pop3.{domain}", domain]
         
-        servers["imap"] = list(dict.fromkeys(servers["imap"]))
-        servers["pop"] = list(dict.fromkeys(servers["pop"]))
-        servers["pop3"] = list(dict.fromkeys(servers["pop3"]))
+        imap_list.extend(base_patterns)
+        pop_list.extend(base_patterns)
+        pop3_list.extend(base_patterns)
+        
+        servers = {
+            "imap": list(dict.fromkeys(imap_list)),
+            "pop": list(dict.fromkeys(pop_list)),
+            "pop3": list(dict.fromkeys(pop3_list))
+        }
         
         with cache_lock:
             if domain not in domain_cache:
@@ -1045,10 +1052,11 @@ def get_servers(email):
     except Exception as e:
         warnings.warn(f"Error resolving servers for {email}: {e}")
         d = email.split('@')[-1] if '@' in email else 'localhost'
+        fallback_patterns = [f"mail.{d}", f"imap.{d}", f"pop.{d}", f"pop3.{d}", d]
         return {
-            "imap": [f"mail.{d}", d],
-            "pop": [f"mail.{d}", d],
-            "pop3": [f"mail.{d}", d]
+            "imap": list(dict.fromkeys(fallback_patterns)),
+            "pop": list(dict.fromkeys(fallback_patterns)),
+            "pop3": list(dict.fromkeys(fallback_patterns))
         }
 
 def precheck_proxy_fast(proxy_str):
@@ -1079,7 +1087,18 @@ def precheck_proxy_fast(proxy_str):
             bad_proxies.add(proxy_str)
         return False
 
+# Optimization 2: Fast-fail DNS check before attempting connection/proxy
+def fast_fail_dns_check(host):
+    try:
+        socket.gethostbyname(host)
+        return True
+    except Exception:
+        return False
+
 def proxy_connect(host, port, proxy_str, timeout=None):
+    if not fast_fail_dns_check(host):
+        raise RuntimeError(f"Fast-fail DNS check failed: Host '{host}' does not resolve")
+
     base_timeout = timeout or CFG["PROXY_CONNECT_TIMEOUT"]
     try:
         with proxy_lock:
@@ -1173,7 +1192,7 @@ def ssl_wrap(sock, host, insecure=False):
 def classify_error(err, domain=""):
     try:
         err_str = str(err).lower()
-        if any(x in err_str for x in ["proxy connect failed", "timed out", "timeout", "connection refused", "network is unreachable", "name or service not known", "gaierror", "sockatmark", "reset by peer", "broken pipe"]):
+        if any(x in err_str for x in ["proxy connect failed", "timed out", "timeout", "connection refused", "network is unreachable", "name or service not known", "gaierror", "sockatmark", "reset by peer", "broken pipe", "fast-fail dns check failed"]):
             return "connection_failed"
         if domain in ZERO_ACCESS_PROVIDERS or any(k in err_str for k in ["zero-access", "bridge", "local connection"]):
             return "need_app_password"
@@ -1288,7 +1307,6 @@ def pop_once(email, password, server, proxy_str=None, insecure=False):
         raise e
 
 def pop3_once(email, password, server, proxy_str=None, insecure=False):
-    """Explicit alias and handler following the IMAP, POP, POP3 pattern."""
     return pop_once(email, password, server, proxy_str=proxy_str, insecure=insecure)
 
 def verify_and_connect(target_email, target_pass, hosts, proxy_str=None):
@@ -1408,7 +1426,7 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, 
             if current_px and not precheck_proxy_fast(current_px):
                 continue
 
-            for server in conf.get("imap", [])[:3]:
+            for server in conf.get("imap", [])[:4]:
                 trace_logs.append(f"Attempting IMAP -> Host: {server}:993")
                 try:
                     imap_once(email, password, server, current_px, insecure=prefer_insecure)
@@ -1422,7 +1440,7 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, 
                     if st_val in ("wrong_password", "need_app_password"):
                         return None, st_val, f"IMAP {server} -> {st_val}", current_px, trace_logs
 
-            for server in conf.get("pop", [])[:3]:
+            for server in conf.get("pop", [])[:4]:
                 trace_logs.append(f"Attempting POP -> Host: {server}:995")
                 try:
                     pop_once(email, password, server, current_px, insecure=prefer_insecure)
@@ -1436,7 +1454,7 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, 
                     if st_val in ("wrong_password", "need_app_password"):
                         return None, st_val, f"POP {server} -> {st_val}", current_px, trace_logs
 
-            for server in conf.get("pop3", [])[:3]:
+            for server in conf.get("pop3", [])[:4]:
                 trace_logs.append(f"Attempting POP3 -> Host: {server}:995")
                 try:
                     pop3_once(email, password, server, current_px, insecure=prefer_insecure)
