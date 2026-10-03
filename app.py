@@ -44,7 +44,6 @@ if not SOCKS_OK:
     warnings.warn("PySocks is not installed in your Python environment! SOCKS proxy support will be disabled. Run 'pip install PySocks' to enable full proxy routing.")
 
 warnings.filterwarnings("ignore", message="Unverified HTTPS request")
-# NOTE: socket.setdefaulttimeout() removed globally to prevent side effects on other sockets/threads. Timeouts are now handled per connection.
 
 # --- Page Config ---
 str_lit.set_page_config(
@@ -107,7 +106,7 @@ if "run_completion_status" not in str_lit.session_state:
 cache_lock = threading.Lock()
 proxy_lock = threading.Lock()
 file_write_lock = threading.Lock()
-session_state_lock = threading.Lock()  # Protects session_state writes from concurrent threads
+session_state_lock = threading.Lock()
 bad_proxies = set()
 consecutive_proxy_failures = defaultdict(int)
 circuit_breaker_until = {}
@@ -201,7 +200,6 @@ max_acc = str_lit.sidebar.slider("Max Accounts", min_value=0, max_value=5000, va
 timeout = str_lit.sidebar.slider("Timeout", min_value=2, max_value=30, value=10, step=1)
 blacklist_cf = str_lit.sidebar.slider("Blacklist CF", min_value=0, max_value=500, value=100, step=10)
 
-# --- New Controls Added Here ---
 str_lit.sidebar.markdown("---")
 str_lit.sidebar.markdown("### 🎛 Advanced Control Rules")
 dynamic_worker_scaling = str_lit.sidebar.toggle("⚡ Thread Auto-Scaling / Dynamic Workers", value=True, help="Let the engine dynamically scale worker threads up or down based on real-time network conditions.")
@@ -290,11 +288,8 @@ def test_single_proxy(proxy_str):
         pass
     finally:
         if sock:
-            try:
-                sock.close()
-            except Exception:
-                pass
-            sock = None
+            try: sock.close()
+            except Exception: pass
 
     if not test_success:
         try:
@@ -313,11 +308,8 @@ def test_single_proxy(proxy_str):
             pass
         finally:
             if sock:
-                try:
-                    sock.close()
-                except Exception:
-                    pass
-                sock = None
+                try: sock.close()
+                except Exception: pass
             
     latency = int((time.time() - start) * 1000)
     initial_score = max(0, min(100, 100 - int(latency / 15)))
@@ -397,7 +389,7 @@ def get_available_countries_with_scores():
         avg_score = sum(scores) / len(scores) if scores else 0
         avg_country_scores.append((c, avg_score))
     avg_country_scores.sort(key=lambda x: x[1], reverse=True)
-    return [item[0] for item in avg_country_scores if item[0] != "UNKNOWN"] + ([ "UNKNOWN" ] if "UNKNOWN" in country_scores else [])
+    return [item[0] for item in avg_country_scores if item[0] != "UNKNOWN"] + (["UNKNOWN"] if "UNKNOWN" in country_scores else [])
 
 selected_countries = []
 selected_mix_countries = []
@@ -748,7 +740,6 @@ def process_accounts(text, previous_valid):
                 continue
             domain = email.split("@")[-1].lower()
 
-            # Apply Custom Whitelist / Blacklist Filtering Rules
             if whitelist and domain not in whitelist:
                 skipped_custom += 1
                 continue
@@ -1233,7 +1224,6 @@ if start_engine_btn:
                 return {"line": f"{line} | Error: {ex}", "email": line, "password": "", "status": "connection_failed", "detail": str(ex), "trace": [str(ex)]}
 
         try:
-            # Implement Dynamic Thread Auto-Scaling
             current_workers = CFG["MAX_WORKERS_START"]
             if CFG.get("DYNAMIC_WORKER_SCALING", False):
                 if total_accs > 500:
@@ -1480,7 +1470,7 @@ else:
                                 fetched_msgs = msgs
                         
                         if success_read:
-                            str_lit.success(f"Successfully retrieved recent messages from mailbox!")
+                            str_lit.success("Successfully retrieved recent messages from mailbox!")
                             for idx, m_content in enumerate(fetched_msgs, 1):
                                 str_lit.markdown(f"**Message {idx}:**")
                                 str_lit.code(m_content, language="text")
