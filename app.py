@@ -1062,7 +1062,7 @@ if raw_text:
     else:
         str_lit.info(f"No items in **{filter_category_choice}**.")
 
-# --- Checking Protocol Functions (IMAP, POP, POP3 Pattern Integration) ---
+# --- Comprehensive Mail Checking Flow Integration ---
 PROVIDER_MAP = {
     "gmail.com": {"imap": ["imap.gmail.com"], "pop": ["pop.gmail.com"], "pop3": ["pop.gmail.com"]},
     "googlemail.com": {"imap": ["imap.gmail.com"], "pop": ["pop.gmail.com"], "pop3": ["pop.gmail.com"]},
@@ -1077,6 +1077,11 @@ PROVIDER_MAP = {
 
 PUBLIC_PROVIDERS = set(PROVIDER_MAP.keys())
 
+# Pre-configured mapping dictionary for known alias domains / parent mappings
+PARENT_PROVIDER_MAPPINGS = {
+    "memoad.jp": "biglobe.ne.jp"
+}
+
 def get_mx_hosts(domain):
     if not dns: return []
     try:
@@ -1086,6 +1091,24 @@ def get_mx_hosts(domain):
     except Exception as e:
         warnings.warn(f"DNS MX lookup failed for {domain}: {e}")
         return []
+
+def detect_parent_provider(domain):
+    # Step 4: Dynamic DNS Inspection & Parent Provider Mapping
+    if domain in PARENT_PROVIDER_MAPPINGS:
+        return PARENT_PROVIDER_MAPPINGS[domain]
+    
+    mx_hosts = get_mx_hosts(domain)
+    for m in mx_hosts:
+        m_lower = m.lower()
+        if "biglobe" in m_lower:
+            return "biglobe.ne.jp"
+        elif "google" in m_lower or "gmail" in m_lower:
+            return "gmail.com"
+        elif "outlook" in m_lower or "protection.outlook" in m_lower:
+            return "outlook.office365.com"
+        elif "yahoo" in m_lower:
+            return "yahoo.com"
+    return None
 
 def get_servers(email):
     try:
@@ -1100,11 +1123,12 @@ def get_servers(email):
         if domain in PROVIDER_MAP:
             return PROVIDER_MAP[domain]
 
-        mx = get_mx_hosts(domain)
         imap_list = []
         pop_list = []
         pop3_list = []
-        
+
+        # Step 2: Primary Check - Direct MX Record Lookup & Connection
+        mx = get_mx_hosts(domain)
         for m in mx:
             if "google" in m or "gmail" in m:
                 imap_list.append("imap.gmail.com")
@@ -1123,10 +1147,23 @@ def get_servers(email):
                 pop_list.append(m)
                 pop3_list.append(m)
 
-        base_patterns = [f"mail.{domain}", f"imap.{domain}", f"pop.{domain}", f"pop3.{domain}", domain]
-        imap_list.extend(base_patterns)
-        pop_list.extend(base_patterns)
-        pop3_list.extend(base_patterns)
+        # Step 3: Secondary Check - Direct Pattern Fallback
+        direct_patterns = [
+            f"imap.{domain}", f"mail.{domain}", f"pop.{domain}", f"pop3.{domain}", domain
+        ]
+        imap_list.extend(direct_patterns)
+        pop_list.extend(direct_patterns)
+        pop3_list.extend(direct_patterns)
+
+        # Step 4 & 5: Parent Provider Detection & Pattern Fallback
+        parent_domain = detect_parent_provider(domain)
+        if parent_domain:
+            parent_patterns = [
+                f"mail.{parent_domain}", f"imap.{parent_domain}", f"pop.{parent_domain}", f"pop3.{parent_domain}", parent_domain
+            ]
+            imap_list.extend(parent_patterns)
+            pop_list.extend(parent_patterns)
+            pop3_list.extend(parent_patterns)
         
         servers = {
             "imap": list(dict.fromkeys(imap_list)),
@@ -1312,14 +1349,14 @@ def record_proxy_attempt(proxy_str, success, is_network_error=False):
     except Exception as e:
         warnings.warn(f"Error recording proxy attempt: {e}")
 
-def imap_once(email, password, server, proxy_str=None, insecure=False):
+def imap_once(email, password, server, proxy_str=None, insecure=True):
     class PIMAP(imaplib.IMAP4_SSL):
         def open(self, host="", port=993, timeout=None):
             raw = None
             try:
                 raw = proxy_connect(host, port, proxy_str, timeout=timeout) if proxy_str else socket.create_connection((host, port), timeout=timeout or CFG["TIMEOUT"])
                 raw.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
-                self.sock = ssl_wrap(raw, host, insecure=insecure)
+                self.sock = ssl_wrap(raw, host, insecure=True)
             except (socket.timeout, socket.error, ConnectionRefusedError, ssl.SSLError) as socket_ex:
                 if raw:
                     try: raw.shutdown(socket.SHUT_RDWR)
@@ -1354,14 +1391,14 @@ def imap_once(email, password, server, proxy_str=None, insecure=False):
             except Exception: pass
         raise e
 
-def pop_once(email, password, server, proxy_str=None, insecure=False):
+def pop_once(email, password, server, proxy_str=None, insecure=True):
     raw = None
     ssock = None
     mail = None
     try:
         raw = proxy_connect(server, 995, proxy_str, timeout=CFG["TIMEOUT"]) if proxy_str else socket.create_connection((server, 995), timeout=CFG["TIMEOUT"])
         raw.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
-        ssock = ssl_wrap(raw, server, insecure=insecure)
+        ssock = ssl_wrap(raw, server, insecure=True)
         mail = poplib.POP3_SSL(server, timeout=CFG["TIMEOUT"])
         mail.sock = ssock
         mail._debugging = 0
@@ -1392,7 +1429,7 @@ def pop_once(email, password, server, proxy_str=None, insecure=False):
             except Exception: pass
         raise e
 
-def pop3_once(email, password, server, proxy_str=None, insecure=False):
+def pop3_once(email, password, server, proxy_str=None, insecure=True):
     return pop_once(email, password, server, proxy_str=proxy_str, insecure=insecure)
 
 def verify_and_connect(target_email, target_pass, hosts, proxy_str=None):
@@ -1495,7 +1532,7 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, 
             return None, "need_app_password", "Zero-Access Architecture | Protocol: Local API / Bridge", None, trace_logs
 
         proxy_mode = CFG.get("PROXY_MODE", "aggressive")
-        prefer_insecure = CFG.get("ALLOW_SELF_SIGNED", True)
+        prefer_insecure = True # Force soft/unverified SSL fallbacks
         
         px = None
         if proxy_pool and proxy_mode != "off":
@@ -1519,47 +1556,47 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, 
                 continue
 
             for server in conf.get("imap", [])[:max_attempts]:
-                trace_logs.append(f"Attempting IMAP -> Host: {server}:993")
+                trace_logs.append(f"[direct-sslsoft] Attempting IMAP -> Host: {server}:993")
                 try:
                     imap_once(email, password, server, current_px, insecure=prefer_insecure)
                     record_proxy_attempt(current_px, success=True)
-                    return server, "valid", f"IMAP | Host: {server} | Port: 993", current_px, trace_logs
+                    return server, "valid", f"[direct-sslsoft] IMAP | Host: {server} | Port: 993", current_px, trace_logs
                 except (socket.timeout, socket.error, ConnectionRefusedError, ssl.SSLError) as sock_err:
                     st_val = classify_error(sock_err, domain)
                     record_proxy_attempt(current_px, success=False, is_network_error=True)
-                    trace_logs.append(f"-> SOCKET FAILED IMAP on {server}: {str(sock_err)[:50]} [Classified: {st_val}]")
+                    trace_logs.append(f"[direct-sslsoft] -> SOCKET FAILED IMAP on {server}: {str(sock_err)[:50]} [Classified: {st_val}]")
                     if st_val in ("wrong_password", "need_app_password"):
-                        return None, st_val, f"IMAP {server} -> {st_val}", current_px, trace_logs
+                        return None, st_val, f"[direct-sslsoft] IMAP {server} -> {st_val}", current_px, trace_logs
                 except Exception as e:
                     st_val = classify_error(e, domain)
                     is_net = (st_val == "connection_failed")
                     record_proxy_attempt(current_px, success=False, is_network_error=is_net)
-                    trace_logs.append(f"-> FAILED IMAP on {server}: {str(e)[:50]} [Classified: {st_val}]")
+                    trace_logs.append(f"[direct-sslsoft] -> FAILED IMAP on {server}: {str(e)[:50]} [Classified: {st_val}]")
                     if st_val in ("wrong_password", "need_app_password"):
-                        return None, st_val, f"IMAP {server} -> {st_val}", current_px, trace_logs
+                        return None, st_val, f"[direct-sslsoft] IMAP {server} -> {st_val}", current_px, trace_logs
 
             for server in conf.get("pop", [])[:max_attempts]:
-                trace_logs.append(f"Attempting POP -> Host: {server}:995")
+                trace_logs.append(f"[direct-sslsoft] Attempting POP -> Host: {server}:995")
                 try:
                     pop_once(email, password, server, current_px, insecure=prefer_insecure)
                     record_proxy_attempt(current_px, success=True)
-                    return server, "valid", f"POP | Host: {server} | Port: 995", current_px, trace_logs
+                    return server, "valid", f"[direct-sslsoft] POP | Host: {server} | Port: 995", current_px, trace_logs
                 except (socket.timeout, socket.error, ConnectionRefusedError, ssl.SSLError) as sock_err:
                     st_val = classify_error(sock_err, domain)
                     record_proxy_attempt(current_px, success=False, is_network_error=True)
-                    trace_logs.append(f"-> SOCKET FAILED POP on {server}: {str(sock_err)[:50]} [Classified: {st_val}]")
+                    trace_logs.append(f"[direct-sslsoft] -> SOCKET FAILED POP on {server}: {str(sock_err)[:50]} [Classified: {st_val}]")
                     if st_val in ("wrong_password", "need_app_password"):
-                        return None, st_val, f"POP {server} -> {st_val}", current_px, trace_logs
+                        return None, st_val, f"[direct-sslsoft] POP {server} -> {st_val}", current_px, trace_logs
                 except Exception as e:
                     st_val = classify_error(e, domain)
                     is_net = (st_val == "connection_failed")
                     record_proxy_attempt(current_px, success=False, is_network_error=is_net)
-                    trace_logs.append(f"-> FAILED POP on {server}: {str(e)[:50]} [Classified: {st_val}]")
+                    trace_logs.append(f"[direct-sslsoft] -> FAILED POP on {server}: {str(e)[:50]} [Classified: {st_val}]")
                     if st_val in ("wrong_password", "need_app_password"):
-                        return None, st_val, f"POP {server} -> {st_val}", current_px, trace_logs
+                        return None, st_val, f"[direct-sslsoft] POP {server} -> {st_val}", current_px, trace_logs
 
     except Exception as e:
-        trace_logs.append(f"Critical Exception in runner: {str(e)}")
+        trace_logs.append(f"[direct-sslsoft] Critical Exception in runner: {str(e)}")
         if CFG.get("FAST_MODE", True):
             failed_domain_cache[domain] = time.time()
         return None, "connection_failed", str(e)[:40], None, trace_logs
@@ -1657,7 +1694,6 @@ if start_engine_btn:
             except Exception as ex:
                 return {"line": f"{line} | Error: {ex}", "email": line, "password": "", "status": "connection_failed", "detail": str(ex), "trace": [str(ex)]}
             finally:
-                # Thread-safe cleanup block ensuring local handles/locks are cleanly reset
                 if hasattr(thread_local, "state"):
                     try:
                         thread_local.state.clear()
