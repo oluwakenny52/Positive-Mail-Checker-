@@ -424,7 +424,17 @@ if 'imap_mail' in st.session_state:
     col_f1, col_f2, col_f3 = st.columns([2, 1, 1])
     with col_f1:
         prev_folder = st.session_state.get('last_selected_folder', None)
-        selected_folder = st.selectbox("Select Mailbox Folder", options=st.session_state.get('available_folders', ["INBOX"]), key="mb_selected_folder")
+        
+        # Clean folder presentation formatting for dropdown
+        raw_folders = st.session_state.get('available_folders', ["INBOX"])
+        folder_display_mapping = {f: f for f in raw_folders}
+        
+        selected_display = st.selectbox(
+            "Select Mailbox Folder", 
+            options=list(folder_display_mapping.keys()), 
+            key="mb_selected_folder"
+        )
+        selected_folder = folder_display_mapping[selected_display]
         
         if prev_folder != selected_folder:
             st.session_state['last_selected_folder'] = selected_folder
@@ -504,7 +514,8 @@ if 'imap_mail' in st.session_state:
                     flagged_bots = []
                     target_ids = st.session_state['current_msg_ids'][:100]
                     if target_ids:
-                        id_str = b",".join([i if isinstance(i, bytes) else str(i).encode() for i in target_ids])
+                        sanitized_target_ids = [i.decode('utf-8', errors='ignore') if isinstance(i, bytes) else str(i) for i in target_ids]
+                        id_str = ",".join(sanitized_target_ids)
                         st_fetch, msg_data = mail.fetch(id_str, "(BODY.PEEK[HEADER.FIELDS (SUBJECT FROM DATE)])")
                         if st_fetch == "OK":
                             for resp in msg_data:
@@ -588,9 +599,9 @@ if 'imap_mail' in st.session_state:
         
         for num in page_ids:
             try:
-                num_str = num.decode('utf-8') if isinstance(num, bytes) else str(num)
+                num_str = num.decode('utf-8', errors='ignore') if isinstance(num, bytes) else str(num)
                 mail.select(f'"{safe_folder}"', readonly=True)
-                st_fetch, msg_data = mail.fetch(num_str.encode(), "(BODY.PEEK[HEADER.FIELDS (SUBJECT FROM DATE)] FLAGS)")
+                st_fetch, msg_data = mail.fetch(num_str, "(BODY.PEEK[HEADER.FIELDS (SUBJECT FROM DATE)] FLAGS)")
                 if st_fetch != "OK":
                     continue
                 
@@ -619,14 +630,14 @@ if 'imap_mail' in st.session_state:
                     with op_col1:
                         if st.button("👁 Mark Seen", key=f"seen_{selected_folder}_{num_str}"):
                             mail.select(f'"{safe_folder}"', readonly=False)
-                            mail.store(num_str.encode(), '+FLAGS', '\\Seen')
+                            mail.store(num_str, '+FLAGS', '\\Seen')
                             log_action(f"Marked message #{num_str} as seen")
                             st.success("Marked as seen!")
                             st.rerun()
                     with op_col2:
                         if st.button("🗑 Delete", key=f"del_{selected_folder}_{num_str}"):
                             mail.select(f'"{safe_folder}"', readonly=False)
-                            mail.store(num_str.encode(), '+FLAGS', '\\Deleted')
+                            mail.store(num_str, '+FLAGS', '\\Deleted')
                             mail.expunge()
                             log_action(f"Deleted message #{num_str}")
                             st.success("Message deleted!")
@@ -637,8 +648,8 @@ if 'imap_mail' in st.session_state:
                         if st.button("🚀 Confirm Move", key=f"move_btn_{selected_folder}_{num_str}"):
                             try:
                                 mail.select(f'"{safe_folder}"', readonly=False)
-                                mail.copy(num_str.encode(), target_move)
-                                mail.store(num_str.encode(), '+FLAGS', '\\Deleted')
+                                mail.copy(num_str, target_move)
+                                mail.store(num_str, '+FLAGS', '\\Deleted')
                                 mail.expunge()
                                 log_action(f"Moved message #{num_str} to {target_move}")
                                 st.success(f"Moved to {target_move} successfully!")
@@ -650,7 +661,7 @@ if 'imap_mail' in st.session_state:
                     if st.button(f"📥 Fetch & Parse Payload #{num_str}", key=f"load_body_{selected_folder}_{num_str}", type="primary"):
                         with st.spinner("Extracting payload through Bot Intelligence & Decoder engine..."):
                             mail.select(f'"{safe_folder}"', readonly=True)
-                            st_f, m_data = mail.fetch(num_str.encode(), "(RFC822)")
+                            st_f, m_data = mail.fetch(num_str, "(RFC822)")
                             raw_body_text = "Could not parse body."
                             full_raw_rfc822 = ""
                             
