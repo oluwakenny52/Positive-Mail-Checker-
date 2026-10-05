@@ -130,7 +130,7 @@ def decode_mime_header(header_value):
     except Exception:
         return str(header_value)
 
-# --- Universal Folder Discovery Engine (Comprehensive Webmail/Public/Private Crawler) ---
+# --- Universal Folder Discovery Engine (Exhaustive & Uncompromising Crawler) ---
 def discover_folders(mail):
     found = set()
     
@@ -142,18 +142,37 @@ def discover_folders(mail):
             return
         found.add(name)
 
-    # 1. Comprehensive list queries across multiple namespace reference configurations
-    reference_queries = [
+    # 1. IMAP NAMESPACE Extension (RFC 2342)
+    try:
+        ns_resp = mail.namespace()
+        if ns_resp[0] == 'OK' and ns_resp[1]:
+            for ns_tuple in ns_resp[1]:
+                if ns_tuple:
+                    ns_strs = re.findall(r'"((?:\\.|[^"\\])*)"', str(ns_tuple))
+                    for s in ns_strs:
+                        if len(s) <= 3 and ('/' in s or '.' in s or '\\' in s):
+                            continue
+                        add_folder(s)
+    except Exception:
+        pass
+
+    # 2. Universal LIST queries with all known reference & pattern combinations
+    ref_patterns = [
         ('""', '*'),
         ('""', '%'),
         ('""', ''),
         ('INBOX', '*'),
+        ('INBOX', '%'),
+        ('*', '*'),
+        ('%', '%'),
         ('#mhinbox', '*'),
-        ('""', '#mu*'),
+        ('#public', '*'),
+        ('#shared', '*'),
+        ('""', ' * '),
         ('""', '~/ *')
     ]
     
-    for ref, pattern in reference_queries:
+    for ref, pattern in ref_patterns:
         try:
             typ, data = mail.list(ref, pattern)
             if typ == "OK" and data:
@@ -173,54 +192,77 @@ def discover_folders(mail):
         except Exception:
             pass
 
-    # 2. Query LSUB (Subscribed folders)
-    try:
-        typ2, data2 = mail.lsub('""', '*')
-        if typ2 == "OK" and data2:
-            for it in data2:
-                if not it:
-                    continue
-                s = it.decode("utf-8", errors="ignore") if isinstance(it, bytes) else str(it)
-                quoted = re.findall(r'"((?:\\.|[^"\\])*)"', s)
-                if len(quoted) >= 2:
-                    add_folder(quoted[-1].replace('\\"', '"'))
-                elif quoted:
-                    add_folder(quoted[0].replace('\\"', '"'))
-                else:
-                    parts = s.split()
-                    if parts:
-                        add_folder(parts[-1])
-    except Exception:
-        pass
+    # 3. LSUB (Subscribed folders) crawl across multiple reference points
+    for ref, pattern in [('""', '*'), ('*', '*'), ('INBOX', '*')]:
+        try:
+            typ, data = mail.lsub(ref, pattern)
+            if typ == "OK" and data:
+                for it in data:
+                    if not it:
+                        continue
+                    s = it.decode("utf-8", errors="ignore") if isinstance(it, bytes) else str(it)
+                    quoted = re.findall(r'"((?:\\.|[^"\\])*)"', s)
+                    if len(quoted) >= 2:
+                        add_folder(quoted[-1].replace('\\"', '"'))
+                    elif quoted:
+                        add_folder(quoted[0].replace('\\"', '"'))
+                    else:
+                        parts = s.split()
+                        if parts:
+                            add_folder(parts[-1])
+        except Exception:
+            pass
 
-    # 3. Exhaustive fallback & standard schema scan across public, private, and webmail naming conventions
-    common_candidates = [
-        "INBOX", "Sent", "Sent Items", "Sent Messages", "Drafts", 
-        "Trash", "Deleted Items", "Junk", "Spam", "Archive", "Notes", "Outbox",
-        "Public", "Public Folders", "Shared", "Private", "Local Folders",
-        "[Gmail]/All Mail", "[Gmail]/Sent Mail", "[Gmail]/Trash", "[Gmail]/Spam", "[Gmail]/Drafts",
-        "INBOX.Sent", "INBOX.Trash", "INBOX.Drafts", "INBOX.Junk", "INBOX.Spam"
+    # 4. Recursive subfolder traversal for any discovered directory
+    initial_found = list(found)
+    for f in initial_found:
+        for delim in ('/', '.', '\\', '_'):
+            try:
+                _, sub_data = mail.list('""', f"{f}{delim}*")
+                if sub_data:
+                    for it in sub_data:
+                        if not it:
+                            continue
+                        s = it.decode("utf-8", errors="ignore") if isinstance(it, bytes) else str(it)
+                        quoted = re.findall(r'"((?:\\.|[^"\\])*)"', s)
+                        if quoted:
+                            add_folder(quoted[-1].replace('\\"', '"'))
+            except Exception:
+                pass
+
+    # 5. Exhaustive Dictionary Brute-Force across all public, private, local, and webmail naming conventions
+    exhaustive_dictionary = [
+        "INBOX", "Inbox", "inbox", "INBOX.Inbox",
+        "Sent", "Sent Items", "Sent Messages", "Sent Mail", "sent", "OUTBOX", "Outbox", "Drafts", "Draft", "drafts",
+        "Trash", "Deleted Items", "Deleted", "Trash Bin", "Bin", "Trash Can", "trash",
+        "Junk", "Spam", "Junk E-mail", "Bulk Mail", "Bulk", "spam", "junk",
+        "Archive", "Archives", "All Mail", "Starred", "Important", "Notes", "Chats", "Snoozed",
+        "Public", "Public Folders", "Shared", "Shared Folders", "Common", "Global",
+        "Private", "Personal", "Secret", "Confidential", "Local Folders", "User",
+        "INBOX.Sent", "INBOX.Trash", "INBOX.Drafts", "INBOX.Junk", "INBOX.Spam", "INBOX.Archive",
+        "INBOX/Sent", "INBOX/Trash", "INBOX/Drafts", "INBOX/Junk", "INBOX/Spam",
+        "[Gmail]/All Mail", "[Gmail]/Sent Mail", "[Gmail]/Trash", "[Gmail]/Spam", "[Gmail]/Drafts", "[Gmail]/Starred", "[Gmail]/Important",
+        "User.Sent", "User.Trash", "User.Drafts", "User.Junk", "User.Spam",
+        "Webmail", "Webmail/Inbox", "Webmail/Sent", "Webmail/Trash",
+        "Mail", "Mail/Inbox", "Mail/Sent", "Mail/Trash", "Mail/Drafts", "Mail/Spam"
     ]
     
-    for candidate in common_candidates:
-        for prefix in ('', '"', 'INBOX.'):
-            test_name = f"{prefix}{candidate}" if prefix != 'INBOX.' or not candidate.startswith('INBOX') else candidate
+    for candidate in exhaustive_dictionary:
+        try:
+            code, _ = mail.status(f'"{candidate}"', "(MESSAGES)")
+            if code == "OK":
+                add_folder(candidate)
+        except Exception:
             try:
-                code, _ = mail.status(f'"{test_name}"', "(MESSAGES)")
+                code, _ = mail.status(candidate, "(MESSAGES)")
                 if code == "OK":
-                    add_folder(test_name)
+                    add_folder(candidate)
             except Exception:
-                try:
-                    code, _ = mail.status(test_name, "(MESSAGES)")
-                    if code == "OK":
-                        add_folder(test_name)
-                except Exception:
-                    pass
+                pass
 
     if not found:
         found.add("INBOX")
         
-    # Sort nicely placing INBOX first, then alphabetical
     names = sorted(list(found), key=lambda x: (0 if x.lower() == "inbox" else 1, x.lower()))
     return names
 
