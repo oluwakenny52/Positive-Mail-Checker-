@@ -4,7 +4,10 @@ import email
 from email.header import decode_header
 import os
 import glob
-import pandas as pd
+import re
+import base64
+import quopri
+from urllib.parse import unquote
 import warnings
 
 warnings.filterwarnings("ignore")
@@ -118,9 +121,100 @@ def decode_mime_header(header_value):
     except Exception:
         return str(header_value)
 
+# --- Colab-Inspired Folder Discovery Engine ---
+def discover_folders(mail):
+    found = []
+    seen = set()
+    def add(name, flags=""):
+        name = (name or "").strip().strip('"').strip("'")
+        if not name or name in (".", "/", "\\", "NIL", "nil") or re.fullmatch(r"[\/.]+", name):
+            return
+        key = name.lower()
+        if key in seen:
+            return
+        seen.add(key)
+        found.append(name)
+        
+    try:
+        typ, data = mail.list()
+        if typ == "OK" and data:
+            for it in data:
+                s = it.decode("utf-8", errors="ignore") if isinstance(it, bytes) else str(it)
+                quoted = re.findall(r'"((?:\\.|[^"\\])*)"', s)
+                if quoted:
+                    add(quoted[-1].replace('\\"', '"'))
+                else:
+                    parts = s.split()
+                    if parts:
+                        add(parts[-1])
+    except Exception:
+        pass
+    
+    names = found if found else ["INBOX"]
+    if not any(n.upper() == "INBOX" for n in names):
+        names = ["INBOX"] + names
+    return names
+
+# --- Bobito Advanced Bot Engines & Decoders ---
+def detect_bot_indicators(subject, body):
+    text = f"{subject} {body}".lower()
+    flags = []
+    if any(k in text for k in ["otp", "code", "pin", "verification", "verify", "authentication"]):
+        flags.append("🔑 OTP / Verification")
+    if any(k in text for k in ["security", "alert", "suspicious", "login", "warning"]):
+        flags.append("🚨 Security Alert")
+    if any(k in text for k in ["reset", "password", "recover"]):
+        flags.append("🔐 Password Reset")
+    if any(k in text for k in ["confirm", "activation", "welcome"]):
+        flags.append("✨ Activation / Action")
+    return list(set(flags))
+
+def extract_actionable_pins(body):
+    pins = re.findall(r'\b(?<![\d-])(\d{4,8})(?![\d-])\b', body)
+    return list(set(pins))
+
+def extract_verification_links(body):
+    urls = re.findall(r'(https?://[^\s<>"]+|www\.[^\s<>"]+)', body)
+    clean_urls = []
+    for u in urls:
+        try:
+            clean_urls.append(unquote(u))
+        except Exception:
+            clean_urls.append(u)
+    return list(set(clean_urls))
+
+def clean_boilerplate_text(body_text):
+    clean_text = re.sub(r'<[^>]+>', '', body_text)
+    lines = clean_text.split('\n')
+    filtered_lines = []
+    for line in lines:
+        l_lower = line.lower()
+        if any(term in l_lower for term in ["unsubscribe", "privacy policy", "all rights reserved", "sent from my", "confidentiality notice"]):
+            continue
+        filtered_lines.append(line)
+    return "\n".join(filtered_lines).strip()
+
+def decode_payload_content(part_payload, content_transfer_encoding):
+    if not part_payload:
+        return ""
+    try:
+        encoding_lower = (content_transfer_encoding or "").lower()
+        if "base64" in encoding_lower:
+            return base64.b64decode(part_payload).decode("utf-8", errors="ignore")
+        elif "quoted-printable" in encoding_lower:
+            return quopri.decodestring(part_payload).decode("utf-8", errors="ignore")
+        else:
+            if isinstance(part_payload, bytes):
+                return part_payload.decode("utf-8", errors="ignore")
+            return str(part_payload)
+    except Exception:
+        if isinstance(part_payload, bytes):
+            return part_payload.decode("utf-8", errors="ignore")
+        return str(part_payload)
+
 # --- Bobito-Style Interface Header ---
 st.title("📥 Bobito Mailbox Reader & Portal Hub")
-st.markdown("High-performance IMAP inbox explorer optimized for mobile Safari and desktop sessions.")
+st.markdown("High-performance IMAP inbox explorer equipped with automated folder discovery, deep keyword search, and bot parsing engines.")
 
 valid_accs = load_valid_accounts()
 
@@ -134,35 +228,14 @@ custom_pass = st.sidebar.text_input("Or enter custom password", type="password",
 target_email = custom_email.strip() if custom_email.strip() else (selected_account.split(":")[0] if ":" in selected_account else "")
 target_pass = custom_pass.strip() if custom_pass.strip() else (selected_account.split(":")[1] if ":" in selected_account else "")
 
-# Persistent Session State Sync
 st.session_state['email'] = target_email
 st.session_state['password'] = target_pass
 
 server_host = st.sidebar.text_input("IMAP Server Host (Blank for Auto)", value="", key="mb_server_host")
-search_keyword = st.sidebar.text_input("Keyword Filter (Optional)", value="", placeholder="e.g. Netflix, Code, Verify", key="mb_search_keyword")
 
-st.sidebar.markdown("---")
-st.sidebar.subheader("📊 Pagination Settings")
-batch_size = st.sidebar.slider("Messages per Page", min_value=5, max_value=50, value=10, key="mb_batch_size")
+connect_pressed = st.button("📥 Connect & Discover Folders", type="primary", use_container_width=True, key="mb_connect_btn")
 
-# Main Action Controls
-connect_pressed = st.button("📥 Connect & Read IMAP Inbox", type="primary", use_container_width=True, key="mb_connect_btn")
-
-# --- Smart Webmail Portal Quick Bar ---
-if target_email:
-    portal_url = get_webmail_portal_url(target_email)
-    st.markdown("---")
-    st.subheader("🌐 Webmail & Credential Portal")
-    col_w1, col_w2 = st.columns([2, 2])
-    with col_w1:
-        st.markdown(f"**Target Portal:** `{portal_url}`")
-        st.link_button("🔗 Open Webmail Portal", portal_url, use_container_width=True)
-    with col_w2:
-        st.markdown(f"**Active Combo:** `{target_email}:{target_pass}`")
-        st.success("🟢 Ready for connection and secure token parsing.")
-    st.markdown("---")
-
-# --- IMAP Retrieval & Lazy Loading Execution ---
+# --- Connection & Session Management ---
 if connect_pressed:
     if not target_email or not target_pass:
         st.warning("⚠ Please provide a valid target email and password combo.")
@@ -174,71 +247,126 @@ if connect_pressed:
             try:
                 mail = imaplib.IMAP4_SSL(host, 993, timeout=12)
                 mail.login(target_email, target_pass)
-                mail.select("INBOX")
                 
-                # Search execution
-                if search_keyword.strip():
-                    status, response = mail.search(None, f'(SUBJECT "{search_keyword.strip()}")')
-                else:
-                    status, response = mail.search(None, "ALL")
-                    
-                if status != "OK":
-                    st.error("Failed to query mailbox messages.")
-                else:
-                    msg_nums = response[0].split()
-                    if not msg_nums:
-                        st.warning("No messages found matching criteria.")
-                        mail.logout()
-                    else:
-                        latest_nums = msg_nums[-batch_size:][::-1]
-                        lightweight_messages = []
-                        
-                        for num in latest_nums:
-                            st_fetch, msg_data = mail.fetch(num, "(BODY.PEEK[HEADER.FIELDS (SUBJECT FROM DATE)] FLAGS)")
-                            if st_fetch != "OK":
-                                continue
-                            
-                            subject, sender, date_str = "No Subject", "Unknown", "Unknown"
-                            for response_part in msg_data:
-                                if isinstance(response_part, tuple):
-                                    msg = email.message_from_bytes(response_part[1])
-                                    subject = decode_mime_header(msg.get("Subject", "No Subject"))
-                                    sender = decode_mime_header(msg.get("From", "Unknown"))
-                                    date_str = msg.get("Date", "Unknown")
-                            
-                            lightweight_messages.append({
-                                "id": num.decode(),
-                                "date": date_str,
-                                "sender": sender,
-                                "subject": subject,
-                                "imap_connection": mail
-                            })
-                        
-                        st.session_state['fetched_messages'] = lightweight_messages
-                        st.success(f"Successfully loaded {len(lightweight_messages)} inbox headers!")
+                # Discover all mail folders dynamically (Colab-inspired)
+                folders = discover_folders(mail)
+                st.session_state['imap_mail'] = mail
+                st.session_state['available_folders'] = folders
+                st.success(f"Successfully connected and discovered {len(folders)} mail folders!")
             except Exception as ex:
                 st.error(f"Connection error: {ex}")
 
-# Render Inbox Messages if Available in Session State
-if 'fetched_messages' in st.session_state and st.session_state['fetched_messages']:
-    st.markdown("### 📬 Inbox Message Stream")
+# --- Folder Selector & Advanced Search Hub ---
+if 'imap_mail' in st.session_state:
+    st.markdown("---")
+    st.subheader("📁 Folder Explorer & Deep Search")
     
-    tab_all, tab_unread = st.tabs(["📂 All Fetched", "⭐ Recent Quick View"])
-    
-    with tab_all:
-        for idx, item in enumerate(st.session_state['fetched_messages']):
-            with st.expander(f"✉ [{item['date']}] {item['sender'][:35]} — {item['subject'][:45]}"):
-                st.markdown(f"**From:** `{item['sender']}`")
-                st.markdown(f"**Subject:** `{item['subject']}`")
-                st.markdown(f"**Date:** `{item['date']}`")
-                st.markdown("---")
+    col_f1, col_f2 = st.columns([2, 2])
+    with col_f1:
+        selected_folder = st.selectbox("Select Mailbox Folder", options=st.session_state.get('available_folders', ["INBOX"]), key="mb_selected_folder")
+    with col_f2:
+        batch_size = st.slider("Messages per Page (Pagination)", min_value=10, max_value=100, value=40, key="mb_batch_size")
+
+    col_s1, col_s2, col_s3 = st.columns([3, 1, 1])
+    with col_s1:
+        search_query = st.text_input("Deep Keyword Search (Subject, Sender, or Text)", placeholder="e.g. Netflix, verify, security", key="mb_deep_search_query")
+    with col_s2:
+        search_scope = st.selectbox("Search Field", ["TEXT", "SUBJECT", "FROM"], key="mb_search_scope")
+    with col_s3:
+        sort_order = st.selectbox("Sort Order", ["Newest First", "Oldest First"], key="mb_sort_order")
+
+    col_btn1, col_btn2 = st.columns([1, 1])
+    with col_btn1:
+        load_folder_btn = st.button("📂 Load Folder Messages", type="primary", use_container_width=True)
+    with col_btn2:
+        search_btn = st.button("🔎 Execute Deep Search", use_container_width=True)
+
+    mail = st.session_state['imap_mail']
+
+    # Load Folder or Execute Search
+    if load_folder_btn or search_btn:
+        with st.spinner("Querying mailbox messages..."):
+            try:
+                mail.select(selected_folder)
+                if search_btn and search_query.strip():
+                    q = search_query.strip()
+                    scope = search_scope
+                    status, response = mail.search(None, f'({scope} "{q}")')
+                else:
+                    status, response = mail.search(None, "ALL")
                 
-                if st.button(f"📥 Load Full Message Body #{item['id']}", key=f"load_body_{item['id']}_{idx}"):
-                    with st.spinner("Fetching full payload from server..."):
-                        try:
-                            mail_conn = item['imap_connection']
-                            st_f, m_data = mail_conn.fetch(item['id'].encode(), "(RFC822)")
-                            body_text = "Could not parse body."
+                if status == "OK" and response and response[0]:
+                    msg_ids = response[0].split()
+                    if sort_order == "Newest First":
+                        msg_ids = msg_ids[::-1]
+                    st.session_state['current_msg_ids'] = msg_ids
+                    st.session_state['current_page'] = 0
+                    st.success(f"Found {len(msg_ids)} messages matching criteria.")
+                else:
+                    st.session_state['current_msg_ids'] = []
+                    st.warning("No messages found.")
+            except Exception as e:
+                st.error(f"Error querying folder: {e}")
+
+    # Display Paginated Message Stream
+    if 'current_msg_ids' in st.session_state and st.session_state['current_msg_ids']:
+        msg_ids = st.session_state['current_msg_ids']
+        total_msgs = len(msg_ids)
+        current_page = st.session_state.get('current_page', 0)
+        
+        max_page = max(0, (total_msgs - 1) // batch_size)
+        current_page = min(current_page, max_page)
+        st.session_state['current_page'] = current_page
+        
+        start_idx = current_page * batch_size
+        end_idx = min(start_idx + batch_size, total_msgs)
+        page_ids = msg_ids[start_idx:end_idx]
+
+        st.markdown(f"**Showing messages {start_idx + 1} to {end_idx} of {total_msgs}**")
+        
+        # Pagination Controls
+        p_col1, p_col2, p_col3 = st.columns([1, 2, 1])
+        with p_col1:
+            if st.button("◀ Previous Page") and current_page > 0:
+                st.session_state['current_page'] -= 1
+                st.rerun()
+        with p_col2:
+            st.markdown(f"<p style='text-align: center;'>Page {current_page + 1} of {max_page + 1}</p>", unsafe_allow_html=True)
+        with p_col3:
+            if st.button("Next Page ▶") and current_page < max_page:
+                st.session_state['current_page'] += 1
+                st.rerun()
+
+        st.markdown("---")
+        
+        # Render Headers for current page
+        for num in page_ids:
+            try:
+                st_fetch, msg_data = mail.fetch(num, "(BODY.PEEK[HEADER.FIELDS (SUBJECT FROM DATE)] FLAGS)")
+                if st_fetch != "OK":
+                    continue
+                
+                subject, sender, date_str = "No Subject", "Unknown", "Unknown"
+                for response_part in msg_data:
+                    if isinstance(response_part, tuple):
+                        msg = email.message_from_bytes(response_part[1])
+                        subject = decode_mime_header(msg.get("Subject", "No Subject"))
+                        sender = decode_mime_header(msg.get("From", "Unknown"))
+                        date_str = msg.get("Date", "Unknown")
+                
+                num_str = num.decode() if isinstance(num, bytes) else str(num)
+                
+                with st.expander(f"✉ [{date_str}] {sender[:30]} — {subject[:40]}"):
+                    st.markdown(f"**From:** `{sender}`")
+                    st.markdown(f"**Subject:** `{subject}`")
+                    st.markdown(f"**Date:** `{date_str}`")
+                    st.markdown("---")
+                    
+                    if st.button(f"📥 Fetch & Parse Payload #{num_str}", key=f"load_body_{num_str}"):
+                        with st.spinner("Extracting payload through Bot Intelligence & Decoder engine..."):
+                            st_f, m_data = mail.fetch(num, "(RFC822)")
+                            raw_body_text = "Could not parse body."
+                            
                             if st_f == "OK":
                                 for part in m_data:
                                     if isinstance(part, tuple):
@@ -247,18 +375,38 @@ if 'fetched_messages' in st.session_state and st.session_state['fetched_messages
                                             for subpart in full_msg.walk():
                                                 if subpart.get_content_type() == "text/plain":
                                                     payload = subpart.get_payload(decode=True)
+                                                    encoding = subpart.get("Content-Transfer-Encoding")
                                                     if payload:
-                                                        body_text = payload.decode("utf-8", errors="ignore")
+                                                        raw_body_text = decode_payload_content(payload, encoding)
                                                         break
                                         else:
                                             payload = full_msg.get_payload(decode=True)
+                                            encoding = full_msg.get("Content-Transfer-Encoding")
                                             if payload:
-                                                body_text = payload.decode("utf-8", errors="ignore")
-                            st.text_area("Message Content", body_text, height=200, key=f"body_area_{item['id']}")
-                        except Exception as ex:
-                            st.error(f"Error loading body: {ex}")
+                                                raw_body_text = decode_payload_content(payload, encoding)
                             
-    with tab_unread:
-        st.info("💡 Tip: Use the 'Load Full Message Body' button inside each card above to inspect verification links or OTP codes instantly.")
-        for item in st.session_state['fetched_messages'][:5]:
-            st.markdown(f"- **{item['subject']}** (`{item['date']}`)")
+                            bot_flags = detect_bot_indicators(subject, raw_body_text)
+                            extracted_pins = extract_actionable_pins(raw_body_text)
+                            extracted_links = extract_verification_links(raw_body_text)
+                            cleaned_content = clean_boilerplate_text(raw_body_text)
+                            
+                            if bot_flags:
+                                st.markdown("### 🤖 Bot Intelligence Detected")
+                                cols = st.columns(len(bot_flags))
+                                for c_idx, flag in enumerate(bot_flags):
+                                    with cols[c_idx]:
+                                        st.warning(flag)
+                            
+                            if extracted_pins:
+                                st.success(f"🔑 **Extracted Verification PIN(s):** `{'`, `'.join(extracted_pins)}`")
+                            
+                            if extracted_links:
+                                st.markdown("##### 🔗 Actionable Verification Links")
+                                for l_idx, link in enumerate(extracted_links[:3]):
+                                    st.link_button(f"🚀 Open Link #{l_idx+1}", link, use_container_width=True)
+                            
+                            st.markdown("---")
+                            st.markdown("##### 🧹 Cleaned Core Message Body")
+                            st.text_area("Parsed Text", cleaned_content, height=220, key=f"body_area_{num_str}")
+            except Exception as ex:
+                st.error(f"Error loading message {num}: {ex}")
