@@ -19,15 +19,13 @@ st.set_page_config(
 
 # Keep-Alive Injector Script for Mobile / Safari Sessions
 st.markdown(
-    """
-    <script>
+    """<script>
     setInterval(function() {
         fetch('/_stcore/health').then(function(res) {
             // Keep connection alive
         }).catch(function(err) {});
     }, 25000);
-    </script>
-    """,
+    </script>""",
     unsafe_allow_html=True
 )
 
@@ -192,19 +190,15 @@ if connect_pressed:
                         st.warning("No messages found matching criteria.")
                         mail.logout()
                     else:
-                        # Slice messages based on pagination batch size (Latest first)
                         latest_nums = msg_nums[-batch_size:][::-1]
-                        
-                        # Store lightweight header dictionaries first (Lazy loading pattern)
                         lightweight_messages = []
                         
                         for num in latest_nums:
-                            # Fetch headers & flags first without pulling massive body payloads instantly
                             st_fetch, msg_data = mail.fetch(num, "(BODY.PEEK[HEADER.FIELDS (SUBJECT FROM DATE)] FLAGS)")
                             if st_fetch != "OK":
                                 continue
                             
-                            subject, sender, date_str, is_read = "No Subject", "Unknown", "Unknown", False
+                            subject, sender, date_str = "No Subject", "Unknown", "Unknown"
                             for response_part in msg_data:
                                 if isinstance(response_part, tuple):
                                     msg = email.message_from_bytes(response_part[1])
@@ -217,10 +211,9 @@ if connect_pressed:
                                 "date": date_str,
                                 "sender": sender,
                                 "subject": subject,
-                                "imap_connection": mail # Kept reference for lazy body fetching on expand
+                                "imap_connection": mail
                             })
                         
-                        # Store in session state for UI persistence across tabs/filters
                         st.session_state['fetched_messages'] = lightweight_messages
                         st.success(f"Successfully loaded {len(lightweight_messages)} inbox headers!")
 
@@ -228,19 +221,16 @@ if connect_pressed:
 if 'fetched_messages' in st.session_state and st.session_state['fetched_messages']:
     st.markdown("### 📬 Inbox Message Stream")
     
-    # Filter Tabs for quick views
     tab_all, tab_unread = st.tabs(["📂 All Fetched", "⭐ Recent Quick View"])
     
     with tab_all:
         for idx, item in enumerate(st.session_state['fetched_messages']):
-            # Bobito mobile-friendly card container layout
             with st.expander(f"✉ [{item['date']}] {item['sender'][:35]} — {item['subject'][:45]}"):
                 st.markdown(f"**From:** `{item['sender']}`")
                 st.markdown(f"**Subject:** `{item['subject']}`")
                 st.markdown(f"**Date:** `{item['date']}`")
                 st.markdown("---")
                 
-                # Lazy load full body content only when expander is tapped/opened
                 if st.button(f"📥 Load Full Message Body #{item['id']}", key=f"load_body_{item['id']}_{idx}"):
                     with st.spinner("Fetching full payload from server..."):
                         try:
