@@ -130,7 +130,7 @@ def decode_mime_header(header_value):
     except Exception:
         return str(header_value)
 
-# --- Universal Folder Discovery Engine (Robust & Recursive) ---
+# --- Universal Folder Discovery Engine (Comprehensive Webmail/Public/Private Crawler) ---
 def discover_folders(mail):
     found = set()
     
@@ -142,25 +142,36 @@ def discover_folders(mail):
             return
         found.add(name)
 
-    # 1. Query standard LIST command with empty reference name
-    try:
-        typ, data = mail.list('""', '*')
-        if typ == "OK" and data:
-            for it in data:
-                if not it:
-                    continue
-                s = it.decode("utf-8", errors="ignore") if isinstance(it, bytes) else str(it)
-                quoted = re.findall(r'"((?:\\.|[^"\\])*)"', s)
-                if len(quoted) >= 2:
-                    add_folder(quoted[-1].replace('\\"', '"'))
-                elif quoted:
-                    add_folder(quoted[0].replace('\\"', '"'))
-                else:
-                    parts = s.split()
-                    if parts:
-                        add_folder(parts[-1])
-    except Exception:
-        pass
+    # 1. Comprehensive list queries across multiple namespace reference configurations
+    reference_queries = [
+        ('""', '*'),
+        ('""', '%'),
+        ('""', ''),
+        ('INBOX', '*'),
+        ('#mhinbox', '*'),
+        ('""', '#mu*'),
+        ('""', '~/ *')
+    ]
+    
+    for ref, pattern in reference_queries:
+        try:
+            typ, data = mail.list(ref, pattern)
+            if typ == "OK" and data:
+                for it in data:
+                    if not it:
+                        continue
+                    s = it.decode("utf-8", errors="ignore") if isinstance(it, bytes) else str(it)
+                    quoted = re.findall(r'"((?:\\.|[^"\\])*)"', s)
+                    if len(quoted) >= 2:
+                        add_folder(quoted[-1].replace('\\"', '"'))
+                    elif quoted:
+                        add_folder(quoted[0].replace('\\"', '"'))
+                    else:
+                        parts = s.split()
+                        if parts:
+                            add_folder(parts[-1])
+        except Exception:
+            pass
 
     # 2. Query LSUB (Subscribed folders)
     try:
@@ -182,25 +193,29 @@ def discover_folders(mail):
     except Exception:
         pass
 
-    # 3. Explicit fallback checks for standard folders across various provider schemas
+    # 3. Exhaustive fallback & standard schema scan across public, private, and webmail naming conventions
     common_candidates = [
         "INBOX", "Sent", "Sent Items", "Sent Messages", "Drafts", 
-        "Trash", "Deleted Items", "Junk", "Spam", "Archive",
-        "[Gmail]/All Mail", "[Gmail]/Sent Mail", "[Gmail]/Trash", "[Gmail]/Spam"
+        "Trash", "Deleted Items", "Junk", "Spam", "Archive", "Notes", "Outbox",
+        "Public", "Public Folders", "Shared", "Private", "Local Folders",
+        "[Gmail]/All Mail", "[Gmail]/Sent Mail", "[Gmail]/Trash", "[Gmail]/Spam", "[Gmail]/Drafts",
+        "INBOX.Sent", "INBOX.Trash", "INBOX.Drafts", "INBOX.Junk", "INBOX.Spam"
     ]
     
     for candidate in common_candidates:
-        try:
-            code, _ = mail.status(f'"{candidate}"', "(MESSAGES)")
-            if code == "OK":
-                add_folder(candidate)
-        except Exception:
+        for prefix in ('', '"', 'INBOX.'):
+            test_name = f"{prefix}{candidate}" if prefix != 'INBOX.' or not candidate.startswith('INBOX') else candidate
             try:
-                code, _ = mail.status(candidate, "(MESSAGES)")
+                code, _ = mail.status(f'"{test_name}"', "(MESSAGES)")
                 if code == "OK":
-                    add_folder(candidate)
+                    add_folder(test_name)
             except Exception:
-                pass
+                try:
+                    code, _ = mail.status(test_name, "(MESSAGES)")
+                    if code == "OK":
+                        add_folder(test_name)
+                except Exception:
+                    pass
 
     if not found:
         found.add("INBOX")
@@ -348,7 +363,7 @@ if connect_pressed:
         
         with st.spinner(f"Connecting to IMAP secure gateway **{host}:993**..."):
             try:
-                mail = imaplib.IMAP4_SSL(host, 993, timeout=15)
+                mail = imaplib.IMAP4_SSL(host, 993, timeout=20)
                 mail.login(target_email, target_pass)
                 
                 folders = discover_folders(mail)
@@ -441,23 +456,29 @@ if 'imap_mail' in st.session_state:
             mass_clean_btn = st.button("🗑 Mass Delete Previewed Bots", use_container_width=True, type="primary")
             
         if preview_bots_btn:
-            with st.spinner("Scanning headers for bot and spam messages..."):
+            with st.spinner("Scanning headers for bot and spam messages (Batched)..."):
                 try:
                     mail.select(f'"{safe_folder}"', readonly=True)
                     flagged_bots = []
-                    for num in st.session_state['current_msg_ids']:
-                        num_str = num.decode('utf-8') if isinstance(num, bytes) else str(num)
-                        st_fetch, msg_data = mail.fetch(num_str.encode(), "(BODY.PEEK[HEADER.FIELDS (SUBJECT FROM DATE)])")
+                    target_ids = st.session_state['current_msg_ids'][:100]
+                    if target_ids:
+                        id_str = b",".join([i if isinstance(i, bytes) else str(i).encode() for i in target_ids])
+                        st_fetch, msg_data = mail.fetch(id_str, "(BODY.PEEK[HEADER.FIELDS (SUBJECT FROM DATE)])")
                         if st_fetch == "OK":
-                            sub, snd, dt = "", "", ""
                             for resp in msg_data:
                                 if isinstance(resp, tuple):
+                                    header_part = resp[0]
+                                    num_match = re.search(r'^(\d+)', header_part.decode('utf-8', errors='ignore'))
+                                    num_str = num_match.group(1) if num_match else "?"
+                                    
                                     m = email.message_from_bytes(resp[1])
                                     sub = decode_mime_header(m.get("Subject", ""))
                                     snd = decode_mime_header(m.get("From", ""))
                                     dt = m.get("Date", "")
-                            if is_bot_message(sub, snd):
-                                flagged_bots.append({"id": num_str, "subject": sub, "sender": snd, "date": dt})
+                                    
+                                    if is_bot_message(sub, snd):
+                                        flagged_bots.append({"id": num_str, "subject": sub, "sender": snd, "date": dt})
+                                        
                     st.session_state['flagged_bot_list'] = flagged_bots
                     log_action(f"Scanned and found {len(flagged_bots)} potential bot messages.")
                     st.success(f"Scan complete! Found {len(flagged_bots)} bot/spam messages. Preview them below before deleting.")
