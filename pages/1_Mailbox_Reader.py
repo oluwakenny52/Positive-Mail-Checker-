@@ -287,7 +287,11 @@ if target_email:
     st.sidebar.subheader("🌐 Webmail Portal Quick Access")
     st.sidebar.markdown(f"**Target Webmail URL:**\n`{portal_url}`")
     st.sidebar.link_button("• Open Webmail Portal in New Tab", portal_url, use_container_width=True)
-    st.sidebar.markdown(f"**Selected Combo:**\n`{target_email}`")
+    
+    # Active Combo made fully copyable via text_input
+    active_combo = f"{target_email}:{target_pass}" if target_pass else target_email
+    st.sidebar.text_input("Selected Combo (Copyable)", value=active_combo, key="mb_copyable_combo")
+    
     st.sidebar.markdown("**Option:** `Active IMAP Session`")
 
 # Action Log Sidebar Viewer
