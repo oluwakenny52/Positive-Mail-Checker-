@@ -84,7 +84,7 @@ str_lit.markdown("""
 """, unsafe_allow_html=True)
 
 str_lit.title("⚡ Mega Ultimate Mail Checker v11.5 (Tri-Mode Edition)")
-str_lit.markdown("Asynchronous proxy-backed mail validation engine featuring Fast Mode, Normal Mode, and Deep/Aggressive Mode with DNS MX pre-filtering and adaptive circuit breakers.")
+str_lit.markdown("Asynchronous proxy-backed mail validation engine featuring Fast Mode, Normal Mode, and Deep/Aggressive Mode with prioritized fallback queue logic and adaptive circuit breakers.")
 
 # --- Persistent Session State Initialization ---
 if "engine_has_run" not in str_lit.session_state:
@@ -1077,7 +1077,6 @@ PROVIDER_MAP = {
 
 PUBLIC_PROVIDERS = set(PROVIDER_MAP.keys())
 
-# Pre-configured mapping dictionary for known alias domains / parent mappings
 PARENT_PROVIDER_MAPPINGS = {
     "memoad.jp": "biglobe.ne.jp"
 }
@@ -1093,7 +1092,6 @@ def get_mx_hosts(domain):
         return []
 
 def detect_parent_provider(domain):
-    # Step 4: Dynamic DNS Inspection & Parent Provider Mapping
     if domain in PARENT_PROVIDER_MAPPINGS:
         return PARENT_PROVIDER_MAPPINGS[domain]
     
@@ -1110,6 +1108,34 @@ def detect_parent_provider(domain):
             return "yahoo.com"
     return None
 
+def generate_candidate_hosts(domain: str, mx_records: list = None) -> list:
+    candidates = []
+    
+    # 1. Primary & Secondary: Direct standard patterns on the custom domain
+    standard_prefixes = ['imap', 'mail', 'pop', 'pop3', 'secure']
+    for prefix in standard_prefixes:
+        candidates.append(f"{prefix}.{domain}")
+    
+    # 2. Add raw custom domain as a fallback
+    candidates.append(domain)
+    
+    # 3. Tertiary/Quaternary: Extract root domains from MX records if available
+    if mx_records:
+        for mx in mx_records:
+            # Extract root domain or add mx hostname directly if useful
+            candidates.append(mx)
+            
+            # Extract parent domain (e.g., mx01.t-online.de -> t-online.de)
+            parts = mx.split('.')
+            if len(parts) >= 2:
+                parent_domain = f"{parts[-2]}.{parts[-1]}"
+                if parent_domain != domain:
+                    for prefix in ['imap', 'mail', 'pop']:
+                        candidates.append(f"{prefix}.{parent_domain}")
+
+    # Deduplicate while preserving order
+    return list(dict.fromkeys(candidates))
+
 def get_servers(email):
     try:
         domain = email.split("@")[-1].lower().strip()
@@ -1123,52 +1149,14 @@ def get_servers(email):
         if domain in PROVIDER_MAP:
             return PROVIDER_MAP[domain]
 
-        imap_list = []
-        pop_list = []
-        pop3_list = []
+        mx_records = get_mx_hosts(domain)
+        candidate_hosts = generate_candidate_hosts(domain, mx_records)
 
-        # Step 2: Primary Check - Direct MX Record Lookup & Connection
-        mx = get_mx_hosts(domain)
-        for m in mx:
-            if "google" in m or "gmail" in m:
-                imap_list.append("imap.gmail.com")
-                pop_list.append("pop.gmail.com")
-                pop3_list.append("pop.gmail.com")
-            elif "outlook" in m or "protection.outlook" in m:
-                imap_list.append("outlook.office365.com")
-                pop_list.append("outlook.office365.com")
-                pop3_list.append("outlook.office365.com")
-            elif "yahoo" in m:
-                imap_list.append("imap.mail.yahoo.com")
-                pop_list.append("pop.mail.yahoo.com")
-                pop3_list.append("pop.mail.yahoo.com")
-            else:
-                imap_list.append(m)
-                pop_list.append(m)
-                pop3_list.append(m)
-
-        # Step 3: Secondary Check - Direct Pattern Fallback
-        direct_patterns = [
-            f"imap.{domain}", f"mail.{domain}", f"pop.{domain}", f"pop3.{domain}", domain
-        ]
-        imap_list.extend(direct_patterns)
-        pop_list.extend(direct_patterns)
-        pop3_list.extend(direct_patterns)
-
-        # Step 4 & 5: Parent Provider Detection & Pattern Fallback
-        parent_domain = detect_parent_provider(domain)
-        if parent_domain:
-            parent_patterns = [
-                f"mail.{parent_domain}", f"imap.{parent_domain}", f"pop.{parent_domain}", f"pop3.{parent_domain}", parent_domain
-            ]
-            imap_list.extend(parent_patterns)
-            pop_list.extend(parent_patterns)
-            pop3_list.extend(parent_patterns)
-        
+        # Normalize across IMAP, POP, and POP3 queues
         servers = {
-            "imap": list(dict.fromkeys(imap_list)),
-            "pop": list(dict.fromkeys(pop_list)),
-            "pop3": list(dict.fromkeys(pop3_list))
+            "imap": candidate_hosts,
+            "pop": candidate_hosts,
+            "pop3": candidate_hosts
         }
         
         with cache_lock:
@@ -1182,11 +1170,11 @@ def get_servers(email):
     except Exception as e:
         warnings.warn(f"Error resolving servers for {email}: {e}")
         d = email.split('@')[-1] if '@' in email else 'localhost'
-        fallback_patterns = [f"mail.{d}", f"imap.{d}", f"pop.{d}", f"pop3.{d}", d]
+        fallback_patterns = generate_candidate_hosts(d, [])
         return {
-            "imap": list(dict.fromkeys(fallback_patterns)),
-            "pop": list(dict.fromkeys(fallback_patterns)),
-            "pop3": list(dict.fromkeys(fallback_patterns))
+            "imap": fallback_patterns,
+            "pop": fallback_patterns,
+            "pop3": fallback_patterns
         }
 
 def precheck_proxy_fast(proxy_str):
@@ -1532,7 +1520,7 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, 
             return None, "need_app_password", "Zero-Access Architecture | Protocol: Local API / Bridge", None, trace_logs
 
         proxy_mode = CFG.get("PROXY_MODE", "aggressive")
-        prefer_insecure = True # Force soft/unverified SSL fallbacks
+        prefer_insecure = True
         
         px = None
         if proxy_pool and proxy_mode != "off":
@@ -1549,7 +1537,7 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, 
         if proxy_mode == "fallback" and px:
             proxies_to_try.append(None)
 
-        max_attempts = 1 if CFG.get("FAST_MODE", True) else min(len(conf.get("imap", [])), 4)
+        max_attempts = 1 if CFG.get("FAST_MODE", True) else min(len(conf.get("imap", [])), 6)
 
         for current_px in proxies_to_try:
             if current_px and not precheck_proxy_fast(current_px):
