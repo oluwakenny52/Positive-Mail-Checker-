@@ -216,6 +216,8 @@ if connect_pressed:
                         
                         st.session_state['fetched_messages'] = lightweight_messages
                         st.success(f"Successfully loaded {len(lightweight_messages)} inbox headers!")
+            except Exception as ex:
+                st.error(f"Connection error: {ex}")
 
 # Render Inbox Messages if Available in Session State
 if 'fetched_messages' in st.session_state and st.session_state['fetched_messages']:
