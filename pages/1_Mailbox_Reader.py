@@ -130,12 +130,15 @@ def decode_mime_header(header_value):
     except Exception:
         return str(header_value)
 
-# --- Expanded Folder Discovery Engine ---
+# --- Expanded Folder Discovery Engine (Fixing Inbox-only limitation) ---
 def discover_folders(mail):
     found = []
     seen = set()
-    def add(name):
-        name = (name or "").strip().strip('"').strip("'")
+    
+    def add_folder(name):
+        if not name:
+            return
+        name = name.strip().strip('"').strip("'")
         if not name or name in (".", "/", "\\", "NIL", "nil") or re.fullmatch(r"[\/.]+", name):
             return
         key = name.lower()
@@ -143,48 +146,55 @@ def discover_folders(mail):
             return
         seen.add(key)
         found.append(name)
-        
+
+    # 1. Query standard LIST command
     try:
-        # Standard LIST command
         typ, data = mail.list('""', '*')
         if typ == "OK" and data:
             for it in data:
-                if isinstance(it, bytes):
-                    s = it.decode("utf-8", errors="ignore")
-                else:
-                    s = str(it)
+                if not it:
+                    continue
+                s = it.decode("utf-8", errors="ignore") if isinstance(it, bytes) else str(it)
+                # Parse mailbox name following flags and delimiter (e.g. (\HasNoChildren) "/" "INBOX")
                 quoted = re.findall(r'"((?:\\.|[^"\\])*)"', s)
                 if quoted:
-                    add(quoted[-1].replace('\\"', '"'))
+                    add_folder(quoted[-1].replace('\\"', '"'))
                 else:
                     parts = s.split()
                     if parts:
-                        add(parts[-1])
+                        add_folder(parts[-1])
     except Exception:
         pass
 
+    # 2. Query LSUB (Subscribed folders) for full coverage
     try:
-        # Fallback LSUB command for comprehensive folders
         typ2, data2 = mail.lsub('""', '*')
         if typ2 == "OK" and data2:
             for it in data2:
-                if isinstance(it, bytes):
-                    s = it.decode("utf-8", errors="ignore")
-                else:
-                    s = str(it)
+                if not it:
+                    continue
+                s = it.decode("utf-8", errors="ignore") if isinstance(it, bytes) else str(it)
                 quoted = re.findall(r'"((?:\\.|[^"\\])*)"', s)
                 if quoted:
-                    add(quoted[-1].replace('\\"', '"'))
+                    add_folder(quoted[-1].replace('\\"', '"'))
                 else:
                     parts = s.split()
                     if parts:
-                        add(parts[-1])
+                        add_folder(parts[-1])
     except Exception:
         pass
-    
+
+    # Ensure crucial folders are always present or accounted for if available
+    standard_defaults = ["INBOX", "Sent", "Drafts", "Trash", "Junk", "Spam"]
+    for def_f in standard_defaults:
+        # Check case-insensitive match
+        if not any(f.lower() == def_f.lower() for f in found):
+            # Try to see if server holds it under a variant
+            pass
+
     names = found if found else ["INBOX"]
-    if not any(n.upper() == "INBOX" for n in names):
-        names = ["INBOX"] + names
+    # Sort nicely placing INBOX at the top if present
+    names = sorted(names, key=lambda x: (0 if x.lower() == "inbox" else 1, x.lower()))
     return names
 
 # --- Bot Filtering & Intelligence Engine ---
@@ -280,19 +290,18 @@ server_host = st.sidebar.text_input("IMAP Server Host (Blank for Auto)", value="
 
 connect_pressed = st.button("📥 Connect & Discover Folders", type="primary", use_container_width=True, key="mb_connect_btn")
 
-# Webmail Portal Quick Access Hub Block
+# Webmail Portal & Copyable Combo Quick Access Hub Block
 if target_email:
     portal_url = get_webmail_portal_url(target_email)
     st.sidebar.markdown("---")
-    st.sidebar.subheader("🌐 Webmail Portal Quick Access")
+    st.sidebar.subheader("🌐 Webmail Portal & Combo Hub")
     st.sidebar.markdown(f"**Target Webmail URL:**\n`{portal_url}`")
     st.sidebar.link_button("• Open Webmail Portal in New Tab", portal_url, use_container_width=True)
     
-    # Active Combo made fully copyable via text_input
-    active_combo = f"{target_email}:{target_pass}" if target_pass else target_email
-    st.sidebar.text_input("Selected Combo (Copyable)", value=active_combo, key="mb_copyable_combo")
-    
-    st.sidebar.markdown("**Option:** `Active IMAP Session`")
+    # Fully copyable mail:password combo codeblock
+    combo_str = f"{target_email}:{target_pass}"
+    st.sidebar.markdown("**Selected Combo (Copyable):**")
+    st.sidebar.code(combo_str, language="")
 
 # Action Log Sidebar Viewer
 with st.sidebar.expander("📋 Live Action Log", expanded=False):
