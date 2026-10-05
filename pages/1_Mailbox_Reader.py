@@ -130,10 +130,9 @@ def decode_mime_header(header_value):
     except Exception:
         return str(header_value)
 
-# --- Universal Folder Discovery Engine (Comprehensive mapping) ---
+# --- Universal Folder Discovery Engine (Robust & Recursive) ---
 def discover_folders(mail):
-    found = []
-    seen = set()
+    found = set()
     
     def add_folder(name):
         if not name:
@@ -141,13 +140,9 @@ def discover_folders(mail):
         name = name.strip().strip('"').strip("'")
         if not name or name in (".", "/", "\\", "NIL", "nil") or re.fullmatch(r"[\/.]+", name):
             return
-        key = name.lower()
-        if key in seen:
-            return
-        seen.add(key)
-        found.append(name)
+        found.add(name)
 
-    # 1. Query standard LIST command
+    # 1. Query standard LIST command with empty reference name
     try:
         typ, data = mail.list('""', '*')
         if typ == "OK" and data:
@@ -156,8 +151,10 @@ def discover_folders(mail):
                     continue
                 s = it.decode("utf-8", errors="ignore") if isinstance(it, bytes) else str(it)
                 quoted = re.findall(r'"((?:\\.|[^"\\])*)"', s)
-                if quoted:
+                if len(quoted) >= 2:
                     add_folder(quoted[-1].replace('\\"', '"'))
+                elif quoted:
+                    add_folder(quoted[0].replace('\\"', '"'))
                 else:
                     parts = s.split()
                     if parts:
@@ -174,8 +171,10 @@ def discover_folders(mail):
                     continue
                 s = it.decode("utf-8", errors="ignore") if isinstance(it, bytes) else str(it)
                 quoted = re.findall(r'"((?:\\.|[^"\\])*)"', s)
-                if quoted:
+                if len(quoted) >= 2:
                     add_folder(quoted[-1].replace('\\"', '"'))
+                elif quoted:
+                    add_folder(quoted[0].replace('\\"', '"'))
                 else:
                     parts = s.split()
                     if parts:
@@ -183,18 +182,31 @@ def discover_folders(mail):
     except Exception:
         pass
 
-    # Fallback standard checks if server supports them directly
-    for candidate in ["INBOX", "Sent", "Drafts", "Trash", "Junk", "Spam", "[Gmail]/Sent Mail", "[Gmail]/Trash", "[Gmail]/Spam"]:
+    # 3. Explicit fallback checks for standard folders across various provider schemas
+    common_candidates = [
+        "INBOX", "Sent", "Sent Items", "Sent Messages", "Drafts", 
+        "Trash", "Deleted Items", "Junk", "Spam", "Archive",
+        "[Gmail]/All Mail", "[Gmail]/Sent Mail", "[Gmail]/Trash", "[Gmail]/Spam"
+    ]
+    
+    for candidate in common_candidates:
         try:
-            code, _ = mail.status(candidate, "(MESSAGES)")
+            code, _ = mail.status(f'"{candidate}"', "(MESSAGES)")
             if code == "OK":
                 add_folder(candidate)
         except Exception:
-            pass
+            try:
+                code, _ = mail.status(candidate, "(MESSAGES)")
+                if code == "OK":
+                    add_folder(candidate)
+            except Exception:
+                pass
 
-    names = found if found else ["INBOX"]
-    # Sort nicely placing INBOX first
-    names = sorted(names, key=lambda x: (0 if x.lower() == "inbox" else 1, x.lower()))
+    if not found:
+        found.add("INBOX")
+        
+    # Sort nicely placing INBOX first, then alphabetical
+    names = sorted(list(found), key=lambda x: (0 if x.lower() == "inbox" else 1, x.lower()))
     return names
 
 # --- Bot Filtering & Intelligence Engine ---
