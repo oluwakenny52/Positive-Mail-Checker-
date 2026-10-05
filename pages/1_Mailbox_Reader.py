@@ -9,14 +9,21 @@ import warnings
 
 warnings.filterwarnings("ignore")
 
-# Keep-Alive Injector Script
+# Page Config for Mobile & Desktop Responsive Layout
+st.set_page_config(
+    page_title="Mailbox Reader & Portal Hub",
+    page_icon="📥",
+    layout="wide",
+    initial_sidebar_state="expanded"
+)
+
+# Keep-Alive Injector Script for Mobile / Safari Sessions
 st.markdown(
     """
     <script>
-    // Simple Streamlit Keep-Alive Poller
     setInterval(function() {
         fetch('/_stcore/health').then(function(res) {
-            // Ping to maintain connection
+            // Keep connection alive
         }).catch(function(err) {});
     }, 25000);
     </script>
@@ -52,15 +59,12 @@ def load_valid_accounts():
 def guess_imap_server(email_addr):
     try:
         domain = email_addr.split("@")[-1].lower()
-        
-        # Explicit Provider Configurations for custom and major hosts
         PROVIDER_CONFIGS = {
             "mideon.nir.jp": {
                 "imap_host": "imap.cyberhome.ne.jp",
                 "imap_port": 993,
             }
         }
-        
         if domain in PROVIDER_CONFIGS:
             return PROVIDER_CONFIGS[domain]["imap_host"]
             
@@ -82,12 +86,9 @@ def guess_imap_server(email_addr):
 def get_webmail_portal_url(email_addr):
     try:
         domain = email_addr.split("@")[-1].lower()
-        
-        # Explicit Portal URL Configurations
         PORTAL_CONFIGS = {
             "mideon.nir.jp": "https://wmail.cyberhome.ne.jp"
         }
-        
         if domain in PORTAL_CONFIGS:
             return PORTAL_CONFIGS[domain]
             
@@ -102,20 +103,31 @@ def get_webmail_portal_url(email_addr):
             "aol.com": "https://mail.aol.com",
             "zoho.com": "https://mail.zoho.com"
         }
-        if domain in mapping:
-            return mapping[domain]
-        else:
-            return f"https://mail.{domain}"
+        return mapping.get(domain, f"https://mail.{domain}")
     except Exception:
         return "https://google.com"
 
-# Main Page Interface
-st.title("📥 Mailbox Reader & Webmail Portal Hub")
-st.markdown("Connects to verified valid IMAP inboxes or launches direct Webmail portal access with smart credential helpers.")
+def decode_mime_header(header_value):
+    try:
+        decoded_parts = decode_header(header_value)
+        result = ""
+        for part, encoding in decoded_parts:
+            if isinstance(part, bytes):
+                result += part.decode(encoding or "utf-8", errors="ignore")
+            else:
+                result += str(part)
+        return result
+    except Exception:
+        return str(header_value)
+
+# --- Bobito-Style Interface Header ---
+st.title("📥 Bobito Mailbox Reader & Portal Hub")
+st.markdown("High-performance IMAP inbox explorer optimized for mobile Safari and desktop sessions.")
 
 valid_accs = load_valid_accounts()
 
-st.sidebar.header("⚙ Reader & Portal Configuration")
+# --- Sidebar Configuration Hub ---
+st.sidebar.header("⚙ Reader & Portal Config")
 selected_account = st.sidebar.selectbox("Select Valid Account", options=valid_accs if valid_accs else ["No valid accounts found"], key="mb_selected_account")
 
 custom_email = st.sidebar.text_input("Or enter custom email", key="mb_custom_email")
@@ -124,118 +136,137 @@ custom_pass = st.sidebar.text_input("Or enter custom password", type="password",
 target_email = custom_email.strip() if custom_email.strip() else (selected_account.split(":")[0] if ":" in selected_account else "")
 target_pass = custom_pass.strip() if custom_pass.strip() else (selected_account.split(":")[1] if ":" in selected_account else "")
 
-# Sync session state with target inputs so other modules or background checks can reuse them
+# Persistent Session State Sync
 st.session_state['email'] = target_email
 st.session_state['password'] = target_pass
 
-server_host = st.sidebar.text_input("IMAP Server Host (Leave blank for auto-detect)", value="", key="mb_server_host")
-search_keyword = st.sidebar.text_input("Keyword Filter (Optional)", value="", placeholder="e.g. Netflix, Reset, Code", key="mb_search_keyword")
-max_msgs = st.sidebar.slider("Max Messages to Fetch", min_value=1, max_value=50, value=10, key="mb_max_msgs")
+server_host = st.sidebar.text_input("IMAP Server Host (Blank for Auto)", value="", key="mb_server_host")
+search_keyword = st.sidebar.text_input("Keyword Filter (Optional)", value="", placeholder="e.g. Netflix, Code, Verify", key="mb_search_keyword")
+
+st.sidebar.markdown("---")
+st.sidebar.subheader("📊 Pagination Settings")
+batch_size = st.sidebar.slider("Messages per Page", min_value=5, max_value=50, value=10, key="mb_batch_size")
 
 # Main Action Controls
-connect_col, _ = st.columns([1, 1])
-with connect_col:
-    connect_pressed = st.button("📥 Connect & Read IMAP Inbox", type="primary", key="mb_connect_btn")
+connect_pressed = st.button("📥 Connect & Read IMAP Inbox", type="primary", use_container_width=True, key="mb_connect_btn")
 
-# Smart Webmail / Portal Quick Action Section
+# --- Smart Webmail Portal Quick Bar ---
 if target_email:
     portal_url = get_webmail_portal_url(target_email)
     st.markdown("---")
-    st.subheader("🌐 Webmail & Portal Quick Access")
+    st.subheader("🌐 Webmail & Credential Portal")
     col_w1, col_w2 = st.columns([2, 2])
     with col_w1:
-        st.markdown(f"**Target Webmail URL:** `{portal_url}`")
-        st.link_button("🔗 Open Webmail Portal in New Tab", portal_url, use_container_width=True)
+        st.markdown(f"**Target Portal:** `{portal_url}`")
+        st.link_button("🔗 Open Webmail Portal", portal_url, use_container_width=True)
     with col_w2:
-        st.markdown(f"**Selected Combo:** `{target_email}:{target_pass}`")
-        st.info("💡 Tip: Click the webmail button to open the login portal. You can copy your password directly from the details above.")
+        st.markdown(f"**Active Combo:** `{target_email}:{target_pass}`")
+        st.success("🟢 Ready for connection and secure token parsing.")
     st.markdown("---")
 
+# --- IMAP Retrieval & Lazy Loading Execution ---
 if connect_pressed:
     if not target_email or not target_pass:
-        st.warning("⚠️️ Please select or enter a valid email and password.")
+        st.warning("⚠ Please provide a valid target email and password combo.")
     else:
         host = server_host.strip() if server_host.strip() else guess_imap_server(target_email)
         st.session_state['imap_host'] = host
         
-        st.info(f"Connecting to IMAP server **{host}:993** for **{target_email}**...")
-        
-        try:
-            mail = imaplib.IMAP4_SSL(host, 993, timeout=10)
-            mail.login(target_email, target_pass)
-            mail.select("INBOX")
-            
-            if search_keyword.strip():
-                status, response = mail.search(None, f'(SUBJECT "{search_keyword.strip()}")')
-            else:
-                status, response = mail.search(None, "ALL")
+        with st.spinner(f"Connecting to IMAP secure gateway **{host}:993**..."):
+            try:
+                mail = imaplib.IMAP4_SSL(host, 993, timeout=12)
+                mail.login(target_email, target_pass)
+                mail.select("INBOX")
                 
-            if status != "OK":
-                st.error("Failed to search mailbox messages.")
-            else:
-                msg_nums = response[0].split()
-                if not msg_nums:
-                    st.warning("No messages found matching criteria.")
+                # Search execution
+                if search_keyword.strip():
+                    status, response = mail.search(None, f'(SUBJECT "{search_keyword.strip()}")')
                 else:
-                    latest_nums = msg_nums[-max_msgs:][::-1]
-                    table_data = []
+                    status, response = mail.search(None, "ALL")
                     
-                    for num in latest_nums:
-                        st_fetch, msg_data = mail.fetch(num, "(RFC822)")
-                        if st_fetch != "OK":
-                            continue
-                        for response_part in msg_data:
-                            if isinstance(response_part, tuple):
-                                msg = email.message_from_bytes(response_part[1])
-                                
-                                # Subject
-                                sub_hdr = decode_header(msg.get("Subject", "No Subject"))[0]
-                                subject = sub_hdr[0].decode(sub_hdr[1] or "utf-8", errors="ignore") if isinstance(sub_hdr[0], bytes) else str(sub_hdr[0])
-                                
-                                # Sender
-                                from_hdr = decode_header(msg.get("From", "Unknown"))[0]
-                                sender = from_hdr[0].decode(from_hdr[1] or "utf-8", errors="ignore") if isinstance(from_hdr[0], bytes) else str(from_hdr[0])
-                                
-                                date_str = msg.get("Date", "Unknown")
-                                
-                                body = ""
-                                if msg.is_multipart():
-                                    for part in msg.walk():
-                                        if part.get_content_type() == "text/plain":
-                                            payload = part.get_payload(decode=True)
-                                            if payload:
-                                                body = payload.decode("utf-8", errors="ignore")
-                                                break
-                                else:
-                                    payload = msg.get_payload(decode=True)
-                                    if payload:
-                                        body = payload.decode("utf-8", errors="ignore")
-                                        
-                                table_data.append({
-                                    "ID": num.decode(),
-                                    "Date": date_str,
-                                    "From": sender,
-                                    "Subject": subject,
-                                    "Snippet": body[:300].strip()
-                                })
-                                
-                    mail.logout()
-                    
-                    if table_data:
-                        st.success(f"Successfully retrieved {len(table_data)} messages!")
-                        df = pd.DataFrame(table_data)
-                        st.dataframe(df, use_container_width=True)
-                        
-                        # Expandable message view
-                        for idx, row in df.iterrows():
-                            with st.expander(f"✉ [{row['Date']}] {row['From']} - {row['Subject']}"):
-                                st.markdown(f"**From:** {row['From']}")
-                                st.markdown(f"**Subject:** {row['Subject']}")
-                                st.markdown(f"**Date:** {row['Date']}")
-                                st.markdown("---")
-                                st.text(row['Snippet'])
+                if status != "OK":
+                    st.error("Failed to query mailbox messages.")
+                else:
+                    msg_nums = response[0].split()
+                    if not msg_nums:
+                        st.warning("No messages found matching criteria.")
+                        mail.logout()
                     else:
-                        st.info("No readable messages extracted.")
+                        # Slice messages based on pagination batch size (Latest first)
+                        latest_nums = msg_nums[-batch_size:][::-1]
                         
-        except Exception as ex:
-            st.error(f"Connection / Authentication Error: {ex}")
+                        # Store lightweight header dictionaries first (Lazy loading pattern)
+                        lightweight_messages = []
+                        
+                        for num in latest_nums:
+                            # Fetch headers & flags first without pulling massive body payloads instantly
+                            st_fetch, msg_data = mail.fetch(num, "(BODY.PEEK[HEADER.FIELDS (SUBJECT FROM DATE)] FLAGS)")
+                            if st_fetch != "OK":
+                                continue
+                            
+                            subject, sender, date_str, is_read = "No Subject", "Unknown", "Unknown", False
+                            for response_part in msg_data:
+                                if isinstance(response_part, tuple):
+                                    msg = email.message_from_bytes(response_part[1])
+                                    subject = decode_mime_header(msg.get("Subject", "No Subject"))
+                                    sender = decode_mime_header(msg.get("From", "Unknown"))
+                                    date_str = msg.get("Date", "Unknown")
+                            
+                            lightweight_messages.append({
+                                "id": num.decode(),
+                                "date": date_str,
+                                "sender": sender,
+                                "subject": subject,
+                                "imap_connection": mail # Kept reference for lazy body fetching on expand
+                            })
+                        
+                        # Store in session state for UI persistence across tabs/filters
+                        st.session_state['fetched_messages'] = lightweight_messages
+                        st.success(f"Successfully loaded {len(lightweight_messages)} inbox headers!")
+
+# Render Inbox Messages if Available in Session State
+if 'fetched_messages' in st.session_state and st.session_state['fetched_messages']:
+    st.markdown("### 📬 Inbox Message Stream")
+    
+    # Filter Tabs for quick views
+    tab_all, tab_unread = st.tabs(["📂 All Fetched", "⭐ Recent Quick View"])
+    
+    with tab_all:
+        for idx, item in enumerate(st.session_state['fetched_messages']):
+            # Bobito mobile-friendly card container layout
+            with st.expander(f"✉ [{item['date']}] {item['sender'][:35]} — {item['subject'][:45]}"):
+                st.markdown(f"**From:** `{item['sender']}`")
+                st.markdown(f"**Subject:** `{item['subject']}`")
+                st.markdown(f"**Date:** `{item['date']}`")
+                st.markdown("---")
+                
+                # Lazy load full body content only when expander is tapped/opened
+                if st.button(f"📥 Load Full Message Body #{item['id']}", key=f"load_body_{item['id']}_{idx}"):
+                    with st.spinner("Fetching full payload from server..."):
+                        try:
+                            mail_conn = item['imap_connection']
+                            st_f, m_data = mail_conn.fetch(item['id'].encode(), "(RFC822)")
+                            body_text = "Could not parse body."
+                            if st_f == "OK":
+                                for part in m_data:
+                                    if isinstance(part, tuple):
+                                        full_msg = email.message_from_bytes(part[1])
+                                        if full_msg.is_multipart():
+                                            for subpart in full_msg.walk():
+                                                if subpart.get_content_type() == "text/plain":
+                                                    payload = subpart.get_payload(decode=True)
+                                                    if payload:
+                                                        body_text = payload.decode("utf-8", errors="ignore")
+                                                        break
+                                        else:
+                                            payload = full_msg.get_payload(decode=True)
+                                            if payload:
+                                                body_text = payload.decode("utf-8", errors="ignore")
+                            st.text_area("Message Content", body_text, height=200, key=f"body_area_{item['id']}")
+                        except Exception as ex:
+                            st.error(f"Error loading body: {ex}")
+                            
+    with tab_unread:
+        st.info("💡 Tip: Use the 'Load Full Message Body' button inside each card above to inspect verification links or OTP codes instantly.")
+        for item in st.session_state['fetched_messages'][:5]:
+            st.markdown(f"- **{item['subject']}** (`{item['date']}`)")
