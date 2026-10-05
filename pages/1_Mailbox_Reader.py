@@ -130,7 +130,7 @@ def decode_mime_header(header_value):
     except Exception:
         return str(header_value)
 
-# --- Expanded Folder Discovery Engine (Fixing Inbox-only limitation) ---
+# --- Universal Folder Discovery Engine (Comprehensive mapping) ---
 def discover_folders(mail):
     found = []
     seen = set()
@@ -155,7 +155,6 @@ def discover_folders(mail):
                 if not it:
                     continue
                 s = it.decode("utf-8", errors="ignore") if isinstance(it, bytes) else str(it)
-                # Parse mailbox name following flags and delimiter (e.g. (\HasNoChildren) "/" "INBOX")
                 quoted = re.findall(r'"((?:\\.|[^"\\])*)"', s)
                 if quoted:
                     add_folder(quoted[-1].replace('\\"', '"'))
@@ -166,7 +165,7 @@ def discover_folders(mail):
     except Exception:
         pass
 
-    # 2. Query LSUB (Subscribed folders) for full coverage
+    # 2. Query LSUB (Subscribed folders)
     try:
         typ2, data2 = mail.lsub('""', '*')
         if typ2 == "OK" and data2:
@@ -184,16 +183,17 @@ def discover_folders(mail):
     except Exception:
         pass
 
-    # Ensure crucial folders are always present or accounted for if available
-    standard_defaults = ["INBOX", "Sent", "Drafts", "Trash", "Junk", "Spam"]
-    for def_f in standard_defaults:
-        # Check case-insensitive match
-        if not any(f.lower() == def_f.lower() for f in found):
-            # Try to see if server holds it under a variant
+    # Fallback standard checks if server supports them directly
+    for candidate in ["INBOX", "Sent", "Drafts", "Trash", "Junk", "Spam", "[Gmail]/Sent Mail", "[Gmail]/Trash", "[Gmail]/Spam"]:
+        try:
+            code, _ = mail.status(candidate, "(MESSAGES)")
+            if code == "OK":
+                add_folder(candidate)
+        except Exception:
             pass
 
     names = found if found else ["INBOX"]
-    # Sort nicely placing INBOX at the top if present
+    # Sort nicely placing INBOX first
     names = sorted(names, key=lambda x: (0 if x.lower() == "inbox" else 1, x.lower()))
     return names
 
@@ -290,6 +290,19 @@ server_host = st.sidebar.text_input("IMAP Server Host (Blank for Auto)", value="
 
 connect_pressed = st.button("📥 Connect & Discover Folders", type="primary", use_container_width=True, key="mb_connect_btn")
 
+# --- Export Valid Accounts Option ---
+if valid_accs:
+    st.sidebar.markdown("---")
+    st.sidebar.subheader("📥 Export Valid Combos")
+    txt_data = "\n".join(valid_accs)
+    st.sidebar.download_button(
+        label="Download Valid Accounts (.txt)",
+        data=txt_data,
+        file_name="valid_accounts.txt",
+        mime="text/plain",
+        use_container_width=True
+    )
+
 # Webmail Portal & Copyable Combo Quick Access Hub Block
 if target_email:
     portal_url = get_webmail_portal_url(target_email)
@@ -298,7 +311,6 @@ if target_email:
     st.sidebar.markdown(f"**Target Webmail URL:**\n`{portal_url}`")
     st.sidebar.link_button("• Open Webmail Portal in New Tab", portal_url, use_container_width=True)
     
-    # Fully copyable mail:password combo codeblock
     combo_str = f"{target_email}:{target_pass}"
     st.sidebar.markdown("**Selected Combo (Copyable):**")
     st.sidebar.code(combo_str, language="")
@@ -345,7 +357,6 @@ if 'imap_mail' in st.session_state:
         prev_folder = st.session_state.get('last_selected_folder', None)
         selected_folder = st.selectbox("Select Mailbox Folder", options=st.session_state.get('available_folders', ["INBOX"]), key="mb_selected_folder")
         
-        # Clear message state if folder changed to avoid widget/ID state pollution
         if prev_folder != selected_folder:
             st.session_state['last_selected_folder'] = selected_folder
             if 'current_msg_ids' in st.session_state:
@@ -364,9 +375,9 @@ if 'imap_mail' in st.session_state:
 
     col_s1, col_s2, col_s3 = st.columns([3, 1, 1])
     with col_s1:
-        search_query = st.text_input("Deep Keyword Search (Subject, Sender, or Text)", placeholder="e.g. Netflix, verify, security", key="mb_deep_search_query")
+        search_query = st.text_input("Deep Keyword Search (Subject, Sender, or Body Text)", placeholder="e.g. Netflix, verify, security", key="mb_deep_search_query")
     with col_s2:
-        search_scope = st.selectbox("Search Field", ["TEXT", "SUBJECT", "FROM"], key="mb_search_scope")
+        search_scope = st.selectbox("Search Field", ["TEXT", "BODY", "SUBJECT", "FROM"], key="mb_search_scope")
     with col_s3:
         st.markdown("<br>", unsafe_allow_html=True)
         refresh_btn = st.button("🔄 Refresh Inbox", use_container_width=True)
@@ -380,7 +391,6 @@ if 'imap_mail' in st.session_state:
     mail = st.session_state['imap_mail']
     safe_folder = selected_folder.replace('"', '\\"')
 
-    # Load Folder or Execute Search or Refresh
     if load_folder_btn or search_btn or refresh_btn:
         with st.spinner("Querying mailbox messages..."):
             try:
@@ -395,10 +405,8 @@ if 'imap_mail' in st.session_state:
                 if status == "OK" and response and response[0]:
                     msg_ids = response[0].split()
                     if "Newest First" in sort_order:
-                        msg_ids = msg_ids[::-1] # Descending
-                    else:
-                        msg_ids = msg_ids # Ascending
-                        
+                        msg_ids = msg_ids[::-1]
+                    
                     st.session_state['current_msg_ids'] = msg_ids
                     st.session_state['current_page'] = 0
                     log_action(f"Loaded folder '{selected_folder}' ({len(msg_ids)} messages)")
@@ -444,7 +452,6 @@ if 'imap_mail' in st.session_state:
                 except Exception as ex:
                     st.error(f"Error scanning for bots: {ex}")
 
-        # Render Preview Expander for Flagged Bots
         if 'flagged_bot_list' in st.session_state and st.session_state['flagged_bot_list']:
             st.info(f"📋 **{len(st.session_state['flagged_bot_list'])} Bot Messages Flagged for Review:**")
             for b_item in st.session_state['flagged_bot_list']:
@@ -459,7 +466,6 @@ if 'imap_mail' in st.session_state:
             if 'flagged_bot_list' in st.session_state and st.session_state['flagged_bot_list']:
                 with st.spinner("Deleting previewed bot messages..."):
                     try:
-                        # Re-open folder in writable mode
                         mail.select(f'"{safe_folder}"', readonly=False)
                         deleted_count = 0
                         for b_item in st.session_state['flagged_bot_list']:
@@ -491,7 +497,6 @@ if 'imap_mail' in st.session_state:
 
         st.markdown(f"**Showing messages {start_idx + 1} to {end_idx} of {total_msgs}**")
         
-        # Pagination Controls
         p_col1, p_col2, p_col3 = st.columns([1, 2, 1])
         with p_col1:
             if st.button("◀ Previous Page") and current_page > 0:
@@ -506,7 +511,6 @@ if 'imap_mail' in st.session_state:
 
         st.markdown("---")
         
-        # Render Headers for current page with Advanced Management Options
         for num in page_ids:
             try:
                 num_str = num.decode('utf-8') if isinstance(num, bytes) else str(num)
@@ -536,7 +540,6 @@ if 'imap_mail' in st.session_state:
                     st.markdown(f"**Server ID / Flags:** `Msg #{num_str}` | Flags: `{flags}`")
                     st.markdown("---")
                     
-                    # Management Operation Buttons (Folder-prefixed keys to eliminate key collisions)
                     op_col1, op_col2, op_col3, op_col4 = st.columns(4)
                     with op_col1:
                         if st.button("👁 Mark Seen", key=f"seen_{selected_folder}_{num_str}"):
@@ -602,11 +605,10 @@ if 'imap_mail' in st.session_state:
                             
                             if bot_flags:
                                 st.markdown("### 🤖 Bot Intelligence Detected")
-                                if bot_flags:
-                                    cols = st.columns(len(bot_flags))
-                                    for c_idx, flag in enumerate(bot_flags):
-                                        with cols[c_idx]:
-                                            st.warning(flag)
+                                cols = st.columns(len(bot_flags))
+                                for c_idx, flag in enumerate(bot_flags):
+                                    with cols[c_idx]:
+                                        st.warning(flag)
                             
                             if extracted_pins:
                                 st.success(f"🔑 **Extracted Verification PIN(s):** `{'`, `'.join(extracted_pins)}`")
