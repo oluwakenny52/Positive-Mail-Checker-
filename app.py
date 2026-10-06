@@ -1176,8 +1176,12 @@ def get_servers(email):
         if domain in PROVIDER_MAP:
             return PROVIDER_MAP[domain]
 
-        mx_records = get_mx_hosts(domain)
-        candidate_hosts = generate_candidate_hosts(domain, mx_records)
+        # FIX: Check if there is an explicit parent provider mapping first
+        parent_domain = detect_parent_provider(domain)
+        effective_domain = parent_domain if parent_domain else domain
+
+        mx_records = get_mx_hosts(effective_domain)
+        candidate_hosts = generate_candidate_hosts(effective_domain, mx_records)
 
         servers = {
             "imap": candidate_hosts,
