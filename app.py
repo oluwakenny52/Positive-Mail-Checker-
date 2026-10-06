@@ -21,6 +21,8 @@ import concurrent.futures
 from dataclasses import dataclass
 from typing import List, Dict, Optional
 import re
+import streamlit as str_lit
+import ast
 
 # Optional network libs
 try:
@@ -799,7 +801,7 @@ with str_lit.sidebar:
                     "Fails": meta.get("fails", 0),
                     "Successes": meta.get("success", 0)
                 })
-            str_lit.dataframe(pd.DataFrame(proxy_data_list), width='stretch')
+            str_lit.dataframe(pd.DataFrame(proxy_data_list), use_container_width=True)
             
             col_ref1, col_ref2 = str_lit.columns(2)
             with col_ref1:
@@ -1511,15 +1513,6 @@ def read_mailbox_messages(email, password, server, proxy_str=None, limit=10):
 def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, trace_logs=None):
     if trace_logs is None:
         trace_logs = []
-        
-    # --- TEMPORARILY COMMENTED OUT FOR DEBUGGING ---
-    # ts = failed_domain_cache.get(domain)
-    # cooldown_period = CFG.get("FAILURE_COOLDOWN", 60.0)
-    # if ts and (time.time() - ts) < cooldown_period:
-    #     trace_logs.append(f"Fast Mode: Domain '{domain}' is in cooldown cache. Skipping immediately.")
-    #     return None, "connection_failed", "skipped_cooldown", None, trace_logs
-    # elif ts:
-    #     failed_domain_cache.pop(domain, None)
 
     try:
         if conf.get("type") == "zero_access":
@@ -1540,7 +1533,6 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, 
                 available_candidates = [p for p in proxy_pool if precheck_proxy_fast(p)]
                 px = random.choice(available_candidates) if available_candidates else None
         
-        # Build the proxy list to try, ensuring direct fallback (None) is always included if using proxies
         proxies_to_try = [px] if px else [None]
         if px and None not in proxies_to_try:
             proxies_to_try.append(None)
@@ -1779,7 +1771,7 @@ if start_engine_btn:
                                     r_col4.metric("⚠ Failed", conn_len)
 
                                 df_report = pd.DataFrame(current_reports[::-1])
-                                report_log_container.dataframe(df_report, width='stretch', height=300)
+                                report_log_container.dataframe(df_report, use_container_width=True, height=300)
                             
                     except Exception as ex:
                         err_msg = f"[EXCEPTION] {str(ex)}"
@@ -1938,7 +1930,7 @@ if str_lit.session_state.engine_has_run:
     with exec_tab2_p:
         if report_entries_copy:
             df_report_persisted = pd.DataFrame(report_entries_copy[::-1])
-            str_lit.dataframe(df_report_persisted, width='stretch', height=300)
+            str_lit.dataframe(df_report_persisted, use_container_width=True, height=300)
         else:
             str_lit.info("No report logs available.")
 
@@ -2006,12 +1998,11 @@ else:
                         else:
                             str_lit.warning(f"Could not read mailbox: {fetched_msgs}")
 
-# Verify syntax
-import ast
+# Verify syntax safely using the current script source
 try:
-    ast.parse(app_code)
+    with open(__file__, "r", encoding="utf-8") as f:
+        app_code_source = f.read()
+    ast.parse(app_code_source)
     print("SYNTAX OK")
-    with open("app.py", "w", encoding="utf-8") as f:
-        f.write(app_code)
 except SyntaxError as se:
     print(f"Syntax error: {se}")
