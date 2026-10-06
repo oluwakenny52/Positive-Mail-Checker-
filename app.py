@@ -1,4 +1,3 @@
-import streamlit as str_lit
 import asyncio
 import imaplib
 import poplib
@@ -1108,25 +1107,42 @@ def detect_parent_provider(domain):
             return "yahoo.com"
     return None
 
-def generate_candidate_hosts(domain: str, mx_records: list = None) -> list:
-    candidates = []
-    standard_prefixes = ['imap', 'mail', 'pop', 'pop3', 'secure']
-    for prefix in standard_prefixes:
-        candidates.append(f"{prefix}.{domain}")
+def generate_candidate_hosts(domain):
+    hosts = []
     
-    candidates.append(domain)
-    
-    if mx_records:
+    # 1. Attempt MX lookup first
+    try:
+        mx_records = get_mx_hosts(domain)
         for mx in mx_records:
-            candidates.append(mx)
-            parts = mx.split('.')
-            if len(parts) >= 2:
-                parent_domain = f"{parts[-2]}.{parts[-1]}"
-                if parent_domain != domain:
-                    for prefix in ['imap', 'mail', 'pop']:
-                        candidates.append(f"{prefix}.{parent_domain}")
-
-    return list(dict.fromkeys(candidates))
+            hosts.append(mx)
+    except Exception:
+        pass
+        
+    # 2. Append standard fallback patterns if MX fails or as secondary options
+    common_patterns = [
+        f"imap.{domain}",
+        f"mail.{domain}",
+        f"pop.{domain}"
+    ]
+    
+    for pattern in common_patterns:
+        if pattern not in hosts:
+            hosts.append(pattern)
+            
+    # 3. Final fallback map for popular providers (Gmail, Outlook, Yahoo, etc.)
+    provider_map = {
+        "gmail.com": ["imap.gmail.com"],
+        "yahoo.com": ["imap.mail.yahoo.com"],
+        "outlook.com": ["outlook.office365.com"],
+        "hotmail.com": ["outlook.office365.com"]
+    }
+    
+    if domain in provider_map:
+        for phost in provider_map[domain]:
+            if phost not in hosts:
+                hosts.insert(0, phost) # prioritize known good hosts
+                
+    return hosts
 
 def get_servers(email):
     try:
@@ -1141,8 +1157,7 @@ def get_servers(email):
         if domain in PROVIDER_MAP:
             return PROVIDER_MAP[domain]
 
-        mx_records = get_mx_hosts(domain)
-        candidate_hosts = generate_candidate_hosts(domain, mx_records)
+        candidate_hosts = generate_candidate_hosts(domain)
 
         servers = {
             "imap": candidate_hosts,
@@ -1161,7 +1176,7 @@ def get_servers(email):
     except Exception as e:
         warnings.warn(f"Error resolving servers for {email}: {e}")
         d = email.split('@')[-1] if '@' in email else 'localhost'
-        fallback_patterns = generate_candidate_hosts(d, [])
+        fallback_patterns = generate_candidate_hosts(d)
         return {
             "imap": fallback_patterns,
             "pop": fallback_patterns,
@@ -1497,14 +1512,14 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, 
     if trace_logs is None:
         trace_logs = []
         
-    if CFG.get("FAST_MODE", True):
-        ts = failed_domain_cache.get(domain)
-        cooldown_period = CFG.get("FAILURE_COOLDOWN", 60.0)
-        if ts and (time.time() - ts) < cooldown_period:
-            trace_logs.append(f"Fast Mode: Domain '{domain}' is in cooldown cache. Skipping immediately.")
-            return None, "connection_failed", "skipped_cooldown", None, trace_logs
-        elif ts:
-            failed_domain_cache.pop(domain, None)
+    # --- TEMPORARILY COMMENTED OUT FOR DEBUGGING ---
+    # ts = failed_domain_cache.get(domain)
+    # cooldown_period = CFG.get("FAILURE_COOLDOWN", 60.0)
+    # if ts and (time.time() - ts) < cooldown_period:
+    #     trace_logs.append(f"Fast Mode: Domain '{domain}' is in cooldown cache. Skipping immediately.")
+    #     return None, "connection_failed", "skipped_cooldown", None, trace_logs
+    # elif ts:
+    #     failed_domain_cache.pop(domain, None)
 
     try:
         if conf.get("type") == "zero_access":
@@ -1525,8 +1540,9 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, 
                 available_candidates = [p for p in proxy_pool if precheck_proxy_fast(p)]
                 px = random.choice(available_candidates) if available_candidates else None
         
+        # Build the proxy list to try, ensuring direct fallback (None) is always included if using proxies
         proxies_to_try = [px] if px else [None]
-        if proxy_mode == "fallback" and px:
+        if px and None not in proxies_to_try:
             proxies_to_try.append(None)
 
         max_attempts = 1 if CFG.get("FAST_MODE", True) else min(len(conf.get("imap", [])), 6)
@@ -1989,3 +2005,13 @@ else:
                                 str_lit.code(m_content, language="text")
                         else:
                             str_lit.warning(f"Could not read mailbox: {fetched_msgs}")
+
+# Verify syntax
+import ast
+try:
+    ast.parse(app_code)
+    print("SYNTAX OK")
+    with open("app.py", "w", encoding="utf-8") as f:
+        f.write(app_code)
+except SyntaxError as se:
+    print(f"Syntax error: {se}")
