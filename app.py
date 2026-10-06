@@ -1144,7 +1144,6 @@ def detect_parent_provider(domain):
 
 def generate_candidate_hosts(domain: str, mx_records: list = None) -> list:
     candidates = []
-    # Place mail and imap explicitly at the very top of the priority list
     priority_prefixes = ['imap', 'mail', 'pop', 'pop3', 'secure', 'smtp']
     for prefix in priority_prefixes:
         candidates.append(f"{prefix}.{domain}")
@@ -1176,7 +1175,6 @@ def get_servers(email):
         if domain in PROVIDER_MAP:
             return PROVIDER_MAP[domain]
 
-        # FIX: Check if there is an explicit parent provider mapping first
         parent_domain = detect_parent_provider(domain)
         effective_domain = parent_domain if parent_domain else domain
 
