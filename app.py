@@ -1144,8 +1144,9 @@ def detect_parent_provider(domain):
 
 def generate_candidate_hosts(domain: str, mx_records: list = None) -> list:
     candidates = []
-    standard_prefixes = ['imap', 'mail', 'pop', 'pop3', 'secure']
-    for prefix in standard_prefixes:
+    # Place mail and imap explicitly at the very top of the priority list
+    priority_prefixes = ['imap', 'mail', 'pop', 'pop3', 'secure', 'smtp']
+    for prefix in priority_prefixes:
         candidates.append(f"{prefix}.{domain}")
     
     candidates.append(domain)
@@ -1581,8 +1582,7 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, 
                     trace_logs.append(f"[direct-sslsoft] -> SOCKET FAILED IMAP on {server}: {str(sock_err)[:50]} [Classified: {st_val}]")
                     if st_val in ("wrong_password", "need_app_password"):
                         return None, st_val, f"[direct-sslsoft] IMAP {server} -> {st_val}", current_px, trace_logs
-                    elif st_val == "connection_failed":
-                        break
+                    continue
                 except Exception as e:
                     st_val = classify_error(e, domain)
                     is_net = (st_val == "connection_failed")
@@ -1590,8 +1590,7 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, 
                     trace_logs.append(f"[direct-sslsoft] -> FAILED IMAP on {server}: {str(e)[:50]} [Classified: {st_val}]")
                     if st_val in ("wrong_password", "need_app_password"):
                         return None, st_val, f"[direct-sslsoft] IMAP {server} -> {st_val}", current_px, trace_logs
-                    elif st_val == "connection_failed":
-                        break
+                    continue
 
             for server in conf.get("pop", [])[:max_attempts]:
                 trace_logs.append(f"[direct-sslsoft] Attempting POP -> Host: {server}:995")
@@ -1605,8 +1604,7 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, 
                     trace_logs.append(f"[direct-sslsoft] -> SOCKET FAILED POP on {server}: {str(sock_err)[:50]} [Classified: {st_val}]")
                     if st_val in ("wrong_password", "need_app_password"):
                         return None, st_val, f"[direct-sslsoft] POP {server} -> {st_val}", current_px, trace_logs
-                    elif st_val == "connection_failed":
-                        break
+                    continue
                 except Exception as e:
                     st_val = classify_error(e, domain)
                     is_net = (st_val == "connection_failed")
@@ -1614,8 +1612,7 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, 
                     trace_logs.append(f"[direct-sslsoft] -> FAILED POP on {server}: {str(e)[:50]} [Classified: {st_val}]")
                     if st_val in ("wrong_password", "need_app_password"):
                         return None, st_val, f"[direct-sslsoft] POP {server} -> {st_val}", current_px, trace_logs
-                    elif st_val == "connection_failed":
-                        break
+                    continue
 
     except Exception as e:
         trace_logs.append(f"[direct-sslsoft] Critical Exception in runner: {str(e)}")
