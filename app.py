@@ -1064,15 +1064,15 @@ if raw_text:
 
 # --- Comprehensive Mail Checking Flow Integration ---
 PROVIDER_MAP = {
-    "gmail.com": {"imap": ["imap.gmail.com"], "pop": ["pop.gmail.com"], "pop3": ["pop.gmail.com"]},
-    "googlemail.com": {"imap": ["imap.gmail.com"], "pop": ["pop.gmail.com"], "pop3": ["pop.gmail.com"]},
-    "outlook.com": {"imap": ["outlook.office365.com"], "pop": ["outlook.office365.com"], "pop3": ["outlook.office365.com"]},
-    "hotmail.com": {"imap": ["outlook.office365.com"], "pop": ["outlook.office365.com"], "pop3": ["outlook.office365.com"]},
-    "live.com": {"imap": ["outlook.office365.com"], "pop": ["outlook.office365.com"], "pop3": ["outlook.office365.com"]},
-    "yahoo.com": {"imap": ["imap.mail.yahoo.com"], "pop": ["pop.mail.yahoo.com"], "pop3": ["pop.mail.yahoo.com"]},
-    "icloud.com": {"imap": ["imap.mail.me.com"], "pop": ["pop.mail.me.com"], "pop3": ["pop.mail.me.com"]},
-    "naver.com": {"imap": ["imap.naver.com"], "pop": ["pop.naver.com"], "pop3": ["pop.naver.com"]},
-    "qq.com": {"imap": ["imap.qq.com"], "pop": ["pop.qq.com"], "pop3": ["pop.qq.com"]}
+    "gmail.com": {"imap": ["imap.gmail.com", "mail.gmail.com"], "pop": ["pop.gmail.com", "mail.gmail.com"], "pop3": ["pop.gmail.com", "mail.gmail.com"]},
+    "googlemail.com": {"imap": ["imap.gmail.com", "mail.gmail.com"], "pop": ["pop.gmail.com", "mail.gmail.com"], "pop3": ["pop.gmail.com", "mail.gmail.com"]},
+    "outlook.com": {"imap": ["outlook.office365.com", "mail.outlook.com"], "pop": ["outlook.office365.com", "mail.outlook.com"], "pop3": ["outlook.office365.com", "mail.outlook.com"]},
+    "hotmail.com": {"imap": ["outlook.office365.com", "mail.hotmail.com"], "pop": ["outlook.office365.com", "mail.hotmail.com"], "pop3": ["outlook.office365.com", "mail.hotmail.com"]},
+    "live.com": {"imap": ["outlook.office365.com", "mail.live.com"], "pop": ["outlook.office365.com", "mail.live.com"], "pop3": ["outlook.office365.com", "mail.live.com"]},
+    "yahoo.com": {"imap": ["imap.mail.yahoo.com", "mail.yahoo.com"], "pop": ["pop.mail.yahoo.com", "mail.yahoo.com"], "pop3": ["pop.mail.yahoo.com", "mail.yahoo.com"]},
+    "icloud.com": {"imap": ["imap.mail.me.com", "mail.icloud.com"], "pop": ["pop.mail.me.com", "mail.icloud.com"], "pop3": ["pop.mail.me.com", "mail.icloud.com"]},
+    "naver.com": {"imap": ["imap.naver.com", "mail.naver.com"], "pop": ["pop.naver.com", "mail.naver.com"], "pop3": ["pop.naver.com", "mail.naver.com"]},
+    "qq.com": {"imap": ["imap.qq.com", "mail.qq.com"], "pop": ["pop.qq.com", "mail.qq.com"], "pop3": ["pop.qq.com", "mail.qq.com"]}
 }
 
 PUBLIC_PROVIDERS = set(PROVIDER_MAP.keys())
@@ -1123,7 +1123,7 @@ def generate_candidate_hosts(domain: str, mx_records: list = None) -> list:
             if len(parts) >= 2:
                 parent_domain = f"{parts[-2]}.{parts[-1]}"
                 if parent_domain != domain:
-                    for prefix in ['imap', 'mail', 'pop']:
+                    for prefix in ['imap', 'mail', 'pop', 'pop3']:
                         candidates.append(f"{prefix}.{parent_domain}")
 
     return list(dict.fromkeys(candidates))
