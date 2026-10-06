@@ -1,3 +1,4 @@
+import streamlit as str_lit
 import asyncio
 import imaplib
 import poplib
@@ -21,8 +22,6 @@ import concurrent.futures
 from dataclasses import dataclass
 from typing import List, Dict, Optional
 import re
-import streamlit as str_lit
-import ast
 
 # Optional network libs
 try:
@@ -801,7 +800,7 @@ with str_lit.sidebar:
                     "Fails": meta.get("fails", 0),
                     "Successes": meta.get("success", 0)
                 })
-            str_lit.dataframe(pd.DataFrame(proxy_data_list), use_container_width=True)
+            str_lit.dataframe(pd.DataFrame(proxy_data_list), width='stretch')
             
             col_ref1, col_ref2 = str_lit.columns(2)
             with col_ref1:
@@ -1109,42 +1108,25 @@ def detect_parent_provider(domain):
             return "yahoo.com"
     return None
 
-def generate_candidate_hosts(domain):
-    hosts = []
+def generate_candidate_hosts(domain: str, mx_records: list = None) -> list:
+    candidates = []
+    standard_prefixes = ['imap', 'mail', 'pop', 'pop3', 'secure']
+    for prefix in standard_prefixes:
+        candidates.append(f"{prefix}.{domain}")
     
-    # 1. Attempt MX lookup first
-    try:
-        mx_records = get_mx_hosts(domain)
+    candidates.append(domain)
+    
+    if mx_records:
         for mx in mx_records:
-            hosts.append(mx)
-    except Exception:
-        pass
-        
-    # 2. Append standard fallback patterns if MX fails or as secondary options
-    common_patterns = [
-        f"imap.{domain}",
-        f"mail.{domain}",
-        f"pop.{domain}"
-    ]
-    
-    for pattern in common_patterns:
-        if pattern not in hosts:
-            hosts.append(pattern)
-            
-    # 3. Final fallback map for popular providers (Gmail, Outlook, Yahoo, etc.)
-    provider_map = {
-        "gmail.com": ["imap.gmail.com"],
-        "yahoo.com": ["imap.mail.yahoo.com"],
-        "outlook.com": ["outlook.office365.com"],
-        "hotmail.com": ["outlook.office365.com"]
-    }
-    
-    if domain in provider_map:
-        for phost in provider_map[domain]:
-            if phost not in hosts:
-                hosts.insert(0, phost) # prioritize known good hosts
-                
-    return hosts
+            candidates.append(mx)
+            parts = mx.split('.')
+            if len(parts) >= 2:
+                parent_domain = f"{parts[-2]}.{parts[-1]}"
+                if parent_domain != domain:
+                    for prefix in ['imap', 'mail', 'pop']:
+                        candidates.append(f"{prefix}.{parent_domain}")
+
+    return list(dict.fromkeys(candidates))
 
 def get_servers(email):
     try:
@@ -1159,7 +1141,8 @@ def get_servers(email):
         if domain in PROVIDER_MAP:
             return PROVIDER_MAP[domain]
 
-        candidate_hosts = generate_candidate_hosts(domain)
+        mx_records = get_mx_hosts(domain)
+        candidate_hosts = generate_candidate_hosts(domain, mx_records)
 
         servers = {
             "imap": candidate_hosts,
@@ -1178,7 +1161,7 @@ def get_servers(email):
     except Exception as e:
         warnings.warn(f"Error resolving servers for {email}: {e}")
         d = email.split('@')[-1] if '@' in email else 'localhost'
-        fallback_patterns = generate_candidate_hosts(d)
+        fallback_patterns = generate_candidate_hosts(d, [])
         return {
             "imap": fallback_patterns,
             "pop": fallback_patterns,
@@ -1513,6 +1496,15 @@ def read_mailbox_messages(email, password, server, proxy_str=None, limit=10):
 def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, trace_logs=None):
     if trace_logs is None:
         trace_logs = []
+        
+    if CFG.get("FAST_MODE", True):
+        ts = failed_domain_cache.get(domain)
+        cooldown_period = CFG.get("FAILURE_COOLDOWN", 60.0)
+        if ts and (time.time() - ts) < cooldown_period:
+            trace_logs.append(f"Fast Mode: Domain '{domain}' is in cooldown cache. Skipping immediately.")
+            return None, "connection_failed", "skipped_cooldown", None, trace_logs
+        elif ts:
+            failed_domain_cache.pop(domain, None)
 
     try:
         if conf.get("type") == "zero_access":
@@ -1534,7 +1526,7 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, 
                 px = random.choice(available_candidates) if available_candidates else None
         
         proxies_to_try = [px] if px else [None]
-        if px and None not in proxies_to_try:
+        if proxy_mode == "fallback" and px:
             proxies_to_try.append(None)
 
         max_attempts = 1 if CFG.get("FAST_MODE", True) else min(len(conf.get("imap", [])), 6)
@@ -1771,7 +1763,7 @@ if start_engine_btn:
                                     r_col4.metric("⚠ Failed", conn_len)
 
                                 df_report = pd.DataFrame(current_reports[::-1])
-                                report_log_container.dataframe(df_report, use_container_width=True, height=300)
+                                report_log_container.dataframe(df_report, width='stretch', height=300)
                             
                     except Exception as ex:
                         err_msg = f"[EXCEPTION] {str(ex)}"
@@ -1930,7 +1922,7 @@ if str_lit.session_state.engine_has_run:
     with exec_tab2_p:
         if report_entries_copy:
             df_report_persisted = pd.DataFrame(report_entries_copy[::-1])
-            str_lit.dataframe(df_report_persisted, use_container_width=True, height=300)
+            str_lit.dataframe(df_report_persisted, width='stretch', height=300)
         else:
             str_lit.info("No report logs available.")
 
@@ -1997,12 +1989,3 @@ else:
                                 str_lit.code(m_content, language="text")
                         else:
                             str_lit.warning(f"Could not read mailbox: {fetched_msgs}")
-
-# Verify syntax safely using the current script source
-try:
-    with open(__file__, "r", encoding="utf-8") as f:
-        app_code_source = f.read()
-    ast.parse(app_code_source)
-    print("SYNTAX OK")
-except SyntaxError as se:
-    print(f"Syntax error: {se}")
