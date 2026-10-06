@@ -561,40 +561,74 @@ resolved_proxy_mode = str_lit.sidebar.selectbox(
     index=1
 )
 
+# Configuration state management linked strictly to the apply button
+if "applied_cfg" not in str_lit.session_state:
+    str_lit.session_state.applied_cfg = {
+        "MODE_NAME": engine_config.mode_name,
+        "MAX_WORKERS_START": workers,
+        "MAX_WORKERS_MAX": max(workers * 2, 25),
+        "TIMEOUT": timeout,
+        "ACCOUNT_DEADLINE": deadline,
+        "MAX_ACCOUNTS": max_acc,
+        "BLACKLIST_CF": blacklist_cf,
+        "PROXY_MODE": "off" if not use_proxy else resolved_proxy_mode,
+        "RETRY_CONNECTION_FAILED": 1 if retry_cf else 0,
+        "ALLOW_SELF_SIGNED": self_signed,
+        "PROXY_TEST_FLIGHT": proxy_test_flight,
+        "SKIP_STRICT_APP_PROVIDERS": skip_app,
+        "DEBUG": debug_mode,
+        "MIN_PROXY_SCORE": min_proxy_score,
+        "PROXY_PRECHECK_TIMEOUT": proxy_precheck_timeout,
+        "POOL_MODE": pool_mode,
+        "SELECTED_COUNTRIES": selected_countries,
+        "SELECTED_MIX_COUNTRIES": selected_mix_countries,
+        "DYNAMIC_WORKER_SCALING": dynamic_worker_scaling,
+        "CUSTOM_WHITELIST": [d.strip().lower() for d in custom_whitelist_input.split(",") if d.strip()],
+        "CUSTOM_BLACKLIST": [d.strip().lower() for d in custom_blacklist_input.split(",") if d.strip()],
+        "PROXY_FILE": "proxies.txt",
+        "RESULTS_DIR": "mail_results",
+        "CACHE_FILE": "domain_cache.json",
+        "PROXY_META_FILE": "proxy_meta.json",
+        "MAX_PROXY_TRIES": engine_config.max_retries,
+        "PROXY_CONNECT_TIMEOUT": engine_config.connect_timeout,
+        "FAST_MODE": engine_config.fast_mode
+    }
+
 if str_lit.sidebar.button("💾 Apply Settings", type="primary"):
+    str_lit.session_state.applied_cfg = {
+        "MODE_NAME": engine_config.mode_name,
+        "MAX_WORKERS_START": workers,
+        "MAX_WORKERS_MAX": max(workers * 2, 25),
+        "TIMEOUT": timeout,
+        "ACCOUNT_DEADLINE": deadline,
+        "MAX_ACCOUNTS": max_acc,
+        "BLACKLIST_CF": blacklist_cf,
+        "PROXY_MODE": "off" if not use_proxy else resolved_proxy_mode,
+        "RETRY_CONNECTION_FAILED": 1 if retry_cf else 0,
+        "ALLOW_SELF_SIGNED": self_signed,
+        "PROXY_TEST_FLIGHT": proxy_test_flight,
+        "SKIP_STRICT_APP_PROVIDERS": skip_app,
+        "DEBUG": debug_mode,
+        "MIN_PROXY_SCORE": min_proxy_score,
+        "PROXY_PRECHECK_TIMEOUT": proxy_precheck_timeout,
+        "POOL_MODE": pool_mode,
+        "SELECTED_COUNTRIES": selected_countries,
+        "SELECTED_MIX_COUNTRIES": selected_mix_countries,
+        "DYNAMIC_WORKER_SCALING": dynamic_worker_scaling,
+        "CUSTOM_WHITELIST": [d.strip().lower() for d in custom_whitelist_input.split(",") if d.strip()],
+        "CUSTOM_BLACKLIST": [d.strip().lower() for d in custom_blacklist_input.split(",") if d.strip()],
+        "PROXY_FILE": "proxies.txt",
+        "RESULTS_DIR": "mail_results",
+        "CACHE_FILE": "domain_cache.json",
+        "PROXY_META_FILE": "proxy_meta.json",
+        "MAX_PROXY_TRIES": engine_config.max_retries,
+        "PROXY_CONNECT_TIMEOUT": engine_config.connect_timeout,
+        "FAST_MODE": engine_config.fast_mode
+    }
     str_lit.sidebar.success("Settings applied successfully!")
     log_startup("User applied new configuration settings via sidebar control panel.")
 
-CFG = {
-    "MODE_NAME": engine_config.mode_name,
-    "MAX_WORKERS_START": workers,
-    "MAX_WORKERS_MAX": max(workers * 2, 25),
-    "TIMEOUT": timeout,
-    "ACCOUNT_DEADLINE": deadline,
-    "MAX_ACCOUNTS": max_acc,
-    "BLACKLIST_CF": blacklist_cf,
-    "PROXY_MODE": "off" if not use_proxy else resolved_proxy_mode,
-    "RETRY_CONNECTION_FAILED": 1 if retry_cf else 0,
-    "ALLOW_SELF_SIGNED": self_signed,
-    "PROXY_TEST_FLIGHT": proxy_test_flight,
-    "SKIP_STRICT_APP_PROVIDERS": skip_app,
-    "DEBUG": debug_mode,
-    "MIN_PROXY_SCORE": min_proxy_score,
-    "PROXY_PRECHECK_TIMEOUT": proxy_precheck_timeout,
-    "POOL_MODE": pool_mode,
-    "SELECTED_COUNTRIES": selected_countries,
-    "SELECTED_MIX_COUNTRIES": selected_mix_countries,
-    "DYNAMIC_WORKER_SCALING": dynamic_worker_scaling,
-    "CUSTOM_WHITELIST": [d.strip().lower() for d in custom_whitelist_input.split(",") if d.strip()],
-    "CUSTOM_BLACKLIST": [d.strip().lower() for d in custom_blacklist_input.split(",") if d.strip()],
-    "PROXY_FILE": "proxies.txt",
-    "RESULTS_DIR": "mail_results",
-    "CACHE_FILE": "domain_cache.json",
-    "PROXY_META_FILE": "proxy_meta.json",
-    "MAX_PROXY_TRIES": engine_config.max_retries,
-    "PROXY_CONNECT_TIMEOUT": engine_config.connect_timeout,
-    "FAST_MODE": engine_config.fast_mode
-}
+CFG = str_lit.session_state.applied_cfg
 
 try:
     os.makedirs(CFG["RESULTS_DIR"], exist_ok=True)
