@@ -169,38 +169,12 @@ try:
 except Exception as e:
     log_startup(f"WARNING: Failed to bridge secrets to environment: {e}")
 
-# --- Config & Proxy Key Loaders ---
-_default_webshare = [
-    "ty1wj93kaw0k1ab7vv05lqvga86zs6tu2ngqjkyo",
-    "z6rhxx6390l1kitf5zjptukkjbjielb56mwqr741",
-    "a0afl99r624zz7fs8fh5y1ck5f9a0me3kajz5xtn",
-    "5gtgl0pheucjczwxjjwzh1u7edgs65dp4cyfbcl3",
-    "dqibfb8n2kkp7w0sku8gielshqqv4lcq6vuzdltb",
-    "mpb64af9rak5931lfvmoozs9hsepeovj59ggrufz",
-    "0hnwlw0e590d0yo9odtr411p4rw85uqv3oenc0ej",
-    "3enappszm6k7p4tm5czf9as9d3g95jgasbuuvcr8",
-    "myyibaqdn66o8pavn4kti90x2ametb9117zdwyi3"
-]
-
-_raw_ws_env = os.getenv("WEBSHARE_KEYS")
-if _raw_ws_env:
-    WEBSHARE_KEYS = [line.strip() for line in _raw_ws_env.splitlines() if line.strip()]
-    log_startup(f"Loaded {len(WEBSHARE_KEYS)} Webshare keys from environment variables.")
-else:
-    WEBSHARE_KEYS = _default_webshare
-    log_startup("Using default Webshare keys pool.")
-
-_default_oxylabs = [
-    "user-Positive_S79mq-country-US:Kingfrosh5252+@dc.oxylabs.io:8000",
-    "user-Positivekenny_ls8CB-country-US:Adejoke52_52@dc.oxylabs.io:8000"
-]
-_raw_ox_env = os.getenv("OXYLABS_BASE") or os.getenv("OXYLABS_PROXIES")
-if _raw_ox_env:
-    OXYLABS_PROXIES = [line.strip() for line in _raw_ox_env.splitlines() if line.strip()]
-    log_startup(f"Loaded {len(OXYLABS_PROXIES)} Oxylabs proxies from environment variables.")
-else:
-    OXYLABS_PROXIES = _default_oxylabs
-    log_startup("Using default Oxylabs proxies pool.")
+# --- Config & Proxy Key Loaders (Secrets only) ---
+WEBSHARE_KEYS = [line.strip() for line in os.getenv("WEBSHARE_KEYS", "").splitlines() if line.strip()]
+OXYLABS_PROXIES = [line.strip() for line in (os.getenv("OXYLABS_BASE") or os.getenv("OXYLABS_PROXIES") or "").splitlines() if line.strip()]
+log_startup(f"Secrets keys: webshare={len(WEBSHARE_KEYS)} oxylabs={len(OXYLABS_PROXIES)}")
+if not WEBSHARE_KEYS and not OXYLABS_PROXIES:
+    str_lit.sidebar.error("No proxy keys. Add WEBSHARE_KEYS and OXYLABS_BASE in Settings -> Secrets.")
 
 if "help_states" not in str_lit.session_state:
     str_lit.session_state.help_states = {}
@@ -311,7 +285,12 @@ str_lit.sidebar.markdown("### 🌐 Proxy / Pool Configuration")
 
 min_proxy_score = str_lit.sidebar.slider("Min Proxy Score", min_value=0, max_value=100, value=40, step=10)
 proxy_precheck_timeout = str_lit.sidebar.slider("Proxy Pre-Check Timeout (Sec)", min_value=1, max_value=10, value=3, step=1)
-pool_mode = str_lit.sidebar.selectbox("Pool Mode", options=["all", "us_only", "country", "mix"], index=0)
+if "pool_mode" not in str_lit.session_state:
+    str_lit.session_state.pool_mode = "all"
+if "pool_locked" not in str_lit.session_state:
+    str_lit.session_state.pool_locked = True
+if "picked_countries" not in str_lit.session_state:
+    str_lit.session_state.picked_countries = ["US"]
 
 def load_json(path, default=None):
     if default is None: default = {}
@@ -513,38 +492,42 @@ def get_available_countries_with_scores():
     except Exception:
         return ["US", "GB", "DE", "CA", "FR"]
 
-selected_countries = []
-selected_mix_countries = []
+selected_countries = list(str_lit.session_state.picked_countries)
+selected_mix_countries = list(str_lit.session_state.picked_countries)
+pool_mode = str_lit.session_state.pool_mode
 
-if pool_mode == "country":
-    str_lit.sidebar.markdown("#### Select Countries")
-    available_countries = get_available_countries_with_scores()
-    if not available_countries:
-        available_countries = ["US", "GB", "DE", "CA", "FR"]
-    with str_lit.sidebar.form("country_form"):
-        country_checkboxes = {}
+if str_lit.session_state.pool_locked:
+    str_lit.sidebar.success(f"Pool set: {pool_mode}")
+    if pool_mode in ("country", "mix"):
+        str_lit.sidebar.caption("Picked: " + ", ".join(str_lit.session_state.picked_countries))
+    if str_lit.sidebar.button("Change pool"):
+        str_lit.session_state.pool_locked = False
+        str_lit.rerun()
+else:
+    choice = str_lit.sidebar.radio("Pool", ["all", "us_only", "country", "mix"], index=["all", "us_only", "country", "mix"].index(pool_mode))
+    if choice in ("all", "us_only"):
+        str_lit.session_state.pool_mode = choice
+        str_lit.session_state.pool_locked = True
+        str_lit.rerun()
+    available_countries = get_available_countries_with_scores() or ["US"]
+    with str_lit.sidebar.form("pool_pick_form"):
+        picked = []
         for c in available_countries:
-            country_checkboxes[c] = str_lit.checkbox(c, value=(c == "US"), key=f"country_chk_{c}")
-        country_done = str_lit.form_submit_button("Done")
-        if country_done:
-            selected_countries = [c for c, checked in country_checkboxes.items() if checked]
-            str_lit.sidebar.success(f"Selected countries: {', '.join(selected_countries)}")
-
-elif pool_mode == "mix":
-    str_lit.sidebar.markdown("#### Select Mix Countries (Ranked by Score)")
-    available_countries = get_available_countries_with_scores()
-    if not available_countries:
-        available_countries = ["US", "GB", "DE", "CA", "FR"]
-    with str_lit.sidebar.form("mix_form"):
-        mix_checkboxes = {}
-        for c in available_countries:
-            scores_for_c = [proxy_meta.get(p, {}).get("score", 50) for p in load_proxies() if proxy_meta.get(p, {}).get("country", "").upper() == c]
-            avg_s = int(sum(scores_for_c) / len(scores_for_c)) if scores_for_c else 50
-            mix_checkboxes[c] = str_lit.checkbox(f"{c} (Avg Score: {avg_s})", value=True, key=f"mix_chk_{c}")
-        mix_done = str_lit.form_submit_button("Done")
-        if mix_done:
-            selected_mix_countries = [c.split(" ")[0] for c, checked in mix_checkboxes.items() if checked]
-            str_lit.sidebar.success(f"Selected mix pool: {', '.join(selected_mix_countries)}")
+            label = c
+            if choice == "mix":
+                scores = [proxy_meta.get(p, {}).get("score", 0) for p in load_proxies() if str(proxy_meta.get(p, {}).get("country", "")).upper() == c]
+                best = max(scores) if scores else 0
+                label = f"{c}  score={best}"
+            if str_lit.checkbox(label, value=c in str_lit.session_state.picked_countries, key=f"poolchk_{choice}_{c}"):
+                picked.append(c)
+        if str_lit.form_submit_button("Done"):
+            if not picked:
+                str_lit.sidebar.error("Pick at least one country")
+            else:
+                str_lit.session_state.pool_mode = choice
+                str_lit.session_state.picked_countries = picked
+                str_lit.session_state.pool_locked = True
+                str_lit.rerun()
 
 str_lit.sidebar.markdown("---")
 
