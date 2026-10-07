@@ -289,7 +289,7 @@ else:  # Normal Mode (Default)
         max_concurrent_checks=50,
         connect_timeout=5.0,
         read_timeout=5.0,
-        max_retries=2,
+        max_retries=1,
         failure_cooldown=30.0
     )
     workers = str_lit.sidebar.slider("Workers Start", min_value=1, max_value=75, value=30, step=5)
@@ -571,7 +571,7 @@ if "applied_cfg" not in str_lit.session_state:
         "ACCOUNT_DEADLINE": deadline,
         "MAX_ACCOUNTS": max_acc,
         "BLACKLIST_CF": blacklist_cf,
-        "PROXY_MODE": "off" if not use_proxy else resolved_proxy_mode,
+        "PROXY_MODE": "on" if not use_proxy else resolved_proxy_mode,
         "RETRY_CONNECTION_FAILED": 1 if retry_cf else 0,
         "ALLOW_SELF_SIGNED": self_signed,
         "PROXY_TEST_FLIGHT": proxy_test_flight,
@@ -603,7 +603,7 @@ if str_lit.sidebar.button("💾 Apply Settings", type="primary"):
         "ACCOUNT_DEADLINE": deadline,
         "MAX_ACCOUNTS": max_acc,
         "BLACKLIST_CF": blacklist_cf,
-        "PROXY_MODE": "off" if not use_proxy else resolved_proxy_mode,
+        "PROXY_MODE": "on" if not use_proxy else resolved_proxy_mode,
         "RETRY_CONNECTION_FAILED": 1 if retry_cf else 0,
         "ALLOW_SELF_SIGNED": self_signed,
         "PROXY_TEST_FLIGHT": proxy_test_flight,
