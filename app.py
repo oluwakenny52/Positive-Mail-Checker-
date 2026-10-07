@@ -945,10 +945,9 @@ def list_unfinished_runs():
 
 def save_unfinished(reason, remaining, checked, total):
     os.makedirs("mail_results", exist_ok=True)
-    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    path = f"mail_results/unfinished_{stamp}.json"
+    path = "mail_results/unfinished_live.json"
     payload = {
-        "id": stamp,
+        "id": "live",
         "reason": reason,
         "checked": checked,
         "total": total,
@@ -958,6 +957,11 @@ def save_unfinished(reason, remaining, checked, total):
     with open(path, "w", encoding="utf-8") as f:
         json.dump(payload, f)
     return path
+
+def clear_unfinished():
+    path = "mail_results/unfinished_live.json"
+    if os.path.exists(path):
+        os.remove(path)
 
 def check_domain_resolvable(domain):
     with cache_lock:
@@ -1244,9 +1248,12 @@ def px_tag(proxy_str):
     if not proxy_str:
         return "direct"
     info = parse_proxy(proxy_str) if "parse_proxy" in globals() else None
-    if info:
-        return f"{info.get('host')}:{info.get('port')}"
-    return "proxy"
+    if not info:
+        return "proxy"
+    meta = proxy_meta.get(proxy_str, {}) if isinstance(proxy_meta, dict) else {}
+    country = meta.get("country") or "?"
+    region = meta.get("region") or "?"
+    return f"{info.get('host')}:{info.get('port')} | {country} | {region}"
 
 def known_provider_conf(domain):
     yahoo_imap = ["imap.mail.yahoo.com"]
@@ -1916,6 +1923,14 @@ if start_engine_btn:
                                     "Under-The-Hood Background Trace": f"Result: {res.get('detail', '')}\nSteps Executed:\n  ↳ {trace_text}"
                                 })
 
+                                done = set(str_lit.session_state.checked_emails_set)
+                                left = []
+                                for raw in all_target_accounts:
+                                    em = raw.split(":", 1)[0].strip().lower() if ":" in raw else raw
+                                    if em not in done:
+                                        left.append(raw)
+                                save_unfinished("stopped or connection cut before finish", left, checked_count, total_accs)
+
                                 valid_len = len(str_lit.session_state.valid_results)
                                 wrong_len = len(str_lit.session_state.wrong_results)
                                 need_len = len(str_lit.session_state.need_app_results)
@@ -1959,11 +1974,8 @@ if start_engine_btn:
         end_dt = datetime.now()
         duration = end_dt - start_dt
 
-        if checked_count < total_accs:
-            left = all_target_accounts[checked_count:]
-            save_unfinished("stopped before finish", left, checked_count, total_accs)
-            with session_state_lock:
-                str_lit.session_state.run_completion_status = "Unfinished"
+        if checked_count >= total_accs:
+            clear_unfinished()
         with session_state_lock:
             str_lit.session_state.run_completion_status = "Successful" if checked_count >= total_accs else "Unfinished"
             str_lit.session_state.end_timestamp = end_dt.strftime("%Y-%m-%d %H:%M:%S")
