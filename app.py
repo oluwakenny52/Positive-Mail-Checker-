@@ -1688,7 +1688,7 @@ if start_engine_btn:
         live_log_area = str_lit.empty()
         
         total_accounts = len(accounts_to_check)
-        completed_count = 0
+        completed_count = 0  # Standard assignment defined explicitly before worker_task
         lock_results = threading.Lock()
         
         # UI Live Log container list
