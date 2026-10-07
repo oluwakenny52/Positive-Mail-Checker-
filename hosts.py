@@ -1,4 +1,27 @@
-"""IMAP host order: country map, then mail., imap., MX."""
+"""Known IMAP/POP hosts. Do not invent imap.yahoo.com."""
+
+YAHOO_IMAP = ["imap.mail.yahoo.com"]
+YAHOO_POP = ["pop.mail.yahoo.com"]
+MS_IMAP = ["outlook.office365.com", "imap-mail.outlook.com"]
+MS_POP = ["outlook.office365.com"]
+GMAIL_IMAP = ["imap.gmail.com"]
+GMAIL_POP = ["pop.gmail.com"]
+ATT_IMAP = ["imap.mail.att.net"]
+ATT_POP = ["inbound.att.net"]
+
+YAHOO_DOMAINS = {
+    "yahoo.com", "ymail.com", "rocketmail.com", "yahoo.co.uk", "yahoo.fr",
+    "yahoo.de", "yahoo.it", "yahoo.es", "yahoo.com.br", "frontier.com",
+    "frontiernet.net", "sbcglobal.net", "att.net", "bellsouth.net",
+    "pacbell.net", "swbell.net", "ameritech.net", "currently.com",
+    "nvbell.net", "prodigy.net", "snet.net", "wans.net",
+}
+MS_DOMAINS = {
+    "outlook.com", "hotmail.com", "live.com", "msn.com", "hotmail.co.uk",
+    "outlook.com.br", "hotmail.com.br", "live.com.br",
+}
+GMAIL_DOMAINS = {"gmail.com", "googlemail.com"}
+ATT_ONLY = {"att.net"}
 
 COUNTRY = {
     "bluewin.ch": "imaps.bluewin.ch",
@@ -20,49 +43,50 @@ COUNTRY = {
     "suddenlink.net": "mail.suddenlink.net",
 }
 
-BIG = {
-    "gmail.com": "imap.gmail.com",
-    "googlemail.com": "imap.gmail.com",
-    "outlook.com": "outlook.office365.com",
-    "hotmail.com": "outlook.office365.com",
-    "live.com": "outlook.office365.com",
-    "msn.com": "outlook.office365.com",
-    "yahoo.com": "imap.mail.yahoo.com",
-    "icloud.com": "imap.mail.me.com",
-}
+DISPOSABLE_PARTS = (
+    "tempmail", "temp-mail", "guerrillamail", "10minutemail", "mailinator",
+    "yopmail", "trashmail", "throwaway", "fakeinbox", "sharklasers",
+    "rerttymail", "discard.email", "maildrop", "getnada", "moakt",
+)
 
 
-def mx_hosts(domain):
-    try:
-        import dns.resolver
-    except Exception:
-        return []
-    try:
-        ans = dns.resolver.resolve(domain, "MX")
-        return [str(r.exchange).rstrip(".").lower() for r in sorted(ans, key=lambda x: x.preference)][:3]
-    except Exception:
-        return []
+def domain_of(email_addr):
+    return (email_addr or "").split("@")[-1].lower().strip()
+
+
+def bad_combo(email_addr):
+    email = (email_addr or "").strip().lower()
+    if email.count("@") != 1:
+        return True
+    local, domain = email.split("@", 1)
+    if not local or not domain or "." not in domain:
+        return True
+    if "http" in local or "login.live" in local or " " in email:
+        return True
+    return False
+
+
+def is_disposable(email_addr):
+    domain = domain_of(email_addr)
+    return any(part in domain for part in DISPOSABLE_PARTS)
+
+
+def provider_hosts(email_addr):
+    domain = domain_of(email_addr)
+    if domain in YAHOO_DOMAINS or domain.endswith(".yahoo.com"):
+        return YAHOO_IMAP, YAHOO_POP
+    if domain in MS_DOMAINS or domain.endswith(".outlook.com") or domain.endswith(".hotmail.com"):
+        return MS_IMAP, MS_POP
+    if domain in GMAIL_DOMAINS:
+        return GMAIL_IMAP, GMAIL_POP
+    if domain in ATT_ONLY:
+        return ATT_IMAP, ATT_POP
+    known = COUNTRY.get(domain)
+    if known:
+        return [known], [known]
+    return [f"mail.{domain}", f"imap.{domain}"], [f"mail.{domain}", f"pop.{domain}"]
 
 
 def host_list(email_addr):
-    domain = (email_addr or "").split("@")[-1].lower().strip()
-    seen, out = set(), []
-
-    def add(h):
-        h = (h or "").lower().strip(".")
-        if h and h not in seen:
-            seen.add(h)
-            out.append(h)
-
-    add(COUNTRY.get(domain))
-    add(BIG.get(domain))
-    add(f"mail.{domain}")
-    add(f"imap.{domain}")
-    add(f"imap.mail.{domain}")
-    for mx in mx_hosts(domain):
-        add(mx)
-        if "outlook" in mx or "protection.outlook" in mx:
-            add("outlook.office365.com")
-        if "google" in mx or "gmail" in mx:
-            add("imap.gmail.com")
-    return out[:6]
+    imap_hosts, _ = provider_hosts(email_addr)
+    return imap_hosts[:3]
