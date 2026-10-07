@@ -1124,14 +1124,16 @@ if raw_text:
     previous_valid = load_previous_valid()
     clean_lines, disp, typo, resume, app_skip, custom_skipped, dns_skipped = process_accounts(raw_text, previous_valid)
     
-    col_m1, col_m2, col_m3, col_m4, col_m5, col_m6, col_m7 = str_lit.columns(7)
+    unfinished_count = len(list_unfinished_runs())
+    col_m1, col_m2, col_m3, col_m4, col_m5, col_m6, col_m7, col_m8 = str_lit.columns(8)
     col_m1.metric("Ready to Check", len(clean_lines))
-    col_m2.metric("Disposables", len(disp))
-    col_m3.metric("Typos", len(typo))
-    col_m4.metric("Resume Skipped", len(resume))
-    col_m5.metric("App-Skipped", len(app_skip))
-    col_m6.metric("Custom Filtered", len(custom_skipped))
-    col_m7.metric("DNS Failed", len(dns_skipped))
+    col_m2.metric("Resume Unfinished", unfinished_count)
+    col_m3.metric("Disposables", len(disp))
+    col_m4.metric("Typos", len(typo))
+    col_m5.metric("Resume Skipped", len(resume))
+    col_m6.metric("App-Skipped", len(app_skip))
+    col_m7.metric("Custom Filtered", len(custom_skipped))
+    col_m8.metric("DNS Failed", len(dns_skipped))
 
     # --- Dropdown Inspector for Filtered Categories ---
     str_lit.markdown("#### 🔍 Filter Categories Content Inspector")
