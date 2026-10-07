@@ -492,6 +492,9 @@ def get_available_countries_with_scores():
     except Exception:
         return ["US", "GB", "DE", "CA", "FR"]
 
+if "pool_pick" not in str_lit.session_state:
+    str_lit.session_state.pool_pick = None
+
 selected_countries = list(str_lit.session_state.picked_countries)
 selected_mix_countries = list(str_lit.session_state.picked_countries)
 pool_mode = str_lit.session_state.pool_mode
@@ -502,32 +505,48 @@ if str_lit.session_state.pool_locked:
         str_lit.sidebar.caption("Picked: " + ", ".join(str_lit.session_state.picked_countries))
     if str_lit.sidebar.button("Change pool"):
         str_lit.session_state.pool_locked = False
+        str_lit.session_state.pool_pick = None
         str_lit.rerun()
 else:
-    choice = str_lit.sidebar.radio("Pool", ["all", "us_only", "country", "mix"], index=["all", "us_only", "country", "mix"].index(pool_mode))
-    if choice in ("all", "us_only"):
-        str_lit.session_state.pool_mode = choice
+    str_lit.sidebar.caption("Tap one")
+    if str_lit.sidebar.button("all", key="pool_btn_all"):
+        str_lit.session_state.pool_mode = "all"
         str_lit.session_state.pool_locked = True
+        str_lit.session_state.pool_pick = None
         str_lit.rerun()
-    available_countries = get_available_countries_with_scores() or ["US"]
-    with str_lit.sidebar.form("pool_pick_form"):
-        picked = []
-        for c in available_countries:
-            label = c
-            if choice == "mix":
-                scores = [proxy_meta.get(p, {}).get("score", 0) for p in load_proxies() if str(proxy_meta.get(p, {}).get("country", "")).upper() == c]
-                best = max(scores) if scores else 0
-                label = f"{c}  score={best}"
-            if str_lit.checkbox(label, value=c in str_lit.session_state.picked_countries, key=f"poolchk_{choice}_{c}"):
-                picked.append(c)
-        if str_lit.form_submit_button("Done"):
-            if not picked:
-                str_lit.sidebar.error("Pick at least one country")
-            else:
-                str_lit.session_state.pool_mode = choice
-                str_lit.session_state.picked_countries = picked
-                str_lit.session_state.pool_locked = True
-                str_lit.rerun()
+    if str_lit.sidebar.button("us_only", key="pool_btn_us"):
+        str_lit.session_state.pool_mode = "us_only"
+        str_lit.session_state.pool_locked = True
+        str_lit.session_state.pool_pick = None
+        str_lit.rerun()
+    if str_lit.sidebar.button("country", key="pool_btn_country"):
+        str_lit.session_state.pool_pick = "country"
+        str_lit.rerun()
+    if str_lit.sidebar.button("mix", key="pool_btn_mix"):
+        str_lit.session_state.pool_pick = "mix"
+        str_lit.rerun()
+    choice = str_lit.session_state.pool_pick
+    if choice in ("country", "mix"):
+        available_countries = get_available_countries_with_scores() or ["US"]
+        with str_lit.sidebar.form("pool_pick_form"):
+            picked = []
+            for c in available_countries:
+                label = c
+                if choice == "mix":
+                    scores = [proxy_meta.get(p, {}).get("score", 0) for p in load_proxies() if str(proxy_meta.get(p, {}).get("country", "")).upper() == c]
+                    best = max(scores) if scores else 0
+                    label = f"{c}  score={best}"
+                if str_lit.checkbox(label, value=c in str_lit.session_state.picked_countries, key=f"poolchk_{choice}_{c}"):
+                    picked.append(c)
+            if str_lit.form_submit_button("Done"):
+                if not picked:
+                    str_lit.sidebar.error("Pick at least one country")
+                else:
+                    str_lit.session_state.pool_mode = choice
+                    str_lit.session_state.picked_countries = picked
+                    str_lit.session_state.pool_locked = True
+                    str_lit.session_state.pool_pick = None
+                    str_lit.rerun()
 
 str_lit.sidebar.markdown("---")
 
