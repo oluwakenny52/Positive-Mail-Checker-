@@ -886,11 +886,78 @@ ZERO_ACCESS_PROVIDERS = {
 
 EMAIL_REGEX = re.compile(r"^[\w\.-]+@[\w\.-]+\.\w+$")
 
+DISPOSABLE_EXTRA = {
+    "rerttymail.com", "tmpmail.org", "tmpmail.net", "tempmailo.com",
+    "guerrillamail.com", "mailinator.com", "yopmail.com", "10minutemail.com",
+}
+DISPOSABLE_FILE = "disposable_domains.txt"
+
+def load_disposable_set():
+    found = set(DISPOSABLE) | set(DISPOSABLE_EXTRA)
+    if os.path.exists(DISPOSABLE_FILE):
+        try:
+            with open(DISPOSABLE_FILE, encoding="utf-8", errors="ignore") as f:
+                found.update(x.strip().lower() for x in f if x.strip() and not x.startswith("#"))
+        except Exception:
+            pass
+    if requests and len(found) < 500:
+        try:
+            r = requests.get(
+                "https://raw.githubusercontent.com/disposable-email-domains/disposable-email-domains/master/disposable_email_blocklist.conf",
+                timeout=8,
+            )
+            if r.ok and r.text:
+                extra = [x.strip().lower() for x in r.text.splitlines() if x.strip() and not x.startswith("#")]
+                found.update(extra)
+                with open(DISPOSABLE_FILE, "w", encoding="utf-8") as f:
+                    f.write("\n".join(sorted(found)))
+                log_startup(f"Disposable blocklist loaded: {len(found)}")
+        except Exception as e:
+            log_startup(f"Disposable list fetch skipped: {e}")
+    return found
+
+DISPOSABLE_LIVE = load_disposable_set()
+
 def is_disposable(email):
     try:
-        return email.split("@")[-1].lower().strip() in DISPOSABLE
+        domain = email.split("@")[-1].lower().strip()
+        if domain in DISPOSABLE_LIVE or domain in DISPOSABLE_EXTRA:
+            return True
+        return any(part in domain for part in ("tempmail", "rerttymail", "mailinator", "yopmail", "guerrilla", "throwaway", "10minute"))
     except Exception:
         return False
+
+def list_unfinished_runs():
+    runs = []
+    try:
+        os.makedirs("mail_results", exist_ok=True)
+        for path in sorted(glob.glob("mail_results/unfinished_*.json"), reverse=True):
+            try:
+                with open(path, encoding="utf-8") as f:
+                    data = json.load(f)
+                data["file"] = path
+                runs.append(data)
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return runs
+
+def save_unfinished(reason, remaining, checked, total):
+    os.makedirs("mail_results", exist_ok=True)
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    path = f"mail_results/unfinished_{stamp}.json"
+    payload = {
+        "id": stamp,
+        "reason": reason,
+        "checked": checked,
+        "total": total,
+        "remaining": remaining,
+        "saved_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+    }
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(payload, f)
+    return path
 
 def check_domain_resolvable(domain):
     with cache_lock:
@@ -1072,6 +1139,7 @@ if raw_text:
         "Select category to inspect contents:",
         options=[
             "Ready to Check",
+            "Resume Unfinished",
             "Disposables",
             "Typos",
             "Resume Skipped",
@@ -1081,8 +1149,13 @@ if raw_text:
         ]
     )
 
+    unfinished_preview = []
+    for run in list_unfinished_runs():
+        unfinished_preview.append(f"{run.get('saved_at','')} | {run.get('reason','')} | left {len(run.get('remaining') or [])}")
+        unfinished_preview.extend(run.get("remaining") or [])
     category_map = {
         "Ready to Check": clean_lines,
+        "Resume Unfinished": unfinished_preview,
         "Disposables": disp,
         "Typos": typo,
         "Resume Skipped": resume,
@@ -1689,6 +1762,7 @@ with col_action2:
         "Engine Action Mode:",
         options=[
             "Ready to Check",
+            "Resume Unfinished",
             "Disposables",
             "Typos",
             "Resume Skipped",
@@ -1699,14 +1773,24 @@ with col_action2:
         index=0,
         help="Select the account category you would like the live checking engine to execute on."
     )
+    unfinished_runs = list_unfinished_runs()
+    unfinished_pick = None
+    if engine_action_mode == "Resume Unfinished":
+        labels = [f"{r.get('saved_at','')} | {r.get('reason','stop')} | {r.get('checked',0)}/{r.get('total',0)}" for r in unfinished_runs] or ["none saved"]
+        unfinished_pick = str_lit.selectbox("Unfinished run:", labels)
 
 active_proxy_pool = get_filtered_active_proxies()
 
 if start_engine_btn:
     log_startup(f"Live checking engine execution triggered in [{CFG['MODE_NAME']}] mode on category: [{engine_action_mode}].")
     
+    resume_lines = []
+    if engine_action_mode == "Resume Unfinished" and unfinished_runs and unfinished_pick and unfinished_pick != "none saved":
+        idx = [f"{r.get('saved_at','')} | {r.get('reason','stop')} | {r.get('checked',0)}/{r.get('total',0)}" for r in unfinished_runs].index(unfinished_pick)
+        resume_lines = unfinished_runs[idx].get("remaining") or []
     category_queue_map = {
         "Ready to Check": clean_lines,
+        "Resume Unfinished": resume_lines,
         "Disposables": disp,
         "Typos": typo,
         "Resume Skipped": resume,
@@ -1873,8 +1957,13 @@ if start_engine_btn:
         end_dt = datetime.now()
         duration = end_dt - start_dt
 
+        if checked_count < total_accs:
+            left = all_target_accounts[checked_count:]
+            save_unfinished("stopped before finish", left, checked_count, total_accs)
+            with session_state_lock:
+                str_lit.session_state.run_completion_status = "Unfinished"
         with session_state_lock:
-            str_lit.session_state.run_completion_status = "Successful"
+            str_lit.session_state.run_completion_status = "Successful" if checked_count >= total_accs else "Unfinished"
             str_lit.session_state.end_timestamp = end_dt.strftime("%Y-%m-%d %H:%M:%S")
             str_lit.session_state.total_duration = str(timedelta(seconds=int(duration.total_seconds())))
             
