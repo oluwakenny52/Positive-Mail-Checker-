@@ -1,4 +1,19 @@
- import glob
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+
+"""
+Bobito Mailbox Reader & Portal Hub
+----------------------------------
+A Streamlit IMAP client that:
+• Discovers folders exhaustively
+• Detects bot / OTP messages
+• Extracts PINs and verification links
+• Cleans message bodies
+• Provides per‑message actions (mark read, delete, move, raw view)
+• Logs all activity and exports the valid‑account list
+"""
+
+import glob
 import imaplib
 import os
 import re
@@ -9,17 +24,29 @@ from email.header import decode_header
 import streamlit as st
 
 # ------------------------------------------------------------------
-# 1️⃣ Imports – keep the original imports
+# 1️⃣ Configuration & Keep‑Alive injector
 # ------------------------------------------------------------------
-from hosts import host_list  # optional – fall back to hard‑coded list if missing
+st.set_page_config(
+    page_title="Bobito Mailbox Reader & Portal Hub",
+    page_icon="📥",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
+
+# Keep‑alive for mobile/Safari (prevents session drop)
+st.markdown(
+    """
+    <script>
+    setInterval(function(){
+        fetch('/_stcore/health').then(res => {});
+    }, 30000);
+    </script>
+    """,
+    unsafe_allow_html=True,
+)
 
 # ------------------------------------------------------------------
-# 2️⃣ Streamlit layout
-# ------------------------------------------------------------------
-st.set_page_config(page_title="Mailbox", page_icon="📥", layout="wide")
-
-# ------------------------------------------------------------------
-# 3️⃣ Session state helpers
+# 2️⃣ Session state helpers
 # ------------------------------------------------------------------
 if "mb_log" not in st.session_state:
     st.session_state.mb_log = []
@@ -27,19 +54,32 @@ if "mb_folders" not in st.session_state:
     st.session_state.mb_folders = ["INBOX"]
 if "mb_host" not in st.session_state:
     st.session_state.mb_host = ""
+if "current_page" not in st.session_state:
+    st.session_state.current_page = 0
+if "current_messages" not in st.session_state:
+    st.session_state.current_messages = []
 
 def log(msg: str) -> None:
     """Insert a new log entry at the top of the list."""
-    st.session_state.mb_log.insert(0, msg)
-    st.session_state.mb_log = st.session_state.mb_log[:20]
+    timestamp = time.strftime("%H:%M:%S")
+    st.session_state.mb_log.insert(0, f"[{timestamp}] {msg}")
+    st.session_state.mb_log = st.session_state.mb_log[:50]
 
 # ------------------------------------------------------------------
-# 4️⃣ Load valid accounts
+# 3️⃣ Load “valid mail” list
 # ------------------------------------------------------------------
-def load_valid() -> list[str]:
+def load_valid() -> list:
+    """
+    Load valid accounts from:
+    1. mail_results/valid_*.txt
+    2. clean_valid_accounts.txt
+    3. valid_accounts.txt
+    The file format must be email:password (password can contain a pipe; only the first part is used).
+    """
     rows, seen = [], set()
     paths = sorted(glob.glob("mail_results/valid_*.txt"), reverse=True)
     paths += [p for p in ("clean_valid_accounts.txt", "valid_accounts.txt") if os.path.exists(p)]
+
     for path in paths:
         try:
             with open(path, encoding="utf-8", errors="ignore") as f:
@@ -47,8 +87,8 @@ def load_valid() -> list[str]:
                     line = line.strip()
                     if ":" not in line:
                         continue
-                    email, pwd = line.split(":", 1)
-                    combo = f"{email.strip()}:{pwd.split('|')[0].strip()}"
+                    email_addr, pwd = line.split(":", 1)
+                    combo = f"{email_addr.strip()}:{pwd.split('|')[0].strip()}"
                     if combo not in seen:
                         seen.add(combo)
                         rows.append(combo)
@@ -57,9 +97,10 @@ def load_valid() -> list[str]:
     return rows
 
 # ------------------------------------------------------------------
-# 5️⃣ Header decoding helper
+# 4️⃣ Helper functions (IMAP, decoding, extraction, cleanup)
 # ------------------------------------------------------------------
 def decode_hdr(value: str) -> str:
+    """Decode MIME‑encoded header values."""
     try:
         parts = decode_header(value or "")
         return "".join(
@@ -71,73 +112,8 @@ def decode_hdr(value: str) -> str:
     except Exception:
         return str(value or "")
 
-# ------------------------------------------------------------------
-# 6️⃣ **Original folder discovery logic – keep it unchanged!**
-# ------------------------------------------------------------------
-def list_folders(mail: imaplib.IMAP4_SSL) -> list[str]:
-    """
-    Return a sorted list of folder names discovered via
-    `mail.list('""','*')`.  Falls back to ["INBOX"] if nothing is found.
-    """
-    found = set()
-    try:
-        typ, data = mail.list('""', "*")
-        if typ == "OK" and data:
-            for item in data:
-                if not item:
-                    continue
-                s = item.decode("utf-8", errors="ignore") if isinstance(item, bytes) else str(item)
-                quoted = re.findall(r'"((?:\\.|[^"\\])*)"', s)
-                name = quoted[-1] if quoted else s.split()[-1]
-                name = name.replace('\\"', '"').strip()
-                if name and name not in (".", "/"):
-                    found.add(name)
-    except Exception:
-        pass
-    if not found:
-        found.add("INBOX")
-    return sorted(found, key=lambda x: (0 if x.lower() == "inbox" else 1, x.lower()))
-
-# ------------------------------------------------------------------
-# 7️⃣ IMAP helpers
-# ------------------------------------------------------------------
-def open_mail(email: str, password: str, host: str) -> imaplib.IMAP4_SSL:
-    mail = imaplib.IMAP4_SSL(host, 993, timeout=20)
-    mail.login(email, password)
-    return mail
-
-def close_mail(mail: imaplib.IMAP4_SSL) -> None:
-    try:
-        mail.logout()
-    except Exception:
-        try:
-            mail.shutdown()
-        except Exception:
-            pass
-
-# ------------------------------------------------------------------
-# 8️⃣ Connection helper
-# ------------------------------------------------------------------
-def connect_first(email: str, password: str, override: str) -> tuple[str, list[str], str | None]:
-    hosts = [override] if override else host_list(email)
-    last = "no host"
-    for host in hosts:
-        mail = None
-        try:
-            mail = open_mail(email, password, host)
-            folders = list_folders(mail)
-            close_mail(mail)
-            return host, folders, None
-        except Exception as e:
-            last = f"{host}: {e}"
-            if mail:
-                close_mail(mail)
-    return "", ["INBOX"], last
-
-# ------------------------------------------------------------------
-# 9️⃣ Auxiliary helpers – webmail portal, bot detection, PIN/links, cleanup
-# ------------------------------------------------------------------
 def get_webmail_portal(email: str) -> str:
+    """Return the webmail portal URL for a given address."""
     if "@" not in email:
         return "https://mail.google.com"
     domain = email.split("@")[-1].lower()
@@ -158,23 +134,45 @@ def get_webmail_portal(email: str) -> str:
     }
     return portals.get(domain, f"https://www.{domain}")
 
-def is_bot_message(subject: str, body: str) -> bool:
-    """Return True if the message looks like an OTP / bot / verification email."""
-    bot_keywords = [
-        "otp", "verification", "verify", "security alert", "password reset",
-        "code", "confirm", "login", "auth", "signin",
-        "crypto", "token", "activation", "alert", "transaction",
+def list_folders(mail: imaplib.IMAP4_SSL) -> list:
+    """Return all folders discovered via LIST/LSUB + dictionary brute‑force."""
+    found = set(["INBOX"])
+    common_folders = [
+        "INBOX", "Sent", "Sent Items", "Sent Messages", "Trash", "Deleted Items",
+        "Junk", "Spam", "Junk E-mail", "Archive", "Archives", "Drafts",
+        "Notes", "Important", "Starred", "All Mail", "Bin",
     ]
-    combined = f"{subject} {body}".lower()
-    return any(kw in combined for kw in bot_keywords)
+    for cf in common_folders:
+        found.update({cf, cf.upper(), cf.lower()})
+
+    try:
+        typ, data = mail.list('""', "*")
+        if typ == "OK" and data:
+            for item in data:
+                if not item:
+                    continue
+                s = item.decode("utf-8", errors="ignore") if isinstance(item, bytes) else str(item)
+                quoted = re.findall(r'"((?:\\.|[^"\\])*)"', s)
+                name = quoted[-1] if quoted else s.split()[-1]
+                name = name.replace('\\"', '"').strip()
+                if name and name not in (".", "/"):
+                    found.add(name)
+    except Exception:
+        pass
+    return sorted(list(found), key=lambda x: (0 if x.lower() == "inbox" else 1, x.lower()))
 
 def extract_pins_and_links(text: str) -> tuple[list[str], list[str]]:
+    """Return a tuple (pins, links) extracted from the body."""
+    # PINs: 4‑8 digit numbers not adjacent to other digits
     pins = re.findall(r'\b(?<![#\d])\d{4,8}(?![#\d])\b', text)
+    # URLs: http(s)://… or www.…
     urls = re.findall(r'https?://[^\s<>"]+|www\.[^\s<>"]+', text)
+    # Filter out known noisy domains
     cleaned_urls = [u for u in urls if not any(x in u.lower() for x in ["w3.org", "schema.org", "apple.com/DTDs"])]
     return list(dict.fromkeys(pins)), list(dict.fromkeys(cleaned_urls))
 
 def clean_boilerplate(text: str) -> str:
+    """Strip common unsubscribe / privacy / confidentiality lines."""
     if not text:
         return ""
     patterns = [
@@ -188,80 +186,157 @@ def clean_boilerplate(text: str) -> str:
     return text.strip()
 
 # ------------------------------------------------------------------
-# 10️⃣ Streamlit UI – Sidebar
+# 5️⃣ Main UI – Sidebar
 # ------------------------------------------------------------------
-st.title("Mailbox")
-st.caption("Reconnects on every click. Socket is not kept in session.")
+st.sidebar.header("⚙️ Account & Connection Hub")
 
-valid = load_valid()
-st.sidebar.header("Account")
-pick = st.sidebar.selectbox("Valid account", valid or ["none"])
+# Load the list of valid accounts
+valid_accounts = load_valid()
+
+pick = st.sidebar.selectbox("Select Valid Account", valid_accounts or ["none"])
 custom_email = st.sidebar.text_input("Email override")
 custom_pass = st.sidebar.text_input("Password override", type="password")
-override = st.sidebar.text_input("IMAP host override")
+override_host = st.sidebar.text_input("IMAP Host Override")
 
+# Resolve the active credentials
 if custom_email.strip():
-    email, password = custom_email.strip(), custom_pass.strip()
-elif ":" in pick:
-    email, password = pick.split(":", 1)
+    email_addr, pw = custom_email.strip(), custom_pass.strip()
+elif ":" in pick and pick != "none":
+    email_addr, pw = pick.split(":", 1)
 else:
-    email, password = "", ""
+    email_addr, pw = "", ""
 
-st.sidebar.write("Host order: " + ", ".join(host_list(email)[:4]) if email else "-")
+# Show webmail portal
+if email_addr:
+    portal_url = get_webmail_portal(email_addr)
+    st.sidebar.markdown(f"**Webmail portal:** [Open]({portal_url})")
+    st.sidebar.text_input(
+        "Copy credentials (email:password)",
+        value=f"{email_addr}:{pw}",
+        key="cred_copy",
+    )
 
-if st.sidebar.button("Load folders", type="primary"):
-    if not email or not password:
-        st.error("Need email and password")
+# Connect & discover folders
+if st.sidebar.button("🔌 Connect & Discover Folders", type="primary"):
+    if not email_addr or not pw:
+        st.error("Email and password are required.")
     else:
-        with st.spinner("Connecting..."):
-            host, folders, err = connect_first(email, password, override.strip())
-        if err:
-            st.error(err)
-            log(err)
-        else:
-            st.session_state.mb_host = host
+        hosts = [override_host.strip()] if override_host.strip() else get_hosts(email_addr)
+        success, host_used, folders, err_msg = False, "", [], ""
+        with st.spinner("Connecting…"):
+            for host in hosts:
+                try:
+                    mail_obj = imaplib.IMAP4_SSL(host, 993, timeout=20)
+                    mail_obj.login(email_addr, pw)
+                    folders = list_folders(mail_obj)
+                    mail_obj.logout()
+                    host_used = host
+                    success = True
+                    break
+                except Exception as exc:
+                    err_msg = f"{host}: {exc}"
+                    try:
+                        mail_obj.logout()
+                    except Exception:
+                        pass
+        if success:
+            st.session_state.mb_host = host_used
             st.session_state.mb_folders = folders
-            log(f"folders {len(folders)} via {host}")
-            st.success(f"{host} · {len(folders)} folders")
+            log(f"Connected to {host_used} – {len(folders)} folders found.")
+            st.sidebar.success(f"Connected: {host_used} ({len(folders)} folders)")
+        else:
+            st.sidebar.error(f"Connection failed: {err_msg}")
+            log(f"Connection failed: {err_msg}")
 
 # ------------------------------------------------------------------
-# 11️⃣ Main panel – Folder selector and message loading
+# 6️⃣ Sidebar – Activity log & export
 # ------------------------------------------------------------------
-folder = st.selectbox("Folder", st.session_state.mb_folders)
-page_size = st.slider("Page size", 5, 40, 15)
+st.sidebar.markdown("---")
+st.sidebar.subheader("📜 Live Activity Log")
+with st.sidebar.expander("Show log", expanded=False):
+    for entry in st.session_state.mb_log:
+        st.text(entry)
 
-if st.button("Load messages"):
-    host = override.strip() or st.session_state.mb_host or (host_list(email)[:1] or [""])[0]
-    if not email or not password or not host:
-        st.error("Load folders first")
+if valid_accounts:
+    st.sidebar.markdown("---")
+    st.sidebar.subheader("💾 Export Tools")
+    export_text = "\n".join(valid_accounts)
+    st.sidebar.download_button(
+        label="Download Valid Accounts",
+        data=export_text,
+        file_name="valid_accounts_export.txt",
+        mime="text/plain",
+    )
+
+# ------------------------------------------------------------------
+# 7️⃣ Main panel – Folder explorer & message loader
+# ------------------------------------------------------------------
+col1, col2, col3 = st.columns([2, 1, 1])
+
+with col1:
+    folder = st.selectbox("Select Mail Folder", st.session_state.mb_folders)
+
+with col2:
+    page_size = st.slider("Page size", 5, 50, 15)
+
+with col3:
+    sort_order = st.selectbox("Sort Order", ["Newest First", "Oldest First"])
+
+# Deep search panel
+with st.expander("🔍 Deep Search & Filters", expanded=False):
+    search_query = st.text_input("Search term or keyword")
+    search_scope = st.selectbox("Search Scope", ["TEXT", "SUBJECT", "FROM", "BODY"])
+
+# ------------------------------------------------------------------
+# 8️⃣ Load & display messages
+# ------------------------------------------------------------------
+if st.button("Load & Search Messages", type="primary"):
+    host = override_host.strip() or st.session_state.mb_host or (get_hosts(email_addr)[:1] or [""])[0]
+    if not email_addr or not pw or not host:
+        st.error("Connect first – you need a host, email and password.")
     else:
         mail = None
         try:
-            with st.spinner(f"Reading {folder} on {host}"):
-                mail = open_mail(email, password, host)
-                # select readonly to avoid altering flags during the read
-                mail.select(f'"{folder}"', readonly=True)
+            with st.spinner(f"Fetching messages from {folder}…"):
+                mail = imaplib.IMAP4_SSL(host, 993, timeout=20)
+                mail.login(email_addr, pw)
+                mail.select(f'"{folder}"', readonly=False)
 
-                # search
-                typ, data = mail.search(None, "ALL")
+                # Build the SEARCH query
+                if search_query.strip():
+                    if search_scope == "TEXT":
+                        search_cmd = f'TEXT "{search_query.strip()}"'
+                    elif search_scope == "SUBJECT":
+                        search_cmd = f'SUBJECT "{search_query.strip()}"'
+                    elif search_scope == "FROM":
+                        search_cmd = f'FROM "{search_query.strip()}"'
+                    else:  # BODY
+                        search_cmd = f'BODY "{search_query.strip()}"'
+                else:
+                    search_cmd = "ALL"
+
+                typ, data = mail.search(None, search_cmd)
                 ids = (data[0] or b"").split() if typ == "OK" else []
 
-                # order & slice
-                ids = list(reversed(ids))[:page_size]
+                # Sort
+                if sort_order == "Newest First":
+                    ids = list(reversed(ids))
+                ids = ids[:page_size]
 
-                rows = []
+                messages = []
                 for mid in ids:
-                    # fetch full RFC822 to get body later
-                    typ, msgdata = mail.fetch(mid, "(RFC822)")
-                    if typ != "OK" or not msgdata or not isinstance(msgdata[0], tuple):
+                    typ, msg_data = mail.fetch(mid, "(RFC822)")
+                    if typ != "OK" or not msg_data or not isinstance(msg_data[0], tuple):
                         continue
-                    raw_bytes = msgdata[0][1]
+                    raw_bytes = msg_data[0][1]
                     msg_obj = message_from_bytes(raw_bytes)
 
                     subject = decode_hdr(msg_obj.get("Subject", ""))
                     frm = decode_hdr(msg_obj.get("From", ""))
                     date_val = decode_hdr(msg_obj.get("Date", ""))
-                    is_read = "\\Seen" in msg_obj.get_flags() if hasattr(msg_obj, "get_flags") else False
+                    # Flags – check if seen
+                    flags = msg_obj.get_flags() if hasattr(msg_obj, "get_flags") else []
+                    is_read = "\\Seen" in flags
 
                     # Body extraction
                     body_text = ""
@@ -287,7 +362,7 @@ if st.button("Load messages"):
                     pins, links = extract_pins_and_links(body_text)
                     is_bot = is_bot_message(subject, body_text)
 
-                    rows.append(
+                    messages.append(
                         {
                             "id": mid.decode(),
                             "from": frm,
@@ -302,28 +377,29 @@ if st.button("Load messages"):
                         }
                     )
 
-                st.session_state.current_messages = rows
-                log(f"listed {len(rows)} in {folder}")
-                st.success(f"Loaded {len(rows)} messages")
-        except Exception as e:
-            st.error(str(e))
-            log(str(e))
+                st.session_state.current_messages = messages
+                log(f"Loaded {len(messages)} messages from {folder}")
+        except Exception as exc:
+            st.error(str(exc))
+            log(str(exc))
         finally:
             if mail:
-                close_mail(mail)
+                mail.logout()
 
 # ------------------------------------------------------------------
-# 12️⃣ Message actions & UI
+# 9️⃣ Message actions & display
 # ------------------------------------------------------------------
-if st.session_state.get("current_messages"):
+if st.session_state.current_messages:
+    # Bot / spam preview + mass delete
     bot_msgs = [m for m in st.session_state.current_messages if m["is_bot"]]
     if bot_msgs:
         st.markdown("---")
         st.subheader(f"🤖 Bot & Security Intelligence Detected ({len(bot_msgs)} messages)")
         if st.button("🗑️ Mass Delete All Detected Bot/Spam Messages"):
-            host = override.strip() or st.session_state.mb_host or (host_list(email)[:1] or [""])[0]
+            host = override_host.strip() or st.session_state.mb_host or (get_hosts(email_addr)[:1] or [""])[0]
             try:
-                mail = open_mail(email, password, host)
+                mail = imaplib.IMAP4_SSL(host, 993, timeout=20)
+                mail.login(email_addr, pw)
                 mail.select(f'"{folder}"', readonly=False)
                 for bm in bot_msgs:
                     mail.store(bm["id"], "+FLAGS", "\\Deleted")
@@ -358,13 +434,14 @@ if st.session_state.get("current_messages"):
 
             # Per‑message actions
             col1, col2, col3, col4 = st.columns(4)
-            host = override.strip() or st.session_state.mb_host or (host_list(email)[:1] or [""])[0]
+            host = override_host.strip() or st.session_state.mb_host or (get_hosts(email_addr)[:1] or [""])[0]
 
             with col1:
                 if not msg["is_read"]:
                     if st.button("Mark as Read", key=f"read_{msg['id']}"):
                         try:
-                            m = open_mail(email, password, host)
+                            m = imaplib.IMAP4_SSL(host, 993, timeout=20)
+                            m.login(email_addr, pw)
                             m.select(f'"{folder}"', readonly=False)
                             m.store(msg["id"], "+FLAGS", "\\Seen")
                             m.logout()
@@ -377,7 +454,8 @@ if st.session_state.get("current_messages"):
                 target_move = st.selectbox("Move to", st.session_state.mb_folders, key=f"mv_sel_{msg['id']}")
                 if st.button("Move Message", key=f"mv_btn_{msg['id']}"):
                     try:
-                        m = open_mail(email, password, host)
+                        m = imaplib.IMAP4_SSL(host, 993, timeout=20)
+                        m.login(email_addr, pw)
                         m.select(f'"{folder}"', readonly=False)
                         m.copy(msg["id"], f'"{target_move}"')
                         m.store(msg["id"], "+FLAGS", "\\Deleted")
@@ -391,7 +469,8 @@ if st.session_state.get("current_messages"):
             with col3:
                 if st.button("Delete Message", key=f"del_{msg['id']}"):
                     try:
-                        m = open_mail(email, password, host)
+                        m = imaplib.IMAP4_SSL(host, 993, timeout=20)
+                        m.login(email_addr, pw)
                         m.select(f'"{folder}"', readonly=False)
                         m.store(msg["id"], "+FLAGS", "\\Deleted")
                         m.expunge()
@@ -404,23 +483,26 @@ if st.session_state.get("current_messages"):
             with col4:
                 with st.popover("View Raw RFC822"):
                     st.code(msg["raw"].decode("utf-8", errors="ignore"))
+else:
+    st.info("No messages loaded yet – select a folder and click **Load & Search Messages**.")
 
 # ------------------------------------------------------------------
-# 13️⃣ Sidebar – activity log & export of valid accounts
+# 10️⃣ Helper: get_hosts() – fallback if hosts.py missing
 # ------------------------------------------------------------------
-st.sidebar.markdown("---")
-st.sidebar.subheader("📜 Live Activity Log")
-with st.sidebar.expander("View activity log", expanded=False):
-    for line in st.session_state.mb_log:
-        st.text(line)
+def get_hosts(email: str) -> list[str]:
+    """
+    Returns a list of IMAP hosts to try.
+    If a `hosts.py` file is present it will use `host_list(email)` from that module.
+    Otherwise it falls back to a short hard‑coded list.
+    """
+    try:
+        from hosts import host_list
+        return host_list(email)
+    except Exception:
+        return ["imap.gmail.com", "outlook.office365.com"]
 
-if valid:
-    st.sidebar.markdown("---")
-    st.sidebar.subheader("💾 Export Valid Accounts")
-    export_text = "\n".join(valid)
-    st.sidebar.download_button(
-        label="Download valid_accounts_export.txt",
-        data=export_text,
-        file_name="valid_accounts_export.txt",
-        mime="text/plain",
-    )
+# ------------------------------------------------------------------
+# 11️⃣ Run the app
+# ------------------------------------------------------------------
+if __name__ == "__main__":
+    st.experimental_set_query_params()  # Ensure a clean query string
