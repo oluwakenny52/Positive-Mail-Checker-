@@ -269,14 +269,29 @@ def close_mail(mail):
             pass
 
 
+def is_extortion_spam(subject: str, body: str, frm: str = "") -> bool:
+    """Detects sextortion, ransom, and bitcoin extortion emails."""
+    extortion_keywords = [
+        "bitcoin wallet", "transfer me", "deactivate and remove all malware",
+        "posted to the public", "recorded all your actions", "trojan",
+        "remote control function", "my servers", "pay bitcoin", "ransom"
+    ]
+    combined = f"{subject} {body} {frm}".lower()
+    return any(kw in combined for kw in extortion_keywords)
+
+
 def is_bot_message(subject, body, frm=""):
+    if is_extortion_spam(subject, body, frm):
+        return False
+
     bot_keywords = [
         "otp", "verification", "verify", "security alert", "password reset",
-        "code", "confirm", "login", "auth", "signin", "crypto", "token", "activation",
-        "hacked", "extortion", "wallet", "staking", "mcafee", "iptv", "lot", "card",
-        "debit card", "credit card", "gift card", "payment", "id card", "credential", 
+        "code", "confirm", "login", "auth", "signin", "token", "activation",
+        "mcafee", "iptv", "lot", "credential", 
         "application password", "cvv", "exp date", "debit", "bank debit", "online purchase",
-        "tracking number", "order tracking", "purchase order", "purchase confirmation"
+        "tracking number", "order tracking", "purchase order", "purchase confirmation",
+        "telegram", "tg", "t.me", "telegram notification", "telegram alert", "telegram code",
+        "blacklist", "blacklisted", "banned", "blocked", "spam list", "denylist"
     ]
     combined = f"{subject} {body} {frm}".lower()
     return any(kw in combined for kw in bot_keywords)
@@ -471,6 +486,10 @@ def fetch_messages_paginated(mail, email_addr, password_val, host_val, target_fo
                     except Exception:
                         pass
 
+                if is_extortion_spam(subject, body_text, frm):
+                    log_func(f"  │   ├─ [Msg ID #{mid.decode()}] ⚠️ EXCLUDED: Extortion / Ransom Spam detected.")
+                    continue
+
                 cleaned_body = clean_boilerplate(body_text)
                 pins, links = extract_pins_and_links(body_text)
                 cards, creds = extract_credentials_and_cards(body_text)
@@ -499,7 +518,7 @@ def fetch_messages_paginated(mail, email_addr, password_val, host_val, target_fo
                 log_func(
                     f"  │   ├─ [Msg #{idx} | ID: {mid.decode()}] Parsed in {fetch_elapsed}ms | Size: {len(raw_msg_bytes)}B | "
                     f"From: '{frm}' | To: '{to_hdr}' | Subject: '{subject}' | "
-                    f"Flags: {flags_str} | BotDetected={is_bot}"
+                    f"Flags: {flags_str} | BotDetected={is_bot} | Pins={pins} | Cards={cards}"
                 )
 
         except (socket.timeout, TimeoutError):
@@ -521,7 +540,7 @@ def fetch_messages_paginated(mail, email_addr, password_val, host_val, target_fo
 
 # Header
 st.title("📥 Bobito Mailbox Reader & Portal Hub")
-st.caption("Advanced IMAP Client with Interactive Bot Intelligence, Dedicated OTP, Debit/Credit Card & Credentials Scanner, Multi-Field Search, and Deep Diagnostic Instrumentation.")
+st.caption("Advanced IMAP Client with Interactive Bot Intelligence, Dedicated OTP, Debit/Credit Card & Credentials Scanner, Multi-Field Search, Telegram/Blacklist Filter, and Deep Diagnostic Instrumentation.")
 
 valid = load_valid()
 
@@ -598,7 +617,7 @@ if st.sidebar.button("Connect & Discover Folders", type="primary", use_container
         else:
             st.sidebar.error(last)
 
-# Debug Expander for Discovery (Collapsed by default)
+# Debug Expander for Discovery
 if st.session_state.folder_debug_logs:
     with st.expander("🛠️ Folder Discovery Diagnostic Traces", expanded=False):
         st.code("\n".join(st.session_state.folder_debug_logs), language="text")
@@ -641,7 +660,7 @@ if st.button("📂 Load Folder Messages", type="primary", use_container_width=Tr
 # -----------------------------------------------------------------------------
 if st.session_state.bot_filter_mode:
     active_msgs = [m for m in st.session_state.current_messages if m["is_bot"]]
-    st.info("⚠️ Message stream is currently filtered to show DETECTED BOT/SPAM MESSAGES ONLY.")
+    st.info("⚠️ Message stream is currently filtered to show DETECTED BOT/SPAM/TELEGRAM/BLACKLIST MESSAGES ONLY.")
 else:
     active_msgs = st.session_state.current_messages
 
@@ -658,7 +677,7 @@ if len(active_msgs) > 0:
 
     for idx, msg in enumerate(active_msgs):
         status_icon = "📖" if msg["is_read"] else "📩"
-        bot_badge = " [🤖 BOT/OTP/SPAM]" if msg["is_bot"] else ""
+        bot_badge = " [🤖 BOT/OTP/TELEGRAM/BLACKLIST]" if msg["is_bot"] else ""
         folder_badge = f" [{msg['folder']}]"
 
         with st.expander(f"{status_icon}{folder_badge} [{msg['date']}] {msg['from']} - {msg['subject']}{bot_badge}", expanded=False):
@@ -777,7 +796,7 @@ if len(active_msgs) > 0:
 # -----------------------------------------------------------------------------
 st.markdown("---")
 with st.expander("🔑 Standalone OTP, Debit/Credit Cards & Sensitive Data Scanner", expanded=True):
-    st.markdown("#### Dynamic OTP, Password, Debit & Credit Cards, Gift Cards & Credential Scanner Controls")
+    st.markdown("#### Dynamic OTP, Password, Debit & Credit Cards, Gift Cards, Telegram & Credential Scanner Controls")
     
     otp_c1, otp_c2, otp_c3 = st.columns([2, 1, 1])
     
@@ -797,6 +816,7 @@ with st.expander("🔑 Standalone OTP, Debit/Credit Cards & Sensitive Data Scann
             "Bank Debit Alert & Online Debit",
             "Order Tracking & Purchase Confirmation",
             "OTP Message & Verification", 
+            "Telegram Alerts & Blacklist",
             "Password / Reset Code", 
             "Gift Cards", 
             "ID Cards / Credentials", 
@@ -812,7 +832,7 @@ with st.expander("🔑 Standalone OTP, Debit/Credit Cards & Sensitive Data Scann
     with otp_c3:
         otp_search_field = st.selectbox("Scan Field", ["TEXT", "SUBJECT", "BODY", "FROM"], key="otp_search_field")
 
-    # Dedicated Controls (Toggle & Checkbox)
+    # Dedicated Controls
     t_col1, t_col2 = st.columns(2)
     with t_col1:
         otp_auto_clean_toggle = st.toggle("Auto-Clean HTML & Boilerplate", value=True, key="otp_clean_toggle")
@@ -821,11 +841,12 @@ with st.expander("🔑 Standalone OTP, Debit/Credit Cards & Sensitive Data Scann
 
     # Preset Keyword Mapping
     preset_keywords_map = {
-        "All Security Categories": "OTP password debit credit card gift payment credential login verification reset order tracking confirmation",
+        "All Security Categories": "OTP password debit credit card gift payment credential login verification reset order tracking confirmation telegram blacklist banned",
         "Debit Card & Credit Card Details": "debit card credit card cardholder cvv cvc exp expiry cardholder payment",
         "Bank Debit Alert & Online Debit": "bank debit online purchase debited debit alert account debited transaction paid",
         "Order Tracking & Purchase Confirmation": "order tracking tracking number purchase order order confirmation PO tracking",
         "OTP Message & Verification": "OTP verification code verify auth token pin",
+        "Telegram Alerts & Blacklist": "telegram tg t.me blacklist blacklisted banned blocked spam",
         "Password / Reset Code": "password reset passwd new password",
         "Gift Cards": "gift card claim code voucher redeem",
         "ID Cards / Credentials": "id card identity credentials account info",
@@ -850,7 +871,7 @@ with st.expander("🔑 Standalone OTP, Debit/Credit Cards & Sensitive Data Scann
                     kw_to_use = otp_custom_keyword.strip()
                 else:
                     selected_kws = [preset_keywords_map[cat] for cat in otp_scan_category if cat in preset_keywords_map]
-                    kw_to_use = " ".join(selected_kws) if selected_kws else "card OTP debit"
+                    kw_to_use = " ".join(selected_kws) if selected_kws else "card OTP debit telegram blacklist"
 
                 with st.spinner(f"Scanning target folders ({len(target_scope)}) for security payload [{kw_to_use}]..."):
                     mail = open_mail(email, password, host, timeout=120)
@@ -974,7 +995,7 @@ with st.expander("🔑 Standalone OTP, Debit/Credit Cards & Sensitive Data Scann
                     kw_to_use = otp_custom_keyword.strip()
                 else:
                     selected_kws = [preset_keywords_map[cat] for cat in otp_scan_category if cat in preset_keywords_map]
-                    kw_to_use = " ".join(selected_kws) if selected_kws else "card OTP debit"
+                    kw_to_use = " ".join(selected_kws) if selected_kws else "card OTP debit telegram blacklist"
                 st.session_state.otp_messages = fetch_messages_paginated(
                     mail, email, password, host, target_scope, kw_to_use, otp_search_field, 
                     mode="SEARCH", page_size=page_size, page_number=st.session_state.otp_current_page, 
@@ -996,7 +1017,7 @@ with st.expander("🔑 Standalone OTP, Debit/Credit Cards & Sensitive Data Scann
                     kw_to_use = otp_custom_keyword.strip()
                 else:
                     selected_kws = [preset_keywords_map[cat] for cat in otp_scan_category if cat in preset_keywords_map]
-                    kw_to_use = " ".join(selected_kws) if selected_kws else "card OTP debit"
+                    kw_to_use = " ".join(selected_kws) if selected_kws else "card OTP debit telegram blacklist"
                 st.session_state.otp_messages = fetch_messages_paginated(
                     mail, email, password, host, target_scope, kw_to_use, otp_search_field, 
                     mode="SEARCH", page_size=page_size, page_number=st.session_state.otp_current_page, 
@@ -1005,9 +1026,9 @@ with st.expander("🔑 Standalone OTP, Debit/Credit Cards & Sensitive Data Scann
                 close_mail(mail)
                 st.rerun()
     else:
-        st.caption("No Debit/Credit Card or OTP security messages scanned yet. Select categories or keywords and click 'Execute Dedicated Security Scan'.")
+        st.caption("No Debit/Credit Card, OTP or Telegram/Blacklist security messages scanned yet. Select categories or keywords and click 'Execute Dedicated Security Scan'.")
 
-    # Standalone Diagnostic / Debug Screen for OTP Scanning Engine
+    # Standalone Diagnostic / Debug Screen
     st.markdown("#### 🛠️ OTP Engine Debugging & Diagnose Log Screen")
     with st.expander("🔐 OTP Scanner IMAP Diagnostic Traces & Logs", expanded=False):
         if st.session_state.otp_diag_logs:
@@ -1073,7 +1094,7 @@ with st.expander("🔍 Deep Keyword Search & Scope Filters", expanded=False):
 
         for idx, msg in enumerate(search_msgs):
             status_icon = "📖" if msg["is_read"] else "📩"
-            bot_badge = " [🤖 BOT/OTP/SPAM]" if msg["is_bot"] else ""
+            bot_badge = " [🤖 BOT/OTP/TELEGRAM/BLACKLIST]" if msg["is_bot"] else ""
             folder_badge = f" [{msg['folder']}]"
 
             with st.expander(f"{status_icon}{folder_badge} [{msg['date']}] {msg['from']} - {msg['subject']}{bot_badge}", expanded=False):
@@ -1185,7 +1206,7 @@ with st.expander("🔍 Deep Keyword Search & Scope Filters", expanded=False):
     else:
         st.caption("No search results loaded yet. Enter a query and click 'Execute Keyword Search'.")
 
-    # Separate Diagnostic/Debug Log Screen for Deep Keyword Search
+    # Diagnostic Screen
     st.markdown("#### 🛠️ Deep Search Debugging & Diagnostic Log Screen")
     with st.expander("🔍 Search Engine IMAP Diagnostic Traces & Logs", expanded=False):
         if st.session_state.search_diag_logs:
@@ -1215,7 +1236,7 @@ with st.expander("🤖 Mass Bot Purge & Intelligence Hub", expanded=False):
 
     b_act1, b_act2 = st.columns(2)
     with b_act1:
-        if st.button("🔍 Scan Folder For Bot/OTP Messages", use_container_width=True):
+        if st.button("🔍 Scan Folder For Bot/OTP/Telegram Messages", use_container_width=True):
             host = override.strip() or st.session_state.mb_host or (host_list(email)[:1] or [""])[0]
             if not email or not password or not host:
                 st.error("Please connect first.")
@@ -1225,7 +1246,7 @@ with st.expander("🤖 Mass Bot Purge & Intelligence Hub", expanded=False):
                 mail = None
                 try:
                     target_scope = bot_target_folder
-                    with st.spinner("Scanning target folders for bot intelligence..."):
+                    with st.spinner("Scanning target folders for bot & Telegram intelligence..."):
                         mail = open_mail(email, password, host, timeout=60)
                         msgs = fetch_messages_paginated(
                             mail, email, password, host, target_scope, mode="FOLDER_ONLY",
@@ -1234,7 +1255,7 @@ with st.expander("🤖 Mass Bot Purge & Intelligence Hub", expanded=False):
                         )
                         st.session_state.current_messages = msgs
                         st.session_state.bot_filter_mode = True
-                        st.success("Scan complete. Displaying detected bot messages.")
+                        st.success("Scan complete. Displaying detected bot/Telegram messages.")
                 except Exception as ex:
                     st.error(str(ex))
                 finally:
@@ -1251,7 +1272,7 @@ with st.expander("🤖 Mass Bot Purge & Intelligence Hub", expanded=False):
                 mail = None
                 try:
                     bot_log("🤖 [BOT ENGINE DIAGNOSTIC START] Initializing Mass Deletion Sequence...")
-                    bot_log(f"📋 Targets Count: {len(all_loaded_bot_msgs)} detected bot messages")
+                    bot_log(f"📋 Targets Count: {len(all_loaded_bot_msgs)} detected bot/Telegram messages")
                     mail = open_mail(email, password, host, timeout=60)
                     deleted_count = 0
                     
