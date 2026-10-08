@@ -5,6 +5,7 @@ import os
 import re
 import base64
 import math
+import time
 from typing import List, Tuple
 from email.header import decode_header
 from email import message_from_bytes
@@ -270,34 +271,47 @@ def clean_boilerplate(text):
     return cleaned.strip()
 
 
-# Fetch helper supporting both single folder and cross-folder global search
-def fetch_messages(mail, email_addr, password_val, host_val, target_folders: List[str], search_query: str = "", search_scope: str = "ALL_FOLDERS"):
+def fetch_messages(mail, email_addr, password_val, host_val, target_folders: List[str], search_query: str = "", search_scope: str = "ALL_FOLDERS", mode: str = "SEARCH"):
     st.session_state.search_diag_logs = []
     messages = []
-    search_log(f"🔎 [SEARCH ENGINE] Starting search. Query: '{search_query}' | Scope Mode: '{search_scope}'")
+    start_time = time.time()
+    
+    search_log(f"⚙️ [ENGINE INIT] Mode: '{mode}' | Target Folders: {target_folders}")
+    search_log(f"🔎 [SEARCH SPECS] Query: '{search_query}' | Scope Mode: '{search_scope}'")
 
     for f_label in target_folders:
         real_imap_folder = get_imap_path(f_label)
+        search_log(f"\n📂 [PROCESSING FOLDER] Label='{f_label}' -> IMAP Path='{real_imap_folder}'")
+        
         try:
-            status, _ = mail.select(f'"{real_imap_folder}"', readonly=True)
-            if status != "OK":
-                search_log(f"  └─ ⚠️ Skipped folder '{f_label}' ({real_imap_folder}): Could not select.")
+            sel_typ, sel_data = mail.select(f'"{real_imap_folder}"', readonly=True)
+            search_log(f"  ├─ [IMAP SELECT] Status: '{sel_typ}' | Response: {sel_data}")
+            
+            if sel_typ != "OK":
+                search_log(f"  └─ ⚠️ Skipped folder '{f_label}': Failed to select IMAP path.")
                 continue
 
-            if search_query.strip():
-                if search_scope == "ALL_FOLDERS" or search_scope == "TEXT":
-                    typ, data = mail.search(None, "TEXT", f'"{search_query.strip()}"')
-                else:
-                    typ, data = mail.search(None, search_scope, f'"{search_query.strip()}"')
-            else:
+            # Execute Search or All Load based on mode
+            if mode == "FOLDER_ONLY" or not search_query.strip():
+                cmd = "SEARCH ALL"
+                search_log(f"  ├─ [EXECUTING COMMAND] {cmd}")
                 typ, data = mail.search(None, "ALL")
+            else:
+                scope_cmd = "TEXT" if search_scope in ("ALL_FOLDERS", "TEXT") else search_scope
+                cmd = f'SEARCH {scope_cmd} "{search_query.strip()}"'
+                search_log(f"  ├─ [EXECUTING COMMAND] {cmd}")
+                typ, data = mail.search(None, scope_cmd, f'"{search_query.strip()}"')
 
+            search_log(f"  ├─ [IMAP SEARCH RESPONSE] Status: '{typ}' | Raw Bytes: {data}")
             ids = (data[0] or b"").split() if typ == "OK" else []
-            search_log(f"  ├─ Folder '{f_label}': Found {len(ids)} matching message IDs.")
+            search_log(f"  ├─ [MATCHES COUNT] Found {len(ids)} message IDs in '{f_label}'.")
 
-            for mid in ids:
+            for idx, mid in enumerate(ids, 1):
+                msg_start = time.time()
                 typ, msgdata = mail.fetch(mid, "(FLAGS BODY.PEEK[])")
+                
                 if not msgdata or not isinstance(msgdata[0], tuple):
+                    search_log(f"  │   ├─ [Msg ID #{mid.decode()}] ⚠️ FETCH returned empty structure.")
                     continue
 
                 raw_msg_bytes = msgdata[0][1]
@@ -340,16 +354,25 @@ def fetch_messages(mail, email_addr, password_val, host_val, target_folders: Lis
                     "links": links,
                     "raw": raw_msg_bytes
                 })
-        except Exception as ex:
-            search_log(f"  └─ ❌ Error querying folder '{f_label}': {ex}")
+                
+                fetch_elapsed = round((time.time() - msg_start) * 1000, 2)
+                search_log(
+                    f"  │   ├─ [Msg #{idx} | ID: {mid.decode()}] Parsed in {fetch_elapsed}ms | "
+                    f"From: '{frm[:25]}...' | Subject: '{subject[:30]}...' | "
+                    f"Flags: {flags_str} | BotDetected={is_bot}"
+                )
 
-    search_log(f"🏁 [SEARCH COMPLETE] Total retrieved messages: {len(messages)}")
+        except Exception as ex:
+            search_log(f"  └─ ❌ [EXCEPTION ERROR] Querying folder '{f_label}' failed: {ex}")
+
+    total_elapsed = round(time.time() - start_time, 2)
+    search_log(f"\n🏁 [ENGINE COMPLETE] Total retrieved messages: {len(messages)} | Execution time: {total_elapsed}s")
     return messages
 
 
 # Header
 st.title("📥 Bobito Mailbox Reader & Portal Hub")
-st.caption("Advanced IMAP Client with Interactive Bot Intelligence, Cross-Folder Search, and Pagination.")
+st.caption("Advanced IMAP Client with Interactive Bot Intelligence, Cross-Folder Search, and Deep Diagnostic Instrumentation.")
 
 valid = load_valid()
 
@@ -375,7 +398,7 @@ if st.sidebar.button("🔄 Refresh Inbox", type="secondary", use_container_width
         try:
             with st.spinner("Refreshing Inbox..."):
                 mail_obj = open_mail(email, password, host)
-                st.session_state.current_messages = fetch_messages(mail_obj, email, password, host, ["INBOX"])
+                st.session_state.current_messages = fetch_messages(mail_obj, email, password, host, ["INBOX"], mode="FOLDER_ONLY")
                 close_mail(mail_obj)
                 st.session_state.current_page = 1
                 st.sidebar.success("Inbox refreshed successfully!")
@@ -436,42 +459,58 @@ with col2:
 with col3:
     sort_order = st.selectbox("Sort Order", ["Newest First", "Oldest First"])
 
-# Deep Search and Scope Filters
-with st.expander("🔍 Deep Keyword Search & Global Scope Filters", expanded=False):
-    search_query = st.text_input("Search term or keyword")
-    search_scope = st.selectbox("Search Scope", ["ALL_FOLDERS", "TEXT", "SUBJECT", "FROM", "BODY"])
-
-col_btn1, col_btn2 = st.columns([1, 1])
-with col_btn1:
-    execute_search = st.button("Load & Search Messages", type="primary", use_container_width=True)
-with col_btn2:
-    refresh_top = st.button("🔄 Refresh Inbox Stream", use_container_width=True)
-
-if execute_search or refresh_top:
+# Direct Folder Load Trigger
+if st.button("📂 Load Folder Messages", type="primary", use_container_width=True):
     host = override.strip() or st.session_state.mb_host or (host_list(email)[:1] or [""])[0]
     if not email or not password or not host:
         st.error("Please connect and load folders first.")
     else:
         mail = None
         try:
-            target_scope = st.session_state.mb_folders if search_scope == "ALL_FOLDERS" else [folder]
-            with st.spinner(f"Scanning target mailboxes ({len(target_scope)} folder/s)..."):
+            with st.spinner(f"Loading folder '{folder}'..."):
                 mail = open_mail(email, password, host)
-                msgs = fetch_messages(mail, email, password, host, target_scope, search_query, search_scope)
+                msgs = fetch_messages(mail, email, password, host, [folder], mode="FOLDER_ONLY")
                 if sort_order == "Newest First":
                     msgs = list(reversed(msgs))
                 st.session_state.current_messages = msgs
                 st.session_state.current_page = 1
-                log(f"Loaded {len(msgs)} messages across target scope.")
+                log(f"Loaded {len(msgs)} messages from folder '{folder}'.")
         except Exception as e:
             st.error(str(e))
         finally:
             if mail:
                 close_mail(mail)
 
-# Search Diagnostic Logs Expander
+# Deep Search and Scope Filters Block
+with st.expander("🔍 Deep Keyword Search & Global Scope Filters", expanded=False):
+    search_query = st.text_input("Search term or keyword")
+    search_scope = st.selectbox("Search Scope", ["ALL_FOLDERS", "TEXT", "SUBJECT", "FROM", "BODY"])
+    
+    if st.button("🔍 Execute Keyword Search", use_container_width=True):
+        host = override.strip() or st.session_state.mb_host or (host_list(email)[:1] or [""])[0]
+        if not email or not password or not host:
+            st.error("Please connect and load folders first.")
+        else:
+            mail = None
+            try:
+                target_scope = st.session_state.mb_folders if search_scope == "ALL_FOLDERS" else [folder]
+                with st.spinner(f"Scanning target mailboxes ({len(target_scope)} folder/s)..."):
+                    mail = open_mail(email, password, host)
+                    msgs = fetch_messages(mail, email, password, host, target_scope, search_query, search_scope, mode="SEARCH")
+                    if sort_order == "Newest First":
+                        msgs = list(reversed(msgs))
+                    st.session_state.current_messages = msgs
+                    st.session_state.current_page = 1
+                    log(f"Search found {len(msgs)} messages across target scope.")
+            except Exception as e:
+                st.error(str(e))
+            finally:
+                if mail:
+                    close_mail(mail)
+
+# Diagnostic Logs Expander
 if st.session_state.search_diag_logs:
-    with st.expander("🛠️ Global Cross-Folder Search Diagnostic Logs", expanded=False):
+    with st.expander("🛠️ Screen Log & Deep Diagnostic Traces", expanded=True):
         st.code("\n".join(st.session_state.search_diag_logs), language="text")
 
 # Bot Intelligence & Interactive Mass Delete Section
@@ -538,8 +577,8 @@ if total_msgs > 0:
     
     page_msgs = all_msgs[start_idx:end_idx]
 
-    # Display Indicator Header: example: Showing messages: 1 to 40 of 481
-    st.markdown(f"### ✉️ Message Stream")
+    # Display Indicator Header
+    st.markdown("### ✉️ Message Stream")
     st.markdown(f"**Showing messages: {start_idx + 1} to {end_idx} of {total_msgs}**")
 
     # Render Messages Page
