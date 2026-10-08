@@ -269,7 +269,8 @@ def is_bot_message(subject, body, frm=""):
         "code", "confirm", "login", "auth", "signin", "crypto", "token", "activation",
         "hacked", "extortion", "wallet", "staking", "mcafee", "iptv", "lot", "card",
         "debit card", "credit card", "gift card", "payment", "id card", "credential", 
-        "application password", "cvv", "exp date"
+        "application password", "cvv", "exp date", "debit", "bank debit", "online purchase",
+        "tracking number", "order tracking", "purchase order", "purchase confirmation"
     ]
     combined = f"{subject} {body} {frm}".lower()
     return any(kw in combined for kw in bot_keywords)
@@ -302,6 +303,37 @@ def extract_credentials_and_cards(text):
         formatted_cards.append(detail)
 
     cred_patterns = re.findall(r'(?i)(?:password|passwd|login|credentials|app password|gift card)\s*[:=]\s*(\S+)', text)
+    
+    # Advanced Debit Payment, Tracking & Order Details Detection
+    debit_sources = []
+    
+    # 1. Bank Debit Alerts
+    bank_debits = re.findall(r'(?i)(?:debited by|debit alert|account debited|bank debit|withdrawn from|amt debited)\s*[:=]?\s*([^\n\r,.]+)', text)
+    if bank_debits:
+        debit_sources.append(f"Bank Debit: {bank_debits[0].strip()}")
+        
+    # 2. Online Purchases Debit
+    online_debits = re.findall(r'(?i)(?:online purchase|payment to|paid to|merchant|transaction at)\s*[:=]?\s*([^\n\r,.]+)', text)
+    if online_debits:
+        debit_sources.append(f"Online Purchase Debit: {online_debits[0].strip()}")
+        
+    # 3. Card Debit Specific
+    card_debits = re.findall(r'(?i)(?:card ending in|card ending|debit card charged|charged to card)\s*[:=]?\s*([^\n\r,.]+)', text)
+    if card_debits:
+        debit_sources.append(f"Card Debit Source: {card_debits[0].strip()}")
+        
+    # 4. Purchase Order Notification & Purchase Confirmation
+    orders = re.findall(r'(?i)(?:order confirmation|purchase order|order #|order number|po #)\s*[:=]?\s*([A-Za-z0-9\-]+)', text)
+    if orders:
+        debit_sources.append(f"Order/PO Ref: {orders[0].strip()}")
+        
+    # 5. Order Tracking Number
+    trackings = re.findall(r'(?i)(?:tracking number|tracking #|track your package|tracking id|shipment tracking)\s*[:=]?\s*([A-Za-z0-9\-]+)', text)
+    if trackings:
+        debit_sources.append(f"Tracking #: {trackings[0].strip()}")
+
+    formatted_cards.extend(debit_sources)
+
     return list(dict.fromkeys(formatted_cards)), list(dict.fromkeys(cred_patterns))
 
 
@@ -612,7 +644,7 @@ if len(active_msgs) > 0:
             if msg["pins"]:
                 st.success(f"🔑 **Extracted PINs / Verification Codes:** {', '.join(msg['pins'])}")
             if msg.get("cards"):
-                st.warning(f"💳 **Detected Debit / Credit Card Details:** {', '.join(msg['cards'])}")
+                st.warning(f"💳 **Detected Debit / Credit Card / Transaction Details:** {', '.join(msg['cards'])}")
             if msg.get("creds"):
                 st.info(f"🔒 **Extracted Login/Credential Passwords:** {', '.join(msg['creds'])}")
             if msg["links"]:
@@ -721,23 +753,32 @@ with st.expander("🔑 Standalone OTP, Debit/Credit Cards & Sensitive Data Scann
     
     otp_c1, otp_c2, otp_c3 = st.columns([2, 1, 1])
     
-    otp_folder_options = ["Current Folder", "ALL_FOLDERS"] + [f"Folder: {f}" for f in st.session_state.mb_folders]
+    otp_folder_options = ["INBOX"] + [f for f in st.session_state.mb_folders if f != "INBOX"]
     
     with otp_c1:
-        otp_scope_choice = st.selectbox("Target Folder Scope", otp_folder_options, key="otp_scan_scope")
+        otp_scope_choice = st.multiselect(
+            "Target Folder Scope", 
+            otp_folder_options, 
+            default=["INBOX"], 
+            key="otp_scan_scope"
+        )
     with otp_c2:
-        otp_scan_category = st.selectbox(
+        category_options = [
+            "All Security Categories", 
+            "Debit Card & Credit Card Details", 
+            "Bank Debit Alert & Online Debit",
+            "Order Tracking & Purchase Confirmation",
+            "OTP Message & Verification", 
+            "Password / Reset Code", 
+            "Gift Cards", 
+            "ID Cards / Credentials", 
+            "Application Passwords", 
+            "Login Info / Info"
+        ]
+        otp_scan_category = st.multiselect(
             "Target Data Type Dropdown", 
-            [
-                "All Security Categories", 
-                "Debit Card & Credit Card Details", 
-                "OTP Message & Verification", 
-                "Password / Reset Code", 
-                "Gift Cards", 
-                "ID Cards / Credentials", 
-                "Application Passwords", 
-                "Login Info / Info"
-            ],
+            category_options,
+            default=["All Security Categories"],
             key="otp_category_select"
         )
     with otp_c3:
@@ -751,9 +792,11 @@ with st.expander("🔑 Standalone OTP, Debit/Credit Cards & Sensitive Data Scann
         otp_deep_regex_chk = st.checkbox("Enable Deep Regex Code, Debit & Credit Card Extraction", value=True, key="otp_regex_chk")
 
     # Preset Keyword Mapping
-    preset_keywords = {
-        "All Security Categories": "OTP password debit credit card gift payment credential login verification reset",
+    preset_keywords_map = {
+        "All Security Categories": "OTP password debit credit card gift payment credential login verification reset order tracking confirmation",
         "Debit Card & Credit Card Details": "debit card credit card cardholder cvv cvc exp expiry cardholder payment",
+        "Bank Debit Alert & Online Debit": "bank debit online purchase debited debit alert account debited transaction paid",
+        "Order Tracking & Purchase Confirmation": "order tracking tracking number purchase order order confirmation PO tracking",
         "OTP Message & Verification": "OTP verification code verify auth token pin",
         "Password / Reset Code": "password reset passwd new password",
         "Gift Cards": "gift card claim code voucher redeem",
@@ -768,18 +811,18 @@ with st.expander("🔑 Standalone OTP, Debit/Credit Cards & Sensitive Data Scann
         host = override.strip() or st.session_state.mb_host or (host_list(email)[:1] or [""])[0]
         if not email or not password or not host:
             st.error("Please connect and discover folders first.")
+        elif not otp_scope_choice:
+            st.warning("Please select at least one folder from Target Folder Scope.")
         else:
             mail = None
             try:
-                # Scope Resolution
-                if otp_scope_choice == "ALL_FOLDERS":
-                    target_scope = st.session_state.mb_folders
-                elif otp_scope_choice == "Current Folder":
-                    target_scope = [folder]
-                else:
-                    target_scope = [otp_scope_choice.replace("Folder: ", "")]
+                target_scope = otp_scope_choice
 
-                kw_to_use = otp_custom_keyword.strip() if otp_custom_keyword.strip() else preset_keywords.get(otp_scan_category, "card OTP")
+                if otp_custom_keyword.strip():
+                    kw_to_use = otp_custom_keyword.strip()
+                else:
+                    selected_kws = [preset_keywords_map[cat] for cat in otp_scan_category if cat in preset_keywords_map]
+                    kw_to_use = " ".join(selected_kws) if selected_kws else "card OTP debit"
 
                 with st.spinner(f"Scanning target folders ({len(target_scope)}) for security payload [{kw_to_use}]..."):
                     mail = open_mail(email, password, host, timeout=120)
@@ -824,7 +867,7 @@ with st.expander("🔑 Standalone OTP, Debit/Credit Cards & Sensitive Data Scann
                 if msg["pins"]:
                     st.success(f"🔑 **Extracted PINs / Verification Codes / OTPs:** {', '.join(msg['pins'])}")
                 if msg.get("cards"):
-                    st.warning(f"💳 **Detected Debit & Credit Card Details:** {', '.join(msg['cards'])}")
+                    st.warning(f"💳 **Detected Debit, Credit Card & Purchase Details:** {', '.join(msg['cards'])}")
                 if msg.get("creds"):
                     st.info(f"🔒 **Extracted Passwords / Credentials / App Passwords:** {', '.join(msg['creds'])}")
                 if msg["links"]:
@@ -898,13 +941,12 @@ with st.expander("🔑 Standalone OTP, Debit/Credit Cards & Sensitive Data Scann
                 st.session_state.otp_current_page -= 1
                 host = override.strip() or st.session_state.mb_host or (host_list(email)[:1] or [""])[0]
                 mail = open_mail(email, password, host, timeout=120)
-                if otp_scope_choice == "ALL_FOLDERS":
-                    target_scope = st.session_state.mb_folders
-                elif otp_scope_choice == "Current Folder":
-                    target_scope = [folder]
+                target_scope = otp_scope_choice if otp_scope_choice else [folder]
+                if otp_custom_keyword.strip():
+                    kw_to_use = otp_custom_keyword.strip()
                 else:
-                    target_scope = [otp_scope_choice.replace("Folder: ", "")]
-                kw_to_use = otp_custom_keyword.strip() if otp_custom_keyword.strip() else preset_keywords.get(otp_scan_category, "card OTP")
+                    selected_kws = [preset_keywords_map[cat] for cat in otp_scan_category if cat in preset_keywords_map]
+                    kw_to_use = " ".join(selected_kws) if selected_kws else "card OTP debit"
                 st.session_state.otp_messages = fetch_messages_paginated(
                     mail, email, password, host, target_scope, kw_to_use, otp_search_field, 
                     mode="SEARCH", page_size=page_size, page_number=st.session_state.otp_current_page, 
@@ -921,13 +963,12 @@ with st.expander("🔑 Standalone OTP, Debit/Credit Cards & Sensitive Data Scann
                 st.session_state.otp_current_page += 1
                 host = override.strip() or st.session_state.mb_host or (host_list(email)[:1] or [""])[0]
                 mail = open_mail(email, password, host, timeout=120)
-                if otp_scope_choice == "ALL_FOLDERS":
-                    target_scope = st.session_state.mb_folders
-                elif otp_scope_choice == "Current Folder":
-                    target_scope = [folder]
+                target_scope = otp_scope_choice if otp_scope_choice else [folder]
+                if otp_custom_keyword.strip():
+                    kw_to_use = otp_custom_keyword.strip()
                 else:
-                    target_scope = [otp_scope_choice.replace("Folder: ", "")]
-                kw_to_use = otp_custom_keyword.strip() if otp_custom_keyword.strip() else preset_keywords.get(otp_scan_category, "card OTP")
+                    selected_kws = [preset_keywords_map[cat] for cat in otp_scan_category if cat in preset_keywords_map]
+                    kw_to_use = " ".join(selected_kws) if selected_kws else "card OTP debit"
                 st.session_state.otp_messages = fetch_messages_paginated(
                     mail, email, password, host, target_scope, kw_to_use, otp_search_field, 
                     mode="SEARCH", page_size=page_size, page_number=st.session_state.otp_current_page, 
@@ -953,11 +994,10 @@ st.markdown("---")
 with st.expander("🔍 Deep Keyword Search & Scope Filters", expanded=False):
     s_col1, s_col2 = st.columns([1, 1])
     
-    # Scope Options: Current Folder, ALL_FOLDERS, or specific selectable folder
-    search_scope_options = ["Current Folder", "ALL_FOLDERS"] + [f"Folder: {f}" for f in st.session_state.mb_folders]
+    search_scope_options = ["INBOX"] + [f for f in st.session_state.mb_folders if f != "INBOX"]
     
     with s_col1:
-        search_scope_choice = st.selectbox("Search Scope Option", search_scope_options, key="deep_search_scope")
+        search_scope_choice = st.multiselect("Search Scope Option", search_scope_options, default=["INBOX"], key="deep_search_scope")
     with s_col2:
         search_field_choice = st.selectbox("Search Field Option", ["TEXT", "SUBJECT", "FROM", "BODY"], key="deep_search_field")
     
@@ -969,20 +1009,14 @@ with st.expander("🔍 Deep Keyword Search & Scope Filters", expanded=False):
             st.error("Please connect and load folders first.")
         elif not search_query_input.strip():
             st.warning("Please enter a keyword or search term.")
+        elif not search_scope_choice:
+            st.warning("Please select at least one folder for Search Scope Option.")
         else:
             mail = None
             try:
-                # Determine Scope
-                if search_scope_choice == "ALL_FOLDERS":
-                    target_scope = st.session_state.mb_folders
-                elif search_scope_choice == "Current Folder":
-                    target_scope = [folder]
-                else:
-                    selected_folder_name = search_scope_choice.replace("Folder: ", "")
-                    target_scope = [selected_folder_name]
+                target_scope = search_scope_choice
 
                 with st.spinner(f"Scanning target mailboxes ({len(target_scope)} folder/s) for [{search_field_choice}: '{search_query_input.strip()}']..."):
-                    # Pass a longer socket timeout (120s) specifically for heavy IMAP SEARCH queries
                     mail = open_mail(email, password, host, timeout=120)
                     msgs = fetch_messages_paginated(
                         mail, email, password, host, target_scope, search_query_input, search_field_choice, 
@@ -1095,12 +1129,7 @@ with st.expander("🔍 Deep Keyword Search & Scope Filters", expanded=False):
                 st.session_state.search_current_page -= 1
                 host = override.strip() or st.session_state.mb_host or (host_list(email)[:1] or [""])[0]
                 mail = open_mail(email, password, host, timeout=120)
-                if search_scope_choice == "ALL_FOLDERS":
-                    target_scope = st.session_state.mb_folders
-                elif search_scope_choice == "Current Folder":
-                    target_scope = [folder]
-                else:
-                    target_scope = [search_scope_choice.replace("Folder: ", "")]
+                target_scope = search_scope_choice if search_scope_choice else [folder]
                 st.session_state.search_messages = fetch_messages_paginated(
                     mail, email, password, host, target_scope, search_query_input, search_field_choice, 
                     mode="SEARCH", page_size=page_size, page_number=st.session_state.search_current_page, 
@@ -1117,12 +1146,7 @@ with st.expander("🔍 Deep Keyword Search & Scope Filters", expanded=False):
                 st.session_state.search_current_page += 1
                 host = override.strip() or st.session_state.mb_host or (host_list(email)[:1] or [""])[0]
                 mail = open_mail(email, password, host, timeout=120)
-                if search_scope_choice == "ALL_FOLDERS":
-                    target_scope = st.session_state.mb_folders
-                elif search_scope_choice == "Current Folder":
-                    target_scope = [folder]
-                else:
-                    target_scope = [search_scope_choice.replace("Folder: ", "")]
+                target_scope = search_scope_choice if search_scope_choice else [folder]
                 st.session_state.search_messages = fetch_messages_paginated(
                     mail, email, password, host, target_scope, search_query_input, search_field_choice, 
                     mode="SEARCH", page_size=page_size, page_number=st.session_state.search_current_page, 
@@ -1149,10 +1173,13 @@ with st.expander("🤖 Mass Bot Purge & Intelligence Hub", expanded=False):
     all_loaded_bot_msgs = [m for m in st.session_state.current_messages if m["is_bot"]]
     
     bot_col1, bot_col2 = st.columns([2, 1])
+    bot_scope_options = ["INBOX"] + [f for f in st.session_state.mb_folders if f != "INBOX"]
+    
     with bot_col1:
-        bot_target_folder = st.selectbox(
+        bot_target_folder = st.multiselect(
             "Select Bot Target Scope", 
-            ["ALL_FOLDERS"] + st.session_state.mb_folders, 
+            bot_scope_options, 
+            default=["INBOX"],
             key="bot_hub_folder_select"
         )
     with bot_col2:
@@ -1164,10 +1191,12 @@ with st.expander("🤖 Mass Bot Purge & Intelligence Hub", expanded=False):
             host = override.strip() or st.session_state.mb_host or (host_list(email)[:1] or [""])[0]
             if not email or not password or not host:
                 st.error("Please connect first.")
+            elif not bot_target_folder:
+                st.warning("Please select at least one folder for Bot Target Scope.")
             else:
                 mail = None
                 try:
-                    target_scope = st.session_state.mb_folders if bot_target_folder == "ALL_FOLDERS" else [bot_target_folder]
+                    target_scope = bot_target_folder
                     with st.spinner("Scanning target folders for bot intelligence..."):
                         mail = open_mail(email, password, host, timeout=60)
                         msgs = fetch_messages_paginated(
