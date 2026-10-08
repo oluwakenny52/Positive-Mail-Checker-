@@ -129,51 +129,74 @@ def decode_imap_utf7(s: str) -> str:
     return "".join(res)
 
 
-# Strictly discover ONLY live mail account folders with detailed debugging logs
-def list_folders(mail):
+# Strictly discover ONLY live mail account folders with robust regex parsing & deep diagnostic logs
+def list_folders(mail, email_addr: str = "", host_val: str = ""):
     found = set()
     st.session_state.folder_debug_logs = []
-    debug_log("🔍 [ENGINE START] Querying server with wildcard: IMAP LIST '' '*'")
+    debug_log(f"📧 [TARGET ACCOUNT] Email: '{email_addr}' | Host: '{host_val}'")
+    debug_log("🔍 [ENGINE START] Issuing IMAP command: LIST '' '*'")
 
     try:
         typ, data = mail.list('""', "*")
-        debug_log(f"📡 [RESPONSE STATUS] Server status: '{typ}', Raw items returned: {len(data) if data else 0}")
+        debug_log(f"📡 [RESPONSE STATUS] Server Response Code: '{typ}' | Raw Records Count: {len(data) if data else 0}")
 
         if typ == "OK" and data:
+            # RFC 3501 LIST response pattern: (<flags>) <delimiter> <mailbox_name>
+            list_pattern = re.compile(r'^\((?P<flags>[^)]*)\)\s+(?P<delim>"[^"]*"|NIL)\s+(?P<name>.+)$')
+
             for idx, item in enumerate(data, 1):
                 if not item:
                     continue
                 s = item.decode("latin1", errors="ignore") if isinstance(item, bytes) else str(item)
-                debug_log(f"  ├─ Raw Line #{idx}: {s}")
+                s = s.strip()
+                debug_log(f"\n  ├─ [Line #{idx} Raw]: {s}")
 
-                if r"\noselect" in s.lower() or r"\nonexistent" in s.lower():
-                    debug_log("  │   ⚠️ FILTERED OUT: Container node flagged as \\Noselect or \\Nonexistent")
+                match = list_pattern.match(s)
+                if match:
+                    flags = match.group("flags")
+                    delim = match.group("delim")
+                    raw_name = match.group("name").strip()
+                else:
+                    # Fallback extraction if response structure varies slightly
+                    flags = s
+                    delim = "UNKNOWN"
+                    quoted = re.findall(r'"((?:\\.|[^"\\])*)"', s)
+                    raw_name = quoted[-1] if quoted else s.split()[-1]
+
+                # Strip surrounding quotes from folder name if present
+                clean_name = raw_name
+                if clean_name.startswith('"') and clean_name.endswith('"'):
+                    clean_name = clean_name[1:-1].replace('\\"', '"')
+
+                debug_log(f"  │   ├─ Parsed Flags    : ({flags})")
+                debug_log(f"  │   ├─ Hierarchy Delim : {delim}")
+                debug_log(f"  │   ├─ Extracted Name  : '{clean_name}' (Raw: '{raw_name}')")
+
+                # Filter out unselectable container nodes
+                if r"\noselect" in flags.lower() or r"\nonexistent" in flags.lower():
+                    debug_log("  │   └─ ⚠️ FILTERED OUT: Flagged as \\Noselect or \\Nonexistent container")
                     continue
 
-                quoted = re.findall(r'"((?:\\.|[^"\\])*)"', s)
-                name = quoted[-1] if quoted else s.split()[-1]
-                name = name.replace('\\"', '"').strip()
-
-                if name and name not in (".", "/", '""', "''"):
-                    decoded_folder = decode_imap_utf7(name)
-                    if decoded_folder != name:
-                        debug_log(f"  │   🌐 UTF-7 DECODED: '{name}' -> '{decoded_folder}'")
+                if clean_name and clean_name not in (".", "/", '""', "''"):
+                    decoded_folder = decode_imap_utf7(clean_name)
+                    if decoded_folder != clean_name:
+                        debug_log(f"  │   ├─ UTF-7 Decoded   : '{decoded_folder}'")
                     found.add(decoded_folder)
-                    debug_log(f"  │   ✅ DISCOVERED FOLDER: '{decoded_folder}'")
+                    debug_log(f"  │   └─ ✅ ACCEPTED FOLDER: '{decoded_folder}'")
                 else:
-                    debug_log("  │   ⚠️ IGNORED: Empty or root delimiter token")
+                    debug_log("  │   └─ ⚠️ IGNORED: Empty string or root hierarchy delimiter")
         else:
-            debug_log("⚠️ [WARNING] Server returned empty or non-OK status for LIST query.")
+            debug_log("⚠️ [WARNING] IMAP server returned empty dataset or non-OK response.")
 
     except Exception as ex:
-        debug_log(f"❌ [EXCEPTION ERROR] Encountered during folder discovery: {ex}")
+        debug_log(f"❌ [EXCEPTION ERROR] Critical failure during folder enumeration: {ex}")
 
     if not found:
-        debug_log("⚠️ [FALLBACK] No folders detected via LIST; defaulting to ['INBOX']")
+        debug_log("⚠️ [FALLBACK] Zero selectable folders parsed; defaulting folder list to ['INBOX']")
         found.add("INBOX")
 
     sorted_result = sorted(list(found), key=lambda x: (0 if x.lower() == "inbox" else 1, x.lower()))
-    debug_log(f"🏁 [ENGINE COMPLETE] Final confirmed selectable folders ({len(sorted_result)}): {sorted_result}")
+    debug_log(f"\n🏁 [ENGINE COMPLETE] Final Confirmed Selectable Folders ({len(sorted_result)}): {sorted_result}")
     return sorted_result
 
 
@@ -272,7 +295,7 @@ if st.sidebar.button("Connect & Discover Folders", type="primary"):
                 mail_obj = None
                 try:
                     mail_obj = open_mail(email, password, host)
-                    folders = list_folders(mail_obj)
+                    folders = list_folders(mail_obj, email_addr=email, host_val=host)
                     close_mail(mail_obj)
                     connected_host = host
                     success = True
