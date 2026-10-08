@@ -12,6 +12,9 @@ from email.header import decode_header
 from email import message_from_bytes
 from hosts import host_list
 
+# Pre-compiled RFC 3501 LIST response parser
+LIST_PATTERN = re.compile(r'^\((?P<flags>[^)]*)\)\s+(?P<delim>"[^"]*"|NIL)\s+(?P<name>.+)$')
+
 # 1. Mobile & Desktop Responsive Configuration & Keep-Alive Injector
 st.set_page_config(
     page_title="Bobito Mailbox Reader & Portal Hub",
@@ -144,7 +147,7 @@ def get_imap_path(selected_ui_folder: str) -> str:
     return folder_map.get(selected_ui_folder, selected_ui_folder)
 
 
-# Strictly discover live folders, parse RFC 3501 lines, and strip prefix for UI
+# Robust folder parsing and list extraction
 def list_folders(mail, email_addr: str = "", host_val: str = ""):
     found = set()
     st.session_state.folder_debug_logs = []
@@ -156,46 +159,58 @@ def list_folders(mail, email_addr: str = "", host_val: str = ""):
         debug_log(f"📡 [RESPONSE STATUS] Server Response Code: '{typ}' | Raw Records Count: {len(data) if data else 0}")
 
         if typ == "OK" and data:
-            list_pattern = re.compile(r'^\((?P<flags>[^)]*)\)\s+(?P<delim>"[^"]*"|NIL)\s+(?P<name>.+)$')
-
             for idx, item in enumerate(data, 1):
                 if not item:
                     continue
-                s = item.decode("latin1", errors="ignore") if isinstance(item, bytes) else str(item)
-                s = s.strip()
-                debug_log(f"\n  ├─ [Line #{idx} Raw]: {s}")
+                try:
+                    s = item.decode("latin1", errors="ignore") if isinstance(item, bytes) else str(item)
+                    s = s.strip()
+                    debug_log(f"\n  ├─ [Line #{idx} Raw]: {s}")
 
-                match = list_pattern.match(s)
-                if match:
-                    flags = match.group("flags")
-                    delim = match.group("delim")
-                    raw_name = match.group("name").strip()
-                else:
-                    flags = s
-                    delim = "UNKNOWN"
-                    quoted = re.findall(r'"((?:\\.|[^"\\])*)"', s)
-                    raw_name = quoted[-1] if quoted else s.split()[-1]
+                    match = LIST_PATTERN.match(s)
+                    if match:
+                        flags = match.group("flags")
+                        delim = match.group("delim")
+                        raw_name = match.group("name").strip()
+                    else:
+                        # Fallback parsing strategy using standard splitting
+                        flags = ""
+                        delim = '"."'
+                        raw_name = s
+                        if s.startswith("("):
+                            close_paren = s.find(")")
+                            if close_paren != -1:
+                                flags = s[1:close_paren]
+                                remainder = s[close_paren + 1:].strip()
+                                parts = remainder.split(None, 1)
+                                if len(parts) == 2:
+                                    delim = parts[0]
+                                    raw_name = parts[1].strip()
 
-                clean_name = raw_name
-                if clean_name.startswith('"') and clean_name.endswith('"'):
-                    clean_name = clean_name[1:-1].replace('\\"', '"')
+                    clean_name = raw_name
+                    if clean_name.startswith('"') and clean_name.endswith('"'):
+                        clean_name = clean_name[1:-1].replace('\\"', '"')
 
-                debug_log(f"  │   ├─ Parsed Flags    : ({flags})")
-                debug_log(f"  │   ├─ Hierarchy Delim : {delim}")
-                debug_log(f"  │   ├─ Raw IMAP Name   : '{clean_name}'")
+                    debug_log(f"  │   ├─ Parsed Flags    : ({flags})")
+                    debug_log(f"  │   ├─ Hierarchy Delim : {delim}")
+                    debug_log(f"  │   ├─ Raw IMAP Name   : '{clean_name}'")
 
-                if r"\noselect" in flags.lower() or r"\nonexistent" in flags.lower():
-                    debug_log("  │   └─ ⚠️ FILTERED OUT: Flagged as \\Noselect or \\Nonexistent container")
+                    if r"\noselect" in flags.lower() or r"\nonexistent" in flags.lower():
+                        debug_log("  │   └─ ⚠️ FILTERED OUT: Flagged as \\Noselect or \\Nonexistent container")
+                        continue
+
+                    if clean_name and clean_name not in (".", "/", '""', "''"):
+                        decoded_folder = decode_imap_utf7(clean_name)
+                        ui_label = clean_display_label(decoded_folder)
+                        debug_log(f"  │   ├─ UI Display Label: '{ui_label}'")
+                        found.add(decoded_folder)
+                        debug_log(f"  │   └─ ✅ ACCEPTED FOLDER: Raw='{decoded_folder}' -> UI='{ui_label}'")
+                    else:
+                        debug_log("  │   └─ ⚠️ IGNORED: Empty string or root hierarchy delimiter")
+
+                except Exception as line_ex:
+                    debug_log(f"  │   └─ ⚠️ PARSE ERROR ON LINE #{idx}: {line_ex}")
                     continue
-
-                if clean_name and clean_name not in (".", "/", '""', "''"):
-                    decoded_folder = decode_imap_utf7(clean_name)
-                    ui_label = clean_display_label(decoded_folder)
-                    debug_log(f"  │   ├─ UI Display Label: '{ui_label}'")
-                    found.add(decoded_folder)
-                    debug_log(f"  │   └─ ✅ ACCEPTED FOLDER: Raw='{decoded_folder}' -> UI='{ui_label}'")
-                else:
-                    debug_log("  │   └─ ⚠️ IGNORED: Empty string or root hierarchy delimiter")
         else:
             debug_log("⚠️ [WARNING] IMAP server returned empty dataset or non-OK response.")
 
@@ -208,7 +223,7 @@ def list_folders(mail, email_addr: str = "", host_val: str = ""):
 
     sorted_raw = sorted(list(found), key=lambda x: (0 if x.lower() == "inbox" else 1, clean_display_label(x).lower()))
 
-    # Build bidirectional map: { Display Label -> Raw IMAP Path }
+    # Build mapping dictionary: { Display Label -> Raw IMAP Path }
     folder_map = {}
     display_folders = []
     for raw_f in sorted_raw:
