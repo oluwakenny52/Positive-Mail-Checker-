@@ -1,3 +1,15 @@
+"""
+MAIL ENGINE v7 FINAL - COMPLETE WITH ALL FEATURES
+===================================================
+Universal Mail Reader + Complete UI
+Features: Connection hub, folder discovery, message reading, bot detection,
+          activity log, valid accounts download, webmail portal mapper,
+          credentials copy, all sidebar functions
+Status: Production-ready, fully featured
+
+RUN: streamlit run MAIL_ENGINE_v7_FINAL_COMPLETE.py
+"""
+
 import streamlit as st
 import imaplib
 import poplib
@@ -377,20 +389,27 @@ def log_activity(msg: str):
 # ============================================================
 st.sidebar.header("🔐 Mail Server Connection Hub")
 
+# Email & Password inputs ALWAYS VISIBLE (primary entry)
+email_addr = st.sidebar.text_input("Email Address", placeholder="user@example.com", key="sidebar_email")
+password_val = st.sidebar.text_input("Password", type="password", key="sidebar_password")
+
+# Optional: Quick account selector from valid accounts
 valid_accounts = load_valid_accounts()
-
-# Account selector
 if valid_accounts:
-    pick = st.sidebar.selectbox("📋 Select Valid Account", valid_accounts or ["(manual entry)"], key="sidebar_account_sel")
-    if pick and ":" in pick:
+    st.sidebar.markdown("---")
+    st.sidebar.subheader("⚡ Quick Account Picker")
+    pick = st.sidebar.selectbox(
+        "Or select saved account",
+        ["(manual entry)"] + valid_accounts,
+        key="sidebar_account_sel"
+    )
+    if pick and pick != "(manual entry)" and ":" in pick:
         email_addr, password_val = pick.split(":", 1)
-    else:
-        email_addr = st.sidebar.text_input("Email Address", key="sidebar_email")
-        password_val = st.sidebar.text_input("Password", type="password", key="sidebar_password")
-else:
-    email_addr = st.sidebar.text_input("Email Address", key="sidebar_email")
-    password_val = st.sidebar.text_input("Password", type="password", key="sidebar_password")
+        st.sidebar.info(f"✓ Loaded: {email_addr}")
 
+st.sidebar.markdown("---")
+
+# Protocol, Host, Port
 protocol_sel = st.sidebar.selectbox("Protocol", ["IMAP", "POP3"], key="sidebar_protocol")
 host_addr = st.sidebar.text_input("Mail Server Host", placeholder="imap.gmail.com", key="sidebar_host")
 port_val = st.sidebar.number_input("Port (0 = auto)", min_value=0, max_value=65535, value=0, key="sidebar_port")
