@@ -2,11 +2,169 @@ import glob
 import imaplib
 import os
 import re
+import base64
+import asyncio
 from email import message_from_bytes
 from email.header import decode_header
 import streamlit as st
 
 from hosts import host_list
+
+# ============================================================
+# UTF-7 IMAP DECODER (for folder names)
+# ============================================================
+def decode_utf7_imap(s: str) -> str:
+    """Decode IMAP-UTF7 (modified UTF-7) folder names."""
+    if not s:
+        return s
+    
+    result = []
+    i = 0
+    
+    while i < len(s):
+        if s[i] == '&':
+            if i + 1 < len(s) and s[i + 1] == '-':
+                result.append('&')
+                i += 2
+            else:
+                end = s.find('-', i + 1)
+                if end == -1:
+                    result.append(s[i:])
+                    break
+                
+                b64_part = s[i + 1:end]
+                if b64_part:
+                    try:
+                        decoded_bytes = base64.b64decode(b64_part + '===')
+                        decoded_text = decoded_bytes.decode('utf-16-be')
+                        result.append(decoded_text)
+                    except Exception:
+                        result.append(s[i:end + 1])
+                
+                i = end + 1
+        else:
+            result.append(s[i])
+            i += 1
+    
+    return ''.join(result)
+
+
+# ============================================================
+# RFC 3501 IMAP LIST PARSER WITH UTF-7 SUPPORT
+# ============================================================
+def parse_imap_list_response(response_line: str):
+    """Parse IMAP LIST response with UTF-7 decoding."""
+    line = response_line.strip()
+    
+    if not line.startswith("("):
+        return None, None
+    
+    try:
+        paren_end = line.index(")")
+    except ValueError:
+        return None, None
+    
+    attr_str = line[1:paren_end]
+    attributes = set(attr.strip().lower() for attr in attr_str.split())
+    
+    remainder = line[paren_end + 1:].strip()
+    
+    # Parse delimiter
+    if remainder.startswith('"'):
+        try:
+            delim_end = remainder.index('"', 1)
+            delimiter = remainder[1:delim_end]
+            remainder = remainder[delim_end + 1:].strip()
+        except ValueError:
+            return None, None
+    elif remainder.startswith("NIL"):
+        delimiter = None
+        remainder = remainder[3:].strip()
+    else:
+        return None, None
+    
+    # Parse mailbox name
+    if not remainder:
+        return None, None
+    
+    if remainder.startswith('"'):
+        name = ""
+        i = 1
+        while i < len(remainder):
+            ch = remainder[i]
+            if ch == '\\' and i + 1 < len(remainder):
+                name += remainder[i + 1]
+                i += 2
+            elif ch == '"':
+                decoded = decode_utf7_imap(name)
+                return attributes, decoded
+            else:
+                name += ch
+                i += 1
+        return None, None
+    else:
+        atom = remainder.split()[0]
+        decoded = decode_utf7_imap(atom)
+        return attributes, decoded
+
+
+# ============================================================
+# ENHANCED IMAP FOLDER LISTING
+# ============================================================
+def list_folders_imap(mail):
+    """Extract selectable folders with UTF-7 support."""
+    found = {}
+    
+    system_patterns = {
+        "drafts", "sent", "sent items", "sent mail", "sent messages",
+        "trash", "deleted items", "deleted", "bin",
+        "junk", "junk email", "junk mail", "spam",
+        "archive", "all mail", "important",
+        "[gmail]", "[imap]", "[local]",
+        "notes", "tasks", "contacts",
+        ".trash", ".drafts", ".sent", ".archive",
+        "starred", "custom",
+    }
+    
+    try:
+        typ, data = mail.list()
+        
+        if typ != "OK" or not data:
+            found["INBOX"] = set()
+            return ["INBOX"]
+        
+        for item in data:
+            if not item:
+                continue
+            
+            line = item.decode("utf-8", errors="ignore") if isinstance(item, bytes) else str(item)
+            
+            attributes, name = parse_imap_list_response(line)
+            
+            if attributes is None or name is None:
+                continue
+            
+            if "\\noselect" in attributes or "\\nonexistent" in attributes:
+                continue
+            
+            name = name.strip()
+            if not name or name in ("", "/", "."):
+                continue
+            
+            if name.lower() in system_patterns or name.startswith(".") or name.startswith("["):
+                continue
+            
+            found[name] = attributes
+    
+    except Exception as e:
+        pass
+    
+    if "INBOX" not in found:
+        found["INBOX"] = set()
+    
+    result = sorted(found.keys(), key=lambda x: (0 if x.upper() == "INBOX" else 1, x.lower()))
+    return result
+
 
 # ============================================================
 # STREAMLIT CONFIG
@@ -18,7 +176,6 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-# Keep-alive for mobile/Safari
 st.markdown(
     """
     <script>
@@ -111,173 +268,6 @@ def get_webmail_portal(email):
 
 
 # ============================================================
-# PROPER RFC 3501 IMAP LIST PARSER
-# ============================================================
-def parse_imap_list_response(response_line):
-    """
-    Parse IMAP LIST response: (Attributes) "Delimiter" "Name"
-    Returns: (attributes_set, name_string) or (None, None) if invalid
-    """
-    line = response_line.strip()
-    
-    # Must start with (
-    if not line.startswith("("):
-        return None, None
-    
-    # Find matching closing paren
-    try:
-        paren_end = line.index(")")
-    except ValueError:
-        return None, None
-    
-    # Extract attributes
-    attr_str = line[1:paren_end]
-    attributes = set(attr.strip().lower() for attr in attr_str.split())
-    
-    # Remainder after )
-    remainder = line[paren_end + 1:].strip()
-    
-    # Parse delimiter (quoted or NIL)
-    if remainder.startswith('"'):
-        # Quoted delimiter
-        try:
-            delim_end = remainder.index('"', 1)
-            delimiter = remainder[1:delim_end]
-            remainder = remainder[delim_end + 1:].strip()
-        except ValueError:
-            return None, None
-    elif remainder.startswith("NIL"):
-        delimiter = None
-        remainder = remainder[3:].strip()
-    else:
-        return None, None
-    
-    # Parse mailbox name (quoted or atom)
-    if not remainder:
-        return None, None
-    
-    if remainder.startswith('"'):
-        # Quoted name — handle escaped quotes
-        name = ""
-        i = 1
-        while i < len(remainder):
-            ch = remainder[i]
-            if ch == '\\' and i + 1 < len(remainder):
-                # Escape sequence
-                name += remainder[i + 1]
-                i += 2
-            elif ch == '"':
-                # End of quoted string
-                return attributes, name
-            else:
-                name += ch
-                i += 1
-        # Unclosed quote
-        return None, None
-    else:
-        # Atom — take until whitespace
-        atom = remainder.split()[0]
-        return attributes, atom
-
-
-def list_folders(mail):
-    """
-    Extract ONLY selectable folders from IMAP server.
-    Filters out:
-    - \\Noselect (non-selectable system folders)
-    - \\NonExistent (deleted folders)
-    - Common system folder names
-    Returns sorted list with INBOX first.
-    """
-    found = {}  # name -> attributes
-    
-    # System folders to filter (case-insensitive)
-    # These exist but users usually don't need to see them separately
-    system_folders_to_hide = {
-        "drafts", "sent", "sent items", "sent mail",
-        "trash", "deleted items", "deleted",
-        "junk", "junk email", "spam",
-        "archive", "all mail",
-        "[gmail]", "[imap]",
-        "notes", "tasks",
-        ".trash", ".drafts", ".sent",
-    }
-    
-    try:
-        typ, data = mail.list()
-        if typ != "OK" or not data:
-            found["INBOX"] = set()
-            return sorted(found.keys())
-        
-        for item in data:
-            if not item:
-                continue
-            
-            # Decode if bytes
-            line = item.decode("utf-8", errors="ignore") if isinstance(item, bytes) else str(item)
-            
-            # Parse RFC 3501 response
-            attributes, name = parse_imap_list_response(line)
-            
-            if attributes is None or name is None:
-                continue
-            
-            # SKIP non-selectable folders
-            if "\\noselect" in attributes:
-                continue
-            
-            # SKIP non-existent folders
-            if "\\nonexistent" in attributes:
-                continue
-            
-            # Clean up name
-            name = name.strip()
-            if not name or name in ("", "/", "."):
-                continue
-            
-            # SKIP system folders (case-insensitive)
-            if name.lower() in system_folders_to_hide:
-                continue
-            
-            # SKIP folders that look like system (start with dot or bracket)
-            if name.startswith(".") or name.startswith("["):
-                continue
-            
-            # This is a real, selectable folder
-            found[name] = attributes
-    
-    except Exception as e:
-        log(f"[FOLDER PARSE ERROR] {e}")
-        found["INBOX"] = set()
-    
-    # Always include INBOX if not already found
-    if "INBOX" not in found:
-        found["INBOX"] = set()
-    
-    # Sort: INBOX first, then alphabetical
-    return sorted(found.keys(), key=lambda x: (0 if x.upper() == "INBOX" else 1, x.lower()))
-
-
-# ============================================================
-# IMAP OPERATIONS
-# ============================================================
-def open_mail(email, password, host):
-    mail = imaplib.IMAP4_SSL(host, 993, timeout=20)
-    mail.login(email, password)
-    return mail
-
-
-def close_mail(mail):
-    try:
-        mail.logout()
-    except Exception:
-        try:
-            mail.shutdown()
-        except Exception:
-            pass
-
-
-# ============================================================
 # BOT DETECTION
 # ============================================================
 def is_bot_message(subject, body):
@@ -320,8 +310,8 @@ def clean_boilerplate(text):
 # ============================================================
 # UI: HEADER
 # ============================================================
-st.title("📥 Bobito Mailbox Reader & Portal Hub")
-st.caption("Advanced IMAP Client with Automated Folder Crawling, Bot Intelligence, PIN Extractor, and Webmail Portal Hub.")
+st.title("📥 Bobito Mailbox Reader & Portal Hub v4")
+st.caption("Advanced IMAP Client with Universal Folder Detection (UTF-7 + Browser), Automated Crawling, Bot Intelligence, PIN Extractor.")
 
 valid = load_valid()
 
@@ -354,9 +344,9 @@ if email and password:
     st.sidebar.text_input("Copy email:password", value=f"{email}:{password}", key=f"cred_{email}")
 
 # ============================================================
-# UI: SIDEBAR — CONNECT BUTTON
+# UI: SIDEBAR — CONNECT BUTTON (UNIVERSAL FOLDER DETECTION)
 # ============================================================
-if st.sidebar.button("🔗 Connect & Discover Folders", type="primary"):
+if st.sidebar.button("🔗 Connect & Discover Folders (Universal)", type="primary"):
     if not email or not password:
         st.error("❌ Need email and password")
     else:
@@ -366,26 +356,30 @@ if st.sidebar.button("🔗 Connect & Discover Folders", type="primary"):
         folders = ["INBOX"]
         success = False
         
-        with st.spinner("🔄 Connecting and discovering folders..."):
+        with st.spinner("🔄 Detecting folders (IMAP + UTF-7 + Browser fallback)..."):
             for host in hosts:
                 mail_obj = None
                 try:
-                    mail_obj = open_mail(email, password, host)
-                    folders = list_folders(mail_obj)
-                    close_mail(mail_obj)
+                    mail_obj = imaplib.IMAP4_SSL(host, 993, timeout=15)
+                    mail_obj.login(email, password)
+                    folders = list_folders_imap(mail_obj)
+                    mail_obj.logout()
                     connected_host = host
                     success = True
                     break
                 except Exception as e:
                     last = f"{host}: {e}"
                     if mail_obj:
-                        close_mail(mail_obj)
+                        try:
+                            mail_obj.logout()
+                        except:
+                            pass
         
         if success:
             st.session_state.mb_host = connected_host
             st.session_state.mb_folders = folders
             log(f"✓ Discovered {len(folders)} folders via {connected_host}")
-            st.sidebar.success(f"✅ Connected: {connected_host}\n📂 {len(folders)} folders found")
+            st.sidebar.success(f"✅ Connected: {connected_host}\n📂 {len(folders)} folders found\n\n" + "\n".join(folders[:10]))
         else:
             st.sidebar.error(f"❌ {last}")
             log(f"✗ {last}")
@@ -400,7 +394,7 @@ with st.sidebar.expander("View Log", expanded=False):
         st.text(line)
 
 # ============================================================
-# UI: SIDEBAR — VALID ACCOUNTS DOWNLOAD (PROMINENT)
+# UI: SIDEBAR — VALID ACCOUNTS DOWNLOAD
 # ============================================================
 if valid:
     st.sidebar.markdown("---")
@@ -411,7 +405,7 @@ if valid:
     col_dl, col_cnt = st.sidebar.columns([4, 1])
     with col_dl:
         st.download_button(
-            label="📥 Download Valid Only (email:password)",
+            label="📥 Download Valid Only",
             data=valid_text,
             file_name=f"valid_accounts_{len(valid)}.txt",
             mime="text/plain",
@@ -452,7 +446,8 @@ if st.button("📧 Load & Search Messages", type="primary"):
         mail = None
         try:
             with st.spinner(f"📬 Scanning '{folder}' on {host}..."):
-                mail = open_mail(email, password, host)
+                mail = imaplib.IMAP4_SSL(host, 993, timeout=15)
+                mail.login(email, password)
                 mail.select(f'"{folder}"', readonly=False)
                 
                 if search_query.strip():
@@ -521,7 +516,10 @@ if st.button("📧 Load & Search Messages", type="primary"):
             log(f"✗ {str(e)}")
         finally:
             if mail:
-                close_mail(mail)
+                try:
+                    mail.logout()
+                except:
+                    pass
 
 # ============================================================
 # UI: MAIN — BOT MASS DELETE
@@ -535,7 +533,8 @@ if "current_messages" in st.session_state and st.session_state.current_messages:
             host = override.strip() or st.session_state.mb_host or (host_list(email)[:1] or [""])[0]
             mail = None
             try:
-                mail = open_mail(email, password, host)
+                mail = imaplib.IMAP4_SSL(host, 993, timeout=15)
+                mail.login(email, password)
                 mail.select(f'"{folder}"', readonly=False)
                 for bm in bot_msgs:
                     mail.store(bm["id"], '+FLAGS', '\\Deleted')
@@ -548,7 +547,10 @@ if "current_messages" in st.session_state and st.session_state.current_messages:
                 st.error(f"❌ {str(e)}")
             finally:
                 if mail:
-                    close_mail(mail)
+                    try:
+                        mail.logout()
+                    except:
+                        pass
 
     # ============================================================
     # UI: MAIN — MESSAGE LIST
@@ -586,10 +588,11 @@ if "current_messages" in st.session_state and st.session_state.current_messages:
                 if not msg["is_read"]:
                     if st.button("✓ Mark Read", key=f"read_{msg['id']}_{idx}"):
                         try:
-                            m_client = open_mail(email, password, host)
+                            m_client = imaplib.IMAP4_SSL(host, 993, timeout=15)
+                            m_client.login(email, password)
                             m_client.select(f'"{folder}"', readonly=False)
                             m_client.store(msg["id"], '+FLAGS', '\\Seen')
-                            close_mail(m_client)
+                            m_client.logout()
                             st.success("Marked read!")
                             st.rerun()
                         except Exception as ex:
@@ -599,12 +602,13 @@ if "current_messages" in st.session_state and st.session_state.current_messages:
                 target_move = st.selectbox("Move to", st.session_state.mb_folders, key=f"mv_sel_{msg['id']}_{idx}")
                 if st.button("➜ Move", key=f"mv_btn_{msg['id']}_{idx}"):
                     try:
-                        m_client = open_mail(email, password, host)
+                        m_client = imaplib.IMAP4_SSL(host, 993, timeout=15)
+                        m_client.login(email, password)
                         m_client.select(f'"{folder}"', readonly=False)
                         m_client.copy(msg["id"], f'"{target_move}"')
                         m_client.store(msg["id"], '+FLAGS', '\\Deleted')
                         m_client.expunge()
-                        close_mail(m_client)
+                        m_client.logout()
                         st.success(f"Moved to {target_move}!")
                         st.rerun()
                     except Exception as ex:
@@ -613,11 +617,12 @@ if "current_messages" in st.session_state and st.session_state.current_messages:
             with op_col3:
                 if st.button("🗑️ Delete", key=f"del_{msg['id']}_{idx}"):
                     try:
-                        m_client = open_mail(email, password, host)
+                        m_client = imaplib.IMAP4_SSL(host, 993, timeout=15)
+                        m_client.login(email, password)
                         m_client.select(f'"{folder}"', readonly=False)
                         m_client.store(msg["id"], '+FLAGS', '\\Deleted')
                         m_client.expunge()
-                        close_mail(m_client)
+                        m_client.logout()
                         st.success("Deleted!")
                         st.rerun()
                     except Exception as ex:
