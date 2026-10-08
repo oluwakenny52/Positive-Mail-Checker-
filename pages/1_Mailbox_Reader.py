@@ -44,20 +44,28 @@ if "current_page" not in st.session_state:
     st.session_state.current_page = 1
 if "search_current_page" not in st.session_state:
     st.session_state.search_current_page = 1
+if "otp_current_page" not in st.session_state:
+    st.session_state.otp_current_page = 1
 if "folder_debug_logs" not in st.session_state:
     st.session_state.folder_debug_logs = []
 if "bot_diag_logs" not in st.session_state:
     st.session_state.bot_diag_logs = []
 if "search_diag_logs" not in st.session_state:
     st.session_state.search_diag_logs = []
+if "otp_diag_logs" not in st.session_state:
+    st.session_state.otp_diag_logs = []
 if "current_messages" not in st.session_state:
     st.session_state.current_messages = []
 if "search_messages" not in st.session_state:
     st.session_state.search_messages = []
+if "otp_messages" not in st.session_state:
+    st.session_state.otp_messages = []
 if "total_matched_count" not in st.session_state:
     st.session_state.total_matched_count = 0
 if "search_total_matched_count" not in st.session_state:
     st.session_state.search_total_matched_count = 0
+if "otp_total_matched_count" not in st.session_state:
+    st.session_state.otp_total_matched_count = 0
 if "bot_filter_mode" not in st.session_state:
     st.session_state.bot_filter_mode = False
 
@@ -77,6 +85,10 @@ def bot_log(msg):
 
 def search_log(msg):
     st.session_state.search_diag_logs.append(msg)
+
+
+def otp_log(msg):
+    st.session_state.otp_diag_logs.append(msg)
 
 
 def load_valid():
@@ -255,7 +267,8 @@ def is_bot_message(subject, body, frm=""):
     bot_keywords = [
         "otp", "verification", "verify", "security alert", "password reset",
         "code", "confirm", "login", "auth", "signin", "crypto", "token", "activation",
-        "hacked", "extortion", "wallet", "staking", "mcafee", "iptv", "lot"
+        "hacked", "extortion", "wallet", "staking", "mcafee", "iptv", "lot", "card",
+        "gift card", "payment", "id card", "credential", "application password"
     ]
     combined = f"{subject} {body} {frm}".lower()
     return any(kw in combined for kw in bot_keywords)
@@ -266,6 +279,15 @@ def extract_pins_and_links(text):
     urls = re.findall(r'https?://[^\s<>"]+|www\.[^\s<>"]+', text)
     cleaned_urls = [u for u in urls if not any(x in u.lower() for x in ["w3.org", "schema.org", "apple.com/DTDs"])]
     return list(dict.fromkeys(pins)), list(dict.fromkeys(cleaned_urls))
+
+
+def extract_credentials_and_cards(text):
+    card_pattern = r'\b(?:\d[ -]*?){13,16}\b'
+    cards = re.findall(card_pattern, text)
+    cleaned_cards = [c.replace(" ", "").replace("-", "") for c in cards if len(c.replace(" ", "").replace("-", "")) in (13, 15, 16)]
+    
+    cred_patterns = re.findall(r'(?i)(?:password|passwd|login|credentials|app password|gift card)\s*[:=]\s*(\S+)', text)
+    return list(dict.fromkeys(cleaned_cards)), list(dict.fromkeys(cred_patterns))
 
 
 def clean_boilerplate(text):
@@ -286,13 +308,18 @@ def clean_boilerplate(text):
 def fetch_messages_paginated(mail, email_addr, password_val, host_val, target_folders: List[str], 
                             search_query: str = "", search_field: str = "TEXT", mode: str = "SEARCH", 
                             page_size: int = 15, page_number: int = 1, sort_order: str = "Newest First",
-                            is_search_operation: bool = False):
-    if is_search_operation:
+                            log_target: str = "DEBUG"):
+    if log_target == "SEARCH":
         st.session_state.search_diag_logs = []
+        log_func = search_log
+    elif log_target == "OTP":
+        st.session_state.otp_diag_logs = []
+        log_func = otp_log
+    else:
+        log_func = debug_log
+
     messages = []
     start_time = time.time()
-    
-    log_func = search_log if is_search_operation else debug_log
     
     clean_query = search_query.strip()
     log_func(f"⚙️ [ENGINE INIT] Mode: '{mode}' | Target Folders ({len(target_folders)}): {target_folders}")
@@ -312,7 +339,6 @@ def fetch_messages_paginated(mail, email_addr, password_val, host_val, target_fo
                 log_func(f"  └─ ⚠️ Skipped folder '{f_label}': Failed to select IMAP path.")
                 continue
 
-            # Clean and sanitize input query (removes trailing/leading whitespace)
             if mode == "FOLDER_ONLY" or not clean_query:
                 cmd = "SEARCH ALL"
                 log_func(f"  ├─ [EXECUTING COMMAND] {cmd}")
@@ -372,6 +398,7 @@ def fetch_messages_paginated(mail, email_addr, password_val, host_val, target_fo
 
                 cleaned_body = clean_boilerplate(body_text)
                 pins, links = extract_pins_and_links(body_text)
+                cards, creds = extract_credentials_and_cards(body_text)
                 is_bot = is_bot_message(subject, body_text, frm)
 
                 messages.append({
@@ -386,6 +413,8 @@ def fetch_messages_paginated(mail, email_addr, password_val, host_val, target_fo
                     "body": cleaned_body,
                     "pins": pins,
                     "links": links,
+                    "cards": cards,
+                    "creds": creds,
                     "raw": raw_msg_bytes,
                     "flags": flags_str,
                     "size_bytes": len(raw_msg_bytes)
@@ -404,8 +433,10 @@ def fetch_messages_paginated(mail, email_addr, password_val, host_val, target_fo
             log_func(f"  └─ ❌ [EXCEPTION ERROR] Querying folder '{f_label}' failed: {ex}")
 
     total_elapsed = round(time.time() - start_time, 2)
-    if is_search_operation:
+    if log_target == "SEARCH":
         st.session_state.search_total_matched_count = total_matched_all_folders
+    elif log_target == "OTP":
+        st.session_state.otp_total_matched_count = total_matched_all_folders
     else:
         st.session_state.total_matched_count = total_matched_all_folders
 
@@ -415,7 +446,7 @@ def fetch_messages_paginated(mail, email_addr, password_val, host_val, target_fo
 
 # Header
 st.title("📥 Bobito Mailbox Reader & Portal Hub")
-st.caption("Advanced IMAP Client with Interactive Bot Intelligence, Multi-Field Search, and Deep Diagnostic Instrumentation.")
+st.caption("Advanced IMAP Client with Interactive Bot Intelligence, Dedicated OTP & Credentials Scanner, Multi-Field Search, and Deep Diagnostic Instrumentation.")
 
 valid = load_valid()
 
@@ -443,7 +474,7 @@ if st.sidebar.button("🔄 Refresh Inbox", type="secondary", use_container_width
                 mail_obj = open_mail(email, password, host, timeout=60)
                 st.session_state.current_messages = fetch_messages_paginated(
                     mail_obj, email, password, host, ["INBOX"], mode="FOLDER_ONLY", 
-                    page_size=15, page_number=1, sort_order="Newest First", is_search_operation=False
+                    page_size=15, page_number=1, sort_order="Newest First", log_target="DEBUG"
                 )
                 close_mail(mail_obj)
                 st.session_state.current_page = 1
@@ -518,7 +549,7 @@ if st.button("📂 Load Folder Messages", type="primary", use_container_width=Tr
                 mail = open_mail(email, password, host, timeout=60)
                 msgs = fetch_messages_paginated(
                     mail, email, password, host, [folder], mode="FOLDER_ONLY",
-                    page_size=page_size, page_number=1, sort_order=sort_order, is_search_operation=False
+                    page_size=page_size, page_number=1, sort_order=sort_order, log_target="DEBUG"
                 )
                 st.session_state.current_messages = msgs
                 st.session_state.current_page = 1
@@ -565,6 +596,10 @@ if len(active_msgs) > 0:
 
             if msg["pins"]:
                 st.success(f"🔑 **Extracted PINs / Verification Codes:** {', '.join(msg['pins'])}")
+            if msg.get("cards"):
+                st.warning(f"💳 **Detected Card Numbers:** {', '.join(msg['cards'])}")
+            if msg.get("creds"):
+                st.info(f"🔒 **Extracted Login/Credential Passwords:** {', '.join(msg['creds'])}")
             if msg["links"]:
                 st.markdown("🔗 **Actionable Verification Links:**")
                 for link in msg["links"]:
@@ -640,7 +675,7 @@ if len(active_msgs) > 0:
                 mail, email, password, host, [folder], 
                 mode="FOLDER_ONLY",
                 page_size=page_size, page_number=st.session_state.current_page, sort_order=sort_order,
-                is_search_operation=False
+                log_target="DEBUG"
             )
             close_mail(mail)
             st.rerun()
@@ -657,10 +692,244 @@ if len(active_msgs) > 0:
                 mail, email, password, host, [folder], 
                 mode="FOLDER_ONLY",
                 page_size=page_size, page_number=st.session_state.current_page, sort_order=sort_order,
-                is_search_operation=False
+                log_target="DEBUG"
             )
             close_mail(mail)
             st.rerun()
+
+# -----------------------------------------------------------------------------
+# SEPARATE STANDALONE OTP / CREDENTIAL / CARD MESSAGE SCANNER ECOSYSTEM
+# -----------------------------------------------------------------------------
+st.markdown("---")
+with st.expander("🔑 Standalone OTP & Sensitive Data Scanner", expanded=True):
+    st.markdown("#### Dynamic OTP, Password, Card Details & Credential Scanner Controls")
+    
+    otp_c1, otp_c2, otp_c3 = st.columns([2, 1, 1])
+    
+    otp_folder_options = ["Current Folder", "ALL_FOLDERS"] + [f"Folder: {f}" for f in st.session_state.mb_folders]
+    
+    with otp_c1:
+        otp_scope_choice = st.selectbox("Target Folder Scope", otp_folder_options, key="otp_scan_scope")
+    with otp_c2:
+        otp_scan_category = st.selectbox(
+            "Target Data Type Dropdown", 
+            [
+                "All Security Categories", 
+                "OTP Message & Verification", 
+                "Password / Reset Code", 
+                "Card Details & Payment", 
+                "Gift Cards", 
+                "ID Cards / Credentials", 
+                "Application Passwords", 
+                "Login Info / Info"
+            ],
+            key="otp_category_select"
+        )
+    with otp_c3:
+        otp_search_field = st.selectbox("Scan Field", ["TEXT", "SUBJECT", "BODY", "FROM"], key="otp_search_field")
+
+    # Dedicated Controls (Toggle & Checkbox)
+    t_col1, t_col2 = st.columns(2)
+    with t_col1:
+        otp_auto_clean_toggle = st.toggle("Auto-Clean HTML & Boilerplate", value=True, key="otp_clean_toggle")
+    with t_col2:
+        otp_deep_regex_chk = st.checkbox("Enable Deep Regex Code & Card Extraction", value=True, key="otp_regex_chk")
+
+    # Preset Keyword Mapping
+    preset_keywords = {
+        "All Security Categories": "OTP password card gift payment credential login verification reset",
+        "OTP Message & Verification": "OTP verification code verify auth token pin",
+        "Password / Reset Code": "password reset passwd new password",
+        "Card Details & Payment": "card details cardholder credit debit cvv expire payment",
+        "Gift Cards": "gift card claim code voucher redeem",
+        "ID Cards / Credentials": "id card identity credentials account info",
+        "Application Passwords": "app password application password token secret",
+        "Login Info / Info": "login details signin info account access"
+    }
+
+    otp_custom_keyword = st.text_input("Custom Keyword Override (Optional)", key="otp_custom_kw")
+
+    if st.button("🚀 Execute Dedicated Security Scan", type="primary", use_container_width=True, key="otp_exec_btn"):
+        host = override.strip() or st.session_state.mb_host or (host_list(email)[:1] or [""])[0]
+        if not email or not password or not host:
+            st.error("Please connect and discover folders first.")
+        else:
+            mail = None
+            try:
+                # Scope Resolution
+                if otp_scope_choice == "ALL_FOLDERS":
+                    target_scope = st.session_state.mb_folders
+                elif otp_scope_choice == "Current Folder":
+                    target_scope = [folder]
+                else:
+                    target_scope = [otp_scope_choice.replace("Folder: ", "")]
+
+                kw_to_use = otp_custom_keyword.strip() if otp_custom_keyword.strip() else preset_keywords.get(otp_scan_category, "OTP")
+
+                with st.spinner(f"Scanning target folders ({len(target_scope)}) for security payload [{kw_to_use}]..."):
+                    mail = open_mail(email, password, host, timeout=120)
+                    msgs = fetch_messages_paginated(
+                        mail, email, password, host, target_scope, kw_to_use, otp_search_field,
+                        mode="SEARCH", page_size=page_size, page_number=1, sort_order=sort_order,
+                        log_target="OTP"
+                    )
+                    st.session_state.otp_messages = msgs
+                    st.session_state.otp_current_page = 1
+                    otp_log(f"Scan complete. Retried {st.session_state.otp_total_matched_count} matching messages across {len(target_scope)} folders.")
+            except Exception as e:
+                st.error(str(e))
+            finally:
+                if mail:
+                    close_mail(mail)
+
+    # Standalone Security / OTP Stream
+    st.markdown("#### 🔒 Standalone Security & OTP Message Stream")
+    otp_msgs = st.session_state.otp_messages
+    otp_total = st.session_state.otp_total_matched_count or len(otp_msgs)
+
+    if len(otp_msgs) > 0:
+        otp_total_pages = max(1, math.ceil(otp_total / page_size))
+        otp_curr_p = st.session_state.otp_current_page
+        
+        st.markdown(f"**Showing Page {otp_curr_p} of {otp_total_pages} (Total Security Matches: {otp_total})**")
+
+        for idx, msg in enumerate(otp_msgs):
+            status_icon = "📖" if msg["is_read"] else "📩"
+            bot_badge = " [🔐 SENSITIVE DATA DETECTED]" if (msg["pins"] or msg.get("cards") or msg.get("creds")) else ""
+            folder_badge = f" [{msg['folder']}]"
+
+            with st.expander(f"{status_icon}{folder_badge} [{msg['date']}] {msg['from']} - {msg['subject']}{bot_badge}", expanded=False):
+                st.write(f"**Folder:** {msg['folder']}")
+                st.write(f"**From:** {msg['from']}")
+                st.write(f"**To:** {msg['to']}")
+                st.write(f"**Subject:** {msg['subject']}")
+                st.write(f"**Date:** {msg['date']}")
+                st.write(f"**IMAP Message ID:** {msg['id']} | **Size:** {msg['size_bytes']} bytes")
+
+                if msg["pins"]:
+                    st.success(f"🔑 **Extracted PINs / Verification Codes / OTPs:** {', '.join(msg['pins'])}")
+                if msg.get("cards"):
+                    st.warning(f"💳 **Detected Card Numbers / Payment Info:** {', '.join(msg['cards'])}")
+                if msg.get("creds"):
+                    st.info(f"🔒 **Extracted Passwords / Credentials / App Passwords:** {', '.join(msg['creds'])}")
+                if msg["links"]:
+                    st.markdown("🔗 **Actionable Verification Links:**")
+                    for link in msg["links"]:
+                        st.markdown(f"- [{link}]({link})", unsafe_allow_html=True)
+
+                st.markdown("---")
+                display_body = msg["body"] if otp_auto_clean_toggle else msg["body"]
+                st.text_area("Message Payload Body", value=display_body, height=150, key=f"otp_b_{msg['folder']}_{msg['id']}_{idx}")
+
+                o_col1, o_col2, o_col3, o_col4 = st.columns(4)
+                host = override.strip() or st.session_state.mb_host or (host_list(email)[:1] or [""])[0]
+                real_imap_folder = get_imap_path(msg['folder'])
+
+                with o_col1:
+                    if not msg["is_read"]:
+                        if st.button("Mark as Read", key=f"otp_read_{msg['folder']}_{msg['id']}_{idx}"):
+                            try:
+                                m_client = open_mail(email, password, host, timeout=60)
+                                m_client.select(f'"{real_imap_folder}"', readonly=False)
+                                m_client.store(msg["id"], '+FLAGS', '\\Seen')
+                                close_mail(m_client)
+                                msg["is_read"] = True
+                                st.success("Marked as read!")
+                                st.rerun()
+                            except Exception as ex:
+                                st.error(str(ex))
+
+                with o_col2:
+                    otp_mv_target = st.selectbox("Move to", st.session_state.mb_folders, key=f"otp_mv_sel_{msg['folder']}_{msg['id']}_{idx}")
+                    if st.button("Move Message", key=f"otp_mv_btn_{msg['folder']}_{msg['id']}_{idx}"):
+                        try:
+                            real_target_path = get_imap_path(otp_mv_target)
+                            m_client = open_mail(email, password, host, timeout=60)
+                            m_client.select(f'"{real_imap_folder}"', readonly=False)
+                            m_client.copy(msg["id"], f'"{real_target_path}"')
+                            m_client.store(msg["id"], '+FLAGS', '\\Deleted')
+                            m_client.expunge()
+                            close_mail(m_client)
+                            st.session_state.otp_messages.remove(msg)
+                            st.success(f"Moved to {otp_mv_target}!")
+                            st.rerun()
+                        except Exception as ex:
+                            st.error(str(ex))
+
+                with o_col3:
+                    if st.button("Delete Message", key=f"otp_del_{msg['folder']}_{msg['id']}_{idx}", type="primary"):
+                        try:
+                            m_client = open_mail(email, password, host, timeout=60)
+                            m_client.select(f'"{real_imap_folder}"', readonly=False)
+                            m_client.store(msg["id"], '+FLAGS', '\\Deleted')
+                            m_client.expunge()
+                            close_mail(m_client)
+                            st.session_state.otp_messages.remove(msg)
+                            st.success("Deleted message!")
+                            st.rerun()
+                        except Exception as ex:
+                            st.error(str(ex))
+
+                with o_col4:
+                    with st.popover("View Raw RFC822"):
+                        st.code(msg["raw"].decode("utf-8", errors="ignore"))
+
+        # OTP Stream Pagination Controls
+        st.markdown("---")
+        op_c1, op_c2, op_c3 = st.columns([1, 2, 1])
+
+        with op_c1:
+            if st.button("Previous Page", disabled=(otp_curr_p <= 1), use_container_width=True, key="otp_prev_pg"):
+                st.session_state.otp_current_page -= 1
+                host = override.strip() or st.session_state.mb_host or (host_list(email)[:1] or [""])[0]
+                mail = open_mail(email, password, host, timeout=120)
+                if otp_scope_choice == "ALL_FOLDERS":
+                    target_scope = st.session_state.mb_folders
+                elif otp_scope_choice == "Current Folder":
+                    target_scope = [folder]
+                else:
+                    target_scope = [otp_scope_choice.replace("Folder: ", "")]
+                kw_to_use = otp_custom_keyword.strip() if otp_custom_keyword.strip() else preset_keywords.get(otp_scan_category, "OTP")
+                st.session_state.otp_messages = fetch_messages_paginated(
+                    mail, email, password, host, target_scope, kw_to_use, otp_search_field, 
+                    mode="SEARCH", page_size=page_size, page_number=st.session_state.otp_current_page, 
+                    sort_order=sort_order, log_target="OTP"
+                )
+                close_mail(mail)
+                st.rerun()
+
+        with op_c2:
+            st.markdown(f"<h4 style='text-align: center; margin: 0;'>Page {otp_curr_p} of {otp_total_pages}</h4>", unsafe_allow_html=True)
+
+        with op_c3:
+            if st.button("Next Page", disabled=(otp_curr_p >= otp_total_pages), use_container_width=True, key="otp_next_pg"):
+                st.session_state.otp_current_page += 1
+                host = override.strip() or st.session_state.mb_host or (host_list(email)[:1] or [""])[0]
+                mail = open_mail(email, password, host, timeout=120)
+                if otp_scope_choice == "ALL_FOLDERS":
+                    target_scope = st.session_state.mb_folders
+                elif otp_scope_choice == "Current Folder":
+                    target_scope = [folder]
+                else:
+                    target_scope = [otp_scope_choice.replace("Folder: ", "")]
+                kw_to_use = otp_custom_keyword.strip() if otp_custom_keyword.strip() else preset_keywords.get(otp_scan_category, "OTP")
+                st.session_state.otp_messages = fetch_messages_paginated(
+                    mail, email, password, host, target_scope, kw_to_use, otp_search_field, 
+                    mode="SEARCH", page_size=page_size, page_number=st.session_state.otp_current_page, 
+                    sort_order=sort_order, log_target="OTP"
+                )
+                close_mail(mail)
+                st.rerun()
+    else:
+        st.caption("No OTP / Sensitive security messages scanned yet. Select categories or keywords and click 'Execute Dedicated Security Scan'.")
+
+    # Standalone Diagnostic / Debug Screen for OTP Scanning Engine
+    st.markdown("#### 🛠️ OTP Engine Debugging & Diagnose Log Screen")
+    with st.expander("🔐 OTP Scanner IMAP Diagnostic Traces & Logs", expanded=False):
+        if st.session_state.otp_diag_logs:
+            st.code("\n".join(st.session_state.otp_diag_logs), language="text")
+        else:
+            st.caption("OTP scanner traces and raw server logs will appear here during execution.")
 
 # -----------------------------------------------------------------------------
 # SEPARATE STANDALONE DEEP KEYWORD SEARCH & SCOPE FILTERS
@@ -703,7 +972,7 @@ with st.expander("🔍 Deep Keyword Search & Scope Filters", expanded=False):
                     msgs = fetch_messages_paginated(
                         mail, email, password, host, target_scope, search_query_input, search_field_choice, 
                         mode="SEARCH", page_size=page_size, page_number=1, sort_order=sort_order,
-                        is_search_operation=True
+                        log_target="SEARCH"
                     )
                     st.session_state.search_messages = msgs
                     st.session_state.search_current_page = 1
@@ -820,7 +1089,7 @@ with st.expander("🔍 Deep Keyword Search & Scope Filters", expanded=False):
                 st.session_state.search_messages = fetch_messages_paginated(
                     mail, email, password, host, target_scope, search_query_input, search_field_choice, 
                     mode="SEARCH", page_size=page_size, page_number=st.session_state.search_current_page, 
-                    sort_order=sort_order, is_search_operation=True
+                    sort_order=sort_order, log_target="SEARCH"
                 )
                 close_mail(mail)
                 st.rerun()
@@ -842,7 +1111,7 @@ with st.expander("🔍 Deep Keyword Search & Scope Filters", expanded=False):
                 st.session_state.search_messages = fetch_messages_paginated(
                     mail, email, password, host, target_scope, search_query_input, search_field_choice, 
                     mode="SEARCH", page_size=page_size, page_number=st.session_state.search_current_page, 
-                    sort_order=sort_order, is_search_operation=True
+                    sort_order=sort_order, log_target="SEARCH"
                 )
                 close_mail(mail)
                 st.rerun()
@@ -889,7 +1158,7 @@ with st.expander("🤖 Mass Bot Purge & Intelligence Hub", expanded=False):
                         msgs = fetch_messages_paginated(
                             mail, email, password, host, target_scope, mode="FOLDER_ONLY",
                             page_size=bot_scan_limit, page_number=1, sort_order="Newest First",
-                            is_search_operation=False
+                            log_target="DEBUG"
                         )
                         st.session_state.current_messages = msgs
                         st.session_state.bot_filter_mode = True
