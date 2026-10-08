@@ -1,543 +1,485 @@
-import glob
+import base64
+import email
+from email.header import decode_header
 import imaplib
 import poplib
-import os
 import re
-from email import message_from_bytes, message_from_string
-from email.header import decode_header
+from typing import List, Set
 import streamlit as st
 
-from hosts import host_list
+st.set_page_config(page_title="Mailbox Reader", page_icon="📧", layout="wide")
 
-# Responsive Configuration & Session Keep-Alive Injector
-st.set_page_config(
-    page_title="Bobito Universal Mailbox Reader & Portal Hub",
-    page_icon="📥",
-    layout="wide",
-    initial_sidebar_state="expanded"
-)
 
-st.markdown(
+# ==============================================================================
+# UNIVERSAL MAILBOX FOLDER DISCOVERY ENGINE
+# ==============================================================================
+class MailboxFolderEngine:
     """
-    <script>
-    setInterval(function(){
-        fetch('/_stcore/health').then(res => {});
-    }, 30000);
-    </script>
-    """,
-    unsafe_allow_html=True
-)
+    Universal Mailbox Folder Discovery Engine.
+    Handles IMAP (multi-pattern LIST/LSUB traversal, delimiter stripping, UTF-7 handling,
+    and active STATUS verification) and POP3 single-stream mailbox fallbacks.
+    """
 
-# Session State Initialization
-if "mb_log" not in st.session_state:
-    st.session_state.mb_log = []
-if "mb_folders" not in st.session_state:
-    st.session_state.mb_folders = ["INBOX"]
-if "mb_host" not in st.session_state:
-    st.session_state.mb_host = ""
-if "mb_proto" not in st.session_state:
-    st.session_state.mb_proto = "IMAP"
+    DEFAULT_SYSTEM_FOLDERS = [
+        "INBOX",
+        "Sent",
+        "Sent Messages",
+        "Sent Items",
+        "Drafts",
+        "Trash",
+        "Deleted Items",
+        "Junk",
+        "Spam",
+        "Archive",
+        "Archives",
+        "Outbox",
+        "Notes",
+    ]
 
+    def __init__(self, email: str, password: str, host: str, protocol: str = "IMAP", port: int = None, timeout: int = 20):
+        self.email = email
+        self.password = password
+        self.host = host
+        self.protocol = protocol.upper()
+        self.port = port or (995 if self.protocol == "POP3" else 993)
+        self.timeout = timeout
 
-def log(msg):
-    st.session_state.mb_log.insert(0, msg)
-    st.session_state.mb_log = st.session_state.mb_log[:50]
+    def discover_folders(self) -> List[str]:
+        if self.protocol == "POP3":
+            return ["INBOX"]
+        return self._discover_imap()
 
+    def _discover_imap(self) -> List[str]:
+        client = None
+        discovered_raw: Set[str] = set()
 
-def load_valid():
-    rows, seen = [], set()
-    paths = sorted(glob.glob("mail_results/valid_*.txt"), reverse=True)
-    paths += [p for p in ("clean_valid_accounts.txt", "valid_accounts.txt") if os.path.exists(p)]
-    for path in paths:
         try:
-            with open(path, encoding="utf-8", errors="ignore") as f:
-                for line in f:
-                    line = line.strip()
-                    if ":" not in line:
-                        continue
-                    email, pwd = line.split(":", 1)
-                    combo = f"{email.strip()}:{pwd.split('|')[0].strip()}"
-                    if combo not in seen:
-                        seen.add(combo)
-                        rows.append(combo)
-        except Exception:
-            continue
-    return rows
+            client = imaplib.IMAP4_SSL(self.host, self.port, timeout=self.timeout)
+            client.login(self.email, self.password)
 
+            # Strategy 1: Wildcard LIST queries
+            list_patterns = [
+                ('""', '*'),
+                ('""', '%'),
+                ('""', '"*"'),
+                ('""', '"%"'),
+                ('*', '*'),
+            ]
 
-def decode_hdr(value):
-    try:
-        out = []
-        for part, enc in decode_header(value or ""):
-            out.append(part.decode(enc or "utf-8", errors="ignore") if isinstance(part, bytes) else str(part))
-        return "".join(out)
-    except Exception:
-        return str(value or "")
+            for ref, pattern in list_patterns:
+                try:
+                    status, data = client.list(ref, pattern)
+                    if status == "OK" and data:
+                        parsed = self._parse_imap_response(data)
+                        discovered_raw.update(parsed)
+                except Exception:
+                    continue
 
+            # Strategy 2: LSUB (Subscribed folders) fallback
+            try:
+                status, data = client.lsub('""', '*')
+                if status == "OK" and data:
+                    parsed = self._parse_imap_response(data)
+                    discovered_raw.update(parsed)
+            except Exception:
+                pass
 
-def get_webmail_portal(email):
-    if "@" not in email:
-        return "https://mail.google.com"
-    domain = email.split("@")[-1].lower()
-    portals = {
-        "gmail.com": "https://mail.google.com",
-        "googlemail.com": "https://mail.google.com",
-        "outlook.com": "https://outlook.live.com",
-        "hotmail.com": "https://outlook.live.com",
-        "live.com": "https://outlook.live.com",
-        "yahoo.com": "https://mail.yahoo.com",
-        "ymail.com": "https://mail.yahoo.com",
-        "icloud.com": "https://www.icloud.com/mail",
-        "me.com": "https://www.icloud.com/mail",
-        "aol.com": "https://mail.aol.com",
-        "zoho.com": "https://mail.zoho.com",
-        "proton.me": "https://mail.proton.me",
-        "protonmail.com": "https://mail.proton.me"
-    }
-    return portals.get(domain, f"https://www.{domain}")
+            # Strategy 3: Verify folders using STATUS/EXAMINE
+            verified_folders = set()
+            for folder in discovered_raw:
+                if self._verify_folder_selectable(client, folder):
+                    verified_folders.add(folder)
 
+            # Strategy 4: Direct probe of common system folders if discovery returned few items
+            if len(verified_folders) <= 1:
+                for sys_folder in self.DEFAULT_SYSTEM_FOLDERS:
+                    if sys_folder not in verified_folders and self._verify_folder_selectable(client, sys_folder):
+                        verified_folders.add(sys_folder)
 
-# Universal Legitimate Folder Discovery Engine
-def list_folders_imap(mail):
-    found = set()
-    try:
-        # Request full list of mailboxes
-        for pattern in ('"" "*"', '"" "%"'):
-            typ, data = mail.list(pattern)
-            if typ == "OK" and data:
-                for item in data:
-                    if not item:
-                        continue
-                    s = item.decode("utf-8", errors="ignore") if isinstance(item, bytes) else str(item)
-                    
-                    # Ignore non-selectable structural nodes
-                    if "\\noselect" in s.lower() or "\\nonexistent" in s.lower():
-                        continue
-
-                    # Parse folder name taking quotes and delimiters into account
-                    match = re.search(r'\((?P<flags>[^\)]*)\)\s+"(?P<delim>[^"]+)"\s+(?P<name>.*)', s)
-                    if match:
-                        name = match.group("name").strip()
-                    else:
-                        match_simple = re.search(r'\((?P<flags>[^\)]*)\)\s+(?P<delim>\S+)\s+(?P<name>.*)', s)
-                        name = match_simple.group("name").strip() if match_simple else s.split()[-1]
-
-                    if name.startswith('"') and name.endswith('"'):
-                        name = name[1:-1]
-                    name = name.replace('\\"', '"').strip()
-
-                    if name and name not in (".", "/", '""'):
-                        found.add(name)
-    except Exception as e:
-        log(f"Folder discovery warning: {e}")
-
-    if not found:
-        found.add("INBOX")
-
-    return sorted(list(found), key=lambda x: (0 if x.lower() == "inbox" else 1, x.lower()))
-
-
-def open_mail_connection(email, password, host, protocol="IMAP", port=None):
-    if protocol.upper() == "POP3":
-        p = port or 995
-        client = poplib.POP3_SSL(host, p, timeout=20)
-        client.user(email)
-        client.pass_(password)
-        return client
-    else:
-        p = port or 993
-        client = imaplib.IMAP4_SSL(host, p, timeout=20)
-        client.login(email, password)
-        return client
-
-
-def close_mail_connection(client, protocol="IMAP"):
-    try:
-        if protocol.upper() == "POP3":
-            client.quit()
-        else:
             client.logout()
-    except Exception:
+
+            if not verified_folders:
+                return ["INBOX"]
+
+            return sorted(list(verified_folders), key=lambda x: (0 if x.upper() == "INBOX" else 1, x.lower()))
+
+        except Exception:
+            if client:
+                try:
+                    client.logout()
+                except Exception:
+                    pass
+            return ["INBOX"]
+
+    def _parse_imap_response(self, raw_data: list) -> Set[str]:
+        valid_folders = set()
+
+        for line in raw_data:
+            if not line:
+                continue
+
+            entry = line.decode("utf-8", errors="ignore") if isinstance(line, bytes) else str(line)
+
+            # Filter out non-selectable parent containers (\Noselect / \NonExistent)
+            if r"\noselect" in entry.lower() or r"\nonexistent" in entry.lower():
+                continue
+
+            folder_name = self._extract_folder_name(entry)
+            if folder_name and folder_name not in (".", "/", '""', "''"):
+                valid_folders.add(folder_name)
+
+        return valid_folders
+
+    @staticmethod
+    def _extract_folder_name(raw_line: str) -> str:
+        # Match quoted delimiter format: (\Flags) "Delimiter" "FolderName"
+        match = re.search(r'\((?P<flags>[^\)]*)\)\s+"(?P<delim>[^"]*)"\s+(?P<name>.*)', raw_line)
+        if match:
+            name = match.group("name").strip()
+            if name.startswith('"') and name.endswith('"'):
+                name = name[1:-1]
+            return name.replace(r'\"', '"').strip()
+
+        # Match unquoted delimiter format
+        match_alt = re.search(r'\((?P<flags>[^\)]*)\)\s+(?P<delim>\S+)\s+(?P<name>.*)', raw_line)
+        if match_alt:
+            name = match_alt.group("name").strip()
+            if name.startswith('"') and name.endswith('"'):
+                name = name[1:-1]
+            return name.replace(r'\"', '"').strip()
+
+        # Fallback split
+        tokens = raw_line.split()
+        if tokens:
+            return tokens[-1].strip('"').strip()
+
+        return ""
+
+    @staticmethod
+    def _verify_folder_selectable(client: imaplib.IMAP4_SSL, folder_name: str) -> bool:
         try:
-            if hasattr(client, 'shutdown'):
-                client.shutdown()
-            elif hasattr(client, 'close'):
-                client.close()
+            status, _ = client.status(f'"{folder_name}"', "(MESSAGES)")
+            if status == "OK":
+                return True
         except Exception:
             pass
 
+        try:
+            status, _ = client.examine(f'"{folder_name}"')
+            if status == "OK":
+                return True
+        except Exception:
+            pass
 
-def is_bot_message(subject, body):
-    bot_keywords = [
-        "otp", "verification", "verify", "security alert", "password reset",
-        "code", "confirm", "login", "auth", "signin", "crypto", "token", "activation"
-    ]
-    combined = f"{subject} {body}".lower()
-    return any(kw in combined for kw in bot_keywords)
-
-
-def extract_pins_and_links(text):
-    pins = re.findall(r'\b(?<![#\d])\d{4,8}(?![#\d])\b', text)
-    urls = re.findall(r'https?://[^\s<>"]+|www\.[^\s<>"]+', text)
-    cleaned_urls = [u for u in urls if not any(x in u.lower() for x in ["w3.org", "schema.org", "apple.com/DTDs"])]
-    return list(dict.fromkeys(pins)), list(dict.fromkeys(cleaned_urls))
+        return False
 
 
-def clean_boilerplate(text):
-    if not text:
-        return ""
-    patterns_to_remove = [
-        r"(?i)unsubscribe.*?(?:\n|$)",
-        r"(?i)privacy policy.*?(?:\n|$)",
-        r"(?i)confidentiality notice.*?(?:\n\n|$)",
-        r"(?i)this email was sent by.*?(?:\n|$)"
-    ]
-    cleaned = text
-    for pat in patterns_to_remove:
-        cleaned = re.sub(pat, "", cleaned)
-    return cleaned.strip()
-
-
-# UI Title Block
-st.title("📥 Universal Mailbox Reader & Portal Hub")
-st.caption("Supports IMAP, POP3, Custom Domains, Webmail & Private Servers with Real Folder Discovery.")
-
-valid = load_valid()
-
-# Sidebar Setup
-st.sidebar.header("Connection Hub")
-pick = st.sidebar.selectbox("Valid account", valid or ["none"])
-custom_email = st.sidebar.text_input("Email override")
-custom_pass = st.sidebar.text_input("Password override", type="password")
-protocol_choice = st.sidebar.radio("Protocol", ["IMAP", "POP3"], index=0)
-override_host = st.sidebar.text_input("Mail host override (e.g. imap.domain.com)")
-override_port = st.sidebar.number_input("Custom Port (0 = Default)", min_value=0, max_value=65535, value=0)
-
-if custom_email.strip():
-    email, password = custom_email.strip(), custom_pass.strip()
-elif ":" in pick:
-    email, password = pick.split(":", 1)
-else:
-    email, password = "", ""
-
-st.sidebar.write("**Suggested hosts:** " + ", ".join(host_list(email)[:4]) if email else "-")
-
-# Dynamic Credentials Display
-if email and password:
-    st.sidebar.markdown("---")
-    st.sidebar.subheader("🌐 Webmail & Credentials")
-    portal_url = get_webmail_portal(email)
-    st.sidebar.markdown(f"[Open Webmail Portal]({portal_url})", unsafe_allow_html=True)
-    st.sidebar.text_input("Copy Credentials (email:password)", value=f"{email}:{password}", key=f"cred_{email}")
-
-if st.sidebar.button("Connect & Discover Folders", type="primary"):
-    if not email or not password:
-        st.error("Email and password required")
-    else:
-        hosts = [override_host.strip()] if override_host.strip() else host_list(email)
-        port_val = override_port if override_port > 0 else None
-        last_err = "No connection attempted"
-        connected_host = ""
-        folders = ["INBOX"]
-        success = False
-
-        with st.spinner(f"Connecting via {protocol_choice}..."):
-            for host in hosts:
-                client = None
-                try:
-                    client = open_mail_connection(email, password, host, protocol=protocol_choice, port=port_val)
-                    if protocol_choice == "IMAP":
-                        folders = list_folders_imap(client)
-                    else:
-                        folders = ["INBOX"] # POP3 standard only exposes single inbox stream
-                    
-                    close_mail_connection(client, protocol=protocol_choice)
-                    connected_host = host
-                    success = True
-                    break
-                except Exception as e:
-                    last_err = f"{host}: {e}"
-                    if client:
-                        close_mail_connection(client, protocol=protocol_choice)
-
-        if success:
-            st.session_state.mb_host = connected_host
-            st.session_state.mb_folders = folders
-            st.session_state.mb_proto = protocol_choice
-            log(f"Connected to {connected_host} [{protocol_choice}] - Found {len(folders)} real folders")
-            st.sidebar.success(f"Connected to {connected_host} ({len(folders)} folders)")
+# ==============================================================================
+# HELPER FUNCTIONS (PARSING, MIME & SECURITY DETECTION)
+# ==============================================================================
+def decode_mime_header(header_val, default="No Subject"):
+    if not header_val:
+        return default
+    decoded_parts = decode_header(header_val)
+    result = ""
+    for part, encoding in decoded_parts:
+        if isinstance(part, bytes):
+            result += part.decode(encoding or "utf-8", errors="ignore")
         else:
-            st.sidebar.error(last_err)
-            log(last_err)
+            result += str(part)
+    return result if result.strip() else default
 
-# Live Activity Log & Clean Account Downloader
-st.sidebar.markdown("---")
-st.sidebar.subheader("📜 Live Action Log")
-with st.sidebar.expander("View Activity Log", expanded=False):
-    for line in st.session_state.mb_log:
-        st.text(line)
 
-if valid:
-    st.sidebar.markdown("---")
-    st.sidebar.subheader("💾 Clean Accounts Export")
-    valid_text = "\n".join(valid)
-    st.sidebar.download_button(
-        label="Download ONLY Valid Accounts",
-        data=valid_text,
-        file_name="valid_accounts_only.txt",
-        mime="text/plain"
+def decode_payload_content(payload, encoding):
+    if not payload:
+        return ""
+    if encoding and encoding.lower() == "base64":
+        try:
+            return base64.b64decode(payload).decode("utf-8", errors="ignore")
+        except Exception:
+            pass
+    if isinstance(payload, bytes):
+        return payload.decode("utf-8", errors="ignore")
+    return str(payload)
+
+
+def detect_bot_indicators(subject, body):
+    combined = f"{subject} {body}".lower()
+    flags = []
+    if any(k in combined for k in ["verify", "verification", "otp", "code", "confirm"]):
+        flags.append("Verification Code / OTP Detected")
+    if any(k in combined for k in ["security alert", "unusual activity", "new sign-in", "login attempt"]):
+        flags.append("Security Alert / Login Warning")
+    if any(k in combined for k in ["password", "reset", "credentials"]):
+        flags.append("Password / Credential Event")
+    return flags
+
+
+def extract_actionable_pins(body):
+    pattern = r"\b(?:\d{4,8}|[A-Z0-9]{6,10})\b"
+    matches = re.findall(pattern, body)
+    return list(set(matches))[:5]
+
+
+def extract_verification_links(body):
+    url_pattern = r'https?://[^\s<>"]+|www\.[^\s<>"]+'
+    links = re.findall(url_pattern, body)
+    return [
+        l for l in links if any(k in l.lower() for k in ["verify", "confirm", "auth", "login", "security", "token"])
+    ]
+
+
+# ==============================================================================
+# STREAMLIT UI INTERFACE
+# ==============================================================================
+st.title("📧 Advanced Mailbox Reader & Bot Intelligence")
+
+# Sidebar - Connection Hub
+st.sidebar.header("🔑 Mailbox Connection Settings")
+email_in = st.sidebar.text_input("Email Address", key="mb_email")
+password_in = st.sidebar.text_input("Password", type="password", key="mb_password")
+protocol_in = st.sidebar.selectbox("Protocol", ["IMAP", "POP3"], index=0, key="mb_proto")
+host_in = st.sidebar.text_input("Host Server (e.g. imap.example.com)", key="mb_host")
+port_in = st.sidebar.number_input("Port (0 = default)", min_value=0, max_value=65535, value=0, key="mb_port")
+
+if st.sidebar.button("🔗 Connect & Discover Folders", type="primary", use_container_width=True):
+    if not email_in or not password_in or not host_in:
+        st.sidebar.error("Email, password, and host server are required.")
+    else:
+        with st.spinner("Executing Folder Engine discovery..."):
+            port_val = port_in if port_in > 0 else None
+            engine = MailboxFolderEngine(
+                email=email_in,
+                password=password_in,
+                host=host_in,
+                protocol=protocol_in,
+                port=port_val,
+            )
+            discovered_folders = engine.discover_folders()
+
+            st.session_state["available_folders"] = discovered_folders
+            st.session_state["connected"] = True
+            st.sidebar.success(f"Connected! Found {len(discovered_folders)} selectable folder(s).")
+
+# Main Section - Folder Selection Layout
+st.subheader("📁 Mailbox & Folder Configuration")
+raw_folders = st.session_state.get("available_folders", ["INBOX"])
+
+col_f1, col_f2, col_f3 = st.columns([2, 1, 1])
+
+with col_f1:
+    selected_folder = st.selectbox("Select Mailbox Folder", options=raw_folders, key="mb_selected_folder")
+
+with col_f2:
+    batch_size = st.slider("Messages per Page", min_value=10, max_value=100, value=20, key="mb_batch_size")
+
+with col_f3:
+    sort_order = st.selectbox(
+        "Sort Order", ["Newest First (Descending)", "Oldest First (Ascending)"], key="mb_sort_order"
     )
 
-# Main Controls
-col1, col2, col3 = st.columns([2, 1, 1])
-with col1:
-    folder = st.selectbox("Select Mail Folder", st.session_state.mb_folders)
-with col2:
-    page_size = st.slider("Page size", 5, 50, 15)
-with col3:
-    sort_order = st.selectbox("Sort Order", ["Newest First", "Oldest First"])
+col_s1, col_s2, col_s3 = st.columns([3, 1, 1])
 
-with st.expander("🔍 Keyword Search & Filtering Options", expanded=False):
-    search_query = st.text_input("Search term or keyword")
-    search_scope = st.selectbox("Search Scope (IMAP Only)", ["TEXT", "SUBJECT", "FROM", "BODY"])
+with col_s1:
+    search_query = st.text_input(
+        "Deep Keyword Search", placeholder="e.g. Netflix, verify, security", key="mb_deep_search_query"
+    )
 
-if st.button("Load & Search Messages", type="primary"):
-    proto = st.session_state.mb_proto
-    host = override_host.strip() or st.session_state.mb_host or (host_list(email)[:1] or [""])[0]
-    port_val = override_port if override_port > 0 else None
+with col_s2:
+    search_scope = st.selectbox("Search Field", ["TEXT", "BODY", "SUBJECT", "FROM"], key="mb_search_scope")
 
-    if not email or not password or not host:
-        st.error("Please connect first or set valid credentials.")
+with col_s3:
+    st.markdown("<br>", unsafe_allow_html=True)
+    refresh_btn = st.button("🔄 Refresh Inbox", use_container_width=True)
+
+col_btn1, col_btn2 = st.columns([1, 1])
+with col_btn1:
+    load_folder_btn = st.button("📥 Load Folder Messages", type="primary", use_container_width=True)
+with col_btn2:
+    search_btn = st.button("🔍 Execute Deep Search", use_container_width=True)
+
+# Message Fetching Execution
+if load_folder_btn or search_btn or refresh_btn:
+    if not st.session_state.get("connected"):
+        st.error("Please connect to a server using the sidebar panel first.")
     else:
-        client = None
-        try:
-            with st.spinner(f"Reading '{folder}' on {host} via {proto}..."):
-                client = open_mail_connection(email, password, host, protocol=proto, port=port_val)
-                messages_data = []
-
-                if proto == "IMAP":
-                    client.select(f'"{folder}"', readonly=False)
-                    if search_query.strip():
-                        typ, data = client.search(None, search_scope, f'"{search_query.strip()}"')
-                    else:
-                        typ, data = client.search(None, "ALL")
-
-                    ids = (data[0] or b"").split() if typ == "OK" else []
-                    if sort_order == "Newest First":
-                        ids = list(reversed(ids))
-
-                    ids = ids[:page_size]
-
-                    for mid in ids:
-                        typ, msgdata = client.fetch(mid, "(FLAGS BODY.PEEK[])")
-                        if not msgdata or not isinstance(msgdata[0], tuple):
-                            continue
-
-                        raw_msg_bytes = msgdata[0][1]
-                        msg = message_from_bytes(raw_msg_bytes)
-
-                        subject = decode_hdr(msg.get("Subject", ""))
-                        frm = decode_hdr(msg.get("From", ""))
-                        date_val = decode_hdr(msg.get("Date", ""))
-                        flags_str = str(msgdata[0][0])
-                        is_read = "\\Seen" in flags_str
-
-                        body_text = ""
-                        if msg.is_multipart():
-                            for part in msg.walk():
-                                if part.get_content_type() == "text/plain":
-                                    try:
-                                        body_text = part.get_payload(decode=True).decode("utf-8", errors="ignore")
-                                        break
-                                    except Exception:
-                                        pass
-                        else:
-                            try:
-                                body_text = msg.get_payload(decode=True).decode("utf-8", errors="ignore")
-                            except Exception:
-                                pass
-
-                        cleaned_body = clean_boilerplate(body_text)
-                        pins, links = extract_pins_and_links(body_text)
-                        is_bot = is_bot_message(subject, body_text)
-
-                        messages_data.append({
-                            "id": mid.decode(),
-                            "from": frm,
-                            "subject": subject,
-                            "date": date_val,
-                            "is_read": is_read,
-                            "is_bot": is_bot,
-                            "body": cleaned_body,
-                            "pins": pins,
-                            "links": links,
-                            "raw": raw_msg_bytes
-                        })
-                else: # POP3
-                    num_msgs = len(client.list()[1])
-                    msg_indices = list(range(1, num_msgs + 1))
-                    if sort_order == "Newest First":
-                        msg_indices = list(reversed(msg_indices))
-
-                    msg_indices = msg_indices[:page_size]
-
-                    for idx in msg_indices:
-                        raw_lines = client.retr(idx)[1]
-                        raw_msg_bytes = b"\n".join(raw_lines)
-                        msg = message_from_bytes(raw_msg_bytes)
-
-                        subject = decode_hdr(msg.get("Subject", ""))
-                        frm = decode_hdr(msg.get("From", ""))
-                        date_val = decode_hdr(msg.get("Date", ""))
-
-                        body_text = ""
-                        if msg.is_multipart():
-                            for part in msg.walk():
-                                if part.get_content_type() == "text/plain":
-                                    try:
-                                        body_text = part.get_payload(decode=True).decode("utf-8", errors="ignore")
-                                        break
-                                    except Exception:
-                                        pass
-                        else:
-                            try:
-                                body_text = msg.get_payload(decode=True).decode("utf-8", errors="ignore")
-                            except Exception:
-                                pass
-
-                        if search_query.strip():
-                            if search_query.lower() not in f"{subject} {frm} {body_text}".lower():
-                                continue
-
-                        cleaned_body = clean_boilerplate(body_text)
-                        pins, links = extract_pins_and_links(body_text)
-                        is_bot = is_bot_message(subject, body_text)
-
-                        messages_data.append({
-                            "id": str(idx),
-                            "from": frm,
-                            "subject": subject,
-                            "date": date_val,
-                            "is_read": True,
-                            "is_bot": is_bot,
-                            "body": cleaned_body,
-                            "pins": pins,
-                            "links": links,
-                            "raw": raw_msg_bytes
-                        })
-
-                st.session_state.current_messages = messages_data
-                log(f"Loaded {len(messages_data)} messages from {folder} via {proto}")
-        except Exception as e:
-            st.error(str(e))
-            log(str(e))
-        finally:
-            if client:
-                close_mail_connection(client, protocol=proto)
-
-# Message Stream Display & Interactivity
-if "current_messages" in st.session_state and st.session_state.current_messages:
-    bot_msgs = [m for m in st.session_state.current_messages if m["is_bot"]]
-    proto = st.session_state.mb_proto
-
-    if bot_msgs:
-        st.markdown("---")
-        st.subheader(f"🤖 Bot & Security Intelligence ({len(bot_msgs)} detected)")
-        if st.button("🗑️ Mass Delete All Bot/Spam Messages"):
-            host = override_host.strip() or st.session_state.mb_host or (host_list(email)[:1] or [""])[0]
-            port_val = override_port if override_port > 0 else None
-            client = None
+        with st.spinner(f"Querying messages in '{selected_folder}'..."):
             try:
-                client = open_mail_connection(email, password, host, protocol=proto, port=port_val)
-                if proto == "IMAP":
-                    client.select(f'"{folder}"', readonly=False)
-                    for bm in bot_msgs:
-                        client.store(bm["id"], '+FLAGS', '\\Deleted')
-                    client.expunge()
-                else:
-                    for bm in bot_msgs:
-                        client.dele(int(bm["id"]))
+                proto = st.session_state.get("mb_proto", "IMAP")
+                host = st.session_state.get("mb_host")
+                port = st.session_state.get("mb_port") or (995 if proto == "POP3" else 993)
+                user = st.session_state.get("mb_email")
+                pwd = st.session_state.get("mb_password")
 
-                st.success(f"Deleted {len(bot_msgs)} bot messages!")
-                log(f"Mass deleted {len(bot_msgs)} bot messages from {folder}")
-                st.rerun()
+                if proto == "IMAP":
+                    mail = imaplib.IMAP4_SSL(host, port, timeout=20)
+                    mail.login(user, pwd)
+                    st.session_state["imap_mail"] = mail
+
+                    safe_folder = selected_folder.replace('"', '\\"')
+                    mail.select(f'"{safe_folder}"', readonly=True)
+
+                    if search_btn and search_query.strip():
+                        q = search_query.strip()
+                        status, response = mail.search(None, f'({search_scope} "{q}")')
+                    else:
+                        status, response = mail.search(None, "ALL")
+
+                    if status == "OK":
+                        msg_ids = response[0].split()
+                        if "Ascending" in sort_order:
+                            msg_ids = sorted(msg_ids, key=lambda x: int(x))
+                        else:
+                            msg_ids = sorted(msg_ids, key=lambda x: int(x), reverse=True)
+
+                        st.session_state["current_msg_ids"] = msg_ids
+                        st.session_state["current_page"] = 0
+                        st.success(f"Loaded {len(msg_ids)} message(s) successfully.")
+                else:
+                    pop_cli = poplib.POP3_SSL(host, port, timeout=20)
+                    pop_cli.user(user)
+                    pop_cli.pass_(pwd)
+
+                    num_msgs = len(pop_cli.list()[1])
+                    msg_ids = [str(i).encode() for i in range(1, num_msgs + 1)]
+
+                    if "Descending" in sort_order:
+                        msg_ids = list(reversed(msg_ids))
+
+                    st.session_state["current_msg_ids"] = msg_ids
+                    st.session_state["current_page"] = 0
+                    st.session_state["active_pop_client"] = pop_cli
+                    st.success(f"Loaded {len(msg_ids)} message(s) via POP3.")
+
             except Exception as e:
-                st.error(f"Error deleting bot messages: {e}")
-            finally:
-                if client:
-                    close_mail_connection(client, protocol=proto)
+                st.error(f"Error loading messages: {e}")
+
+# Message Pagination & Display Stream
+if "current_msg_ids" in st.session_state and st.session_state["current_msg_ids"]:
+    msg_ids = st.session_state["current_msg_ids"]
+    total_msgs = len(msg_ids)
+    current_page = st.session_state.get("current_page", 0)
+
+    max_page = max(0, (total_msgs - 1) // batch_size)
+    start_idx = current_page * batch_size
+    end_idx = min(start_idx + batch_size, total_msgs)
+    page_ids = msg_ids[start_idx:end_idx]
 
     st.markdown("---")
-    st.subheader(f"✉️ Message Stream ({len(st.session_state.current_messages)} loaded)")
+    p_col1, p_col2, p_col3 = st.columns([1, 2, 1])
+    with p_col1:
+        if st.button("◀ Previous Page") and current_page > 0:
+            st.session_state["current_page"] -= 1
+            st.rerun()
+    with p_col2:
+        st.markdown(
+            f"<p style='text-align: center;'>Page {current_page + 1} of {max_page + 1}</p>",
+            unsafe_allow_html=True,
+        )
+    with p_col3:
+        if st.button("Next Page ▶") and current_page < max_page:
+            st.session_state["current_page"] += 1
+            st.rerun()
 
-    for idx, msg in enumerate(st.session_state.current_messages):
-        status_icon = "📖" if msg["is_read"] else "📩"
-        bot_badge = " [🤖 BOT/OTP]" if msg["is_bot"] else ""
+    st.markdown("---")
 
-        with st.expander(f"{status_icon} [{msg['date']}] {msg['from']} - {msg['subject']}{bot_badge}"):
-            st.write(f"**From:** {msg['from']}")
-            st.write(f"**Subject:** {msg['subject']}")
-            st.write(f"**Date:** {msg['date']}")
+    proto = st.session_state.get("mb_proto", "IMAP")
 
-            if msg["pins"]:
-                st.success(f"🔑 **Extracted PINs / Verification Codes:** {', '.join(msg['pins'])}")
-            if msg["links"]:
-                st.markdown("🔗 **Actionable Verification Links:**")
-                for link in msg["links"]:
-                    st.markdown(f"- [{link}]({link})", unsafe_allow_html=True)
+    for num in page_ids:
+        try:
+            num_str = num.decode("utf-8", errors="ignore") if isinstance(num, bytes) else str(num)
+            subject, sender, date_str, flags = "No Subject", "Unknown", "Unknown", ""
 
-            st.markdown("---")
-            st.text_area("Cleaned Message Body", value=msg["body"], height=150, key=f"body_{msg['id']}_{idx}")
+            if proto == "IMAP" and "imap_mail" in st.session_state:
+                mail = st.session_state["imap_mail"]
+                safe_folder = selected_folder.replace('"', '\\"')
+                mail.select(f'"{safe_folder}"', readonly=True)
 
-            op_col1, op_col2, op_col3, op_col4 = st.columns(4)
-            host = override_host.strip() or st.session_state.mb_host or (host_list(email)[:1] or [""])[0]
-            port_val = override_port if override_port > 0 else None
+                st_fetch, msg_data = mail.fetch(num_str, "(BODY.PEEK[HEADER.FIELDS (SUBJECT FROM DATE)] FLAGS)")
+                if st_fetch == "OK":
+                    for response_part in msg_data:
+                        if isinstance(response_part, tuple):
+                            msg = email.message_from_bytes(response_part[1])
+                            subject = decode_mime_header(msg.get("Subject", "No Subject"))
+                            sender = decode_mime_header(msg.get("From", "Unknown"))
+                            date_str = msg.get("Date", "Unknown")
+                        elif isinstance(response_part, bytes):
+                            flags = response_part.decode("utf-8", errors="ignore")
 
-            with op_col1:
-                if proto == "IMAP" and not msg["is_read"]:
-                    if st.button("Mark Read", key=f"read_{msg['id']}_{idx}"):
-                        try:
-                            cli = open_mail_connection(email, password, host, protocol="IMAP", port=port_val)
-                            cli.select(f'"{folder}"', readonly=False)
-                            cli.store(msg["id"], '+FLAGS', '\\Seen')
-                            close_mail_connection(cli, protocol="IMAP")
-                            st.success("Marked as read!")
+            is_read = "\\Seen" in flags
+            read_indicator = "📭" if is_read else "📬 **[UNREAD]**"
+
+            with st.expander(f"{read_indicator} [{date_str}] {sender[:30]} — {subject[:40]}"):
+                st.markdown(f"**From:** {sender}")
+                st.markdown(f"**Subject:** {subject}")
+                st.markdown(f"**Date:** {date_str}")
+                st.markdown(f"**Server ID / Flags:** Msg ID `{num_str}` | Flags: `{flags}`")
+                st.markdown("---")
+
+                # Action buttons for IMAP operations
+                if proto == "IMAP" and "imap_mail" in st.session_state:
+                    op_col1, op_col2 = st.columns(2)
+                    with op_col1:
+                        if st.button("✔ Mark Seen", key=f"seen_{selected_folder}_{num_str}"):
+                            mail = st.session_state["imap_mail"]
+                            mail.select(f'"{safe_folder}"', readonly=False)
+                            mail.store(num_str, "+FLAGS", "\\Seen")
+                            st.success("Marked message as seen.")
                             st.rerun()
-                        except Exception as ex:
-                            st.error(str(ex))
-
-            with op_col2:
-                if proto == "IMAP":
-                    target_move = st.selectbox("Move to", st.session_state.mb_folders, key=f"mv_sel_{msg['id']}_{idx}")
-                    if st.button("Move", key=f"mv_btn_{msg['id']}_{idx}"):
-                        try:
-                            cli = open_mail_connection(email, password, host, protocol="IMAP", port=port_val)
-                            cli.select(f'"{folder}"', readonly=False)
-                            cli.copy(msg["id"], f'"{target_move}"')
-                            cli.store(msg["id"], '+FLAGS', '\\Deleted')
-                            cli.expunge()
-                            close_mail_connection(cli, protocol="IMAP")
-                            st.success(f"Moved to {target_move}!")
+                    with op_col2:
+                        if st.button("❌ Delete", key=f"del_{selected_folder}_{num_str}"):
+                            mail = st.session_state["imap_mail"]
+                            mail.select(f'"{safe_folder}"', readonly=False)
+                            mail.store(num_str, "+FLAGS", "\\Deleted")
+                            mail.expunge()
+                            st.success("Deleted message.")
                             st.rerun()
-                        except Exception as ex:
-                            st.error(str(ex))
 
-            with op_col3:
-                if st.button("Delete Message", key=f"del_{msg['id']}_{idx}"):
-                    try:
-                        cli = open_mail_connection(email, password, host, protocol=proto, port=port_val)
-                        if proto == "IMAP":
-                            cli.select(f'"{folder}"', readonly=False)
-                            cli.store(msg["id"], '+FLAGS', '\\Deleted')
-                            cli.expunge()
-                        else:
-                            cli.dele(int(msg["id"]))
-                        close_mail_connection(cli, protocol=proto)
-                        st.success("Deleted message!")
-                        st.rerun()
-                    except Exception as ex:
-                        st.error(str(ex))
+                # Full Body Payload Parser
+                if st.button("📖 Read Full Message Body", key=f"read_body_{selected_folder}_{num_str}"):
+                    raw_body_text = ""
+                    if proto == "IMAP" and "imap_mail" in st.session_state:
+                        mail = st.session_state["imap_mail"]
+                        st_full, full_data = mail.fetch(num_str, "(RFC822)")
+                        if st_full == "OK":
+                            for part in full_data:
+                                if isinstance(part, tuple):
+                                    full_msg = email.message_from_bytes(part[1])
+                                    if full_msg.is_multipart():
+                                        for subpart in full_msg.walk():
+                                            if subpart.get_content_type() == "text/plain":
+                                                payload = subpart.get_payload(decode=True)
+                                                encoding = subpart.get("Content-Transfer-Encoding")
+                                                raw_body_text = decode_payload_content(payload, encoding)
+                                                break
+                                    else:
+                                        payload = full_msg.get_payload(decode=True)
+                                        encoding = full_msg.get("Content-Transfer-Encoding")
+                                        raw_body_text = decode_payload_content(payload, encoding)
 
-            with op_col4:
-                with st.popover("View Raw RFC822"):
-                    st.code(msg["raw"].decode("utf-8", errors="ignore"))
+                    bot_flags = detect_bot_indicators(subject, raw_body_text)
+                    extracted_pins = extract_actionable_pins(raw_body_text)
+                    extracted_links = extract_verification_links(raw_body_text)
+
+                    if bot_flags:
+                        st.markdown("### 🤖 Bot Intelligence Detected")
+                        cols = st.columns(len(bot_flags))
+                        for c_idx, flag in enumerate(bot_flags):
+                            with cols[c_idx]:
+                                st.warning(flag)
+
+                    if extracted_pins:
+                        st.success(f"🔑 Extracted Verification PIN(s): `{', '.join(extracted_pins)}`")
+
+                    if extracted_links:
+                        st.markdown("#### 🔗 Actionable Verification Links")
+                        for l_idx, link in enumerate(extracted_links[:3]):
+                            st.link_button(f"Open Link #{l_idx+1}", link, use_container_width=True)
+
+                    st.markdown("---")
+                    st.markdown("#### 📄 Cleaned Message Body")
+                    st.text_area(
+                        "Parsed Text", raw_body_text, height=220, key=f"body_area_{selected_folder}_{num_str}"
+                    )
+        except Exception as ex:
+            st.error(f"Error loading message `{num}`: {ex}")
