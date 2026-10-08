@@ -6,6 +6,7 @@ import re
 import base64
 import math
 import time
+import socket
 from typing import List, Tuple
 from email.header import decode_header
 from email import message_from_bytes
@@ -234,8 +235,8 @@ def list_folders(mail, email_addr: str = "", host_val: str = ""):
     return display_folders
 
 
-def open_mail(email_addr, password_val, host_val):
-    mail = imaplib.IMAP4_SSL(host_val, 993, timeout=20)
+def open_mail(email_addr, password_val, host_val, timeout=60):
+    mail = imaplib.IMAP4_SSL(host_val, 993, timeout=timeout)
     mail.login(email_addr, password_val)
     return mail
 
@@ -293,8 +294,9 @@ def fetch_messages_paginated(mail, email_addr, password_val, host_val, target_fo
     
     log_func = search_log if is_search_operation else debug_log
     
+    clean_query = search_query.strip()
     log_func(f"⚙️ [ENGINE INIT] Mode: '{mode}' | Target Folders ({len(target_folders)}): {target_folders}")
-    log_func(f"🔎 [SEARCH SPECS] Query: '{search_query}' | Search Field: '{search_field}' | Page: {page_number} | Page Size: {page_size}")
+    log_func(f"🔎 [SEARCH SPECS] Query: '{clean_query}' | Search Field: '{search_field}' | Page: {page_number} | Page Size: {page_size}")
 
     total_matched_all_folders = 0
 
@@ -310,16 +312,16 @@ def fetch_messages_paginated(mail, email_addr, password_val, host_val, target_fo
                 log_func(f"  └─ ⚠️ Skipped folder '{f_label}': Failed to select IMAP path.")
                 continue
 
-            # Execute Search or All Load based on mode
-            if mode == "FOLDER_ONLY" or not search_query.strip():
+            # Clean and sanitize input query (removes trailing/leading whitespace)
+            if mode == "FOLDER_ONLY" or not clean_query:
                 cmd = "SEARCH ALL"
                 log_func(f"  ├─ [EXECUTING COMMAND] {cmd}")
                 typ, data = mail.search(None, "ALL")
             else:
                 field_cmd = search_field if search_field in ("TEXT", "SUBJECT", "FROM", "BODY") else "TEXT"
-                cmd = f'SEARCH {field_cmd} "{search_query.strip()}"'
+                cmd = f'SEARCH {field_cmd} "{clean_query}"'
                 log_func(f"  ├─ [EXECUTING COMMAND] {cmd}")
-                typ, data = mail.search(None, field_cmd, f'"{search_query.strip()}"')
+                typ, data = mail.search(None, field_cmd, f'"{clean_query}"')
 
             log_func(f"  ├─ [IMAP SEARCH RESPONSE] Status: '{typ}' | Raw Bytes: {data}")
             ids = (data[0] or b"").split() if typ == "OK" else []
@@ -396,6 +398,8 @@ def fetch_messages_paginated(mail, email_addr, password_val, host_val, target_fo
                     f"Flags: {flags_str} | BotDetected={is_bot}"
                 )
 
+        except (socket.timeout, TimeoutError):
+            log_func(f"  └─ ❌ [TIMEOUT ERROR] Folder '{f_label}' timed out during IMAP search. Try using 'SUBJECT' or 'FROM' field for large mailboxes.")
         except Exception as ex:
             log_func(f"  └─ ❌ [EXCEPTION ERROR] Querying folder '{f_label}' failed: {ex}")
 
@@ -436,7 +440,7 @@ if st.sidebar.button("🔄 Refresh Inbox", type="secondary", use_container_width
         mail_obj = None
         try:
             with st.spinner("Refreshing Inbox..."):
-                mail_obj = open_mail(email, password, host)
+                mail_obj = open_mail(email, password, host, timeout=60)
                 st.session_state.current_messages = fetch_messages_paginated(
                     mail_obj, email, password, host, ["INBOX"], mode="FOLDER_ONLY", 
                     page_size=15, page_number=1, sort_order="Newest First", is_search_operation=False
@@ -469,7 +473,7 @@ if st.sidebar.button("Connect & Discover Folders", type="primary", use_container
             for host in hosts:
                 mail_obj = None
                 try:
-                    mail_obj = open_mail(email, password, host)
+                    mail_obj = open_mail(email, password, host, timeout=60)
                     folders = list_folders(mail_obj, email_addr=email, host_val=host)
                     close_mail(mail_obj)
                     connected_host = host
@@ -511,7 +515,7 @@ if st.button("📂 Load Folder Messages", type="primary", use_container_width=Tr
         mail = None
         try:
             with st.spinner(f"Loading folder '{folder}'..."):
-                mail = open_mail(email, password, host)
+                mail = open_mail(email, password, host, timeout=60)
                 msgs = fetch_messages_paginated(
                     mail, email, password, host, [folder], mode="FOLDER_ONLY",
                     page_size=page_size, page_number=1, sort_order=sort_order, is_search_operation=False
@@ -527,7 +531,7 @@ if st.button("📂 Load Folder Messages", type="primary", use_container_width=Tr
                 close_mail(mail)
 
 # -----------------------------------------------------------------------------
-# MAIN MESSAGE STREAM (Positioned directly under 📂 Load Folder Messages button)
+# MAIN MESSAGE STREAM
 # -----------------------------------------------------------------------------
 if st.session_state.bot_filter_mode:
     active_msgs = [m for m in st.session_state.current_messages if m["is_bot"]]
@@ -577,7 +581,7 @@ if len(active_msgs) > 0:
                 if not msg["is_read"]:
                     if st.button("Mark as Read", key=f"read_{msg['folder']}_{msg['id']}_{idx}"):
                         try:
-                            m_client = open_mail(email, password, host)
+                            m_client = open_mail(email, password, host, timeout=60)
                             m_client.select(f'"{real_imap_folder}"', readonly=False)
                             m_client.store(msg["id"], '+FLAGS', '\\Seen')
                             close_mail(m_client)
@@ -592,7 +596,7 @@ if len(active_msgs) > 0:
                 if st.button("Move Message", key=f"mv_btn_{msg['folder']}_{msg['id']}_{idx}"):
                     try:
                         real_target_path = get_imap_path(target_move)
-                        m_client = open_mail(email, password, host)
+                        m_client = open_mail(email, password, host, timeout=60)
                         m_client.select(f'"{real_imap_folder}"', readonly=False)
                         m_client.copy(msg["id"], f'"{real_target_path}"')
                         m_client.store(msg["id"], '+FLAGS', '\\Deleted')
@@ -608,7 +612,7 @@ if len(active_msgs) > 0:
                 del_label = "Delete Bot Msg" if msg["is_bot"] else "Delete Message"
                 if st.button(del_label, key=f"del_{msg['folder']}_{msg['id']}_{idx}", type="primary" if msg["is_bot"] else "secondary"):
                     try:
-                        m_client = open_mail(email, password, host)
+                        m_client = open_mail(email, password, host, timeout=60)
                         m_client.select(f'"{real_imap_folder}"', readonly=False)
                         m_client.store(msg["id"], '+FLAGS', '\\Deleted')
                         m_client.expunge()
@@ -631,7 +635,7 @@ if len(active_msgs) > 0:
         if st.button("Previous Page", disabled=(curr_p <= 1), use_container_width=True, key="msg_stream_prev"):
             st.session_state.current_page -= 1
             host = override.strip() or st.session_state.mb_host or (host_list(email)[:1] or [""])[0]
-            mail = open_mail(email, password, host)
+            mail = open_mail(email, password, host, timeout=60)
             st.session_state.current_messages = fetch_messages_paginated(
                 mail, email, password, host, [folder], 
                 mode="FOLDER_ONLY",
@@ -648,7 +652,7 @@ if len(active_msgs) > 0:
         if st.button("Next Page", disabled=(curr_p >= total_pages), use_container_width=True, key="msg_stream_next"):
             st.session_state.current_page += 1
             host = override.strip() or st.session_state.mb_host or (host_list(email)[:1] or [""])[0]
-            mail = open_mail(email, password, host)
+            mail = open_mail(email, password, host, timeout=60)
             st.session_state.current_messages = fetch_messages_paginated(
                 mail, email, password, host, [folder], 
                 mode="FOLDER_ONLY",
@@ -693,8 +697,9 @@ with st.expander("🔍 Deep Keyword Search & Scope Filters", expanded=False):
                     selected_folder_name = search_scope_choice.replace("Folder: ", "")
                     target_scope = [selected_folder_name]
 
-                with st.spinner(f"Scanning target mailboxes ({len(target_scope)} folder/s) for [{search_field_choice}: '{search_query_input}']..."):
-                    mail = open_mail(email, password, host)
+                with st.spinner(f"Scanning target mailboxes ({len(target_scope)} folder/s) for [{search_field_choice}: '{search_query_input.strip()}']..."):
+                    # Pass a longer socket timeout (120s) specifically for heavy IMAP SEARCH queries
+                    mail = open_mail(email, password, host, timeout=120)
                     msgs = fetch_messages_paginated(
                         mail, email, password, host, target_scope, search_query_input, search_field_choice, 
                         mode="SEARCH", page_size=page_size, page_number=1, sort_order=sort_order,
@@ -751,7 +756,7 @@ with st.expander("🔍 Deep Keyword Search & Scope Filters", expanded=False):
                     if not msg["is_read"]:
                         if st.button("Mark as Read", key=f"s_read_{msg['folder']}_{msg['id']}_{idx}"):
                             try:
-                                m_client = open_mail(email, password, host)
+                                m_client = open_mail(email, password, host, timeout=60)
                                 m_client.select(f'"{real_imap_folder}"', readonly=False)
                                 m_client.store(msg["id"], '+FLAGS', '\\Seen')
                                 close_mail(m_client)
@@ -766,7 +771,7 @@ with st.expander("🔍 Deep Keyword Search & Scope Filters", expanded=False):
                     if st.button("Move Message", key=f"s_mv_btn_{msg['folder']}_{msg['id']}_{idx}"):
                         try:
                             real_target_path = get_imap_path(s_target_move)
-                            m_client = open_mail(email, password, host)
+                            m_client = open_mail(email, password, host, timeout=60)
                             m_client.select(f'"{real_imap_folder}"', readonly=False)
                             m_client.copy(msg["id"], f'"{real_target_path}"')
                             m_client.store(msg["id"], '+FLAGS', '\\Deleted')
@@ -782,7 +787,7 @@ with st.expander("🔍 Deep Keyword Search & Scope Filters", expanded=False):
                     s_del_label = "Delete Bot Msg" if msg["is_bot"] else "Delete Message"
                     if st.button(s_del_label, key=f"s_del_{msg['folder']}_{msg['id']}_{idx}", type="primary" if msg["is_bot"] else "secondary"):
                         try:
-                            m_client = open_mail(email, password, host)
+                            m_client = open_mail(email, password, host, timeout=60)
                             m_client.select(f'"{real_imap_folder}"', readonly=False)
                             m_client.store(msg["id"], '+FLAGS', '\\Deleted')
                             m_client.expunge()
@@ -805,7 +810,7 @@ with st.expander("🔍 Deep Keyword Search & Scope Filters", expanded=False):
             if st.button("Previous Page", disabled=(search_curr_p <= 1), use_container_width=True, key="s_prev_pg"):
                 st.session_state.search_current_page -= 1
                 host = override.strip() or st.session_state.mb_host or (host_list(email)[:1] or [""])[0]
-                mail = open_mail(email, password, host)
+                mail = open_mail(email, password, host, timeout=120)
                 if search_scope_choice == "ALL_FOLDERS":
                     target_scope = st.session_state.mb_folders
                 elif search_scope_choice == "Current Folder":
@@ -827,7 +832,7 @@ with st.expander("🔍 Deep Keyword Search & Scope Filters", expanded=False):
             if st.button("Next Page", disabled=(search_curr_p >= search_total_pages), use_container_width=True, key="s_next_pg"):
                 st.session_state.search_current_page += 1
                 host = override.strip() or st.session_state.mb_host or (host_list(email)[:1] or [""])[0]
-                mail = open_mail(email, password, host)
+                mail = open_mail(email, password, host, timeout=120)
                 if search_scope_choice == "ALL_FOLDERS":
                     target_scope = st.session_state.mb_folders
                 elif search_scope_choice == "Current Folder":
@@ -880,7 +885,7 @@ with st.expander("🤖 Mass Bot Purge & Intelligence Hub", expanded=False):
                 try:
                     target_scope = st.session_state.mb_folders if bot_target_folder == "ALL_FOLDERS" else [bot_target_folder]
                     with st.spinner("Scanning target folders for bot intelligence..."):
-                        mail = open_mail(email, password, host)
+                        mail = open_mail(email, password, host, timeout=60)
                         msgs = fetch_messages_paginated(
                             mail, email, password, host, target_scope, mode="FOLDER_ONLY",
                             page_size=bot_scan_limit, page_number=1, sort_order="Newest First",
@@ -906,7 +911,7 @@ with st.expander("🤖 Mass Bot Purge & Intelligence Hub", expanded=False):
                 try:
                     bot_log("🤖 [BOT ENGINE DIAGNOSTIC START] Initializing Mass Deletion Sequence...")
                     bot_log(f"📋 Targets Count: {len(all_loaded_bot_msgs)} detected bot messages")
-                    mail = open_mail(email, password, host)
+                    mail = open_mail(email, password, host, timeout=60)
                     deleted_count = 0
                     
                     for idx, bm in enumerate(all_loaded_bot_msgs, 1):
