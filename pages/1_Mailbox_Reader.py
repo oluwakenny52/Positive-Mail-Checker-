@@ -99,20 +99,9 @@ def get_webmail_portal(email):
     return portals.get(domain, f"https://www.{domain}")
 
 
-# Automated & Exhaustive Folder Discovery Engine
+# Folder Discovery Engine (from top reference code)
 def list_folders(mail):
-    found = set(["INBOX"])
-    # Standard exhaustive dictionary brute-force list & Webmail-specific folders
-    common_folders = [
-        "INBOX", "Sent", "Sent Items", "Sent Messages", "Trash", "Deleted Items",
-        "Junk", "Spam", "Junk E-mail", "Archive", "Archives", "Drafts",
-        "Notes", "Important", "Starred", "All Mail", "Bin"
-    ]
-    for cf in common_folders:
-        found.add(cf)
-        found.add(cf.upper())
-        found.add(cf.lower())
-
+    found = set()
     try:
         typ, data = mail.list('""', "*")
         if typ == "OK" and data:
@@ -127,7 +116,9 @@ def list_folders(mail):
                     found.add(name)
     except Exception:
         pass
-    return sorted(list(found), key=lambda x: (0 if x.lower() == "inbox" else 1, x.lower()))
+    if not found:
+        found.add("INBOX")
+    return sorted(found, key=lambda x: (0 if x.lower() == "inbox" else 1, x.lower()))
 
 
 def open_mail(email, password, host):
@@ -146,6 +137,23 @@ def close_mail(mail):
             pass
 
 
+def connect_first(email, password, override):
+    hosts = [override] if override else host_list(email)
+    last = "no host"
+    for host in hosts:
+        mail = None
+        try:
+            mail = open_mail(email, password, host)
+            folders = list_folders(mail)
+            close_mail(mail)
+            return host, folders, None
+        except Exception as e:
+            last = f"{host}: {e}"
+            if mail:
+                close_mail(mail)
+    return "", ["INBOX"], last
+
+
 # Bot Intelligence & Detection Engine
 def is_bot_message(subject, body):
     bot_keywords = [
@@ -158,11 +166,8 @@ def is_bot_message(subject, body):
 
 # Actionable PIN & Link Extractor
 def extract_pins_and_links(text):
-    # Match 4 to 8 digit verification codes/PINs
     pins = re.findall(r'\b(?<![#\d])\d{4,8}(?![#\d])\b', text)
-    # Match verification or HTTP/HTTPS URLs
     urls = re.findall(r'https?://[^\s<>"]+|www\.[^\s<>"]+', text)
-    # Filter out common noise URLs
     cleaned_urls = [u for u in urls if not any(x in u.lower() for x in ["w3.org", "schema.org", "apple.com/DTDs"])]
     return list(dict.fromkeys(pins)), list(dict.fromkeys(cleaned_urls))
 
@@ -205,47 +210,28 @@ else:
 
 st.sidebar.write("**Host order:** " + ", ".join(host_list(email)[:4]) if email else "-")
 
-# Webmail Portal & Combo Hub
+# Webmail Portal & Combo Hub (Instantly displays credentials on selection)
 if email and password:
     st.sidebar.markdown("---")
     st.sidebar.subheader("🌐 Webmail Portal & Credentials")
     portal_url = get_webmail_portal(email)
     st.sidebar.markdown(f"[Open Webmail Portal]({portal_url})", unsafe_allow_html=True)
-    st.sidebar.text_input("Copy Credentials (email:password)", value=f"{email}:{password}", key="cred_copy")
+    st.sidebar.text_input("Copy Credentials (email:password)", value=f"{email}:{password}", key="cred_copy_instant")
 
 if st.sidebar.button("Connect & Discover Folders", type="primary"):
     if not email or not password:
         st.error("Need email and password")
     else:
-        hosts = [override.strip()] if override.strip() else host_list(email)
-        last = "no host"
-        connected_host = ""
-        folders = ["INBOX"]
-        success = False
-        
-        with st.spinner("Connecting and running exhaustive folder crawl..."):
-            for host in hosts:
-                mail_obj = None
-                try:
-                    mail_obj = open_mail(email, password, host)
-                    folders = list_folders(mail_obj)
-                    close_mail(mail_obj)
-                    connected_host = host
-                    success = True
-                    break
-                except Exception as e:
-                    last = f"{host}: {e}"
-                    if mail_obj:
-                        close_mail(mail_obj)
-        
-        if success:
-            st.session_state.mb_host = connected_host
-            st.session_state.mb_folders = folders
-            log(f"Discovered {len(folders)} folders via {connected_host}")
-            st.sidebar.success(f"Connected: {connected_host} ({len(folders)} folders)")
+        with st.spinner("Connecting..."):
+            host, folders, err = connect_first(email, password, override.strip())
+        if err:
+            st.error(err)
+            log(err)
         else:
-            st.sidebar.error(last)
-            log(last)
+            st.session_state.mb_host = host
+            st.session_state.mb_folders = folders
+            log(f"folders {len(folders)} via {host}")
+            st.sidebar.success(f"{host} · {len(folders)} folders")
 
 # Live Action Log & Export Tools in Sidebar
 st.sidebar.markdown("---")
@@ -429,7 +415,6 @@ if "current_messages" in st.session_state and st.session_state.current_messages:
                     try:
                         m_client = open_mail(email, password, host)
                         m_client.select(f'"{folder}"', readonly=False)
-                        # Copy to target and flag deleted in current
                         m_client.copy(msg["id"], f'"{target_move}"')
                         m_client.store(msg["id"], '+FLAGS', '\\Deleted')
                         m_client.expunge()
