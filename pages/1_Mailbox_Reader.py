@@ -41,6 +41,8 @@ if "mb_host" not in st.session_state:
     st.session_state.mb_host = ""
 if "current_page" not in st.session_state:
     st.session_state.current_page = 1
+if "search_current_page" not in st.session_state:
+    st.session_state.search_current_page = 1
 if "folder_debug_logs" not in st.session_state:
     st.session_state.folder_debug_logs = []
 if "bot_diag_logs" not in st.session_state:
@@ -49,8 +51,12 @@ if "search_diag_logs" not in st.session_state:
     st.session_state.search_diag_logs = []
 if "current_messages" not in st.session_state:
     st.session_state.current_messages = []
+if "search_messages" not in st.session_state:
+    st.session_state.search_messages = []
 if "total_matched_count" not in st.session_state:
     st.session_state.total_matched_count = 0
+if "search_total_matched_count" not in st.session_state:
+    st.session_state.search_total_matched_count = 0
 if "bot_filter_mode" not in st.session_state:
     st.session_state.bot_filter_mode = False
 
@@ -278,45 +284,48 @@ def clean_boilerplate(text):
 
 def fetch_messages_paginated(mail, email_addr, password_val, host_val, target_folders: List[str], 
                             search_query: str = "", search_field: str = "TEXT", mode: str = "SEARCH", 
-                            page_size: int = 15, page_number: int = 1, sort_order: str = "Newest First"):
-    st.session_state.search_diag_logs = []
+                            page_size: int = 15, page_number: int = 1, sort_order: str = "Newest First",
+                            is_search_operation: bool = False):
+    if is_search_operation:
+        st.session_state.search_diag_logs = []
     messages = []
     start_time = time.time()
     
-    search_log(f"⚙️ [ENGINE INIT] Mode: '{mode}' | Target Folders ({len(target_folders)}): {target_folders}")
-    search_log(f"🔎 [SEARCH SPECS] Query: '{search_query}' | Search Field: '{search_field}' | Page: {page_number} | Page Size: {page_size}")
+    log_func = search_log if is_search_operation else debug_log
+    
+    log_func(f"⚙️ [ENGINE INIT] Mode: '{mode}' | Target Folders ({len(target_folders)}): {target_folders}")
+    log_func(f"🔎 [SEARCH SPECS] Query: '{search_query}' | Search Field: '{search_field}' | Page: {page_number} | Page Size: {page_size}")
 
     total_matched_all_folders = 0
 
     for f_label in target_folders:
         real_imap_folder = get_imap_path(f_label)
-        search_log(f"\n📂 [PROCESSING FOLDER] Label='{f_label}' -> IMAP Path='{real_imap_folder}'")
+        log_func(f"\n📂 [PROCESSING FOLDER] Label='{f_label}' -> IMAP Path='{real_imap_folder}'")
         
         try:
             sel_typ, sel_data = mail.select(f'"{real_imap_folder}"', readonly=True)
-            search_log(f"  ├─ [IMAP SELECT] Status: '{sel_typ}' | Response: {sel_data}")
+            log_func(f"  ├─ [IMAP SELECT] Status: '{sel_typ}' | Response: {sel_data}")
             
             if sel_typ != "OK":
-                search_log(f"  └─ ⚠️ Skipped folder '{f_label}': Failed to select IMAP path.")
+                log_func(f"  └─ ⚠️ Skipped folder '{f_label}': Failed to select IMAP path.")
                 continue
 
             # Execute Search or All Load based on mode
             if mode == "FOLDER_ONLY" or not search_query.strip():
                 cmd = "SEARCH ALL"
-                search_log(f"  ├─ [EXECUTING COMMAND] {cmd}")
+                log_func(f"  ├─ [EXECUTING COMMAND] {cmd}")
                 typ, data = mail.search(None, "ALL")
             else:
                 field_cmd = search_field if search_field in ("TEXT", "SUBJECT", "FROM", "BODY") else "TEXT"
                 cmd = f'SEARCH {field_cmd} "{search_query.strip()}"'
-                search_log(f"  ├─ [EXECUTING COMMAND] {cmd}")
+                log_func(f"  ├─ [EXECUTING COMMAND] {cmd}")
                 typ, data = mail.search(None, field_cmd, f'"{search_query.strip()}"')
 
-            search_log(f"  ├─ [IMAP SEARCH RESPONSE] Status: '{typ}' | Raw Bytes: {data}")
+            log_func(f"  ├─ [IMAP SEARCH RESPONSE] Status: '{typ}' | Raw Bytes: {data}")
             ids = (data[0] or b"").split() if typ == "OK" else []
             total_matched_all_folders += len(ids)
-            search_log(f"  ├─ [MATCHES COUNT] Found {len(ids)} message IDs in '{f_label}'.")
+            log_func(f"  ├─ [MATCHES COUNT] Found {len(ids)} message IDs in '{f_label}'.")
 
-            # Slice Message IDs before fetching to eliminate parsing lag
             if sort_order == "Newest First":
                 ids = list(reversed(ids))
 
@@ -324,7 +333,7 @@ def fetch_messages_paginated(mail, email_addr, password_val, host_val, target_fo
             end_idx = start_idx + page_size
             target_ids = ids[start_idx:end_idx]
 
-            search_log(f"  ├─ [PAGINATION RANGE] Total IDs: {len(ids)} | Fetching range index [{start_idx}:{end_idx}] -> {len(target_ids)} target IDs")
+            log_func(f"  ├─ [PAGINATION RANGE] Total IDs: {len(ids)} | Fetching range index [{start_idx}:{end_idx}] -> {len(target_ids)} target IDs")
 
             for idx, mid in enumerate(target_ids, 1):
                 msg_start = time.time()
@@ -332,7 +341,7 @@ def fetch_messages_paginated(mail, email_addr, password_val, host_val, target_fo
                 typ, msgdata = mail.fetch(mid, "(FLAGS ENVELOPE BODYSTRUCTURE BODY.PEEK[])")
                 
                 if not msgdata or not isinstance(msgdata[0], tuple):
-                    search_log(f"  │   ├─ [Msg ID #{mid.decode()}] ⚠️ FETCH returned empty structure.")
+                    log_func(f"  │   ├─ [Msg ID #{mid.decode()}] ⚠️ FETCH returned empty structure.")
                     continue
 
                 raw_msg_bytes = msgdata[0][1]
@@ -381,18 +390,22 @@ def fetch_messages_paginated(mail, email_addr, password_val, host_val, target_fo
                 })
                 
                 fetch_elapsed = round((time.time() - msg_start) * 1000, 2)
-                search_log(
+                log_func(
                     f"  │   ├─ [Msg #{idx} | ID: {mid.decode()}] Parsed in {fetch_elapsed}ms | Size: {len(raw_msg_bytes)}B | "
                     f"From: '{frm}' | To: '{to_hdr}' | Subject: '{subject}' | "
                     f"Flags: {flags_str} | BotDetected={is_bot}"
                 )
 
         except Exception as ex:
-            search_log(f"  └─ ❌ [EXCEPTION ERROR] Querying folder '{f_label}' failed: {ex}")
+            log_func(f"  └─ ❌ [EXCEPTION ERROR] Querying folder '{f_label}' failed: {ex}")
 
     total_elapsed = round(time.time() - start_time, 2)
-    st.session_state.total_matched_count = total_matched_all_folders
-    search_log(f"\n🏁 [ENGINE COMPLETE] Total retrieved page messages: {len(messages)} / {total_matched_all_folders} matched | Execution time: {total_elapsed}s")
+    if is_search_operation:
+        st.session_state.search_total_matched_count = total_matched_all_folders
+    else:
+        st.session_state.total_matched_count = total_matched_all_folders
+
+    log_func(f"\n🏁 [ENGINE COMPLETE] Total retrieved page messages: {len(messages)} / {total_matched_all_folders} matched | Execution time: {total_elapsed}s")
     return messages
 
 
@@ -426,7 +439,7 @@ if st.sidebar.button("🔄 Refresh Inbox", type="secondary", use_container_width
                 mail_obj = open_mail(email, password, host)
                 st.session_state.current_messages = fetch_messages_paginated(
                     mail_obj, email, password, host, ["INBOX"], mode="FOLDER_ONLY", 
-                    page_size=15, page_number=1, sort_order="Newest First"
+                    page_size=15, page_number=1, sort_order="Newest First", is_search_operation=False
                 )
                 close_mail(mail_obj)
                 st.session_state.current_page = 1
@@ -475,7 +488,7 @@ if st.sidebar.button("Connect & Discover Folders", type="primary", use_container
         else:
             st.sidebar.error(last)
 
-# Debug Expander for Discovery
+# Debug Expander for Discovery (Collapsed by default)
 if st.session_state.folder_debug_logs:
     with st.expander("🛠️ Folder Discovery Diagnostic Traces", expanded=False):
         st.code("\n".join(st.session_state.folder_debug_logs), language="text")
@@ -501,7 +514,7 @@ if st.button("📂 Load Folder Messages", type="primary", use_container_width=Tr
                 mail = open_mail(email, password, host)
                 msgs = fetch_messages_paginated(
                     mail, email, password, host, [folder], mode="FOLDER_ONLY",
-                    page_size=page_size, page_number=1, sort_order=sort_order
+                    page_size=page_size, page_number=1, sort_order=sort_order, is_search_operation=False
                 )
                 st.session_state.current_messages = msgs
                 st.session_state.current_page = 1
@@ -513,149 +526,8 @@ if st.button("📂 Load Folder Messages", type="primary", use_container_width=Tr
             if mail:
                 close_mail(mail)
 
-# Deep Search and Scope Filters Block
-with st.expander("🔍 Deep Keyword Search & Scope Filters", expanded=True):
-    s_col1, s_col2 = st.columns([1, 1])
-    with s_col1:
-        search_scope = st.selectbox("Search Scope", ["Current Folder", "ALL_FOLDERS"])
-    with s_col2:
-        search_field = st.selectbox("Search Field Option", ["TEXT", "SUBJECT", "FROM", "BODY"])
-    
-    search_query = st.text_input("Search term or keyword")
-    
-    if st.button("🔍 Execute Keyword Search", use_container_width=True):
-        host = override.strip() or st.session_state.mb_host or (host_list(email)[:1] or [""])[0]
-        if not email or not password or not host:
-            st.error("Please connect and load folders first.")
-        else:
-            mail = None
-            try:
-                target_scope = st.session_state.mb_folders if search_scope == "ALL_FOLDERS" else [folder]
-                with st.spinner(f"Scanning target mailboxes ({len(target_scope)} folder/s) for [{search_field}: '{search_query}']..."):
-                    mail = open_mail(email, password, host)
-                    msgs = fetch_messages_paginated(
-                        mail, email, password, host, target_scope, search_query, search_field, mode="SEARCH",
-                        page_size=page_size, page_number=1, sort_order=sort_order
-                    )
-                    st.session_state.current_messages = msgs
-                    st.session_state.current_page = 1
-                    st.session_state.bot_filter_mode = False
-                    log(f"Search found {st.session_state.total_matched_count} total matches across target scope.")
-            except Exception as e:
-                st.error(str(e))
-            finally:
-                if mail:
-                    close_mail(mail)
-
-# Diagnostic Logs Expander
-if st.session_state.search_diag_logs:
-    with st.expander("🛠️ Screen Log & Deep Diagnostic Traces", expanded=True):
-        st.code("\n".join(st.session_state.search_diag_logs), language="text")
-
 # -----------------------------------------------------------------------------
-# SEPARATE DEDICATED MASS BOT DELETE & DIAGNOSTIC SECTION
-# -----------------------------------------------------------------------------
-st.markdown("---")
-with st.expander("🤖 Mass Bot Purge & Intelligence Hub", expanded=True):
-    all_loaded_bot_msgs = [m for m in st.session_state.current_messages if m["is_bot"]]
-    
-    bot_col1, bot_col2 = st.columns([2, 1])
-    with bot_col1:
-        bot_target_folder = st.selectbox(
-            "Select Bot Target Scope", 
-            ["ALL_FOLDERS"] + st.session_state.mb_folders, 
-            key="bot_hub_folder_select"
-        )
-    with bot_col2:
-        bot_scan_limit = st.selectbox("Bot Scan Depth", [50, 100, 200, 500], index=1)
-
-    b_act1, b_act2 = st.columns(2)
-    with b_act1:
-        if st.button("🔍 Scan Folder For Bot/OTP Messages", use_container_width=True):
-            host = override.strip() or st.session_state.mb_host or (host_list(email)[:1] or [""])[0]
-            if not email or not password or not host:
-                st.error("Please connect first.")
-            else:
-                mail = None
-                try:
-                    target_scope = st.session_state.mb_folders if bot_target_folder == "ALL_FOLDERS" else [bot_target_folder]
-                    with st.spinner("Scanning target folders for bot intelligence..."):
-                        mail = open_mail(email, password, host)
-                        msgs = fetch_messages_paginated(
-                            mail, email, password, host, target_scope, mode="FOLDER_ONLY",
-                            page_size=bot_scan_limit, page_number=1, sort_order="Newest First"
-                        )
-                        st.session_state.current_messages = msgs
-                        st.session_state.bot_filter_mode = True
-                        st.success(f"Scan complete. Displaying detected bot messages.")
-                except Exception as ex:
-                    st.error(str(ex))
-                finally:
-                    if mail:
-                        close_mail(mail)
-
-    with b_act2:
-        if st.button("🚨 Mass Delete All Detected Bot Messages", type="primary", use_container_width=True):
-            if not all_loaded_bot_msgs:
-                st.warning("No bot messages detected in current loaded stream to delete.")
-            else:
-                st.session_state.bot_diag_logs = []
-                host = override.strip() or st.session_state.mb_host or (host_list(email)[:1] or [""])[0]
-                mail = None
-                try:
-                    bot_log("🤖 [BOT ENGINE DIAGNOSTIC START] Initializing Mass Deletion Sequence...")
-                    bot_log(f"📋 Targets Count: {len(all_loaded_bot_msgs)} detected bot messages")
-                    mail = open_mail(email, password, host)
-                    deleted_count = 0
-                    
-                    for idx, bm in enumerate(all_loaded_bot_msgs, 1):
-                        r_folder = get_imap_path(bm["folder"])
-                        bot_log(f"  ├─ [Msg #{idx}] ID={bm['id']} | Folder='{bm['folder']}' ({r_folder}) | From='{bm['from']}' | Subject='{bm['subject']}'")
-                        sel_code, sel_res = mail.select(f'"{r_folder}"', readonly=False)
-                        bot_log(f"  │   ├─ IMAP SELECT: Status={sel_code} | Res={sel_res}")
-                        
-                        st_code, st_res = mail.store(bm["id"], '+FLAGS', '\\Deleted')
-                        bot_log(f"  │   ├─ STORE FLAGS: Status={st_code} | Res={st_res}")
-                        
-                        exp_code, exp_res = mail.expunge()
-                        bot_log(f"  │   ├─ EXPUNGE: Status={exp_code} | Res={exp_res}")
-                        
-                        deleted_count += 1
-                        bot_log(f"  │   └─ ✅ EXPOSED & PURGED from IMAP target")
-
-                    bot_log(f"\n🏁 [MASS DELETE COMPLETE] Successfully purged {deleted_count} bot messages from server.")
-                    st.success(f"Successfully deleted {deleted_count} bot messages!")
-                    
-                    # Refresh local state
-                    st.session_state.current_messages = [m for m in st.session_state.current_messages if not m["is_bot"]]
-                    st.session_state.bot_filter_mode = False
-                    st.rerun()
-                except Exception as e:
-                    bot_log(f"❌ [MASS DELETE EXCEPTION]: {e}")
-                    st.error(f"Error during mass delete: {e}")
-                finally:
-                    if mail:
-                        close_mail(mail)
-
-    # Bot Messages Dedicated Preview Screen
-    st.markdown("#### 📱 Detected Bot Message Preview Screen")
-    if all_loaded_bot_msgs:
-        for idx, bm in enumerate(all_loaded_bot_msgs, 1):
-            st.markdown(f"**[{idx}] [{bm['folder']}]** `{bm['from']}` — **{bm['subject']}** (ID: `{bm['id']}`) ")
-            if bm["pins"]:
-                st.info(f"🔑 PINs detected: {', '.join(bm['pins'])}")
-    else:
-        st.caption("No bot messages currently loaded in session memory.")
-
-    # Dedicated Bot Diagnostic & Log Screen
-    st.markdown("#### 🛠️ Mass Bot Delete Diagnostic & Diagnose Log Screen")
-    if st.session_state.bot_diag_logs:
-        st.code("\n".join(st.session_state.bot_diag_logs), language="text")
-    else:
-        st.caption("Bot engine traces will be printed here during purge operations.")
-
-# -----------------------------------------------------------------------------
-# MAIN MESSAGE STREAM
+# MAIN MESSAGE STREAM (Positioned directly under 📂 Load Folder Messages button)
 # -----------------------------------------------------------------------------
 if st.session_state.bot_filter_mode:
     active_msgs = [m for m in st.session_state.current_messages if m["is_bot"]]
@@ -668,21 +540,18 @@ total_msgs = st.session_state.total_matched_count or len(active_msgs)
 if len(active_msgs) > 0:
     st.markdown("---")
     
-    # Calculate Pagination Parameters
     total_pages = max(1, math.ceil(total_msgs / page_size))
     curr_p = st.session_state.current_page
     
-    # Display Indicator Header
     st.markdown("### ✉️ Message Stream")
     st.markdown(f"**Showing Page {curr_p} of {total_pages} (Total Server Matches: {total_msgs})**")
 
-    # Render Messages Page
     for idx, msg in enumerate(active_msgs):
         status_icon = "📖" if msg["is_read"] else "📩"
         bot_badge = " [🤖 BOT/OTP/SPAM]" if msg["is_bot"] else ""
         folder_badge = f" [{msg['folder']}]"
 
-        with st.expander(f"{status_icon}{folder_badge} [{msg['date']}] {msg['from']} - {msg['subject']}{bot_badge}"):
+        with st.expander(f"{status_icon}{folder_badge} [{msg['date']}] {msg['from']} - {msg['subject']}{bot_badge}", expanded=False):
             st.write(f"**Folder:** {msg['folder']}")
             st.write(f"**From:** {msg['from']}")
             st.write(f"**To:** {msg['to']}")
@@ -700,7 +569,6 @@ if len(active_msgs) > 0:
             st.markdown("---")
             st.text_area("Cleaned Message Body", value=msg["body"], height=150, key=f"body_{msg['folder']}_{msg['id']}_{idx}")
 
-            # Per-Message Interactive Operations
             op_col1, op_col2, op_col3, op_col4 = st.columns(4)
             host = override.strip() or st.session_state.mb_host or (host_list(email)[:1] or [""])[0]
             real_imap_folder = get_imap_path(msg['folder'])
@@ -760,15 +628,15 @@ if len(active_msgs) > 0:
     p_col1, p_col2, p_col3 = st.columns([1, 2, 1])
 
     with p_col1:
-        if st.button("Previous Page", disabled=(curr_p <= 1), use_container_width=True):
+        if st.button("Previous Page", disabled=(curr_p <= 1), use_container_width=True, key="msg_stream_prev"):
             st.session_state.current_page -= 1
             host = override.strip() or st.session_state.mb_host or (host_list(email)[:1] or [""])[0]
             mail = open_mail(email, password, host)
-            target_scope = st.session_state.mb_folders if search_scope == "ALL_FOLDERS" else [folder]
             st.session_state.current_messages = fetch_messages_paginated(
-                mail, email, password, host, target_scope, search_query, search_field, 
-                mode="SEARCH" if search_query else "FOLDER_ONLY",
-                page_size=page_size, page_number=st.session_state.current_page, sort_order=sort_order
+                mail, email, password, host, [folder], 
+                mode="FOLDER_ONLY",
+                page_size=page_size, page_number=st.session_state.current_page, sort_order=sort_order,
+                is_search_operation=False
             )
             close_mail(mail)
             st.rerun()
@@ -777,15 +645,309 @@ if len(active_msgs) > 0:
         st.markdown(f"<h4 style='text-align: center; margin: 0;'>Page {curr_p} of {total_pages}</h4>", unsafe_allow_html=True)
 
     with p_col3:
-        if st.button("Next Page", disabled=(curr_p >= total_pages), use_container_width=True):
+        if st.button("Next Page", disabled=(curr_p >= total_pages), use_container_width=True, key="msg_stream_next"):
             st.session_state.current_page += 1
             host = override.strip() or st.session_state.mb_host or (host_list(email)[:1] or [""])[0]
             mail = open_mail(email, password, host)
-            target_scope = st.session_state.mb_folders if search_scope == "ALL_FOLDERS" else [folder]
             st.session_state.current_messages = fetch_messages_paginated(
-                mail, email, password, host, target_scope, search_query, search_field, 
-                mode="SEARCH" if search_query else "FOLDER_ONLY",
-                page_size=page_size, page_number=st.session_state.current_page, sort_order=sort_order
+                mail, email, password, host, [folder], 
+                mode="FOLDER_ONLY",
+                page_size=page_size, page_number=st.session_state.current_page, sort_order=sort_order,
+                is_search_operation=False
             )
             close_mail(mail)
             st.rerun()
+
+# -----------------------------------------------------------------------------
+# SEPARATE STANDALONE DEEP KEYWORD SEARCH & SCOPE FILTERS
+# -----------------------------------------------------------------------------
+st.markdown("---")
+with st.expander("🔍 Deep Keyword Search & Scope Filters", expanded=False):
+    s_col1, s_col2 = st.columns([1, 1])
+    
+    # Scope Options: Current Folder, ALL_FOLDERS, or specific selectable folder
+    search_scope_options = ["Current Folder", "ALL_FOLDERS"] + [f"Folder: {f}" for f in st.session_state.mb_folders]
+    
+    with s_col1:
+        search_scope_choice = st.selectbox("Search Scope Option", search_scope_options, key="deep_search_scope")
+    with s_col2:
+        search_field_choice = st.selectbox("Search Field Option", ["TEXT", "SUBJECT", "FROM", "BODY"], key="deep_search_field")
+    
+    search_query_input = st.text_input("Search term or keyword", key="deep_search_query")
+    
+    if st.button("🔍 Execute Keyword Search", type="primary", use_container_width=True, key="deep_search_btn"):
+        host = override.strip() or st.session_state.mb_host or (host_list(email)[:1] or [""])[0]
+        if not email or not password or not host:
+            st.error("Please connect and load folders first.")
+        elif not search_query_input.strip():
+            st.warning("Please enter a keyword or search term.")
+        else:
+            mail = None
+            try:
+                # Determine Scope
+                if search_scope_choice == "ALL_FOLDERS":
+                    target_scope = st.session_state.mb_folders
+                elif search_scope_choice == "Current Folder":
+                    target_scope = [folder]
+                else:
+                    selected_folder_name = search_scope_choice.replace("Folder: ", "")
+                    target_scope = [selected_folder_name]
+
+                with st.spinner(f"Scanning target mailboxes ({len(target_scope)} folder/s) for [{search_field_choice}: '{search_query_input}']..."):
+                    mail = open_mail(email, password, host)
+                    msgs = fetch_messages_paginated(
+                        mail, email, password, host, target_scope, search_query_input, search_field_choice, 
+                        mode="SEARCH", page_size=page_size, page_number=1, sort_order=sort_order,
+                        is_search_operation=True
+                    )
+                    st.session_state.search_messages = msgs
+                    st.session_state.search_current_page = 1
+                    log(f"Search found {st.session_state.search_total_matched_count} total matches across target scope.")
+            except Exception as e:
+                st.error(str(e))
+            finally:
+                if mail:
+                    close_mail(mail)
+
+    # Separate Search Message Stream
+    st.markdown("#### ✉️ Search Results Message Stream")
+    search_msgs = st.session_state.search_messages
+    search_total_msgs = st.session_state.search_total_matched_count or len(search_msgs)
+
+    if len(search_msgs) > 0:
+        search_total_pages = max(1, math.ceil(search_total_msgs / page_size))
+        search_curr_p = st.session_state.search_current_page
+        
+        st.markdown(f"**Showing Page {search_curr_p} of {search_total_pages} (Total Matches Found: {search_total_msgs})**")
+
+        for idx, msg in enumerate(search_msgs):
+            status_icon = "📖" if msg["is_read"] else "📩"
+            bot_badge = " [🤖 BOT/OTP/SPAM]" if msg["is_bot"] else ""
+            folder_badge = f" [{msg['folder']}]"
+
+            with st.expander(f"{status_icon}{folder_badge} [{msg['date']}] {msg['from']} - {msg['subject']}{bot_badge}", expanded=False):
+                st.write(f"**Folder:** {msg['folder']}")
+                st.write(f"**From:** {msg['from']}")
+                st.write(f"**To:** {msg['to']}")
+                st.write(f"**Subject:** {msg['subject']}")
+                st.write(f"**Date:** {msg['date']}")
+                st.write(f"**IMAP Message ID:** {msg['id']} | **Size:** {msg['size_bytes']} bytes")
+
+                if msg["pins"]:
+                    st.success(f"🔑 **Extracted PINs / Verification Codes:** {', '.join(msg['pins'])}")
+                if msg["links"]:
+                    st.markdown("🔗 **Actionable Verification Links:**")
+                    for link in msg["links"]:
+                        st.markdown(f"- [{link}]({link})", unsafe_allow_html=True)
+
+                st.markdown("---")
+                st.text_area("Cleaned Message Body", value=msg["body"], height=150, key=f"s_body_{msg['folder']}_{msg['id']}_{idx}")
+
+                s_op1, s_op2, s_op3, s_op4 = st.columns(4)
+                host = override.strip() or st.session_state.mb_host or (host_list(email)[:1] or [""])[0]
+                real_imap_folder = get_imap_path(msg['folder'])
+
+                with s_op1:
+                    if not msg["is_read"]:
+                        if st.button("Mark as Read", key=f"s_read_{msg['folder']}_{msg['id']}_{idx}"):
+                            try:
+                                m_client = open_mail(email, password, host)
+                                m_client.select(f'"{real_imap_folder}"', readonly=False)
+                                m_client.store(msg["id"], '+FLAGS', '\\Seen')
+                                close_mail(m_client)
+                                msg["is_read"] = True
+                                st.success("Marked as read!")
+                                st.rerun()
+                            except Exception as ex:
+                                st.error(str(ex))
+
+                with s_op2:
+                    s_target_move = st.selectbox("Move to", st.session_state.mb_folders, key=f"s_mv_sel_{msg['folder']}_{msg['id']}_{idx}")
+                    if st.button("Move Message", key=f"s_mv_btn_{msg['folder']}_{msg['id']}_{idx}"):
+                        try:
+                            real_target_path = get_imap_path(s_target_move)
+                            m_client = open_mail(email, password, host)
+                            m_client.select(f'"{real_imap_folder}"', readonly=False)
+                            m_client.copy(msg["id"], f'"{real_target_path}"')
+                            m_client.store(msg["id"], '+FLAGS', '\\Deleted')
+                            m_client.expunge()
+                            close_mail(m_client)
+                            st.session_state.search_messages.remove(msg)
+                            st.success(f"Moved to {s_target_move}!")
+                            st.rerun()
+                        except Exception as ex:
+                            st.error(str(ex))
+
+                with s_op3:
+                    s_del_label = "Delete Bot Msg" if msg["is_bot"] else "Delete Message"
+                    if st.button(s_del_label, key=f"s_del_{msg['folder']}_{msg['id']}_{idx}", type="primary" if msg["is_bot"] else "secondary"):
+                        try:
+                            m_client = open_mail(email, password, host)
+                            m_client.select(f'"{real_imap_folder}"', readonly=False)
+                            m_client.store(msg["id"], '+FLAGS', '\\Deleted')
+                            m_client.expunge()
+                            close_mail(m_client)
+                            st.session_state.search_messages.remove(msg)
+                            st.success("Deleted message!")
+                            st.rerun()
+                        except Exception as ex:
+                            st.error(str(ex))
+
+                with s_op4:
+                    with st.popover("View Raw RFC822"):
+                        st.code(msg["raw"].decode("utf-8", errors="ignore"))
+
+        # Search Pagination Controls
+        st.markdown("---")
+        sp_col1, sp_col2, sp_col3 = st.columns([1, 2, 1])
+
+        with sp_col1:
+            if st.button("Previous Page", disabled=(search_curr_p <= 1), use_container_width=True, key="s_prev_pg"):
+                st.session_state.search_current_page -= 1
+                host = override.strip() or st.session_state.mb_host or (host_list(email)[:1] or [""])[0]
+                mail = open_mail(email, password, host)
+                if search_scope_choice == "ALL_FOLDERS":
+                    target_scope = st.session_state.mb_folders
+                elif search_scope_choice == "Current Folder":
+                    target_scope = [folder]
+                else:
+                    target_scope = [search_scope_choice.replace("Folder: ", "")]
+                st.session_state.search_messages = fetch_messages_paginated(
+                    mail, email, password, host, target_scope, search_query_input, search_field_choice, 
+                    mode="SEARCH", page_size=page_size, page_number=st.session_state.search_current_page, 
+                    sort_order=sort_order, is_search_operation=True
+                )
+                close_mail(mail)
+                st.rerun()
+
+        with sp_col2:
+            st.markdown(f"<h4 style='text-align: center; margin: 0;'>Page {search_curr_p} of {search_total_pages}</h4>", unsafe_allow_html=True)
+
+        with sp_col3:
+            if st.button("Next Page", disabled=(search_curr_p >= search_total_pages), use_container_width=True, key="s_next_pg"):
+                st.session_state.search_current_page += 1
+                host = override.strip() or st.session_state.mb_host or (host_list(email)[:1] or [""])[0]
+                mail = open_mail(email, password, host)
+                if search_scope_choice == "ALL_FOLDERS":
+                    target_scope = st.session_state.mb_folders
+                elif search_scope_choice == "Current Folder":
+                    target_scope = [folder]
+                else:
+                    target_scope = [search_scope_choice.replace("Folder: ", "")]
+                st.session_state.search_messages = fetch_messages_paginated(
+                    mail, email, password, host, target_scope, search_query_input, search_field_choice, 
+                    mode="SEARCH", page_size=page_size, page_number=st.session_state.search_current_page, 
+                    sort_order=sort_order, is_search_operation=True
+                )
+                close_mail(mail)
+                st.rerun()
+    else:
+        st.caption("No search results loaded yet. Enter a query and click 'Execute Keyword Search'.")
+
+    # Separate Diagnostic/Debug Log Screen for Deep Keyword Search
+    st.markdown("#### 🛠️ Deep Search Debugging & Diagnostic Log Screen")
+    with st.expander("🔍 Search Engine IMAP Diagnostic Traces & Logs", expanded=False):
+        if st.session_state.search_diag_logs:
+            st.code("\n".join(st.session_state.search_diag_logs), language="text")
+        else:
+            st.caption("Search engine logs will be recorded here after executing a keyword search.")
+
+# -----------------------------------------------------------------------------
+# MASS BOT PURGE & INTELLIGENCE HUB
+# -----------------------------------------------------------------------------
+st.markdown("---")
+with st.expander("🤖 Mass Bot Purge & Intelligence Hub", expanded=False):
+    all_loaded_bot_msgs = [m for m in st.session_state.current_messages if m["is_bot"]]
+    
+    bot_col1, bot_col2 = st.columns([2, 1])
+    with bot_col1:
+        bot_target_folder = st.selectbox(
+            "Select Bot Target Scope", 
+            ["ALL_FOLDERS"] + st.session_state.mb_folders, 
+            key="bot_hub_folder_select"
+        )
+    with bot_col2:
+        bot_scan_limit = st.selectbox("Bot Scan Depth", [50, 100, 200, 500], index=1)
+
+    b_act1, b_act2 = st.columns(2)
+    with b_act1:
+        if st.button("🔍 Scan Folder For Bot/OTP Messages", use_container_width=True):
+            host = override.strip() or st.session_state.mb_host or (host_list(email)[:1] or [""])[0]
+            if not email or not password or not host:
+                st.error("Please connect first.")
+            else:
+                mail = None
+                try:
+                    target_scope = st.session_state.mb_folders if bot_target_folder == "ALL_FOLDERS" else [bot_target_folder]
+                    with st.spinner("Scanning target folders for bot intelligence..."):
+                        mail = open_mail(email, password, host)
+                        msgs = fetch_messages_paginated(
+                            mail, email, password, host, target_scope, mode="FOLDER_ONLY",
+                            page_size=bot_scan_limit, page_number=1, sort_order="Newest First",
+                            is_search_operation=False
+                        )
+                        st.session_state.current_messages = msgs
+                        st.session_state.bot_filter_mode = True
+                        st.success("Scan complete. Displaying detected bot messages.")
+                except Exception as ex:
+                    st.error(str(ex))
+                finally:
+                    if mail:
+                        close_mail(mail)
+
+    with b_act2:
+        if st.button("🚨 Mass Delete All Detected Bot Messages", type="primary", use_container_width=True):
+            if not all_loaded_bot_msgs:
+                st.warning("No bot messages detected in current loaded stream to delete.")
+            else:
+                st.session_state.bot_diag_logs = []
+                host = override.strip() or st.session_state.mb_host or (host_list(email)[:1] or [""])[0]
+                mail = None
+                try:
+                    bot_log("🤖 [BOT ENGINE DIAGNOSTIC START] Initializing Mass Deletion Sequence...")
+                    bot_log(f"📋 Targets Count: {len(all_loaded_bot_msgs)} detected bot messages")
+                    mail = open_mail(email, password, host)
+                    deleted_count = 0
+                    
+                    for idx, bm in enumerate(all_loaded_bot_msgs, 1):
+                        r_folder = get_imap_path(bm["folder"])
+                        bot_log(f"  ├─ [Msg #{idx}] ID={bm['id']} | Folder='{bm['folder']}' ({r_folder}) | From='{bm['from']}' | Subject='{bm['subject']}'")
+                        sel_code, sel_res = mail.select(f'"{r_folder}"', readonly=False)
+                        bot_log(f"  │   ├─ IMAP SELECT: Status={sel_code} | Res={sel_res}")
+                        
+                        st_code, st_res = mail.store(bm["id"], '+FLAGS', '\\Deleted')
+                        bot_log(f"  │   ├─ STORE FLAGS: Status={st_code} | Res={st_res}")
+                        
+                        exp_code, exp_res = mail.expunge()
+                        bot_log(f"  │   ├─ EXPUNGE: Status={exp_code} | Res={exp_res}")
+                        
+                        deleted_count += 1
+                        bot_log("  │   └─ ✅ EXPOSED & PURGED from IMAP target")
+
+                    bot_log(f"\n🏁 [MASS DELETE COMPLETE] Successfully purged {deleted_count} bot messages from server.")
+                    st.success(f"Successfully deleted {deleted_count} bot messages!")
+                    
+                    st.session_state.current_messages = [m for m in st.session_state.current_messages if not m["is_bot"]]
+                    st.session_state.bot_filter_mode = False
+                    st.rerun()
+                except Exception as e:
+                    bot_log(f"❌ [MASS DELETE EXCEPTION]: {e}")
+                    st.error(f"Error during mass delete: {e}")
+                finally:
+                    if mail:
+                        close_mail(mail)
+
+    st.markdown("#### 📱 Detected Bot Message Preview Screen")
+    if all_loaded_bot_msgs:
+        for idx, bm in enumerate(all_loaded_bot_msgs, 1):
+            st.markdown(f"**[{idx}] [{bm['folder']}]** `{bm['from']}` — **{bm['subject']}** (ID: `{bm['id']}`) ")
+            if bm["pins"]:
+                st.info(f"🔑 PINs detected: {', '.join(bm['pins'])}")
+    else:
+        st.caption("No bot messages currently loaded in session memory.")
+
+    st.markdown("#### 🛠️ Mass Bot Delete Diagnostic & Diagnose Log Screen")
+    if st.session_state.bot_diag_logs:
+        st.code("\n".join(st.session_state.bot_diag_logs), language="text")
+    else:
+        st.caption("Bot engine traces will be printed here during purge operations.")
