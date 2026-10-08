@@ -1,5 +1,13 @@
 import glob
 import imaplib
+# --- BEGIN: Add this import near the top of the file -----------------
+try:
+    from hosts import host_list
+except Exception:
+    # Fallback if the module is missing – returns an empty list
+    def host_list(email: str) -> list[str]:
+        return []
+# ----------------------------------------------------------------------
 import os
 import re
 import time
