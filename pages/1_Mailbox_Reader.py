@@ -37,6 +37,8 @@ if "mb_log" not in st.session_state:
     st.session_state.mb_log = []
 if "mb_folders" not in st.session_state:
     st.session_state.mb_folders = ["INBOX"]
+if "folder_map" not in st.session_state:
+    st.session_state.folder_map = {"INBOX": "INBOX"}
 if "mb_host" not in st.session_state:
     st.session_state.mb_host = ""
 if "current_page" not in st.session_state:
@@ -129,7 +131,20 @@ def decode_imap_utf7(s: str) -> str:
     return "".join(res)
 
 
-# Strictly discover ONLY live mail account folders with robust regex parsing & deep diagnostic logs
+# Clean display label utility: Removes leading "INBOX." or "INBOX/" for UI display
+def clean_display_label(folder_name: str) -> str:
+    if folder_name.upper() == "INBOX":
+        return "INBOX"
+    return re.sub(r'^(?i)INBOX[./]', '', folder_name)
+
+
+# Helper to map a UI display label back to its raw IMAP path
+def get_imap_path(selected_ui_folder: str) -> str:
+    folder_map = st.session_state.get("folder_map", {})
+    return folder_map.get(selected_ui_folder, selected_ui_folder)
+
+
+# Strictly discover live folders, parse RFC 3501 lines, and strip prefix for UI
 def list_folders(mail, email_addr: str = "", host_val: str = ""):
     found = set()
     st.session_state.folder_debug_logs = []
@@ -141,7 +156,6 @@ def list_folders(mail, email_addr: str = "", host_val: str = ""):
         debug_log(f"📡 [RESPONSE STATUS] Server Response Code: '{typ}' | Raw Records Count: {len(data) if data else 0}")
 
         if typ == "OK" and data:
-            # RFC 3501 LIST response pattern: (<flags>) <delimiter> <mailbox_name>
             list_pattern = re.compile(r'^\((?P<flags>[^)]*)\)\s+(?P<delim>"[^"]*"|NIL)\s+(?P<name>.+)$')
 
             for idx, item in enumerate(data, 1):
@@ -157,32 +171,29 @@ def list_folders(mail, email_addr: str = "", host_val: str = ""):
                     delim = match.group("delim")
                     raw_name = match.group("name").strip()
                 else:
-                    # Fallback extraction if response structure varies slightly
                     flags = s
                     delim = "UNKNOWN"
                     quoted = re.findall(r'"((?:\\.|[^"\\])*)"', s)
                     raw_name = quoted[-1] if quoted else s.split()[-1]
 
-                # Strip surrounding quotes from folder name if present
                 clean_name = raw_name
                 if clean_name.startswith('"') and clean_name.endswith('"'):
                     clean_name = clean_name[1:-1].replace('\\"', '"')
 
                 debug_log(f"  │   ├─ Parsed Flags    : ({flags})")
                 debug_log(f"  │   ├─ Hierarchy Delim : {delim}")
-                debug_log(f"  │   ├─ Extracted Name  : '{clean_name}' (Raw: '{raw_name}')")
+                debug_log(f"  │   ├─ Raw IMAP Name   : '{clean_name}'")
 
-                # Filter out unselectable container nodes
                 if r"\noselect" in flags.lower() or r"\nonexistent" in flags.lower():
                     debug_log("  │   └─ ⚠️ FILTERED OUT: Flagged as \\Noselect or \\Nonexistent container")
                     continue
 
                 if clean_name and clean_name not in (".", "/", '""', "''"):
                     decoded_folder = decode_imap_utf7(clean_name)
-                    if decoded_folder != clean_name:
-                        debug_log(f"  │   ├─ UTF-7 Decoded   : '{decoded_folder}'")
+                    ui_label = clean_display_label(decoded_folder)
+                    debug_log(f"  │   ├─ UI Display Label: '{ui_label}'")
                     found.add(decoded_folder)
-                    debug_log(f"  │   └─ ✅ ACCEPTED FOLDER: '{decoded_folder}'")
+                    debug_log(f"  │   └─ ✅ ACCEPTED FOLDER: Raw='{decoded_folder}' -> UI='{ui_label}'")
                 else:
                     debug_log("  │   └─ ⚠️ IGNORED: Empty string or root hierarchy delimiter")
         else:
@@ -195,9 +206,19 @@ def list_folders(mail, email_addr: str = "", host_val: str = ""):
         debug_log("⚠️ [FALLBACK] Zero selectable folders parsed; defaulting folder list to ['INBOX']")
         found.add("INBOX")
 
-    sorted_result = sorted(list(found), key=lambda x: (0 if x.lower() == "inbox" else 1, x.lower()))
-    debug_log(f"\n🏁 [ENGINE COMPLETE] Final Confirmed Selectable Folders ({len(sorted_result)}): {sorted_result}")
-    return sorted_result
+    sorted_raw = sorted(list(found), key=lambda x: (0 if x.lower() == "inbox" else 1, clean_display_label(x).lower()))
+
+    # Build bidirectional map: { Display Label -> Raw IMAP Path }
+    folder_map = {}
+    display_folders = []
+    for raw_f in sorted_raw:
+        label = clean_display_label(raw_f)
+        folder_map[label] = raw_f
+        display_folders.append(label)
+
+    st.session_state.folder_map = folder_map
+    debug_log(f"\n🏁 [ENGINE COMPLETE] UI Selectable Folders ({len(display_folders)}): {display_folders}")
+    return display_folders
 
 
 def open_mail(email_addr, password_val, host_val):
@@ -358,9 +379,10 @@ if st.button("Load & Search Messages", type="primary"):
     else:
         mail = None
         try:
-            with st.spinner(f"Scanning folder '{folder}' on {host}..."):
+            real_imap_folder = get_imap_path(folder)
+            with st.spinner(f"Scanning folder '{folder}' ({real_imap_folder}) on {host}..."):
                 mail = open_mail(email, password, host)
-                mail.select(f'"{folder}"', readonly=False)
+                mail.select(f'"{real_imap_folder}"', readonly=False)
 
                 if search_query.strip():
                     typ, data = mail.search(None, search_scope, f'"{search_query.strip()}"')
@@ -440,8 +462,9 @@ if "current_messages" in st.session_state and st.session_state.current_messages:
             host = override.strip() or st.session_state.mb_host or (host_list(email)[:1] or [""])[0]
             mail = None
             try:
+                real_imap_folder = get_imap_path(folder)
                 mail = open_mail(email, password, host)
-                mail.select(f'"{folder}"', readonly=False)
+                mail.select(f'"{real_imap_folder}"', readonly=False)
                 for bm in bot_msgs:
                     mail.store(bm["id"], '+FLAGS', '\\Deleted')
                 mail.expunge()
@@ -481,13 +504,14 @@ if "current_messages" in st.session_state and st.session_state.current_messages:
             op_col1, op_col2, op_col3, op_col4 = st.columns(4)
 
             host = override.strip() or st.session_state.mb_host or (host_list(email)[:1] or [""])[0]
+            real_imap_folder = get_imap_path(folder)
 
             with op_col1:
                 if not msg["is_read"]:
                     if st.button("Mark as Read", key=f"read_{msg['id']}_{idx}"):
                         try:
                             m_client = open_mail(email, password, host)
-                            m_client.select(f'"{folder}"', readonly=False)
+                            m_client.select(f'"{real_imap_folder}"', readonly=False)
                             m_client.store(msg["id"], '+FLAGS', '\\Seen')
                             close_mail(m_client)
                             st.success("Marked as read!")
@@ -499,9 +523,10 @@ if "current_messages" in st.session_state and st.session_state.current_messages:
                 target_move = st.selectbox("Move to", st.session_state.mb_folders, key=f"mv_sel_{msg['id']}_{idx}")
                 if st.button("Move Message", key=f"mv_btn_{msg['id']}_{idx}"):
                     try:
+                        real_target_path = get_imap_path(target_move)
                         m_client = open_mail(email, password, host)
-                        m_client.select(f'"{folder}"', readonly=False)
-                        m_client.copy(msg["id"], f'"{target_move}"')
+                        m_client.select(f'"{real_imap_folder}"', readonly=False)
+                        m_client.copy(msg["id"], f'"{real_target_path}"')
                         m_client.store(msg["id"], '+FLAGS', '\\Deleted')
                         m_client.expunge()
                         close_mail(m_client)
@@ -514,7 +539,7 @@ if "current_messages" in st.session_state and st.session_state.current_messages:
                 if st.button("Delete Message", key=f"del_{msg['id']}_{idx}"):
                     try:
                         m_client = open_mail(email, password, host)
-                        m_client.select(f'"{folder}"', readonly=False)
+                        m_client.select(f'"{real_imap_folder}"', readonly=False)
                         m_client.store(msg["id"], '+FLAGS', '\\Deleted')
                         m_client.expunge()
                         close_mail(m_client)
