@@ -10,7 +10,6 @@ from enum import Enum
 import email
 from email.header import decode_header
 from email import message_from_bytes
-from email.header import decode_header
 from hosts import host_list
 
 # 1. Mobile & Desktop Responsive Configuration & Keep-Alive Injector
@@ -42,11 +41,17 @@ if "mb_host" not in st.session_state:
     st.session_state.mb_host = ""
 if "current_page" not in st.session_state:
     st.session_state.current_page = 0
+if "folder_debug_logs" not in st.session_state:
+    st.session_state.folder_debug_logs = []
 
 
 def log(msg):
     st.session_state.mb_log.insert(0, msg)
     st.session_state.mb_log = st.session_state.mb_log[:50]
+
+
+def debug_log(msg):
+    st.session_state.folder_debug_logs.append(msg)
 
 
 def load_valid():
@@ -60,8 +65,8 @@ def load_valid():
                     line = line.strip()
                     if ":" not in line:
                         continue
-                    email, pwd = line.split(":", 1)
-                    combo = f"{email.strip()}:{pwd.split('|')[0].strip()}"
+                    email_val, pwd = line.split(":", 1)
+                    combo = f"{email_val.strip()}:{pwd.split('|')[0].strip()}"
                     if combo not in seen:
                         seen.add(combo)
                         rows.append(combo)
@@ -81,10 +86,10 @@ def decode_hdr(value):
 
 
 # Webmail Portal Mapper
-def get_webmail_portal(email):
-    if "@" not in email:
+def get_webmail_portal(email_addr):
+    if "@" not in email_addr:
         return "https://mail.google.com"
-    domain = email.split("@")[-1].lower()
+    domain = email_addr.split("@")[-1].lower()
     portals = {
         "gmail.com": "https://mail.google.com",
         "googlemail.com": "https://mail.google.com",
@@ -103,31 +108,78 @@ def get_webmail_portal(email):
     return portals.get(domain, f"https://www.{domain}")
 
 
-# Streamlined Folder Discovery Engine (from top code)
+def decode_imap_utf7(s: str) -> str:
+    if "&" not in s:
+        return s
+    res = []
+    for part in s.split("&"):
+        if "-" in part and not part.startswith("-"):
+            b64_str, rest = part.split("-", 1)
+            if b64_str == "":
+                res.append("&" + rest)
+            else:
+                try:
+                    b64_padded = b64_str.replace(",", "/") + "=" * ((4 - len(b64_str) % 4) % 4)
+                    decoded = base64.b64decode(b64_padded).decode("utf-16be")
+                    res.append(decoded + rest)
+                except Exception:
+                    res.append("&" + part)
+        else:
+            res.append(part)
+    return "".join(res)
+
+
+# Strictly discover ONLY live mail account folders with detailed debugging logs
 def list_folders(mail):
     found = set()
+    st.session_state.folder_debug_logs = []
+    debug_log("🔍 [ENGINE START] Querying server with wildcard: IMAP LIST '' '*'")
+
     try:
         typ, data = mail.list('""', "*")
+        debug_log(f"📡 [RESPONSE STATUS] Server status: '{typ}', Raw items returned: {len(data) if data else 0}")
+
         if typ == "OK" and data:
-            for item in data:
+            for idx, item in enumerate(data, 1):
                 if not item:
                     continue
-                s = item.decode("utf-8", errors="ignore") if isinstance(item, bytes) else str(item)
+                s = item.decode("latin1", errors="ignore") if isinstance(item, bytes) else str(item)
+                debug_log(f"  ├─ Raw Line #{idx}: {s}")
+
+                if r"\noselect" in s.lower() or r"\nonexistent" in s.lower():
+                    debug_log("  │   ⚠️ FILTERED OUT: Container node flagged as \\Noselect or \\Nonexistent")
+                    continue
+
                 quoted = re.findall(r'"((?:\\.|[^"\\])*)"', s)
                 name = quoted[-1] if quoted else s.split()[-1]
                 name = name.replace('\\"', '"').strip()
-                if name and name not in (".", "/"):
-                    found.add(name)
-    except Exception:
-        pass
+
+                if name and name not in (".", "/", '""', "''"):
+                    decoded_folder = decode_imap_utf7(name)
+                    if decoded_folder != name:
+                        debug_log(f"  │   🌐 UTF-7 DECODED: '{name}' -> '{decoded_folder}'")
+                    found.add(decoded_folder)
+                    debug_log(f"  │   ✅ DISCOVERED FOLDER: '{decoded_folder}'")
+                else:
+                    debug_log("  │   ⚠️ IGNORED: Empty or root delimiter token")
+        else:
+            debug_log("⚠️ [WARNING] Server returned empty or non-OK status for LIST query.")
+
+    except Exception as ex:
+        debug_log(f"❌ [EXCEPTION ERROR] Encountered during folder discovery: {ex}")
+
     if not found:
+        debug_log("⚠️ [FALLBACK] No folders detected via LIST; defaulting to ['INBOX']")
         found.add("INBOX")
-    return sorted(found, key=lambda x: (0 if x.lower() == "inbox" else 1, x.lower()))
+
+    sorted_result = sorted(list(found), key=lambda x: (0 if x.lower() == "inbox" else 1, x.lower()))
+    debug_log(f"🏁 [ENGINE COMPLETE] Final confirmed selectable folders ({len(sorted_result)}): {sorted_result}")
+    return sorted_result
 
 
-def open_mail(email, password, host):
-    mail = imaplib.IMAP4_SSL(host, 993, timeout=20)
-    mail.login(email, password)
+def open_mail(email_addr, password_val, host_val):
+    mail = imaplib.IMAP4_SSL(host_val, 993, timeout=20)
+    mail.login(email_addr, password_val)
     return mail
 
 
@@ -197,7 +249,7 @@ else:
 
 st.sidebar.write("**Host order:** " + ", ".join(host_list(email)[:4]) if email else "-")
 
-# Webmail Portal & Dynamic Credentials Hub (Fixed to update instantly on selection)
+# Webmail Portal & Dynamic Credentials Hub
 if email and password:
     st.sidebar.markdown("---")
     st.sidebar.subheader("🌐 Webmail Portal & Credentials")
@@ -214,7 +266,7 @@ if st.sidebar.button("Connect & Discover Folders", type="primary"):
         connected_host = ""
         folders = ["INBOX"]
         success = False
-        
+
         with st.spinner("Connecting and discovering folders..."):
             for host in hosts:
                 mail_obj = None
@@ -229,7 +281,7 @@ if st.sidebar.button("Connect & Discover Folders", type="primary"):
                     last = f"{host}: {e}"
                     if mail_obj:
                         close_mail(mail_obj)
-        
+
         if success:
             st.session_state.mb_host = connected_host
             st.session_state.mb_folders = folders
@@ -238,6 +290,11 @@ if st.sidebar.button("Connect & Discover Folders", type="primary"):
         else:
             st.sidebar.error(last)
             log(last)
+
+# Debugging Screen Log Expander
+if "folder_debug_logs" in st.session_state and st.session_state.folder_debug_logs:
+    with st.expander("🛠️ Live Folder Discovery Screen Log & Server Raw Traces", expanded=True):
+        st.code("\n".join(st.session_state.folder_debug_logs), language="text")
 
 # Live Action Log & Export Tools in Sidebar
 st.sidebar.markdown("---")
@@ -281,34 +338,34 @@ if st.button("Load & Search Messages", type="primary"):
             with st.spinner(f"Scanning folder '{folder}' on {host}..."):
                 mail = open_mail(email, password, host)
                 mail.select(f'"{folder}"', readonly=False)
-                
+
                 if search_query.strip():
                     typ, data = mail.search(None, search_scope, f'"{search_query.strip()}"')
                 else:
                     typ, data = mail.search(None, "ALL")
-                
+
                 ids = (data[0] or b"").split() if typ == "OK" else []
                 if sort_order == "Newest First":
                     ids = list(reversed(ids))
-                
+
                 ids = ids[:page_size]
                 messages_data = []
-                
+
                 for mid in ids:
                     typ, msgdata = mail.fetch(mid, "(FLAGS BODY.PEEK[])")
                     if not msgdata or not isinstance(msgdata[0], tuple):
                         continue
-                    
+
                     raw_msg_bytes = msgdata[0][1]
                     msg = message_from_bytes(raw_msg_bytes)
-                    
+
                     subject = decode_hdr(msg.get("Subject", ""))
                     frm = decode_hdr(msg.get("From", ""))
                     date_val = decode_hdr(msg.get("Date", ""))
-                    
+
                     flags_str = str(msgdata[0][0])
                     is_read = "\\Seen" in flags_str
-                    
+
                     body_text = ""
                     if msg.is_multipart():
                         for part in msg.walk():
@@ -323,11 +380,11 @@ if st.button("Load & Search Messages", type="primary"):
                             body_text = msg.get_payload(decode=True).decode("utf-8", errors="ignore")
                         except Exception:
                             pass
-                    
+
                     cleaned_body = clean_boilerplate(body_text)
                     pins, links = extract_pins_and_links(body_text)
                     is_bot = is_bot_message(subject, body_text)
-                    
+
                     messages_data.append({
                         "id": mid.decode(),
                         "from": frm,
@@ -340,7 +397,7 @@ if st.button("Load & Search Messages", type="primary"):
                         "links": links,
                         "raw": raw_msg_bytes
                     })
-                
+
                 st.session_state.current_messages = messages_data
                 log(f"Loaded {len(messages_data)} messages from {folder}")
         except Exception as e:
@@ -377,31 +434,31 @@ if "current_messages" in st.session_state and st.session_state.current_messages:
 
     st.markdown("---")
     st.subheader(f"✉️ Message Stream ({len(st.session_state.current_messages)} loaded)")
-    
+
     for idx, msg in enumerate(st.session_state.current_messages):
         status_icon = "📖" if msg["is_read"] else "📩"
         bot_badge = " [🤖 BOT/OTP]" if msg["is_bot"] else ""
-        
+
         with st.expander(f"{status_icon} [{msg['date']}] {msg['from']} - {msg['subject']}{bot_badge}"):
             st.write(f"**From:** {msg['from']}")
             st.write(f"**Subject:** {msg['subject']}")
             st.write(f"**Date:** {msg['date']}")
-            
+
             if msg["pins"]:
                 st.success(f"🔑 **Extracted PINs / Verification Codes:** {', '.join(msg['pins'])}")
             if msg["links"]:
                 st.markdown("🔗 **Actionable Verification Links:**")
                 for link in msg["links"]:
                     st.markdown(f"- [{link}]({link})", unsafe_allow_html=True)
-            
+
             st.markdown("---")
             st.text_area("Cleaned Message Body", value=msg["body"], height=150, key=f"body_{msg['id']}_{idx}")
-            
+
             # Per-Message Interactive Operations
             op_col1, op_col2, op_col3, op_col4 = st.columns(4)
-            
+
             host = override.strip() or st.session_state.mb_host or (host_list(email)[:1] or [""])[0]
-            
+
             with op_col1:
                 if not msg["is_read"]:
                     if st.button("Mark as Read", key=f"read_{msg['id']}_{idx}"):
@@ -414,7 +471,7 @@ if "current_messages" in st.session_state and st.session_state.current_messages:
                             st.rerun()
                         except Exception as ex:
                             st.error(str(ex))
-            
+
             with op_col2:
                 target_move = st.selectbox("Move to", st.session_state.mb_folders, key=f"mv_sel_{msg['id']}_{idx}")
                 if st.button("Move Message", key=f"mv_btn_{msg['id']}_{idx}"):
@@ -429,7 +486,7 @@ if "current_messages" in st.session_state and st.session_state.current_messages:
                         st.rerun()
                     except Exception as ex:
                         st.error(str(ex))
-            
+
             with op_col3:
                 if st.button("Delete Message", key=f"del_{msg['id']}_{idx}"):
                     try:
@@ -442,7 +499,7 @@ if "current_messages" in st.session_state and st.session_state.current_messages:
                         st.rerun()
                     except Exception as ex:
                         st.error(str(ex))
-            
+
             with op_col4:
                 with st.popover("View Raw RFC822"):
                     st.code(msg["raw"].decode("utf-8", errors="ignore"))
