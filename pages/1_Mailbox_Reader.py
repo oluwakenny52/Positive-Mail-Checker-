@@ -12,9 +12,6 @@ from email.header import decode_header
 from email import message_from_bytes
 from hosts import host_list
 
-# Pre-compiled RFC 3501 LIST response parser
-LIST_PATTERN = re.compile(r'^\((?P<flags>[^)]*)\)\s+(?P<delim>"[^"]*"|NIL)\s+(?P<name>.+)$')
-
 # 1. Mobile & Desktop Responsive Configuration & Keep-Alive Injector
 st.set_page_config(
     page_title="Bobito Mailbox Reader & Portal Hub",
@@ -134,11 +131,43 @@ def decode_imap_utf7(s: str) -> str:
     return "".join(res)
 
 
-# Clean display label utility: Removes leading "INBOX." or "INBOX/" for UI display
+# Non-regex display label utility to prevent regex flag position errors
 def clean_display_label(folder_name: str) -> str:
-    if folder_name.upper() == "INBOX":
+    upper_name = folder_name.upper()
+    if upper_name == "INBOX":
         return "INBOX"
-    return re.sub(r'^(?i)INBOX[./]', '', folder_name)
+    if upper_name.startswith("INBOX.") or upper_name.startswith("INBOX/"):
+        return folder_name[6:]
+    return folder_name
+
+
+# Pure String Tokenizer for RFC 3501 IMAP LIST Responses (Replaces regex)
+def parse_imap_list_line(s: str) -> Tuple[str, str, str]:
+    s = s.strip()
+    flags = ""
+    delim = '"."'
+    raw_name = s
+
+    if s.startswith("("):
+        end_paren = s.find(")")
+        if end_paren != -1:
+            flags = s[1:end_paren].strip()
+            remainder = s[end_paren + 1:].strip()
+            
+            # Extract hierarchy delimiter and folder name
+            parts = remainder.split(None, 1)
+            if len(parts) >= 1:
+                delim = parts[0]
+            if len(parts) == 2:
+                raw_name = parts[1].strip()
+            else:
+                raw_name = ""
+
+    # Unquote string literals if present
+    if raw_name.startswith('"') and raw_name.endswith('"') and len(raw_name) >= 2:
+        raw_name = raw_name[1:-1].replace('\\"', '"')
+
+    return flags, delim, raw_name
 
 
 # Helper to map a UI display label back to its raw IMAP path
@@ -147,7 +176,7 @@ def get_imap_path(selected_ui_folder: str) -> str:
     return folder_map.get(selected_ui_folder, selected_ui_folder)
 
 
-# Robust folder parsing and list extraction
+# Robust folder discovery using string tokenization
 def list_folders(mail, email_addr: str = "", host_val: str = ""):
     found = set()
     st.session_state.folder_debug_logs = []
@@ -167,35 +196,14 @@ def list_folders(mail, email_addr: str = "", host_val: str = ""):
                     s = s.strip()
                     debug_log(f"\n  ├─ [Line #{idx} Raw]: {s}")
 
-                    match = LIST_PATTERN.match(s)
-                    if match:
-                        flags = match.group("flags")
-                        delim = match.group("delim")
-                        raw_name = match.group("name").strip()
-                    else:
-                        # Fallback parsing strategy using standard splitting
-                        flags = ""
-                        delim = '"."'
-                        raw_name = s
-                        if s.startswith("("):
-                            close_paren = s.find(")")
-                            if close_paren != -1:
-                                flags = s[1:close_paren]
-                                remainder = s[close_paren + 1:].strip()
-                                parts = remainder.split(None, 1)
-                                if len(parts) == 2:
-                                    delim = parts[0]
-                                    raw_name = parts[1].strip()
-
-                    clean_name = raw_name
-                    if clean_name.startswith('"') and clean_name.endswith('"'):
-                        clean_name = clean_name[1:-1].replace('\\"', '"')
+                    flags, delim, clean_name = parse_imap_list_line(s)
 
                     debug_log(f"  │   ├─ Parsed Flags    : ({flags})")
                     debug_log(f"  │   ├─ Hierarchy Delim : {delim}")
                     debug_log(f"  │   ├─ Raw IMAP Name   : '{clean_name}'")
 
-                    if r"\noselect" in flags.lower() or r"\nonexistent" in flags.lower():
+                    flags_lower = flags.lower()
+                    if r"\noselect" in flags_lower or r"\nonexistent" in flags_lower:
                         debug_log("  │   └─ ⚠️ FILTERED OUT: Flagged as \\Noselect or \\Nonexistent container")
                         continue
 
@@ -270,19 +278,19 @@ def extract_pins_and_links(text):
     return list(dict.fromkeys(pins)), list(dict.fromkeys(cleaned_urls))
 
 
-# Boilerplate Clean-Up Utility
+# Boilerplate Clean-Up Utility without inline regex flags
 def clean_boilerplate(text):
     if not text:
         return ""
     patterns_to_remove = [
-        r"(?i)unsubscribe.*?(?:\n|$)",
-        r"(?i)privacy policy.*?(?:\n|$)",
-        r"(?i)confidentiality notice.*?(?:\n\n|$)",
-        r"(?i)this email was sent by.*?(?:\n|$)"
+        (r"unsubscribe.*?(?:\n|$)", re.IGNORECASE),
+        (r"privacy policy.*?(?:\n|$)", re.IGNORECASE),
+        (r"confidentiality notice.*?(?:\n\n|$)", re.IGNORECASE),
+        (r"this email was sent by.*?(?:\n|$)", re.IGNORECASE)
     ]
     cleaned = text
-    for pat in patterns_to_remove:
-        cleaned = re.sub(pat, "", cleaned)
+    for pat, flags in patterns_to_remove:
+        cleaned = re.sub(pat, "", cleaned, flags=flags)
     return cleaned.strip()
 
 
