@@ -49,6 +49,8 @@ if "search_diag_logs" not in st.session_state:
     st.session_state.search_diag_logs = []
 if "current_messages" not in st.session_state:
     st.session_state.current_messages = []
+if "bot_filter_mode" not in st.session_state:
+    st.session_state.bot_filter_mode = False
 
 
 def log(msg):
@@ -240,12 +242,13 @@ def close_mail(mail):
             pass
 
 
-def is_bot_message(subject, body):
+def is_bot_message(subject, body, frm=""):
     bot_keywords = [
         "otp", "verification", "verify", "security alert", "password reset",
-        "code", "confirm", "login", "auth", "signin", "crypto", "token", "activation"
+        "code", "confirm", "login", "auth", "signin", "crypto", "token", "activation",
+        "hacked", "extortion", "wallet", "staking", "mcafee", "iptv", "lot"
     ]
-    combined = f"{subject} {body}".lower()
+    combined = f"{subject} {body} {frm}".lower()
     return any(kw in combined for kw in bot_keywords)
 
 
@@ -271,13 +274,13 @@ def clean_boilerplate(text):
     return cleaned.strip()
 
 
-def fetch_messages(mail, email_addr, password_val, host_val, target_folders: List[str], search_query: str = "", search_scope: str = "ALL_FOLDERS", mode: str = "SEARCH"):
+def fetch_messages(mail, email_addr, password_val, host_val, target_folders: List[str], search_query: str = "", search_field: str = "TEXT", mode: str = "SEARCH"):
     st.session_state.search_diag_logs = []
     messages = []
     start_time = time.time()
     
-    search_log(f"⚙️ [ENGINE INIT] Mode: '{mode}' | Target Folders: {target_folders}")
-    search_log(f"🔎 [SEARCH SPECS] Query: '{search_query}' | Scope Mode: '{search_scope}'")
+    search_log(f"⚙️ [ENGINE INIT] Mode: '{mode}' | Target Folders ({len(target_folders)}): {target_folders}")
+    search_log(f"🔎 [SEARCH SPECS] Query: '{search_query}' | Search Field: '{search_field}'")
 
     for f_label in target_folders:
         real_imap_folder = get_imap_path(f_label)
@@ -297,10 +300,10 @@ def fetch_messages(mail, email_addr, password_val, host_val, target_folders: Lis
                 search_log(f"  ├─ [EXECUTING COMMAND] {cmd}")
                 typ, data = mail.search(None, "ALL")
             else:
-                scope_cmd = "TEXT" if search_scope in ("ALL_FOLDERS", "TEXT") else search_scope
-                cmd = f'SEARCH {scope_cmd} "{search_query.strip()}"'
+                field_cmd = search_field if search_field in ("TEXT", "SUBJECT", "FROM", "BODY") else "TEXT"
+                cmd = f'SEARCH {field_cmd} "{search_query.strip()}"'
                 search_log(f"  ├─ [EXECUTING COMMAND] {cmd}")
-                typ, data = mail.search(None, scope_cmd, f'"{search_query.strip()}"')
+                typ, data = mail.search(None, field_cmd, f'"{search_query.strip()}"')
 
             search_log(f"  ├─ [IMAP SEARCH RESPONSE] Status: '{typ}' | Raw Bytes: {data}")
             ids = (data[0] or b"").split() if typ == "OK" else []
@@ -308,7 +311,9 @@ def fetch_messages(mail, email_addr, password_val, host_val, target_folders: Lis
 
             for idx, mid in enumerate(ids, 1):
                 msg_start = time.time()
-                typ, msgdata = mail.fetch(mid, "(FLAGS BODY.PEEK[])")
+                
+                # Enhanced diagnostic fetch: Retrieves ENVELOPE, BODYSTRUCTURE, HEADER, and PEEK
+                typ, msgdata = mail.fetch(mid, "(FLAGS ENVELOPE BODYSTRUCTURE BODY.PEEK[])")
                 
                 if not msgdata or not isinstance(msgdata[0], tuple):
                     search_log(f"  │   ├─ [Msg ID #{mid.decode()}] ⚠️ FETCH returned empty structure.")
@@ -318,6 +323,7 @@ def fetch_messages(mail, email_addr, password_val, host_val, target_folders: Lis
                 msg = message_from_bytes(raw_msg_bytes)
                 subject = decode_hdr(msg.get("Subject", ""))
                 frm = decode_hdr(msg.get("From", ""))
+                to_hdr = decode_hdr(msg.get("To", ""))
                 date_val = decode_hdr(msg.get("Date", ""))
                 flags_str = str(msgdata[0][0])
                 is_read = "\\Seen" in flags_str
@@ -339,12 +345,13 @@ def fetch_messages(mail, email_addr, password_val, host_val, target_folders: Lis
 
                 cleaned_body = clean_boilerplate(body_text)
                 pins, links = extract_pins_and_links(body_text)
-                is_bot = is_bot_message(subject, body_text)
+                is_bot = is_bot_message(subject, body_text, frm)
 
                 messages.append({
                     "id": mid.decode(),
                     "folder": f_label,
                     "from": frm,
+                    "to": to_hdr,
                     "subject": subject,
                     "date": date_val,
                     "is_read": is_read,
@@ -352,13 +359,15 @@ def fetch_messages(mail, email_addr, password_val, host_val, target_folders: Lis
                     "body": cleaned_body,
                     "pins": pins,
                     "links": links,
-                    "raw": raw_msg_bytes
+                    "raw": raw_msg_bytes,
+                    "flags": flags_str,
+                    "size_bytes": len(raw_msg_bytes)
                 })
                 
                 fetch_elapsed = round((time.time() - msg_start) * 1000, 2)
                 search_log(
-                    f"  │   ├─ [Msg #{idx} | ID: {mid.decode()}] Parsed in {fetch_elapsed}ms | "
-                    f"From: '{frm[:25]}...' | Subject: '{subject[:30]}...' | "
+                    f"  │   ├─ [Msg #{idx} | ID: {mid.decode()}] Parsed in {fetch_elapsed}ms | Size: {len(raw_msg_bytes)}B | "
+                    f"From: '{frm}' | To: '{to_hdr}' | Subject: '{subject}' | "
                     f"Flags: {flags_str} | BotDetected={is_bot}"
                 )
 
@@ -372,7 +381,7 @@ def fetch_messages(mail, email_addr, password_val, host_val, target_folders: Lis
 
 # Header
 st.title("📥 Bobito Mailbox Reader & Portal Hub")
-st.caption("Advanced IMAP Client with Interactive Bot Intelligence, Cross-Folder Search, and Deep Diagnostic Instrumentation.")
+st.caption("Advanced IMAP Client with Interactive Bot Intelligence, Multi-Field Search, and Deep Diagnostic Instrumentation.")
 
 valid = load_valid()
 
@@ -401,6 +410,7 @@ if st.sidebar.button("🔄 Refresh Inbox", type="secondary", use_container_width
                 st.session_state.current_messages = fetch_messages(mail_obj, email, password, host, ["INBOX"], mode="FOLDER_ONLY")
                 close_mail(mail_obj)
                 st.session_state.current_page = 1
+                st.session_state.bot_filter_mode = False
                 st.sidebar.success("Inbox refreshed successfully!")
         except Exception as e:
             st.sidebar.error(f"Refresh failed: {e}")
@@ -474,6 +484,7 @@ if st.button("📂 Load Folder Messages", type="primary", use_container_width=Tr
                     msgs = list(reversed(msgs))
                 st.session_state.current_messages = msgs
                 st.session_state.current_page = 1
+                st.session_state.bot_filter_mode = False
                 log(f"Loaded {len(msgs)} messages from folder '{folder}'.")
         except Exception as e:
             st.error(str(e))
@@ -482,9 +493,14 @@ if st.button("📂 Load Folder Messages", type="primary", use_container_width=Tr
                 close_mail(mail)
 
 # Deep Search and Scope Filters Block
-with st.expander("🔍 Deep Keyword Search & Global Scope Filters", expanded=False):
+with st.expander("🔍 Deep Keyword Search & Scope Filters", expanded=True):
+    s_col1, s_col2 = st.columns([1, 1])
+    with s_col1:
+        search_scope = st.selectbox("Search Scope", ["Current Folder", "ALL_FOLDERS"])
+    with s_col2:
+        search_field = st.selectbox("Search Field Option", ["TEXT", "SUBJECT", "FROM", "BODY"])
+    
     search_query = st.text_input("Search term or keyword")
-    search_scope = st.selectbox("Search Scope", ["ALL_FOLDERS", "TEXT", "SUBJECT", "FROM", "BODY"])
     
     if st.button("🔍 Execute Keyword Search", use_container_width=True):
         host = override.strip() or st.session_state.mb_host or (host_list(email)[:1] or [""])[0]
@@ -494,13 +510,14 @@ with st.expander("🔍 Deep Keyword Search & Global Scope Filters", expanded=Fal
             mail = None
             try:
                 target_scope = st.session_state.mb_folders if search_scope == "ALL_FOLDERS" else [folder]
-                with st.spinner(f"Scanning target mailboxes ({len(target_scope)} folder/s)..."):
+                with st.spinner(f"Scanning target mailboxes ({len(target_scope)} folder/s) for [{search_field}: '{search_query}']..."):
                     mail = open_mail(email, password, host)
-                    msgs = fetch_messages(mail, email, password, host, target_scope, search_query, search_scope, mode="SEARCH")
+                    msgs = fetch_messages(mail, email, password, host, target_scope, search_query, search_field, mode="SEARCH")
                     if sort_order == "Newest First":
                         msgs = list(reversed(msgs))
                     st.session_state.current_messages = msgs
                     st.session_state.current_page = 1
+                    st.session_state.bot_filter_mode = False
                     log(f"Search found {len(msgs)} messages across target scope.")
             except Exception as e:
                 st.error(str(e))
@@ -515,14 +532,21 @@ if st.session_state.search_diag_logs:
 
 # Bot Intelligence & Interactive Mass Delete Section
 if st.session_state.current_messages:
-    bot_msgs = [m for m in st.session_state.current_messages if m["is_bot"]]
-    if bot_msgs:
+    all_loaded_bot_msgs = [m for m in st.session_state.current_messages if m["is_bot"]]
+    if all_loaded_bot_msgs:
         st.markdown("---")
-        st.subheader(f"🤖 Bot & Security Intelligence Detected ({len(bot_msgs)} messages)")
+        st.subheader(f"🤖 Bot & Security Intelligence Detected ({len(all_loaded_bot_msgs)} messages)")
         
-        bot_col1, bot_col2 = st.columns([1, 1])
-        with bot_col1:
+        b_col1, b_col2 = st.columns([1, 1])
+        with b_col1:
+            if st.button("🚨 Filter & Show All Detected Bot/Spam Messages", type="primary", use_container_width=True):
+                st.session_state.bot_filter_mode = True
+                st.session_state.current_page = 1
+                st.success("Message stream filtered to show ONLY Bot/Spam messages below.")
+        
+        with b_col2:
             if st.button("🗑️ Mass Delete All Detected Bot/Spam Messages", type="primary", use_container_width=True):
+                st.session_state.bot_filter_mode = True
                 st.session_state.bot_diag_logs = []
                 host = override.strip() or st.session_state.mb_host or (host_list(email)[:1] or [""])[0]
                 mail = None
@@ -531,9 +555,9 @@ if st.session_state.current_messages:
                     mail = open_mail(email, password, host)
                     deleted_count = 0
                     
-                    for idx, bm in enumerate(bot_msgs, 1):
+                    for idx, bm in enumerate(all_loaded_bot_msgs, 1):
                         r_folder = get_imap_path(bm["folder"])
-                        bot_log(f"  ├─ [Msg #{idx}] ID={bm['id']} | Folder='{bm['folder']}' ({r_folder}) | Subject='{bm['subject']}'")
+                        bot_log(f"  ├─ [Msg #{idx}] ID={bm['id']} | Folder='{bm['folder']}' ({r_folder}) | From='{bm['from']}' | Subject='{bm['subject']}'")
                         mail.select(f'"{r_folder}"', readonly=False)
                         mail.store(bm["id"], '+FLAGS', '\\Deleted')
                         mail.expunge()
@@ -546,6 +570,7 @@ if st.session_state.current_messages:
                     
                     # Refresh local state
                     st.session_state.current_messages = [m for m in st.session_state.current_messages if not m["is_bot"]]
+                    st.session_state.bot_filter_mode = False
                     st.rerun()
                 except Exception as e:
                     bot_log(f"❌ [MASS DELETE EXCEPTION]: {e}")
@@ -559,9 +584,14 @@ if st.session_state.current_messages:
             with st.expander("🛠️ Mass Bot Delete Diagnostic & Purge Log", expanded=True):
                 st.code("\n".join(st.session_state.bot_diag_logs), language="text")
 
-# Pagination & Message Stream Display
-all_msgs = st.session_state.current_messages
-total_msgs = len(all_msgs)
+# Determine active list of messages to display based on filter mode
+if st.session_state.bot_filter_mode:
+    active_msgs = [m for m in st.session_state.current_messages if m["is_bot"]]
+    st.info("⚠️ Message stream is currently filtered to show DETECTED BOT/SPAM MESSAGES ONLY.")
+else:
+    active_msgs = st.session_state.current_messages
+
+total_msgs = len(active_msgs)
 
 if total_msgs > 0:
     st.markdown("---")
@@ -575,7 +605,7 @@ if total_msgs > 0:
     start_idx = (curr_p - 1) * page_size
     end_idx = min(start_idx + page_size, total_msgs)
     
-    page_msgs = all_msgs[start_idx:end_idx]
+    page_msgs = active_msgs[start_idx:end_idx]
 
     # Display Indicator Header
     st.markdown("### ✉️ Message Stream")
@@ -584,14 +614,16 @@ if total_msgs > 0:
     # Render Messages Page
     for idx, msg in enumerate(page_msgs):
         status_icon = "📖" if msg["is_read"] else "📩"
-        bot_badge = " [🤖 BOT/OTP]" if msg["is_bot"] else ""
-        folder_badge = f" [{msg['folder']}]" if search_scope == "ALL_FOLDERS" else ""
+        bot_badge = " [🤖 BOT/OTP/SPAM]" if msg["is_bot"] else ""
+        folder_badge = f" [{msg['folder']}]"
 
         with st.expander(f"{status_icon}{folder_badge} [{msg['date']}] {msg['from']} - {msg['subject']}{bot_badge}"):
             st.write(f"**Folder:** {msg['folder']}")
             st.write(f"**From:** {msg['from']}")
+            st.write(f"**To:** {msg['to']}")
             st.write(f"**Subject:** {msg['subject']}")
             st.write(f"**Date:** {msg['date']}")
+            st.write(f"**IMAP Message ID:** {msg['id']} | **Size:** {msg['size_bytes']} bytes")
 
             if msg["pins"]:
                 st.success(f"🔑 **Extracted PINs / Verification Codes:** {', '.join(msg['pins'])}")
@@ -601,7 +633,7 @@ if total_msgs > 0:
                     st.markdown(f"- [{link}]({link})", unsafe_allow_html=True)
 
             st.markdown("---")
-            st.text_area("Cleaned Message Body", value=msg["body"], height=150, key=f"body_{msg['id']}_{idx}")
+            st.text_area("Cleaned Message Body", value=msg["body"], height=150, key=f"body_{msg['folder']}_{msg['id']}_{idx}")
 
             # Per-Message Interactive Operations
             op_col1, op_col2, op_col3, op_col4 = st.columns(4)
@@ -610,7 +642,7 @@ if total_msgs > 0:
 
             with op_col1:
                 if not msg["is_read"]:
-                    if st.button("Mark as Read", key=f"read_{msg['id']}_{idx}"):
+                    if st.button("Mark as Read", key=f"read_{msg['folder']}_{msg['id']}_{idx}"):
                         try:
                             m_client = open_mail(email, password, host)
                             m_client.select(f'"{real_imap_folder}"', readonly=False)
@@ -623,8 +655,8 @@ if total_msgs > 0:
                             st.error(str(ex))
 
             with op_col2:
-                target_move = st.selectbox("Move to", st.session_state.mb_folders, key=f"mv_sel_{msg['id']}_{idx}")
-                if st.button("Move Message", key=f"mv_btn_{msg['id']}_{idx}"):
+                target_move = st.selectbox("Move to", st.session_state.mb_folders, key=f"mv_sel_{msg['folder']}_{msg['id']}_{idx}")
+                if st.button("Move Message", key=f"mv_btn_{msg['folder']}_{msg['id']}_{idx}"):
                     try:
                         real_target_path = get_imap_path(target_move)
                         m_client = open_mail(email, password, host)
@@ -641,7 +673,7 @@ if total_msgs > 0:
 
             with op_col3:
                 del_label = "Delete Bot Msg" if msg["is_bot"] else "Delete Message"
-                if st.button(del_label, key=f"del_{msg['id']}_{idx}", type="primary" if msg["is_bot"] else "secondary"):
+                if st.button(del_label, key=f"del_{msg['folder']}_{msg['id']}_{idx}", type="primary" if msg["is_bot"] else "secondary"):
                     try:
                         m_client = open_mail(email, password, host)
                         m_client.select(f'"{real_imap_folder}"', readonly=False)
