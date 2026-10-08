@@ -268,7 +268,8 @@ def is_bot_message(subject, body, frm=""):
         "otp", "verification", "verify", "security alert", "password reset",
         "code", "confirm", "login", "auth", "signin", "crypto", "token", "activation",
         "hacked", "extortion", "wallet", "staking", "mcafee", "iptv", "lot", "card",
-        "gift card", "payment", "id card", "credential", "application password"
+        "debit card", "credit card", "gift card", "payment", "id card", "credential", 
+        "application password", "cvv", "exp date"
     ]
     combined = f"{subject} {body} {frm}".lower()
     return any(kw in combined for kw in bot_keywords)
@@ -282,12 +283,26 @@ def extract_pins_and_links(text):
 
 
 def extract_credentials_and_cards(text):
-    card_pattern = r'\b(?:\d[ -]*?){13,16}\b'
+    # Regex for Debit & Credit Cards (Visa, MasterCard, Amex, Discover - 13 to 19 digits formatted or raw)
+    card_pattern = r'\b(?:4[0-9]{12}(?:[0-9]{3})?|5[1-5][0-9]{14}|3[47][0-9]{13}|3(?:0[0-5]|[68][0-9])[0-9]{11}|6(?:011|5[0-9]{2})[0-9]{12}|(?:[0-9]{4}[ -]?){3}[0-9]{4})\b'
     cards = re.findall(card_pattern, text)
-    cleaned_cards = [c.replace(" ", "").replace("-", "") for c in cards if len(c.replace(" ", "").replace("-", "")) in (13, 15, 16)]
+    cleaned_cards = [c.replace(" ", "").replace("-", "") for c in cards]
+
+    # Detect Card Details (Expiration Date & CVV/CVC)
+    card_exp = re.findall(r'(?i)(?:exp(?:iry|iration)?|valid thru|exp date)\s*[:=]?\s*(\d{2}/\d{2,4})', text)
+    card_cvv = re.findall(r'(?i)(?:cvv2?|cvc|security code|cid)\s*[:=]?\s*(\d{3,4})', text)
     
+    formatted_cards = []
+    for c in cleaned_cards:
+        detail = f"Card: {c}"
+        if card_exp:
+            detail += f" | EXP: {card_exp[0]}"
+        if card_cvv:
+            detail += f" | CVV: {card_cvv[0]}"
+        formatted_cards.append(detail)
+
     cred_patterns = re.findall(r'(?i)(?:password|passwd|login|credentials|app password|gift card)\s*[:=]\s*(\S+)', text)
-    return list(dict.fromkeys(cleaned_cards)), list(dict.fromkeys(cred_patterns))
+    return list(dict.fromkeys(formatted_cards)), list(dict.fromkeys(cred_patterns))
 
 
 def clean_boilerplate(text):
@@ -446,7 +461,7 @@ def fetch_messages_paginated(mail, email_addr, password_val, host_val, target_fo
 
 # Header
 st.title("📥 Bobito Mailbox Reader & Portal Hub")
-st.caption("Advanced IMAP Client with Interactive Bot Intelligence, Dedicated OTP & Credentials Scanner, Multi-Field Search, and Deep Diagnostic Instrumentation.")
+st.caption("Advanced IMAP Client with Interactive Bot Intelligence, Dedicated OTP, Debit/Credit Card & Credentials Scanner, Multi-Field Search, and Deep Diagnostic Instrumentation.")
 
 valid = load_valid()
 
@@ -597,7 +612,7 @@ if len(active_msgs) > 0:
             if msg["pins"]:
                 st.success(f"🔑 **Extracted PINs / Verification Codes:** {', '.join(msg['pins'])}")
             if msg.get("cards"):
-                st.warning(f"💳 **Detected Card Numbers:** {', '.join(msg['cards'])}")
+                st.warning(f"💳 **Detected Debit / Credit Card Details:** {', '.join(msg['cards'])}")
             if msg.get("creds"):
                 st.info(f"🔒 **Extracted Login/Credential Passwords:** {', '.join(msg['creds'])}")
             if msg["links"]:
@@ -698,11 +713,11 @@ if len(active_msgs) > 0:
             st.rerun()
 
 # -----------------------------------------------------------------------------
-# SEPARATE STANDALONE OTP / CREDENTIAL / CARD MESSAGE SCANNER ECOSYSTEM
+# SEPARATE STANDALONE OTP / DEBIT & CREDIT CARD / CREDENTIAL SCANNER ECOSYSTEM
 # -----------------------------------------------------------------------------
 st.markdown("---")
-with st.expander("🔑 Standalone OTP & Sensitive Data Scanner", expanded=True):
-    st.markdown("#### Dynamic OTP, Password, Card Details & Credential Scanner Controls")
+with st.expander("🔑 Standalone OTP, Debit/Credit Cards & Sensitive Data Scanner", expanded=True):
+    st.markdown("#### Dynamic OTP, Password, Debit & Credit Cards, Gift Cards & Credential Scanner Controls")
     
     otp_c1, otp_c2, otp_c3 = st.columns([2, 1, 1])
     
@@ -715,9 +730,9 @@ with st.expander("🔑 Standalone OTP & Sensitive Data Scanner", expanded=True):
             "Target Data Type Dropdown", 
             [
                 "All Security Categories", 
+                "Debit Card & Credit Card Details", 
                 "OTP Message & Verification", 
                 "Password / Reset Code", 
-                "Card Details & Payment", 
                 "Gift Cards", 
                 "ID Cards / Credentials", 
                 "Application Passwords", 
@@ -733,14 +748,14 @@ with st.expander("🔑 Standalone OTP & Sensitive Data Scanner", expanded=True):
     with t_col1:
         otp_auto_clean_toggle = st.toggle("Auto-Clean HTML & Boilerplate", value=True, key="otp_clean_toggle")
     with t_col2:
-        otp_deep_regex_chk = st.checkbox("Enable Deep Regex Code & Card Extraction", value=True, key="otp_regex_chk")
+        otp_deep_regex_chk = st.checkbox("Enable Deep Regex Code, Debit & Credit Card Extraction", value=True, key="otp_regex_chk")
 
     # Preset Keyword Mapping
     preset_keywords = {
-        "All Security Categories": "OTP password card gift payment credential login verification reset",
+        "All Security Categories": "OTP password debit credit card gift payment credential login verification reset",
+        "Debit Card & Credit Card Details": "debit card credit card cardholder cvv cvc exp expiry cardholder payment",
         "OTP Message & Verification": "OTP verification code verify auth token pin",
         "Password / Reset Code": "password reset passwd new password",
-        "Card Details & Payment": "card details cardholder credit debit cvv expire payment",
         "Gift Cards": "gift card claim code voucher redeem",
         "ID Cards / Credentials": "id card identity credentials account info",
         "Application Passwords": "app password application password token secret",
@@ -764,7 +779,7 @@ with st.expander("🔑 Standalone OTP & Sensitive Data Scanner", expanded=True):
                 else:
                     target_scope = [otp_scope_choice.replace("Folder: ", "")]
 
-                kw_to_use = otp_custom_keyword.strip() if otp_custom_keyword.strip() else preset_keywords.get(otp_scan_category, "OTP")
+                kw_to_use = otp_custom_keyword.strip() if otp_custom_keyword.strip() else preset_keywords.get(otp_scan_category, "card OTP")
 
                 with st.spinner(f"Scanning target folders ({len(target_scope)}) for security payload [{kw_to_use}]..."):
                     mail = open_mail(email, password, host, timeout=120)
@@ -775,7 +790,7 @@ with st.expander("🔑 Standalone OTP & Sensitive Data Scanner", expanded=True):
                     )
                     st.session_state.otp_messages = msgs
                     st.session_state.otp_current_page = 1
-                    otp_log(f"Scan complete. Retried {st.session_state.otp_total_matched_count} matching messages across {len(target_scope)} folders.")
+                    otp_log(f"Scan complete. Retrieved {st.session_state.otp_total_matched_count} matching messages across {len(target_scope)} folders.")
             except Exception as e:
                 st.error(str(e))
             finally:
@@ -783,7 +798,7 @@ with st.expander("🔑 Standalone OTP & Sensitive Data Scanner", expanded=True):
                     close_mail(mail)
 
     # Standalone Security / OTP Stream
-    st.markdown("#### 🔒 Standalone Security & OTP Message Stream")
+    st.markdown("#### 🔒 Standalone Security & Card Message Stream")
     otp_msgs = st.session_state.otp_messages
     otp_total = st.session_state.otp_total_matched_count or len(otp_msgs)
 
@@ -795,7 +810,7 @@ with st.expander("🔑 Standalone OTP & Sensitive Data Scanner", expanded=True):
 
         for idx, msg in enumerate(otp_msgs):
             status_icon = "📖" if msg["is_read"] else "📩"
-            bot_badge = " [🔐 SENSITIVE DATA DETECTED]" if (msg["pins"] or msg.get("cards") or msg.get("creds")) else ""
+            bot_badge = " [🔐 SENSITIVE DATA / CARD DETECTED]" if (msg["pins"] or msg.get("cards") or msg.get("creds")) else ""
             folder_badge = f" [{msg['folder']}]"
 
             with st.expander(f"{status_icon}{folder_badge} [{msg['date']}] {msg['from']} - {msg['subject']}{bot_badge}", expanded=False):
@@ -809,7 +824,7 @@ with st.expander("🔑 Standalone OTP & Sensitive Data Scanner", expanded=True):
                 if msg["pins"]:
                     st.success(f"🔑 **Extracted PINs / Verification Codes / OTPs:** {', '.join(msg['pins'])}")
                 if msg.get("cards"):
-                    st.warning(f"💳 **Detected Card Numbers / Payment Info:** {', '.join(msg['cards'])}")
+                    st.warning(f"💳 **Detected Debit & Credit Card Details:** {', '.join(msg['cards'])}")
                 if msg.get("creds"):
                     st.info(f"🔒 **Extracted Passwords / Credentials / App Passwords:** {', '.join(msg['creds'])}")
                 if msg["links"]:
@@ -889,7 +904,7 @@ with st.expander("🔑 Standalone OTP & Sensitive Data Scanner", expanded=True):
                     target_scope = [folder]
                 else:
                     target_scope = [otp_scope_choice.replace("Folder: ", "")]
-                kw_to_use = otp_custom_keyword.strip() if otp_custom_keyword.strip() else preset_keywords.get(otp_scan_category, "OTP")
+                kw_to_use = otp_custom_keyword.strip() if otp_custom_keyword.strip() else preset_keywords.get(otp_scan_category, "card OTP")
                 st.session_state.otp_messages = fetch_messages_paginated(
                     mail, email, password, host, target_scope, kw_to_use, otp_search_field, 
                     mode="SEARCH", page_size=page_size, page_number=st.session_state.otp_current_page, 
@@ -912,7 +927,7 @@ with st.expander("🔑 Standalone OTP & Sensitive Data Scanner", expanded=True):
                     target_scope = [folder]
                 else:
                     target_scope = [otp_scope_choice.replace("Folder: ", "")]
-                kw_to_use = otp_custom_keyword.strip() if otp_custom_keyword.strip() else preset_keywords.get(otp_scan_category, "OTP")
+                kw_to_use = otp_custom_keyword.strip() if otp_custom_keyword.strip() else preset_keywords.get(otp_scan_category, "card OTP")
                 st.session_state.otp_messages = fetch_messages_paginated(
                     mail, email, password, host, target_scope, kw_to_use, otp_search_field, 
                     mode="SEARCH", page_size=page_size, page_number=st.session_state.otp_current_page, 
@@ -921,7 +936,7 @@ with st.expander("🔑 Standalone OTP & Sensitive Data Scanner", expanded=True):
                 close_mail(mail)
                 st.rerun()
     else:
-        st.caption("No OTP / Sensitive security messages scanned yet. Select categories or keywords and click 'Execute Dedicated Security Scan'.")
+        st.caption("No Debit/Credit Card or OTP security messages scanned yet. Select categories or keywords and click 'Execute Dedicated Security Scan'.")
 
     # Standalone Diagnostic / Debug Screen for OTP Scanning Engine
     st.markdown("#### 🛠️ OTP Engine Debugging & Diagnose Log Screen")
