@@ -37,7 +37,7 @@ st.markdown(
     unsafe_allow_html=True
 )
 
-# Initialize Session State
+# Initialize Isolated Session State Variables
 if "mb_log" not in st.session_state:
     st.session_state.mb_log = []
 if "mb_folders" not in st.session_state:
@@ -74,6 +74,14 @@ if "otp_total_matched_count" not in st.session_state:
     st.session_state.otp_total_matched_count = 0
 if "bot_filter_mode" not in st.session_state:
     st.session_state.bot_filter_mode = False
+if "selected_account" not in st.session_state:
+    st.session_state.selected_account = "none"
+if "custom_email" not in st.session_state:
+    st.session_state.custom_email = ""
+if "custom_pass" not in st.session_state:
+    st.session_state.custom_pass = ""
+if "custom_host" not in st.session_state:
+    st.session_state.custom_host = ""
 
 
 def log(msg):
@@ -544,8 +552,8 @@ st.caption("Advanced IMAP Client with Interactive Bot Intelligence, Dedicated OT
 
 valid = load_valid()
 
-# Valid Account Selection Dropdown on Main Screen below Caption
-pick = st.selectbox("Valid account", valid or ["none"])
+# Valid Account Selection Dropdown on Main Screen bound to st.session_state
+pick = st.selectbox("Valid account", valid or ["none"], key="selected_account")
 
 # Sidebar Hub
 st.sidebar.header("Account & Connection Hub")
@@ -561,21 +569,25 @@ if valid:
         use_container_width=True
     )
 
-custom_email = st.sidebar.text_input("Email override")
-custom_pass = st.sidebar.text_input("Password override", type="password")
-override = st.sidebar.text_input("IMAP host override")
+st.sidebar.text_input("Email override", key="custom_email")
+st.sidebar.text_input("Password override", type="password", key="custom_pass")
+st.sidebar.text_input("IMAP host override", key="custom_host")
 
-if custom_email.strip():
-    email, password = custom_email.strip(), custom_pass.strip()
-elif ":" in pick:
-    email, password = pick.split(":", 1)
+# Resolve Email and Password Isolated per Session
+if st.session_state.custom_email.strip():
+    email = st.session_state.custom_email.strip()
+    password = st.session_state.custom_pass.strip()
+elif ":" in st.session_state.selected_account:
+    email, password = st.session_state.selected_account.split(":", 1)
 else:
     email, password = "", ""
+
+override = st.session_state.custom_host.strip()
 
 # Quick Refresh Inbox Control
 if st.sidebar.button("🔄 Refresh Inbox", type="secondary", use_container_width=True):
     if email and password:
-        host = override.strip() or st.session_state.mb_host or (host_list(email)[:1] or [""])[0]
+        host = override or st.session_state.mb_host or (host_list(email)[:1] or [""])[0]
         mail_obj = None
         try:
             with st.spinner("Refreshing Inbox..."):
@@ -606,7 +618,7 @@ if st.button("Connect & Discover Folders", type="primary", use_container_width=T
     if not email or not password:
         st.error("Need email and password")
     else:
-        hosts = [override.strip()] if override.strip() else host_list(email)
+        hosts = [override] if override else host_list(email)
         last, connected_host, folders, success = "no host", "", ["INBOX"], False
 
         with st.spinner("Connecting and discovering folders..."):
@@ -648,7 +660,7 @@ with col3:
 
 # Direct Folder Load Trigger
 if st.button("📂 Load Folder Messages", type="primary", use_container_width=True):
-    host = override.strip() or st.session_state.mb_host or (host_list(email)[:1] or [""])[0]
+    host = override or st.session_state.mb_host or (host_list(email)[:1] or [""])[0]
     if not email or not password or not host:
         st.error("Please connect and load folders first.")
     else:
@@ -718,7 +730,7 @@ if len(active_msgs) > 0:
             st.text_area("Cleaned Message Body", value=msg["body"], height=150, key=f"body_{msg['folder']}_{msg['id']}_{idx}")
 
             op_col1, op_col2, op_col3, op_col4 = st.columns(4)
-            host = override.strip() or st.session_state.mb_host or (host_list(email)[:1] or [""])[0]
+            host = override or st.session_state.mb_host or (host_list(email)[:1] or [""])[0]
             real_imap_folder = get_imap_path(msg['folder'])
 
             with op_col1:
@@ -778,7 +790,7 @@ if len(active_msgs) > 0:
     with p_col1:
         if st.button("Previous Page", disabled=(curr_p <= 1), use_container_width=True, key="msg_stream_prev"):
             st.session_state.current_page -= 1
-            host = override.strip() or st.session_state.mb_host or (host_list(email)[:1] or [""])[0]
+            host = override or st.session_state.mb_host or (host_list(email)[:1] or [""])[0]
             mail = open_mail(email, password, host, timeout=60)
             st.session_state.current_messages = fetch_messages_paginated(
                 mail, email, password, host, [folder], 
@@ -795,7 +807,7 @@ if len(active_msgs) > 0:
     with p_col3:
         if st.button("Next Page", disabled=(curr_p >= total_pages), use_container_width=True, key="msg_stream_next"):
             st.session_state.current_page += 1
-            host = override.strip() or st.session_state.mb_host or (host_list(email)[:1] or [""])[0]
+            host = override or st.session_state.mb_host or (host_list(email)[:1] or [""])[0]
             mail = open_mail(email, password, host, timeout=60)
             st.session_state.current_messages = fetch_messages_paginated(
                 mail, email, password, host, [folder], 
@@ -872,7 +884,7 @@ with st.expander("🔑 Standalone OTP, Debit/Credit Cards & Sensitive Data Scann
     otp_custom_keyword = st.text_input("Custom Keyword Override (Optional)", key="otp_custom_kw")
 
     if st.button("🚀 Execute Dedicated Security Scan", type="primary", use_container_width=True, key="otp_exec_btn"):
-        host = override.strip() or st.session_state.mb_host or (host_list(email)[:1] or [""])[0]
+        host = override or st.session_state.mb_host or (host_list(email)[:1] or [""])[0]
         if not email or not password or not host:
             st.error("Please connect and discover folders first.")
         elif not otp_scope_choice:
@@ -944,7 +956,7 @@ with st.expander("🔑 Standalone OTP, Debit/Credit Cards & Sensitive Data Scann
                 st.text_area("Message Payload Body", value=display_body, height=150, key=f"otp_b_{msg['folder']}_{msg['id']}_{idx}")
 
                 o_col1, o_col2, o_col3, o_col4 = st.columns(4)
-                host = override.strip() or st.session_state.mb_host or (host_list(email)[:1] or [""])[0]
+                host = override or st.session_state.mb_host or (host_list(email)[:1] or [""])[0]
                 real_imap_folder = get_imap_path(msg['folder'])
 
                 with o_col1:
@@ -1003,7 +1015,7 @@ with st.expander("🔑 Standalone OTP, Debit/Credit Cards & Sensitive Data Scann
         with op_c1:
             if st.button("Previous Page", disabled=(otp_curr_p <= 1), use_container_width=True, key="otp_prev_pg"):
                 st.session_state.otp_current_page -= 1
-                host = override.strip() or st.session_state.mb_host or (host_list(email)[:1] or [""])[0]
+                host = override or st.session_state.mb_host or (host_list(email)[:1] or [""])[0]
                 mail = open_mail(email, password, host, timeout=120)
                 target_scope = otp_scope_choice if otp_scope_choice else [folder]
                 if otp_custom_keyword.strip():
@@ -1025,7 +1037,7 @@ with st.expander("🔑 Standalone OTP, Debit/Credit Cards & Sensitive Data Scann
         with op_c3:
             if st.button("Next Page", disabled=(otp_curr_p >= otp_total_pages), use_container_width=True, key="otp_next_pg"):
                 st.session_state.otp_current_page += 1
-                host = override.strip() or st.session_state.mb_host or (host_list(email)[:1] or [""])[0]
+                host = override or st.session_state.mb_host or (host_list(email)[:1] or [""])[0]
                 mail = open_mail(email, password, host, timeout=120)
                 target_scope = otp_scope_choice if otp_scope_choice else [folder]
                 if otp_custom_keyword.strip():
@@ -1068,7 +1080,7 @@ with st.expander("🔍 Deep Keyword Search & Scope Filters", expanded=False):
     search_query_input = st.text_input("Search term or keyword", key="deep_search_query")
     
     if st.button("🔍 Execute Keyword Search", type="primary", use_container_width=True, key="deep_search_btn"):
-        host = override.strip() or st.session_state.mb_host or (host_list(email)[:1] or [""])[0]
+        host = override or st.session_state.mb_host or (host_list(email)[:1] or [""])[0]
         if not email or not password or not host:
             st.error("Please connect and load folders first.")
         elif not search_query_input.strip():
@@ -1131,7 +1143,7 @@ with st.expander("🔍 Deep Keyword Search & Scope Filters", expanded=False):
                 st.text_area("Cleaned Message Body", value=msg["body"], height=150, key=f"s_body_{msg['folder']}_{msg['id']}_{idx}")
 
                 s_op1, s_op2, s_op3, s_op4 = st.columns(4)
-                host = override.strip() or st.session_state.mb_host or (host_list(email)[:1] or [""])[0]
+                host = override or st.session_state.mb_host or (host_list(email)[:1] or [""])[0]
                 real_imap_folder = get_imap_path(msg['folder'])
 
                 with s_op1:
@@ -1191,7 +1203,7 @@ with st.expander("🔍 Deep Keyword Search & Scope Filters", expanded=False):
         with sp_col1:
             if st.button("Previous Page", disabled=(search_curr_p <= 1), use_container_width=True, key="s_prev_pg"):
                 st.session_state.search_current_page -= 1
-                host = override.strip() or st.session_state.mb_host or (host_list(email)[:1] or [""])[0]
+                host = override or st.session_state.mb_host or (host_list(email)[:1] or [""])[0]
                 mail = open_mail(email, password, host, timeout=120)
                 target_scope = search_scope_choice if search_scope_choice else [folder]
                 st.session_state.search_messages = fetch_messages_paginated(
@@ -1208,7 +1220,7 @@ with st.expander("🔍 Deep Keyword Search & Scope Filters", expanded=False):
         with sp_col3:
             if st.button("Next Page", disabled=(search_curr_p >= search_total_pages), use_container_width=True, key="s_next_pg"):
                 st.session_state.search_current_page += 1
-                host = override.strip() or st.session_state.mb_host or (host_list(email)[:1] or [""])[0]
+                host = override or st.session_state.mb_host or (host_list(email)[:1] or [""])[0]
                 mail = open_mail(email, password, host, timeout=120)
                 target_scope = search_scope_choice if search_scope_choice else [folder]
                 st.session_state.search_messages = fetch_messages_paginated(
@@ -1252,7 +1264,7 @@ with st.expander("🤖 Mass Bot Purge & Intelligence Hub", expanded=False):
     b_act1, b_act2 = st.columns(2)
     with b_act1:
         if st.button("🔍 Scan Folder For Bot/OTP/Telegram Messages", use_container_width=True):
-            host = override.strip() or st.session_state.mb_host or (host_list(email)[:1] or [""])[0]
+            host = override or st.session_state.mb_host or (host_list(email)[:1] or [""])[0]
             if not email or not password or not host:
                 st.error("Please connect first.")
             elif not bot_target_folder:
@@ -1283,7 +1295,7 @@ with st.expander("🤖 Mass Bot Purge & Intelligence Hub", expanded=False):
                 st.warning("No bot messages detected in current loaded stream to delete.")
             else:
                 st.session_state.bot_diag_logs = []
-                host = override.strip() or st.session_state.mb_host or (host_list(email)[:1] or [""])[0]
+                host = override or st.session_state.mb_host or (host_list(email)[:1] or [""])[0]
                 mail = None
                 try:
                     bot_log("🤖 [BOT ENGINE DIAGNOSTIC START] Initializing Mass Deletion Sequence...")
