@@ -544,9 +544,23 @@ st.caption("Advanced IMAP Client with Interactive Bot Intelligence, Dedicated OT
 
 valid = load_valid()
 
+# Valid Account Selection Dropdown on Main Screen below Caption
+pick = st.selectbox("Valid account", valid or ["none"])
+
 # Sidebar Hub
 st.sidebar.header("Account & Connection Hub")
-pick = st.sidebar.selectbox("Valid account", valid or ["none"])
+
+# Download Button for Valid Mail List in Slide Out Sidebar
+if valid:
+    valid_text_data = "\n".join(valid)
+    st.sidebar.download_button(
+        label="📥 Download Valid Mail List",
+        data=valid_text_data,
+        file_name="valid_accounts.txt",
+        mime="text/plain",
+        use_container_width=True
+    )
+
 custom_email = st.sidebar.text_input("Email override")
 custom_pass = st.sidebar.text_input("Password override", type="password")
 override = st.sidebar.text_input("IMAP host override")
