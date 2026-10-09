@@ -601,7 +601,8 @@ if email and password:
     st.sidebar.markdown(f"[Open Webmail Portal]({portal_url})", unsafe_allow_html=True)
     st.sidebar.text_input("Copy Credentials", value=f"{email}:{password}")
 
-if st.sidebar.button("Connect & Discover Folders", type="primary", use_container_width=True):
+# Connect & Discover Folders button under Valid Account dropdown on main screen
+if st.button("Connect & Discover Folders", type="primary", use_container_width=True):
     if not email or not password:
         st.error("Need email and password")
     else:
@@ -627,9 +628,9 @@ if st.sidebar.button("Connect & Discover Folders", type="primary", use_container
             st.session_state.mb_host = connected_host
             st.session_state.mb_folders = folders
             log(f"Discovered {len(folders)} folders via {connected_host}")
-            st.sidebar.success(f"Connected: {connected_host} ({len(folders)} folders)")
+            st.success(f"Connected: {connected_host} ({len(folders)} folders)")
         else:
-            st.sidebar.error(last)
+            st.error(last)
 
 # Debug Expander for Discovery
 if st.session_state.folder_debug_logs:
