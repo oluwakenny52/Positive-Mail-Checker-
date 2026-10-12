@@ -52,6 +52,8 @@ if "search_current_page" not in st.session_state:
     st.session_state.search_current_page = 1
 if "otp_current_page" not in st.session_state:
     st.session_state.otp_current_page = 1
+if "bot_current_page" not in st.session_state:
+    st.session_state.bot_current_page = 1
 if "folder_debug_logs" not in st.session_state:
     st.session_state.folder_debug_logs = []
 if "bot_diag_logs" not in st.session_state:
@@ -418,14 +420,13 @@ def clean_boilerplate(text):
 
 
 def execute_imap_search_safely(mail, field_cmd: str, query_term: str, log_func):
-    """Robust IMAP search strategy engine that avoids socket EOF errors."""
+    """Robust IMAP search strategy engine that avoids socket EOF errors and correctly falls back."""
     log_func(f"  ├─ [SEARCH STRATEGY 1] Trying: mail.search(None, '{field_cmd}', '{query_term}')")
     try:
         typ, data = mail.search(None, field_cmd, query_term)
         if typ == "OK":
             log_func(f"  │   └─ ✅ Strategy 1 Successful! Response: {data}")
             return typ, data
-        log_func(f"  │   └─ ⚠️ Strategy 1 Status: '{typ}'. Trying Strategy 2...")
     except (socket.error, OSError, imaplib.IMAP4.error) as ex1:
         log_func(f"  │   └─ ⚠️ Strategy 1 Failed: {ex1}. Trying Strategy 2...")
 
@@ -435,7 +436,6 @@ def execute_imap_search_safely(mail, field_cmd: str, query_term: str, log_func):
         if typ == "OK":
             log_func(f"  │   └─ ✅ Strategy 2 Successful! Response: {data}")
             return typ, data
-        log_func(f"  │   └─ ⚠️ Strategy 2 Status: '{typ}'. Trying Strategy 3...")
     except (socket.error, OSError, imaplib.IMAP4.error) as ex2:
         log_func(f"  │   └─ ⚠️ Strategy 2 Failed: {ex2}. Trying Strategy 3...")
 
@@ -446,7 +446,6 @@ def execute_imap_search_safely(mail, field_cmd: str, query_term: str, log_func):
         if typ == "OK":
             log_func(f"  │   └─ ✅ Strategy 3 Successful! Response: {data}")
             return typ, data
-        log_func(f"  │   └─ ⚠️ Strategy 3 Status: '{typ}'. Trying Strategy 4...")
     except (socket.error, OSError, imaplib.IMAP4.error) as ex3:
         log_func(f"  │   └─ ⚠️ Strategy 3 Failed: {ex3}. Trying Strategy 4...")
 
@@ -457,11 +456,10 @@ def execute_imap_search_safely(mail, field_cmd: str, query_term: str, log_func):
         if typ == "OK":
             log_func(f"  │   └─ ✅ Strategy 4 Successful! Response: {data}")
             return typ, data
-        log_func(f"  │   └─ ⚠️ Strategy 4 Failed. Engaging Strategy 5 Client-Side Fallback...")
     except (socket.error, OSError, imaplib.IMAP4.error) as ex4:
         log_func(f"  │   └─ ⚠️ Strategy 4 Failed: {ex4}. Engaging Strategy 5 Fallback...")
 
-    # Strategy 5: Client-Side Engine Fallback (Fetches ALL and filters locally without dropping sockets)
+    # Strategy 5: Client-Side Engine Fallback (Fetches ALL and filters locally via robust envelope/body check)
     log_func("  ├─ [SEARCH STRATEGY 5 - ENGINE FALLBACK] Fetching ALL Message IDs for local regex filter...")
     try:
         typ, data = mail.search(None, "ALL")
@@ -546,7 +544,6 @@ def fetch_messages_paginated(mail, email_addr, password_val, host_val, target_fo
             if sort_order == "Newest First":
                 ids = list(reversed(ids))
 
-            # Correctly compute total server count for folder pagination
             folder_total_count = len(ids)
 
             start_idx = (page_number - 1) * page_size
@@ -633,7 +630,7 @@ def fetch_messages_paginated(mail, email_addr, password_val, host_val, target_fo
                     f"Flags: {flags_str} | Categories={detected_categories} | Pins={pins} | Cards={cards}"
                 )
 
-            total_matched_all_folders += (folder_total_count if (is_fallback_mode or clean_query) else folder_total_count)
+            total_matched_all_folders += folder_total_count
             log_func(f"  ├─ [MATCHES COUNT] Verified {folder_matches_count} matching messages in '{f_label}'.")
 
         except (socket.timeout, TimeoutError):
@@ -659,10 +656,8 @@ st.caption("Advanced IMAP Client with Interactive Bot Intelligence, Dedicated OT
 
 valid = load_valid()
 
-# Valid Account Selection Dropdown on Main Screen bound to st.session_state
 pick = st.selectbox("Valid account", valid or ["none"], key="selected_account")
 
-# Sidebar Hub
 st.sidebar.header("Account & Connection Hub")
 
 if valid:
@@ -943,6 +938,9 @@ with st.expander("🔑 Standalone OTP, Debit/Credit Cards & Sensitive Data Scann
     with otp_c3:
         otp_search_field = st.selectbox("Scan Field", ["TEXT", "SUBJECT", "BODY", "FROM"], key="otp_search_field")
 
+    # Independent Page Size Slider for OTP Scanner
+    otp_page_size = st.slider("OTP Scanner Results Page Size", 5, 50, 15, key="otp_page_size_slider")
+
     t_col1, t_col2 = st.columns(2)
     with t_col1:
         otp_auto_clean_toggle = st.toggle("Auto-Clean HTML & Boilerplate", value=True, key="otp_clean_toggle")
@@ -985,7 +983,7 @@ with st.expander("🔑 Standalone OTP, Debit/Credit Cards & Sensitive Data Scann
                     mail = open_mail(email, password, host, timeout=120)
                     msgs = fetch_messages_paginated(
                         mail, email, password, host, target_scope, kw_to_use, otp_search_field,
-                        mode="SEARCH", page_size=page_size, page_number=1, sort_order=sort_order,
+                        mode="SEARCH", page_size=otp_page_size, page_number=1, sort_order=sort_order,
                         log_target="OTP"
                     )
                     st.session_state.otp_messages = msgs
@@ -1002,7 +1000,7 @@ with st.expander("🔑 Standalone OTP, Debit/Credit Cards & Sensitive Data Scann
     otp_total = st.session_state.otp_total_matched_count or len(otp_msgs)
 
     if len(otp_msgs) > 0:
-        otp_total_pages = max(1, math.ceil(otp_total / page_size))
+        otp_total_pages = max(1, math.ceil(otp_total / otp_page_size))
         otp_curr_p = st.session_state.otp_current_page
         
         st.markdown(f"**Showing Page {otp_curr_p} of {otp_total_pages} (Total Security Matches: {otp_total})**")
@@ -1109,7 +1107,7 @@ with st.expander("🔑 Standalone OTP, Debit/Credit Cards & Sensitive Data Scann
                     kw_to_use = " ".join(selected_kws) if selected_kws else "card OTP debit telegram blacklist"
                 st.session_state.otp_messages = fetch_messages_paginated(
                     mail, email, password, host, target_scope, kw_to_use, otp_search_field, 
-                    mode="SEARCH", page_size=page_size, page_number=st.session_state.otp_current_page, 
+                    mode="SEARCH", page_size=otp_page_size, page_number=st.session_state.otp_current_page, 
                     sort_order=sort_order, log_target="OTP"
                 )
                 close_mail(mail)
@@ -1131,7 +1129,7 @@ with st.expander("🔑 Standalone OTP, Debit/Credit Cards & Sensitive Data Scann
                     kw_to_use = " ".join(selected_kws) if selected_kws else "card OTP debit telegram blacklist"
                 st.session_state.otp_messages = fetch_messages_paginated(
                     mail, email, password, host, target_scope, kw_to_use, otp_search_field, 
-                    mode="SEARCH", page_size=page_size, page_number=st.session_state.otp_current_page, 
+                    mode="SEARCH", page_size=otp_page_size, page_number=st.session_state.otp_current_page, 
                     sort_order=sort_order, log_target="OTP"
                 )
                 close_mail(mail)
@@ -1161,6 +1159,9 @@ with st.expander("🔍 Deep Keyword Search & Scope Filters", expanded=False):
     
     search_query_input = st.text_input("Search term or keyword", key="deep_search_query")
     
+    # Independent Page Size Slider for Search
+    search_page_size = st.slider("Search Results Page Size", 5, 50, 15, key="search_page_size_slider")
+    
     if st.button("🔍 Execute Keyword Search", type="primary", use_container_width=True, key="deep_search_btn"):
         host = override or st.session_state.mb_host or (host_list(email)[:1] or [""])[0]
         if not email or not password or not host:
@@ -1177,7 +1178,7 @@ with st.expander("🔍 Deep Keyword Search & Scope Filters", expanded=False):
                     mail = open_mail(email, password, host, timeout=120)
                     msgs = fetch_messages_paginated(
                         mail, email, password, host, target_scope, search_query_input, search_field_choice, 
-                        mode="SEARCH", page_size=page_size, page_number=1, sort_order=sort_order,
+                        mode="SEARCH", page_size=search_page_size, page_number=1, sort_order=sort_order,
                         log_target="SEARCH"
                     )
                     st.session_state.search_messages = msgs
@@ -1194,7 +1195,7 @@ with st.expander("🔍 Deep Keyword Search & Scope Filters", expanded=False):
     search_total_msgs = st.session_state.search_total_matched_count or len(search_msgs)
 
     if len(search_msgs) > 0:
-        search_total_pages = max(1, math.ceil(search_total_msgs / page_size))
+        search_total_pages = max(1, math.ceil(search_total_msgs / search_page_size))
         search_curr_p = st.session_state.search_current_page
         
         st.markdown(f"**Showing Page {search_curr_p} of {search_total_pages} (Total Matches Found: {search_total_msgs})**")
@@ -1292,7 +1293,7 @@ with st.expander("🔍 Deep Keyword Search & Scope Filters", expanded=False):
                 target_scope = search_scope_choice if search_scope_choice else [folder]
                 st.session_state.search_messages = fetch_messages_paginated(
                     mail, email, password, host, target_scope, search_query_input, search_field_choice, 
-                    mode="SEARCH", page_size=page_size, page_number=st.session_state.search_current_page, 
+                    mode="SEARCH", page_size=search_page_size, page_number=st.session_state.search_current_page, 
                     sort_order=sort_order, log_target="SEARCH"
                 )
                 close_mail(mail)
@@ -1309,7 +1310,7 @@ with st.expander("🔍 Deep Keyword Search & Scope Filters", expanded=False):
                 target_scope = search_scope_choice if search_scope_choice else [folder]
                 st.session_state.search_messages = fetch_messages_paginated(
                     mail, email, password, host, target_scope, search_query_input, search_field_choice, 
-                    mode="SEARCH", page_size=page_size, page_number=st.session_state.search_current_page, 
+                    mode="SEARCH", page_size=search_page_size, page_number=st.session_state.search_current_page, 
                     sort_order=sort_order, log_target="SEARCH"
                 )
                 close_mail(mail)
@@ -1339,6 +1340,9 @@ with st.expander("🤖 Mass Bot Purge & Intelligence Hub", expanded=False):
     with bot_col2:
         bot_scan_limit = st.selectbox("Bot Scan Depth", [50, 100, 200, 500], index=1)
 
+    # Independent Page Size Slider for Bot Stream
+    bot_page_size = st.slider("Bot Stream Results Page Size", 5, 50, 15, key="bot_page_size_slider")
+
     b_act1, b_act2 = st.columns(2)
     with b_act1:
         if st.button("🔍 Scan Folder For Bot/OTP/Telegram Messages", use_container_width=True):
@@ -1360,6 +1364,7 @@ with st.expander("🤖 Mass Bot Purge & Intelligence Hub", expanded=False):
                         )
                         st.session_state.current_messages = msgs
                         st.session_state.bot_filter_mode = True
+                        st.session_state.bot_current_page = 1
                         st.success("Scan complete. Displaying detected bot/Telegram messages.")
                 except Exception as ex:
                     st.error(str(ex))
@@ -1402,10 +1407,33 @@ with st.expander("🤖 Mass Bot Purge & Intelligence Hub", expanded=False):
 
     st.markdown("#### 📱 Detected Bot Message Preview Screen")
     if all_loaded_bot_msgs:
-        for idx, bm in enumerate(all_loaded_bot_msgs, 1):
+        bot_total_pages = max(1, math.ceil(len(all_loaded_bot_msgs) / bot_page_size))
+        bot_curr_p = min(st.session_state.bot_current_page, bot_total_pages)
+        st.session_state.bot_current_page = bot_curr_p
+        
+        start_idx = (bot_curr_p - 1) * bot_page_size
+        end_idx = start_idx + bot_page_size
+        paged_bot_msgs = all_loaded_bot_msgs[start_idx:end_idx]
+
+        st.markdown(f"**Showing Bot Page {bot_curr_p} of {bot_total_pages} ({len(all_loaded_bot_msgs)} Total Detected Bots)**")
+
+        for idx, bm in enumerate(paged_bot_msgs, start_idx + 1):
             st.markdown(f"**[{idx}] [{bm['folder']}]** `{bm['from']}` — **{bm['subject']}** (ID: `{bm['id']}`) ")
             if bm["pins"]:
                 st.info(f"🔑 PINs detected: {', '.join(bm['pins'])}")
+
+        st.markdown("---")
+        bp_c1, bp_c2, bp_c3 = st.columns([1, 2, 1])
+        with bp_c1:
+            if st.button("Previous Bot Page", disabled=(bot_curr_p <= 1), use_container_width=True, key="bot_prev_pg"):
+                st.session_state.bot_current_page -= 1
+                st.rerun()
+        with bp_c2:
+            st.markdown(f"<h4 style='text-align: center; margin: 0;'>Page {bot_curr_p} of {bot_total_pages}</h4>", unsafe_allow_html=True)
+        with bp_c3:
+            if st.button("Next Bot Page", disabled=(bot_curr_p >= bot_total_pages), use_container_width=True, key="bot_next_pg"):
+                st.session_state.bot_current_page += 1
+                st.rerun()
     else:
         st.caption("No bot messages currently loaded in session memory.")
 
