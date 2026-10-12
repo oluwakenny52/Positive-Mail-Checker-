@@ -310,28 +310,48 @@ def is_extortion_spam(subject: str, body: str, frm: str = "") -> bool:
     return any(kw in combined for kw in extortion_keywords)
 
 
-def is_bot_message(subject, body, frm=""):
+def detect_specific_categories(subject: str, body: str, frm: str = "", pins=None, cards=None, creds=None) -> List[str]:
+    """Precisely detects email category type tags instead of dumping a static combined string."""
     if is_extortion_spam(subject, body, frm):
-        return False
+        return []
 
-    # Multilingual bot keywords: English, Chinese, Russian, German, French, Spanish, Japanese, Arabic
-    bot_keywords = [
-        "otp", "verification", "verify", "security alert", "password reset",
-        "code", "confirm", "login", "auth", "signin", "token", "activation",
-        "mcafee", "iptv", "lot", "credential", 
-        "application password", "cvv", "exp date", "debit", "bank debit", "online purchase",
-        "tracking number", "order tracking", "purchase order", "purchase confirmation",
-        "telegram", "tg", "t.me", "telegram notification", "telegram alert", "telegram code",
-        "blacklist", "blacklisted", "banned", "blocked", "spam list", "denylist",
-        "验证码", "动态密码", "安全验证", "密码重置", "登录提醒", "扣款", "银行卡", "订单",
-        "код", "пароль", "подтверждение", "списание", "карта",
-        "bestätigung", "passwort", "verifizierung",
-        "vérification", "mot de passe",
-        "código", "verificación", "contraseña", "débito",
-        "認証", "パスワード", "コード", "رمز", "تأكيد"
-    ]
+    categories = []
     combined = f"{subject} {body} {frm}".lower()
-    return any(kw in combined for kw in bot_keywords)
+    pins = pins or []
+    cards = cards or []
+    creds = creds or []
+
+    # 1. Precise OTP / Verification Code Check
+    otp_kws = ["otp", "verification", "verify", "verification code", "auth code", "confirm code", "pin", "security code", "验证码", "动态密码", "код", "код подтверждения", "código"]
+    if pins or any(kw in combined for kw in otp_kws):
+        categories.append("🔑 OTP / CODE")
+
+    # 2. Telegram Specific Check
+    tg_kws = ["telegram", "t.me", "tg", "telegram code", "telegram notification", "telegram alert"]
+    if any(kw in combined for kw in tg_kws):
+        categories.append("📱 TELEGRAM")
+
+    # 3. Blacklist / Ban / Blocked Check
+    bl_kws = ["blacklist", "blacklisted", "banned", "blocked", "spam list", "denylist", "黑名单", "封禁"]
+    if any(kw in combined for kw in bl_kws):
+        categories.append("🚫 BLACKLIST / BAN")
+
+    # 4. Debit / Credit Card Details Check
+    card_kws = ["cvv", "exp date", "debit", "bank debit", "online purchase", "card ending", "debited by", "debit alert", "银行卡", "扣款"]
+    if cards or any(kw in combined for kw in card_kws):
+        categories.append("💳 CARD / DEBIT")
+
+    # 5. General Bot / System Auth Check
+    gen_bot_kws = ["password reset", "security alert", "mcafee", "credential", "application password", "tracking number", "purchase order", "po #"]
+    if creds or (not categories and any(kw in combined for kw in gen_bot_kws)):
+        categories.append("🤖 BOT MSG")
+
+    return categories
+
+
+def is_bot_message(subject, body, frm=""):
+    cats = detect_specific_categories(subject, body, frm)
+    return len(cats) > 0
 
 
 def extract_pins_and_links(text):
@@ -600,7 +620,10 @@ def fetch_messages_paginated(mail, email_addr, password_val, host_val, target_fo
                 cleaned_body = clean_boilerplate(body_text)
                 pins, links = extract_pins_and_links(body_text)
                 cards, creds = extract_credentials_and_cards(body_text)
-                is_bot = is_bot_message(subject, body_text, frm)
+                
+                # Precise Category Badges Detection
+                detected_categories = detect_specific_categories(subject, body_text, frm, pins, cards, creds)
+                is_bot = len(detected_categories) > 0
 
                 folder_matches_count += 1
                 messages.append({
@@ -612,6 +635,7 @@ def fetch_messages_paginated(mail, email_addr, password_val, host_val, target_fo
                     "date": date_val,
                     "is_read": is_read,
                     "is_bot": is_bot,
+                    "categories": detected_categories,
                     "body": cleaned_body,
                     "pins": pins,
                     "links": links,
@@ -626,7 +650,7 @@ def fetch_messages_paginated(mail, email_addr, password_val, host_val, target_fo
                 log_func(
                     f"  │   ├─ [Msg #{idx} | ID: {mid.decode()}] Parsed in {fetch_elapsed}ms | Size: {len(raw_msg_bytes)}B | "
                     f"From: '{frm}' | To: '{to_hdr}' | Subject: '{subject}' | "
-                    f"Flags: {flags_str} | BotDetected={is_bot} | Pins={pins} | Cards={cards}"
+                    f"Flags: {flags_str} | Categories={detected_categories} | Pins={pins} | Cards={cards}"
                 )
 
             total_matched_all_folders += folder_matches_count
@@ -786,7 +810,7 @@ if st.button("📂 Load Folder Messages", type="primary", use_container_width=Tr
                 close_mail(mail)
 
 # -----------------------------------------------------------------------------
-# MAIN MESSAGE STREAM
+# MAIN MESSAGE STREAM (NOW INSIDE COLLAPSIBLE DROPDOWN)
 # -----------------------------------------------------------------------------
 if st.session_state.bot_filter_mode:
     active_msgs = [m for m in st.session_state.current_messages if m["is_bot"]]
@@ -802,126 +826,132 @@ if len(active_msgs) > 0:
     total_pages = max(1, math.ceil(total_msgs / page_size))
     curr_p = st.session_state.current_page
     
-    st.markdown("### ✉️ Message Stream")
-    st.markdown(f"**Showing Page {curr_p} of {total_pages} (Total Server Matches: {total_msgs})**")
+    # Wrapped inside dropdown expander (expanded=False by default)
+    with st.expander(f"✉️ Main Message Stream — Page {curr_p} of {total_pages} ({total_msgs} Total Matches)", expanded=False):
+        st.markdown(f"**Showing Page {curr_p} of {total_pages} (Total Server Matches: {total_msgs})**")
 
-    for idx, msg in enumerate(active_msgs):
-        status_icon = "📖" if msg["is_read"] else "📩"
-        bot_badge = " [🤖 BOT/OTP/TELEGRAM/BLACKLIST]" if msg["is_bot"] else ""
-        folder_badge = f" [{msg['folder']}]"
+        for idx, msg in enumerate(active_msgs):
+            status_icon = "📖" if msg["is_read"] else "📩"
+            
+            # Precise Category Badge Rendering
+            cat_list = msg.get("categories", [])
+            cat_badge = f" [{' '.join(cat_list)}]" if cat_list else ""
+            folder_badge = f" [{msg['folder']}]"
 
-        with st.expander(f"{status_icon}{folder_badge} [{msg['date']}] {msg['from']} - {msg['subject']}{bot_badge}", expanded=False):
-            st.write(f"**Folder:** {msg['folder']}")
-            st.write(f"**From:** {msg['from']}")
-            st.write(f"**To:** {msg['to']}")
-            st.write(f"**Subject:** {msg['subject']}")
-            st.write(f"**Date:** {msg['date']}")
-            st.write(f"**IMAP Message ID:** {msg['id']} | **Size:** {msg['size_bytes']} bytes")
+            with st.expander(f"{status_icon}{folder_badge} [{msg['date']}] {msg['from']} - {msg['subject']}{cat_badge}", expanded=False):
+                st.write(f"**Folder:** {msg['folder']}")
+                st.write(f"**From:** {msg['from']}")
+                st.write(f"**To:** {msg['to']}")
+                st.write(f"**Subject:** {msg['subject']}")
+                st.write(f"**Date:** {msg['date']}")
+                st.write(f"**IMAP Message ID:** {msg['id']} | **Size:** {msg['size_bytes']} bytes")
 
-            if msg["pins"]:
-                st.success(f"🔑 **Extracted PINs / Verification Codes:** {', '.join(msg['pins'])}")
-            if msg.get("cards"):
-                st.warning(f"💳 **Detected Debit / Credit Card / Transaction Details:** {', '.join(msg['cards'])}")
-            if msg.get("creds"):
-                st.info(f"🔒 **Extracted Login/Credential Passwords:** {', '.join(msg['creds'])}")
-            if msg["links"]:
-                st.markdown("🔗 **Actionable Verification Links:**")
-                for link in msg["links"]:
-                    st.markdown(f"- [{link}]({link})", unsafe_allow_html=True)
+                if msg.get("categories"):
+                    st.info(f"🏷️ **Detected Classifications:** {' | '.join(msg['categories'])}")
+                if msg["pins"]:
+                    st.success(f"🔑 **Extracted PINs / Verification Codes:** {', '.join(msg['pins'])}")
+                if msg.get("cards"):
+                    st.warning(f"💳 **Detected Debit / Credit Card / Transaction Details:** {', '.join(msg['cards'])}")
+                if msg.get("creds"):
+                    st.info(f"🔒 **Extracted Login/Credential Passwords:** {', '.join(msg['creds'])}")
+                if msg["links"]:
+                    st.markdown("🔗 **Actionable Verification Links:**")
+                    for link in msg["links"]:
+                        st.markdown(f"- [{link}]({link})", unsafe_allow_html=True)
 
-            st.markdown("---")
-            st.text_area("Cleaned Message Body", value=msg["body"], height=150, key=f"body_{msg['folder']}_{msg['id']}_{idx}")
+                st.markdown("---")
+                st.text_area("Cleaned Message Body", value=msg["body"], height=150, key=f"body_{msg['folder']}_{msg['id']}_{idx}")
 
-            op_col1, op_col2, op_col3, op_col4 = st.columns(4)
-            host = override or st.session_state.mb_host or (host_list(email)[:1] or [""])[0]
-            real_imap_folder = get_imap_path(msg['folder'])
-            real_imap_encoded = encode_imap_utf7(real_imap_folder)
+                op_col1, op_col2, op_col3, op_col4 = st.columns(4)
+                host = override or st.session_state.mb_host or (host_list(email)[:1] or [""])[0]
+                real_imap_folder = get_imap_path(msg['folder'])
+                real_imap_encoded = encode_imap_utf7(real_imap_folder)
 
-            with op_col1:
-                if not msg["is_read"]:
-                    if st.button("Mark as Read", key=f"read_{msg['folder']}_{msg['id']}_{idx}"):
+                with op_col1:
+                    if not msg["is_read"]:
+                        if st.button("Mark as Read", key=f"read_{msg['folder']}_{msg['id']}_{idx}"):
+                            try:
+                                m_client = open_mail(email, password, host, timeout=60)
+                                m_client.select(f'"{real_imap_encoded}"', readonly=False)
+                                m_client.store(msg["id"], '+FLAGS', '\\Seen')
+                                close_mail(m_client)
+                                msg["is_read"] = True
+                                st.success("Marked as read!")
+                                st.rerun()
+                            except Exception as ex:
+                                st.error(str(ex))
+
+                with op_col2:
+                    target_move = st.selectbox("Move to", st.session_state.mb_folders, key=f"mv_sel_{msg['folder']}_{msg['id']}_{idx}")
+                    if st.button("Move Message", key=f"mv_btn_{msg['folder']}_{msg['id']}_{idx}"):
                         try:
+                            real_target_path = get_imap_path(target_move)
+                            real_target_encoded = encode_imap_utf7(real_target_path)
                             m_client = open_mail(email, password, host, timeout=60)
                             m_client.select(f'"{real_imap_encoded}"', readonly=False)
-                            m_client.store(msg["id"], '+FLAGS', '\\Seen')
+                            m_client.copy(msg["id"], f'"{real_target_encoded}"')
+                            m_client.store(msg["id"], '+FLAGS', '\\Deleted')
+                            m_client.expunge()
                             close_mail(m_client)
-                            msg["is_read"] = True
-                            st.success("Marked as read!")
+                            st.session_state.current_messages.remove(msg)
+                            st.success(f"Moved to {target_move}!")
                             st.rerun()
                         except Exception as ex:
                             st.error(str(ex))
 
-            with op_col2:
-                target_move = st.selectbox("Move to", st.session_state.mb_folders, key=f"mv_sel_{msg['folder']}_{msg['id']}_{idx}")
-                if st.button("Move Message", key=f"mv_btn_{msg['folder']}_{msg['id']}_{idx}"):
-                    try:
-                        real_target_path = get_imap_path(target_move)
-                        real_target_encoded = encode_imap_utf7(real_target_path)
-                        m_client = open_mail(email, password, host, timeout=60)
-                        m_client.select(f'"{real_imap_encoded}"', readonly=False)
-                        m_client.copy(msg["id"], f'"{real_target_encoded}"')
-                        m_client.store(msg["id"], '+FLAGS', '\\Deleted')
-                        m_client.expunge()
-                        close_mail(m_client)
-                        st.session_state.current_messages.remove(msg)
-                        st.success(f"Moved to {target_move}!")
-                        st.rerun()
-                    except Exception as ex:
-                        st.error(str(ex))
+                with op_col3:
+                    del_label = "Delete Bot Msg" if msg["is_bot"] else "Delete Message"
+                    if st.button(del_label, key=f"del_{msg['folder']}_{msg['id']}_{idx}", type="primary" if msg["is_bot"] else "secondary"):
+                        try:
+                            m_client = open_mail(email, password, host, timeout=60)
+                            m_client.select(f'"{real_imap_encoded}"', readonly=False)
+                            m_client.store(msg["id"], '+FLAGS', '\\Deleted')
+                            m_client.expunge()
+                            close_mail(m_client)
+                            st.session_state.current_messages.remove(msg)
+                            st.success("Deleted message!")
+                            st.rerun()
+                        except Exception as ex:
+                            st.error(str(ex))
 
-            with op_col3:
-                del_label = "Delete Bot Msg" if msg["is_bot"] else "Delete Message"
-                if st.button(del_label, key=f"del_{msg['folder']}_{msg['id']}_{idx}", type="primary" if msg["is_bot"] else "secondary"):
-                    try:
-                        m_client = open_mail(email, password, host, timeout=60)
-                        m_client.select(f'"{real_imap_encoded}"', readonly=False)
-                        m_client.store(msg["id"], '+FLAGS', '\\Deleted')
-                        m_client.expunge()
-                        close_mail(m_client)
-                        st.session_state.current_messages.remove(msg)
-                        st.success("Deleted message!")
-                        st.rerun()
-                    except Exception as ex:
-                        st.error(str(ex))
+                with op_col4:
+                    with st.popover("View Raw RFC822"):
+                        st.code(msg["raw"].decode("utf-8", errors="ignore"))
 
-            with op_col4:
-                with st.popover("View Raw RFC822"):
-                    st.code(msg["raw"].decode("utf-8", errors="ignore"))
+        # Pagination Controls Bar
+        st.markdown("---")
+        p_col1, p_col2, p_col3 = st.columns([1, 2, 1])
 
-    # Pagination Controls Bar
-    st.markdown("---")
-    p_col1, p_col2, p_col3 = st.columns([1, 2, 1])
+        with p_col1:
+            if st.button("Previous Page", disabled=(curr_p <= 1), use_container_width=True, key="msg_stream_prev"):
+                st.session_state.current_page -= 1
+                host = override or st.session_state.mb_host or (host_list(email)[:1] or [""])[0]
+                mail = open_mail(email, password, host, timeout=60)
+                st.session_state.current_messages = fetch_messages_paginated(
+                    mail, email, password, host, [folder], 
+                    mode="FOLDER_ONLY",
+                    page_size=page_size, page_number=st.session_state.current_page, sort_order=sort_order,
+                    log_target="DEBUG"
+                )
+                close_mail(mail)
+                st.rerun()
 
-    with p_col1:
-        if st.button("Previous Page", disabled=(curr_p <= 1), use_container_width=True, key="msg_stream_prev"):
-            st.session_state.current_page -= 1
-            host = override or st.session_state.mb_host or (host_list(email)[:1] or [""])[0]
-            mail = open_mail(email, password, host, timeout=60)
-            st.session_state.current_messages = fetch_messages_paginated(
-                mail, email, password, host, [folder], 
-                mode="FOLDER_ONLY",
-                page_size=page_size, page_number=st.session_state.current_page, sort_order=sort_order,
-                log_target="DEBUG"
-            )
-            close_mail(mail)
-            st.rerun()
+        with p_col2:
+            st.markdown(f"<h4 style='text-align: center; margin: 0;'>Page {curr_p} of {total_pages}</h4>", unsafe_allow_html=True)
 
-    with p_col2:
-        st.markdown(f"<h4 style='text-align: center; margin: 0;'>Page {curr_p} of {total_pages}</h4>", unsafe_allow_html=True)
-
-    with p_col3:
-        if st.button("Next Page", disabled=(curr_p >= total_pages), use_container_width=True, key="msg_stream_next"):
-            st.session_state.current_page += 1
-            host = override or st.session_state.mb_host or (host_list(email)[:1] or [""])[0]
-            mail = open_mail(email, password, host, timeout=60)
-            st.session_state.current_messages = fetch_messages_paginated(
-                mail, email, password, host, [folder], 
-                mode="FOLDER_ONLY",
-                page_size=page_size, page_number=st.session_state.current_page, sort_order=sort_order,
-                log_target="DEBUG"
-            )
-            close_mail(mail)
-            st.rerun()
+        with p_col3:
+            if st.button("Next Page", disabled=(curr_p >= total_pages), use_container_width=True, key="msg_stream_next"):
+                st.session_state.current_page += 1
+                host = override or st.session_state.mb_host or (host_list(email)[:1] or [""])[0]
+                mail = open_mail(email, password, host, timeout=60)
+                st.session_state.current_messages = fetch_messages_paginated(
+                    mail, email, password, host, [folder], 
+                    mode="FOLDER_ONLY",
+                    page_size=page_size, page_number=st.session_state.current_page, sort_order=sort_order,
+                    log_target="DEBUG"
+                )
+                close_mail(mail)
+                st.rerun()
 
 # -----------------------------------------------------------------------------
 # SEPARATE STANDALONE OTP / DEBIT & CREDIT CARD / CREDENTIAL SCANNER ECOSYSTEM
@@ -1035,10 +1065,13 @@ with st.expander("🔑 Standalone OTP, Debit/Credit Cards & Sensitive Data Scann
 
         for idx, msg in enumerate(otp_msgs):
             status_icon = "📖" if msg["is_read"] else "📩"
-            bot_badge = " [🔐 SENSITIVE DATA / CARD DETECTED]" if (msg["pins"] or msg.get("cards") or msg.get("creds")) else ""
+            
+            # Precise Category Badges
+            cat_list = msg.get("categories", [])
+            cat_badge = f" [{' '.join(cat_list)}]" if cat_list else ""
             folder_badge = f" [{msg['folder']}]"
 
-            with st.expander(f"{status_icon}{folder_badge} [{msg['date']}] {msg['from']} - {msg['subject']}{bot_badge}", expanded=False):
+            with st.expander(f"{status_icon}{folder_badge} [{msg['date']}] {msg['from']} - {msg['subject']}{cat_badge}", expanded=False):
                 st.write(f"**Folder:** {msg['folder']}")
                 st.write(f"**From:** {msg['from']}")
                 st.write(f"**To:** {msg['to']}")
@@ -1046,6 +1079,8 @@ with st.expander("🔑 Standalone OTP, Debit/Credit Cards & Sensitive Data Scann
                 st.write(f"**Date:** {msg['date']}")
                 st.write(f"**IMAP Message ID:** {msg['id']} | **Size:** {msg['size_bytes']} bytes")
 
+                if msg.get("categories"):
+                    st.info(f"🏷️ **Detected Classifications:** {' | '.join(msg['categories'])}")
                 if msg["pins"]:
                     st.success(f"🔑 **Extracted PINs / Verification Codes / OTPs:** {', '.join(msg['pins'])}")
                 if msg.get("cards"):
@@ -1230,10 +1265,13 @@ with st.expander("🔍 Deep Keyword Search & Scope Filters", expanded=False):
 
         for idx, msg in enumerate(search_msgs):
             status_icon = "📖" if msg["is_read"] else "📩"
-            bot_badge = " [🤖 BOT/OTP/TELEGRAM/BLACKLIST]" if msg["is_bot"] else ""
+            
+            # Precise Category Badges
+            cat_list = msg.get("categories", [])
+            cat_badge = f" [{' '.join(cat_list)}]" if cat_list else ""
             folder_badge = f" [{msg['folder']}]"
 
-            with st.expander(f"{status_icon}{folder_badge} [{msg['date']}] {msg['from']} - {msg['subject']}{bot_badge}", expanded=False):
+            with st.expander(f"{status_icon}{folder_badge} [{msg['date']}] {msg['from']} - {msg['subject']}{cat_badge}", expanded=False):
                 st.write(f"**Folder:** {msg['folder']}")
                 st.write(f"**From:** {msg['from']}")
                 st.write(f"**To:** {msg['to']}")
@@ -1241,6 +1279,8 @@ with st.expander("🔍 Deep Keyword Search & Scope Filters", expanded=False):
                 st.write(f"**Date:** {msg['date']}")
                 st.write(f"**IMAP Message ID:** {msg['id']} | **Size:** {msg['size_bytes']} bytes")
 
+                if msg.get("categories"):
+                    st.info(f"🏷️ **Detected Classifications:** {' | '.join(msg['categories'])}")
                 if msg["pins"]:
                     st.success(f"🔑 **Extracted PINs / Verification Codes:** {', '.join(msg['pins'])}")
                 if msg["links"]:
