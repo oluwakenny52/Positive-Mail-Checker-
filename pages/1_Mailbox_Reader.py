@@ -7,6 +7,8 @@ import base64
 import math
 import time
 import socket
+import zipfile
+import io
 from typing import List, Tuple
 from email.header import decode_header
 from email import message_from_bytes
@@ -126,6 +128,43 @@ def load_valid():
         except Exception:
             continue
     return rows
+
+
+def generate_all_mail_zip():
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        search_paths = glob.glob("mail_results/*.txt") + glob.glob("*.txt")
+        added_files = set()
+        
+        for path in search_paths:
+            filename = os.path.basename(path)
+            if filename in added_files:
+                continue
+            try:
+                with open(path, "r", encoding="utf-8", errors="ignore") as f:
+                    lines = [line.strip() for line in f if line.strip() and ":" in line]
+                count = len(lines)
+                
+                lower_name = filename.lower()
+                if "valid" in lower_name or "clean" in lower_name:
+                    cat_name = f"Clean_Valid_{count}.txt"
+                elif "wrong" in lower_name or "pass" in lower_name:
+                    cat_name = f"Wrong_Password_{count}.txt"
+                elif "app" in lower_name or "2fa" in lower_name or "otp" in lower_name:
+                    cat_name = f"App_Password_2FA_{count}.txt"
+                elif "fail" in lower_name or "conn" in lower_name:
+                    cat_name = f"Connection_Failed_{count}.txt"
+                else:
+                    base_wo_ext = os.path.splitext(filename)[0]
+                    cat_name = f"{base_wo_ext}_{count}.txt"
+                
+                file_content = "\n".join(lines)
+                zf.writestr(cat_name, file_content)
+                added_files.add(filename)
+            except Exception:
+                continue
+    buf.seek(0)
+    return buf.getvalue()
 
 
 def decode_hdr(value):
@@ -420,7 +459,7 @@ def clean_boilerplate(text):
 
 
 def execute_imap_search_safely(mail, field_cmd: str, query_term: str, log_func):
-    """Robust IMAP search strategy engine with Fast Envelope Pre-Filter Fallback."""
+    """Robust IMAP search strategy engine with comprehensive local pre-filter (Subject, Headers, From, Body)."""
     log_func(f"  ├─ [SEARCH STRATEGY 1] Trying: mail.search(None, '{field_cmd}', '{query_term}')")
     try:
         typ, data = mail.search(None, field_cmd, query_term)
@@ -459,27 +498,30 @@ def execute_imap_search_safely(mail, field_cmd: str, query_term: str, log_func):
     except Exception as ex4:
         log_func(f"  │   └─ ⚠️ Strategy 4 Failed: {ex4}")
 
-    # Strategy 5: Fast Envelope Pre-Filter Fallback (Collects ONLY matching message IDs locally)
-    log_func("  ├─ [SEARCH STRATEGY 5 - FAST LOCAL PRE-FILTER] Fetching ALL Message IDs and filtering locally...")
+    # Strategy 5: Comprehensive Local Pre-Filter Fallback (Searches Subject, Headers, From, and Body)
+    log_func("  ├─ [SEARCH STRATEGY 5 - COMPREHENSIVE LOCAL PRE-FILTER] Fetching message headers & text locally...")
     try:
         typ, data = mail.search(None, "ALL")
         if typ == "OK" and data and data[0]:
             all_ids = (data[0] or b"").split()
-            log_func(f"  │   └─ 🔍 Pre-filtering {len(all_ids)} message envelopes for query '{query_term}'...")
+            log_func(f"  │   └─ 🔍 Scanning {len(all_ids)} messages (Subject, Headers, From, Body) for query '{query_term}'...")
             matched_ids = []
             q_lower = query_term.lower()
             
             for mid in all_ids:
                 try:
-                    _, edata = mail.fetch(mid, "(ENVELOPE)")
-                    if edata and isinstance(edata[0], tuple):
-                        env_text = edata[0][1].decode("utf-8", errors="ignore").lower()
-                        if q_lower in env_text:
+                    _, edata = mail.fetch(mid, "(BODY.PEEK[HEADER] BODY.PEEK[TEXT])")
+                    if edata and isinstance(edata, list):
+                        combined_text = ""
+                        for item in edata:
+                            if isinstance(item, tuple) and item[1]:
+                                combined_text += item[1].decode("utf-8", errors="ignore").lower() + " "
+                        if q_lower in combined_text:
                             matched_ids.append(mid)
                 except Exception:
                     continue
             
-            log_func(f"  │   └─ ✅ Fast Local Pre-Filter Complete! Found {len(matched_ids)} matching message IDs out of {len(all_ids)}.")
+            log_func(f"  │   └─ ✅ Comprehensive Pre-Filter Complete! Found {len(matched_ids)} matching message IDs out of {len(all_ids)}.")
             return "OK_FALLBACK", [b" ".join(matched_ids)] if matched_ids else [b""]
     except Exception as ex5:
         log_func(f"  │   └─ ❌ Strategy 5 Exception: {ex5}")
@@ -672,9 +714,45 @@ if valid:
         use_container_width=True
     )
 
+    zip_bytes = generate_all_mail_zip()
+    st.sidebar.download_button(
+        label="📦 Download All Mail Lists (ZIP)",
+        data=zip_bytes,
+        file_name="all_mail_results_bundle.zip",
+        mime="application/zip",
+        use_container_width=True
+    )
+
 st.sidebar.text_input("Email override", key="custom_email")
 st.sidebar.text_input("Password override", type="password", key="custom_pass")
 st.sidebar.text_input("IMAP host override", key="custom_host")
+
+# Sidebar Login & Auto-Save Button
+if st.sidebar.button("🔑 Login & Save Account", type="primary", use_container_width=True):
+    c_email = st.session_state.custom_email.strip()
+    c_pass = st.session_state.custom_pass.strip()
+    c_override = st.session_state.custom_host.strip()
+    if not c_email or not c_pass:
+        st.sidebar.error("Please enter both Email and Password override.")
+    else:
+        host_to_try = c_override or (host_list(c_email)[:1] or [""])[0]
+        test_mail = None
+        try:
+            with st.spinner("Validating credentials..."):
+                test_mail = open_mail(c_email, c_pass, host_to_try, timeout=30)
+                close_mail(test_mail)
+                
+                combo = f"{c_email}:{c_pass}"
+                existing_valid = load_valid()
+                if combo not in existing_valid:
+                    with open("clean_valid_accounts.txt", "a", encoding="utf-8") as f:
+                        f.write(combo + "\n")
+                st.sidebar.success(f"✅ Login successful! Saved {c_email} to valid accounts.")
+                st.rerun()
+        except Exception as ex:
+            st.sidebar.error(f"❌ Login failed: {ex}")
+            if test_mail:
+                close_mail(test_mail)
 
 if st.session_state.custom_email.strip():
     email = st.session_state.custom_email.strip()
@@ -869,7 +947,7 @@ if len(active_msgs) > 0:
                     del_label = "Delete Bot Msg" if msg["is_bot"] else "Delete Message"
                     if st.button(del_label, key=f"del_{msg['folder']}_{msg['id']}_{idx}", type="primary" if msg["is_bot"] else "secondary"):
                         try:
-                            m_client = open_mail(email, password, host, readonly=False)
+                            m_client = open_mail(email, password, host, timeout=60)
                             m_client.select(f'"{real_imap_encoded}"', readonly=False)
                             m_client.store(msg["id"], '+FLAGS', '\\Deleted')
                             m_client.expunge()
