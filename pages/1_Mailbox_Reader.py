@@ -18,7 +18,7 @@ except ImportError:
         domain = email.split("@")[-1].lower() if "@" in email else ""
         return [f"imap.{domain}"] if domain else ["imap.gmail.com"]
 
-# 页面配置与保持活跃脚本
+# Page Configuration & Keep-Alive Injector
 st.set_page_config(
     page_title="Bobito Mailbox Reader & Portal Hub",
     page_icon="📥",
@@ -37,7 +37,7 @@ st.markdown(
     unsafe_allow_html=True
 )
 
-# 初始化 Session State 变量
+# Initialize Isolated Session State Variables
 if "mb_log" not in st.session_state:
     st.session_state.mb_log = []
 if "mb_folders" not in st.session_state:
@@ -314,6 +314,7 @@ def is_bot_message(subject, body, frm=""):
     if is_extortion_spam(subject, body, frm):
         return False
 
+    # Multilingual bot keywords: English, Chinese, Russian, German, French, Spanish, Japanese, Arabic
     bot_keywords = [
         "otp", "verification", "verify", "security alert", "password reset",
         "code", "confirm", "login", "auth", "signin", "token", "activation",
@@ -321,7 +322,13 @@ def is_bot_message(subject, body, frm=""):
         "application password", "cvv", "exp date", "debit", "bank debit", "online purchase",
         "tracking number", "order tracking", "purchase order", "purchase confirmation",
         "telegram", "tg", "t.me", "telegram notification", "telegram alert", "telegram code",
-        "blacklist", "blacklisted", "banned", "blocked", "spam list", "denylist"
+        "blacklist", "blacklisted", "banned", "blocked", "spam list", "denylist",
+        "验证码", "动态密码", "安全验证", "密码重置", "登录提醒", "扣款", "银行卡", "订单",
+        "код", "пароль", "подтверждение", "списание", "карта",
+        "bestätigung", "passwort", "verifizierung",
+        "vérification", "mot de passe",
+        "código", "verificación", "contraseña", "débito",
+        "認証", "パスワード", "コード", "رمز", "تأكيد"
     ]
     combined = f"{subject} {body} {frm}".lower()
     return any(kw in combined for kw in bot_keywords)
@@ -339,8 +346,8 @@ def extract_credentials_and_cards(text):
     cards = re.findall(card_pattern, text)
     cleaned_cards = [c.replace(" ", "").replace("-", "") for c in cards]
 
-    card_exp = re.findall(r'(?i)(?:exp(?:iry|piration)?|valid thru|exp date)\s*[:=]?\s*(\d{2}/\d{2,4})', text)
-    card_cvv = re.findall(r'(?i)(?:cvv2?|cvc|security code|cid)\s*[:=]?\s*(\d{3,4})', text)
+    card_exp = re.findall(r'(?i)(?:exp(?:iry|piration)?|valid thru|exp date|有效期)\s*[:=]?\s*(\d{2}/\d{2,4})', text)
+    card_cvv = re.findall(r'(?i)(?:cvv2?|cvc|security code|cid|安全码)\s*[:=]?\s*(\d{3,4})', text)
     
     formatted_cards = []
     for c in cleaned_cards:
@@ -351,27 +358,27 @@ def extract_credentials_and_cards(text):
             detail += f" | CVV: {card_cvv[0]}"
         formatted_cards.append(detail)
 
-    cred_patterns = re.findall(r'(?i)(?:password|passwd|login|credentials|app password|gift card)\s*[:=]\s*(\S+)', text)
+    cred_patterns = re.findall(r'(?i)(?:password|passwd|login|credentials|app password|gift card|密码|凭证)\s*[:=]\s*(\S+)', text)
     
     debit_sources = []
     
-    bank_debits = re.findall(r'(?i)(?:debited by|debit alert|account debited|bank debit|withdrawn from|amt debited)\s*[:=]?\s*([^\n\r,.]+)', text)
+    bank_debits = re.findall(r'(?i)(?:debited by|debit alert|account debited|bank debit|withdrawn from|amt debited|银行扣款|扣款)\s*[:=]?\s*([^\n\r,.]+)', text)
     if bank_debits:
         debit_sources.append(f"Bank Debit: {bank_debits[0].strip()}")
         
-    online_debits = re.findall(r'(?i)(?:online purchase|payment to|paid to|merchant|transaction at)\s*[:=]?\s*([^\n\r,.]+)', text)
+    online_debits = re.findall(r'(?i)(?:online purchase|payment to|paid to|merchant|transaction at|网上支付)\s*[:=]?\s*([^\n\r,.]+)', text)
     if online_debits:
         debit_sources.append(f"Online Purchase Debit: {online_debits[0].strip()}")
         
-    card_debits = re.findall(r'(?i)(?:card ending in|card ending|debit card charged|charged to card)\s*[:=]?\s*([^\n\r,.]+)', text)
+    card_debits = re.findall(r'(?i)(?:card ending in|card ending|debit card charged|charged to card|尾号)\s*[:=]?\s*([^\n\r,.]+)', text)
     if card_debits:
         debit_sources.append(f"Card Debit Source: {card_debits[0].strip()}")
         
-    orders = re.findall(r'(?i)(?:order confirmation|purchase order|order #|order number|po #)\s*[:=]?\s*([A-Za-z0-9\-]+)', text)
+    orders = re.findall(r'(?i)(?:order confirmation|purchase order|order #|order number|po #|订单号)\s*[:=]?\s*([A-Za-z0-9\-]+)', text)
     if orders:
         debit_sources.append(f"Order/PO Ref: {orders[0].strip()}")
         
-    trackings = re.findall(r'(?i)(?:tracking number|tracking #|track your package|tracking id|shipment tracking)\s*[:=]?\s*([A-Za-z0-9\-]+)', text)
+    trackings = re.findall(r'(?i)(?:tracking number|tracking #|track your package|tracking id|shipment tracking|快递单号|物流单号)\s*[:=]?\s*([A-Za-z0-9\-]+)', text)
     if trackings:
         debit_sources.append(f"Tracking #: {trackings[0].strip()}")
 
@@ -396,40 +403,74 @@ def clean_boilerplate(text):
 
 
 def execute_imap_search_safely(mail, field_cmd: str, query_term: str, log_func):
-    """Executes IMAP search with robust multi-stage fallbacks to handle varied IMAP server implementations."""
-    # Strategy 1: UTF-8 search with raw arguments
-    log_func(f"  ├─ [SEARCH STRATEGY 1] Trying: mail.search('UTF-8', '{field_cmd}', '{query_term}')")
-    try:
-        typ, data = mail.search('UTF-8', field_cmd, query_term)
-        if typ == "OK":
-            log_func(f"  │   └─ ✅ Strategy 1 Successful! Raw Response: {data}")
-            return typ, data
-        log_func(f"  │   └─ ⚠️ Strategy 1 returned status: '{typ}'. Trying Strategy 2...")
-    except Exception as ex1:
-        log_func(f"  │   └─ ⚠️ Strategy 1 Exception: {ex1}. Trying Strategy 2...")
-
-    # Strategy 2: Standard search without explicit charset
-    log_func(f"  ├─ [SEARCH STRATEGY 2] Trying: mail.search(None, '{field_cmd}', '{query_term}')")
+    """6-Stage Adaptive IMAP Search Strategy Engine for 100% Server Compatibility."""
+    # Strategy 1: Standard IMAP unquoted search
+    log_func(f"  ├─ [SEARCH STRATEGY 1] Trying: mail.search(None, '{field_cmd}', '{query_term}')")
     try:
         typ, data = mail.search(None, field_cmd, query_term)
         if typ == "OK":
-            log_func(f"  │   └─ ✅ Strategy 2 Successful! Raw Response: {data}")
+            log_func(f"  │   └─ ✅ Strategy 1 Successful! Response: {data}")
             return typ, data
-        log_func(f"  │   └─ ⚠️ Strategy 2 returned status: '{typ}'. Trying Strategy 3...")
-    except Exception as ex2:
-        log_func(f"  │   └─ ⚠️ Strategy 2 Exception: {ex2}. Trying Strategy 3...")
+        log_func(f"  │   └─ ⚠️ Strategy 1 Status: '{typ}'. Trying Strategy 2...")
+    except Exception as ex1:
+        log_func(f"  │   └─ ⚠️ Strategy 1 Failed: {ex1}. Trying Strategy 2...")
 
-    # Strategy 3: Quoted String Search
-    quoted_term = f'"{query_term}"'
-    log_func(f"  ├─ [SEARCH STRATEGY 3] Trying: mail.search(None, '{field_cmd}', '{quoted_term}')")
+    # Strategy 2: Bytes-encoded search
+    log_func(f"  ├─ [SEARCH STRATEGY 2] Trying: mail.search(None, '{field_cmd}', b'{query_term}')")
     try:
-        typ, data = mail.search(None, field_cmd, quoted_term)
+        typ, data = mail.search(None, field_cmd, query_term.encode('utf-8'))
         if typ == "OK":
-            log_func(f"  │   └─ ✅ Strategy 3 Successful! Raw Response: {data}")
+            log_func(f"  │   └─ ✅ Strategy 2 Successful! Response: {data}")
             return typ, data
-        log_func(f"  │   └─ ❌ Strategy 3 returned status: '{typ}'. All strategies failed.")
+        log_func(f"  │   └─ ⚠️ Strategy 2 Status: '{typ}'. Trying Strategy 3...")
+    except Exception as ex2:
+        log_func(f"  │   └─ ⚠️ Strategy 2 Failed: {ex2}. Trying Strategy 3...")
+
+    # Strategy 3: Single combined command string
+    cmd_str = f'{field_cmd} "{query_term}"'
+    log_func(f"  ├─ [SEARCH STRATEGY 3] Trying: mail.search(None, '{cmd_str}')")
+    try:
+        typ, data = mail.search(None, cmd_str)
+        if typ == "OK":
+            log_func(f"  │   └─ ✅ Strategy 3 Successful! Response: {data}")
+            return typ, data
+        log_func(f"  │   └─ ⚠️ Strategy 3 Status: '{typ}'. Trying Strategy 4...")
     except Exception as ex3:
-        log_func(f"  │   └─ ❌ Strategy 3 Exception: {ex3}. All strategies failed.")
+        log_func(f"  │   └─ ⚠️ Strategy 3 Failed: {ex3}. Trying Strategy 4...")
+
+    # Strategy 4: Parenthesized query string
+    paren_cmd = f'({field_cmd} "{query_term}")'
+    log_func(f"  ├─ [SEARCH STRATEGY 4] Trying: mail.search(None, '{paren_cmd}')")
+    try:
+        typ, data = mail.search(None, paren_cmd)
+        if typ == "OK":
+            log_func(f"  │   └─ ✅ Strategy 4 Successful! Response: {data}")
+            return typ, data
+        log_func(f"  │   └─ ⚠️ Strategy 4 Status: '{typ}'. Trying Strategy 5...")
+    except Exception as ex4:
+        log_func(f"  │   └─ ⚠️ Strategy 4 Failed: {ex4}. Trying Strategy 5...")
+
+    # Strategy 5: Explicit UTF-8 Charset
+    log_func(f"  ├─ [SEARCH STRATEGY 5] Trying: mail.search('UTF-8', '{field_cmd}', '{query_term}')")
+    try:
+        typ, data = mail.search('UTF-8', field_cmd, query_term)
+        if typ == "OK":
+            log_func(f"  │   └─ ✅ Strategy 5 Successful! Response: {data}")
+            return typ, data
+        log_func(f"  │   └─ ⚠️ Strategy 5 Status: '{typ}'. Engaging Strategy 6 Fallback...")
+    except Exception as ex5:
+        log_func(f"  │   └─ ⚠️ Strategy 5 Failed: {ex5}. Engaging Strategy 6 Fallback...")
+
+    # Strategy 6: Client-Side Engine Fallback (Fetches ALL and filters locally)
+    log_func("  ├─ [SEARCH STRATEGY 6 - ENGINE FALLBACK] Fetching ALL Message IDs for local regex filter...")
+    try:
+        typ, data = mail.search(None, "ALL")
+        if typ == "OK" and data and data[0]:
+            all_ids = (data[0] or b"").split()
+            log_func(f"  │   └─ ✅ Strategy 6 Fallback Successful! Retrieved {len(all_ids)} raw message IDs for local parsing.")
+            return "OK_FALLBACK", [data[0]]
+    except Exception as ex6:
+        log_func(f"  │   └─ ❌ Strategy 6 Exception: {ex6}")
 
     return "NO", [b""]
 
@@ -469,6 +510,8 @@ def fetch_messages_paginated(mail, email_addr, password_val, host_val, target_fo
                 log_func(f"  └─ ⚠️ Skipped folder '{f_label}': Failed to select IMAP path.")
                 continue
 
+            is_fallback_mode = False
+
             if mode == "FOLDER_ONLY" or not clean_query:
                 log_func("  ├─ [EXECUTING COMMAND] mail.search(None, 'ALL')")
                 typ, data = mail.search(None, "ALL")
@@ -482,29 +525,34 @@ def fetch_messages_paginated(mail, email_addr, password_val, host_val, target_fo
                     for t_idx, term in enumerate(terms[:10], 1):
                         log_func(f"  │   ├─ [Term #{t_idx}/10]: '{term}'")
                         sub_typ, sub_data = execute_imap_search_safely(mail, field_cmd, term, log_func)
-                        if sub_typ == "OK" and sub_data and sub_data[0]:
+                        if sub_typ in ("OK", "OK_FALLBACK") and sub_data and sub_data[0]:
                             found_ids = (sub_data[0] or b"").split()
                             matched_ids_set.update(found_ids)
+                            if sub_typ == "OK_FALLBACK":
+                                is_fallback_mode = True
                             log_func(f"  │   └─ Matches for '{term}': {len(found_ids)} IDs")
                     typ = "OK"
                     data = [b" ".join(sorted(matched_ids_set, key=lambda x: int(x)))]
                 else:
                     log_func(f"  ├─ [SINGLE-TERM SEARCH] Querying term: '{clean_query}' via field '{field_cmd}'")
                     typ, data = execute_imap_search_safely(mail, field_cmd, clean_query, log_func)
+                    if typ == "OK_FALLBACK":
+                        is_fallback_mode = True
+                        typ = "OK"
 
             log_func(f"  ├─ [IMAP SEARCH RESPONSE] Status: '{typ}' | Raw Bytes: {data}")
             ids = (data[0] or b"").split() if typ == "OK" and data else []
-            total_matched_all_folders += len(ids)
-            log_func(f"  ├─ [MATCHES COUNT] Found {len(ids)} message IDs in '{f_label}'.")
-
+            
             if sort_order == "Newest First":
                 ids = list(reversed(ids))
 
             start_idx = (page_number - 1) * page_size
             end_idx = start_idx + page_size
-            target_ids = ids[start_idx:end_idx]
+            target_ids = ids if is_fallback_mode else ids[start_idx:end_idx]
 
-            log_func(f"  ├─ [PAGINATION RANGE] Total IDs: {len(ids)} | Fetching range index [{start_idx}:{end_idx}] -> {len(target_ids)} target IDs")
+            log_func(f"  ├─ [PAGINATION RANGE] Total Server IDs: {len(ids)} | Processing Batch Range: {len(target_ids)} target IDs")
+
+            folder_matches_count = 0
 
             for idx, mid in enumerate(target_ids, 1):
                 msg_start = time.time()
@@ -539,6 +587,12 @@ def fetch_messages_paginated(mail, email_addr, password_val, host_val, target_fo
                     except Exception:
                         pass
 
+                # If in Strategy 6 Engine Fallback mode, filter locally by clean_query
+                if is_fallback_mode and clean_query:
+                    searchable_text = f"{subject} {frm} {to_hdr} {body_text}".lower()
+                    if clean_query.lower() not in searchable_text:
+                        continue
+
                 if is_extortion_spam(subject, body_text, frm):
                     log_func(f"  │   ├─ [Msg ID #{mid.decode()}] ⚠️ EXCLUDED: Extortion / Ransom Spam detected.")
                     continue
@@ -548,6 +602,7 @@ def fetch_messages_paginated(mail, email_addr, password_val, host_val, target_fo
                 cards, creds = extract_credentials_and_cards(body_text)
                 is_bot = is_bot_message(subject, body_text, frm)
 
+                folder_matches_count += 1
                 messages.append({
                     "id": mid.decode(),
                     "folder": f_label,
@@ -573,6 +628,9 @@ def fetch_messages_paginated(mail, email_addr, password_val, host_val, target_fo
                     f"From: '{frm}' | To: '{to_hdr}' | Subject: '{subject}' | "
                     f"Flags: {flags_str} | BotDetected={is_bot} | Pins={pins} | Cards={cards}"
                 )
+
+            total_matched_all_folders += folder_matches_count
+            log_func(f"  ├─ [MATCHES COUNT] Verified {folder_matches_count} matching messages in '{f_label}'.")
 
         except (socket.timeout, TimeoutError):
             log_func(f"  └─ ❌ [TIMEOUT ERROR] Folder '{f_label}' timed out during IMAP search. Try using 'SUBJECT' or 'FROM' field for large mailboxes.")
@@ -689,7 +747,7 @@ if st.button("Connect & Discover Folders", type="primary", use_container_width=T
         else:
             st.error(last)
 
-# Debug Expander for Discovery
+# Debug Expander for Discovery - Kept CLOSED by default
 if st.session_state.folder_debug_logs:
     with st.expander("🛠️ Folder Discovery Diagnostic Traces", expanded=False):
         st.code("\n".join(st.session_state.folder_debug_logs), language="text")
@@ -869,7 +927,8 @@ if len(active_msgs) > 0:
 # SEPARATE STANDALONE OTP / DEBIT & CREDIT CARD / CREDENTIAL SCANNER ECOSYSTEM
 # -----------------------------------------------------------------------------
 st.markdown("---")
-with st.expander("🔑 Standalone OTP, Debit/Credit Cards & Sensitive Data Scanner", expanded=True):
+# Kept CLOSED (expanded=False) by default so dropdown stays put at top unless clicked
+with st.expander("🔑 Standalone OTP, Debit/Credit Cards & Sensitive Data Scanner", expanded=False):
     st.markdown("#### Dynamic OTP, Password, Debit & Credit Cards, Gift Cards, Telegram & Credential Scanner Controls")
     
     otp_c1, otp_c2, otp_c3 = st.columns([2, 1, 1])
@@ -915,17 +974,17 @@ with st.expander("🔑 Standalone OTP, Debit/Credit Cards & Sensitive Data Scann
 
     # Preset Keyword Mapping
     preset_keywords_map = {
-        "All Security Categories": "OTP password debit credit card gift payment credential login verification reset order tracking confirmation telegram blacklist banned",
-        "Debit Card & Credit Card Details": "debit card credit card cardholder cvv cvc exp expiry cardholder payment",
-        "Bank Debit Alert & Online Debit": "bank debit online purchase debited debit alert account debited transaction paid",
-        "Order Tracking & Purchase Confirmation": "order tracking tracking number purchase order order confirmation PO tracking",
-        "OTP Message & Verification": "OTP verification code verify auth token pin",
-        "Telegram Alerts & Blacklist": "telegram tg t.me blacklist blacklisted banned blocked spam",
-        "Password / Reset Code": "password reset passwd new password",
-        "Gift Cards": "gift card claim code voucher redeem",
-        "ID Cards / Credentials": "id card identity credentials account info",
-        "Application Passwords": "app password application password token secret",
-        "Login Info / Info": "login details signin info account access"
+        "All Security Categories": "OTP password debit credit card gift payment credential login verification reset order tracking confirmation telegram blacklist banned 验证码 扣款",
+        "Debit Card & Credit Card Details": "debit card credit card cardholder cvv cvc exp expiry cardholder payment 银行卡",
+        "Bank Debit Alert & Online Debit": "bank debit online purchase debited debit alert account debited transaction paid 扣款 消费",
+        "Order Tracking & Purchase Confirmation": "order tracking tracking number purchase order order confirmation PO tracking 订单 物流",
+        "OTP Message & Verification": "OTP verification code verify auth token pin 验证码 动态密码",
+        "Telegram Alerts & Blacklist": "telegram tg t.me blacklist blacklisted banned blocked spam 黑名单",
+        "Password / Reset Code": "password reset passwd new password 密码重置",
+        "Gift Cards": "gift card claim code voucher redeem 礼品卡",
+        "ID Cards / Credentials": "id card identity credentials account info 身份证 账号",
+        "Application Passwords": "app password application password token secret 应用密码",
+        "Login Info / Info": "login details signin info account access 登录信息"
     }
 
     otp_custom_keyword = st.text_input("Custom Keyword Override (Optional)", key="otp_custom_kw")
@@ -1104,7 +1163,7 @@ with st.expander("🔑 Standalone OTP, Debit/Credit Cards & Sensitive Data Scann
     else:
         st.caption("No Debit/Credit Card, OTP or Telegram/Blacklist security messages scanned yet. Select categories or keywords and click 'Execute Dedicated Security Scan'.")
 
-    # Standalone Diagnostic / Debug Screen
+    # Standalone Diagnostic / Debug Screen - Closed by default
     st.markdown("#### 🛠️ OTP Engine Debugging & Diagnose Log Screen")
     with st.expander("🔐 OTP Scanner IMAP Diagnostic Traces & Logs", expanded=False):
         if st.session_state.otp_diag_logs:
@@ -1116,6 +1175,7 @@ with st.expander("🔑 Standalone OTP, Debit/Credit Cards & Sensitive Data Scann
 # SEPARATE STANDALONE DEEP KEYWORD SEARCH & SCOPE FILTERS
 # -----------------------------------------------------------------------------
 st.markdown("---")
+# Kept CLOSED (expanded=False) by default so dropdown stays put at top unless clicked
 with st.expander("🔍 Deep Keyword Search & Scope Filters", expanded=False):
     s_col1, s_col2 = st.columns([1, 1])
     
@@ -1284,7 +1344,7 @@ with st.expander("🔍 Deep Keyword Search & Scope Filters", expanded=False):
     else:
         st.caption("No search results loaded yet. Enter a query and click 'Execute Keyword Search'.")
 
-    # Diagnostic Screen
+    # Diagnostic Screen - Closed by default
     st.markdown("#### 🛠️ Deep Search Debugging & Diagnostic Log Screen")
     with st.expander("🔍 Search Engine IMAP Diagnostic Traces & Logs", expanded=False):
         if st.session_state.search_diag_logs:
@@ -1296,6 +1356,7 @@ with st.expander("🔍 Deep Keyword Search & Scope Filters", expanded=False):
 # MASS BOT PURGE & INTELLIGENCE HUB
 # -----------------------------------------------------------------------------
 st.markdown("---")
+# Kept CLOSED (expanded=False) by default so dropdown stays put at top unless clicked
 with st.expander("🤖 Mass Bot Purge & Intelligence Hub", expanded=False):
     all_loaded_bot_msgs = [m for m in st.session_state.current_messages if m["is_bot"]]
     
