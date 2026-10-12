@@ -311,7 +311,7 @@ def is_extortion_spam(subject: str, body: str, frm: str = "") -> bool:
 
 
 def detect_specific_categories(subject: str, body: str, frm: str = "", pins=None, cards=None, creds=None) -> List[str]:
-    """Precisely detects email category type tags instead of dumping a static combined string."""
+    """Precisely detects email category type tags."""
     if is_extortion_spam(subject, body, frm):
         return []
 
@@ -321,27 +321,22 @@ def detect_specific_categories(subject: str, body: str, frm: str = "", pins=None
     cards = cards or []
     creds = creds or []
 
-    # 1. Precise OTP / Verification Code Check
     otp_kws = ["otp", "verification", "verify", "verification code", "auth code", "confirm code", "pin", "security code", "验证码", "动态密码", "код", "код подтверждения", "código"]
     if pins or any(kw in combined for kw in otp_kws):
         categories.append("🔑 OTP / CODE")
 
-    # 2. Telegram Specific Check
     tg_kws = ["telegram", "t.me", "tg", "telegram code", "telegram notification", "telegram alert"]
     if any(kw in combined for kw in tg_kws):
         categories.append("📱 TELEGRAM")
 
-    # 3. Blacklist / Ban / Blocked Check
     bl_kws = ["blacklist", "blacklisted", "banned", "blocked", "spam list", "denylist", "黑名单", "封禁"]
     if any(kw in combined for kw in bl_kws):
         categories.append("🚫 BLACKLIST / BAN")
 
-    # 4. Debit / Credit Card Details Check
     card_kws = ["cvv", "exp date", "debit", "bank debit", "online purchase", "card ending", "debited by", "debit alert", "银行卡", "扣款"]
     if cards or any(kw in combined for kw in card_kws):
         categories.append("💳 CARD / DEBIT")
 
-    # 5. General Bot / System Auth Check
     gen_bot_kws = ["password reset", "security alert", "mcafee", "credential", "application password", "tracking number", "purchase order", "po #"]
     if creds or (not categories and any(kw in combined for kw in gen_bot_kws)):
         categories.append("🤖 BOT MSG")
@@ -423,8 +418,7 @@ def clean_boilerplate(text):
 
 
 def execute_imap_search_safely(mail, field_cmd: str, query_term: str, log_func):
-    """6-Stage Adaptive IMAP Search Strategy Engine for 100% Server Compatibility."""
-    # Strategy 1: Standard IMAP unquoted search
+    """Robust IMAP search strategy engine that avoids socket EOF errors."""
     log_func(f"  ├─ [SEARCH STRATEGY 1] Trying: mail.search(None, '{field_cmd}', '{query_term}')")
     try:
         typ, data = mail.search(None, field_cmd, query_term)
@@ -432,10 +426,9 @@ def execute_imap_search_safely(mail, field_cmd: str, query_term: str, log_func):
             log_func(f"  │   └─ ✅ Strategy 1 Successful! Response: {data}")
             return typ, data
         log_func(f"  │   └─ ⚠️ Strategy 1 Status: '{typ}'. Trying Strategy 2...")
-    except Exception as ex1:
+    except (socket.error, OSError, imaplib.IMAP4.error) as ex1:
         log_func(f"  │   └─ ⚠️ Strategy 1 Failed: {ex1}. Trying Strategy 2...")
 
-    # Strategy 2: Bytes-encoded search
     log_func(f"  ├─ [SEARCH STRATEGY 2] Trying: mail.search(None, '{field_cmd}', b'{query_term}')")
     try:
         typ, data = mail.search(None, field_cmd, query_term.encode('utf-8'))
@@ -443,10 +436,9 @@ def execute_imap_search_safely(mail, field_cmd: str, query_term: str, log_func):
             log_func(f"  │   └─ ✅ Strategy 2 Successful! Response: {data}")
             return typ, data
         log_func(f"  │   └─ ⚠️ Strategy 2 Status: '{typ}'. Trying Strategy 3...")
-    except Exception as ex2:
+    except (socket.error, OSError, imaplib.IMAP4.error) as ex2:
         log_func(f"  │   └─ ⚠️ Strategy 2 Failed: {ex2}. Trying Strategy 3...")
 
-    # Strategy 3: Single combined command string
     cmd_str = f'{field_cmd} "{query_term}"'
     log_func(f"  ├─ [SEARCH STRATEGY 3] Trying: mail.search(None, '{cmd_str}')")
     try:
@@ -455,10 +447,9 @@ def execute_imap_search_safely(mail, field_cmd: str, query_term: str, log_func):
             log_func(f"  │   └─ ✅ Strategy 3 Successful! Response: {data}")
             return typ, data
         log_func(f"  │   └─ ⚠️ Strategy 3 Status: '{typ}'. Trying Strategy 4...")
-    except Exception as ex3:
+    except (socket.error, OSError, imaplib.IMAP4.error) as ex3:
         log_func(f"  │   └─ ⚠️ Strategy 3 Failed: {ex3}. Trying Strategy 4...")
 
-    # Strategy 4: Parenthesized query string
     paren_cmd = f'({field_cmd} "{query_term}")'
     log_func(f"  ├─ [SEARCH STRATEGY 4] Trying: mail.search(None, '{paren_cmd}')")
     try:
@@ -466,31 +457,20 @@ def execute_imap_search_safely(mail, field_cmd: str, query_term: str, log_func):
         if typ == "OK":
             log_func(f"  │   └─ ✅ Strategy 4 Successful! Response: {data}")
             return typ, data
-        log_func(f"  │   └─ ⚠️ Strategy 4 Status: '{typ}'. Trying Strategy 5...")
-    except Exception as ex4:
-        log_func(f"  │   └─ ⚠️ Strategy 4 Failed: {ex4}. Trying Strategy 5...")
+        log_func(f"  │   └─ ⚠️ Strategy 4 Failed. Engaging Strategy 5 Client-Side Fallback...")
+    except (socket.error, OSError, imaplib.IMAP4.error) as ex4:
+        log_func(f"  │   └─ ⚠️ Strategy 4 Failed: {ex4}. Engaging Strategy 5 Fallback...")
 
-    # Strategy 5: Explicit UTF-8 Charset
-    log_func(f"  ├─ [SEARCH STRATEGY 5] Trying: mail.search('UTF-8', '{field_cmd}', '{query_term}')")
-    try:
-        typ, data = mail.search('UTF-8', field_cmd, query_term)
-        if typ == "OK":
-            log_func(f"  │   └─ ✅ Strategy 5 Successful! Response: {data}")
-            return typ, data
-        log_func(f"  │   └─ ⚠️ Strategy 5 Status: '{typ}'. Engaging Strategy 6 Fallback...")
-    except Exception as ex5:
-        log_func(f"  │   └─ ⚠️ Strategy 5 Failed: {ex5}. Engaging Strategy 6 Fallback...")
-
-    # Strategy 6: Client-Side Engine Fallback (Fetches ALL and filters locally)
-    log_func("  ├─ [SEARCH STRATEGY 6 - ENGINE FALLBACK] Fetching ALL Message IDs for local regex filter...")
+    # Strategy 5: Client-Side Engine Fallback (Fetches ALL and filters locally without dropping sockets)
+    log_func("  ├─ [SEARCH STRATEGY 5 - ENGINE FALLBACK] Fetching ALL Message IDs for local regex filter...")
     try:
         typ, data = mail.search(None, "ALL")
         if typ == "OK" and data and data[0]:
             all_ids = (data[0] or b"").split()
-            log_func(f"  │   └─ ✅ Strategy 6 Fallback Successful! Retrieved {len(all_ids)} raw message IDs for local parsing.")
+            log_func(f"  │   └─ ✅ Strategy 5 Fallback Successful! Retrieved {len(all_ids)} raw message IDs for local parsing.")
             return "OK_FALLBACK", [data[0]]
-    except Exception as ex6:
-        log_func(f"  │   └─ ❌ Strategy 6 Exception: {ex6}")
+    except Exception as ex5:
+        log_func(f"  │   └─ ❌ Strategy 5 Exception: {ex5}")
 
     return "NO", [b""]
 
@@ -566,11 +546,14 @@ def fetch_messages_paginated(mail, email_addr, password_val, host_val, target_fo
             if sort_order == "Newest First":
                 ids = list(reversed(ids))
 
+            # Correctly compute total server count for folder pagination
+            folder_total_count = len(ids)
+
             start_idx = (page_number - 1) * page_size
             end_idx = start_idx + page_size
             target_ids = ids if is_fallback_mode else ids[start_idx:end_idx]
 
-            log_func(f"  ├─ [PAGINATION RANGE] Total Server IDs: {len(ids)} | Processing Batch Range: {len(target_ids)} target IDs")
+            log_func(f"  ├─ [PAGINATION RANGE] Total Server IDs: {folder_total_count} | Processing Batch Range: {len(target_ids)} target IDs")
 
             folder_matches_count = 0
 
@@ -607,7 +590,6 @@ def fetch_messages_paginated(mail, email_addr, password_val, host_val, target_fo
                     except Exception:
                         pass
 
-                # If in Strategy 6 Engine Fallback mode, filter locally by clean_query
                 if is_fallback_mode and clean_query:
                     searchable_text = f"{subject} {frm} {to_hdr} {body_text}".lower()
                     if clean_query.lower() not in searchable_text:
@@ -620,8 +602,6 @@ def fetch_messages_paginated(mail, email_addr, password_val, host_val, target_fo
                 cleaned_body = clean_boilerplate(body_text)
                 pins, links = extract_pins_and_links(body_text)
                 cards, creds = extract_credentials_and_cards(body_text)
-                
-                # Precise Category Badges Detection
                 detected_categories = detect_specific_categories(subject, body_text, frm, pins, cards, creds)
                 is_bot = len(detected_categories) > 0
 
@@ -653,11 +633,11 @@ def fetch_messages_paginated(mail, email_addr, password_val, host_val, target_fo
                     f"Flags: {flags_str} | Categories={detected_categories} | Pins={pins} | Cards={cards}"
                 )
 
-            total_matched_all_folders += folder_matches_count
+            total_matched_all_folders += (folder_total_count if (is_fallback_mode or clean_query) else folder_total_count)
             log_func(f"  ├─ [MATCHES COUNT] Verified {folder_matches_count} matching messages in '{f_label}'.")
 
         except (socket.timeout, TimeoutError):
-            log_func(f"  └─ ❌ [TIMEOUT ERROR] Folder '{f_label}' timed out during IMAP search. Try using 'SUBJECT' or 'FROM' field for large mailboxes.")
+            log_func(f"  └─ ❌ [TIMEOUT ERROR] Folder '{f_label}' timed out during IMAP search.")
         except Exception as ex:
             log_func(f"  └─ ❌ [EXCEPTION ERROR] Querying folder '{f_label}' failed: {ex}")
 
@@ -685,7 +665,6 @@ pick = st.selectbox("Valid account", valid or ["none"], key="selected_account")
 # Sidebar Hub
 st.sidebar.header("Account & Connection Hub")
 
-# Download Button for Valid Mail List in Slide Out Sidebar
 if valid:
     valid_text_data = "\n".join(valid)
     st.sidebar.download_button(
@@ -700,7 +679,6 @@ st.sidebar.text_input("Email override", key="custom_email")
 st.sidebar.text_input("Password override", type="password", key="custom_pass")
 st.sidebar.text_input("IMAP host override", key="custom_host")
 
-# Resolve Email and Password Isolated per Session
 if st.session_state.custom_email.strip():
     email = st.session_state.custom_email.strip()
     password = st.session_state.custom_pass.strip()
@@ -711,7 +689,6 @@ else:
 
 override = st.session_state.custom_host.strip()
 
-# Quick Refresh Inbox Control
 if st.sidebar.button("🔄 Refresh Inbox", type="secondary", use_container_width=True):
     if email and password:
         host = override or st.session_state.mb_host or (host_list(email)[:1] or [""])[0]
@@ -732,7 +709,6 @@ if st.sidebar.button("🔄 Refresh Inbox", type="secondary", use_container_width
             if mail_obj:
                 close_mail(mail_obj)
 
-# Webmail Portal & Credentials Output
 if email and password:
     st.sidebar.markdown("---")
     st.sidebar.subheader("🌐 Webmail Portal & Credentials")
@@ -740,7 +716,6 @@ if email and password:
     st.sidebar.markdown(f"[Open Webmail Portal]({portal_url})", unsafe_allow_html=True)
     st.sidebar.text_input("Copy Credentials", value=f"{email}:{password}")
 
-# Connect & Discover Folders button under Valid Account dropdown on main screen
 if st.button("Connect & Discover Folders", type="primary", use_container_width=True):
     if not email or not password:
         st.error("Need email and password")
@@ -771,12 +746,10 @@ if st.button("Connect & Discover Folders", type="primary", use_container_width=T
         else:
             st.error(last)
 
-# Debug Expander for Discovery - Kept CLOSED by default
 if st.session_state.folder_debug_logs:
     with st.expander("🛠️ Folder Discovery Diagnostic Traces", expanded=False):
         st.code("\n".join(st.session_state.folder_debug_logs), language="text")
 
-# Controls Layout
 col1, col2, col3 = st.columns([2, 1, 1])
 with col1:
     folder = st.selectbox("Select Mail Folder", st.session_state.mb_folders)
@@ -785,7 +758,6 @@ with col2:
 with col3:
     sort_order = st.selectbox("Sort Order", ["Newest First", "Oldest First"])
 
-# Direct Folder Load Trigger
 if st.button("📂 Load Folder Messages", type="primary", use_container_width=True):
     host = override or st.session_state.mb_host or (host_list(email)[:1] or [""])[0]
     if not email or not password or not host:
@@ -810,7 +782,7 @@ if st.button("📂 Load Folder Messages", type="primary", use_container_width=Tr
                 close_mail(mail)
 
 # -----------------------------------------------------------------------------
-# MAIN MESSAGE STREAM (NOW INSIDE COLLAPSIBLE DROPDOWN)
+# MAIN MESSAGE STREAM
 # -----------------------------------------------------------------------------
 if st.session_state.bot_filter_mode:
     active_msgs = [m for m in st.session_state.current_messages if m["is_bot"]]
@@ -826,14 +798,11 @@ if len(active_msgs) > 0:
     total_pages = max(1, math.ceil(total_msgs / page_size))
     curr_p = st.session_state.current_page
     
-    # Wrapped inside dropdown expander (expanded=False by default)
     with st.expander(f"✉️ Main Message Stream — Page {curr_p} of {total_pages} ({total_msgs} Total Matches)", expanded=False):
         st.markdown(f"**Showing Page {curr_p} of {total_pages} (Total Server Matches: {total_msgs})**")
 
         for idx, msg in enumerate(active_msgs):
             status_icon = "📖" if msg["is_read"] else "📩"
-            
-            # Precise Category Badge Rendering
             cat_list = msg.get("categories", [])
             cat_badge = f" [{' '.join(cat_list)}]" if cat_list else ""
             folder_badge = f" [{msg['folder']}]"
@@ -888,7 +857,7 @@ if len(active_msgs) > 0:
                             real_target_path = get_imap_path(target_move)
                             real_target_encoded = encode_imap_utf7(real_target_path)
                             m_client = open_mail(email, password, host, timeout=60)
-                            m_client.select(f'"{real_imap_encoded}"', readonly=False)
+                            m_client.select(f'"{real_target_encoded}"', readonly=False)
                             m_client.copy(msg["id"], f'"{real_target_encoded}"')
                             m_client.store(msg["id"], '+FLAGS', '\\Deleted')
                             m_client.expunge()
@@ -918,7 +887,6 @@ if len(active_msgs) > 0:
                     with st.popover("View Raw RFC822"):
                         st.code(msg["raw"].decode("utf-8", errors="ignore"))
 
-        # Pagination Controls Bar
         st.markdown("---")
         p_col1, p_col2, p_col3 = st.columns([1, 2, 1])
 
@@ -954,55 +922,33 @@ if len(active_msgs) > 0:
                 st.rerun()
 
 # -----------------------------------------------------------------------------
-# SEPARATE STANDALONE OTP / DEBIT & CREDIT CARD / CREDENTIAL SCANNER ECOSYSTEM
+# STANDALONE OTP / DEBIT / SENSITIVE DATA SCANNER
 # -----------------------------------------------------------------------------
 st.markdown("---")
-# Kept CLOSED (expanded=False) by default so dropdown stays put at top unless clicked
 with st.expander("🔑 Standalone OTP, Debit/Credit Cards & Sensitive Data Scanner", expanded=False):
     st.markdown("#### Dynamic OTP, Password, Debit & Credit Cards, Gift Cards, Telegram & Credential Scanner Controls")
     
     otp_c1, otp_c2, otp_c3 = st.columns([2, 1, 1])
-    
     otp_folder_options = ["INBOX"] + [f for f in st.session_state.mb_folders if f != "INBOX"]
     
     with otp_c1:
-        otp_scope_choice = st.multiselect(
-            "Target Folder Scope", 
-            otp_folder_options, 
-            default=["INBOX"], 
-            key="otp_scan_scope"
-        )
+        otp_scope_choice = st.multiselect("Target Folder Scope", otp_folder_options, default=["INBOX"], key="otp_scan_scope")
     with otp_c2:
         category_options = [
-            "All Security Categories", 
-            "Debit Card & Credit Card Details", 
-            "Bank Debit Alert & Online Debit",
-            "Order Tracking & Purchase Confirmation",
-            "OTP Message & Verification", 
-            "Telegram Alerts & Blacklist",
-            "Password / Reset Code", 
-            "Gift Cards", 
-            "ID Cards / Credentials", 
-            "Application Passwords", 
-            "Login Info / Info"
+            "All Security Categories", "Debit Card & Credit Card Details", "Bank Debit Alert & Online Debit",
+            "Order Tracking & Purchase Confirmation", "OTP Message & Verification", "Telegram Alerts & Blacklist",
+            "Password / Reset Code", "Gift Cards", "ID Cards / Credentials", "Application Passwords", "Login Info / Info"
         ]
-        otp_scan_category = st.multiselect(
-            "Target Data Type Dropdown", 
-            category_options,
-            default=["All Security Categories"],
-            key="otp_category_select"
-        )
+        otp_scan_category = st.multiselect("Target Data Type Dropdown", category_options, default=["All Security Categories"], key="otp_category_select")
     with otp_c3:
         otp_search_field = st.selectbox("Scan Field", ["TEXT", "SUBJECT", "BODY", "FROM"], key="otp_search_field")
 
-    # Dedicated Controls
     t_col1, t_col2 = st.columns(2)
     with t_col1:
         otp_auto_clean_toggle = st.toggle("Auto-Clean HTML & Boilerplate", value=True, key="otp_clean_toggle")
     with t_col2:
         otp_deep_regex_chk = st.checkbox("Enable Deep Regex Code, Debit & Credit Card Extraction", value=True, key="otp_regex_chk")
 
-    # Preset Keyword Mapping
     preset_keywords_map = {
         "All Security Categories": "OTP password debit credit card gift payment credential login verification reset order tracking confirmation telegram blacklist banned 验证码 扣款",
         "Debit Card & Credit Card Details": "debit card credit card cardholder cvv cvc exp expiry cardholder payment 银行卡",
@@ -1029,7 +975,6 @@ with st.expander("🔑 Standalone OTP, Debit/Credit Cards & Sensitive Data Scann
             mail = None
             try:
                 target_scope = otp_scope_choice
-
                 if otp_custom_keyword.strip():
                     kw_to_use = otp_custom_keyword.strip()
                 else:
@@ -1045,14 +990,13 @@ with st.expander("🔑 Standalone OTP, Debit/Credit Cards & Sensitive Data Scann
                     )
                     st.session_state.otp_messages = msgs
                     st.session_state.otp_current_page = 1
-                    otp_log(f"Scan complete. Retrieved {st.session_state.otp_total_matched_count} matching messages across {len(target_scope)} folders.")
+                    otp_log(f"Scan complete. Retrieved {st.session_state.otp_total_matched_count} matching messages.")
             except Exception as e:
                 st.error(str(e))
             finally:
                 if mail:
                     close_mail(mail)
 
-    # Standalone Security / OTP Stream
     st.markdown("#### 🔒 Standalone Security & Card Message Stream")
     otp_msgs = st.session_state.otp_messages
     otp_total = st.session_state.otp_total_matched_count or len(otp_msgs)
@@ -1065,8 +1009,6 @@ with st.expander("🔑 Standalone OTP, Debit/Credit Cards & Sensitive Data Scann
 
         for idx, msg in enumerate(otp_msgs):
             status_icon = "📖" if msg["is_read"] else "📩"
-            
-            # Precise Category Badges
             cat_list = msg.get("categories", [])
             cat_badge = f" [{' '.join(cat_list)}]" if cat_list else ""
             folder_badge = f" [{msg['folder']}]"
@@ -1122,7 +1064,7 @@ with st.expander("🔑 Standalone OTP, Debit/Credit Cards & Sensitive Data Scann
                             real_target_path = get_imap_path(otp_mv_target)
                             real_target_encoded = encode_imap_utf7(real_target_path)
                             m_client = open_mail(email, password, host, timeout=60)
-                            m_client.select(f'"{real_imap_encoded}"', readonly=False)
+                            m_client.select(f'"{real_target_encoded}"', readonly=False)
                             m_client.copy(msg["id"], f'"{real_target_encoded}"')
                             m_client.store(msg["id"], '+FLAGS', '\\Deleted')
                             m_client.expunge()
@@ -1151,7 +1093,6 @@ with st.expander("🔑 Standalone OTP, Debit/Credit Cards & Sensitive Data Scann
                     with st.popover("View Raw RFC822"):
                         st.code(msg["raw"].decode("utf-8", errors="ignore"))
 
-        # OTP Stream Pagination Controls
         st.markdown("---")
         op_c1, op_c2, op_c3 = st.columns([1, 2, 1])
 
@@ -1196,9 +1137,8 @@ with st.expander("🔑 Standalone OTP, Debit/Credit Cards & Sensitive Data Scann
                 close_mail(mail)
                 st.rerun()
     else:
-        st.caption("No Debit/Credit Card, OTP or Telegram/Blacklist security messages scanned yet. Select categories or keywords and click 'Execute Dedicated Security Scan'.")
+        st.caption("No security messages scanned yet. Select categories or keywords and click 'Execute Dedicated Security Scan'.")
 
-    # Standalone Diagnostic / Debug Screen - Closed by default
     st.markdown("#### 🛠️ OTP Engine Debugging & Diagnose Log Screen")
     with st.expander("🔐 OTP Scanner IMAP Diagnostic Traces & Logs", expanded=False):
         if st.session_state.otp_diag_logs:
@@ -1207,13 +1147,11 @@ with st.expander("🔑 Standalone OTP, Debit/Credit Cards & Sensitive Data Scann
             st.caption("OTP scanner traces and raw server logs will appear here during execution.")
 
 # -----------------------------------------------------------------------------
-# SEPARATE STANDALONE DEEP KEYWORD SEARCH & SCOPE FILTERS
+# DEEP KEYWORD SEARCH & SCOPE FILTERS
 # -----------------------------------------------------------------------------
 st.markdown("---")
-# Kept CLOSED (expanded=False) by default so dropdown stays put at top unless clicked
 with st.expander("🔍 Deep Keyword Search & Scope Filters", expanded=False):
     s_col1, s_col2 = st.columns([1, 1])
-    
     search_scope_options = ["INBOX"] + [f for f in st.session_state.mb_folders if f != "INBOX"]
     
     with s_col1:
@@ -1235,7 +1173,6 @@ with st.expander("🔍 Deep Keyword Search & Scope Filters", expanded=False):
             mail = None
             try:
                 target_scope = search_scope_choice
-
                 with st.spinner(f"Scanning target mailboxes ({len(target_scope)} folder/s) for [{search_field_choice}: '{search_query_input.strip()}']..."):
                     mail = open_mail(email, password, host, timeout=120)
                     msgs = fetch_messages_paginated(
@@ -1252,7 +1189,6 @@ with st.expander("🔍 Deep Keyword Search & Scope Filters", expanded=False):
                 if mail:
                     close_mail(mail)
 
-    # Separate Search Message Stream
     st.markdown("#### ✉️ Search Results Message Stream")
     search_msgs = st.session_state.search_messages
     search_total_msgs = st.session_state.search_total_matched_count or len(search_msgs)
@@ -1265,8 +1201,6 @@ with st.expander("🔍 Deep Keyword Search & Scope Filters", expanded=False):
 
         for idx, msg in enumerate(search_msgs):
             status_icon = "📖" if msg["is_read"] else "📩"
-            
-            # Precise Category Badges
             cat_list = msg.get("categories", [])
             cat_badge = f" [{' '.join(cat_list)}]" if cat_list else ""
             folder_badge = f" [{msg['folder']}]"
@@ -1317,7 +1251,7 @@ with st.expander("🔍 Deep Keyword Search & Scope Filters", expanded=False):
                             real_target_path = get_imap_path(s_target_move)
                             real_target_encoded = encode_imap_utf7(real_target_path)
                             m_client = open_mail(email, password, host, timeout=60)
-                            m_client.select(f'"{real_imap_encoded}"', readonly=False)
+                            m_client.select(f'"{real_target_encoded}"', readonly=False)
                             m_client.copy(msg["id"], f'"{real_target_encoded}"')
                             m_client.store(msg["id"], '+FLAGS', '\\Deleted')
                             m_client.expunge()
@@ -1347,7 +1281,6 @@ with st.expander("🔍 Deep Keyword Search & Scope Filters", expanded=False):
                     with st.popover("View Raw RFC822"):
                         st.code(msg["raw"].decode("utf-8", errors="ignore"))
 
-        # Search Pagination Controls
         st.markdown("---")
         sp_col1, sp_col2, sp_col3 = st.columns([1, 2, 1])
 
@@ -1384,7 +1317,6 @@ with st.expander("🔍 Deep Keyword Search & Scope Filters", expanded=False):
     else:
         st.caption("No search results loaded yet. Enter a query and click 'Execute Keyword Search'.")
 
-    # Diagnostic Screen - Closed by default
     st.markdown("#### 🛠️ Deep Search Debugging & Diagnostic Log Screen")
     with st.expander("🔍 Search Engine IMAP Diagnostic Traces & Logs", expanded=False):
         if st.session_state.search_diag_logs:
@@ -1396,7 +1328,6 @@ with st.expander("🔍 Deep Keyword Search & Scope Filters", expanded=False):
 # MASS BOT PURGE & INTELLIGENCE HUB
 # -----------------------------------------------------------------------------
 st.markdown("---")
-# Kept CLOSED (expanded=False) by default so dropdown stays put at top unless clicked
 with st.expander("🤖 Mass Bot Purge & Intelligence Hub", expanded=False):
     all_loaded_bot_msgs = [m for m in st.session_state.current_messages if m["is_bot"]]
     
@@ -1404,12 +1335,7 @@ with st.expander("🤖 Mass Bot Purge & Intelligence Hub", expanded=False):
     bot_scope_options = ["INBOX"] + [f for f in st.session_state.mb_folders if f != "INBOX"]
     
     with bot_col1:
-        bot_target_folder = st.multiselect(
-            "Select Bot Target Scope", 
-            bot_scope_options, 
-            default=["INBOX"],
-            key="bot_hub_folder_select"
-        )
+        bot_target_folder = st.multiselect("Select Bot Target Scope", bot_scope_options, default=["INBOX"], key="bot_hub_folder_select")
     with bot_col2:
         bot_scan_limit = st.selectbox("Bot Scan Depth", [50, 100, 200, 500], index=1)
 
@@ -1451,29 +1377,19 @@ with st.expander("🤖 Mass Bot Purge & Intelligence Hub", expanded=False):
                 mail = None
                 try:
                     bot_log("🤖 [BOT ENGINE DIAGNOSTIC START] Initializing Mass Deletion Sequence...")
-                    bot_log(f"📋 Targets Count: {len(all_loaded_bot_msgs)} detected bot/Telegram messages")
                     mail = open_mail(email, password, host, timeout=60)
                     deleted_count = 0
                     
                     for idx, bm in enumerate(all_loaded_bot_msgs, 1):
                         r_folder = get_imap_path(bm["folder"])
                         r_encoded = encode_imap_utf7(r_folder)
-                        bot_log(f"  ├─ [Msg #{idx}] ID={bm['id']} | Folder='{bm['folder']}' ({r_encoded}) | From='{bm['from']}' | Subject='{bm['subject']}'")
-                        sel_code, sel_res = mail.select(f'"{r_encoded}"', readonly=False)
-                        bot_log(f"  │   ├─ IMAP SELECT: Status={sel_code} | Res={sel_res}")
-                        
-                        st_code, st_res = mail.store(bm["id"], '+FLAGS', '\\Deleted')
-                        bot_log(f"  │   ├─ STORE FLAGS: Status={st_code} | Res={st_res}")
-                        
-                        exp_code, exp_res = mail.expunge()
-                        bot_log(f"  │   ├─ EXPUNGE: Status={exp_code} | Res={exp_res}")
-                        
+                        mail.select(f'"{r_encoded}"', readonly=False)
+                        mail.store(bm["id"], '+FLAGS', '\\Deleted')
+                        mail.expunge()
                         deleted_count += 1
-                        bot_log("  │   └─ ✅ EXPOSED & PURGED from IMAP target")
 
-                    bot_log(f"\n🏁 [MASS DELETE COMPLETE] Successfully purged {deleted_count} bot messages from server.")
+                    bot_log(f"🏁 [MASS DELETE COMPLETE] Successfully purged {deleted_count} bot messages from server.")
                     st.success(f"Successfully deleted {deleted_count} bot messages!")
-                    
                     st.session_state.current_messages = [m for m in st.session_state.current_messages if not m["is_bot"]]
                     st.session_state.bot_filter_mode = False
                     st.rerun()
