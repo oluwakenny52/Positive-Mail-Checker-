@@ -179,6 +179,29 @@ def decode_imap_utf7(s: str) -> str:
     return "".join(res)
 
 
+def encode_imap_utf7(s: str) -> str:
+    parts = []
+    i = 0
+    while i < len(s):
+        char = s[i]
+        if 0x20 <= ord(char) <= 0x7E:
+            if char == '&':
+                parts.append('&-')
+            else:
+                parts.append(char)
+            i += 1
+        else:
+            start = i
+            while i < len(s) and not (0x20 <= ord(s[i]) <= 0x7E):
+                i += 1
+            chunk = s[start:i]
+            utf16 = chunk.encode('utf-16be')
+            b64 = base64.b64encode(utf16).decode('ascii')
+            mod_b64 = b64.replace('/', ',').rstrip('=')
+            parts.append(f'&{mod_b64}-')
+    return "".join(parts)
+
+
 def clean_display_label(folder_name: str) -> str:
     upper_name = folder_name.upper()
     if upper_name == "INBOX":
@@ -278,7 +301,6 @@ def close_mail(mail):
 
 
 def is_extortion_spam(subject: str, body: str, frm: str = "") -> bool:
-    """Detects sextortion, ransom, and bitcoin extortion emails."""
     extortion_keywords = [
         "bitcoin wallet", "transfer me", "deactivate and remove all malware",
         "posted to the public", "recorded all your actions", "trojan",
@@ -373,19 +395,6 @@ def clean_boilerplate(text):
     return cleaned.strip()
 
 
-def build_imap_or_query(terms: List[str], field_cmd: str) -> str:
-    cleaned_terms = [t.strip() for t in terms if t.strip()]
-    if not cleaned_terms:
-        return f'{field_cmd} ""'
-    if len(cleaned_terms) == 1:
-        return f'{field_cmd} "{cleaned_terms[0]}"'
-
-    query = f'{field_cmd} "{cleaned_terms[-1]}"'
-    for term in reversed(cleaned_terms[:-1]):
-        query = f'OR {field_cmd} "{term}" ({query})'
-    return query
-
-
 def fetch_messages_paginated(mail, email_addr, password_val, host_val, target_folders: List[str], 
                             search_query: str = "", search_field: str = "TEXT", mode: str = "SEARCH", 
                             page_size: int = 15, page_number: int = 1, sort_order: str = "Newest First",
@@ -410,10 +419,11 @@ def fetch_messages_paginated(mail, email_addr, password_val, host_val, target_fo
 
     for f_label in target_folders:
         real_imap_folder = get_imap_path(f_label)
-        log_func(f"\n📂 [PROCESSING FOLDER] Label='{f_label}' -> IMAP Path='{real_imap_folder}'")
+        real_imap_encoded = encode_imap_utf7(real_imap_folder)
+        log_func(f"\n📂 [PROCESSING FOLDER] Label='{f_label}' -> IMAP Path='{real_imap_folder}' (Encoded: '{real_imap_encoded}')")
         
         try:
-            sel_typ, sel_data = mail.select(f'"{real_imap_folder}"', readonly=True)
+            sel_typ, sel_data = mail.select(f'"{real_imap_encoded}"', readonly=True)
             log_func(f"  ├─ [IMAP SELECT] Status: '{sel_typ}' | Response: {sel_data}")
             
             if sel_typ != "OK":
@@ -429,23 +439,18 @@ def fetch_messages_paginated(mail, email_addr, password_val, host_val, target_fo
                 terms = clean_query.split()
                 
                 if len(terms) > 1:
-                    or_query = build_imap_or_query(terms, field_cmd)
-                    log_func(f"  ├─ [EXECUTING COMMAND] SEARCH {or_query}")
-                    typ, data = mail.search(None, or_query)
-                    
-                    if typ != "OK" or not (data and data[0]):
-                        log_func("  ├─ [RETRY FALLBACK] Multi-term OR query yielded 0 results or failed. Retrying individual keywords...")
-                        matched_ids_set = set()
-                        for term in terms[:10]:
-                            sub_typ, sub_data = mail.search(None, field_cmd, f'"{term}"')
-                            if sub_typ == "OK" and sub_data and sub_data[0]:
-                                matched_ids_set.update((sub_data[0] or b"").split())
-                        typ = "OK"
-                        data = [b" ".join(sorted(matched_ids_set, key=lambda x: int(x)))]
+                    log_func(f"  ├─ [EXECUTING COMMAND] Multi-term search for terms {terms} using {field_cmd}")
+                    matched_ids_set = set()
+                    for term in terms[:10]:
+                        sub_typ, sub_data = mail.search(None, field_cmd, term)
+                        if sub_typ == "OK" and sub_data and sub_data[0]:
+                            matched_ids_set.update((sub_data[0] or b"").split())
+                    typ = "OK"
+                    data = [b" ".join(sorted(matched_ids_set, key=lambda x: int(x)))]
                 else:
                     cmd = f'SEARCH {field_cmd} "{clean_query}"'
                     log_func(f"  ├─ [EXECUTING COMMAND] {cmd}")
-                    typ, data = mail.search(None, field_cmd, f'"{clean_query}"')
+                    typ, data = mail.search(None, field_cmd, clean_query)
 
             log_func(f"  ├─ [IMAP SEARCH RESPONSE] Status: '{typ}' | Raw Bytes: {data}")
             ids = (data[0] or b"").split() if typ == "OK" and data else []
@@ -732,13 +737,14 @@ if len(active_msgs) > 0:
             op_col1, op_col2, op_col3, op_col4 = st.columns(4)
             host = override or st.session_state.mb_host or (host_list(email)[:1] or [""])[0]
             real_imap_folder = get_imap_path(msg['folder'])
+            real_imap_encoded = encode_imap_utf7(real_imap_folder)
 
             with op_col1:
                 if not msg["is_read"]:
                     if st.button("Mark as Read", key=f"read_{msg['folder']}_{msg['id']}_{idx}"):
                         try:
                             m_client = open_mail(email, password, host, timeout=60)
-                            m_client.select(f'"{real_imap_folder}"', readonly=False)
+                            m_client.select(f'"{real_imap_encoded}"', readonly=False)
                             m_client.store(msg["id"], '+FLAGS', '\\Seen')
                             close_mail(m_client)
                             msg["is_read"] = True
@@ -752,9 +758,10 @@ if len(active_msgs) > 0:
                 if st.button("Move Message", key=f"mv_btn_{msg['folder']}_{msg['id']}_{idx}"):
                     try:
                         real_target_path = get_imap_path(target_move)
+                        real_target_encoded = encode_imap_utf7(real_target_path)
                         m_client = open_mail(email, password, host, timeout=60)
-                        m_client.select(f'"{real_imap_folder}"', readonly=False)
-                        m_client.copy(msg["id"], f'"{real_target_path}"')
+                        m_client.select(f'"{real_imap_encoded}"', readonly=False)
+                        m_client.copy(msg["id"], f'"{real_target_encoded}"')
                         m_client.store(msg["id"], '+FLAGS', '\\Deleted')
                         m_client.expunge()
                         close_mail(m_client)
@@ -769,7 +776,7 @@ if len(active_msgs) > 0:
                 if st.button(del_label, key=f"del_{msg['folder']}_{msg['id']}_{idx}", type="primary" if msg["is_bot"] else "secondary"):
                     try:
                         m_client = open_mail(email, password, host, timeout=60)
-                        m_client.select(f'"{real_imap_folder}"', readonly=False)
+                        m_client.select(f'"{real_imap_encoded}"', readonly=False)
                         m_client.store(msg["id"], '+FLAGS', '\\Deleted')
                         m_client.expunge()
                         close_mail(m_client)
@@ -958,13 +965,14 @@ with st.expander("🔑 Standalone OTP, Debit/Credit Cards & Sensitive Data Scann
                 o_col1, o_col2, o_col3, o_col4 = st.columns(4)
                 host = override or st.session_state.mb_host or (host_list(email)[:1] or [""])[0]
                 real_imap_folder = get_imap_path(msg['folder'])
+                real_imap_encoded = encode_imap_utf7(real_imap_folder)
 
                 with o_col1:
                     if not msg["is_read"]:
                         if st.button("Mark as Read", key=f"otp_read_{msg['folder']}_{msg['id']}_{idx}"):
                             try:
                                 m_client = open_mail(email, password, host, timeout=60)
-                                m_client.select(f'"{real_imap_folder}"', readonly=False)
+                                m_client.select(f'"{real_imap_encoded}"', readonly=False)
                                 m_client.store(msg["id"], '+FLAGS', '\\Seen')
                                 close_mail(m_client)
                                 msg["is_read"] = True
@@ -978,9 +986,10 @@ with st.expander("🔑 Standalone OTP, Debit/Credit Cards & Sensitive Data Scann
                     if st.button("Move Message", key=f"otp_mv_btn_{msg['folder']}_{msg['id']}_{idx}"):
                         try:
                             real_target_path = get_imap_path(otp_mv_target)
+                            real_target_encoded = encode_imap_utf7(real_target_path)
                             m_client = open_mail(email, password, host, timeout=60)
-                            m_client.select(f'"{real_imap_folder}"', readonly=False)
-                            m_client.copy(msg["id"], f'"{real_target_path}"')
+                            m_client.select(f'"{real_imap_encoded}"', readonly=False)
+                            m_client.copy(msg["id"], f'"{real_target_encoded}"')
                             m_client.store(msg["id"], '+FLAGS', '\\Deleted')
                             m_client.expunge()
                             close_mail(m_client)
@@ -994,7 +1003,7 @@ with st.expander("🔑 Standalone OTP, Debit/Credit Cards & Sensitive Data Scann
                     if st.button("Delete Message", key=f"otp_del_{msg['folder']}_{msg['id']}_{idx}", type="primary"):
                         try:
                             m_client = open_mail(email, password, host, timeout=60)
-                            m_client.select(f'"{real_imap_folder}"', readonly=False)
+                            m_client.select(f'"{real_imap_encoded}"', readonly=False)
                             m_client.store(msg["id"], '+FLAGS', '\\Deleted')
                             m_client.expunge()
                             close_mail(m_client)
@@ -1145,13 +1154,14 @@ with st.expander("🔍 Deep Keyword Search & Scope Filters", expanded=False):
                 s_op1, s_op2, s_op3, s_op4 = st.columns(4)
                 host = override or st.session_state.mb_host or (host_list(email)[:1] or [""])[0]
                 real_imap_folder = get_imap_path(msg['folder'])
+                real_imap_encoded = encode_imap_utf7(real_imap_folder)
 
                 with s_op1:
                     if not msg["is_read"]:
                         if st.button("Mark as Read", key=f"s_read_{msg['folder']}_{msg['id']}_{idx}"):
                             try:
                                 m_client = open_mail(email, password, host, timeout=60)
-                                m_client.select(f'"{real_imap_folder}"', readonly=False)
+                                m_client.select(f'"{real_imap_encoded}"', readonly=False)
                                 m_client.store(msg["id"], '+FLAGS', '\\Seen')
                                 close_mail(m_client)
                                 msg["is_read"] = True
@@ -1165,9 +1175,10 @@ with st.expander("🔍 Deep Keyword Search & Scope Filters", expanded=False):
                     if st.button("Move Message", key=f"s_mv_btn_{msg['folder']}_{msg['id']}_{idx}"):
                         try:
                             real_target_path = get_imap_path(s_target_move)
+                            real_target_encoded = encode_imap_utf7(real_target_path)
                             m_client = open_mail(email, password, host, timeout=60)
-                            m_client.select(f'"{real_imap_folder}"', readonly=False)
-                            m_client.copy(msg["id"], f'"{real_target_path}"')
+                            m_client.select(f'"{real_imap_encoded}"', readonly=False)
+                            m_client.copy(msg["id"], f'"{real_target_encoded}"')
                             m_client.store(msg["id"], '+FLAGS', '\\Deleted')
                             m_client.expunge()
                             close_mail(m_client)
@@ -1182,7 +1193,7 @@ with st.expander("🔍 Deep Keyword Search & Scope Filters", expanded=False):
                     if st.button(s_del_label, key=f"s_del_{msg['folder']}_{msg['id']}_{idx}", type="primary" if msg["is_bot"] else "secondary"):
                         try:
                             m_client = open_mail(email, password, host, timeout=60)
-                            m_client.select(f'"{real_imap_folder}"', readonly=False)
+                            m_client.select(f'"{real_imap_encoded}"', readonly=False)
                             m_client.store(msg["id"], '+FLAGS', '\\Deleted')
                             m_client.expunge()
                             close_mail(m_client)
@@ -1305,8 +1316,9 @@ with st.expander("🤖 Mass Bot Purge & Intelligence Hub", expanded=False):
                     
                     for idx, bm in enumerate(all_loaded_bot_msgs, 1):
                         r_folder = get_imap_path(bm["folder"])
-                        bot_log(f"  ├─ [Msg #{idx}] ID={bm['id']} | Folder='{bm['folder']}' ({r_folder}) | From='{bm['from']}' | Subject='{bm['subject']}'")
-                        sel_code, sel_res = mail.select(f'"{r_folder}"', readonly=False)
+                        r_encoded = encode_imap_utf7(r_folder)
+                        bot_log(f"  ├─ [Msg #{idx}] ID={bm['id']} | Folder='{bm['folder']}' ({r_encoded}) | From='{bm['from']}' | Subject='{bm['subject']}'")
+                        sel_code, sel_res = mail.select(f'"{r_encoded}"', readonly=False)
                         bot_log(f"  │   ├─ IMAP SELECT: Status={sel_code} | Res={sel_res}")
                         
                         st_code, st_res = mail.store(bm["id"], '+FLAGS', '\\Deleted')
