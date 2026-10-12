@@ -476,85 +476,67 @@ def clean_boilerplate(text):
 
 
 def execute_imap_search_safely(mail, field_cmd: str, query_term: str, log_func):
-    """Optimized IMAP search engine with Chunked Batch Envelope Pre-Filtering for high performance."""
-    log_func(f"  ├─ [SEARCH STRATEGY 1] Trying: mail.search(None, '{field_cmd}', '{query_term}')")
-    try:
-        typ, data = mail.search(None, field_cmd, query_term)
-        if typ == "OK" and data and data[0]:
-            log_func(f"  │   └─ ✅ Strategy 1 Successful! Response: {data}")
-            return typ, data
-    except Exception as ex1:
-        log_func(f"  │   └─ ⚠️ Strategy 1 Failed: {ex1}")
+    """Robust IMAP search engine with server-side charset/quoting strategies and guaranteed client-side fallback."""
+    clean_q = query_term.replace('"', '\\"')
+    
+    for strat_name, search_args in [
+        ("CHARSET UTF-8 Quoted", ['CHARSET', 'UTF-8', field_cmd, f'"{clean_q}"']),
+        ("Standard Quoted", [field_cmd, f'"{clean_q}"']),
+        ("CHARSET UTF-8 Unquoted", ['CHARSET', 'UTF-8', field_cmd, clean_q]),
+        ("Standard Unquoted", [field_cmd, clean_q])
+    ]:
+        log_func(f"  ├─ [SEARCH STRATEGY] Trying: mail.search(None, {search_args})")
+        try:
+            typ, data = mail.search(None, *search_args)
+            if typ == "OK" and data:
+                log_func(f"  │   └─ ✅ {strat_name} Successful! Response: {data}")
+                return typ, data
+        except Exception as ex:
+            log_func(f"  │   └─ ⚠️ {strat_name} Failed: {ex}")
 
-    log_func(f"  ├─ [SEARCH STRATEGY 2] Trying: mail.search(None, '{field_cmd}', b'{query_term}')")
-    try:
-        typ, data = mail.search(None, field_cmd, query_term.encode('utf-8'))
-        if typ == "OK" and data and data[0]:
-            log_func(f"  │   └─ ✅ Strategy 2 Successful! Response: {data}")
-            return typ, data
-    except Exception as ex2:
-        log_func(f"  │   └─ ⚠️ Strategy 2 Failed: {ex2}")
-
-    cmd_str = f'{field_cmd} "{query_term}"'
-    log_func(f"  ├─ [SEARCH STRATEGY 3] Trying: mail.search(None, '{cmd_str}')")
-    try:
-        typ, data = mail.search(None, cmd_str)
-        if typ == "OK" and data and data[0]:
-            log_func(f"  │   └─ ✅ Strategy 3 Successful! Response: {data}")
-            return typ, data
-    except Exception as ex3:
-        log_func(f"  │   └─ ⚠️ Strategy 3 Failed: {ex3}")
-
-    paren_cmd = f'({field_cmd} "{query_term}")'
-    log_func(f"  ├─ [SEARCH STRATEGY 4] Trying: mail.search(None, '{paren_cmd}')")
-    try:
-        typ, data = mail.search(None, paren_cmd)
-        if typ == "OK" and data and data[0]:
-            log_func(f"  │   └─ ✅ Strategy 4 Successful! Response: {data}")
-            return typ, data
-    except Exception as ex4:
-        log_func(f"  │   └─ ⚠️ Strategy 4 Failed: {ex4}")
-
-    # Strategy 5: Ultra-Fast Chunked Batch Envelope Pre-Filter Fallback
-    log_func("  ├─ [SEARCH STRATEGY 5 - OPTIMIZED BATCH PRE-FILTER] Fetching message envelopes in batched chunks...")
+    # Robust Client-Side Fallback Search (Guaranteed for strict servers like Aliyun)
+    log_func("  ├─ [SEARCH STRATEGY 5 - ROBUST CLIENT-SIDE FALLBACK] Server search rejected. Scanning message contents...")
     try:
         typ, data = mail.search(None, "ALL")
         if typ == "OK" and data and data[0]:
             all_ids = (data[0] or b"").split()
-            log_func(f"  │   └─ 🔍 Batch pre-filtering {len(all_ids)} messages for query '{query_term}'...")
+            log_func(f"  │   └─ 🔍 Scanning {len(all_ids)} messages for query '{query_term}'...")
             matched_ids = []
             q_lower = query_term.lower()
             
-            chunk_size = 200
-            for i in range(0, len(all_ids), chunk_size):
-                chunk = all_ids[i:i+chunk_size]
-                id_range_str = b",".join(chunk)
+            for mid in all_ids:
                 try:
-                    _, edatas = mail.fetch(id_range_str, "(ENVELOPE)")
-                    if edatas:
-                        for item in edatas:
-                            if isinstance(item, tuple):
-                                header_line = item[0].decode("utf-8", errors="ignore")
-                                body_content = item[1].decode("utf-8", errors="ignore").lower()
-                                m_id_match = re.search(r'^(\d+)', header_line)
-                                if m_id_match:
-                                    m_id_str = m_id_match.group(1).encode('utf-8')
-                                    if m_id_str in chunk and q_lower in body_content:
-                                        matched_ids.append(m_id_str)
+                    _, msgdata = mail.fetch(mid, "(BODY.PEEK[])")
+                    if msgdata and isinstance(msgdata[0], tuple):
+                        raw_bytes = msgdata[0][1]
+                        msg = message_from_bytes(raw_bytes)
+                        subject = decode_hdr(msg.get("Subject", ""))
+                        frm = decode_hdr(msg.get("From", ""))
+                        body_text = ""
+                        if msg.is_multipart():
+                            for part in msg.walk():
+                                if part.get_content_type() == "text/plain":
+                                    try:
+                                        body_text = part.get_payload(decode=True).decode("utf-8", errors="ignore")
+                                        break
+                                    except Exception:
+                                        pass
+                        else:
+                            try:
+                                body_text = msg.get_payload(decode=True).decode("utf-8", errors="ignore")
+                            except Exception:
+                                pass
+                        
+                        combined_text = f"{subject} {frm} {body_text}".lower()
+                        if q_lower in combined_text:
+                            matched_ids.append(mid)
                 except Exception:
-                    for mid in chunk:
-                        try:
-                            _, edata = mail.fetch(mid, "(ENVELOPE)")
-                            if edata and isinstance(edata[0], tuple):
-                                if q_lower in edata[0][1].decode("utf-8", errors="ignore").lower():
-                                    matched_ids.append(mid)
-                        except Exception:
-                            continue
+                    continue
             
-            log_func(f"  │   └─ ✅ Batch Pre-Filter Complete! Found {len(matched_ids)} matching message IDs out of {len(all_ids)}.")
+            log_func(f"  │   └─ ✅ Client-Side Fallback Complete! Found {len(matched_ids)} matching message IDs out of {len(all_ids)}.")
             return "OK_FALLBACK", [b" ".join(matched_ids)] if matched_ids else [b""]
     except Exception as ex5:
-        log_func(f"  │   └─ ❌ Strategy 5 Exception: {ex5}")
+        log_func(f"  │   └─ ❌ Client-Side Fallback Exception: {ex5}")
 
     return "NO", [b""]
 
@@ -733,7 +715,6 @@ valid = load_valid()
 valid_dropdown_options = valid if valid else ["none"]
 default_index = 0
 
-# Safely check forced account or persistent cache before selectbox instantiation
 if "forced_account" in st.session_state and st.session_state.forced_account in valid_dropdown_options:
     default_index = valid_dropdown_options.index(st.session_state.forced_account)
 else:
@@ -1568,7 +1549,7 @@ with st.expander("🤖 Mass Bot Purge & Intelligence Hub", expanded=False):
                 st.session_state.bot_current_page -= 1
                 st.rerun()
         with bp_c2:
-            st.markdown(f"<h4 style='text-align: center; margin: 0;'>Page {bot_curr_p} of {bot_total_pages}</h4>", unsafe_allow_html=True)
+            st.markdown(f"<h4 style='text-align: center; margin: 0;'>Page {bot_curr_p} of {total_pages}</h4>", unsafe_allow_html=True)
         with bp_c3:
             if st.button("Next Bot Page", disabled=(bot_curr_p >= bot_total_pages), use_container_width=True, key="bot_next_pg"):
                 st.session_state.bot_current_page += 1
