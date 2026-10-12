@@ -420,53 +420,67 @@ def clean_boilerplate(text):
 
 
 def execute_imap_search_safely(mail, field_cmd: str, query_term: str, log_func):
-    """Robust IMAP search strategy engine that avoids socket EOF errors and correctly falls back."""
+    """Optimized IMAP search strategy engine with Fast Envelope Pre-Filter Fallback."""
     log_func(f"  ├─ [SEARCH STRATEGY 1] Trying: mail.search(None, '{field_cmd}', '{query_term}')")
     try:
         typ, data = mail.search(None, field_cmd, query_term)
-        if typ == "OK":
+        if typ == "OK" and data and data[0]:
             log_func(f"  │   └─ ✅ Strategy 1 Successful! Response: {data}")
             return typ, data
-    except (socket.error, OSError, imaplib.IMAP4.error) as ex1:
-        log_func(f"  │   └─ ⚠️ Strategy 1 Failed: {ex1}. Trying Strategy 2...")
+    except Exception as ex1:
+        log_func(f"  │   └─ ⚠️ Strategy 1 Failed: {ex1}")
 
     log_func(f"  ├─ [SEARCH STRATEGY 2] Trying: mail.search(None, '{field_cmd}', b'{query_term}')")
     try:
         typ, data = mail.search(None, field_cmd, query_term.encode('utf-8'))
-        if typ == "OK":
+        if typ == "OK" and data and data[0]:
             log_func(f"  │   └─ ✅ Strategy 2 Successful! Response: {data}")
             return typ, data
-    except (socket.error, OSError, imaplib.IMAP4.error) as ex2:
-        log_func(f"  │   └─ ⚠️ Strategy 2 Failed: {ex2}. Trying Strategy 3...")
+    except Exception as ex2:
+        log_func(f"  │   └─ ⚠️ Strategy 2 Failed: {ex2}")
 
     cmd_str = f'{field_cmd} "{query_term}"'
     log_func(f"  ├─ [SEARCH STRATEGY 3] Trying: mail.search(None, '{cmd_str}')")
     try:
         typ, data = mail.search(None, cmd_str)
-        if typ == "OK":
+        if typ == "OK" and data and data[0]:
             log_func(f"  │   └─ ✅ Strategy 3 Successful! Response: {data}")
             return typ, data
-    except (socket.error, OSError, imaplib.IMAP4.error) as ex3:
-        log_func(f"  │   └─ ⚠️ Strategy 3 Failed: {ex3}. Trying Strategy 4...")
+    except Exception as ex3:
+        log_func(f"  │   └─ ⚠️ Strategy 3 Failed: {ex3}")
 
     paren_cmd = f'({field_cmd} "{query_term}")'
     log_func(f"  ├─ [SEARCH STRATEGY 4] Trying: mail.search(None, '{paren_cmd}')")
     try:
         typ, data = mail.search(None, paren_cmd)
-        if typ == "OK":
+        if typ == "OK" and data and data[0]:
             log_func(f"  │   └─ ✅ Strategy 4 Successful! Response: {data}")
             return typ, data
-    except (socket.error, OSError, imaplib.IMAP4.error) as ex4:
-        log_func(f"  │   └─ ⚠️ Strategy 4 Failed: {ex4}. Engaging Strategy 5 Fallback...")
+    except Exception as ex4:
+        log_func(f"  │   └─ ⚠️ Strategy 4 Failed: {ex4}")
 
-    # Strategy 5: Client-Side Engine Fallback (Fetches ALL and filters locally via robust envelope/body check)
-    log_func("  ├─ [SEARCH STRATEGY 5 - ENGINE FALLBACK] Fetching ALL Message IDs for local regex filter...")
+    # Strategy 5: Fast Envelope Pre-Filter Fallback (Collects ONLY matching message IDs)
+    log_func("  ├─ [SEARCH STRATEGY 5 - FAST FALLBACK] Fetching ALL Message IDs for local envelope pre-filter...")
     try:
         typ, data = mail.search(None, "ALL")
         if typ == "OK" and data and data[0]:
             all_ids = (data[0] or b"").split()
-            log_func(f"  │   └─ ✅ Strategy 5 Fallback Successful! Retrieved {len(all_ids)} raw message IDs for local parsing.")
-            return "OK_FALLBACK", [data[0]]
+            log_func(f"  │   └─ 🔍 Scanning {len(all_ids)} message envelopes locally for '{query_term}'...")
+            matched_ids = []
+            q_lower = query_term.lower()
+            
+            for mid in all_ids:
+                try:
+                    _, edata = mail.fetch(mid, "(ENVELOPE)")
+                    if edata and isinstance(edata[0], tuple):
+                        env_text = edata[0][1].decode("utf-8", errors="ignore").lower()
+                        if q_lower in env_text:
+                            matched_ids.append(mid)
+                except Exception:
+                    continue
+            
+            log_func(f"  │   └─ ✅ Fast Fallback Scan Complete! Found {len(matched_ids)} matching message IDs.")
+            return "OK_FALLBACK", [b" ".join(matched_ids)] if matched_ids else [b""]
     except Exception as ex5:
         log_func(f"  │   └─ ❌ Strategy 5 Exception: {ex5}")
 
@@ -508,8 +522,6 @@ def fetch_messages_paginated(mail, email_addr, password_val, host_val, target_fo
                 log_func(f"  └─ ⚠️ Skipped folder '{f_label}': Failed to select IMAP path.")
                 continue
 
-            is_fallback_mode = False
-
             if mode == "FOLDER_ONLY" or not clean_query:
                 log_func("  ├─ [EXECUTING COMMAND] mail.search(None, 'ALL')")
                 typ, data = mail.search(None, "ALL")
@@ -526,20 +538,15 @@ def fetch_messages_paginated(mail, email_addr, password_val, host_val, target_fo
                         if sub_typ in ("OK", "OK_FALLBACK") and sub_data and sub_data[0]:
                             found_ids = (sub_data[0] or b"").split()
                             matched_ids_set.update(found_ids)
-                            if sub_typ == "OK_FALLBACK":
-                                is_fallback_mode = True
                             log_func(f"  │   └─ Matches for '{term}': {len(found_ids)} IDs")
                     typ = "OK"
                     data = [b" ".join(sorted(matched_ids_set, key=lambda x: int(x)))]
                 else:
                     log_func(f"  ├─ [SINGLE-TERM SEARCH] Querying term: '{clean_query}' via field '{field_cmd}'")
                     typ, data = execute_imap_search_safely(mail, field_cmd, clean_query, log_func)
-                    if typ == "OK_FALLBACK":
-                        is_fallback_mode = True
-                        typ = "OK"
 
             log_func(f"  ├─ [IMAP SEARCH RESPONSE] Status: '{typ}' | Raw Bytes: {data}")
-            ids = (data[0] or b"").split() if typ == "OK" and data else []
+            ids = (data[0] or b"").split() if typ in ("OK", "OK_FALLBACK") and data else []
             
             if sort_order == "Newest First":
                 ids = list(reversed(ids))
@@ -548,9 +555,9 @@ def fetch_messages_paginated(mail, email_addr, password_val, host_val, target_fo
 
             start_idx = (page_number - 1) * page_size
             end_idx = start_idx + page_size
-            target_ids = ids if is_fallback_mode else ids[start_idx:end_idx]
+            target_ids = ids[start_idx:end_idx]
 
-            log_func(f"  ├─ [PAGINATION RANGE] Total Server IDs: {folder_total_count} | Processing Batch Range: {len(target_ids)} target IDs")
+            log_func(f"  ├─ [PAGINATION RANGE] Total Matched IDs: {folder_total_count} | Processing Batch Range ({start_idx}:{end_idx}): {len(target_ids)} target IDs")
 
             folder_matches_count = 0
 
@@ -586,11 +593,6 @@ def fetch_messages_paginated(mail, email_addr, password_val, host_val, target_fo
                         body_text = msg.get_payload(decode=True).decode("utf-8", errors="ignore")
                     except Exception:
                         pass
-
-                if is_fallback_mode and clean_query:
-                    searchable_text = f"{subject} {frm} {to_hdr} {body_text}".lower()
-                    if clean_query.lower() not in searchable_text:
-                        continue
 
                 if is_extortion_spam(subject, body_text, frm):
                     log_func(f"  │   ├─ [Msg ID #{mid.decode()}] ⚠️ EXCLUDED: Extortion / Ransom Spam detected.")
@@ -867,7 +869,7 @@ if len(active_msgs) > 0:
                     del_label = "Delete Bot Msg" if msg["is_bot"] else "Delete Message"
                     if st.button(del_label, key=f"del_{msg['folder']}_{msg['id']}_{idx}", type="primary" if msg["is_bot"] else "secondary"):
                         try:
-                            m_client = open_mail(email, password, host, timeout=60)
+                            m_client = open_mail(email, password, host, readonly=False)
                             m_client.select(f'"{real_imap_encoded}"', readonly=False)
                             m_client.store(msg["id"], '+FLAGS', '\\Deleted')
                             m_client.expunge()
