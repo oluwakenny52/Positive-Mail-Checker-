@@ -733,7 +733,6 @@ st.caption("Advanced IMAP Client with Interactive Bot Intelligence, Dedicated OT
 
 valid = load_valid()
 
-# Determine selected account, defaulting to persistent cache
 valid_dropdown_options = valid if valid else ["none"]
 default_index = 0
 if st.session_state.selected_account in valid_dropdown_options:
@@ -768,7 +767,7 @@ st.sidebar.text_input("Email override", key="custom_email")
 st.sidebar.text_input("Password override", type="password", key="custom_pass")
 st.sidebar.text_input("IMAP host override", key="custom_host")
 
-# Sidebar Login & Auto-Save Button with 60s Timeout
+# Sidebar Login & Save Account with Multi-Host Discovery & Auto-Save
 if st.sidebar.button("🔑 Login & Save Account", type="primary", use_container_width=True):
     c_email = st.session_state.custom_email.strip()
     c_pass = st.session_state.custom_pass.strip()
@@ -776,27 +775,43 @@ if st.sidebar.button("🔑 Login & Save Account", type="primary", use_container_
     if not c_email or not c_pass:
         st.sidebar.error("Please enter both Email and Password override.")
     else:
-        host_to_try = c_override or (host_list(c_email)[:1] or [""])[0]
+        hosts = [c_override] if c_override else host_list(c_email)
+        success, connected_host, discovered_folders = False, "", ["INBOX"]
+        last_err = ""
         test_mail = None
-        try:
-            with st.spinner("Validating credentials (60s timeout)..."):
-                test_mail = open_mail(c_email, c_pass, host_to_try, timeout=60)
-                close_mail(test_mail)
-                
-                combo = f"{c_email}:{c_pass}"
-                existing_valid = load_valid()
-                if combo not in existing_valid:
-                    with open("clean_valid_accounts.txt", "a", encoding="utf-8") as f:
-                        f.write(combo + "\n")
-                
-                save_last_account(combo)
-                st.session_state.selected_account = combo
-                st.sidebar.success(f"✅ Login successful! Saved {c_email} and added to valid accounts.")
-                st.rerun()
-        except Exception as ex:
-            st.sidebar.error(f"❌ Login failed: {ex}")
-            if test_mail:
-                close_mail(test_mail)
+        
+        with st.spinner("Connecting, authenticating & discovering folders..."):
+            for host in hosts:
+                try:
+                    test_mail = open_mail(c_email, c_pass, host, timeout=60)
+                    discovered_folders = list_folders(test_mail, email_addr=c_email, host_val=host)
+                    close_mail(test_mail)
+                    connected_host = host
+                    success = True
+                    break
+                except Exception as ex:
+                    last_err = f"{host}: {ex}"
+                    if test_mail:
+                        try:
+                            close_mail(test_mail)
+                        except:
+                            pass
+        
+        if success:
+            combo = f"{c_email}:{c_pass}"
+            existing_valid = load_valid()
+            if combo not in existing_valid:
+                with open("clean_valid_accounts.txt", "a", encoding="utf-8") as f:
+                    f.write(combo + "\n")
+            
+            save_last_account(combo)
+            st.session_state.selected_account = combo
+            st.session_state.mb_host = connected_host
+            st.session_state.mb_folders = discovered_folders
+            st.sidebar.success(f"✅ Logged in via {connected_host}, discovered {len(discovered_folders)} folders, and saved to valid accounts!")
+            st.rerun()
+        else:
+            st.sidebar.error(f"❌ Login failed: {last_err}")
 
 if st.session_state.custom_email.strip():
     email = st.session_state.custom_email.strip()
@@ -1550,7 +1565,7 @@ with st.expander("🤖 Mass Bot Purge & Intelligence Hub", expanded=False):
                 st.session_state.bot_current_page -= 1
                 st.rerun()
         with bp_c2:
-            st.markdown(f"<h4 style='text-align: center; margin: 0;'>Page {bot_curr_p} of {bot_total_pages}</h4>", unsafe_allow_html=True)
+            st.markdown(f"<h4 style='text-align: center; margin: 0;'>Page {bot_curr_p} of {total_pages}</h4>", unsafe_allow_html=True)
         with bp_c3:
             if st.button("Next Bot Page", disabled=(bot_curr_p >= bot_total_pages), use_container_width=True, key="bot_next_pg"):
                 st.session_state.bot_current_page += 1
