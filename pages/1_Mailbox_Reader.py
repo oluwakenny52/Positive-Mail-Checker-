@@ -97,9 +97,6 @@ if "otp_total_matched_count" not in st.session_state:
     st.session_state.otp_total_matched_count = 0
 if "bot_filter_mode" not in st.session_state:
     st.session_state.bot_filter_mode = False
-if "selected_account" not in st.session_state:
-    last_acc = load_last_account()
-    st.session_state.selected_account = last_acc if last_acc else "none"
 if "custom_email" not in st.session_state:
     st.session_state.custom_email = ""
 if "custom_pass" not in st.session_state:
@@ -735,8 +732,14 @@ valid = load_valid()
 
 valid_dropdown_options = valid if valid else ["none"]
 default_index = 0
-if st.session_state.selected_account in valid_dropdown_options:
-    default_index = valid_dropdown_options.index(st.session_state.selected_account)
+
+# Safely check forced account or persistent cache before selectbox instantiation
+if "forced_account" in st.session_state and st.session_state.forced_account in valid_dropdown_options:
+    default_index = valid_dropdown_options.index(st.session_state.forced_account)
+else:
+    last_acc = load_last_account()
+    if last_acc in valid_dropdown_options:
+        default_index = valid_dropdown_options.index(last_acc)
 
 pick = st.selectbox("Valid account", valid_dropdown_options, index=default_index, key="selected_account")
 if pick != "none":
@@ -805,7 +808,7 @@ if st.sidebar.button("🔑 Login & Save Account", type="primary", use_container_
                     f.write(combo + "\n")
             
             save_last_account(combo)
-            st.session_state.selected_account = combo
+            st.session_state.forced_account = combo
             st.session_state.mb_host = connected_host
             st.session_state.mb_folders = discovered_folders
             st.sidebar.success(f"✅ Logged in via {connected_host}, discovered {len(discovered_folders)} folders, and saved to valid accounts!")
@@ -1565,7 +1568,7 @@ with st.expander("🤖 Mass Bot Purge & Intelligence Hub", expanded=False):
                 st.session_state.bot_current_page -= 1
                 st.rerun()
         with bp_c2:
-            st.markdown(f"<h4 style='text-align: center; margin: 0;'>Page {bot_curr_p} of {total_pages}</h4>", unsafe_allow_html=True)
+            st.markdown(f"<h4 style='text-align: center; margin: 0;'>Page {bot_curr_p} of {bot_total_pages}</h4>", unsafe_allow_html=True)
         with bp_c3:
             if st.button("Next Bot Page", disabled=(bot_curr_p >= bot_total_pages), use_container_width=True, key="bot_next_pg"):
                 st.session_state.bot_current_page += 1
