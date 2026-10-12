@@ -18,7 +18,7 @@ except ImportError:
         domain = email.split("@")[-1].lower() if "@" in email else ""
         return [f"imap.{domain}"] if domain else ["imap.gmail.com"]
 
-# Page Configuration & Keep-Alive Injector
+# 页面配置与保持活跃脚本
 st.set_page_config(
     page_title="Bobito Mailbox Reader & Portal Hub",
     page_icon="📥",
@@ -37,7 +37,7 @@ st.markdown(
     unsafe_allow_html=True
 )
 
-# Initialize Isolated Session State Variables
+# 初始化 Session State 变量
 if "mb_log" not in st.session_state:
     st.session_state.mb_log = []
 if "mb_folders" not in st.session_state:
@@ -395,6 +395,45 @@ def clean_boilerplate(text):
     return cleaned.strip()
 
 
+def execute_imap_search_safely(mail, field_cmd: str, query_term: str, log_func):
+    """Executes IMAP search with robust multi-stage fallbacks to handle varied IMAP server implementations."""
+    # Strategy 1: UTF-8 search with raw arguments
+    log_func(f"  ├─ [SEARCH STRATEGY 1] Trying: mail.search('UTF-8', '{field_cmd}', '{query_term}')")
+    try:
+        typ, data = mail.search('UTF-8', field_cmd, query_term)
+        if typ == "OK":
+            log_func(f"  │   └─ ✅ Strategy 1 Successful! Raw Response: {data}")
+            return typ, data
+        log_func(f"  │   └─ ⚠️ Strategy 1 returned status: '{typ}'. Trying Strategy 2...")
+    except Exception as ex1:
+        log_func(f"  │   └─ ⚠️ Strategy 1 Exception: {ex1}. Trying Strategy 2...")
+
+    # Strategy 2: Standard search without explicit charset
+    log_func(f"  ├─ [SEARCH STRATEGY 2] Trying: mail.search(None, '{field_cmd}', '{query_term}')")
+    try:
+        typ, data = mail.search(None, field_cmd, query_term)
+        if typ == "OK":
+            log_func(f"  │   └─ ✅ Strategy 2 Successful! Raw Response: {data}")
+            return typ, data
+        log_func(f"  │   └─ ⚠️ Strategy 2 returned status: '{typ}'. Trying Strategy 3...")
+    except Exception as ex2:
+        log_func(f"  │   └─ ⚠️ Strategy 2 Exception: {ex2}. Trying Strategy 3...")
+
+    # Strategy 3: Quoted String Search
+    quoted_term = f'"{query_term}"'
+    log_func(f"  ├─ [SEARCH STRATEGY 3] Trying: mail.search(None, '{field_cmd}', '{quoted_term}')")
+    try:
+        typ, data = mail.search(None, field_cmd, quoted_term)
+        if typ == "OK":
+            log_func(f"  │   └─ ✅ Strategy 3 Successful! Raw Response: {data}")
+            return typ, data
+        log_func(f"  │   └─ ❌ Strategy 3 returned status: '{typ}'. All strategies failed.")
+    except Exception as ex3:
+        log_func(f"  │   └─ ❌ Strategy 3 Exception: {ex3}. All strategies failed.")
+
+    return "NO", [b""]
+
+
 def fetch_messages_paginated(mail, email_addr, password_val, host_val, target_folders: List[str], 
                             search_query: str = "", search_field: str = "TEXT", mode: str = "SEARCH", 
                             page_size: int = 15, page_number: int = 1, sort_order: str = "Newest First",
@@ -431,26 +470,27 @@ def fetch_messages_paginated(mail, email_addr, password_val, host_val, target_fo
                 continue
 
             if mode == "FOLDER_ONLY" or not clean_query:
-                cmd = "SEARCH ALL"
-                log_func(f"  ├─ [EXECUTING COMMAND] {cmd}")
+                log_func("  ├─ [EXECUTING COMMAND] mail.search(None, 'ALL')")
                 typ, data = mail.search(None, "ALL")
             else:
                 field_cmd = search_field if search_field in ("TEXT", "SUBJECT", "FROM", "BODY") else "TEXT"
                 terms = clean_query.split()
                 
                 if len(terms) > 1:
-                    log_func(f"  ├─ [EXECUTING COMMAND] Multi-term search for terms {terms} using {field_cmd}")
+                    log_func(f"  ├─ [MULTI-TERM SEARCH] Query has {len(terms)} keywords. Executing individual IMAP fetches...")
                     matched_ids_set = set()
-                    for term in terms[:10]:
-                        sub_typ, sub_data = mail.search(None, field_cmd, term)
+                    for t_idx, term in enumerate(terms[:10], 1):
+                        log_func(f"  │   ├─ [Term #{t_idx}/10]: '{term}'")
+                        sub_typ, sub_data = execute_imap_search_safely(mail, field_cmd, term, log_func)
                         if sub_typ == "OK" and sub_data and sub_data[0]:
-                            matched_ids_set.update((sub_data[0] or b"").split())
+                            found_ids = (sub_data[0] or b"").split()
+                            matched_ids_set.update(found_ids)
+                            log_func(f"  │   └─ Matches for '{term}': {len(found_ids)} IDs")
                     typ = "OK"
                     data = [b" ".join(sorted(matched_ids_set, key=lambda x: int(x)))]
                 else:
-                    cmd = f'SEARCH {field_cmd} "{clean_query}"'
-                    log_func(f"  ├─ [EXECUTING COMMAND] {cmd}")
-                    typ, data = mail.search(None, field_cmd, clean_query)
+                    log_func(f"  ├─ [SINGLE-TERM SEARCH] Querying term: '{clean_query}' via field '{field_cmd}'")
+                    typ, data = execute_imap_search_safely(mail, field_cmd, clean_query, log_func)
 
             log_func(f"  ├─ [IMAP SEARCH RESPONSE] Status: '{typ}' | Raw Bytes: {data}")
             ids = (data[0] or b"").split() if typ == "OK" and data else []
