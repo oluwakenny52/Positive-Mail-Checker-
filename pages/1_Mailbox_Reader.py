@@ -418,57 +418,68 @@ def clean_boilerplate(text):
 
 
 def execute_imap_search_safely(mail, field_cmd: str, query_term: str, log_func):
-    """Robust IMAP search strategy engine that avoids socket EOF errors."""
-    log_func(f"  ├─ [SEARCH STRATEGY 1] Trying: mail.search(None, '{field_cmd}', '{query_term}')")
+    """Optimized IMAP search strategy engine trying SUBJECT, FROM, and BODY first for instant server-side results."""
+    # Strategy 1: SUBJECT Search
+    log_func(f"  ├─ [SEARCH STRATEGY 1] Trying: mail.search(None, 'SUBJECT', '{query_term}')")
     try:
-        typ, data = mail.search(None, field_cmd, query_term)
-        if typ == "OK":
-            log_func(f"  │   └─ ✅ Strategy 1 Successful! Response: {data}")
+        typ, data = mail.search(None, 'SUBJECT', query_term)
+        if typ == "OK" and data and data[0]:
+            log_func(f"  │   └─ ✅ Strategy 1 (SUBJECT) Successful! Response: {data}")
             return typ, data
-        log_func(f"  │   └─ ⚠️ Strategy 1 Status: '{typ}'. Trying Strategy 2...")
-    except (socket.error, OSError, imaplib.IMAP4.error) as ex1:
-        log_func(f"  │   └─ ⚠️ Strategy 1 Failed: {ex1}. Trying Strategy 2...")
+    except Exception as ex1:
+        log_func(f"  │   └─ ⚠️ Strategy 1 Failed: {ex1}")
 
-    log_func(f"  ├─ [SEARCH STRATEGY 2] Trying: mail.search(None, '{field_cmd}', b'{query_term}')")
+    # Strategy 2: FROM Search
+    log_func(f"  ├─ [SEARCH STRATEGY 2] Trying: mail.search(None, 'FROM', '{query_term}')")
     try:
-        typ, data = mail.search(None, field_cmd, query_term.encode('utf-8'))
-        if typ == "OK":
-            log_func(f"  │   └─ ✅ Strategy 2 Successful! Response: {data}")
+        typ, data = mail.search(None, 'FROM', query_term)
+        if typ == "OK" and data and data[0]:
+            log_func(f"  │   └─ ✅ Strategy 2 (FROM) Successful! Response: {data}")
             return typ, data
-        log_func(f"  │   └─ ⚠️ Strategy 2 Status: '{typ}'. Trying Strategy 3...")
-    except (socket.error, OSError, imaplib.IMAP4.error) as ex2:
-        log_func(f"  │   └─ ⚠️ Strategy 2 Failed: {ex2}. Trying Strategy 3...")
+    except Exception as ex2:
+        log_func(f"  │   └─ ⚠️ Strategy 2 Failed: {ex2}")
 
-    cmd_str = f'{field_cmd} "{query_term}"'
-    log_func(f"  ├─ [SEARCH STRATEGY 3] Trying: mail.search(None, '{cmd_str}')")
+    # Strategy 3: BODY Search
+    log_func(f"  ├─ [SEARCH STRATEGY 3] Trying: mail.search(None, 'BODY', '{query_term}')")
     try:
-        typ, data = mail.search(None, cmd_str)
-        if typ == "OK":
-            log_func(f"  │   └─ ✅ Strategy 3 Successful! Response: {data}")
+        typ, data = mail.search(None, 'BODY', query_term)
+        if typ == "OK" and data and data[0]:
+            log_func(f"  │   └─ ✅ Strategy 3 (BODY) Successful! Response: {data}")
             return typ, data
-        log_func(f"  │   └─ ⚠️ Strategy 3 Status: '{typ}'. Trying Strategy 4...")
-    except (socket.error, OSError, imaplib.IMAP4.error) as ex3:
-        log_func(f"  │   └─ ⚠️ Strategy 3 Failed: {ex3}. Trying Strategy 4...")
+    except Exception as ex3:
+        log_func(f"  │   └─ ⚠️ Strategy 3 Failed: {ex3}")
 
-    paren_cmd = f'({field_cmd} "{query_term}")'
-    log_func(f"  ├─ [SEARCH STRATEGY 4] Trying: mail.search(None, '{paren_cmd}')")
+    # Strategy 4: Raw string search command
+    log_func(f"  ├─ [SEARCH STRATEGY 4] Trying: mail.search(None, '{field_cmd} \"{query_term}\"')")
     try:
-        typ, data = mail.search(None, paren_cmd)
-        if typ == "OK":
+        typ, data = mail.search(None, f'{field_cmd} "{query_term}"')
+        if typ == "OK" and data and data[0]:
             log_func(f"  │   └─ ✅ Strategy 4 Successful! Response: {data}")
             return typ, data
-        log_func(f"  │   └─ ⚠️ Strategy 4 Failed. Engaging Strategy 5 Client-Side Fallback...")
-    except (socket.error, OSError, imaplib.IMAP4.error) as ex4:
-        log_func(f"  │   └─ ⚠️ Strategy 4 Failed: {ex4}. Engaging Strategy 5 Fallback...")
+    except Exception as ex4:
+        log_func(f"  │   └─ ⚠️ Strategy 4 Failed: {ex4}")
 
-    # Strategy 5: Client-Side Engine Fallback (Fetches ALL and filters locally without dropping sockets)
-    log_func("  ├─ [SEARCH STRATEGY 5 - ENGINE FALLBACK] Fetching ALL Message IDs for local regex filter...")
+    # Strategy 5: Client-Side Fast Fallback (Fetch ALL + Fast Envelope Scan)
+    log_func("  ├─ [SEARCH STRATEGY 5 - FAST FALLBACK] Fetching ALL Message IDs for local envelope scan...")
     try:
         typ, data = mail.search(None, "ALL")
         if typ == "OK" and data and data[0]:
             all_ids = (data[0] or b"").split()
-            log_func(f"  │   └─ ✅ Strategy 5 Fallback Successful! Retrieved {len(all_ids)} raw message IDs for local parsing.")
-            return "OK_FALLBACK", [data[0]]
+            log_func(f"  │   └─ 🔍 Scanning {len(all_ids)} message envelopes locally for '{query_term}'...")
+            matched_ids = []
+            q_lower = query_term.lower()
+            
+            for mid in all_ids:
+                try:
+                    _, edata = mail.fetch(mid, "(ENVELOPE)")
+                    if edata and isinstance(edata[0], tuple):
+                        if q_lower in edata[0][1].decode("utf-8", errors="ignore").lower():
+                            matched_ids.append(mid)
+                except Exception:
+                    continue
+            
+            log_func(f"  │   └─ ✅ Fast Fallback Scan Complete! Found {len(matched_ids)} matching message IDs.")
+            return "OK_FALLBACK", [b" ".join(matched_ids)] if matched_ids else [b""]
     except Exception as ex5:
         log_func(f"  │   └─ ❌ Strategy 5 Exception: {ex5}")
 
@@ -546,7 +557,6 @@ def fetch_messages_paginated(mail, email_addr, password_val, host_val, target_fo
             if sort_order == "Newest First":
                 ids = list(reversed(ids))
 
-            # Correctly compute total server count for folder pagination
             folder_total_count = len(ids)
 
             start_idx = (page_number - 1) * page_size
@@ -633,7 +643,7 @@ def fetch_messages_paginated(mail, email_addr, password_val, host_val, target_fo
                     f"Flags: {flags_str} | Categories={detected_categories} | Pins={pins} | Cards={cards}"
                 )
 
-            total_matched_all_folders += (folder_total_count if (is_fallback_mode or clean_query) else folder_total_count)
+            total_matched_all_folders += folder_total_count
             log_func(f"  ├─ [MATCHES COUNT] Verified {folder_matches_count} matching messages in '{f_label}'.")
 
         except (socket.timeout, TimeoutError):
@@ -659,10 +669,8 @@ st.caption("Advanced IMAP Client with Interactive Bot Intelligence, Dedicated OT
 
 valid = load_valid()
 
-# Valid Account Selection Dropdown on Main Screen bound to st.session_state
 pick = st.selectbox("Valid account", valid or ["none"], key="selected_account")
 
-# Sidebar Hub
 st.sidebar.header("Account & Connection Hub")
 
 if valid:
