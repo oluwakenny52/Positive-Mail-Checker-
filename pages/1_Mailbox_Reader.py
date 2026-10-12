@@ -420,7 +420,7 @@ def clean_boilerplate(text):
 
 
 def execute_imap_search_safely(mail, field_cmd: str, query_term: str, log_func):
-    """Optimized IMAP search strategy engine with Fast Envelope Pre-Filter Fallback."""
+    """Robust IMAP search strategy engine with Fast Envelope Pre-Filter Fallback."""
     log_func(f"  ├─ [SEARCH STRATEGY 1] Trying: mail.search(None, '{field_cmd}', '{query_term}')")
     try:
         typ, data = mail.search(None, field_cmd, query_term)
@@ -459,13 +459,13 @@ def execute_imap_search_safely(mail, field_cmd: str, query_term: str, log_func):
     except Exception as ex4:
         log_func(f"  │   └─ ⚠️ Strategy 4 Failed: {ex4}")
 
-    # Strategy 5: Fast Envelope Pre-Filter Fallback (Collects ONLY matching message IDs)
-    log_func("  ├─ [SEARCH STRATEGY 5 - FAST FALLBACK] Fetching ALL Message IDs for local envelope pre-filter...")
+    # Strategy 5: Fast Envelope Pre-Filter Fallback (Collects ONLY matching message IDs locally)
+    log_func("  ├─ [SEARCH STRATEGY 5 - FAST LOCAL PRE-FILTER] Fetching ALL Message IDs and filtering locally...")
     try:
         typ, data = mail.search(None, "ALL")
         if typ == "OK" and data and data[0]:
             all_ids = (data[0] or b"").split()
-            log_func(f"  │   └─ 🔍 Scanning {len(all_ids)} message envelopes locally for '{query_term}'...")
+            log_func(f"  │   └─ 🔍 Pre-filtering {len(all_ids)} message envelopes for query '{query_term}'...")
             matched_ids = []
             q_lower = query_term.lower()
             
@@ -479,7 +479,7 @@ def execute_imap_search_safely(mail, field_cmd: str, query_term: str, log_func):
                 except Exception:
                     continue
             
-            log_func(f"  │   └─ ✅ Fast Fallback Scan Complete! Found {len(matched_ids)} matching message IDs.")
+            log_func(f"  │   └─ ✅ Fast Local Pre-Filter Complete! Found {len(matched_ids)} matching message IDs out of {len(all_ids)}.")
             return "OK_FALLBACK", [b" ".join(matched_ids)] if matched_ids else [b""]
     except Exception as ex5:
         log_func(f"  │   └─ ❌ Strategy 5 Exception: {ex5}")
