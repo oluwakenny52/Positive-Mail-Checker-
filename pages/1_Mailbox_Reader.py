@@ -39,6 +39,25 @@ st.markdown(
     unsafe_allow_html=True
 )
 
+# Persistent Last Account Management
+LAST_ACCOUNT_FILE = "last_account.txt"
+
+def save_last_account(account_combo):
+    try:
+        with open(LAST_ACCOUNT_FILE, "w", encoding="utf-8") as f:
+            f.write(account_combo)
+    except Exception:
+        pass
+
+def load_last_account():
+    if os.path.exists(LAST_ACCOUNT_FILE):
+        try:
+            with open(LAST_ACCOUNT_FILE, "r", encoding="utf-8") as f:
+                return f.read().strip()
+        except Exception:
+            pass
+    return ""
+
 # Initialize Isolated Session State Variables
 if "mb_log" not in st.session_state:
     st.session_state.mb_log = []
@@ -79,7 +98,8 @@ if "otp_total_matched_count" not in st.session_state:
 if "bot_filter_mode" not in st.session_state:
     st.session_state.bot_filter_mode = False
 if "selected_account" not in st.session_state:
-    st.session_state.selected_account = "none"
+    last_acc = load_last_account()
+    st.session_state.selected_account = last_acc if last_acc else "none"
 if "custom_email" not in st.session_state:
     st.session_state.custom_email = ""
 if "custom_pass" not in st.session_state:
@@ -138,7 +158,7 @@ def generate_all_mail_zip():
         
         for path in search_paths:
             filename = os.path.basename(path)
-            if filename in added_files:
+            if filename in added_files or filename == LAST_ACCOUNT_FILE:
                 continue
             try:
                 with open(path, "r", encoding="utf-8", errors="ignore") as f:
@@ -459,7 +479,7 @@ def clean_boilerplate(text):
 
 
 def execute_imap_search_safely(mail, field_cmd: str, query_term: str, log_func):
-    """Robust IMAP search strategy engine with comprehensive local pre-filter (Subject, Headers, From, Body)."""
+    """Optimized IMAP search engine with Chunked Batch Envelope Pre-Filtering for high performance."""
     log_func(f"  ├─ [SEARCH STRATEGY 1] Trying: mail.search(None, '{field_cmd}', '{query_term}')")
     try:
         typ, data = mail.search(None, field_cmd, query_term)
@@ -498,30 +518,43 @@ def execute_imap_search_safely(mail, field_cmd: str, query_term: str, log_func):
     except Exception as ex4:
         log_func(f"  │   └─ ⚠️ Strategy 4 Failed: {ex4}")
 
-    # Strategy 5: Comprehensive Local Pre-Filter Fallback (Searches Subject, Headers, From, and Body)
-    log_func("  ├─ [SEARCH STRATEGY 5 - COMPREHENSIVE LOCAL PRE-FILTER] Fetching message headers & text locally...")
+    # Strategy 5: Ultra-Fast Chunked Batch Envelope Pre-Filter Fallback
+    log_func("  ├─ [SEARCH STRATEGY 5 - OPTIMIZED BATCH PRE-FILTER] Fetching message envelopes in batched chunks...")
     try:
         typ, data = mail.search(None, "ALL")
         if typ == "OK" and data and data[0]:
             all_ids = (data[0] or b"").split()
-            log_func(f"  │   └─ 🔍 Scanning {len(all_ids)} messages (Subject, Headers, From, Body) for query '{query_term}'...")
+            log_func(f"  │   └─ 🔍 Batch pre-filtering {len(all_ids)} messages for query '{query_term}'...")
             matched_ids = []
             q_lower = query_term.lower()
             
-            for mid in all_ids:
+            chunk_size = 200
+            for i in range(0, len(all_ids), chunk_size):
+                chunk = all_ids[i:i+chunk_size]
+                id_range_str = b",".join(chunk)
                 try:
-                    _, edata = mail.fetch(mid, "(BODY.PEEK[HEADER] BODY.PEEK[TEXT])")
-                    if edata and isinstance(edata, list):
-                        combined_text = ""
-                        for item in edata:
-                            if isinstance(item, tuple) and item[1]:
-                                combined_text += item[1].decode("utf-8", errors="ignore").lower() + " "
-                        if q_lower in combined_text:
-                            matched_ids.append(mid)
+                    _, edatas = mail.fetch(id_range_str, "(ENVELOPE)")
+                    if edatas:
+                        for item in edatas:
+                            if isinstance(item, tuple):
+                                header_line = item[0].decode("utf-8", errors="ignore")
+                                body_content = item[1].decode("utf-8", errors="ignore").lower()
+                                m_id_match = re.search(r'^(\d+)', header_line)
+                                if m_id_match:
+                                    m_id_str = m_id_match.group(1).encode('utf-8')
+                                    if m_id_str in chunk and q_lower in body_content:
+                                        matched_ids.append(m_id_str)
                 except Exception:
-                    continue
+                    for mid in chunk:
+                        try:
+                            _, edata = mail.fetch(mid, "(ENVELOPE)")
+                            if edata and isinstance(edata[0], tuple):
+                                if q_lower in edata[0][1].decode("utf-8", errors="ignore").lower():
+                                    matched_ids.append(mid)
+                        except Exception:
+                            continue
             
-            log_func(f"  │   └─ ✅ Comprehensive Pre-Filter Complete! Found {len(matched_ids)} matching message IDs out of {len(all_ids)}.")
+            log_func(f"  │   └─ ✅ Batch Pre-Filter Complete! Found {len(matched_ids)} matching message IDs out of {len(all_ids)}.")
             return "OK_FALLBACK", [b" ".join(matched_ids)] if matched_ids else [b""]
     except Exception as ex5:
         log_func(f"  │   └─ ❌ Strategy 5 Exception: {ex5}")
@@ -700,7 +733,15 @@ st.caption("Advanced IMAP Client with Interactive Bot Intelligence, Dedicated OT
 
 valid = load_valid()
 
-pick = st.selectbox("Valid account", valid or ["none"], key="selected_account")
+# Determine selected account, defaulting to persistent cache
+valid_dropdown_options = valid if valid else ["none"]
+default_index = 0
+if st.session_state.selected_account in valid_dropdown_options:
+    default_index = valid_dropdown_options.index(st.session_state.selected_account)
+
+pick = st.selectbox("Valid account", valid_dropdown_options, index=default_index, key="selected_account")
+if pick != "none":
+    save_last_account(pick)
 
 st.sidebar.header("Account & Connection Hub")
 
@@ -727,7 +768,7 @@ st.sidebar.text_input("Email override", key="custom_email")
 st.sidebar.text_input("Password override", type="password", key="custom_pass")
 st.sidebar.text_input("IMAP host override", key="custom_host")
 
-# Sidebar Login & Auto-Save Button
+# Sidebar Login & Auto-Save Button with 60s Timeout
 if st.sidebar.button("🔑 Login & Save Account", type="primary", use_container_width=True):
     c_email = st.session_state.custom_email.strip()
     c_pass = st.session_state.custom_pass.strip()
@@ -738,8 +779,8 @@ if st.sidebar.button("🔑 Login & Save Account", type="primary", use_container_
         host_to_try = c_override or (host_list(c_email)[:1] or [""])[0]
         test_mail = None
         try:
-            with st.spinner("Validating credentials..."):
-                test_mail = open_mail(c_email, c_pass, host_to_try, timeout=30)
+            with st.spinner("Validating credentials (60s timeout)..."):
+                test_mail = open_mail(c_email, c_pass, host_to_try, timeout=60)
                 close_mail(test_mail)
                 
                 combo = f"{c_email}:{c_pass}"
@@ -747,7 +788,10 @@ if st.sidebar.button("🔑 Login & Save Account", type="primary", use_container_
                 if combo not in existing_valid:
                     with open("clean_valid_accounts.txt", "a", encoding="utf-8") as f:
                         f.write(combo + "\n")
-                st.sidebar.success(f"✅ Login successful! Saved {c_email} to valid accounts.")
+                
+                save_last_account(combo)
+                st.session_state.selected_account = combo
+                st.sidebar.success(f"✅ Login successful! Saved {c_email} and added to valid accounts.")
                 st.rerun()
         except Exception as ex:
             st.sidebar.error(f"❌ Login failed: {ex}")
@@ -1018,7 +1062,6 @@ with st.expander("🔑 Standalone OTP, Debit/Credit Cards & Sensitive Data Scann
     with otp_c3:
         otp_search_field = st.selectbox("Scan Field", ["TEXT", "SUBJECT", "BODY", "FROM"], key="otp_search_field")
 
-    # Independent Page Size Slider for OTP Scanner
     otp_page_size = st.slider("OTP Scanner Results Page Size", 5, 50, 15, key="otp_page_size_slider")
 
     t_col1, t_col2 = st.columns(2)
@@ -1239,7 +1282,6 @@ with st.expander("🔍 Deep Keyword Search & Scope Filters", expanded=False):
     
     search_query_input = st.text_input("Search term or keyword", key="deep_search_query")
     
-    # Independent Page Size Slider for Search
     search_page_size = st.slider("Search Results Page Size", 5, 50, 15, key="search_page_size_slider")
     
     if st.button("🔍 Execute Keyword Search", type="primary", use_container_width=True, key="deep_search_btn"):
@@ -1420,7 +1462,6 @@ with st.expander("🤖 Mass Bot Purge & Intelligence Hub", expanded=False):
     with bot_col2:
         bot_scan_limit = st.selectbox("Bot Scan Depth", [50, 100, 200, 500], index=1)
 
-    # Independent Page Size Slider for Bot Stream
     bot_page_size = st.slider("Bot Stream Results Page Size", 5, 50, 15, key="bot_page_size_slider")
 
     b_act1, b_act2 = st.columns(2)
