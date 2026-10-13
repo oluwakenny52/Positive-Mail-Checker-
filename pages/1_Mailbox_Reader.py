@@ -208,9 +208,8 @@ def otp_log(msg):
 def load_valid():
     """Scans valid results files and app logs specifically for authenticated/valid accounts,
     strictly ignoring any unfinished/resume files that contain unchecked accounts."""
-    valid_map = {} # email_lower -> (timestamp_dt, display_label)
+    valid_map = {} # email_lower -> (timestamp_dt, combo_str)
     
-    # Strictly target valid files and log files
     search_patterns = [
         "mail_results/*valid*.txt",
         "mail_results/*clean*.txt",
@@ -229,7 +228,6 @@ def load_valid():
         
     all_files = list(dict.fromkeys([p for p in all_files if os.path.isfile(p)]))
     
-    # Blacklist any input, proxy, or resume/unfinished files
     ignore_keywords = ["resume", "unfinished", "remaining", "input", "proxies", "proxy", "config", "blocklist"]
     
     for path in all_files:
@@ -242,7 +240,6 @@ def load_valid():
             with open(path, encoding="utf-8", errors="ignore") as f:
                 content = f.read()
                 
-                # If reading a log file or general file, explicitly look for [VALID] tags or standard valid account entries
                 if path.endswith(".log") or "log" in filename_lower:
                     valid_lines = re.findall(r'\[VALID\]\s*([a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+)\s*->\s*([^\s|<>\n]+)|\[VALID\]\s*([a-zA-Z0-9_.+-]+@[a-zA-Z0-9-.]+:([^\s|<>\n]+))', content)
                     for m in valid_lines:
@@ -254,11 +251,9 @@ def load_valid():
                         
                         if email_p and pass_p:
                             combo_str = f"{email_p}:{pass_p}"
-                            display_label = f"{combo_str} [Found: {file_mtime.strftime('%Y-%m-%d %H:%M:%S')}]"
                             if email_p not in valid_map or file_mtime > valid_map[email_p][0]:
-                                valid_map[email_p] = (file_mtime, display_label)
+                                valid_map[email_p] = (file_mtime, combo_str)
                 else:
-                    # Parse standard valid result text/JSON files
                     matches = re.findall(r'([a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+\s*[:|]\s*[^\s<>\n"\'\]\}]+)', content)
                     for m in matches:
                         clean_combo = m.replace("|", ":").replace(" ", "").strip('"\'')
@@ -272,15 +267,22 @@ def load_valid():
                             continue
                             
                         combo_str = f"{email_part}:{pwd_part}"
-                        display_label = f"{combo_str} [Found: {file_mtime.strftime('%Y-%m-%d %H:%M:%S')}]"
                         
                         if email_part not in valid_map or file_mtime > valid_map[email_part][0]:
-                            valid_map[email_part] = (file_mtime, display_label)
+                            valid_map[email_part] = (file_mtime, combo_str)
         except Exception:
             continue
             
     sorted_items = sorted(valid_map.values(), key=lambda x: x[0], reverse=True)
-    return [item[1] for item in sorted_items] if sorted_items else ["none"]
+    
+    # Format options with non-clickable timestamp line followed by combo line (newest at the top)
+    options = []
+    for file_mtime, combo_str in sorted_items:
+        time_label = f"# Found: {file_mtime.strftime('%Y-%m-%d %H:%M:%S')}"
+        options.append(time_label)
+        options.append(combo_str)
+        
+    return options if options else ["none"]
 
 
 def generate_all_mail_zip():
@@ -875,7 +877,11 @@ pick = st.selectbox("Valid account", valid_dropdown_options, index=default_index
 
 actual_pick = "none"
 if pick and pick != "none":
-    actual_pick = pick.split("[Found:")[0].strip()
+    if pick.startswith("# Found:"):
+        st.warning("Please select the email:password combo below the timestamp (timestamps are non-clickable labels).")
+        actual_pick = "none"
+    else:
+        actual_pick = pick.strip()
 
 if actual_pick and actual_pick != "none" and ":" in actual_pick:
     save_last_account(actual_pick)
@@ -883,7 +889,9 @@ if actual_pick and actual_pick != "none" and ":" in actual_pick:
 st.sidebar.header("Account & Connection Hub")
 
 if valid:
-    valid_text_data = "\n".join(valid)
+    # Filter out timestamp header lines for the valid mail list download file
+    clean_download_lines = [line for line in valid if not line.startswith("# Found:")]
+    valid_text_data = "\n".join(clean_download_lines)
     st.sidebar.download_button(
         label="📥 Download Valid Mail List",
         data=valid_text_data,
@@ -1030,8 +1038,8 @@ if st.sidebar.button("🚀 Validate & Import Batch Accounts", type="primary", us
             if is_success:
                 valid_count += 1
                 found_timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                combo_str = f"{email_val}:{pass_val} | Found: {found_timestamp}"
-                new_valid_entries.append(combo_str)
+                combo_str = f"{email_val}:{pass_val}"
+                new_valid_entries.append(f"{combo_str} | Found: {found_timestamp}")
                 batch_logs.append(f"✅ [{row_time}] [VALID] {email_val} via {connected_h} [Proxy: {proxy_item['proxy']} ({proxy_item['country']}, {proxy_item['region']})]")
             else:
                 err_lower = err_msg.lower()
