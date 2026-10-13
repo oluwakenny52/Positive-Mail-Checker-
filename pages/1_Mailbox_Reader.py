@@ -208,13 +208,15 @@ def otp_log(msg):
 def load_valid():
     """Recursively scans all text, log, and result files across root and mail_results/ 
     directories, extracting valid email:password combinations instantly from both 
-    finished and unfinished runs."""
+    finished and unfinished runs, while cleaning extra quotes and formatting."""
     valid_map = {} # email_lower -> (timestamp_dt, display_label)
     
     search_patterns = [
         "*.txt",
         "mail_results/*.txt",
         "mail_results/**/*.txt",
+        "*.log",
+        "mail_results/*.log",
         "*.json",
         "mail_results/*.json"
     ]
@@ -234,15 +236,15 @@ def load_valid():
             with open(path, encoding="utf-8", errors="ignore") as f:
                 content = f.read()
                 
-                # Regex matching any email:password combo in raw text, results, or log output
-                matches = re.findall(r'([a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+\s*[:|]\s*[^\s<>\n]+)', content)
+                # Extended regex pattern to extract email:pass and ignore quotes/formatting
+                matches = re.findall(r'([a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+\s*[:|]\s*[^\s<>\n"\'\]\}]+)', content)
                 for m in matches:
-                    clean_combo = m.replace("|", ":").replace(" ", "")
+                    clean_combo = m.replace("|", ":").replace(" ", "").strip('"\'')
                     if ":" not in clean_combo:
                         continue
                     parts = clean_combo.split(":", 1)
-                    email_part = parts[0].strip().lower()
-                    pwd_part = parts[1].strip()
+                    email_part = parts[0].strip().lower().strip('"\'')
+                    pwd_part = parts[1].strip().strip('"\'')
                     
                     if "@" not in email_part or "." not in email_part or not pwd_part:
                         continue
