@@ -275,7 +275,6 @@ def load_valid():
             
     sorted_items = sorted(valid_map.values(), key=lambda x: x[0], reverse=True)
     
-    # Format options with non-clickable timestamp line followed by combo line (newest at the top)
     options = []
     for file_mtime, combo_str in sorted_items:
         time_label = f"# Found: {file_mtime.strftime('%Y-%m-%d %H:%M:%S')}"
@@ -863,7 +862,27 @@ st.caption("Advanced IMAP Client with Interactive Bot Intelligence, Dedicated OT
 
 valid = load_valid()
 
-valid_dropdown_options = valid if valid else ["none"]
+# --- Keyboard Search & Filter Box ---
+account_filter_query = st.text_input("🔍 Filter Valid Accounts (Type to search with keyboard)", placeholder="Type email, domain, or timestamp...").strip().lower()
+
+if account_filter_query:
+    filtered_options = []
+    i = 0
+    while i < len(valid):
+        item = valid[i]
+        if item.startswith("# Found:"):
+            if i + 1 < len(valid) and account_filter_query in valid[i+1].lower():
+                filtered_options.append(item)
+                filtered_options.append(valid[i+1])
+            i += 2
+        else:
+            if account_filter_query in item.lower():
+                filtered_options.append(item)
+            i += 1
+    valid_dropdown_options = filtered_options if filtered_options else ["none"]
+else:
+    valid_dropdown_options = valid if valid else ["none"]
+
 default_index = 0
 
 if "forced_account" in st.session_state and st.session_state.forced_account in valid_dropdown_options:
@@ -889,7 +908,6 @@ if actual_pick and actual_pick != "none" and ":" in actual_pick:
 st.sidebar.header("Account & Connection Hub")
 
 if valid:
-    # Filter out timestamp header lines for the valid mail list download file
     clean_download_lines = [line for line in valid if not line.startswith("# Found:")]
     valid_text_data = "\n".join(clean_download_lines)
     st.sidebar.download_button(
