@@ -56,7 +56,7 @@ def load_app_proxies() -> List[dict]:
                                 "region": region,
                                 "latency": latency
                             })
-            except Exception:
+            except Exception as ex:
                 pass
             if dynamic_pool:
                 return dynamic_pool
@@ -104,7 +104,7 @@ def load_app_config():
                 config = DEFAULT_APP_CONFIG.copy()
                 config.update(data)
                 return config
-        except Exception:
+        except Exception as ex:
             pass
     return DEFAULT_APP_CONFIG.copy()
 
@@ -112,14 +112,14 @@ def save_app_config(config_dict):
     try:
         with open(APP_CONFIG_FILE, "w", encoding="utf-8") as f:
             json.dump(config_dict, f, indent=2)
-    except Exception:
+    except Exception as ex:
         pass
 
 def save_last_account(account_combo):
     try:
         with open(LAST_ACCOUNT_FILE, "w", encoding="utf-8") as f:
             f.write(account_combo)
-    except Exception:
+    except Exception as ex:
         pass
 
 def load_last_account():
@@ -127,7 +127,7 @@ def load_last_account():
         try:
             with open(LAST_ACCOUNT_FILE, "r", encoding="utf-8") as f:
                 return f.read().strip()
-        except Exception:
+        except Exception as ex:
             pass
     return ""
 
@@ -206,55 +206,53 @@ def otp_log(msg):
 
 
 def load_valid():
-    """Dynamically scans all text files in root and mail_results/, extracting valid 
-    email:password combinations instantly from both finished and unfinished runs, 
-    while safely integrating manual accounts."""
+    """Recursively scans all text, log, and result files across root and mail_results/ 
+    directories, extracting valid email:password combinations instantly from both 
+    finished and unfinished runs."""
     valid_map = {} # email_lower -> (timestamp_dt, display_label)
     
-    paths = glob.glob("*.txt") + glob.glob("mail_results/*.txt")
-    paths = list(dict.fromkeys([p for p in paths if os.path.exists(p)]))
+    search_patterns = [
+        "*.txt",
+        "mail_results/*.txt",
+        "mail_results/**/*.txt",
+        "*.json",
+        "mail_results/*.json"
+    ]
     
+    all_files = []
+    for pat in search_patterns:
+        all_files.extend(glob.glob(pat, recursive=True))
+        
+    all_files = list(dict.fromkeys([p for p in all_files if os.path.isfile(p)]))
     exclude_files = {LAST_ACCOUNT_FILE, APP_CONFIG_FILE, "proxies.txt", "proxy_pool.txt", "clean_proxies.txt"}
     
-    for path in paths:
+    for path in all_files:
         if os.path.basename(path) in exclude_files:
             continue
         try:
             file_mtime = datetime.fromtimestamp(os.path.getmtime(path))
             with open(path, encoding="utf-8", errors="ignore") as f:
-                for line in f:
-                    line_str = line.strip()
-                    if not line_str or line_str.startswith("#"):
+                content = f.read()
+                
+                # Regex matching any email:password combo in raw text, results, or log output
+                matches = re.findall(r'([a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+\s*[:|]\s*[^\s<>\n]+)', content)
+                for m in matches:
+                    clean_combo = m.replace("|", ":").replace(" ", "")
+                    if ":" not in clean_combo:
                         continue
+                    parts = clean_combo.split(":", 1)
+                    email_part = parts[0].strip().lower()
+                    pwd_part = parts[1].strip()
                     
-                    combo_part = line_str.split("|")[0].strip()
-                    if ":" not in combo_part:
-                        match = re.search(r'([a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+:[^\s|]+)', line_str)
-                        if match:
-                            combo_part = match.group(1)
-                        else:
-                            continue
-                    
-                    email_part = combo_part.split(":", 1)[0].strip().lower()
-                    if "@" not in email_part or "." not in email_part:
+                    if "@" not in email_part or "." not in email_part or not pwd_part:
                         continue
+                        
+                    combo_str = f"{email_part}:{pwd_part}"
+                    display_label = f"{combo_str} [Found: {file_mtime.strftime('%Y-%m-%d %H:%M:%S')}]"
                     
-                    time_display = file_mtime.strftime("%Y-%m-%d %H:%M:%S")
-                    item_time = file_mtime
-                    
-                    if "Found:" in line_str:
-                        try:
-                            t_str = line_str.split("Found:")[1].strip()
-                            item_time = datetime.strptime(t_str, "%Y-%m-%d %H:%M:%S")
-                            time_display = t_str
-                        except Exception:
-                            pass
-                    
-                    display_label = f"{combo_part} [Found: {time_display}]"
-                    
-                    if email_part not in valid_map or item_time > valid_map[email_part][0]:
-                        valid_map[email_part] = (item_time, display_label)
-        except Exception:
+                    if email_part not in valid_map or file_mtime > valid_map[email_part][0]:
+                        valid_map[email_part] = (file_mtime, display_label)
+        except Exception as ex:
             continue
             
     sorted_items = sorted(valid_map.values(), key=lambda x: x[0], reverse=True)
@@ -303,7 +301,7 @@ def generate_all_mail_zip():
                 file_content = "\n".join(clean_lines)
                 zf.writestr(cat_name, file_content)
                 added_files.add(filename)
-            except Exception:
+            except Exception as ex:
                 continue
     buf.seek(0)
     return buf.getvalue()
@@ -315,7 +313,7 @@ def decode_hdr(value):
         for part, enc in decode_header(value or ""):
             out.append(part.decode(enc or "utf-8", errors="ignore") if isinstance(part, bytes) else str(part))
         return "".join(out)
-    except Exception:
+    except Exception as ex:
         return str(value or "")
 
 
@@ -355,7 +353,7 @@ def decode_imap_utf7(s: str) -> str:
                     b64_padded = b64_str.replace(",", "/") + "=" * ((4 - len(b64_str) % 4) % 4)
                     decoded = base64.b64decode(b64_padded).decode("utf-16be")
                     res.append(decoded + rest)
-                except Exception:
+                except Exception as ex:
                     res.append("&" + part)
         else:
             res.append(part)
@@ -479,10 +477,10 @@ def open_mail(email_addr, password_val, host_val, timeout=None):
 def close_mail(mail):
     try:
         mail.logout()
-    except Exception:
+    except Exception as ex:
         try:
             mail.shutdown()
-        except Exception:
+        except Exception as ex2:
             pass
 
 
@@ -767,12 +765,12 @@ def fetch_messages_paginated(mail, email_addr, password_val, host_val, target_fo
                             try:
                                 body_text = part.get_payload(decode=True).decode("utf-8", errors="ignore")
                                 break
-                            except Exception:
+                            except Exception as ex:
                                 pass
                 else:
                     try:
                         body_text = msg.get_payload(decode=True).decode("utf-8", errors="ignore")
-                    except Exception:
+                    except Exception as ex:
                         pass
 
                 if is_extortion_spam(subject, body_text, frm):
@@ -1000,7 +998,7 @@ if st.sidebar.button("🚀 Validate & Import Batch Accounts", type="primary", us
                     if test_m:
                         try:
                             test_m.logout()
-                        except:
+                        except Exception as ex2:
                             pass
             
             full_trace = f"Proxy: {proxy_item['proxy']} | Country: {proxy_item['country']} | Region: {proxy_item['region']} | Host: {connected_h or hosts_to_test[0]} | Port: {cfg_port} | Steps Executed: " + " | ".join(trace_steps)
@@ -1139,7 +1137,7 @@ if st.sidebar.button("🔑 Login & Save Account", type="primary", use_container_
                     if test_mail:
                         try:
                             close_mail(test_mail)
-                        except:
+                        except Exception as ex2:
                             pass
         
         if success:
