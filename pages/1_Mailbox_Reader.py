@@ -214,53 +214,40 @@ def otp_log(msg):
 
 
 def load_valid():
-    """Reads valid account files, preserves timestamp lines along with account lines, 
-    and sorts them reverse-chronologically so the newest accounts appear first in the dropdown."""
-    raw_blocks = []
-    current_time = datetime.min
-    current_block_lines = []
-    
-    paths = [p for p in ("clean_valid_accounts.txt", "valid_accounts.txt") if os.path.exists(p)]
-    paths += sorted(glob.glob("mail_results/valid_*.txt"), reverse=True)
-    
+    """Quickly scans and aggregates all valid account files from root and mail_results, 
+    extracting clean email:password combinations and sorting them by recency."""
+    valid_combos = []
     seen = set()
+    
+    # Gather all possible valid account file paths
+    paths = [p for p in ("clean_valid_accounts.txt", "valid_accounts.txt") if os.path.exists(p)]
+    paths += glob.glob("mail_results/valid_*.txt") + glob.glob("mail_results/*.txt") + glob.glob("*.txt")
+    
+    # Sort files by modification time so newest results are processed first
+    paths = sorted(list(set(paths)), key=lambda x: os.path.exists(x) and os.path.getmtime(x) or 0, reverse=True)
+    
     for path in paths:
+        if os.path.basename(path) in ("app_config.json", LAST_ACCOUNT_FILE):
+            continue
         try:
             with open(path, encoding="utf-8", errors="ignore") as f:
                 for line in f:
                     line_str = line.strip()
-                    if not line_str:
+                    # Skip empty lines, comments, and metadata timestamp headers
+                    if not line_str or line_str.startswith("#"):
                         continue
-                    if line_str.startswith("# Started:"):
-                        if current_block_lines:
-                            raw_blocks.append((current_time, current_block_lines))
-                            current_block_lines = []
-                        time_str = line_str.replace("# Started:", "").strip()
-                        try:
-                            current_time = datetime.strptime(time_str, "%Y-%m-%d %H:%M:%S")
-                        except ValueError:
-                            current_time = datetime.min
-                        current_block_lines.append(line_str)
-                    elif ":" in line_str and not line_str.startswith("#"):
-                        email_val, pwd = line_str.split(":", 1)
-                        combo = f"{email_val.strip()}:{pwd.split('|')[0].strip()}"
-                        if combo not in seen:
-                            seen.add(combo)
-                            current_block_lines.append(combo)
-                if current_block_lines:
-                    raw_blocks.append((current_time, current_block_lines))
-                    current_block_lines = []
+                    if ":" in line_str:
+                        combo = line_str.split("|")[0].strip()
+                        if ":" in combo:
+                            email_part, pass_part = combo.split(":", 1)
+                            clean_combo = f"{email_part.strip()}:{pass_part.strip()}"
+                            if "@" in email_part and clean_combo not in seen:
+                                seen.add(clean_combo)
+                                valid_combos.append(clean_combo)
         except Exception:
             continue
             
-    raw_blocks.sort(key=lambda x: x[0], reverse=True)
-    
-    dropdown_items = []
-    for _, block in raw_blocks:
-        for item in block:
-            dropdown_items.append(item)
-            
-    return dropdown_items
+    return valid_combos
 
 
 def generate_all_mail_zip():
