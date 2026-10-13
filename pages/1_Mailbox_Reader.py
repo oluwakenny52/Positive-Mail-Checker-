@@ -9,6 +9,7 @@ import time
 import socket
 import zipfile
 import io
+from datetime import datetime
 from typing import List, Tuple
 from email.header import decode_header
 from email import message_from_bytes
@@ -127,24 +128,40 @@ def otp_log(msg):
 
 
 def load_valid():
-    rows, seen = [], set()
-    paths = sorted(glob.glob("mail_results/valid_*.txt"), reverse=True)
-    paths += [p for p in ("clean_valid_accounts.txt", "valid_accounts.txt") if os.path.exists(p)]
+    """解析带有 # Started:YYYY-MM-DD HH:MM:SS 时间戳的有效账号列表，并按时间倒序排序（最新的在前）"""
+    accounts_with_time = []
+    seen = set()
+    paths = [p for p in ("clean_valid_accounts.txt", "valid_accounts.txt") if os.path.exists(p)]
+    paths += sorted(glob.glob("mail_results/valid_*.txt"), reverse=True)
+    
     for path in paths:
         try:
             with open(path, encoding="utf-8", errors="ignore") as f:
+                current_time = datetime.min
                 for line in f:
                     line = line.strip()
-                    if ":" not in line or line.startswith("#"):
+                    if not line:
                         continue
-                    email_val, pwd = line.split(":", 1)
-                    combo = f"{email_val.strip()}:{pwd.split('|')[0].strip()}"
-                    if combo not in seen:
-                        seen.add(combo)
-                        rows.append(combo)
+                    if line.startswith("# Started:"):
+                        time_str = line.replace("# Started:", "").strip()
+                        try:
+                            current_time = datetime.strptime(time_str, "%Y-%m-%d %H:%M:%S")
+                        except ValueError:
+                            current_time = datetime.min
+                        continue
+                    if ":" in line and not line.startswith("#"):
+                        email_val, pwd = line.split(":", 1)
+                        combo = f"{email_val.strip()}:{pwd.split('|')[0].strip()}"
+                        if combo not in seen:
+                            seen.add(combo)
+                            accounts_with_time.append((current_time, combo))
+                        current_time = datetime.min
         except Exception:
             continue
-    return rows
+            
+    # 按时间戳从新到旧（倒序）排列
+    accounts_with_time.sort(key=lambda x: x[0], reverse=True)
+    return [acc[1] for acc in accounts_with_time]
 
 
 def generate_all_mail_zip():
@@ -480,7 +497,7 @@ def execute_imap_search_safely(mail, field_cmd: str, query_term: str, log_func):
     clean_q = query_term.replace('"', '\\"')
     f_cmd = field_cmd.upper()
     
-    # Standard Native Search Formats (Correct Byte Parameter Encoding for Aliyun)
+    # Standard Native Search Formats
     for strat_name, search_params in [
         ("Native Raw Unquoted", f'{f_cmd} {clean_q}'),
         ("Native Raw Quoted", f'{f_cmd} "{clean_q}"'),
@@ -495,7 +512,7 @@ def execute_imap_search_safely(mail, field_cmd: str, query_term: str, log_func):
         except Exception as ex:
             log_func(f"  │   └─ ⚠️ {strat_name} Failed: {ex}")
 
-    # Lightning-Fast Batched Header Pre-Filter Fallback (< 2 Seconds)
+    # Batched Header Pre-Filter Fallback
     log_func("  ├─ [SEARCH STRATEGY 4 - BATCHED HEADER SCAN] Server native search rejected. Running chunked header scan...")
     try:
         typ, data = mail.search(None, "ALL")
@@ -746,7 +763,7 @@ st.sidebar.text_input("Email override", key="custom_email")
 st.sidebar.text_input("Password override", type="password", key="custom_pass")
 st.sidebar.text_input("IMAP host override", key="custom_host")
 
-# Sidebar Login & Save Account with Strict Isolation to Manual Inputs
+# Sidebar Login & Save Account with Strict Timestamp Injection and Top Placement
 if st.sidebar.button("🔑 Login & Save Account", type="primary", use_container_width=True):
     c_email = st.session_state.custom_email.strip()
     c_pass = st.session_state.custom_pass.strip()
@@ -778,14 +795,15 @@ if st.sidebar.button("🔑 Login & Save Account", type="primary", use_container_
         
         if success:
             combo = f"{c_email}:{c_pass}"
-            timestamp_str = time.strftime("# Started:%Y-%m-%d %H:%M:%S")
-            new_entry_block = f"{timestamp_str}\n{combo}\n"
+            timestamp_str = f"# Started:{time.strftime('%Y-%m-%d %H:%M:%S')}"
+            new_entry_block = f"{timestamp_str}\n{combo}\n\n"
             
             existing_content = ""
             if os.path.exists("clean_valid_accounts.txt"):
                 with open("clean_valid_accounts.txt", "r", encoding="utf-8", errors="ignore") as f:
                     existing_content = f.read()
             
+            # 将新添加的账号写在文件的最顶端
             with open("clean_valid_accounts.txt", "w", encoding="utf-8") as f:
                 f.write(new_entry_block + existing_content)
             
