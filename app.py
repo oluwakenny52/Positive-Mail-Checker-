@@ -1290,12 +1290,28 @@ def known_provider_conf(domain):
     gmail_pop = ["pop.gmail.com"]
     att_imap = ["imap.mail.att.net"]
     att_pop = ["inbound.att.net"]
+    
+    charter_imap = ["mobile.charter.net", "imap.charter.net"]
+    charter_pop = ["mobile.charter.net", "pop.charter.net"]
+    twc_imap = ["mail.twc.com"]
+    twc_pop = ["mail.twc.com"]
+
     yahoo_domains = {
         "yahoo.com", "ymail.com", "rocketmail.com", "frontier.com", "frontiernet.net",
         "sbcglobal.net", "att.net", "bellsouth.net", "pacbell.net", "swbell.net",
         "ameritech.net", "currently.com", "prodigy.net", "snet.net",
     }
     ms_domains = {"outlook.com", "hotmail.com", "live.com", "msn.com", "outlook.com.br", "hotmail.com.br"}
+    
+    charter_domains = {
+        "charter.net", "roadrunner.com", "rr.com",
+        "cfl.rr.com", "tampabay.rr.com", "nyc.rr.com", "nycap.rr.com", "rochester.rr.com",
+        "socal.rr.com", "ca.rr.com", "tx.rr.com", "satx.rr.com", "austin.rr.com",
+        "oh.rr.com", "cinci.rr.com", "columbus.rr.com", "carolina.rr.com", "nc.rr.com",
+        "sc.rr.com", "wi.rr.com", "mi.rr.com", "indy.rr.com", "kc.rr.com", "hawaii.rr.com"
+    }
+    twc_domains = {"twc.com", "brighthouse.com", "adelphia.net"}
+
     if domain in yahoo_domains or domain.endswith(".yahoo.com"):
         return {"imap": yahoo_imap, "pop": yahoo_pop, "pop3": yahoo_pop}
     if domain in ms_domains or domain.endswith(".outlook.com") or domain.endswith(".hotmail.com"):
@@ -1304,6 +1320,10 @@ def known_provider_conf(domain):
         return {"imap": gmail_imap, "pop": gmail_pop, "pop3": gmail_pop}
     if domain == "att.net":
         return {"imap": att_imap, "pop": att_pop, "pop3": att_pop}
+    if domain in charter_domains or domain.endswith(".rr.com"):
+        return {"imap": charter_imap, "pop": charter_pop, "pop3": charter_pop}
+    if domain in twc_domains:
+        return {"imap": twc_imap, "pop": twc_pop, "pop3": twc_pop}
     return None
 
 def drop_before_check(email):
