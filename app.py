@@ -736,7 +736,7 @@ str_lit.markdown("---")
 str_lit.markdown("### 🖥️ Startup & Under-The-Hood Display Panel")
 str_lit.markdown("Real-time inspection of app entries, startup parameters, proxy pools, and background engine diagnostic checks.")
 
-startup_expander = str_lit.expander("🔍 View All Startup Entries & What Is Going On In The Hood", expanded=True)
+startup_expander = str_lit.expander("🔍 View All Startup Entries & What Is Going On In The Hood", expanded=False)
 with startup_expander:
     str_lit.markdown("Below is the real-time activity ledger recording system boot, config injection, proxy health checks, and engine state transitions:")
     startup_log_display = str_lit.empty()
