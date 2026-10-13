@@ -189,8 +189,19 @@ def generate_all_mail_zip():
                 continue
             try:
                 with open(path, "r", encoding="utf-8", errors="ignore") as f:
-                    lines = [line.strip() for line in f if line.strip() and ":" in line and not line.startswith("#")]
-                count = len(lines)
+                    clean_lines = []
+                    for line in f:
+                        line = line.strip()
+                        if not line or line.startswith("#"):
+                            continue
+                        if ":" in line:
+                            combo = line.split("|")[0].strip()
+                            if ":" in combo:
+                                clean_lines.append(combo)
+                
+                count = len(clean_lines)
+                if count == 0:
+                    continue
                 
                 lower_name = filename.lower()
                 if "valid" in lower_name or "clean" in lower_name:
@@ -205,7 +216,7 @@ def generate_all_mail_zip():
                     base_wo_ext = os.path.splitext(filename)[0]
                     cat_name = f"{base_wo_ext}_{count}.txt"
                 
-                file_content = "\n".join(lines)
+                file_content = "\n".join(clean_lines)
                 zf.writestr(cat_name, file_content)
                 added_files.add(filename)
             except Exception:
@@ -536,7 +547,6 @@ def execute_imap_search_safely(mail, field_cmd: str, query_term: str, log_func):
             matched_ids = []
             q_lower = query_term.lower()
             
-            # Determine fetch payload based on search field (TEXT scans Subject, From, To, and Body)
             if f_cmd == "SUBJECT":
                 fetch_query = "(BODY.PEEK[HEADER.FIELDS (SUBJECT)])"
             elif f_cmd == "FROM":
