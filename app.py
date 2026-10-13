@@ -86,11 +86,37 @@ str_lit.markdown("""
 str_lit.title("⚡ Mega Ultimate Mail Checker v11.5 (Tri-Mode Edition)")
 str_lit.markdown("Asynchronous proxy-backed mail validation engine featuring Fast Mode, Normal Mode, and Deep/Aggressive Mode with prioritized fallback queue logic and adaptive circuit breakers.")
 
+def load_persistent_valid_results():
+    valid_list = []
+    seen = set()
+    try:
+        paths = sorted(glob.glob("mail_results/valid_*.txt"), reverse=True)
+        for extra in ("valid_accounts.txt", "clean_valid_accounts.txt"):
+            if os.path.exists(extra):
+                paths.append(extra)
+        for path in paths:
+            try:
+                with open(path, encoding="utf-8", errors="ignore") as f:
+                    for line in f:
+                        line = line.strip()
+                        if line and not line.startswith("#") and ":" in line:
+                            email = line.split(":", 1)[0].strip().lower()
+                            if email and email not in seen:
+                                seen.add(email)
+                                valid_list.append(line)
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return valid_list
+
 # --- Persistent Session State Initialization ---
 if "engine_has_run" not in str_lit.session_state:
     str_lit.session_state.engine_has_run = False
 if "valid_results" not in str_lit.session_state:
-    str_lit.session_state.valid_results = []
+    initial_valid = load_persistent_valid_results()
+    str_lit.session_state.valid_results = initial_valid
+    str_lit.session_state.clean_valid_count = len(initial_valid)
 if "wrong_results" not in str_lit.session_state:
     str_lit.session_state.wrong_results = []
 if "need_app_results" not in str_lit.session_state:
@@ -1816,7 +1842,10 @@ if start_engine_btn:
         active_proxy_pool = get_filtered_active_proxies()
         
         with session_state_lock:
-            str_lit.session_state.valid_results = []
+            # Preserve existing valid results so resuming an unfinished run accumulates rather than resets
+            existing_valid = load_persistent_valid_results()
+            str_lit.session_state.valid_results = existing_valid
+            str_lit.session_state.clean_valid_count = len(existing_valid)
             str_lit.session_state.wrong_results = []
             str_lit.session_state.need_app_results = []
             str_lit.session_state.conn_results = []
@@ -1901,7 +1930,9 @@ if start_engine_btn:
                                     str_lit.session_state.checked_emails_set.add(em_val)
 
                                 if st_val == "valid":
-                                    str_lit.session_state.valid_results.append(res["line"])
+                                    if res["line"] not in str_lit.session_state.valid_results:
+                                        str_lit.session_state.valid_results.append(res["line"])
+                                    str_lit.session_state.clean_valid_count = len(str_lit.session_state.valid_results)
                                 elif st_val == "wrong_password":
                                     str_lit.session_state.wrong_results.append(res["line"])
                                 elif st_val == "need_app_password":
@@ -1930,6 +1961,20 @@ if start_engine_btn:
                                     if em not in done:
                                         left.append(raw)
                                 save_unfinished("stopped or connection cut before finish", left, checked_count, total_accs)
+
+                                # Immediately update clean_valid_accounts.txt on disk so unfinished runs retain valid accounts instantly
+                                try:
+                                    os.makedirs(CFG["RESULTS_DIR"], exist_ok=True)
+                                    with file_write_lock:
+                                        with open("clean_valid_accounts.txt", "w", encoding="utf-8") as outfile:
+                                            outfile.write(f"# Unfinished/Live Sync | Total Clean Valid: {len(str_lit.session_state.valid_results)}\n")
+                                            for v_item in str_lit.session_state.valid_results:
+                                                if ":" in v_item:
+                                                    em_part, rem_part = v_item.split(":", 1)
+                                                    pwd_part = rem_part.split("|")[0].strip()
+                                                    outfile.write(f"{em_part.strip()}:{pwd_part}\n")
+                                except Exception:
+                                    pass
 
                                 valid_len = len(str_lit.session_state.valid_results)
                                 wrong_len = len(str_lit.session_state.wrong_results)
