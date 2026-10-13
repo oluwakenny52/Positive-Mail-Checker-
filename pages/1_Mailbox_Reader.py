@@ -206,19 +206,21 @@ def otp_log(msg):
 
 
 def load_valid():
-    """Recursively scans all text, log, and result files across root and mail_results/ 
-    directories, extracting valid email:password combinations instantly from both 
-    finished and unfinished runs, while cleaning extra quotes and formatting."""
+    """Scans valid results files and app logs specifically for authenticated/valid accounts,
+    strictly ignoring any unfinished/resume files that contain unchecked accounts."""
     valid_map = {} # email_lower -> (timestamp_dt, display_label)
     
+    # Strictly target valid files and log files
     search_patterns = [
-        "*.txt",
-        "mail_results/*.txt",
-        "mail_results/**/*.txt",
-        "*.log",
+        "mail_results/*valid*.txt",
+        "mail_results/*clean*.txt",
+        "*valid*.txt",
+        "*clean*.txt",
+        "manual_valid_accounts.txt",
         "mail_results/*.log",
-        "*.json",
-        "mail_results/*.json"
+        "*.log",
+        "mail_results/*.json",
+        "*.json"
     ]
     
     all_files = []
@@ -226,35 +228,55 @@ def load_valid():
         all_files.extend(glob.glob(pat, recursive=True))
         
     all_files = list(dict.fromkeys([p for p in all_files if os.path.isfile(p)]))
-    exclude_files = {LAST_ACCOUNT_FILE, APP_CONFIG_FILE, "proxies.txt", "proxy_pool.txt", "clean_proxies.txt"}
+    
+    # Blacklist any input, proxy, or resume/unfinished files
+    ignore_keywords = ["resume", "unfinished", "remaining", "input", "proxies", "proxy", "config", "blocklist"]
     
     for path in all_files:
-        if os.path.basename(path) in exclude_files:
+        filename_lower = os.path.basename(path).lower()
+        if any(kw in filename_lower for kw in ignore_keywords) or filename_lower == LAST_ACCOUNT_FILE:
             continue
+            
         try:
             file_mtime = datetime.fromtimestamp(os.path.getmtime(path))
             with open(path, encoding="utf-8", errors="ignore") as f:
                 content = f.read()
                 
-                # Extended regex pattern to extract email:pass and ignore quotes/formatting
-                matches = re.findall(r'([a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+\s*[:|]\s*[^\s<>\n"\'\]\}]+)', content)
-                for m in matches:
-                    clean_combo = m.replace("|", ":").replace(" ", "").strip('"\'')
-                    if ":" not in clean_combo:
-                        continue
-                    parts = clean_combo.split(":", 1)
-                    email_part = parts[0].strip().lower().strip('"\'')
-                    pwd_part = parts[1].strip().strip('"\'')
-                    
-                    if "@" not in email_part or "." not in email_part or not pwd_part:
-                        continue
+                # If reading a log file or general file, explicitly look for [VALID] tags or standard valid account entries
+                if path.endswith(".log") or "log" in filename_lower:
+                    valid_lines = re.findall(r'\[VALID\]\s*([a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+)\s*->\s*([^\s|<>\n]+)|\[VALID\]\s*([a-zA-Z0-9_.+-]+@[a-zA-Z0-9-.]+:([^\s|<>\n]+))', content)
+                    for m in valid_lines:
+                        email_p = (m[0] or m[2]).strip().lower()
+                        pass_p = (m[1] or m[3]).strip()
+                        if ":" in email_p:
+                            parts = email_p.split(":", 1)
+                            email_p, pass_p = parts[0], parts[1]
                         
-                    combo_str = f"{email_part}:{pwd_part}"
-                    display_label = f"{combo_str} [Found: {file_mtime.strftime('%Y-%m-%d %H:%M:%S')}]"
-                    
-                    if email_part not in valid_map or file_mtime > valid_map[email_part][0]:
-                        valid_map[email_part] = (file_mtime, display_label)
-        except Exception as ex:
+                        if email_p and pass_p:
+                            combo_str = f"{email_p}:{pass_p}"
+                            display_label = f"{combo_str} [Found: {file_mtime.strftime('%Y-%m-%d %H:%M:%S')}]"
+                            if email_p not in valid_map or file_mtime > valid_map[email_p][0]:
+                                valid_map[email_p] = (file_mtime, display_label)
+                else:
+                    # Parse standard valid result text/JSON files
+                    matches = re.findall(r'([a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+\s*[:|]\s*[^\s<>\n"\'\]\}]+)', content)
+                    for m in matches:
+                        clean_combo = m.replace("|", ":").replace(" ", "").strip('"\'')
+                        if ":" not in clean_combo:
+                            continue
+                        parts = clean_combo.split(":", 1)
+                        email_part = parts[0].strip().lower().strip('"\'')
+                        pwd_part = parts[1].strip().strip('"\'')
+                        
+                        if "@" not in email_part or "." not in email_part or not pwd_part:
+                            continue
+                            
+                        combo_str = f"{email_part}:{pwd_part}"
+                        display_label = f"{combo_str} [Found: {file_mtime.strftime('%Y-%m-%d %H:%M:%S')}]"
+                        
+                        if email_part not in valid_map or file_mtime > valid_map[email_part][0]:
+                            valid_map[email_part] = (file_mtime, display_label)
+        except Exception:
             continue
             
     sorted_items = sorted(valid_map.values(), key=lambda x: x[0], reverse=True)
@@ -269,7 +291,8 @@ def generate_all_mail_zip():
         
         for path in search_paths:
             filename = os.path.basename(path)
-            if filename in added_files or filename == LAST_ACCOUNT_FILE:
+            filename_lower = filename.lower()
+            if filename in added_files or filename == LAST_ACCOUNT_FILE or any(kw in filename_lower for kw in ["resume", "unfinished", "remaining"]):
                 continue
             try:
                 with open(path, "r", encoding="utf-8", errors="ignore") as f:
@@ -287,14 +310,13 @@ def generate_all_mail_zip():
                 if count == 0:
                     continue
                 
-                lower_name = filename.lower()
-                if "valid" in lower_name or "clean" in lower_name:
+                if "valid" in filename_lower or "clean" in filename_lower:
                     cat_name = f"Clean_Valid_{count}.txt"
-                elif "wrong" in lower_name or "pass" in lower_name:
+                elif "wrong" in filename_lower or "pass" in filename_lower:
                     cat_name = f"Wrong_Password_{count}.txt"
-                elif "app" in lower_name or "2fa" in lower_name or "otp" in lower_name:
+                elif "app" in filename_lower or "2fa" in filename_lower or "otp" in filename_lower:
                     cat_name = f"App_Password_2FA_{count}.txt"
-                elif "fail" in lower_name or "conn" in lower_name:
+                elif "fail" in filename_lower or "conn" in filename_lower:
                     cat_name = f"Connection_Failed_{count}.txt"
                 else:
                     base_wo_ext = os.path.splitext(filename)[0]
@@ -303,7 +325,7 @@ def generate_all_mail_zip():
                 file_content = "\n".join(clean_lines)
                 zf.writestr(cat_name, file_content)
                 added_files.add(filename)
-            except Exception as ex:
+            except Exception:
                 continue
     buf.seek(0)
     return buf.getvalue()
@@ -315,7 +337,7 @@ def decode_hdr(value):
         for part, enc in decode_header(value or ""):
             out.append(part.decode(enc or "utf-8", errors="ignore") if isinstance(part, bytes) else str(part))
         return "".join(out)
-    except Exception as ex:
+    except Exception:
         return str(value or "")
 
 
@@ -355,7 +377,7 @@ def decode_imap_utf7(s: str) -> str:
                     b64_padded = b64_str.replace(",", "/") + "=" * ((4 - len(b64_str) % 4) % 4)
                     decoded = base64.b64decode(b64_padded).decode("utf-16be")
                     res.append(decoded + rest)
-                except Exception as ex:
+                except Exception:
                     res.append("&" + part)
         else:
             res.append(part)
@@ -479,10 +501,10 @@ def open_mail(email_addr, password_val, host_val, timeout=None):
 def close_mail(mail):
     try:
         mail.logout()
-    except Exception as ex:
+    except Exception:
         try:
             mail.shutdown()
-        except Exception as ex2:
+        except Exception:
             pass
 
 
@@ -767,12 +789,12 @@ def fetch_messages_paginated(mail, email_addr, password_val, host_val, target_fo
                             try:
                                 body_text = part.get_payload(decode=True).decode("utf-8", errors="ignore")
                                 break
-                            except Exception as ex:
+                            except Exception:
                                 pass
                 else:
                     try:
                         body_text = msg.get_payload(decode=True).decode("utf-8", errors="ignore")
-                    except Exception as ex:
+                    except Exception:
                         pass
 
                 if is_extortion_spam(subject, body_text, frm):
@@ -1000,7 +1022,7 @@ if st.sidebar.button("🚀 Validate & Import Batch Accounts", type="primary", us
                     if test_m:
                         try:
                             test_m.logout()
-                        except Exception as ex2:
+                        except Exception:
                             pass
             
             full_trace = f"Proxy: {proxy_item['proxy']} | Country: {proxy_item['country']} | Region: {proxy_item['region']} | Host: {connected_h or hosts_to_test[0]} | Port: {cfg_port} | Steps Executed: " + " | ".join(trace_steps)
@@ -1139,7 +1161,7 @@ if st.sidebar.button("🔑 Login & Save Account", type="primary", use_container_
                     if test_mail:
                         try:
                             close_mail(test_mail)
-                        except Exception as ex2:
+                        except Exception:
                             pass
         
         if success:
