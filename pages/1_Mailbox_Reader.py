@@ -913,7 +913,7 @@ if valid:
     st.sidebar.download_button(
         label="📥 Download Valid Mail List",
         data=valid_text_data,
-        file_name="valid_accounts.txt",
+        file_name=f"valid_accounts_{len(clean_download_lines)}.txt",
         mime="text/plain",
         use_container_width=True
     )
