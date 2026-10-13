@@ -167,7 +167,6 @@ def load_valid():
         except Exception:
             continue
             
-    # Sort blocks in reverse chronological order (newest first)
     raw_blocks.sort(key=lambda x: x[0], reverse=True)
     
     dropdown_items = []
@@ -507,7 +506,7 @@ def clean_boilerplate(text):
 
 
 def execute_imap_search_safely(mail, field_cmd: str, query_term: str, log_func):
-    """Ultra-fast, 100% accurate IMAP search engine with batched header fetching fallback."""
+    """Ultra-fast, 100% accurate IMAP search engine with batched header & body fetching fallback."""
     clean_q = query_term.replace('"', '\\"')
     f_cmd = field_cmd.upper()
     
@@ -525,7 +524,7 @@ def execute_imap_search_safely(mail, field_cmd: str, query_term: str, log_func):
         except Exception as ex:
             log_func(f"  │   └─ ⚠️ {strat_name} Failed: {ex}")
 
-    log_func("  ├─ [SEARCH STRATEGY 4 - BATCHED HEADER SCAN] Server native search rejected. Running chunked header scan...")
+    log_func(f"  ├─ [SEARCH STRATEGY 4 - BATCHED SCAN ({f_cmd})] Server native search rejected. Running chunked scan...")
     try:
         typ, data = mail.search(None, "ALL")
         if typ == "OK" and data and data[0]:
@@ -533,17 +532,27 @@ def execute_imap_search_safely(mail, field_cmd: str, query_term: str, log_func):
             if not all_ids:
                 return "OK_FALLBACK", [b""]
 
-            log_func(f"  │   └─ 🔍 Batch scanning {len(all_ids)} message headers for query '{query_term}'...")
+            log_func(f"  │   └─ 🔍 Batch scanning {len(all_ids)} messages for query '{query_term}' in field '{f_cmd}'...")
             matched_ids = []
             q_lower = query_term.lower()
             
-            chunk_size = 200
+            # Determine fetch payload based on search field (TEXT scans Subject, From, To, and Body)
+            if f_cmd == "SUBJECT":
+                fetch_query = "(BODY.PEEK[HEADER.FIELDS (SUBJECT)])"
+            elif f_cmd == "FROM":
+                fetch_query = "(BODY.PEEK[HEADER.FIELDS (FROM)])"
+            elif f_cmd == "BODY":
+                fetch_query = "(BODY.PEEK[TEXT])"
+            else:
+                fetch_query = "(BODY.PEEK[])"
+            
+            chunk_size = 100
             for i in range(0, len(all_ids), chunk_size):
                 chunk_ids = all_ids[i:i + chunk_size]
                 id_range_bytes = b",".join(chunk_ids)
                 
                 try:
-                    _, fetch_datas = mail.fetch(id_range_bytes, "(BODY.PEEK[HEADER.FIELDS (SUBJECT FROM TO)])")
+                    _, fetch_datas = mail.fetch(id_range_bytes, fetch_query)
                     if fetch_datas:
                         for item in fetch_datas:
                             if isinstance(item, tuple) and len(item) >= 2:
@@ -557,10 +566,10 @@ def execute_imap_search_safely(mail, field_cmd: str, query_term: str, log_func):
                     log_func(f"  │   └─ ⚠️ Chunk fetch exception: {chunk_ex}")
                     continue
             
-            log_func(f"  │   └─ ✅ Batched Header Scan Complete! Found {len(matched_ids)} matching message IDs out of {len(all_ids)}.")
+            log_func(f"  │   └─ ✅ Batched Scan Complete! Found {len(matched_ids)} matching message IDs out of {len(all_ids)}.")
             return "OK_FALLBACK", [b" ".join(matched_ids)] if matched_ids else [b""]
     except Exception as ex4:
-        log_func(f"  │   └─ ❌ Batched Header Scan Exception: {ex4}")
+        log_func(f"  │   └─ ❌ Batched Scan Exception: {ex4}")
 
     return "NO", [b""]
 
@@ -748,7 +757,6 @@ else:
 
 pick = st.selectbox("Valid account", valid_dropdown_options, index=default_index, key="selected_account")
 
-# Smart Parsing: If a timestamp line (# Started:...) is selected, automatically locate and use the account below it
 actual_pick = pick
 if pick and pick.startswith("#"):
     try:
@@ -788,7 +796,6 @@ st.sidebar.text_input("Email override", key="custom_email")
 st.sidebar.text_input("Password override", type="password", key="custom_pass")
 st.sidebar.text_input("IMAP host override", key="custom_host")
 
-# Sidebar Login & Save Account with Strict Timestamp Injection and Top Placement
 if st.sidebar.button("🔑 Login & Save Account", type="primary", use_container_width=True):
     c_email = st.session_state.custom_email.strip()
     c_pass = st.session_state.custom_pass.strip()
@@ -828,7 +835,6 @@ if st.sidebar.button("🔑 Login & Save Account", type="primary", use_container_
                 with open("clean_valid_accounts.txt", "r", encoding="utf-8", errors="ignore") as f:
                     existing_content = f.read()
             
-            # Write new timestamp and account at the top of the file
             with open("clean_valid_accounts.txt", "w", encoding="utf-8") as f:
                 f.write(new_entry_block + existing_content)
             
@@ -841,7 +847,6 @@ if st.sidebar.button("🔑 Login & Save Account", type="primary", use_container_
         else:
             st.sidebar.error(f"❌ Login failed: {last_err}")
 
-# Determine active email/password exclusively based on action source (Valid account dropdown)
 active_email, active_password = "", ""
 if actual_pick != "none" and ":" in actual_pick:
     active_email, active_password = actual_pick.split(":", 1)
@@ -875,7 +880,6 @@ if active_email and active_password:
     st.sidebar.markdown(f"[Open Webmail Portal]({portal_url})", unsafe_allow_html=True)
     st.sidebar.text_input("Copy Credentials", value=f"{active_email}:{active_password}")
 
-# Connect & Discover Folders strictly tied to Valid Account selection
 if st.button("Connect & Discover Folders", type="primary", use_container_width=True):
     if actual_pick == "none" or not actual_pick or ":" not in actual_pick:
         st.error("Please select a valid account from the dropdown list first.")
@@ -1320,7 +1324,7 @@ with st.expander("🔍 Deep Keyword Search & Scope Filters", expanded=False):
     with s_col1:
         search_scope_choice = st.multiselect("Search Scope Option", search_scope_options, default=["INBOX"], key="deep_search_scope")
     with s_col2:
-        search_field_choice = st.selectbox("Search Field Option", ["TEXT", "SUBJECT", "FROM", "BODY"], key="deep_search_field")
+        search_field_choice = st.selectbox("Search Field Option", ["TEXT", "SUBJECT", "BODY", "FROM"], key="deep_search_field")
     
     search_query_input = st.text_input("Search term or keyword", key="deep_search_query")
     
