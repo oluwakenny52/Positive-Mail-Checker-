@@ -47,7 +47,6 @@ def load_app_proxies() -> List[dict]:
                         line_str = line.strip()
                         if not line_str or line_str.startswith("#"):
                             continue
-                        # Handle CSV or plain IP:PORT formats
                         parts = [x.strip() for x in line_str.replace(",", "|").split("|") if x.strip()]
                         proxy_addr = parts[0]
                         if ":" in proxy_addr:
@@ -214,40 +213,67 @@ def otp_log(msg):
 
 
 def load_valid():
-    """Quickly scans and aggregates all valid account files from root and mail_results, 
-    extracting clean email:password combinations and sorting them by recency."""
-    valid_combos = []
+    """Scans valid account files and result logs, extracting email:password combinations 
+    along with their individual 'Found' timestamps or batch run timestamps, and returns 
+    formatted dropdown display strings sorted in reverse-chronological order[span_3](start_span)[span_3](end_span)."""
+    valid_entries = [] # list of tuples: (timestamp_dt, display_label, combo_str)
     seen = set()
     
-    # Gather all possible valid account file paths
     paths = [p for p in ("clean_valid_accounts.txt", "valid_accounts.txt") if os.path.exists(p)]
-    paths += glob.glob("mail_results/valid_*.txt") + glob.glob("mail_results/*.txt") + glob.glob("*.txt")
+    paths += sorted(glob.glob("mail_results/valid_*.txt") + glob.glob("mail_results/*.txt"), reverse=True)
+    paths = list(dict.fromkeys(paths))
     
-    # Sort files by modification time so newest results are processed first
-    paths = sorted(list(set(paths)), key=lambda x: os.path.exists(x) and os.path.getmtime(x) or 0, reverse=True)
+    current_batch_time = datetime.min
     
     for path in paths:
-        if os.path.basename(path) in ("app_config.json", LAST_ACCOUNT_FILE):
+        if os.path.basename(path) in (LAST_ACCOUNT_FILE, APP_CONFIG_FILE):
             continue
         try:
             with open(path, encoding="utf-8", errors="ignore") as f:
                 for line in f:
                     line_str = line.strip()
-                    # Skip empty lines, comments, and metadata timestamp headers
-                    if not line_str or line_str.startswith("#"):
+                    if not line_str:
                         continue
-                    if ":" in line_str:
-                        combo = line_str.split("|")[0].strip()
-                        if ":" in combo:
-                            email_part, pass_part = combo.split(":", 1)
-                            clean_combo = f"{email_part.strip()}:{pass_part.strip()}"
-                            if "@" in email_part and clean_combo not in seen:
-                                seen.add(clean_combo)
-                                valid_combos.append(clean_combo)
+                    if line_str.startswith("# Started:"):
+                        time_str = line_str.replace("# Started:", "").strip()
+                        try:
+                            current_batch_time = datetime.strptime(time_str, "%Y-%m-%d %H:%M:%S")
+                        except ValueError:
+                            current_batch_time = datetime.min
+                        continue
+                    
+                    if ":" in line_str and not line_str.startswith("#"):
+                        combo_part = line_str.split("|")[0].strip()
+                        if ":" not in combo_part:
+                            continue
+                        email_pwd = combo_part
+                        
+                        item_time = current_batch_time
+                        time_display = "Live/Recent"
+                        if "Found:" in line_str:
+                            try:
+                                t_str = line_str.split("Found:")[1].strip()
+                                item_time = datetime.strptime(t_str, "%Y-%m-%d %H:%M:%S")
+                                time_display = t_str
+                            except Exception:
+                                pass
+                        elif current_batch_time != datetime.min:
+                            time_display = current_batch_time.strftime("%Y-%m-%d %H:%M:%S")
+                        
+                        if email_pwd not in seen:
+                            seen.add(email_pwd)
+                            display_label = f"{email_pwd} [Found: {time_display}]"
+                            valid_entries.append((item_time, display_label, email_pwd))
         except Exception:
             continue
             
-    return valid_combos
+    # Sort reverse-chronologically by timestamp so newest accounts appear first[span_4](start_span)[span_4](end_span)
+    valid_entries.sort(key=lambda x: x[0], reverse=True)
+    
+    if not valid_entries:
+        return ["none"]
+        
+    return [item[1] for item in valid_entries]
 
 
 def generate_all_mail_zip():
@@ -840,16 +866,10 @@ else:
 
 pick = st.selectbox("Valid account", valid_dropdown_options, index=default_index, key="selected_account")
 
-actual_pick = pick
-if pick and pick.startswith("#"):
-    try:
-        idx = valid_dropdown_options.index(pick)
-        for item in valid_dropdown_options[idx+1:]:
-            if ":" in item and not item.startswith("#"):
-                actual_pick = item
-                break
-    except Exception:
-        pass
+# Extract actual email:password from the timestamped label string
+actual_pick = "none"
+if pick and pick != "none":
+    actual_pick = pick.split("[Found:")[0].strip()
 
 if actual_pick and actual_pick != "none" and ":" in actual_pick:
     save_last_account(actual_pick)
@@ -930,22 +950,16 @@ if st.sidebar.button("🚀 Validate & Import Batch Accounts", type="primary", us
         timestamp_str = f"# Started:{start_time_str}"
         new_valid_entries = [timestamp_str]
         
-        # Read application dynamic configuration parameters
         cfg_timeout = st.session_state.app_config.get("connection_timeout", 15)
         cfg_port = st.session_state.app_config.get("imap_port", 993)
         cfg_fallback = st.session_state.app_config.get("auto_fallback_probing", True)
         
-        # Parse multiple host overrides separated by comma, semicolon, or newline
         user_host_overrides = [h.strip() for h in re.split(r'[,;\n]+', batch_host_override_input) if h.strip()]
-        
-        # Auto-fetch live proxy pool from app storage/files
         active_proxy_pool = load_app_proxies()
         
         for idx, line in enumerate(lines):
             clean_line = line.split("|")[0].strip()
             row_time = datetime.now().strftime("%H:%M:%S")
-            
-            # Select proxy dynamically from active proxy pool using round-robin index rotation
             proxy_item = active_proxy_pool[idx % len(active_proxy_pool)]
             
             if ":" not in clean_line:
@@ -966,7 +980,6 @@ if st.sidebar.button("🚀 Validate & Import Batch Accounts", type="primary", us
             status_display.text(f"Testing ({idx+1}/{len(lines)}): {email_val} via {proxy_item['proxy']}")
             progress_bar.progress((idx + 1) / len(lines))
             
-            # Construct host test list
             if user_host_overrides:
                 hosts_to_test = list(user_host_overrides)
                 for h in host_list(email_val):
@@ -1014,7 +1027,8 @@ if st.sidebar.button("🚀 Validate & Import Batch Accounts", type="primary", us
             
             if is_success:
                 valid_count += 1
-                combo_str = f"{email_val}:{pass_val}"
+                found_timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                combo_str = f"{email_val}:{pass_val} | Found: {found_timestamp}"
                 new_valid_entries.append(combo_str)
                 batch_logs.append(f"✅ [{row_time}] [VALID] {email_val} via {connected_h} [Proxy: {proxy_item['proxy']} ({proxy_item['country']}, {proxy_item['region']})]")
             else:
@@ -1045,7 +1059,7 @@ if st.sidebar.button("🚀 Validate & Import Batch Accounts", type="primary", us
         end_run_time = datetime.now()
         duration_delta = end_run_time - start_run_time
         dur_str = str(duration_delta).split(".")[0]
-        if len(dur_str) == 5: # HH:MM
+        if len(dur_str) == 5:
             dur_str = f"0:{dur_str}"
         
         st.session_state.batch_run_meta = {
@@ -1153,8 +1167,9 @@ if st.sidebar.button("🔑 Login & Save Account", type="primary", use_container_
         
         if success:
             combo = f"{c_email}:{c_pass}"
+            found_timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             timestamp_str = f"# Started:{time.strftime('%Y-%m-%d %H:%M:%S')}"
-            new_entry_block = f"{timestamp_str}\n{combo}\n\n"
+            new_entry_block = f"{timestamp_str}\n{combo} | Found: {found_timestamp}\n\n"
             
             existing_content = ""
             if os.path.exists("clean_valid_accounts.txt"):
