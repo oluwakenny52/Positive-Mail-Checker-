@@ -28,7 +28,6 @@ def load_app_proxies() -> List[dict]:
     proxy_files = ["proxies.txt", "proxy_pool.txt", "clean_proxies.txt"]
     dynamic_pool = []
     
-    # 1. Check session state first if user loaded proxies dynamically in app
     if "session_proxies" in st.session_state and st.session_state.session_proxies:
         for p in st.session_state.session_proxies:
             if isinstance(p, dict):
@@ -38,7 +37,6 @@ def load_app_proxies() -> List[dict]:
         if dynamic_pool:
             return dynamic_pool
 
-    # 2. Check local proxy text files
     for pfile in proxy_files:
         if os.path.exists(pfile):
             try:
@@ -64,7 +62,6 @@ def load_app_proxies() -> List[dict]:
             if dynamic_pool:
                 return dynamic_pool
 
-    # 3. Fallback default proxy if no local files/session proxies exist yet
     return [
         {"proxy": "dc.oxylabs.info:8000", "country": "Canada", "region": "Ontario", "latency": 1514}
     ]
@@ -91,6 +88,7 @@ st.markdown(
 # Persistent Last Account Management
 LAST_ACCOUNT_FILE = "last_account.txt"
 APP_CONFIG_FILE = "app_config.json"
+MANUAL_VALID_FILE = "manual_valid_accounts.txt"
 
 DEFAULT_APP_CONFIG = {
     "connection_timeout": 15,
@@ -195,33 +193,29 @@ def log(msg):
     st.session_state.mb_log.insert(0, msg)
     st.session_state.mb_log = st.session_state.mb_log[:50]
 
-
 def debug_log(msg):
     st.session_state.folder_debug_logs.append(msg)
-
 
 def bot_log(msg):
     st.session_state.bot_diag_logs.append(msg)
 
-
 def search_log(msg):
     st.session_state.search_diag_logs.append(msg)
-
 
 def otp_log(msg):
     st.session_state.otp_diag_logs.append(msg)
 
 
 def load_valid():
-    """Scans valid account files and result logs, extracting email:password combinations 
-    along with their individual 'Found' timestamps or batch run timestamps, and returns 
-    formatted dropdown display strings sorted in reverse-chronological order[span_3](start_span)[span_3](end_span)."""
-    valid_entries = [] # list of tuples: (timestamp_dt, display_label, combo_str)
-    seen = set()
+    """Scans all valid account sources (clean_valid_accounts.txt, manual_valid_accounts.txt, 
+    and all mail_results files from finished or unfinished runs), merging and deduplicating 
+    them uniquely by email address with their discovery timestamps."""
+    valid_map = {} # email_lower -> (timestamp_dt, display_label)
     
-    paths = [p for p in ("clean_valid_accounts.txt", "valid_accounts.txt") if os.path.exists(p)]
-    paths += sorted(glob.glob("mail_results/valid_*.txt") + glob.glob("mail_results/*.txt"), reverse=True)
-    paths = list(dict.fromkeys(paths))
+    # Gather all possible valid account file paths (root + mail_results + manual storage)
+    paths = ["clean_valid_accounts.txt", "valid_accounts.txt", MANUAL_VALID_FILE]
+    paths += glob.glob("mail_results/valid_*.txt") + glob.glob("mail_results/*.txt") + glob.glob("*.txt")
+    paths = list(dict.fromkeys([p for p in paths if os.path.exists(p)]))
     
     current_batch_time = datetime.min
     
@@ -246,10 +240,13 @@ def load_valid():
                         combo_part = line_str.split("|")[0].strip()
                         if ":" not in combo_part:
                             continue
-                        email_pwd = combo_part
                         
-                        item_time = current_batch_time
+                        email_part = combo_part.split(":", 1)[0].strip().lower()
+                        if "@" not in email_part:
+                            continue
+                        
                         time_display = "Live/Recent"
+                        item_time = current_batch_time
                         if "Found:" in line_str:
                             try:
                                 t_str = line_str.split("Found:")[1].strip()
@@ -260,20 +257,17 @@ def load_valid():
                         elif current_batch_time != datetime.min:
                             time_display = current_batch_time.strftime("%Y-%m-%d %H:%M:%S")
                         
-                        if email_pwd not in seen:
-                            seen.add(email_pwd)
-                            display_label = f"{email_pwd} [Found: {time_display}]"
-                            valid_entries.append((item_time, display_label, email_pwd))
+                        display_label = f"{combo_part} [Found: {time_display}]"
+                        
+                        # Keep the most recent entry if duplicate
+                        if email_part not in valid_map or item_time > valid_map[email_part][0]:
+                            valid_map[email_part] = (item_time, display_label)
         except Exception:
             continue
             
-    # Sort reverse-chronologically by timestamp so newest accounts appear first[span_4](start_span)[span_4](end_span)
-    valid_entries.sort(key=lambda x: x[0], reverse=True)
-    
-    if not valid_entries:
-        return ["none"]
-        
-    return [item[1] for item in valid_entries]
+    # Sort reverse-chronologically by timestamp
+    sorted_items = sorted(valid_map.values(), key=lambda x: x[0], reverse=True)
+    return [item[1] for item in sorted_items] if sorted_items else ["none"]
 
 
 def generate_all_mail_zip():
@@ -866,7 +860,7 @@ else:
 
 pick = st.selectbox("Valid account", valid_dropdown_options, index=default_index, key="selected_account")
 
-# Extract actual email:password from the timestamped label string
+# Extract actual email:password from the dropdown label string safely
 actual_pick = "none"
 if pick and pick != "none":
     actual_pick = pick.split("[Found:")[0].strip()
@@ -1168,16 +1162,16 @@ if st.sidebar.button("🔑 Login & Save Account", type="primary", use_container_
         if success:
             combo = f"{c_email}:{c_pass}"
             found_timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            timestamp_str = f"# Started:{time.strftime('%Y-%m-%d %H:%M:%S')}"
-            new_entry_block = f"{timestamp_str}\n{combo} | Found: {found_timestamp}\n\n"
+            new_entry_line = f"{combo} | Found: {found_timestamp}\n"
             
+            # Save manual logins safely to manual_valid_accounts.txt so the main app never overwrites them
             existing_content = ""
-            if os.path.exists("clean_valid_accounts.txt"):
-                with open("clean_valid_accounts.txt", "r", encoding="utf-8", errors="ignore") as f:
+            if os.path.exists(MANUAL_VALID_FILE):
+                with open(MANUAL_VALID_FILE, "r", encoding="utf-8", errors="ignore") as f:
                     existing_content = f.read()
             
-            with open("clean_valid_accounts.txt", "w", encoding="utf-8") as f:
-                f.write(new_entry_block + existing_content)
+            with open(MANUAL_VALID_FILE, "w", encoding="utf-8") as f:
+                f.write(new_entry_line + existing_content)
             
             save_last_account(combo)
             st.session_state.forced_account = combo
