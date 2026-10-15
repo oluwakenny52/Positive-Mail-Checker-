@@ -1013,7 +1013,7 @@ st.caption("Advanced IMAP Client with Interactive Bot Intelligence, Dedicated OT
 
 valid = load_valid()
 
-# --- Requirement 1: Well-Organized Account Deletion Manager (With Multiselect & Select All) ---
+# --- Account Deletion Manager ---
 with st.expander("🗑️ Account Deletion Manager", expanded=False):
     st.markdown("#### Permanent Account Deletion Options")
     clean_valid_accounts_list = [l for l in valid if not l.startswith("# Found:")]
@@ -1434,36 +1434,6 @@ if actual_pick != "none" and ":" in actual_pick:
     active_email, active_password = actual_pick.split(":", 1)
 
 override = st.session_state.custom_host.strip()
-
-# --- Requirement 2: Persistent Auto-Connect, Keep-Alive & Cache Restorer ---
-if active_email and active_password:
-    current_combo = f"{active_email}:{active_password}"
-    if st.session_state.get("connected_account_combo") != current_combo or not st.session_state.get("active_mail") or len(st.session_state.get("mb_folders", [])) <= 1:
-        hosts = [override] if override else host_list(active_email)
-        auto_success, auto_host, auto_folders = False, "", ["INBOX"]
-        auto_mail = None
-        
-        for h in hosts:
-            try:
-                auto_mail = open_mail(active_email, active_password, h)
-                auto_folders = list_folders(auto_mail, email_addr=active_email, host_val=h)
-                auto_host = h
-                auto_success = True
-                break
-            except Exception:
-                if auto_mail:
-                    try:
-                        auto_mail.logout()
-                    except Exception:
-                        pass
-        
-        if auto_success:
-            st.session_state.active_mail = auto_mail
-            st.session_state.connected_account_combo = current_combo
-            st.session_state.mb_host = auto_host
-            st.session_state.mb_folders = auto_folders
-            save_last_account(current_combo)
-            save_session_cache()
 
 if st.sidebar.button("🔄 Refresh Inbox", type="secondary", use_container_width=True):
     if active_email and active_password:
