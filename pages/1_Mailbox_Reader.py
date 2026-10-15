@@ -84,10 +84,11 @@ st.markdown(
     unsafe_allow_html=True
 )
 
-# Persistent Last Account Management
+# Persistent Last Account Management & Session Cache
 LAST_ACCOUNT_FILE = "last_account.txt"
 APP_CONFIG_FILE = "app_config.json"
 MANUAL_VALID_FILE = "manual_valid_accounts.txt"
+SESSION_CACHE_FILE = "session_cache.json"
 
 DEFAULT_APP_CONFIG = {
     "connection_timeout": 15,
@@ -131,13 +132,68 @@ def load_last_account():
             pass
     return ""
 
+def save_session_cache():
+    try:
+        cache_data = {
+            "connected_account_combo": st.session_state.get("connected_account_combo", ""),
+            "mb_host": st.session_state.get("mb_host", ""),
+            "mb_folders": st.session_state.get("mb_folders", ["INBOX"]),
+            "folder_map": st.session_state.get("folder_map", {"INBOX": "INBOX"}),
+            "current_page": st.session_state.get("current_page", 1),
+            "search_current_page": st.session_state.get("search_current_page", 1),
+            "otp_current_page": st.session_state.get("otp_current_page", 1),
+            "bot_current_page": st.session_state.get("bot_current_page", 1),
+            "bot_filter_mode": st.session_state.get("bot_filter_mode", False),
+            "total_matched_count": st.session_state.get("total_matched_count", 0),
+            "search_total_matched_count": st.session_state.get("search_total_matched_count", 0),
+            "otp_total_matched_count": st.session_state.get("otp_total_matched_count", 0),
+        }
+        
+        for k_name, key_in_state in [("current_messages", "current_messages"), ("otp_messages", "otp_messages"), ("search_messages", "search_messages")]:
+            serialized_list = []
+            for m in st.session_state.get(key_in_state, []):
+                m_copy = m.copy()
+                if isinstance(m_copy.get("raw"), bytes):
+                    m_copy["raw"] = base64.b64encode(m_copy["raw"]).decode("ascii")
+                serialized_list.append(m_copy)
+            cache_data[k_name] = serialized_list
+
+        with open(SESSION_CACHE_FILE, "w", encoding="utf-8") as f:
+            json.dump(cache_data, f)
+    except Exception:
+        pass
+
+def load_session_cache():
+    if os.path.exists(SESSION_CACHE_FILE):
+        try:
+            with open(SESSION_CACHE_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                for k, v in data.items():
+                    if k in ["current_messages", "otp_messages", "search_messages"]:
+                        deserialized = []
+                        for m in v:
+                            m_copy = m.copy()
+                            if isinstance(m_copy.get("raw"), str):
+                                try:
+                                    m_copy["raw"] = base64.b64decode(m_copy["raw"].encode("ascii"))
+                                except Exception:
+                                    m_copy["raw"] = b""
+                            deserialized.append(m_copy)
+                        st.session_state[k] = deserialized
+                    else:
+                        st.session_state[k] = v
+        except Exception:
+            pass
+
 # Initialize Session Config
 if "app_config" not in st.session_state:
     st.session_state.app_config = load_app_config()
 
-# Initialize Isolated Session State Variables
+# Initialize Isolated Session State Variables & Restore Session Cache on first load
 if "mb_log" not in st.session_state:
     st.session_state.mb_log = []
+    load_session_cache()
+
 if "mb_folders" not in st.session_state:
     st.session_state.mb_folders = ["INBOX"]
 if "folder_map" not in st.session_state:
@@ -195,6 +251,7 @@ if "connected_account_combo" not in st.session_state:
 def log(msg):
     st.session_state.mb_log.insert(0, msg)
     st.session_state.mb_log = st.session_state.mb_log[:50]
+    save_session_cache()
 
 def debug_log(msg):
     st.session_state.folder_debug_logs.append(msg)
@@ -286,6 +343,49 @@ def load_valid():
         options.append(combo_str)
         
     return options if options else ["none"]
+
+
+def delete_specific_account_from_storage(target_combo: str):
+    search_files = glob.glob("mail_results/*.txt") + glob.glob("*.txt")
+    for path in search_files:
+        filename_lower = os.path.basename(path).lower()
+        if filename_lower == LAST_ACCOUNT_FILE or any(kw in filename_lower for kw in ["resume", "unfinished", "remaining", "input", "proxies", "proxy", "config", "blocklist"]):
+            continue
+        try:
+            with open(path, "r", encoding="utf-8", errors="ignore") as f:
+                lines = f.readlines()
+            new_lines = []
+            for line in lines:
+                if target_combo not in line:
+                    new_lines.append(line)
+            with open(path, "w", encoding="utf-8") as f:
+                f.writelines(new_lines)
+        except Exception:
+            pass
+    if load_last_account() == target_combo:
+        if os.path.exists(LAST_ACCOUNT_FILE):
+            try:
+                os.remove(LAST_ACCOUNT_FILE)
+            except Exception:
+                pass
+
+
+def clear_all_valid_accounts_storage():
+    search_files = glob.glob("mail_results/*.txt") + glob.glob("*.txt")
+    for path in search_files:
+        filename_lower = os.path.basename(path).lower()
+        if filename_lower == LAST_ACCOUNT_FILE or any(kw in filename_lower for kw in ["resume", "unfinished", "remaining", "input", "proxies", "proxy", "config", "blocklist"]):
+            continue
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                f.write("")
+        except Exception:
+            pass
+    if os.path.exists(LAST_ACCOUNT_FILE):
+        try:
+            os.remove(LAST_ACCOUNT_FILE)
+        except Exception:
+            pass
 
 
 def generate_all_mail_zip():
@@ -491,6 +591,7 @@ def list_folders(mail, email_addr: str = "", host_val: str = ""):
         display_folders.append(label)
 
     st.session_state.folder_map = folder_map
+    save_session_cache()
     return display_folders
 
 
@@ -517,7 +618,6 @@ def get_active_mail(email_addr, password_val, host_val):
     """Returns an active persistent mail connection, ensuring it reconnects or switches cleanly if the account changes."""
     current_combo = f"{email_addr}:{password_val}"
     if st.session_state.get("connected_account_combo") != current_combo or not st.session_state.get("active_mail"):
-        # Close old connection if account changed or none exists
         if st.session_state.active_mail:
             try:
                 st.session_state.active_mail.logout()
@@ -525,20 +625,20 @@ def get_active_mail(email_addr, password_val, host_val):
                 pass
             st.session_state.active_mail = None
         
-        # Open new persistent connection
         try:
             st.session_state.active_mail = open_mail(email_addr, password_val, host_val)
             st.session_state.connected_account_combo = current_combo
+            save_session_cache()
         except Exception as ex:
             st.session_state.active_mail = None
             raise ex
     else:
-        # Test if existing connection is still alive via NOOP, reconnect transparently if needed
         try:
             st.session_state.active_mail.noop()
         except Exception:
             try:
                 st.session_state.active_mail = open_mail(email_addr, password_val, host_val)
+                save_session_cache()
             except Exception as ex:
                 st.session_state.active_mail = None
                 raise ex
@@ -902,6 +1002,7 @@ def fetch_messages_paginated(mail, email_addr, password_val, host_val, target_fo
     else:
         st.session_state.total_matched_count = total_matched_all_folders
 
+    save_session_cache()
     log_func(f"\n🏁 [ENGINE COMPLETE] Total retrieved page messages: {len(messages)} / {total_matched_all_folders} matched | Execution time: {total_elapsed}s")
     return messages
 
@@ -911,6 +1012,38 @@ st.title("📥 Bobito Mailbox Reader & Portal Hub")
 st.caption("Advanced IMAP Client with Interactive Bot Intelligence, Dedicated OTP, Debit/Credit Card & Credentials Scanner, Multi-Field Search, Telegram/Blacklist Filter, and Deep Diagnostic Instrumentation.")
 
 valid = load_valid()
+
+# --- Requirement 1: Well-Organized Account Deletion Manager (Placed Before Keyboard Filter) ---
+with st.expander("🗑️ Account Deletion Manager", expanded=False):
+    st.markdown("#### Permanent Account Deletion Options")
+    clean_valid_accounts_list = [l for l in valid if not l.startswith("# Found:")]
+    
+    if clean_valid_accounts_list:
+        del_action_mode = st.selectbox(
+            "Select Deletion Mode", 
+            ["-- Choose Action --", "Delete Specific Valid Account", "Delete ALL Valid Accounts"], 
+            key="del_action_mode_sel"
+        )
+        
+        if del_action_mode == "Delete Specific Valid Account":
+            acc_to_delete = st.selectbox("Select Account to Permanently Delete", clean_valid_accounts_list, key="acc_to_del_dropdown")
+            if st.button("🗑️ Permanently Delete Selected Account", type="primary", use_container_width=True):
+                delete_specific_account_from_storage(acc_to_delete)
+                st.success(f"Permanently deleted account: {acc_to_delete}")
+                save_session_cache()
+                st.rerun()
+                
+        elif del_action_mode == "Delete ALL Valid Accounts":
+            st.warning("⚠️ Warning: This will permanently remove all stored valid accounts from local record files!")
+            confirm_all = st.checkbox("I confirm I want to delete ALL valid accounts permanently", key="confirm_del_all_checkbox")
+            if confirm_all:
+                if st.button("🚨 Permanently Delete ALL Accounts", type="primary", use_container_width=True):
+                    clear_all_valid_accounts_storage()
+                    st.success("Permanently deleted all valid accounts!")
+                    save_session_cache()
+                    st.rerun()
+    else:
+        st.caption("No valid accounts currently available for deletion.")
 
 # --- Keyboard Search & Filter Box ---
 account_filter_query = st.text_input("🔍 Filter Valid Accounts (Type to search with keyboard)", placeholder="Type email, domain, or timestamp...").strip().lower()
@@ -954,6 +1087,7 @@ if pick and pick != "none":
 
 if actual_pick and actual_pick != "none" and ":" in actual_pick:
     save_last_account(actual_pick)
+    save_session_cache()
 
 st.sidebar.header("Account & Connection Hub")
 
@@ -1165,6 +1299,7 @@ if st.sidebar.button("🚀 Validate & Import Batch Accounts", type="primary", us
             with open("clean_valid_accounts.txt", "w", encoding="utf-8") as f:
                 f.write(block_content + existing_data)
         
+        save_session_cache()
         st.sidebar.success(f"Batch validation complete! Valid: {valid_count}, Invalid/Failed: {failed_count + wrong_count}")
         st.rerun()
 
@@ -1266,6 +1401,7 @@ if st.sidebar.button("🔑 Login & Save Account", type="primary", use_container_
             st.session_state.forced_account = combo
             st.session_state.mb_host = connected_host
             st.session_state.mb_folders = discovered_folders
+            save_session_cache()
             st.sidebar.success(f"Connected: {connected_host} ({len(discovered_folders)} folders)")
             st.rerun()
         else:
@@ -1277,9 +1413,7 @@ if actual_pick != "none" and ":" in actual_pick:
 
 override = st.session_state.custom_host.strip()
 
-# --- AUTOMATIC PERSISTENT AUTO-CONNECT & RECONNECTION LOGIC ---
-# Automatically connects and discovers folders on startup/refresh if an active account is loaded
-# without requiring the user to click "Connect & Discover Folders" manually.
+# --- Requirement 2: Persistent Auto-Connect, Keep-Alive & Cache Restorer ---
 if active_email and active_password:
     current_combo = f"{active_email}:{active_password}"
     if st.session_state.get("connected_account_combo") != current_combo or not st.session_state.get("active_mail") or len(st.session_state.get("mb_folders", [])) <= 1:
@@ -1307,6 +1441,7 @@ if active_email and active_password:
             st.session_state.mb_host = auto_host
             st.session_state.mb_folders = auto_folders
             save_last_account(current_combo)
+            save_session_cache()
 
 if st.sidebar.button("🔄 Refresh Inbox", type="secondary", use_container_width=True):
     if active_email and active_password:
@@ -1320,6 +1455,7 @@ if st.sidebar.button("🔄 Refresh Inbox", type="secondary", use_container_width
                 )
                 st.session_state.current_page = 1
                 st.session_state.bot_filter_mode = False
+                save_session_cache()
                 st.sidebar.success("Inbox refreshed successfully!")
         except Exception as e:
             st.sidebar.error(f"Refresh failed: {e}")
@@ -1368,6 +1504,7 @@ if st.button("Connect & Discover Folders", type="primary", use_container_width=T
             st.session_state.connected_account_combo = combo
             st.session_state.mb_host = connected_host
             st.session_state.mb_folders = folders
+            save_session_cache()
             log(f"Discovered {len(folders)} folders via {connected_host}")
             st.success(f"Connected: {connected_host} ({len(folders)} folders)")
         else:
@@ -1400,6 +1537,7 @@ if st.button("📂 Load Folder Messages", type="primary", use_container_width=Tr
                 st.session_state.current_messages = msgs
                 st.session_state.current_page = 1
                 st.session_state.bot_filter_mode = False
+                save_session_cache()
                 log(f"Loaded {len(msgs)} messages from folder '{folder}'.")
         except Exception as e:
             st.error(str(e))
@@ -1465,6 +1603,7 @@ if len(active_msgs) > 0:
                                 m_client.select(f'"{real_imap_encoded}"', readonly=False)
                                 m_client.store(msg["id"], '+FLAGS', '\\Seen')
                                 msg["is_read"] = True
+                                save_session_cache()
                                 st.success("Marked as read!")
                                 st.rerun()
                             except Exception as ex:
@@ -1482,6 +1621,7 @@ if len(active_msgs) > 0:
                             m_client.store(msg["id"], '+FLAGS', '\\Deleted')
                             m_client.expunge()
                             st.session_state.current_messages.remove(msg)
+                            save_session_cache()
                             st.success(f"Moved to {target_move}!")
                             st.rerun()
                         except Exception as ex:
@@ -1496,6 +1636,7 @@ if len(active_msgs) > 0:
                             m_client.store(msg["id"], '+FLAGS', '\\Deleted')
                             m_client.expunge()
                             st.session_state.current_messages.remove(msg)
+                            save_session_cache()
                             st.success("Deleted message!")
                             st.rerun()
                         except Exception as ex:
@@ -1519,6 +1660,7 @@ if len(active_msgs) > 0:
                     page_size=page_size, page_number=st.session_state.current_page, sort_order=sort_order,
                     log_target="DEBUG"
                 )
+                save_session_cache()
                 st.rerun()
 
         with p_col2:
@@ -1535,6 +1677,7 @@ if len(active_msgs) > 0:
                     page_size=page_size, page_number=st.session_state.current_page, sort_order=sort_order,
                     log_target="DEBUG"
                 )
+                save_session_cache()
                 st.rerun()
 
 # Standalone OTP / Debit / Sensitive Data Scanner
@@ -1606,6 +1749,7 @@ with st.expander("🔑 Standalone OTP, Debit/Credit Cards & Sensitive Data Scann
                     )
                     st.session_state.otp_messages = msgs
                     st.session_state.otp_current_page = 1
+                    save_session_cache()
                     otp_log(f"Scan complete. Retrieved {st.session_state.otp_total_matched_count} matching messages.")
             except Exception as e:
                 st.error(str(e))
@@ -1664,6 +1808,7 @@ with st.expander("🔑 Standalone OTP, Debit/Credit Cards & Sensitive Data Scann
                                 m_client.select(f'"{real_imap_encoded}"', readonly=False)
                                 m_client.store(msg["id"], '+FLAGS', '\\Seen')
                                 msg["is_read"] = True
+                                save_session_cache()
                                 st.success("Marked as read!")
                                 st.rerun()
                             except Exception as ex:
@@ -1681,6 +1826,7 @@ with st.expander("🔑 Standalone OTP, Debit/Credit Cards & Sensitive Data Scann
                             m_client.store(msg["id"], '+FLAGS', '\\Deleted')
                             m_client.expunge()
                             st.session_state.otp_messages.remove(msg)
+                            save_session_cache()
                             st.success(f"Moved to {otp_mv_target}!")
                             st.rerun()
                         except Exception as ex:
@@ -1694,6 +1840,7 @@ with st.expander("🔑 Standalone OTP, Debit/Credit Cards & Sensitive Data Scann
                             m_client.store(msg["id"], '+FLAGS', '\\Deleted')
                             m_client.expunge()
                             st.session_state.otp_messages.remove(msg)
+                            save_session_cache()
                             st.success("Deleted message!")
                             st.rerun()
                         except Exception as ex:
@@ -1722,6 +1869,7 @@ with st.expander("🔑 Standalone OTP, Debit/Credit Cards & Sensitive Data Scann
                     mode="SEARCH", page_size=otp_page_size, page_number=st.session_state.otp_current_page, 
                     sort_order=sort_order, log_target="OTP"
                 )
+                save_session_cache()
                 st.rerun()
 
         with op_c2:
@@ -1743,6 +1891,7 @@ with st.expander("🔑 Standalone OTP, Debit/Credit Cards & Sensitive Data Scann
                     mode="SEARCH", page_size=otp_page_size, page_number=st.session_state.otp_current_page, 
                     sort_order=sort_order, log_target="OTP"
                 )
+                save_session_cache()
                 st.rerun()
     else:
         st.caption("No security messages scanned yet. Select categories or keywords and click 'Execute Dedicated Security Scan'.")
@@ -1790,6 +1939,7 @@ with st.expander("🔍 Deep Keyword Search & Scope Filters", expanded=False):
                     )
                     st.session_state.search_messages = msgs
                     st.session_state.search_current_page = 1
+                    save_session_cache()
                     log(f"Search found {st.session_state.search_total_matched_count} total matches across target scope.")
             except Exception as e:
                 st.error(str(e))
@@ -1843,6 +1993,7 @@ with st.expander("🔍 Deep Keyword Search & Scope Filters", expanded=False):
                                 m_client.select(f'"{real_imap_encoded}"', readonly=False)
                                 m_client.store(msg["id"], '+FLAGS', '\\Seen')
                                 msg["is_read"] = True
+                                save_session_cache()
                                 st.success("Marked as read!")
                                 st.rerun()
                             except Exception as ex:
@@ -1860,6 +2011,7 @@ with st.expander("🔍 Deep Keyword Search & Scope Filters", expanded=False):
                             m_client.store(msg["id"], '+FLAGS', '\\Deleted')
                             m_client.expunge()
                             st.session_state.search_messages.remove(msg)
+                            save_session_cache()
                             st.success(f"Moved to {s_target_move}!")
                             st.rerun()
                         except Exception as ex:
@@ -1874,6 +2026,7 @@ with st.expander("🔍 Deep Keyword Search & Scope Filters", expanded=False):
                             m_client.store(msg["id"], '+FLAGS', '\\Deleted')
                             m_client.expunge()
                             st.session_state.search_messages.remove(msg)
+                            save_session_cache()
                             st.success("Deleted message!")
                             st.rerun()
                         except Exception as ex:
@@ -1897,6 +2050,7 @@ with st.expander("🔍 Deep Keyword Search & Scope Filters", expanded=False):
                     mode="SEARCH", page_size=search_page_size, page_number=st.session_state.search_current_page, 
                     sort_order=sort_order, log_target="SEARCH"
                 )
+                save_session_cache()
                 st.rerun()
 
         with sp_col2:
@@ -1913,6 +2067,7 @@ with st.expander("🔍 Deep Keyword Search & Scope Filters", expanded=False):
                     mode="SEARCH", page_size=search_page_size, page_number=st.session_state.search_current_page, 
                     sort_order=sort_order, log_target="SEARCH"
                 )
+                save_session_cache()
                 st.rerun()
     else:
         st.caption("No search results loaded yet. Enter a query and click 'Execute Keyword Search'.")
@@ -1960,6 +2115,7 @@ with st.expander("🤖 Mass Bot Purge & Intelligence Hub", expanded=False):
                         st.session_state.current_messages = msgs
                         st.session_state.bot_filter_mode = True
                         st.session_state.bot_current_page = 1
+                        save_session_cache()
                         st.success("Scan complete. Displaying detected bot/Telegram messages.")
                 except Exception as ex:
                     st.error(str(ex))
@@ -1988,6 +2144,7 @@ with st.expander("🤖 Mass Bot Purge & Intelligence Hub", expanded=False):
                     st.success(f"Successfully deleted {deleted_count} bot messages!")
                     st.session_state.current_messages = [m for m in st.session_state.current_messages if not m["is_bot"]]
                     st.session_state.bot_filter_mode = False
+                    save_session_cache()
                     st.rerun()
                 except Exception as e:
                     bot_log(f"❌ [MASS DELETE EXCEPTION]: {e}")
@@ -2015,12 +2172,14 @@ with st.expander("🤖 Mass Bot Purge & Intelligence Hub", expanded=False):
         with bp_c1:
             if st.button("Previous Bot Page", disabled=(bot_curr_p <= 1), use_container_width=True, key="bot_prev_pg"):
                 st.session_state.bot_current_page -= 1
+                save_session_cache()
                 st.rerun()
         with bp_c2:
             st.markdown(f"<h4 style='text-align: center; margin: 0;'>Page {bot_curr_p} of {total_pages}</h4>", unsafe_allow_html=True)
         with bp_c3:
             if st.button("Next Bot Page", disabled=(bot_curr_p >= total_pages), use_container_width=True, key="bot_next_pg"):
                 st.session_state.bot_current_page += 1
+                save_session_cache()
                 st.rerun()
     else:
         st.caption("No bot messages currently loaded in session memory.")
