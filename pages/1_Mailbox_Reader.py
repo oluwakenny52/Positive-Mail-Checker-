@@ -516,8 +516,8 @@ def close_mail(mail):
 def get_active_mail(email_addr, password_val, host_val):
     """Returns an active persistent mail connection, ensuring it reconnects or switches cleanly if the account changes."""
     current_combo = f"{email_addr}:{password_val}"
-    if st.session_state.get("connected_account_combo") != current_combo:
-        # Close old connection if account changed
+    if st.session_state.get("connected_account_combo") != current_combo or not st.session_state.get("active_mail"):
+        # Close old connection if account changed or none exists
         if st.session_state.active_mail:
             try:
                 st.session_state.active_mail.logout()
@@ -533,7 +533,7 @@ def get_active_mail(email_addr, password_val, host_val):
             st.session_state.active_mail = None
             raise ex
     else:
-        # Test if existing connection is still alive, reconnect if needed
+        # Test if existing connection is still alive via NOOP, reconnect transparently if needed
         try:
             st.session_state.active_mail.noop()
         except Exception:
@@ -1242,7 +1242,6 @@ if st.sidebar.button("🔑 Login & Save Account", type="primary", use_container_
         if success:
             combo = f"{c_email}:{c_pass}"
             
-            # Close previous connection if active and different
             if st.session_state.active_mail and st.session_state.get("connected_account_combo") != combo:
                 try:
                     st.session_state.active_mail.logout()
@@ -1277,6 +1276,37 @@ if actual_pick != "none" and ":" in actual_pick:
     active_email, active_password = actual_pick.split(":", 1)
 
 override = st.session_state.custom_host.strip()
+
+# --- AUTOMATIC PERSISTENT AUTO-CONNECT & RECONNECTION LOGIC ---
+# Automatically connects and discovers folders on startup/refresh if an active account is loaded
+# without requiring the user to click "Connect & Discover Folders" manually.
+if active_email and active_password:
+    current_combo = f"{active_email}:{active_password}"
+    if st.session_state.get("connected_account_combo") != current_combo or not st.session_state.get("active_mail") or len(st.session_state.get("mb_folders", [])) <= 1:
+        hosts = [override] if override else host_list(active_email)
+        auto_success, auto_host, auto_folders = False, "", ["INBOX"]
+        auto_mail = None
+        
+        for h in hosts:
+            try:
+                auto_mail = open_mail(active_email, active_password, h)
+                auto_folders = list_folders(auto_mail, email_addr=active_email, host_val=h)
+                auto_host = h
+                auto_success = True
+                break
+            except Exception:
+                if auto_mail:
+                    try:
+                        auto_mail.logout()
+                    except Exception:
+                        pass
+        
+        if auto_success:
+            st.session_state.active_mail = auto_mail
+            st.session_state.connected_account_combo = current_combo
+            st.session_state.mb_host = auto_host
+            st.session_state.mb_folders = auto_folders
+            save_last_account(current_combo)
 
 if st.sidebar.button("🔄 Refresh Inbox", type="secondary", use_container_width=True):
     if active_email and active_password:
