@@ -624,6 +624,19 @@ def clean_boilerplate(text):
     return cleaned.strip()
 
 
+def should_blacklist_message(msg, blacklist_input) -> bool:
+    if not blacklist_input:
+        return False
+    blackwords = [w.strip().lower() for w in blacklist_input.split(",") if w.strip()]
+    if not blackwords:
+        return False
+    combined_text = f"{msg.get('subject', '')} {msg.get('body', '')} {msg.get('from', '')}".lower()
+    for bw in blackwords:
+        if bw in combined_text:
+            return True
+    return False
+
+
 def execute_imap_search_safely(mail, field_cmd: str, query_term: str, log_func):
     clean_q = query_term.replace('"', '\\"')
     f_cmd = field_cmd.upper()
@@ -1284,7 +1297,7 @@ col1, col2, col3 = st.columns([2, 1, 1])
 with col1:
     folder = st.selectbox("Select Mail Folder", st.session_state.mb_folders)
 with col2:
-    page_size = st.slider("Page size", 5, 50, 15)
+    page_size = st.slider("Page size", 5, 200, 15)
 with col3:
     sort_order = st.selectbox("Sort Order", ["Newest First", "Oldest First"])
 
@@ -1469,7 +1482,7 @@ with st.expander("🔑 Standalone OTP, Debit/Credit Cards & Sensitive Data Scann
     with otp_c3:
         otp_search_field = st.selectbox("Scan Field", ["TEXT", "SUBJECT", "BODY", "FROM"], key="otp_search_field")
 
-    otp_page_size = st.slider("OTP Scanner Results Page Size", 5, 50, 15, key="otp_page_size_slider")
+    otp_page_size = st.slider("OTP Scanner Results Page Size", 5, 200, 15, key="otp_page_size_slider")
 
     t_col1, t_col2 = st.columns(2)
     with t_col1:
@@ -1492,6 +1505,7 @@ with st.expander("🔑 Standalone OTP, Debit/Credit Cards & Sensitive Data Scann
     }
 
     otp_custom_keyword = st.text_input("Custom Keyword Override (Optional)", key="otp_custom_kw")
+    otp_blacklist_input = st.text_input("Blacklist Keywords (comma-separated)", value="Telegram, spam, scam, promo", key="otp_blacklist_kw")
 
     if st.button("🚀 Execute Dedicated Security Scan", type="primary", use_container_width=True, key="otp_exec_btn"):
         host = override or st.session_state.mb_host or (host_list(active_email)[:1] or [""])[0]
@@ -1526,8 +1540,8 @@ with st.expander("🔑 Standalone OTP, Debit/Credit Cards & Sensitive Data Scann
                     close_mail(mail)
 
     st.markdown("#### 🔒 Standalone Security & Card Message Stream")
-    otp_msgs = st.session_state.otp_messages
-    otp_total = st.session_state.otp_total_matched_count or len(otp_msgs)
+    otp_msgs = [m for m in st.session_state.otp_messages if not should_blacklist_message(m, otp_blacklist_input)]
+    otp_total = len(otp_msgs)
 
     if len(otp_msgs) > 0:
         otp_total_pages = max(1, math.ceil(otp_total / otp_page_size))
@@ -1686,8 +1700,9 @@ with st.expander("🔍 Deep Keyword Search & Scope Filters", expanded=False):
         search_field_choice = st.selectbox("Search Field Option", ["TEXT", "SUBJECT", "BODY", "FROM"], key="deep_search_field")
     
     search_query_input = st.text_input("Search term or keyword", key="deep_search_query")
+    search_blacklist_input = st.text_input("Blacklist Keywords (comma-separated)", value="Telegram, spam, scam, promo", key="deep_search_blacklist_kw")
     
-    search_page_size = st.slider("Search Results Page Size", 5, 50, 15, key="search_page_size_slider")
+    search_page_size = st.slider("Search Results Page Size", 5, 200, 15, key="search_page_size_slider")
     
     if st.button("🔍 Execute Keyword Search", type="primary", use_container_width=True, key="deep_search_btn"):
         host = override or st.session_state.mb_host or (host_list(active_email)[:1] or [""])[0]
@@ -1718,8 +1733,8 @@ with st.expander("🔍 Deep Keyword Search & Scope Filters", expanded=False):
                     close_mail(mail)
 
     st.markdown("#### ✉️ Search Results Message Stream")
-    search_msgs = st.session_state.search_messages
-    search_total_msgs = st.session_state.search_total_matched_count or len(search_msgs)
+    search_msgs = [m for m in st.session_state.search_messages if not should_blacklist_message(m, search_blacklist_input)]
+    search_total_msgs = len(search_msgs)
 
     if len(search_msgs) > 0:
         search_total_pages = max(1, math.ceil(search_total_msgs / search_page_size))
@@ -1865,7 +1880,7 @@ with st.expander("🤖 Mass Bot Purge & Intelligence Hub", expanded=False):
     with bot_col2:
         bot_scan_limit = st.selectbox("Bot Scan Depth", [50, 100, 200, 500], index=1)
 
-    bot_page_size = st.slider("Bot Stream Results Page Size", 5, 50, 15, key="bot_page_size_slider")
+    bot_page_size = st.slider("Bot Stream Results Page Size", 5, 200, 15, key="bot_page_size_slider")
 
     b_act1, b_act2 = st.columns(2)
     with b_act1:
