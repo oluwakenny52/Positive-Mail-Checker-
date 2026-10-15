@@ -1013,7 +1013,7 @@ st.caption("Advanced IMAP Client with Interactive Bot Intelligence, Dedicated OT
 
 valid = load_valid()
 
-# --- Requirement 1: Well-Organized Account Deletion Manager (Placed Before Keyboard Filter) ---
+# --- Requirement 1: Well-Organized Account Deletion Manager (With Multiselect & Select All) ---
 with st.expander("🗑️ Account Deletion Manager", expanded=False):
     st.markdown("#### Permanent Account Deletion Options")
     clean_valid_accounts_list = [l for l in valid if not l.startswith("# Found:")]
@@ -1021,17 +1021,39 @@ with st.expander("🗑️ Account Deletion Manager", expanded=False):
     if clean_valid_accounts_list:
         del_action_mode = st.selectbox(
             "Select Deletion Mode", 
-            ["-- Choose Action --", "Delete Specific Valid Account", "Delete ALL Valid Accounts"], 
+            ["-- Choose Action --", "Delete Selected Valid Account(s)", "Delete ALL Valid Accounts"], 
             key="del_action_mode_sel"
         )
         
-        if del_action_mode == "Delete Specific Valid Account":
-            acc_to_delete = st.selectbox("Select Account to Permanently Delete", clean_valid_accounts_list, key="acc_to_del_dropdown")
-            if st.button("🗑️ Permanently Delete Selected Account", type="primary", use_container_width=True):
-                delete_specific_account_from_storage(acc_to_delete)
-                st.success(f"Permanently deleted account: {acc_to_delete}")
-                save_session_cache()
-                st.rerun()
+        if del_action_mode == "Delete Selected Valid Account(s)":
+            if "select_all_accounts_chk" not in st.session_state:
+                st.session_state.select_all_accounts_chk = False
+                
+            def toggle_select_all():
+                if st.session_state.select_all_accounts_chk:
+                    st.session_state.accounts_to_del_multiselect = clean_valid_accounts_list
+                else:
+                    st.session_state.accounts_to_del_multiselect = []
+
+            col_sel1, col_sel2 = st.columns([3, 1])
+            with col_sel2:
+                st.markdown("<br>", unsafe_allow_html=True)
+                st.checkbox("Select All", key="select_all_accounts_chk", on_change=toggle_select_all)
+            
+            with col_sel1:
+                selected_accounts_to_delete = st.multiselect(
+                    "Select Account(s) to Permanently Delete", 
+                    clean_valid_accounts_list, 
+                    key="accounts_to_del_multiselect"
+                )
+            
+            if selected_accounts_to_delete:
+                if st.button("🗑️ Permanently Delete Selected Account(s)", type="primary", use_container_width=True):
+                    for acc in selected_accounts_to_delete:
+                        delete_specific_account_from_storage(acc)
+                    st.success(f"Permanently deleted {len(selected_accounts_to_delete)} account(s)!")
+                    save_session_cache()
+                    st.rerun()
                 
         elif del_action_mode == "Delete ALL Valid Accounts":
             st.warning("⚠️ Warning: This will permanently remove all stored valid accounts from local record files!")
