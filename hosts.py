@@ -73,14 +73,14 @@ def is_disposable(email_addr):
 
 def provider_hosts(email_addr):
     domain = domain_of(email_addr)
+    if domain in ATT_ONLY:
+        return ATT_IMAP, ATT_POP
     if domain in YAHOO_DOMAINS or domain.endswith(".yahoo.com"):
         return YAHOO_IMAP, YAHOO_POP
     if domain in MS_DOMAINS or domain.endswith(".outlook.com") or domain.endswith(".hotmail.com"):
         return MS_IMAP, MS_POP
     if domain in GMAIL_DOMAINS:
         return GMAIL_IMAP, GMAIL_POP
-    if domain in ATT_ONLY:
-        return ATT_IMAP, ATT_POP
     known = COUNTRY.get(domain)
     if known:
         return [known], [known]
