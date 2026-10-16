@@ -619,7 +619,8 @@ if "applied_cfg" not in str_lit.session_state:
         "PROXY_META_FILE": "proxy_meta.json",
         "MAX_PROXY_TRIES": engine_config.max_retries,
         "PROXY_CONNECT_TIMEOUT": engine_config.connect_timeout,
-        "FAST_MODE": engine_config.fast_mode
+        "FAST_MODE": engine_config.fast_mode,
+        "FAILURE_COOLDOWN": engine_config.failure_cooldown
     }
 
 if str_lit.sidebar.button("💾 Apply Settings", type="primary"):
@@ -651,7 +652,8 @@ if str_lit.sidebar.button("💾 Apply Settings", type="primary"):
         "PROXY_META_FILE": "proxy_meta.json",
         "MAX_PROXY_TRIES": engine_config.max_retries,
         "PROXY_CONNECT_TIMEOUT": engine_config.connect_timeout,
-        "FAST_MODE": engine_config.fast_mode
+        "FAST_MODE": engine_config.fast_mode,
+        "FAILURE_COOLDOWN": engine_config.failure_cooldown
     }
     str_lit.sidebar.success("Settings applied successfully!")
     log_startup("User applied new configuration settings via sidebar control panel.")
@@ -1312,6 +1314,8 @@ def known_provider_conf(domain):
     }
     twc_domains = {"twc.com", "brighthouse.com", "adelphia.net"}
 
+    if domain == "att.net":
+        return {"imap": att_imap, "pop": att_pop, "pop3": att_pop}
     if domain in yahoo_domains or domain.endswith(".yahoo.com"):
         return {"imap": yahoo_imap, "pop": yahoo_pop, "pop3": yahoo_pop}
     if domain in ms_domains or domain.endswith(".outlook.com") or domain.endswith(".hotmail.com"):
@@ -1353,6 +1357,8 @@ def get_servers(email):
             return known_provider_conf(parent_domain)
         if parent_domain == "outlook.office365.com":
             return known_provider_conf("outlook.com")
+        if parent_domain == "biglobe.ne.jp":
+            return {"imap": ["mail.biglobe.ne.jp"], "pop": ["mail.biglobe.ne.jp"], "pop3": ["mail.biglobe.ne.jp"]}
 
         if domain in PROVIDER_MAP:
             return PROVIDER_MAP[domain]
@@ -1516,11 +1522,13 @@ def classify_error(err, domain=""):
             return "need_app_password"
         if any(keyword in err_str for keyword in ["application-specific password", "app password", "two-factor", "mfa", "web login"]):
             return "need_app_password"
-        if any(x in err_str for x in ["authentication failed", "login failed", "invalid credentials", "auth failed", "invalid login", "bad username", "command error", "logon failure", "-err [auth]", "no [authenticationfailed]"]):
-            return "need_app_password" if domain in PUBLIC_PROVIDERS else "wrong_password"
+        if any(x in err_str for x in ["application-specific password", "app password", "basic authentication is disabled", "authenticate failed"]):
+            return "need_app_password"
+        if any(x in err_str for x in ["authentication failed", "login failed", "invalid credentials", "auth failed", "invalid login", "bad username", "logon failure", "-err [auth]", "[authenticationfailed]"]):
+            return "wrong_password"
     except Exception:
         pass
-    return "connection_failed"
+    return "unknown"
 
 def record_proxy_attempt(proxy_str, success, is_network_error=False):
     try:
@@ -1594,8 +1602,9 @@ def pop_once(email, password, server, proxy_str=None, insecure=True):
         raw = proxy_connect(server, 995, proxy_str, timeout=CFG["TIMEOUT"]) if proxy_str else socket.create_connection((server, 995), timeout=CFG["TIMEOUT"])
         raw.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
         ssock = ssl_wrap(raw, server, insecure=True)
-        mail = poplib.POP3_SSL(server, timeout=CFG["TIMEOUT"])
+        mail = poplib.POP3(server, timeout=CFG["TIMEOUT"])
         mail.sock = ssock
+        mail.file = ssock.makefile("rb")
         mail._debugging = 0
         mail.user(email.strip())
         mail.pass_(password.strip())
@@ -1718,7 +1727,7 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, 
         cooldown_period = CFG.get("FAILURE_COOLDOWN", 60.0)
         if ts and (time.time() - ts) < cooldown_period:
             trace_logs.append(f"Fast Mode: Domain '{domain}' is in cooldown cache. Skipping immediately.")
-            return None, "connection_failed", "skipped_cooldown", None, trace_logs
+            return None, "skipped_cooldown", "skipped_cooldown", None, trace_logs
         elif ts:
             failed_domain_cache.pop(domain, None)
 
@@ -1728,7 +1737,7 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, 
             return None, "need_app_password", "Zero-Access Architecture | Protocol: Local API / Bridge", None, trace_logs
 
         proxy_mode = CFG.get("PROXY_MODE", "aggressive")
-        prefer_insecure = True
+        prefer_insecure = bool(CFG.get("ALLOW_SELF_SIGNED", False))
         
         px = None
         if proxy_pool and proxy_mode != "off":
@@ -1741,6 +1750,7 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, 
                 available_candidates = [p for p in proxy_pool if precheck_proxy_fast(p)]
                 px = random.choice(available_candidates) if available_candidates else None
         
+        current_px = None
         proxies_to_try = [px] if px else [None]
         if proxy_mode == "fallback" and px:
             proxies_to_try.append(None)
