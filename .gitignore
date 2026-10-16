@@ -1,0 +1,16 @@
+.streamlit/secrets.toml
+proxies.txt
+proxy_meta.json
+domain_cache.json
+session_cache.json
+app_config.json
+last_account.txt
+manual_valid_accounts.txt
+disposable_domains.txt
+clean_valid_accounts.txt
+valid_accounts.txt
+mail_results/
+*.zip
+__pycache__/
+*.py[cod]
+.DS_Store
