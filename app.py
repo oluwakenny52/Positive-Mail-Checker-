@@ -1051,10 +1051,9 @@ def load_previous_valid():
                 with open(path, encoding="utf-8", errors="ignore") as f:
                     for line in f:
                         line = line.strip()
-                        if ":" in line:
-                            email, _ = line.split(":", 1)
-                            email = email.strip().lower()
-                            if email:
+                        if line and not line.startswith("#") and ":" in line:
+                            email = line.split(":", 1)[0].strip().lower()
+                            if email and "@" in email:
                                 seen.add(email)
             except Exception:
                 continue
@@ -1886,7 +1885,7 @@ if start_engine_btn:
             str_lit.session_state.last_checked_index = 0
                 
             str_lit.session_state.engine_has_run = True
-            str_lit.session_state.run_completion_status = "Running"
+            str_lit.session_state.run_completion_status = "Unfinished"
             
             start_dt = datetime.now()
             str_lit.session_state.start_timestamp = start_dt.strftime("%Y-%m-%d %H:%M:%S")
@@ -1986,9 +1985,6 @@ if start_engine_btn:
                                     "Under-The-Hood Background Trace": f"Result: {res.get('detail', '')}\nSteps Executed:\n  ↳ {trace_text}"
                                 })
 
-                                pending_unfinished = checked_count
-
-
                                 valid_len = len(str_lit.session_state.valid_results)
                                 wrong_len = len(str_lit.session_state.wrong_results)
                                 need_len = len(str_lit.session_state.need_app_results)
@@ -2019,7 +2015,7 @@ if start_engine_btn:
                             current_logs = list(str_lit.session_state.log_lines)
                         log_container.code("\n".join(current_logs), language="text")
                     
-                    if checked_count % 25 == 0 or checked_count == total_accs:
+                    if checked_count % 5 == 0 or checked_count == total_accs:
                         with session_state_lock:
                             done = set(str_lit.session_state.checked_emails_set)
                             valids = list(str_lit.session_state.valid_results)
@@ -2028,7 +2024,8 @@ if start_engine_btn:
                             em = raw.split(":", 1)[0].strip().lower() if ":" in raw else raw
                             if em not in done:
                                 left.append(raw)
-                        save_unfinished("stopped or connection cut before finish", left, checked_count, total_accs)
+                        if left:
+                            save_unfinished("stopped or connection cut before finish", left, checked_count, total_accs)
                         try:
                             os.makedirs(CFG["RESULTS_DIR"], exist_ok=True)
                             with file_write_lock:
@@ -2050,6 +2047,17 @@ if start_engine_btn:
                     status_text.text(f"Progress: {checked_count}/{total_accs} | Valid: {v_len} | Wrong: {w_len}")
         except Exception as ex:
             str_lit.error(f"Execution thread block error: {ex}")
+        finally:
+            if checked_count < total_accs:
+                with session_state_lock:
+                    done = set(str_lit.session_state.checked_emails_set)
+                left = []
+                for raw in all_target_accounts:
+                    em = raw.split(":", 1)[0].strip().lower() if ":" in raw else raw
+                    if em not in done:
+                        left.append(raw)
+                if left:
+                    save_unfinished("interrupted / stopped before finish", left, checked_count, total_accs)
 
         end_dt = datetime.now()
         duration = end_dt - start_dt
