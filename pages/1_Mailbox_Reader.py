@@ -153,8 +153,7 @@ def save_session_cache():
             serialized_list = []
             for m in st.session_state.get(key_in_state, []):
                 m_copy = m.copy()
-                if isinstance(m_copy.get("raw"), bytes):
-                    m_copy["raw"] = base64.b64encode(m_copy["raw"]).decode("ascii")
+                m_copy.pop("raw", None)
                 serialized_list.append(m_copy)
             cache_data[k_name] = serialized_list
 
@@ -2133,20 +2132,18 @@ with st.expander("🤖 Mass Bot Purge & Intelligence Hub", expanded=False):
                     deleted_count = 0
                     
                     folders = sorted({bm["folder"] for bm in all_loaded_bot_msgs}) or [folder]
+                    terms = ["telegram", "otp", "verification", "passcode", "bot"]
                     for r_folder in folders:
                         r_encoded = encode_imap_utf7(get_imap_path(r_folder))
                         mail.select(f'"{r_encoded}"', readonly=False)
-                        typ, data = mail.search(None, "ALL")
-                        ids = (data[0] or b"").split() if typ == "OK" and data else []
-                        for mid in ids:
-                            typ2, hdr = mail.fetch(mid, "(BODY.PEEK[HEADER.FIELDS (SUBJECT FROM)])")
-                            blob = b""
-                            if typ2 == "OK" and hdr and isinstance(hdr[0], tuple):
-                                blob = hdr[0][1] or b""
-                            low = blob.decode("utf-8", errors="ignore").lower()
-                            if any(k in low for k in ("telegram", "bot", "otp", "verification", "passcode")):
-                                mail.store(mid, "+FLAGS", "\\Deleted")
-                                deleted_count += 1
+                        found = set()
+                        for term in terms:
+                            typ, data = mail.search(None, "TEXT", term)
+                            if typ == "OK" and data and data[0]:
+                                found.update((data[0] or b"").split())
+                        for mid in found:
+                            mail.store(mid, "+FLAGS", "\\Deleted")
+                            deleted_count += 1
                         mail.expunge()
 
                     bot_log(f"🏁 [MASS DELETE COMPLETE] Successfully purged {deleted_count} bot messages from server.")
