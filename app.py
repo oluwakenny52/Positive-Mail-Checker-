@@ -1935,6 +1935,7 @@ if start_engine_btn:
                         pass
 
         detected_stop_reason = "Interrupted / Stopped before completion"
+        run_interrupted = False
         try:
             current_workers = CFG["MAX_WORKERS_START"]
             if CFG.get("DYNAMIC_WORKER_SCALING", False):
@@ -2045,9 +2046,11 @@ if start_engine_btn:
                         w_len = len(str_lit.session_state.wrong_results)
                     status_text.text(f"Progress: {checked_count}/{total_accs} | Valid: {v_len} | Wrong: {w_len}")
         except MemoryError as me:
+            run_interrupted = True
             detected_stop_reason = "Resource Exhaustion: RAM full / Out of Memory"
             str_lit.error(f"⚠ Engine Stopped: RAM Full / Out of Memory Error: {me}")
         except (OSError, IOError) as oe:
+            run_interrupted = True
             if getattr(oe, 'errno', 0) == 28 or "space" in str(oe).lower():
                 detected_stop_reason = "Resource Exhaustion: Disk Space / ROM full"
                 str_lit.error(f"⚠ Engine Stopped: Disk Space / ROM full ({oe})")
@@ -2055,9 +2058,11 @@ if start_engine_btn:
                 detected_stop_reason = f"Filesystem / I/O Error: {oe}"
                 str_lit.error(f"⚠ Engine Stopped: File I/O Error: {oe}")
         except (socket.timeout, ConnectionError, ssl.SSLError) as net_err:
+            run_interrupted = True
             detected_stop_reason = f"Network Connection Failure: Poor signal or connection dropped ({net_err})"
             str_lit.error(f"⚠ Engine Stopped: Network Connection Failure ({net_err})")
         except BaseException as be:
+            run_interrupted = True
             if isinstance(be, (SystemExit, KeyboardInterrupt)):
                 detected_stop_reason = "System Shutdown / Interruption"
                 raise be
@@ -2067,24 +2072,27 @@ if start_engine_btn:
             else:
                 detected_stop_reason = f"Unexpected Error / Interruption: {be}"
         finally:
-            if checked_count < total_accs:
-                with session_state_lock:
-                    done = set(str_lit.session_state.checked_emails_set)
-                left = []
-                for raw in all_target_accounts:
-                    em = raw.split(":", 1)[0].strip().lower() if ":" in raw else raw
-                    if em not in done:
-                        left.append(raw)
+            with session_state_lock:
+                done = set(str_lit.session_state.checked_emails_set)
+            left = []
+            for raw in all_target_accounts:
+                em = raw.split(":", 1)[0].strip().lower() if ":" in raw else raw
+                if em not in done:
+                    left.append(raw)
+            
+            if checked_count >= total_accs and not run_interrupted:
+                clear_unfinished()
+            else:
                 if left:
                     save_unfinished(detected_stop_reason, left, checked_count, total_accs)
 
         end_dt = datetime.now()
         duration = end_dt - start_dt
 
-        if checked_count >= total_accs:
+        if checked_count >= total_accs and not run_interrupted:
             clear_unfinished()
         with session_state_lock:
-            str_lit.session_state.run_completion_status = "Successful" if checked_count >= total_accs else "Unfinished"
+            str_lit.session_state.run_completion_status = "Successful" if (checked_count >= total_accs and not run_interrupted) else "Unfinished"
             str_lit.session_state.end_timestamp = end_dt.strftime("%Y-%m-%d %H:%M:%S")
             str_lit.session_state.total_duration = str(timedelta(seconds=int(duration.total_seconds())))
             
