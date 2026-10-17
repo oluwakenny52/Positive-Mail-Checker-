@@ -2225,9 +2225,9 @@ if str_lit.session_state.engine_has_run:
     col4.metric("⚠ Connection Failed", conn_len_val)
     
     if valid_res_copy:
-        str_lit.markdown("#### ✅ Valid Accounts Found:")
-        for v in valid_res_copy:
-            str_lit.code(v, language="text")
+        with str_lit.expander(f"✅ Valid Accounts Found ({len(valid_res_copy)})", expanded=False):
+            for v in valid_res_copy:
+                str_lit.code(v, language="text")
 
     exec_tab1_p, exec_tab2_p = str_lit.tabs(["⚡ Live Execution Stream", "📊 Live Report Log & Analytics"])
     with exec_tab1_p:
