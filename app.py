@@ -115,9 +115,10 @@ def load_persistent_valid_results():
 if "engine_has_run" not in str_lit.session_state:
     str_lit.session_state.engine_has_run = False
 if "valid_results" not in str_lit.session_state:
-    str_lit.session_state.valid_results = []
-    str_lit.session_state.clean_valid_count = 0
-    str_lit.session_state.run_valid_count = 0
+    loaded_valid = load_persistent_valid_results()
+    str_lit.session_state.valid_results = loaded_valid
+    str_lit.session_state.clean_valid_count = len(loaded_valid)
+    str_lit.session_state.run_valid_count = len(loaded_valid)
 if "wrong_results" not in str_lit.session_state:
     str_lit.session_state.wrong_results = []
 if "need_app_results" not in str_lit.session_state:
@@ -135,9 +136,9 @@ if "zip_bytes" not in str_lit.session_state:
 if "zip_name" not in str_lit.session_state:
     str_lit.session_state.zip_name = ""
 if "clean_valid_count" not in str_lit.session_state:
-    str_lit.session_state.clean_valid_count = 0
+    str_lit.session_state.clean_valid_count = len(str_lit.session_state.get("valid_results", []))
 if "run_valid_count" not in str_lit.session_state:
-    str_lit.session_state.run_valid_count = 0
+    str_lit.session_state.run_valid_count = len(str_lit.session_state.get("valid_results", []))
 if "checked_emails_set" not in str_lit.session_state:
     str_lit.session_state.checked_emails_set = set()
 if "last_checked_index" not in str_lit.session_state:
@@ -2184,10 +2185,10 @@ if start_engine_btn:
             str_lit.error(f"Error compiling results export files: {ex}")
 
 # --- Render Persistent Results Permanently If Engine Has Run ---
-if str_lit.session_state.engine_has_run:
+if str_lit.session_state.engine_has_run or load_persistent_valid_results():
     str_lit.markdown("---")
     with session_state_lock:
-        status_label = "🎉 Check Complete!" if str_lit.session_state.run_completion_status == "Successful" else "⚠️ Unfinished"
+        status_label = "🎉 Check Complete!" if str_lit.session_state.run_completion_status == "Successful" else "⚠️ Unfinished / Loaded from Disk"
         clean_count_val = str_lit.session_state.get("run_valid_count", str_lit.session_state.clean_valid_count)
         wrong_len_val = len(str_lit.session_state.wrong_results)
         need_len_val = len(str_lit.session_state.need_app_results)
@@ -2251,18 +2252,17 @@ if str_lit.session_state.engine_has_run:
             mime="application/zip"
         )
 
-# --- 📬 Mailbox Reader Section ---
+# --- 📬 Mailbox Reader Section (Proxy-Integrated) ---
 str_lit.markdown("---")
 str_lit.markdown("### 📬 Mailbox Reader (Interactive Inbox Inspection)")
 with session_state_lock:
-    has_valid = bool(str_lit.session_state.valid_results)
-    valid_results_snapshot = list(str_lit.session_state.valid_results)
+    current_valid_set = list(str_lit.session_state.valid_results) or load_persistent_valid_results()
 
-if not has_valid:
-    str_lit.info("Run the checker successfully to populate valid accounts for mailbox reading.")
+if not current_valid_set:
+    str_lit.info("Run the checker successfully or ensure valid account files exist to populate valid accounts for mailbox reading.")
 else:
     valid_combo_options = []
-    for item in valid_results_snapshot:
+    for item in current_valid_set:
         try:
             if ":" in item:
                 email_val, remainder = item.split(":", 1)
@@ -2284,14 +2284,16 @@ else:
                 conf_servers = get_servers(acc_email)
                 imap_hosts = conf_servers.get("imap", [])
                 
+                mailbox_proxy = sample_alive_proxy() if use_proxy else None
+                
                 if not imap_hosts:
                     str_lit.error("No IMAP host available for this provider domain name.")
                 else:
-                    with str_lit.spinner(f"Connecting to IMAP and fetching inbox for {acc_email}..."):
+                    with str_lit.spinner(f"Connecting via proxy [{px_tag(mailbox_proxy)}] and fetching inbox for {acc_email}..."):
                         success_read = False
                         fetched_msgs = []
                         for srv in imap_hosts:
-                            msgs = read_mailbox_messages(acc_email, acc_pass, srv, limit=max_msgs)
+                            msgs = read_mailbox_messages(acc_email, acc_pass, srv, proxy_str=mailbox_proxy, limit=max_msgs)
                             if msgs and not any("Error reading mailbox" in m for m in msgs):
                                 fetched_msgs = msgs
                                 success_read = True
