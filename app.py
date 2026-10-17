@@ -274,7 +274,7 @@ if checker_mode == "Fast Mode":
     )
     workers = str_lit.sidebar.slider("Workers Start", min_value=1, max_value=100, value=60, step=5)
     deadline = str_lit.sidebar.slider("Deadline (Seconds)", min_value=3, max_value=60, value=15, step=5)
-    timeout = str_lit.sidebar.slider("Timeout", min_value=1, max_value=15, value=3, step=1)
+    timeout = str_lit.sidebar.slider("Timeout", min_value=1, max_value=15, value=10, step=1)
 elif checker_mode == "Deep / Aggressive Mode":
     engine_config = CheckerConfig(
         mode_name="Deep",
@@ -300,7 +300,7 @@ else:  # Normal Mode (Default)
     )
     workers = str_lit.sidebar.slider("Workers Start", min_value=1, max_value=75, value=30, step=5)
     deadline = str_lit.sidebar.slider("Deadline (Seconds)", min_value=5, max_value=90, value=25, step=5)
-    timeout = str_lit.sidebar.slider("Timeout", min_value=2, max_value=20, value=5, step=1)
+    timeout = str_lit.sidebar.slider("Timeout", min_value=2, max_value=20, value=10, step=1)
 
 max_acc = str_lit.sidebar.slider("Max Accounts", min_value=0, max_value=5000, value=5000, step=100)
 blacklist_cf = str_lit.sidebar.slider("Blacklist CF", min_value=0, max_value=500, value=100, step=10)
@@ -1164,7 +1164,7 @@ with input_tab2:
 
 clean_lines = []
 disp, typo, resume, app_skip, custom_skipped, dns_skipped = [], [], [], [], [], []
-skip_previous = str_lit.checkbox("Skip previously valid", value=False, help="Off by default. On: lines already in old valid files are not checked again.")
+skip_previous = str_lit.checkbox("Skip previously valid", value=True, help="Checked by default. On: lines already in old valid files are not checked again.")
 if raw_text:
     previous_valid = load_previous_valid() if skip_previous else set()
     clean_lines, disp, typo, resume, app_skip, custom_skipped, dns_skipped = process_accounts(raw_text, previous_valid)
