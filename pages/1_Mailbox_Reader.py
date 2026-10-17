@@ -153,8 +153,8 @@ def save_session_cache():
             serialized_list = []
             for m in st.session_state.get(key_in_state, []):
                 m_copy = m.copy()
-                raw_bytes = m_copy.get("raw")
-                if isinstance(raw_bytes, bytes):
+                raw_bytes = m_copy.pop("raw", None)
+                if raw_bytes and isinstance(raw_bytes, bytes):
                     m_copy["raw"] = base64.b64encode(raw_bytes).decode("ascii")
                 else:
                     m_copy["raw"] = ""
