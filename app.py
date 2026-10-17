@@ -22,6 +22,8 @@ import concurrent.futures
 from dataclasses import dataclass
 from typing import List, Dict, Optional
 import re
+from hosts import conf as host_conf, STRICT_APP, ZERO_ACCESS, PARENT, MS_DOMAINS, GMAIL_DOMAINS
+from status import VALID, WRONG, APP, FAILED, SKIP, UNKNOWN
 
 # Optional network libs
 try:
@@ -907,15 +909,9 @@ COMMON_TYPOS = {
     "yaho.com", "yahooo.com", "yhoo.com", "iclound.com", "ezweb.ne"
 }
 
-STRICT_APP_PROVIDERS = {
-    "gmail.com", "googlemail.com",
-    "outlook.com", "hotmail.com", "live.com", "windowslive.com"
-}
+STRICT_APP_PROVIDERS = STRICT_APP
 
-ZERO_ACCESS_PROVIDERS = {
-    "proton.me", "protonmail.com", "pm.me",
-    "tuta.io", "tutanota.com", "tutamail.com", "tuta.com"
-}
+ZERO_ACCESS_PROVIDERS = ZERO_ACCESS
 
 EMAIL_REGEX = re.compile(r"^[\w\.-]+@[\w\.-]+\.\w+$")
 
@@ -1226,9 +1222,7 @@ PROVIDER_MAP = {
 
 PUBLIC_PROVIDERS = set(PROVIDER_MAP.keys())
 
-PARENT_PROVIDER_MAPPINGS = {
-    "memoad.jp": "biglobe.ne.jp"
-}
+PARENT_PROVIDER_MAPPINGS = PARENT
 
 def get_mx_hosts(domain):
     if not dns: return []
@@ -1260,7 +1254,7 @@ def detect_parent_provider(domain):
 def generate_candidate_hosts(domain: str, mx_records: list = None) -> list:
     candidates = []
     # Place mail and imap explicitly at the very top of the priority list
-    priority_prefixes = ['imap', 'mail', 'pop', 'pop3', 'secure', 'smtp']
+    priority_prefixes = ['imap', 'mail', 'pop']
     for prefix in priority_prefixes:
         candidates.append(f"{prefix}.{domain}")
     
@@ -1290,51 +1284,7 @@ def px_tag(proxy_str):
     return f"{info.get('host')}:{info.get('port')} | {country} | {region}"
 
 def known_provider_conf(domain):
-    yahoo_imap = ["imap.mail.yahoo.com"]
-    yahoo_pop = ["pop.mail.yahoo.com"]
-    ms_imap = ["outlook.office365.com", "imap-mail.outlook.com"]
-    ms_pop = ["outlook.office365.com"]
-    gmail_imap = ["imap.gmail.com"]
-    gmail_pop = ["pop.gmail.com"]
-    att_imap = ["imap.mail.att.net"]
-    att_pop = ["inbound.att.net"]
-    
-    charter_imap = ["mobile.charter.net", "imap.charter.net"]
-    charter_pop = ["mobile.charter.net", "pop.charter.net"]
-    twc_imap = ["mail.twc.com"]
-    twc_pop = ["mail.twc.com"]
-
-    yahoo_domains = {
-        "yahoo.com", "ymail.com", "rocketmail.com", "frontier.com", "frontiernet.net",
-        "sbcglobal.net", "att.net", "bellsouth.net", "pacbell.net", "swbell.net",
-        "ameritech.net", "currently.com", "prodigy.net", "snet.net",
-    }
-    ms_domains = {"outlook.com", "hotmail.com", "live.com", "msn.com", "outlook.com.br", "hotmail.com.br"}
-    
-    charter_domains = {
-        "charter.net", "roadrunner.com", "rr.com",
-        "cfl.rr.com", "tampabay.rr.com", "nyc.rr.com", "nycap.rr.com", "rochester.rr.com",
-        "socal.rr.com", "ca.rr.com", "tx.rr.com", "satx.rr.com", "austin.rr.com",
-        "oh.rr.com", "cinci.rr.com", "columbus.rr.com", "carolina.rr.com", "nc.rr.com",
-        "sc.rr.com", "wi.rr.com", "mi.rr.com", "indy.rr.com", "kc.rr.com", "hawaii.rr.com"
-    }
-    twc_domains = {"twc.com", "brighthouse.com", "adelphia.net"}
-
-    if domain == "att.net":
-        return {"imap": att_imap, "pop": att_pop, "pop3": att_pop}
-    if domain in yahoo_domains or domain.endswith(".yahoo.com"):
-        return {"imap": yahoo_imap, "pop": yahoo_pop, "pop3": yahoo_pop}
-    if domain in ms_domains or domain.endswith(".outlook.com") or domain.endswith(".hotmail.com"):
-        return {"imap": ms_imap, "pop": ms_pop, "pop3": ms_pop}
-    if domain in {"gmail.com", "googlemail.com"}:
-        return {"imap": gmail_imap, "pop": gmail_pop, "pop3": gmail_pop}
-    if domain == "att.net":
-        return {"imap": att_imap, "pop": att_pop, "pop3": att_pop}
-    if domain in charter_domains or domain.endswith(".rr.com"):
-        return {"imap": charter_imap, "pop": charter_pop, "pop3": charter_pop}
-    if domain in twc_domains:
-        return {"imap": twc_imap, "pop": twc_pop, "pop3": twc_pop}
-    return None
+    return host_conf(domain)
 
 def drop_before_check(email):
     email = (email or "").strip().lower()
@@ -1369,7 +1319,7 @@ def get_servers(email):
         if domain in PROVIDER_MAP:
             return PROVIDER_MAP[domain]
 
-        mx_records = get_mx_hosts(domain)
+        mx_records = get_mx_hosts(domain) if parent_domain not in PARENT_PROVIDER_MAPPINGS else []
         candidate_hosts = [h for h in generate_candidate_hosts(domain, mx_records) if not h.startswith(("smtp.", "secure.", "pop3."))][:3]
 
         servers = {
@@ -1555,20 +1505,20 @@ def classify_error(err, domain=""):
     try:
         err_str = str(err).lower()
         if any(x in err_str for x in ["proxy connect failed", "timed out", "timeout", "connection refused", "network is unreachable", "name or service not known", "gaierror", "sockatmark", "reset by peer", "broken pipe", "fast-fail dns check failed", "socket.timeout", "connectionrefusederror"]):
-            return "connection_failed"
+            return FAILED
         if domain in ZERO_ACCESS_PROVIDERS or any(k in err_str for k in ["zero-access", "bridge", "local connection"]):
-            return "need_app_password"
+            return APP
         if "basic authentication is disabled" in err_str:
-            return "need_app_password"
+            return APP
         if any(keyword in err_str for keyword in ["application-specific password", "app password", "two-factor", "mfa", "web login"]):
-            return "need_app_password"
+            return APP
         if any(x in err_str for x in ["application-specific password", "app password", "basic authentication is disabled", "authenticate failed"]):
-            return "need_app_password"
+            return APP
         if any(x in err_str for x in ["authentication failed", "login failed", "invalid credentials", "auth failed", "invalid login", "bad username", "logon failure", "-err [auth]", "[authenticationfailed]"]):
-            return "wrong_password"
+            return WRONG
     except Exception:
         pass
-    return "unknown"
+    return UNKNOWN
 
 def record_proxy_attempt(proxy_str, success, is_network_error=False):
     try:
@@ -1767,7 +1717,7 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, 
         cooldown_period = CFG.get("FAILURE_COOLDOWN", 60.0)
         if ts and (time.time() - ts) < cooldown_period:
             trace_logs.append(f"Fast Mode: Domain '{domain}' is in cooldown cache. Skipping immediately.")
-            return None, "skipped_cooldown", "skipped_cooldown", None, trace_logs
+            return None, SKIP, SKIP, None, trace_logs
         elif ts:
             failed_domain_cache.pop(domain, None)
 
@@ -1802,7 +1752,7 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, 
                 try:
                     imap_once(email, password, server, current_px, insecure=prefer_insecure)
                     record_proxy_attempt(current_px, success=True)
-                    return server, "valid", f"{px_tag(current_px)} IMAP | Host: {server} | Port: 993", current_px, trace_logs
+                    return server, VALID, f"{px_tag(current_px)} IMAP | Host: {server} | Port: 993", current_px, trace_logs
                 except (socket.timeout, socket.error, ConnectionRefusedError, ssl.SSLError) as sock_err:
                     st_val = classify_error(sock_err, domain)
                     record_proxy_attempt(current_px, success=False, is_network_error=True)
@@ -1824,7 +1774,7 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, 
                 try:
                     pop_once(email, password, server, current_px, insecure=prefer_insecure)
                     record_proxy_attempt(current_px, success=True)
-                    return server, "valid", f"{px_tag(current_px)} POP | Host: {server} | Port: 995", current_px, trace_logs
+                    return server, VALID, f"{px_tag(current_px)} POP | Host: {server} | Port: 995", current_px, trace_logs
                 except (socket.timeout, socket.error, ConnectionRefusedError, ssl.SSLError) as sock_err:
                     st_val = classify_error(sock_err, domain)
                     record_proxy_attempt(current_px, success=False, is_network_error=True)
@@ -1998,14 +1948,14 @@ if start_engine_btn:
                                 if em_val:
                                     str_lit.session_state.checked_emails_set.add(em_val)
 
-                                if st_val == "valid":
+                                if st_val == VALID:
                                     if res["line"] not in str_lit.session_state.valid_results:
                                         str_lit.session_state.valid_results.append(res["line"])
                                         str_lit.session_state.run_valid_count += 1
                                     str_lit.session_state.clean_valid_count = str_lit.session_state.run_valid_count
-                                elif st_val == "wrong_password":
+                                elif st_val == WRONG:
                                     str_lit.session_state.wrong_results.append(res["line"])
-                                elif st_val == "need_app_password":
+                                elif st_val == APP:
                                     str_lit.session_state.need_app_results.append(res["line"])
                                 else:
                                     str_lit.session_state.conn_results.append(res["line"])
