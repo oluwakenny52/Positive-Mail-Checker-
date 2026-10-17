@@ -47,8 +47,8 @@ def load_app_proxies() -> List[dict]:
                         parts = [x.strip() for x in line_str.replace(",", "|").split("|") if x.strip()]
                         proxy_addr = parts[0]
                         if ":" in proxy_addr:
-                            country = parts[2] if len(parts) > 2 else "United States"
-                            region = parts[3] if len(parts) > 3 else "California"
+                            country = parts[2] if len(parts) > 2 else "unknown"
+                            region = parts[3] if len(parts) > 3 else "unknown"
                             latency = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 350
                             dynamic_pool.append({
                                 "proxy": proxy_addr,
@@ -266,6 +266,46 @@ def otp_log(msg):
     st.session_state.otp_diag_logs.append(msg)
 
 
+
+def open_imap(host, port, timeout, proxy_str=None):
+    import ssl as _ssl
+    if not proxy_str or proxy_str == "direct":
+        return imaplib.IMAP4_SSL(host, port, timeout=timeout)
+    try:
+        import socks
+    except ImportError:
+        return imaplib.IMAP4_SSL(host, port, timeout=timeout)
+    raw = None
+    if "@" in proxy_str:
+        auth, hp = proxy_str.rsplit("@", 1)
+        user, pw = auth.split(":", 1)
+        ph, pp = hp.rsplit(":", 1)
+    else:
+        user = pw = None
+        ph, pp = proxy_str.rsplit(":", 1)
+    last = None
+    for ptype in (socks.SOCKS5, socks.HTTP):
+        try:
+            kw = {"proxy_type": ptype, "proxy_addr": ph, "proxy_port": int(pp)}
+            if user:
+                kw["proxy_username"] = user
+                kw["proxy_password"] = pw
+            raw = socks.create_connection((host, int(port)), timeout=timeout, **kw)
+            ctx = _ssl.create_default_context()
+            ssock = ctx.wrap_socket(raw, server_hostname=host)
+            mail = imaplib.IMAP4_SSL(host)
+            mail.sock = ssock
+            mail.file = ssock.makefile("rb")
+            mail.welcome = mail._getresp()
+            return mail
+        except Exception as e:
+            last = e
+            if raw:
+                try: raw.close()
+                except Exception: pass
+                raw = None
+    raise last or RuntimeError("proxy imap failed")
+
 def load_valid():
     """Optimized instant loader: Scans only valid text result files, bypassing heavy log scanning."""
     valid_map = {}
@@ -332,7 +372,8 @@ def delete_specific_account_from_storage(target_combo: str):
                 lines = f.readlines()
             new_lines = []
             for line in lines:
-                if target_combo not in line:
+                combo = line.split("|")[0].strip()
+                if combo != target_combo:
                     new_lines.append(line)
             with open(path, "w", encoding="utf-8") as f:
                 f.writelines(new_lines)
@@ -350,7 +391,7 @@ def clear_all_valid_accounts_storage():
     search_files = glob.glob("mail_results/*.txt") + glob.glob("*.txt")
     for path in search_files:
         filename_lower = os.path.basename(path).lower()
-        if filename_lower == LAST_ACCOUNT_FILE or any(kw in filename_lower for kw in ["resume", "unfinished", "remaining", "input", "proxies", "proxy", "config", "blocklist"]):
+        if "valid" not in filename_lower and "clean" not in filename_lower:
             continue
         try:
             with open(path, "w", encoding="utf-8") as f:
@@ -1200,7 +1241,7 @@ if st.sidebar.button("🚀 Validate & Import Batch Accounts", type="primary", us
                 test_m = None
                 try:
                     trace_steps.append(f"Attempting IMAP -> Host: {h}:{cfg_port}")
-                    test_m = imaplib.IMAP4_SSL(h, cfg_port, timeout=cfg_timeout)
+                    test_m = open_imap(h, cfg_port, cfg_timeout, proxy_item.get("proxy"))
                     test_m.login(email_val, pass_val)
                     test_m.logout()
                     connected_h = h
