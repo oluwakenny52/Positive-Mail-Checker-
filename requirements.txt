@@ -3,7 +3,3 @@ pandas
 dnspython
 requests
 PySocks
-playwright
-nest_asyncio
-aiohttp
-
