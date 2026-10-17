@@ -716,8 +716,6 @@ def get_filtered_active_proxies():
             breaker_snapshot = dict(circuit_breaker_until)
 
         for p in raw:
-            # If allow_blacklisted is False, drop bad proxies/circuit breakers. 
-            # If allow_blacklisted is True, bypass this block to let blacklisted/flagged IPs through.
             if not allow_blacklisted:
                 if p in bad_proxies:
                     continue
@@ -1936,6 +1934,7 @@ if start_engine_btn:
                     except Exception:
                         pass
 
+        detected_stop_reason = "Interrupted / Stopped before completion"
         try:
             current_workers = CFG["MAX_WORKERS_START"]
             if CFG.get("DYNAMIC_WORKER_SCALING", False):
@@ -2025,7 +2024,7 @@ if start_engine_btn:
                             if em not in done:
                                 left.append(raw)
                         if left:
-                            save_unfinished("stopped or connection cut before finish", left, checked_count, total_accs)
+                            save_unfinished("Running checkpoint sync (Normal)", left, checked_count, total_accs)
                         try:
                             os.makedirs(CFG["RESULTS_DIR"], exist_ok=True)
                             with file_write_lock:
@@ -2045,8 +2044,28 @@ if start_engine_btn:
                         v_len = len(str_lit.session_state.valid_results)
                         w_len = len(str_lit.session_state.wrong_results)
                     status_text.text(f"Progress: {checked_count}/{total_accs} | Valid: {v_len} | Wrong: {w_len}")
+        except MemoryError as me:
+            detected_stop_reason = "Resource Exhaustion: RAM full / Out of Memory"
+            str_lit.error(f"⚠ Engine Stopped: RAM Full / Out of Memory Error: {me}")
+        except (OSError, IOError) as oe:
+            if getattr(oe, 'errno', 0) == 28 or "space" in str(oe).lower():
+                detected_stop_reason = "Resource Exhaustion: Disk Space / ROM full"
+                str_lit.error(f"⚠ Engine Stopped: Disk Space / ROM full ({oe})")
+            else:
+                detected_stop_reason = f"Filesystem / I/O Error: {oe}"
+                str_lit.error(f"⚠ Engine Stopped: File I/O Error: {oe}")
+        except (socket.timeout, ConnectionError, ssl.SSLError) as net_err:
+            detected_stop_reason = f"Network Connection Failure: Poor signal or connection dropped ({net_err})"
+            str_lit.error(f"⚠ Engine Stopped: Network Connection Failure ({net_err})")
+        except SystemExit:
+            detected_stop_reason = "User Interruption: Script rerun or manual termination triggered"
         except Exception as ex:
-            str_lit.error(f"Execution thread block error: {ex}")
+            ex_str = str(ex).lower()
+            if any(k in ex_str for k in ["rerun", "stop", "scriptrunner", "websocket", "closed", "connection lost"]):
+                detected_stop_reason = "User Interruption: User clicked button, moved slider, or closed/reloaded page"
+            else:
+                detected_stop_reason = f"Unexpected Error: {ex}"
+                str_lit.error(f"⚠ Engine Stopped due to unexpected error: {ex}")
         finally:
             if checked_count < total_accs:
                 with session_state_lock:
@@ -2057,7 +2076,7 @@ if start_engine_btn:
                     if em not in done:
                         left.append(raw)
                 if left:
-                    save_unfinished("interrupted / stopped before finish", left, checked_count, total_accs)
+                    save_unfinished(detected_stop_reason, left, checked_count, total_accs)
 
         end_dt = datetime.now()
         duration = end_dt - start_dt
