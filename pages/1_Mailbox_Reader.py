@@ -57,7 +57,7 @@ def load_app_proxies() -> List[dict]:
                                 "latency": latency
                             })
             except Exception as ex:
-                pass
+                st.session_state.folder_debug_logs.append(f"Proxy load warning: {ex}")
             if dynamic_pool:
                 return dynamic_pool
 
@@ -265,7 +265,6 @@ def otp_log(msg):
     st.session_state.otp_diag_logs.append(msg)
 
 
-
 def open_imap(host, port, timeout, proxy_str=None):
     import ssl as _ssl
     if not proxy_str or proxy_str == "direct":
@@ -300,8 +299,10 @@ def open_imap(host, port, timeout, proxy_str=None):
         except Exception as e:
             last = e
             if raw:
-                try: raw.close()
-                except Exception: pass
+                try: 
+                    raw.close()
+                except Exception: 
+                    pass
                 raw = None
     raise last or RuntimeError("proxy imap failed")
 
