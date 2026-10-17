@@ -317,6 +317,14 @@ str_lit.sidebar.markdown("### 🌐 Proxy / Pool Configuration")
 
 min_proxy_score = str_lit.sidebar.slider("Min Proxy Score", min_value=0, max_value=100, value=40, step=10)
 proxy_precheck_timeout = str_lit.sidebar.slider("Proxy Pre-Check Timeout (Sec)", min_value=1, max_value=10, value=3, step=1)
+
+# --- New Blacklist IP Toggle ---
+allow_blacklist_ips = str_lit.sidebar.toggle(
+    "Allow Blacklisted / Flagged Proxy IPs", 
+    value=False, 
+    help="When disabled (default), proxies flagged or circuit-broken due to failures are excluded. When enabled, they remain usable in the pool."
+)
+
 if "pool_mode" not in str_lit.session_state:
     str_lit.session_state.pool_mode = "all"
 if "pool_locked" not in str_lit.session_state:
@@ -613,6 +621,7 @@ if "applied_cfg" not in str_lit.session_state:
         "DEBUG": debug_mode,
         "MIN_PROXY_SCORE": min_proxy_score,
         "PROXY_PRECHECK_TIMEOUT": proxy_precheck_timeout,
+        "ALLOW_BLACKLIST_IPS": allow_blacklist_ips,
         "POOL_MODE": pool_mode,
         "SELECTED_COUNTRIES": selected_countries,
         "SELECTED_MIX_COUNTRIES": selected_mix_countries,
@@ -646,6 +655,7 @@ if str_lit.sidebar.button("💾 Apply Settings", type="primary"):
         "DEBUG": debug_mode,
         "MIN_PROXY_SCORE": min_proxy_score,
         "PROXY_PRECHECK_TIMEOUT": proxy_precheck_timeout,
+        "ALLOW_BLACKLIST_IPS": allow_blacklist_ips,
         "POOL_MODE": pool_mode,
         "SELECTED_COUNTRIES": selected_countries,
         "SELECTED_MIX_COUNTRIES": selected_mix_countries,
@@ -698,6 +708,7 @@ def get_filtered_active_proxies():
         mode = CFG.get("POOL_MODE", "all")
         chosen_countries = CFG.get("SELECTED_COUNTRIES", [])
         chosen_mix = CFG.get("SELECTED_MIX_COUNTRIES", [])
+        allow_blacklisted = CFG.get("ALLOW_BLACKLIST_IPS", False)
         now = time.time()
 
         with proxy_lock:
@@ -705,10 +716,14 @@ def get_filtered_active_proxies():
             breaker_snapshot = dict(circuit_breaker_until)
 
         for p in raw:
-            if p in bad_proxies:
-                continue
-            if p in breaker_snapshot and now < breaker_snapshot[p]:
-                continue
+            # If allow_blacklisted is False, drop bad proxies/circuit breakers. 
+            # If allow_blacklisted is True, bypass this block to let blacklisted/flagged IPs through.
+            if not allow_blacklisted:
+                if p in bad_proxies:
+                    continue
+                if p in breaker_snapshot and now < breaker_snapshot[p]:
+                    continue
+
             meta = meta_snapshot.get(p, {})
             score = meta.get("score", 50)
             country = meta.get("country", "Unknown").upper()
