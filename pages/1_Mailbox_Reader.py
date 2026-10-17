@@ -696,8 +696,15 @@ def detect_specific_categories(subject: str, body: str, frm: str = "", pins=None
 
 
 def extract_pins_and_links(text):
-    pins = re.findall(r'\b(?<![#\d])\d{4,8}(?![#\d])\b', text)
-    urls = re.findall(r'https?://[^\s<>"]+|www\.[^\s<>"]+', text)
+    pins = []
+    for m in re.finditer(r'(?i)(code|otp|pin|passcode|verification|verify)[^\d]{0,12}(\d{4,8})', text or ""):
+        num = m.group(2)
+        if num.startswith(("19", "20")) and len(num) == 4:
+            continue
+        if num in {"0000", "1234", "1111"}:
+            continue
+        pins.append(num)
+    urls = re.findall(r'https?://[^\s<>"]+|www\.[^\s<>"]+', text or "")
     cleaned_urls = [u for u in urls if not any(x in u.lower() for x in ["w3.org", "schema.org", "apple.com/DTDs"])]
     return list(dict.fromkeys(pins)), list(dict.fromkeys(cleaned_urls))
 
@@ -2125,13 +2132,22 @@ with st.expander("🤖 Mass Bot Purge & Intelligence Hub", expanded=False):
                     mail = get_active_mail(active_email, active_password, host)
                     deleted_count = 0
                     
-                    for idx, bm in enumerate(all_loaded_bot_msgs, 1):
-                        r_folder = get_imap_path(bm["folder"])
-                        r_encoded = encode_imap_utf7(r_folder)
+                    folders = sorted({bm["folder"] for bm in all_loaded_bot_msgs}) or [folder]
+                    for r_folder in folders:
+                        r_encoded = encode_imap_utf7(get_imap_path(r_folder))
                         mail.select(f'"{r_encoded}"', readonly=False)
-                        mail.store(bm["id"], '+FLAGS', '\\Deleted')
+                        typ, data = mail.search(None, "ALL")
+                        ids = (data[0] or b"").split() if typ == "OK" and data else []
+                        for mid in ids:
+                            typ2, hdr = mail.fetch(mid, "(BODY.PEEK[HEADER.FIELDS (SUBJECT FROM)])")
+                            blob = b""
+                            if typ2 == "OK" and hdr and isinstance(hdr[0], tuple):
+                                blob = hdr[0][1] or b""
+                            low = blob.decode("utf-8", errors="ignore").lower()
+                            if any(k in low for k in ("telegram", "bot", "otp", "verification", "passcode")):
+                                mail.store(mid, "+FLAGS", "\\Deleted")
+                                deleted_count += 1
                         mail.expunge()
-                        deleted_count += 1
 
                     bot_log(f"🏁 [MASS DELETE COMPLETE] Successfully purged {deleted_count} bot messages from server.")
                     st.success(f"Successfully deleted {deleted_count} bot messages!")
