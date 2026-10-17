@@ -114,9 +114,9 @@ def load_persistent_valid_results():
 if "engine_has_run" not in str_lit.session_state:
     str_lit.session_state.engine_has_run = False
 if "valid_results" not in str_lit.session_state:
-    initial_valid = load_persistent_valid_results()
-    str_lit.session_state.valid_results = initial_valid
-    str_lit.session_state.clean_valid_count = len(initial_valid)
+    str_lit.session_state.valid_results = []
+    str_lit.session_state.clean_valid_count = 0
+    str_lit.session_state.run_valid_count = 0
 if "wrong_results" not in str_lit.session_state:
     str_lit.session_state.wrong_results = []
 if "need_app_results" not in str_lit.session_state:
@@ -135,6 +135,8 @@ if "zip_name" not in str_lit.session_state:
     str_lit.session_state.zip_name = ""
 if "clean_valid_count" not in str_lit.session_state:
     str_lit.session_state.clean_valid_count = 0
+if "run_valid_count" not in str_lit.session_state:
+    str_lit.session_state.run_valid_count = 0
 if "checked_emails_set" not in str_lit.session_state:
     str_lit.session_state.checked_emails_set = set()
 if "last_checked_index" not in str_lit.session_state:
@@ -1152,8 +1154,9 @@ with input_tab2:
 
 clean_lines = []
 disp, typo, resume, app_skip, custom_skipped, dns_skipped = [], [], [], [], [], []
+skip_previous = str_lit.checkbox("Skip previously valid", value=False, help="Off by default. On: lines already in old valid files are not checked again.")
 if raw_text:
-    previous_valid = load_previous_valid()
+    previous_valid = load_previous_valid() if skip_previous else set()
     clean_lines, disp, typo, resume, app_skip, custom_skipped, dns_skipped = process_accounts(raw_text, previous_valid)
     
     unfinished_count = len(list_unfinished_runs())
@@ -1875,7 +1878,8 @@ if start_engine_btn:
             # Preserve existing valid results so resuming an unfinished run accumulates rather than resets
             existing_valid = load_persistent_valid_results()
             str_lit.session_state.valid_results = existing_valid
-            str_lit.session_state.clean_valid_count = len(existing_valid)
+            str_lit.session_state.run_valid_count = 0
+            str_lit.session_state.clean_valid_count = 0
             str_lit.session_state.wrong_results = []
             str_lit.session_state.need_app_results = []
             str_lit.session_state.conn_results = []
@@ -1962,7 +1966,8 @@ if start_engine_btn:
                                 if st_val == "valid":
                                     if res["line"] not in str_lit.session_state.valid_results:
                                         str_lit.session_state.valid_results.append(res["line"])
-                                    str_lit.session_state.clean_valid_count = len(str_lit.session_state.valid_results)
+                                        str_lit.session_state.run_valid_count += 1
+                                    str_lit.session_state.clean_valid_count = str_lit.session_state.run_valid_count
                                 elif st_val == "wrong_password":
                                     str_lit.session_state.wrong_results.append(res["line"])
                                 elif st_val == "need_app_password":
@@ -1984,13 +1989,7 @@ if start_engine_btn:
                                     "Under-The-Hood Background Trace": f"Result: {res.get('detail', '')}\nSteps Executed:\n  ↳ {trace_text}"
                                 })
 
-                                done = set(str_lit.session_state.checked_emails_set)
-                                left = []
-                                for raw in all_target_accounts:
-                                    em = raw.split(":", 1)[0].strip().lower() if ":" in raw else raw
-                                    if em not in done:
-                                        left.append(raw)
-                                save_unfinished("stopped or connection cut before finish", left, checked_count, total_accs)
+                                pending_unfinished = checked_count
 
                                 # Immediately update clean_valid_accounts.txt on disk so unfinished runs retain valid accounts instantly
                                 try:
@@ -2036,6 +2035,15 @@ if start_engine_btn:
                             current_logs = list(str_lit.session_state.log_lines)
                         log_container.code("\n".join(current_logs), language="text")
                     
+                    if checked_count % 25 == 0 or checked_count == total_accs:
+                        with session_state_lock:
+                            done = set(str_lit.session_state.checked_emails_set)
+                        left = []
+                        for raw in all_target_accounts:
+                            em = raw.split(":", 1)[0].strip().lower() if ":" in raw else raw
+                            if em not in done:
+                                left.append(raw)
+                        save_unfinished("stopped or connection cut before finish", left, checked_count, total_accs)
                     if total_accs > 0:
                         pct = min(1.0, checked_count / total_accs)
                         progress_bar.progress(pct, text=f"Checking accounts [{engine_action_mode}]: {checked_count}/{total_accs} completed ({int(pct*100)}%)")
@@ -2148,7 +2156,7 @@ if str_lit.session_state.engine_has_run:
     str_lit.markdown("---")
     with session_state_lock:
         status_label = "🎉 Check Complete!" if str_lit.session_state.run_completion_status == "Successful" else "⚠️ Unfinished"
-        clean_count_val = str_lit.session_state.clean_valid_count
+        clean_count_val = str_lit.session_state.get("run_valid_count", str_lit.session_state.clean_valid_count)
         wrong_len_val = len(str_lit.session_state.wrong_results)
         need_len_val = len(str_lit.session_state.need_app_results)
         conn_len_val = len(str_lit.session_state.conn_results)
