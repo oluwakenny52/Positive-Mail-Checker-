@@ -1178,7 +1178,7 @@ if raw_text:
     col_m2.metric("Resume Unfinished", unfinished_count)
     col_m3.metric("Disposables", len(disp))
     col_m4.metric("Typos", len(typo))
-    col_m5.metric("Resume Skipped", len(resume))
+    col_m5.metric("Skip previously valid", len(resume))
     col_m6.metric("App-Skipped", len(app_skip))
     col_m7.metric("Custom Filtered", len(custom_skipped))
     col_m8.metric("DNS Failed", len(dns_skipped))
@@ -1192,7 +1192,7 @@ if raw_text:
             "Resume Unfinished",
             "Disposables",
             "Typos",
-            "Resume Skipped",
+            "Skip previously valid",
             "App-Skipped",
             "Custom Filtered",
             "DNS Failed"
@@ -1208,7 +1208,7 @@ if raw_text:
         "Resume Unfinished": unfinished_preview,
         "Disposables": disp,
         "Typos": typo,
-        "Resume Skipped": resume,
+        "Skip previously valid": resume,
         "App-Skipped": app_skip,
         "Custom Filtered": custom_skipped,
         "DNS Failed": dns_skipped
@@ -1828,7 +1828,7 @@ with col_action2:
             "Resume Unfinished",
             "Disposables",
             "Typos",
-            "Resume Skipped",
+            "Skip previously valid",
             "App-Skipped",
             "Custom Filtered",
             "DNS Failed"
@@ -1859,7 +1859,7 @@ if start_engine_btn:
         "Resume Unfinished": resume_lines,
         "Disposables": disp,
         "Typos": typo,
-        "Resume Skipped": resume,
+        "Skip previously valid": resume,
         "App-Skipped": app_skip,
         "Custom Filtered": custom_skipped,
         "DNS Failed": dns_skipped
@@ -2168,6 +2168,18 @@ if str_lit.session_state.engine_has_run:
 
     str_lit.markdown(f"### 📊 Live Results Summary & ZIP Archive — **{status_label}**")
     
+    if str_lit.session_state.run_completion_status == "Unfinished":
+        unfinished_list = list_unfinished_runs()
+        reason_text = "Unknown / Stopped manually or connection cut"
+        if unfinished_list:
+            reason_text = unfinished_list[0].get("reason", reason_text)
+            saved_time = unfinished_list[0].get("saved_at", "")
+            checked_prog = unfinished_list[0].get("checked", 0)
+            total_prog = unfinished_list[0].get("total", 0)
+            str_lit.warning(f"⚠ **Engine Stopped Unfinished:** Reason: *{reason_text}* | Progress at stop: {checked_prog}/{total_prog} | Saved at: {saved_time}")
+        else:
+            str_lit.warning(f"⚠ **Engine Stopped Unfinished:** Reason: *{reason_text}*")
+
     if start_ts_copy and end_ts_copy:
         str_lit.info(f"⏱ **Checking Session Timestamps:** Started at **{start_ts_copy}** | Ended at **{end_ts_copy}** | Total Duration: **{duration_copy}**")
     
