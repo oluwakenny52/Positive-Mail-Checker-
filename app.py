@@ -1,5 +1,4 @@
 import streamlit as str_lit
-import asyncio
 import imaplib
 import poplib
 import ssl
@@ -601,7 +600,7 @@ if "applied_cfg" not in str_lit.session_state:
     str_lit.session_state.applied_cfg = {
         "MODE_NAME": engine_config.mode_name,
         "MAX_WORKERS_START": workers,
-        "MAX_WORKERS_MAX": max(workers * 2, 25),
+        "MAX_WORKERS_MAX": max(workers * 2, engine_config.max_concurrent_checks),
         "TIMEOUT": timeout,
         "ACCOUNT_DEADLINE": deadline,
         "MAX_ACCOUNTS": max_acc,
@@ -634,7 +633,7 @@ if str_lit.sidebar.button("💾 Apply Settings", type="primary"):
     str_lit.session_state.applied_cfg = {
         "MODE_NAME": engine_config.mode_name,
         "MAX_WORKERS_START": workers,
-        "MAX_WORKERS_MAX": max(workers * 2, 25),
+        "MAX_WORKERS_MAX": max(workers * 2, engine_config.max_concurrent_checks),
         "TIMEOUT": timeout,
         "ACCOUNT_DEADLINE": deadline,
         "MAX_ACCOUNTS": max_acc,
@@ -738,7 +737,7 @@ def get_filtered_active_proxies():
         return load_proxies()
 
 all_proxies = load_proxies()
-filtered_pool = get_filtered_active_proxies()
+filtered_pool = []
 
 # --- 🖥️ Startup & Under-The-Hood Display Panel ---
 str_lit.markdown("---")
@@ -1365,10 +1364,9 @@ def refresh_alive_pool():
             circuit_breaker_until.pop(k, None)
 
 def start_alive_refresher():
-    global pool_refresher_on
-    if pool_refresher_on:
-        return
-    pool_refresher_on = True
+    for thr in threading.enumerate():
+        if thr.name == "alive-pool":
+            return
     def loop():
         while True:
             try:
@@ -1376,7 +1374,7 @@ def start_alive_refresher():
             except Exception:
                 pass
             time.sleep(15)
-    threading.Thread(target=loop, daemon=True).start()
+    threading.Thread(target=loop, daemon=True, name="alive-pool").start()
 
 def sample_alive_proxy():
     with alive_pool_lock:
@@ -1833,6 +1831,7 @@ with col_action2:
 active_proxy_pool = get_filtered_active_proxies()
 
 if start_engine_btn:
+    filtered_pool[:] = get_filtered_active_proxies()
     start_alive_refresher()
     refresh_alive_pool()
     log_startup(f"Live checking engine execution triggered in [{CFG['MODE_NAME']}] mode on category: [{engine_action_mode}].")
