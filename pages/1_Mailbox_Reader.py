@@ -153,7 +153,11 @@ def save_session_cache():
             serialized_list = []
             for m in st.session_state.get(key_in_state, []):
                 m_copy = m.copy()
-                m_copy.pop("raw", None)
+                raw_bytes = m_copy.get("raw")
+                if isinstance(raw_bytes, bytes):
+                    m_copy["raw"] = base64.b64encode(raw_bytes).decode("ascii")
+                else:
+                    m_copy["raw"] = ""
                 serialized_list.append(m_copy)
             cache_data[k_name] = serialized_list
 
@@ -172,11 +176,14 @@ def load_session_cache():
                         deserialized = []
                         for m in v:
                             m_copy = m.copy()
-                            if isinstance(m_copy.get("raw"), str):
+                            raw_val = m_copy.get("raw")
+                            if isinstance(raw_val, str) and raw_val:
                                 try:
-                                    m_copy["raw"] = base64.b64decode(m_copy["raw"].encode("ascii"))
+                                    m_copy["raw"] = base64.b64decode(raw_val.encode("ascii"))
                                 except Exception:
                                     m_copy["raw"] = b""
+                            else:
+                                m_copy["raw"] = b""
                             deserialized.append(m_copy)
                         st.session_state[k] = deserialized
                     else:
@@ -1644,7 +1651,7 @@ if len(active_msgs) > 0:
 
                 with op_col4:
                     with st.popover("View Raw RFC822"):
-                        st.code(msg["raw"].decode("utf-8", errors="ignore"))
+                        st.code(msg.get("raw", b"").decode("utf-8", errors="ignore"))
 
         st.markdown("---")
         p_col1, p_col2, p_col3 = st.columns([1, 2, 1])
@@ -1848,7 +1855,7 @@ with st.expander("🔑 Standalone OTP, Debit/Credit Cards & Sensitive Data Scann
 
                 with o_col4:
                     with st.popover("View Raw RFC822"):
-                        st.code(msg["raw"].decode("utf-8", errors="ignore"))
+                        st.code(msg.get("raw", b"").decode("utf-8", errors="ignore"))
 
         st.markdown("---")
         op_c1, op_c2, op_c3 = st.columns([1, 2, 1])
@@ -2034,7 +2041,7 @@ with st.expander("🔍 Deep Keyword Search & Scope Filters", expanded=False):
 
                 with s_op4:
                     with st.popover("View Raw RFC822"):
-                        st.code(msg["raw"].decode("utf-8", errors="ignore"))
+                        st.code(msg.get("raw", b"").decode("utf-8", errors="ignore"))
 
         st.markdown("---")
         sp_col1, sp_col2, sp_col3 = st.columns([1, 2, 1])
