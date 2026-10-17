@@ -737,7 +737,7 @@ def get_filtered_active_proxies():
         return load_proxies()
 
 all_proxies = load_proxies()
-filtered_pool = []
+filtered_pool = get_filtered_active_proxies()
 
 # --- 🖥️ Startup & Under-The-Hood Display Panel ---
 str_lit.markdown("---")
@@ -870,7 +870,7 @@ with str_lit.sidebar:
                     "Fails": meta.get("fails", 0),
                     "Successes": meta.get("success", 0)
                 })
-            str_lit.dataframe(pd.DataFrame(proxy_data_list), width='stretch')
+            str_lit.dataframe(pd.DataFrame(proxy_data_list), use_container_width=True)
             
             col_ref1, col_ref2 = str_lit.columns(2)
             with col_ref1:
@@ -1252,7 +1252,6 @@ def detect_parent_provider(domain):
 
 def generate_candidate_hosts(domain: str, mx_records: list = None) -> list:
     candidates = []
-    # Place mail and imap explicitly at the very top of the priority list
     priority_prefixes = ['imap', 'mail', 'pop']
     for prefix in priority_prefixes:
         candidates.append(f"{prefix}.{domain}")
@@ -1859,7 +1858,6 @@ if start_engine_btn:
         active_proxy_pool = get_filtered_active_proxies()
         
         with session_state_lock:
-            # Preserve existing valid results so resuming an unfinished run accumulates rather than resets
             existing_valid = load_persistent_valid_results()
             str_lit.session_state.valid_results = existing_valid
             str_lit.session_state.run_valid_count = 0
@@ -1996,7 +1994,7 @@ if start_engine_btn:
                                     r_col4.metric("⚠ Failed", conn_len)
 
                                 df_report = pd.DataFrame(current_reports[::-1])
-                                report_log_container.dataframe(df_report, width='stretch', height=300)
+                                report_log_container.dataframe(df_report, use_container_width=True, height=300)
                             
                     except Exception as ex:
                         err_msg = f"[EXCEPTION] {str(ex)}"
@@ -2179,7 +2177,7 @@ if str_lit.session_state.engine_has_run:
     with exec_tab2_p:
         if report_entries_copy:
             df_report_persisted = pd.DataFrame(report_entries_copy[::-1])
-            str_lit.dataframe(df_report_persisted, width='stretch', height=300)
+            str_lit.dataframe(df_report_persisted, use_container_width=True, height=300)
         else:
             str_lit.info("No report logs available.")
 
