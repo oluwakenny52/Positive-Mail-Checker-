@@ -2024,7 +2024,7 @@ if start_engine_btn:
                             if em not in done:
                                 left.append(raw)
                         if left:
-                            save_unfinished("Running checkpoint sync (Normal)", left, checked_count, total_accs)
+                            save_unfinished("In Progress (Running)", left, checked_count, total_accs)
                         try:
                             os.makedirs(CFG["RESULTS_DIR"], exist_ok=True)
                             with file_write_lock:
@@ -2057,15 +2057,15 @@ if start_engine_btn:
         except (socket.timeout, ConnectionError, ssl.SSLError) as net_err:
             detected_stop_reason = f"Network Connection Failure: Poor signal or connection dropped ({net_err})"
             str_lit.error(f"⚠ Engine Stopped: Network Connection Failure ({net_err})")
-        except SystemExit:
-            detected_stop_reason = "User Interruption: Script rerun or manual termination triggered"
-        except Exception as ex:
-            ex_str = str(ex).lower()
-            if any(k in ex_str for k in ["rerun", "stop", "scriptrunner", "websocket", "closed", "connection lost"]):
-                detected_stop_reason = "User Interruption: User clicked button, moved slider, or closed/reloaded page"
+        except BaseException as be:
+            if isinstance(be, (SystemExit, KeyboardInterrupt)):
+                detected_stop_reason = "System Shutdown / Interruption"
+                raise be
+            be_str = str(be).lower()
+            if any(k in be_str for k in ["rerun", "stop", "scriptrunner", "websocket", "closed", "connection lost"]) or type(be).__name__ in ["RerunException", "StopException", "ScriptStopped"]:
+                detected_stop_reason = "User Interruption: User clicked button, moved slider, or interacted with UI widgets"
             else:
-                detected_stop_reason = f"Unexpected Error: {ex}"
-                str_lit.error(f"⚠ Engine Stopped due to unexpected error: {ex}")
+                detected_stop_reason = f"Unexpected Error / Interruption: {be}"
         finally:
             if checked_count < total_accs:
                 with session_state_lock:
