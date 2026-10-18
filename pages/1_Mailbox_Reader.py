@@ -1031,7 +1031,7 @@ st.title(("""
             Multi-Field Search, Telegram/Blacklist Filter, Deep Diagnostic Instrumentation
         </p>
     </div>
-""", unsafe_allow_html=True)"📥 Bobito Mailbox Reader & Portal Hub")
+""")"📥 Bobito Mailbox Reader & Portal Hub")
 st.caption("Advanced IMAP Client with Interactive Bot Intelligence, Dedicated OTP, Debit/Credit Card & Credentials Scanner, Multi-Field Search, Telegram/Blacklist Filter, and Deep Diagnostic Instrumentation.")
 
 valid = load_valid()
