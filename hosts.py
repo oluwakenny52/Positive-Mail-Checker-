@@ -1,4 +1,6 @@
-"""One host table. Primary first, backup second."""
+"""One host table. Primary first, backup second, with MX resolution and universal fallbacks."""
+
+import socket
 
 YAHOO_IMAP = ["imap.mail.yahoo.com"]
 YAHOO_POP = ["pop.mail.yahoo.com"]
@@ -92,6 +94,20 @@ DISPOSABLE_PARTS = (
     "rerttymail", "discard.email", "maildrop", "getnada", "moakt",
 )
 
+UNIVERSAL_IMAP_FALLBACKS = [
+    "imap.gmail.com",
+    "outlook.office365.com",
+    "imap.mail.yahoo.com",
+    "imap.aol.com"
+]
+
+UNIVERSAL_POP_FALLBACKS = [
+    "pop.gmail.com",
+    "outlook.office365.com",
+    "pop.mail.yahoo.com",
+    "pop.aol.com"
+]
+
 
 def domain_of(email_addr):
     return (email_addr or "").split("@")[-1].lower().strip()
@@ -99,6 +115,29 @@ def domain_of(email_addr):
 
 def _pair(imap_hosts, pop_hosts):
     return {"imap": imap_hosts, "pop": pop_hosts, "pop3": pop_hosts}
+
+
+def get_mx_host(domain):
+    """Extract primary mail exchange host from DNS MX records if available."""
+    try:
+        import dns.resolver
+        answers = dns.resolver.resolve(domain, 'MX')
+        mx_records = sorted(answers, key=lambda x: x.preference)
+        if mx_records:
+            exchange = str(mx_records[0].exchange).rstrip('.')
+            ex_lower = exchange.lower()
+            if "google" in ex_lower or "gsuite" in ex_lower:
+                return "imap.gmail.com"
+            elif "outlook" in ex_lower or "protection.outlook.com" in ex_lower or "microsoft" in ex_lower:
+                return "outlook.office365.com"
+            elif "yahoo" in ex_lower or "yahoodns" in ex_lower:
+                return "imap.mail.yahoo.com"
+            elif "aol" in ex_lower:
+                return "imap.aol.com"
+            return exchange
+    except Exception:
+        pass
+    return None
 
 
 def conf(domain):
@@ -126,16 +165,35 @@ def conf(domain):
 
 
 def provider_hosts(email_addr):
-    got = conf(domain_of(email_addr))
+    domain = domain_of(email_addr)
+    got = conf(domain)
     if got:
         return got["imap"], got["pop"]
-    domain = domain_of(email_addr)
-    return [f"mail.{domain}", f"imap.{domain}"], [f"mail.{domain}", f"pop.{domain}"]
+    
+    mx_host = get_mx_host(domain)
+    imap_candidates = []
+    pop_candidates = []
+    
+    if mx_host and mx_host not in imap_candidates:
+        imap_candidates.append(mx_host)
+        pop_candidates.append(mx_host)
+        
+    imap_candidates.extend([f"mail.{domain}", f"imap.{domain}", f"secure.{domain}"])
+    pop_candidates.extend([f"mail.{domain}", f"pop.{domain}"])
+    
+    for fb in UNIVERSAL_IMAP_FALLBACKS:
+        if fb not in imap_candidates:
+            imap_candidates.append(fb)
+    for fb in UNIVERSAL_POP_FALLBACKS:
+        if fb not in pop_candidates:
+            pop_candidates.append(fb)
+            
+    return imap_candidates, pop_candidates
 
 
 def host_list(email_addr):
     imap_hosts, _ = provider_hosts(email_addr)
-    return imap_hosts[:3]
+    return imap_hosts[:6]
 
 
 def is_disposable(email_addr):
