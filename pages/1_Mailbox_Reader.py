@@ -65,7 +65,7 @@ def load_app_proxies() -> List[dict]:
         {"proxy": "dc.oxylabs.info:8000", "country": "Canada", "region": "Ontario", "latency": 1514}
     ]
 
-# Helper function to get valid host list matching app.py logic exactly
+# Helper function to get valid host list matching app.py logic exactly (Patched to avoid 407 proxy auth errors)
 def get_verified_hosts_for_email(email_addr: str, custom_override: str = "", auto_fallback: bool = True) -> List[str]:
     domain_lower = email_addr.split("@")[-1].lower() if "@" in email_addr else ""
     if custom_override.strip():
@@ -73,14 +73,16 @@ def get_verified_hosts_for_email(email_addr: str, custom_override: str = "", aut
     
     hosts = host_list(email_addr)
     if auto_fallback:
-        if "charter" in domain_lower:
-            hosts = ["mobile.charter.net", "imap.charter.net"] + [h for h in hosts if h not in ["mobile.charter.net", "imap.charter.net"]]
+        if "charter" in domain_lower or "rr.com" in domain_lower:
+            hosts = ["mobile.charter.net"] + [h for h in hosts if h not in ["mobile.charter.net", "imap.charter.net", "mail.twc.com"]]
         elif "spectrum" in domain_lower:
-            hosts = ["imap.spectrum.net", "mail.spectrum.net"] + [h for h in hosts if h not in ["imap.spectrum.net", "mail.spectrum.net"]]
-        elif "twc" in domain_lower:
-            # Prevent invalid/unauthorized fallback patterns if unwanted, or ensure strict matching
-            hosts = [h for h in hosts if "mail.twc.com" not in h] # Skips bad pattern if configured
-    return hosts
+            hosts = ["imap.spectrum.net"] + [h for h in hosts if h not in ["imap.spectrum.net", "mail.spectrum.net", "mail.twc.com"]]
+        elif "twc" in domain_lower or "brighthouse" in domain_lower:
+            hosts = ["mobile.charter.net"] + [h for h in hosts if h not in ["mail.twc.com", "imap.charter.net"]]
+    
+    # Final filter to completely strip out decommissioned or unauthorized endpoints
+    cleaned_hosts = [h for h in hosts if h not in ["mail.twc.com", "imap.charter.net"]]
+    return cleaned_hosts if cleaned_hosts else ["mobile.charter.net"]
 
 # Page Configuration & Keep-Alive Injector
 st.set_page_config(
