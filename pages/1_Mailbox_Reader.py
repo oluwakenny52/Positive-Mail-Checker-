@@ -65,7 +65,7 @@ def load_app_proxies() -> List[dict]:
         {"proxy": "dc.oxylabs.info:8000", "country": "Canada", "region": "Ontario", "latency": 1514}
     ]
 
-# Helper function to get valid host list matching main app working logic exactly (Patched to force mobile.charter.net first and avoid 407 proxy errors)
+# Helper function to get valid host list matching main app working logic exactly
 def get_verified_hosts_for_email(email_addr: str, custom_override: str = "", auto_fallback: bool = True) -> List[str]:
     domain_lower = email_addr.split("@")[-1].lower() if "@" in email_addr else ""
     if custom_override.strip():
@@ -74,10 +74,8 @@ def get_verified_hosts_for_email(email_addr: str, custom_override: str = "", aut
     hosts = host_list(email_addr)
     if auto_fallback:
         if any(d in domain_lower for d in ["charter", "spectrum", "rr.com", "twc", "brighthouse", "cfl.rr.com", "tampabay.rr.com", "nyc.rr.com", "nycap.rr.com", "rochester.rr.com", "socal.rr.com", "ca.rr.com", "tx.rr.com", "satx.rr.com", "austin.rr.com", "oh.rr.com", "cinci.rr.com", "columbus.rr.com", "carolina.rr.com", "nc.rr.com", "sc.rr.com", "wi.rr.com", "mi.rr.com", "indy.rr.com", "kc.rr.com", "hawaii.rr.com"]):
-            # Force mobile.charter.net first as proven by main app log successes, excluding broken/unauthorized proxies
             hosts = ["mobile.charter.net"] + [h for h in hosts if h not in ["mobile.charter.net", "imap.charter.net", "imap.spectrum.net", "mail.spectrum.net", "mail.twc.com"]]
     
-    # Final filter to completely strip out decommissioned or proxy-unauthorized endpoints
     cleaned_hosts = [h for h in hosts if h not in ["mail.twc.com", "imap.charter.net", "imap.spectrum.net"]]
     return cleaned_hosts if cleaned_hosts else ["mobile.charter.net"]
 
@@ -290,75 +288,90 @@ def otp_log(msg):
 
 def open_imap(host, port, timeout, proxy_str=None):
     import ssl as _ssl
-    if not proxy_str or proxy_str == "direct":
+    # Patched: if proxy requires authentication that fails or 407 occurs, fallback gracefully to direct connection or handle auth correctly
+    if not proxy_str or proxy_str == "direct" or proxy_str.lower() == "none":
         return imaplib.IMAP4_SSL(host, port, timeout=timeout)
+    
     try:
         import socks
     except ImportError:
         return imaplib.IMAP4_SSL(host, port, timeout=timeout)
+        
     raw = None
     user, pw, ph, pp = None, None, "", str(port)
-    if "@" in proxy_str:
-        auth, hp = proxy_str.rsplit("@", 1)
-        if ":" in auth:
-            user, pw = auth.split(":", 1)
-        else:
-            user = auth
-        if ":" in hp:
-            ph, pp = hp.rsplit(":", 1)
-        else:
-            ph = hp
-    else:
-        parts = [p.strip() for p in proxy_str.replace(",", ":").split(":") if p.strip()]
-        if len(parts) >= 4:
-            if parts[0].isdigit() or (len(parts[1]) > 0 and parts[1].isdigit() and not parts[0].isdigit()):
-                ph = parts[0]
-                pp = parts[1]
-                user = parts[2]
-                pw = parts[3]
+    
+    try:
+        if "@" in proxy_str:
+            auth, hp = proxy_str.rsplit("@", 1)
+            if ":" in auth:
+                user, pw = auth.split(":", 1)
             else:
-                user = parts[0]
-                pw = parts[1]
-                ph = parts[2]
-                pp = parts[3]
-        elif len(parts) == 3:
-            if parts[1].isdigit():
-                ph = parts[0]
-                pp = parts[1]
-                pw = parts[2]
+                user = auth
+            if ":" in hp:
+                ph, pp = hp.rsplit(":", 1)
             else:
-                user = parts[0]
-                ph = parts[1]
-                pp = parts[2]
-        elif len(parts) == 2:
-            ph, pp = parts
+                ph = hp
         else:
-            ph = proxy_str
+            parts = [p.strip() for p in proxy_str.replace(",", ":").split(":") if p.strip()]
+            if len(parts) >= 4:
+                if parts[0].isdigit() or (len(parts[1]) > 0 and parts[1].isdigit() and not parts[0].isdigit()):
+                    ph = parts[0]
+                    pp = parts[1]
+                    user = parts[2]
+                    pw = parts[3]
+                else:
+                    user = parts[0]
+                    pw = parts[1]
+                    ph = parts[2]
+                    pp = parts[3]
+            elif len(parts) == 3:
+                if parts[1].isdigit():
+                    ph = parts[0]
+                    pp = parts[1]
+                    pw = parts[2]
+                else:
+                    user = parts[0]
+                    ph = parts[1]
+                    pp = parts[2]
+            elif len(parts) == 2:
+                ph, pp = parts
+            else:
+                ph = proxy_str
 
-    last = None
-    for ptype in (socks.SOCKS5, socks.HTTP):
-        try:
-            kw = {"proxy_type": ptype, "proxy_addr": ph, "proxy_port": int(pp)}
-            if user:
-                kw["proxy_username"] = user
-                kw["proxy_password"] = pw
-            raw = socks.create_connection((host, int(port)), timeout=timeout, **kw)
-            ctx = _ssl.create_default_context()
-            ssock = ctx.wrap_socket(raw, server_hostname=host)
-            mail = imaplib.IMAP4_SSL(host)
-            mail.sock = ssock
-            mail.file = ssock.makefile("rb")
-            mail.welcome = mail._getresp()
-            return mail
-        except Exception as e:
-            last = e
-            if raw:
-                try: 
-                    raw.close()
-                except Exception: 
-                    pass
-                raw = None
-    raise last or RuntimeError("proxy imap failed")
+        last = None
+        # Try proxy first; if 407 proxy auth required or proxy fails, fallback to direct connection automatically
+        for ptype in (socks.SOCKS5, socks.HTTP):
+            try:
+                kw = {"proxy_type": ptype, "proxy_addr": ph, "proxy_port": int(pp)}
+                if user and pw:
+                    kw["proxy_username"] = user
+                    kw["proxy_password"] = pw
+                raw = socks.create_connection((host, int(port)), timeout=timeout, **kw)
+                ctx = _ssl.create_default_context()
+                ssock = ctx.wrap_socket(raw, server_hostname=host)
+                mail = imaplib.IMAP4_SSL(host)
+                mail.sock = ssock
+                mail.file = ssock.makefile("rb")
+                mail.welcome = mail._getresp()
+                return mail
+            except Exception as e:
+                last = e
+                if raw:
+                    try: 
+                        raw.close()
+                    except Exception: 
+                        pass
+                    raw = None
+        
+        # If proxy connection / auth failed with 407 or similar, fallback directly without proxy
+        if last and ("407" in str(last) or "proxy" in str(last).lower()):
+            return imaplib.IMAP4_SSL(host, port, timeout=timeout)
+        raise last or RuntimeError("proxy imap failed")
+    except Exception as proxy_ex:
+        # Ultimate fallback to direct connection if proxy parsing or connection throws 407
+        if "407" in str(proxy_ex) or "proxy" in str(proxy_ex).lower():
+            return imaplib.IMAP4_SSL(host, port, timeout=timeout)
+        raise proxy_ex
 
 def load_valid():
     """Optimized instant loader: Scans only valid text result files, bypassing heavy log scanning."""
