@@ -41,12 +41,12 @@ CHARTER = {
     "oh.rr.com", "cinci.rr.com", "columbus.rr.com", "carolina.rr.com", "nc.rr.com",
     "sc.rr.com", "wi.rr.com", "mi.rr.com", "indy.rr.com", "kc.rr.com", "hawaii.rr.com",
 }
-CHARTER_IMAP = ["mobile.charter.net", "imap.spectrum.net", "mail.twc.com"]
-CHARTER_POP = ["mobile.charter.net", "mail.twc.com"]
+CHARTER_IMAP = ["mobile.charter.net", "imap.spectrum.net"]
+CHARTER_POP = ["mobile.charter.net"]
 
 TWC = {"twc.com", "brighthouse.com", "adelphia.net"}
-TWC_IMAP = ["mail.twc.com", "mobile.charter.net"]
-TWC_POP = ["mail.twc.com", "mobile.charter.net"]
+TWC_IMAP = ["mobile.charter.net"]
+TWC_POP = ["mobile.charter.net"]
 
 VERIZON = {"verizon.net"}
 VERIZON_IMAP = ["imap.aol.com", "imap.verizon.net"]
