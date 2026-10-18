@@ -288,7 +288,7 @@ def otp_log(msg):
 
 def open_imap(host, port, timeout, proxy_str=None):
     import ssl as _ssl
-    # Patched: if proxy requires authentication that fails or 407 occurs, fallback gracefully to direct connection or handle auth correctly
+    # Patched: Robust handling for Connection reset by peer (Errno 104) and proxy auth/routing failures -> fallback to direct connection
     if not proxy_str or proxy_str == "direct" or proxy_str.lower() == "none":
         return imaplib.IMAP4_SSL(host, port, timeout=timeout)
     
@@ -339,7 +339,6 @@ def open_imap(host, port, timeout, proxy_str=None):
                 ph = proxy_str
 
         last = None
-        # Try proxy first; if 407 proxy auth required or proxy fails, fallback to direct connection automatically
         for ptype in (socks.SOCKS5, socks.HTTP):
             try:
                 kw = {"proxy_type": ptype, "proxy_addr": ph, "proxy_port": int(pp)}
@@ -363,13 +362,14 @@ def open_imap(host, port, timeout, proxy_str=None):
                         pass
                     raw = None
         
-        # If proxy connection / auth failed with 407 or similar, fallback directly without proxy
-        if last and ("407" in str(last) or "proxy" in str(last).lower()):
+        # Automatic Fallback on 407, Connection Reset (Errno 104), or general proxy errors
+        err_str = str(last).lower()
+        if last and ("407" in err_str or "104" in err_str or "reset" in err_str or "proxy" in err_str or "timed out" in err_str):
             return imaplib.IMAP4_SSL(host, port, timeout=timeout)
         raise last or RuntimeError("proxy imap failed")
     except Exception as proxy_ex:
-        # Ultimate fallback to direct connection if proxy parsing or connection throws 407
-        if "407" in str(proxy_ex) or "proxy" in str(proxy_ex).lower():
+        err_str = str(proxy_ex).lower()
+        if "407" in err_str or "104" in err_str or "reset" in err_str or "proxy" in err_str or "timed out" in err_str:
             return imaplib.IMAP4_SSL(host, port, timeout=timeout)
         raise proxy_ex
 
