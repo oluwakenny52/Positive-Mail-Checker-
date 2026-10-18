@@ -10,6 +10,7 @@ import socket
 import zipfile
 import io
 import json
+import ssl as _ssl
 from datetime import datetime
 from typing import List, Tuple
 from email.header import decode_header
@@ -287,15 +288,24 @@ def otp_log(msg):
 
 
 def open_imap(host, port, timeout, proxy_str=None):
-    import ssl as _ssl
-    # Patched: Robust handling for Connection reset by peer (Errno 104) and proxy auth/routing failures -> fallback to direct connection
+    """Fortified connection handler with direct SSL context wrapping and automatic fallback."""
+    def _direct_connect():
+        raw_sock = socket.create_connection((host, int(port)), timeout=timeout)
+        ctx = _ssl.create_default_context()
+        ssock = ctx.wrap_socket(raw_sock, server_hostname=host)
+        mail = imaplib.IMAP4_SSL(host)
+        mail.sock = ssock
+        mail.file = ssock.makefile("rb")
+        mail.welcome = mail._getresp()
+        return mail
+
     if not proxy_str or proxy_str == "direct" or proxy_str.lower() == "none":
-        return imaplib.IMAP4_SSL(host, port, timeout=timeout)
+        return _direct_connect()
     
     try:
         import socks
     except ImportError:
-        return imaplib.IMAP4_SSL(host, port, timeout=timeout)
+        return _direct_connect()
         
     raw = None
     user, pw, ph, pp = None, None, "", str(port)
@@ -362,16 +372,16 @@ def open_imap(host, port, timeout, proxy_str=None):
                         pass
                     raw = None
         
-        # Automatic Fallback on 407, Connection Reset (Errno 104), or general proxy errors
         err_str = str(last).lower()
         if last and ("407" in err_str or "104" in err_str or "reset" in err_str or "proxy" in err_str or "timed out" in err_str):
-            return imaplib.IMAP4_SSL(host, port, timeout=timeout)
+            return _direct_connect()
         raise last or RuntimeError("proxy imap failed")
     except Exception as proxy_ex:
         err_str = str(proxy_ex).lower()
         if "407" in err_str or "104" in err_str or "reset" in err_str or "proxy" in err_str or "timed out" in err_str:
-            return imaplib.IMAP4_SSL(host, port, timeout=timeout)
+            return _direct_connect()
         raise proxy_ex
+
 
 def load_valid():
     """Optimized instant loader: Scans only valid text result files, bypassing heavy log scanning."""
