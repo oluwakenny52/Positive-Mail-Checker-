@@ -1024,7 +1024,7 @@ def fetch_messages_paginated(mail, email_addr, password_val, host_val, target_fo
 
 # Header
 st.title(""<div style="background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); padding: 30px; border-radius: 10px; margin-bottom: 20px;">
-        <h1 style="color: white; margin: 0;">🚀📥 Bobito Mailbox Reader & Portal Hub Advanced IMAP Client</h1>
+        <h1 style="color: white; margin: 0;">📥 Bobito Mailbox Reader & Portal Hub Advanced IMAP Client</h1>
         <p style="color: rgba(255,255,255,0.9); margin: 10px 0 0 0;">
             Interactive Bot Intelligence, Dedicated OTP/Debit Card & Credentials Scanner, 
             Multi-Field Search, Telegram/Blacklist Filter, Deep Diagnostic Instrumentation.
