@@ -319,7 +319,6 @@ str_lit.sidebar.markdown("### 🌐 Proxy / Pool Configuration")
 min_proxy_score = str_lit.sidebar.slider("Min Proxy Score", min_value=0, max_value=100, value=40, step=10)
 proxy_precheck_timeout = str_lit.sidebar.slider("Proxy Pre-Check Timeout (Sec)", min_value=1, max_value=10, value=3, step=1)
 
-# --- New Blacklist IP Toggle ---
 allow_blacklist_ips = str_lit.sidebar.toggle(
     "Allow Blacklisted / Flagged Proxy IPs", 
     value=False, 
@@ -784,7 +783,7 @@ with str_lit.sidebar:
         if str_lit.button("Save Custom Proxies"):
             if custom_proxy_text.strip():
                 try:
-                    new_proxies = [l.strip() for l in custom_proxy_text.splitlines() if l.strip() and not l.startswith("#")]
+                    new_proxies = [l.strip() for l in custom_proxy_text.splitlines() if l.strip() and not l.strip().startswith("#")]
                     existing = load_proxies()
                     combined = list(dict.fromkeys(existing + new_proxies))
                     with file_write_lock:
@@ -923,9 +922,7 @@ COMMON_TYPOS = {
 }
 
 STRICT_APP_PROVIDERS = STRICT_APP
-
 ZERO_ACCESS_PROVIDERS = ZERO_ACCESS
-
 EMAIL_REGEX = re.compile(r"^[\w\.-]+@[\w\.-]+\.\w+$")
 
 DISPOSABLE_EXTRA = {
@@ -1233,7 +1230,6 @@ PROVIDER_MAP = {
 }
 
 PUBLIC_PROVIDERS = set(PROVIDER_MAP.keys())
-
 PARENT_PROVIDER_MAPPINGS = PARENT
 
 def get_mx_hosts(domain):
@@ -1265,6 +1261,16 @@ def detect_parent_provider(domain):
 
 def generate_candidate_hosts(domain: str, mx_records: list = None) -> list:
     candidates = []
+    
+    # Inject reliable legacy ISP and custom host fallbacks for Charter, Spectrum, and TWC domains
+    domain_lower = domain.lower()
+    if "charter" in domain_lower:
+        candidates.extend(["mobile.charter.net", "imap.charter.net", "mail.charter.net"])
+    elif "spectrum" in domain_lower:
+        candidates.extend(["imap.spectrum.net", "mail.spectrum.net"])
+    elif "twc" in domain_lower:
+        candidates.extend(["mail.twc.com"])
+
     priority_prefixes = ['imap', 'mail', 'pop']
     for prefix in priority_prefixes:
         candidates.append(f"{prefix}.{domain}")
@@ -1331,7 +1337,7 @@ def get_servers(email):
             return PROVIDER_MAP[domain]
 
         mx_records = get_mx_hosts(domain) if parent_domain not in PARENT_PROVIDER_MAPPINGS else []
-        candidate_hosts = [h for h in generate_candidate_hosts(domain, mx_records) if not h.startswith(("smtp.", "secure.", "pop3."))][:3]
+        candidate_hosts = [h for h in generate_candidate_hosts(domain, mx_records) if not h.startswith(("smtp.", "secure.", "pop3."))][:4]
 
         servers = {
             "imap": candidate_hosts,
@@ -1483,11 +1489,21 @@ def proxy_connect(host, port, proxy_str, timeout=None):
     except Exception as direct_ex:
         raise RuntimeError(f"Proxy and direct fallback connection both failed: {direct_ex}")
 
+# --- Patched Legacy SSL Context & Wrapper ---
+def get_legacy_ssl_context(hostname: str):
+    ctx = ssl.create_default_context()
+    try:
+        ctx.set_ciphers('DEFAULT:@SECLEVEL=1')
+    except Exception:
+        pass
+    if any(dom in hostname.lower() for dom in ["charter", "spectrum", "twc", "aol", "yahoo", "mobile.charter.net", "imap.spectrum.net"]):
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+    return ctx
+
 def ssl_wrap(sock, host, insecure=False):
     if sock is None:
         raise RuntimeError("SSL wrap failed completely: socket is None")
-    
-    ctx = ssl._create_unverified_context() if (insecure or CFG.get("ALLOW_SELF_SIGNED")) else ssl.create_default_context()
     
     try:
         fileno = sock.fileno()
@@ -1496,13 +1512,16 @@ def ssl_wrap(sock, host, insecure=False):
     except Exception as fd_err:
         raise RuntimeError(f"SSL wrap failed completely: [Errno 9] Bad file descriptor ({fd_err})")
 
+    ctx = get_legacy_ssl_context(host) if (insecure or CFG.get("ALLOW_SELF_SIGNED")) else ssl.create_default_context()
     try:
         return ctx.wrap_socket(sock, server_hostname=host)
     except Exception as e:
-        warnings.warn(f"Standard SSL wrap failed, falling back to unverified context: {e}")
+        warnings.warn(f"Standard SSL wrap failed, falling back to legacy/unverified context: {e}")
         try:
-            ctx_unverified = ssl._create_unverified_context()
-            return ctx_unverified.wrap_socket(sock, server_hostname=host)
+            ctx_fallback = get_legacy_ssl_context(host)
+            ctx_fallback.check_hostname = False
+            ctx_fallback.verify_mode = ssl.CERT_NONE
+            return ctx_fallback.wrap_socket(sock, server_hostname=host)
         except Exception as inner_e:
             if sock:
                 try: sock.shutdown(socket.SHUT_RDWR)
@@ -1668,7 +1687,7 @@ def verify_and_connect(target_email, target_pass, hosts, proxy_str=None):
                 mail = imaplib.IMAP4()
                 mail.sock = raw_conn
                 mail.welcome = mail._getresp()
-                mail.starttls(ssl_context=ssl._create_unverified_context())
+                mail.starttls(ssl_context=get_legacy_ssl_context(h))
                 mail.login(target_email.strip(), target_pass.strip())
                 return True, mail, h
             except Exception:
