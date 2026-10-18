@@ -1599,6 +1599,12 @@ def imap_once(email, password, server, proxy_str=None, insecure=True):
         typ, data = mail.login(email.strip(), password.strip())
         if typ != 'OK':
             raise RuntimeError(f"IMAP login returned non-OK status: {typ} {data}")
+        
+        # --- Strict Post-Auth Validation to Prevent Proxy / Captive Portal Spoofing ---
+        select_typ, select_data = mail.select("INBOX", readonly=True)
+        if select_typ != 'OK':
+            raise RuntimeError(f"IMAP post-auth inbox select failed (possible proxy spoofing/captive portal): {select_typ} {select_data}")
+
         try: mail.noop()
         except Exception: pass
         try: mail.logout()
@@ -1638,6 +1644,11 @@ def pop_once(email, password, server, proxy_str=None, insecure=True):
         resp_pass = mail.pass_(password.strip())
         if not resp_pass or not resp_pass.startswith(b"+OK"):
             raise RuntimeError(f"POP3 password rejected: {resp_pass}")
+
+        # --- Strict Post-Auth Validation to Prevent Proxy / Captive Portal Spoofing ---
+        stat_resp = mail.stat()
+        if not stat_resp or not stat_resp[0].startswith(b"+OK"):
+            raise RuntimeError(f"POP3 post-auth stat failed (possible proxy spoofing): {stat_resp}")
 
         try: mail.noop()
         except Exception: pass
@@ -1691,7 +1702,9 @@ def verify_and_connect(target_email, target_pass, hosts, proxy_str=None):
             mail = PIMAPVerify(h, timeout=10)
             typ, data = mail.login(target_email.strip(), target_pass.strip())
             if typ == 'OK':
-                return True, mail, h
+                select_typ, _ = mail.select("INBOX", readonly=True)
+                if select_typ == 'OK':
+                    return True, mail, h
         except (socket.timeout, socket.error, ConnectionRefusedError, ssl.SSLError):
             raw_conn = None
             try:
@@ -1703,7 +1716,9 @@ def verify_and_connect(target_email, target_pass, hosts, proxy_str=None):
                 mail.starttls(ssl_context=get_legacy_ssl_context(h))
                 typ, data = mail.login(target_email.strip(), target_pass.strip())
                 if typ == 'OK':
-                    return True, mail, h
+                    select_typ, _ = mail.select("INBOX", readonly=True)
+                    if select_typ == 'OK':
+                        return True, mail, h
             except Exception:
                 if raw_conn is not None:
                     try: raw_conn.shutdown(socket.SHUT_RDWR)
