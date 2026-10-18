@@ -1262,7 +1262,6 @@ def detect_parent_provider(domain):
 def generate_candidate_hosts(domain: str, mx_records: list = None) -> list:
     candidates = []
     
-    # Inject reliable legacy ISP and custom host fallbacks for Charter, Spectrum, and TWC domains
     domain_lower = domain.lower()
     if "charter" in domain_lower:
         candidates.extend(["mobile.charter.net", "imap.charter.net", "mail.charter.net"])
@@ -1578,7 +1577,7 @@ def imap_once(email, password, server, proxy_str=None, insecure=True):
             try:
                 raw = proxy_connect(host, port, proxy_str, timeout=timeout) if proxy_str else socket.create_connection((host, port), timeout=timeout or CFG["TIMEOUT"])
                 raw.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
-                self.sock = ssl_wrap(raw, host, insecure=True)
+                self.sock = ssl_wrap(raw, host, insecure=insecure)
             except (socket.timeout, socket.error, ConnectionRefusedError, ssl.SSLError) as socket_ex:
                 if raw:
                     try: raw.shutdown(socket.SHUT_RDWR)
@@ -1597,7 +1596,9 @@ def imap_once(email, password, server, proxy_str=None, insecure=True):
     mail = None
     try:
         mail = PIMAP(server, timeout=CFG["TIMEOUT"])
-        mail.login(email.strip(), password.strip())
+        typ, data = mail.login(email.strip(), password.strip())
+        if typ != 'OK':
+            raise RuntimeError(f"IMAP login returned non-OK status: {typ} {data}")
         try: mail.noop()
         except Exception: pass
         try: mail.logout()
@@ -1620,13 +1621,24 @@ def pop_once(email, password, server, proxy_str=None, insecure=True):
     try:
         raw = proxy_connect(server, 995, proxy_str, timeout=CFG["TIMEOUT"]) if proxy_str else socket.create_connection((server, 995), timeout=CFG["TIMEOUT"])
         raw.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
-        ssock = ssl_wrap(raw, server, insecure=True)
+        ssock = ssl_wrap(raw, server, insecure=insecure)
         mail = poplib.POP3(server, timeout=CFG["TIMEOUT"])
         mail.sock = ssock
         mail.file = ssock.makefile("rb")
         mail._debugging = 0
-        mail.user(email.strip())
-        mail.pass_(password.strip())
+        
+        banner = mail.getwelcome()
+        if not banner or (b"+OK" not in banner and "+OK" not in str(banner)):
+            raise RuntimeError(f"POP3 invalid welcome banner: {banner}")
+
+        resp_user = mail.user(email.strip())
+        if not resp_user or not resp_user.startswith(b"+OK"):
+            raise RuntimeError(f"POP3 user rejected: {resp_user}")
+
+        resp_pass = mail.pass_(password.strip())
+        if not resp_pass or not resp_pass.startswith(b"+OK"):
+            raise RuntimeError(f"POP3 password rejected: {resp_pass}")
+
         try: mail.noop()
         except Exception: pass
         try: mail.quit()
@@ -1677,8 +1689,9 @@ def verify_and_connect(target_email, target_pass, hosts, proxy_str=None):
                             except Exception: pass
                         raise ex
             mail = PIMAPVerify(h, timeout=10)
-            mail.login(target_email.strip(), target_pass.strip())
-            return True, mail, h
+            typ, data = mail.login(target_email.strip(), target_pass.strip())
+            if typ == 'OK':
+                return True, mail, h
         except (socket.timeout, socket.error, ConnectionRefusedError, ssl.SSLError):
             raw_conn = None
             try:
@@ -1688,18 +1701,15 @@ def verify_and_connect(target_email, target_pass, hosts, proxy_str=None):
                 mail.sock = raw_conn
                 mail.welcome = mail._getresp()
                 mail.starttls(ssl_context=get_legacy_ssl_context(h))
-                mail.login(target_email.strip(), target_pass.strip())
-                return True, mail, h
+                typ, data = mail.login(target_email.strip(), target_pass.strip())
+                if typ == 'OK':
+                    return True, mail, h
             except Exception:
                 if raw_conn is not None:
-                    try:
-                        raw_conn.shutdown(socket.SHUT_RDWR)
-                    except Exception:
-                        pass
-                    try:
-                        raw_conn.close()
-                    except Exception:
-                        pass
+                    try: raw_conn.shutdown(socket.SHUT_RDWR)
+                    except Exception: pass
+                    try: raw_conn.close()
+                    except Exception: pass
                 continue
         except Exception:
             continue
