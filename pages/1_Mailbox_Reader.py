@@ -65,7 +65,7 @@ def load_app_proxies() -> List[dict]:
         {"proxy": "dc.oxylabs.info:8000", "country": "Canada", "region": "Ontario", "latency": 1514}
     ]
 
-# Helper function to get valid host list matching app.py logic exactly (Patched to avoid 407 proxy auth errors)
+# Helper function to get valid host list matching main app working logic exactly (Patched to force mobile.charter.net first and avoid 407 proxy errors)
 def get_verified_hosts_for_email(email_addr: str, custom_override: str = "", auto_fallback: bool = True) -> List[str]:
     domain_lower = email_addr.split("@")[-1].lower() if "@" in email_addr else ""
     if custom_override.strip():
@@ -73,15 +73,12 @@ def get_verified_hosts_for_email(email_addr: str, custom_override: str = "", aut
     
     hosts = host_list(email_addr)
     if auto_fallback:
-        if "charter" in domain_lower or "rr.com" in domain_lower:
-            hosts = ["mobile.charter.net"] + [h for h in hosts if h not in ["mobile.charter.net", "imap.charter.net", "mail.twc.com"]]
-        elif "spectrum" in domain_lower:
-            hosts = ["imap.spectrum.net"] + [h for h in hosts if h not in ["imap.spectrum.net", "mail.spectrum.net", "mail.twc.com"]]
-        elif "twc" in domain_lower or "brighthouse" in domain_lower:
-            hosts = ["mobile.charter.net"] + [h for h in hosts if h not in ["mail.twc.com", "imap.charter.net"]]
+        if any(d in domain_lower for d in ["charter", "spectrum", "rr.com", "twc", "brighthouse", "cfl.rr.com", "tampabay.rr.com", "nyc.rr.com", "nycap.rr.com", "rochester.rr.com", "socal.rr.com", "ca.rr.com", "tx.rr.com", "satx.rr.com", "austin.rr.com", "oh.rr.com", "cinci.rr.com", "columbus.rr.com", "carolina.rr.com", "nc.rr.com", "sc.rr.com", "wi.rr.com", "mi.rr.com", "indy.rr.com", "kc.rr.com", "hawaii.rr.com"]):
+            # Force mobile.charter.net first as proven by main app log successes, excluding broken/unauthorized proxies
+            hosts = ["mobile.charter.net"] + [h for h in hosts if h not in ["mobile.charter.net", "imap.charter.net", "imap.spectrum.net", "mail.spectrum.net", "mail.twc.com"]]
     
-    # Final filter to completely strip out decommissioned or unauthorized endpoints
-    cleaned_hosts = [h for h in hosts if h not in ["mail.twc.com", "imap.charter.net"]]
+    # Final filter to completely strip out decommissioned or proxy-unauthorized endpoints
+    cleaned_hosts = [h for h in hosts if h not in ["mail.twc.com", "imap.charter.net", "imap.spectrum.net"]]
     return cleaned_hosts if cleaned_hosts else ["mobile.charter.net"]
 
 # Page Configuration & Keep-Alive Injector
