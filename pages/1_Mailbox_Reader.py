@@ -623,7 +623,12 @@ def open_mail(email_addr, password_val, host_val, timeout=None):
     if timeout is None:
         timeout = st.session_state.app_config.get("connection_timeout", 60)
     port_val = st.session_state.app_config.get("imap_port", 993)
-    mail = imaplib.IMAP4_SSL(host_val, port_val, timeout=timeout)
+    
+    # Auto-fetch proxy from active proxy pool to ensure successful proxy-routed connection
+    active_proxies = load_app_proxies()
+    proxy_str = active_proxies[0].get("proxy") if active_proxies else None
+    
+    mail = open_imap(host_val, port_val, timeout=timeout, proxy_str=proxy_str)
     mail.login(email_addr, password_val)
     return mail
 
@@ -1390,7 +1395,19 @@ if st.sidebar.button("🔑 Login & Save Account", type="primary", use_container_
     if not c_email or not c_pass:
         st.sidebar.error("Please enter both Email and Password override.")
     else:
-        hosts = [c_override] if c_override else host_list(c_email)
+        domain_lower = c_email.split("@")[-1].lower() if "@" in c_email else ""
+        if c_override:
+            hosts = [c_override]
+        else:
+            hosts = host_list(c_email)
+            if st.session_state.app_config.get("auto_fallback_probing", True):
+                if "charter" in domain_lower:
+                    hosts = ["mobile.charter.net", "imap.charter.net"] + hosts
+                elif "spectrum" in domain_lower:
+                    hosts = ["imap.spectrum.net", "mail.spectrum.net"] + hosts
+                elif "twc" in domain_lower:
+                    hosts = ["mail.twc.com"] + hosts
+
         success, connected_host, discovered_folders = False, "", ["INBOX"]
         last_err = ""
         test_mail = None
@@ -1398,7 +1415,10 @@ if st.sidebar.button("🔑 Login & Save Account", type="primary", use_container_
         with st.spinner("Connecting, authenticating & discovering folders..."):
             for host in hosts:
                 try:
-                    test_mail = open_mail(c_email, c_pass, host)
+                    active_proxies = load_app_proxies()
+                    proxy_str = active_proxies[0].get("proxy") if active_proxies else None
+                    test_mail = open_imap(host, st.session_state.app_config.get("imap_port", 993), st.session_state.app_config.get("connection_timeout", 15), proxy_str=proxy_str)
+                    test_mail.login(c_email, c_pass)
                     discovered_folders = list_folders(test_mail, email_addr=c_email, host_val=host)
                     connected_host = host
                     success = True
@@ -1452,7 +1472,14 @@ override = st.session_state.custom_host.strip()
 
 if st.sidebar.button("🔄 Refresh Inbox", type="secondary", use_container_width=True):
     if active_email and active_password:
-        host = override or st.session_state.mb_host or (host_list(active_email)[:1] or [""])[0]
+        domain_lower = active_email.split("@")[-1].lower() if "@" in active_email else ""
+        default_hosts = host_list(active_email)
+        if st.session_state.app_config.get("auto_fallback_probing", True):
+            if "charter" in domain_lower:
+                default_hosts = ["mobile.charter.net", "imap.charter.net"] + default_hosts
+            elif "spectrum" in domain_lower:
+                default_hosts = ["imap.spectrum.net", "mail.spectrum.net"] + default_hosts
+        host = override or st.session_state.mb_host or (default_hosts[:1] or [""])[0]
         try:
             with st.spinner("Refreshing Inbox..."):
                 mail_obj = get_active_mail(active_email, active_password, host)
@@ -1479,14 +1506,26 @@ if st.button("Connect & Discover Folders", type="primary", use_container_width=T
         st.error("Please select a valid account from the dropdown list first.")
     else:
         acc_email, acc_pass = actual_pick.split(":", 1)
+        domain_lower = acc_email.split("@")[-1].lower() if "@" in acc_email else ""
         hosts = host_list(acc_email)
+        if st.session_state.app_config.get("auto_fallback_probing", True):
+            if "charter" in domain_lower:
+                hosts = ["mobile.charter.net", "imap.charter.net"] + hosts
+            elif "spectrum" in domain_lower:
+                hosts = ["imap.spectrum.net", "mail.spectrum.net"] + hosts
+            elif "twc" in domain_lower:
+                hosts = ["mail.twc.com"] + hosts
+
         last, connected_host, folders, success = "no host", "", ["INBOX"], False
         test_mail = None
 
         with st.spinner(f"Connecting to {acc_email} and discovering folders..."):
             for host in hosts:
                 try:
-                    test_mail = open_mail(acc_email, acc_pass, host)
+                    active_proxies = load_app_proxies()
+                    proxy_str = active_proxies[0].get("proxy") if active_proxies else None
+                    test_mail = open_imap(host, st.session_state.app_config.get("imap_port", 993), st.session_state.app_config.get("connection_timeout", 15), proxy_str=proxy_str)
+                    test_mail.login(acc_email, acc_pass)
                     folders = list_folders(test_mail, email_addr=acc_email, host_val=host)
                     connected_host = host
                     success = True
@@ -1530,7 +1569,14 @@ with col3:
     sort_order = st.selectbox("Sort Order", ["Newest First", "Oldest First"])
 
 if st.button("📂 Load Folder Messages", type="primary", use_container_width=True):
-    host = override or st.session_state.mb_host or (host_list(active_email)[:1] or [""])[0]
+    domain_lower = active_email.split("@")[-1].lower() if "@" in active_email else ""
+    default_hosts = host_list(active_email)
+    if st.session_state.app_config.get("auto_fallback_probing", True):
+        if "charter" in domain_lower:
+            default_hosts = ["mobile.charter.net", "imap.charter.net"] + default_hosts
+        elif "spectrum" in domain_lower:
+            default_hosts = ["imap.spectrum.net", "mail.spectrum.net"] + default_hosts
+    host = override or st.session_state.mb_host or (default_hosts[:1] or [""])[0]
     if not active_email or not active_password or not host:
         st.error("Please connect and load folders first.")
     else:
@@ -1598,7 +1644,14 @@ if len(active_msgs) > 0:
                 st.text_area("Cleaned Message Body", value=msg["body"], height=150, key=f"body_{msg['folder']}_{msg['id']}_{idx}")
 
                 op_col1, op_col2, op_col3, op_col4 = st.columns(4)
-                host = override or st.session_state.mb_host or (host_list(active_email)[:1] or [""])[0]
+                domain_lower = active_email.split("@")[-1].lower() if "@" in active_email else ""
+                default_hosts = host_list(active_email)
+                if st.session_state.app_config.get("auto_fallback_probing", True):
+                    if "charter" in domain_lower:
+                        default_hosts = ["mobile.charter.net", "imap.charter.net"] + default_hosts
+                    elif "spectrum" in domain_lower:
+                        default_hosts = ["imap.spectrum.net", "mail.spectrum.net"] + default_hosts
+                host = override or st.session_state.mb_host or (default_hosts[:1] or [""])[0]
                 real_imap_folder = get_imap_path(msg['folder'])
                 real_imap_encoded = encode_imap_utf7(real_imap_folder)
 
@@ -1659,7 +1712,14 @@ if len(active_msgs) > 0:
         with p_col1:
             if st.button("Previous Page", disabled=(curr_p <= 1), use_container_width=True, key="msg_stream_prev"):
                 st.session_state.current_page -= 1
-                host = override or st.session_state.mb_host or (host_list(active_email)[:1] or [""])[0]
+                domain_lower = active_email.split("@")[-1].lower() if "@" in active_email else ""
+                default_hosts = host_list(active_email)
+                if st.session_state.app_config.get("auto_fallback_probing", True):
+                    if "charter" in domain_lower:
+                        default_hosts = ["mobile.charter.net", "imap.charter.net"] + default_hosts
+                    elif "spectrum" in domain_lower:
+                        default_hosts = ["imap.spectrum.net", "mail.spectrum.net"] + default_hosts
+                host = override or st.session_state.mb_host or (default_hosts[:1] or [""])[0]
                 mail = get_active_mail(active_email, active_password, host)
                 st.session_state.current_messages = fetch_messages_paginated(
                     mail, active_email, active_password, host, [folder], 
@@ -1676,7 +1736,14 @@ if len(active_msgs) > 0:
         with p_col3:
             if st.button("Next Page", disabled=(curr_p >= total_pages), use_container_width=True, key="msg_stream_next"):
                 st.session_state.current_page += 1
-                host = override or st.session_state.mb_host or (host_list(active_email)[:1] or [""])[0]
+                domain_lower = active_email.split("@")[-1].lower() if "@" in active_email else ""
+                default_hosts = host_list(active_email)
+                if st.session_state.app_config.get("auto_fallback_probing", True):
+                    if "charter" in domain_lower:
+                        default_hosts = ["mobile.charter.net", "imap.charter.net"] + default_hosts
+                    elif "spectrum" in domain_lower:
+                        default_hosts = ["imap.spectrum.net", "mail.spectrum.net"] + default_hosts
+                host = override or st.session_state.mb_host or (default_hosts[:1] or [""])[0]
                 mail = get_active_mail(active_email, active_password, host)
                 st.session_state.current_messages = fetch_messages_paginated(
                     mail, active_email, active_password, host, [folder], 
@@ -1733,7 +1800,14 @@ with st.expander("🔑 Standalone OTP, Debit/Credit Cards & Sensitive Data Scann
     otp_blacklist_input = st.text_input("Blacklist Keywords (comma-separated)", value="Telegram, spam, scam, promo", key="otp_blacklist_kw")
 
     if st.button("🚀 Execute Dedicated Security Scan", type="primary", use_container_width=True, key="otp_exec_btn"):
-        host = override or st.session_state.mb_host or (host_list(active_email)[:1] or [""])[0]
+        domain_lower = active_email.split("@")[-1].lower() if "@" in active_email else ""
+        default_hosts = host_list(active_email)
+        if st.session_state.app_config.get("auto_fallback_probing", True):
+            if "charter" in domain_lower:
+                default_hosts = ["mobile.charter.net", "imap.charter.net"] + default_hosts
+            elif "spectrum" in domain_lower:
+                default_hosts = ["imap.spectrum.net", "mail.spectrum.net"] + default_hosts
+        host = override or st.session_state.mb_host or (default_hosts[:1] or [""])[0]
         if not active_email or not active_password or not host:
             st.error("Please connect and discover folders first.")
         elif not otp_scope_choice:
@@ -1803,7 +1877,14 @@ with st.expander("🔑 Standalone OTP, Debit/Credit Cards & Sensitive Data Scann
                 st.text_area("Message Payload Body", value=display_body, height=150, key=f"otp_b_{msg['folder']}_{msg['id']}_{idx}")
 
                 o_col1, o_col2, o_col3, o_col4 = st.columns(4)
-                host = override or st.session_state.mb_host or (host_list(active_email)[:1] or [""])[0]
+                domain_lower = active_email.split("@")[-1].lower() if "@" in active_email else ""
+                default_hosts = host_list(active_email)
+                if st.session_state.app_config.get("auto_fallback_probing", True):
+                    if "charter" in domain_lower:
+                        default_hosts = ["mobile.charter.net", "imap.charter.net"] + default_hosts
+                    elif "spectrum" in domain_lower:
+                        default_hosts = ["imap.spectrum.net", "mail.spectrum.net"] + default_hosts
+                host = override or st.session_state.mb_host or (default_hosts[:1] or [""])[0]
                 real_imap_folder = get_imap_path(msg['folder'])
                 real_imap_encoded = encode_imap_utf7(real_imap_folder)
 
@@ -1863,7 +1944,14 @@ with st.expander("🔑 Standalone OTP, Debit/Credit Cards & Sensitive Data Scann
         with op_c1:
             if st.button("Previous Page", disabled=(otp_curr_p <= 1), use_container_width=True, key="otp_prev_pg"):
                 st.session_state.otp_current_page -= 1
-                host = override or st.session_state.mb_host or (host_list(active_email)[:1] or [""])[0]
+                domain_lower = active_email.split("@")[-1].lower() if "@" in active_email else ""
+                default_hosts = host_list(active_email)
+                if st.session_state.app_config.get("auto_fallback_probing", True):
+                    if "charter" in domain_lower:
+                        default_hosts = ["mobile.charter.net", "imap.charter.net"] + default_hosts
+                    elif "spectrum" in domain_lower:
+                        default_hosts = ["imap.spectrum.net", "mail.spectrum.net"] + default_hosts
+                host = override or st.session_state.mb_host or (default_hosts[:1] or [""])[0]
                 mail = get_active_mail(active_email, active_password, host)
                 target_scope = otp_scope_choice if otp_scope_choice else [folder]
                 if otp_custom_keyword.strip():
@@ -1885,7 +1973,14 @@ with st.expander("🔑 Standalone OTP, Debit/Credit Cards & Sensitive Data Scann
         with op_c3:
             if st.button("Next Page", disabled=(otp_curr_p >= otp_total_pages), use_container_width=True, key="otp_next_pg"):
                 st.session_state.otp_current_page += 1
-                host = override or st.session_state.mb_host or (host_list(active_email)[:1] or [""])[0]
+                domain_lower = active_email.split("@")[-1].lower() if "@" in active_email else ""
+                default_hosts = host_list(active_email)
+                if st.session_state.app_config.get("auto_fallback_probing", True):
+                    if "charter" in domain_lower:
+                        default_hosts = ["mobile.charter.net", "imap.charter.net"] + default_hosts
+                    elif "spectrum" in domain_lower:
+                        default_hosts = ["imap.spectrum.net", "mail.spectrum.net"] + default_hosts
+                host = override or st.session_state.mb_host or (default_hosts[:1] or [""])[0]
                 mail = get_active_mail(active_email, active_password, host)
                 target_scope = otp_scope_choice if otp_scope_choice else [folder]
                 if otp_custom_keyword.strip():
@@ -1927,7 +2022,14 @@ with st.expander("🔍 Deep Keyword Search & Scope Filters", expanded=False):
     search_page_size = st.slider("Search Results Page Size", 5, 200, 15, key="search_page_size_slider")
     
     if st.button("🔍 Execute Keyword Search", type="primary", use_container_width=True, key="deep_search_btn"):
-        host = override or st.session_state.mb_host or (host_list(active_email)[:1] or [""])[0]
+        domain_lower = active_email.split("@")[-1].lower() if "@" in active_email else ""
+        default_hosts = host_list(active_email)
+        if st.session_state.app_config.get("auto_fallback_probing", True):
+            if "charter" in domain_lower:
+                default_hosts = ["mobile.charter.net", "imap.charter.net"] + default_hosts
+            elif "spectrum" in domain_lower:
+                default_hosts = ["imap.spectrum.net", "mail.spectrum.net"] + default_hosts
+        host = override or st.session_state.mb_host or (default_hosts[:1] or [""])[0]
         if not active_email or not active_password or not host:
             st.error("Please connect and load folders first.")
         elif not search_query_input.strip():
@@ -1988,7 +2090,14 @@ with st.expander("🔍 Deep Keyword Search & Scope Filters", expanded=False):
                 st.text_area("Cleaned Message Body", value=msg["body"], height=150, key=f"s_body_{msg['folder']}_{msg['id']}_{idx}")
 
                 s_op1, s_op2, s_op3, s_op4 = st.columns(4)
-                host = override or st.session_state.mb_host or (host_list(active_email)[:1] or [""])[0]
+                domain_lower = active_email.split("@")[-1].lower() if "@" in active_email else ""
+                default_hosts = host_list(active_email)
+                if st.session_state.app_config.get("auto_fallback_probing", True):
+                    if "charter" in domain_lower:
+                        default_hosts = ["mobile.charter.net", "imap.charter.net"] + default_hosts
+                    elif "spectrum" in domain_lower:
+                        default_hosts = ["imap.spectrum.net", "mail.spectrum.net"] + default_hosts
+                host = override or st.session_state.mb_host or (default_hosts[:1] or [""])[0]
                 real_imap_folder = get_imap_path(msg['folder'])
                 real_imap_encoded = encode_imap_utf7(real_imap_folder)
 
@@ -2049,7 +2158,14 @@ with st.expander("🔍 Deep Keyword Search & Scope Filters", expanded=False):
         with sp_col1:
             if st.button("Previous Page", disabled=(search_curr_p <= 1), use_container_width=True, key="s_prev_pg"):
                 st.session_state.search_current_page -= 1
-                host = override or st.session_state.mb_host or (host_list(active_email)[:1] or [""])[0]
+                domain_lower = active_email.split("@")[-1].lower() if "@" in active_email else ""
+                default_hosts = host_list(active_email)
+                if st.session_state.app_config.get("auto_fallback_probing", True):
+                    if "charter" in domain_lower:
+                        default_hosts = ["mobile.charter.net", "imap.charter.net"] + default_hosts
+                    elif "spectrum" in domain_lower:
+                        default_hosts = ["imap.spectrum.net", "mail.spectrum.net"] + default_hosts
+                host = override or st.session_state.mb_host or (default_hosts[:1] or [""])[0]
                 mail = get_active_mail(active_email, active_password, host)
                 target_scope = search_scope_choice if search_scope_choice else [folder]
                 st.session_state.search_messages = fetch_messages_paginated(
@@ -2066,7 +2182,14 @@ with st.expander("🔍 Deep Keyword Search & Scope Filters", expanded=False):
         with sp_col3:
             if st.button("Next Page", disabled=(search_curr_p >= search_total_pages), use_container_width=True, key="s_next_pg"):
                 st.session_state.search_current_page += 1
-                host = override or st.session_state.mb_host or (host_list(active_email)[:1] or [""])[0]
+                domain_lower = active_email.split("@")[-1].lower() if "@" in active_email else ""
+                default_hosts = host_list(active_email)
+                if st.session_state.app_config.get("auto_fallback_probing", True):
+                    if "charter" in domain_lower:
+                        default_hosts = ["mobile.charter.net", "imap.charter.net"] + default_hosts
+                    elif "spectrum" in domain_lower:
+                        default_hosts = ["imap.spectrum.net", "mail.spectrum.net"] + default_hosts
+                host = override or st.session_state.mb_host or (default_hosts[:1] or [""])[0]
                 mail = get_active_mail(active_email, active_password, host)
                 target_scope = search_scope_choice if search_scope_choice else [folder]
                 st.session_state.search_messages = fetch_messages_paginated(
@@ -2104,7 +2227,14 @@ with st.expander("🤖 Mass Bot Purge & Intelligence Hub", expanded=False):
     b_act1, b_act2 = st.columns(2)
     with b_act1:
         if st.button("🔍 Scan Folder For Bot/OTP/Telegram Messages", use_container_width=True):
-            host = override or st.session_state.mb_host or (host_list(active_email)[:1] or [""])[0]
+            domain_lower = active_email.split("@")[-1].lower() if "@" in active_email else ""
+            default_hosts = host_list(active_email)
+            if st.session_state.app_config.get("auto_fallback_probing", True):
+                if "charter" in domain_lower:
+                    default_hosts = ["mobile.charter.net", "imap.charter.net"] + default_hosts
+                elif "spectrum" in domain_lower:
+                    default_hosts = ["imap.spectrum.net", "mail.spectrum.net"] + default_hosts
+            host = override or st.session_state.mb_host or (default_hosts[:1] or [""])[0]
             if not active_email or not active_password or not host:
                 st.error("Please connect first.")
             elif not bot_target_folder:
@@ -2133,7 +2263,14 @@ with st.expander("🤖 Mass Bot Purge & Intelligence Hub", expanded=False):
                 st.warning("No bot messages detected in current loaded stream to delete.")
             else:
                 st.session_state.bot_diag_logs = []
-                host = override or st.session_state.mb_host or (host_list(active_email)[:1] or [""])[0]
+                domain_lower = active_email.split("@")[-1].lower() if "@" in active_email else ""
+                default_hosts = host_list(active_email)
+                if st.session_state.app_config.get("auto_fallback_probing", True):
+                    if "charter" in domain_lower:
+                        default_hosts = ["mobile.charter.net", "imap.charter.net"] + default_hosts
+                    elif "spectrum" in domain_lower:
+                        default_hosts = ["imap.spectrum.net", "mail.spectrum.net"] + default_hosts
+                host = override or st.session_state.mb_host or (default_hosts[:1] or [""])[0]
                 try:
                     bot_log("🤖 [BOT ENGINE DIAGNOSTIC START] Initializing Mass Deletion Sequence...")
                     mail = get_active_mail(active_email, active_password, host)
@@ -2147,7 +2284,7 @@ with st.expander("🤖 Mass Bot Purge & Intelligence Hub", expanded=False):
                         found = set()
                         for term in terms:
                             typ, data = mail.search(None, "TEXT", term)
-                            if typ == "OK" and data and data[0]:
+                            if typ == "OK" as typ and data and data[0]:
                                 found.update((data[0] or b"").split())
                         for mid in found:
                             mail.store(mid, "+FLAGS", "\\Deleted")
@@ -2174,7 +2311,7 @@ with st.expander("🤖 Mass Bot Purge & Intelligence Hub", expanded=False):
         end_idx = start_idx + bot_page_size
         paged_bot_msgs = all_loaded_bot_msgs[start_idx:end_idx]
 
-        st.markdown(f"**Showing Bot Page {bot_curr_p} of {bot_total_pages} ({len(all_loaded_bot_msgs)} Total Detected Bots)**")
+        st.markdown(f"**Showing Bot Page {bot_curr_p} of {bot_total_pages} ({len(all_loaded_bot_msgs)} Total Detected Bots)**`")
 
         for idx, bm in enumerate(paged_bot_msgs, start_idx + 1):
             st.markdown(f"**[{idx}] [{bm['folder']}]** `{bm['from']}` — **{bm['subject']}** (ID: `{bm['id']}`) ")
