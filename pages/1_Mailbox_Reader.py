@@ -1,16 +1,3 @@
-# ============================================================
-# HEADER
-# ============================================================
-st.markdown("""
-    <div style="background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); padding: 30px; border-radius: 10px; margin-bottom: 20px;">
-        <h1 style="color: white; margin: 0;">🚀 Positive Advanced IMAP Client</h1>
-        <p style="color: rgba(255,255,255,0.9); margin: 10px 0 0 0;">
-            Interactive Bot Intelligence, Dedicated OTP/Debit Card & Credentials Scanner, 
-            Multi-Field Search, Telegram/Blacklist Filter, Deep Diagnostic Instrumentation
-        </p>
-    </div>
-""", unsafe_allow_html=True)
-
 import streamlit as st
 import imaplib
 import glob
