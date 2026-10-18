@@ -281,13 +281,44 @@ def open_imap(host, port, timeout, proxy_str=None):
     except ImportError:
         return imaplib.IMAP4_SSL(host, port, timeout=timeout)
     raw = None
+    user, pw, ph, pp = None, None, "", str(port)
     if "@" in proxy_str:
         auth, hp = proxy_str.rsplit("@", 1)
-        user, pw = auth.split(":", 1)
-        ph, pp = hp.rsplit(":", 1)
+        if ":" in auth:
+            user, pw = auth.split(":", 1)
+        else:
+            user = auth
+        if ":" in hp:
+            ph, pp = hp.rsplit(":", 1)
+        else:
+            ph = hp
     else:
-        user = pw = None
-        ph, pp = proxy_str.rsplit(":", 1)
+        parts = [p.strip() for p in proxy_str.replace(",", ":").split(":") if p.strip()]
+        if len(parts) >= 4:
+            if parts[0].isdigit() or (len(parts[1]) > 0 and parts[1].isdigit() and not parts[0].isdigit()):
+                ph = parts[0]
+                pp = parts[1]
+                user = parts[2]
+                pw = parts[3]
+            else:
+                user = parts[0]
+                pw = parts[1]
+                ph = parts[2]
+                pp = parts[3]
+        elif len(parts) == 3:
+            if parts[1].isdigit():
+                ph = parts[0]
+                pp = parts[1]
+                pw = parts[2]
+            else:
+                user = parts[0]
+                ph = parts[1]
+                pp = parts[2]
+        elif len(parts) == 2:
+            ph, pp = parts
+        else:
+            ph = proxy_str
+
     last = None
     for ptype in (socks.SOCKS5, socks.HTTP):
         try:
