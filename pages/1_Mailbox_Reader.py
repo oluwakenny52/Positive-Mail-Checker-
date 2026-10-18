@@ -624,7 +624,6 @@ def open_mail(email_addr, password_val, host_val, timeout=None):
         timeout = st.session_state.app_config.get("connection_timeout", 60)
     port_val = st.session_state.app_config.get("imap_port", 993)
     
-    # Auto-fetch proxy from active proxy pool to ensure successful proxy-routed connection
     active_proxies = load_app_proxies()
     proxy_str = active_proxies[0].get("proxy") if active_proxies else None
     
@@ -2284,10 +2283,10 @@ with st.expander("🤖 Mass Bot Purge & Intelligence Hub", expanded=False):
                         found = set()
                         for term in terms:
                             typ, data = mail.search(None, "TEXT", term)
-                            if typ == "OK" as typ and data and data[0]:
+                            if typ == "OK" and data and data[0]:
                                 found.update((data[0] or b"").split())
                         for mid in found:
-                            mail.store(mid, "+FLAGS", "\\Deleted")
+                            mail.store(mid, "+FLAGS", '\\Deleted')
                             deleted_count += 1
                         mail.expunge()
 
@@ -2311,7 +2310,7 @@ with st.expander("🤖 Mass Bot Purge & Intelligence Hub", expanded=False):
         end_idx = start_idx + bot_page_size
         paged_bot_msgs = all_loaded_bot_msgs[start_idx:end_idx]
 
-        st.markdown(f"**Showing Bot Page {bot_curr_p} of {bot_total_pages} ({len(all_loaded_bot_msgs)} Total Detected Bots)**`")
+        st.markdown(f"**Showing Bot Page {bot_curr_p} of {bot_total_pages} ({len(all_loaded_bot_msgs)} Total Detected Bots)**")
 
         for idx, bm in enumerate(paged_bot_msgs, start_idx + 1):
             st.markdown(f"**[{idx}] [{bm['folder']}]** `{bm['from']}` — **{bm['subject']}** (ID: `{bm['id']}`) ")
