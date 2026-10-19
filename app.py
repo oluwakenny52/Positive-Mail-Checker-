@@ -84,7 +84,7 @@ str_lit.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-str_lit.title("⚡ Mega Ultimate Mail Checker v11.7 (Tri-Mode Edition)")
+str_lit.title("⚡ Mega Ultimate Mail Checker v11.8 (Tri-Mode Edition)")
 str_lit.markdown("Asynchronous proxy-backed mail validation engine featuring Fast Mode, Normal Mode, and Deep/Aggressive Mode with strict anti-spoofing post-auth validation.")
 
 def load_persistent_valid_results():
@@ -274,8 +274,9 @@ if checker_mode == "Fast Mode":
         failure_cooldown=60.0
     )
     workers = str_lit.sidebar.slider("Workers Start", min_value=1, max_value=100, value=60, step=5)
-    deadline = str_lit.sidebar.slider("Deadline (Seconds)", min_value=3, max_value=60, value=15, step=5)
+    deadline = str_lit.sidebar.slider("Deadline (Seconds)", min_value=5, max_value=90, value=20, step=5)
     timeout = str_lit.sidebar.slider("Timeout", min_value=1, max_value=15, value=10, step=1)
+    default_hosts = 2
 elif checker_mode == "Deep / Aggressive Mode":
     engine_config = CheckerConfig(
         mode_name="Deep",
@@ -287,8 +288,9 @@ elif checker_mode == "Deep / Aggressive Mode":
         failure_cooldown=10.0
     )
     workers = str_lit.sidebar.slider("Workers Start", min_value=1, max_value=50, value=15, step=1)
-    deadline = str_lit.sidebar.slider("Deadline (Seconds)", min_value=10, max_value=180, value=45, step=5)
+    deadline = str_lit.sidebar.slider("Deadline (Seconds)", min_value=15, max_value=240, value=60, step=5)
     timeout = str_lit.sidebar.slider("Timeout", min_value=5, max_value=45, value=10, step=1)
+    default_hosts = 4
 else:  # Normal Mode (Default)
     engine_config = CheckerConfig(
         mode_name="Normal",
@@ -300,15 +302,24 @@ else:  # Normal Mode (Default)
         failure_cooldown=30.0
     )
     workers = str_lit.sidebar.slider("Workers Start", min_value=1, max_value=75, value=30, step=5)
-    deadline = str_lit.sidebar.slider("Deadline (Seconds)", min_value=5, max_value=90, value=25, step=5)
+    deadline = str_lit.sidebar.slider("Deadline (Seconds)", min_value=10, max_value=120, value=45, step=5)
     timeout = str_lit.sidebar.slider("Timeout", min_value=2, max_value=20, value=10, step=1)
+    default_hosts = 3
 
 max_acc = str_lit.sidebar.slider("Max Accounts", min_value=0, max_value=5000, value=5000, step=100)
-blacklist_cf = str_lit.sidebar.slider("Blacklist CF", min_value=0, max_value=500, value=100, step=10)
+blacklist_cf = str_lit.sidebar.slider(
+    "Blacklist CF (consecutive proxy fails)",
+    min_value=3, max_value=100, value=15, step=1,
+    help="A proxy is circuit-broken for 30s after this many consecutive network failures."
+)
 
 str_lit.sidebar.markdown("---")
 str_lit.sidebar.markdown("### 🎛 Advanced Control Rules")
 dynamic_worker_scaling = str_lit.sidebar.toggle("⚡ Thread Auto-Scaling / Dynamic Workers", value=True, help="Let the engine dynamically scale worker threads up or down based on real-time network conditions.")
+max_hosts_per_domain = str_lit.sidebar.slider(
+    "Max Hosts Per Domain", min_value=1, max_value=6, value=default_hosts, step=1,
+    help="How many discovered IMAP/POP hosts to try per account. Higher = better coverage, slower worst case."
+)
 
 custom_whitelist_input = str_lit.sidebar.text_input("Custom Whitelist Domains (comma-separated)", placeholder="gmail.com, outlook.com")
 custom_blacklist_input = str_lit.sidebar.text_input("Custom Blacklist Domains (comma-separated)", placeholder="spamdomain.com")
@@ -590,22 +601,31 @@ else:
 
 str_lit.sidebar.markdown("---")
 
-use_proxy = instant_help("use_proxy", "Route all checker requests through proxy nodes to prevent IP rate-limiting.", "Use Proxy", widget_type="checkbox", value=True)
-retry_cf = instant_help("retry_cf", "Automatically retry connection failures using alternative fallback paths.", "Retry CF", widget_type="checkbox", value=False)
+use_proxy = instant_help("use_proxy", "Route all checker requests through proxy nodes to prevent IP rate-limiting. UNCHECK for a fully direct connection.", "Use Proxy", widget_type="checkbox", value=True)
+retry_cf = instant_help("retry_cf", "After every proxy route has failed for an account, make one extra pass with a direct connection.", "Retry CF (Direct Retry)", widget_type="checkbox", value=True)
 self_signed = instant_help("self_signed", "Bypass strict SSL certificate validation errors for secure connections.", "Allow Self-Signed", widget_type="checkbox", value=True)
-proxy_test_flight = instant_help("proxy_test_flight", "Perform an initial health and latency probe on proxies prior to live execution.", "Test Flight", widget_type="checkbox", value=True)
+proxy_test_flight = instant_help("proxy_test_flight", "Probe every proxy for liveness before it enters the live pool. Turn OFF to use the raw pool untouched.", "Test Flight", widget_type="checkbox", value=True)
 skip_app = instant_help("skip_app", "Filter out accounts requiring explicit app passwords or token generation upfront.", "Skip Strict App-Only Providers", widget_type="checkbox", value=True)
 debug_mode = instant_help("debug_mode", "Stream verbose logs and error tracing directly into the UI interface.", "Enable Debug Mode", widget_type="checkbox", value=True)
+
+try_starttls_ui = str_lit.sidebar.toggle(
+    "Enable STARTTLS fallback (port 143 / 110)", value=True,
+    help="If implicit TLS on 993/995 fails, retry the host over STARTTLS. Disable for faster worst-case runs."
+)
 
 resolved_proxy_mode = str_lit.sidebar.selectbox(
     "Proxy Mode Engine:",
     options=["aggressive", "fallback", "sticky", "off"],
-    index=1
+    index=1,
+    help="aggressive: proxy only. fallback: proxy then direct. sticky: one proxy per worker thread. off: never use proxies."
 )
 
-# Configuration state management linked strictly to the apply button
-if "applied_cfg" not in str_lit.session_state:
-    str_lit.session_state.applied_cfg = {
+
+# ---------------------------------------------------------------------------
+# Config builder - single source of truth so we can detect unapplied changes
+# ---------------------------------------------------------------------------
+def build_cfg():
+    return {
         "MODE_NAME": engine_config.mode_name,
         "MAX_WORKERS_START": workers,
         "MAX_WORKERS_MAX": max(workers * 2, engine_config.max_concurrent_checks),
@@ -613,11 +633,12 @@ if "applied_cfg" not in str_lit.session_state:
         "ACCOUNT_DEADLINE": deadline,
         "MAX_ACCOUNTS": max_acc,
         "BLACKLIST_CF": blacklist_cf,
-        "PROXY_MODE": "on" if not use_proxy else resolved_proxy_mode,
+        "PROXY_MODE": resolved_proxy_mode if use_proxy else "off",
         "RETRY_CONNECTION_FAILED": 1 if retry_cf else 0,
         "ALLOW_SELF_SIGNED": self_signed,
         "TLS_STRICT": False,
-        "TRY_STARTTLS": True,
+        "TRY_STARTTLS": try_starttls_ui,
+        "MAX_HOSTS_PER_DOMAIN": max_hosts_per_domain,
         "PROXY_TEST_FLIGHT": proxy_test_flight,
         "SKIP_STRICT_APP_PROVIDERS": skip_app,
         "DEBUG": debug_mode,
@@ -637,46 +658,24 @@ if "applied_cfg" not in str_lit.session_state:
         "MAX_PROXY_TRIES": engine_config.max_retries,
         "PROXY_CONNECT_TIMEOUT": engine_config.connect_timeout,
         "FAST_MODE": engine_config.fast_mode,
-        "FAILURE_COOLDOWN": engine_config.failure_cooldown
+        "FAILURE_COOLDOWN": engine_config.failure_cooldown,
     }
 
+
+if "applied_cfg" not in str_lit.session_state:
+    str_lit.session_state.applied_cfg = build_cfg()
+
+_pending_cfg = build_cfg()
+_settings_dirty = _pending_cfg != str_lit.session_state.applied_cfg
+
+if _settings_dirty:
+    str_lit.sidebar.warning("⚠ You have UNAPPLIED settings changes. Click 💾 Apply Settings.")
+
 if str_lit.sidebar.button("💾 Apply Settings", type="primary"):
-    str_lit.session_state.applied_cfg = {
-        "MODE_NAME": engine_config.mode_name,
-        "MAX_WORKERS_START": workers,
-        "MAX_WORKERS_MAX": max(workers * 2, engine_config.max_concurrent_checks),
-        "TIMEOUT": timeout,
-        "ACCOUNT_DEADLINE": deadline,
-        "MAX_ACCOUNTS": max_acc,
-        "BLACKLIST_CF": blacklist_cf,
-        "PROXY_MODE": "on" if not use_proxy else resolved_proxy_mode,
-        "RETRY_CONNECTION_FAILED": 1 if retry_cf else 0,
-        "ALLOW_SELF_SIGNED": self_signed,
-        "TLS_STRICT": False,
-        "TRY_STARTTLS": True,
-        "PROXY_TEST_FLIGHT": proxy_test_flight,
-        "SKIP_STRICT_APP_PROVIDERS": skip_app,
-        "DEBUG": debug_mode,
-        "MIN_PROXY_SCORE": min_proxy_score,
-        "PROXY_PRECHECK_TIMEOUT": proxy_precheck_timeout,
-        "ALLOW_BLACKLIST_IPS": allow_blacklist_ips,
-        "POOL_MODE": pool_mode,
-        "SELECTED_COUNTRIES": selected_countries,
-        "SELECTED_MIX_COUNTRIES": selected_mix_countries,
-        "DYNAMIC_WORKER_SCALING": dynamic_worker_scaling,
-        "CUSTOM_WHITELIST": [d.strip().lower() for d in custom_whitelist_input.split(",") if d.strip()],
-        "CUSTOM_BLACKLIST": [d.strip().lower() for d in custom_blacklist_input.split(",") if d.strip()],
-        "PROXY_FILE": "proxies.txt",
-        "RESULTS_DIR": "mail_results",
-        "CACHE_FILE": "domain_cache.json",
-        "PROXY_META_FILE": "proxy_meta.json",
-        "MAX_PROXY_TRIES": engine_config.max_retries,
-        "PROXY_CONNECT_TIMEOUT": engine_config.connect_timeout,
-        "FAST_MODE": engine_config.fast_mode,
-        "FAILURE_COOLDOWN": engine_config.failure_cooldown
-    }
+    str_lit.session_state.applied_cfg = build_cfg()
     str_lit.sidebar.success("Settings applied successfully!")
     log_startup("User applied new configuration settings via sidebar control panel.")
+    str_lit.rerun()
 
 CFG = str_lit.session_state.applied_cfg
 
@@ -684,10 +683,27 @@ CFG = str_lit.session_state.applied_cfg
 CFG.setdefault("ALLOW_SELF_SIGNED", True)
 CFG.setdefault("TLS_STRICT", False)
 CFG.setdefault("TRY_STARTTLS", True)
+CFG.setdefault("MAX_HOSTS_PER_DOMAIN", 3)
 CFG.setdefault("TIMEOUT", 10)
+CFG.setdefault("ACCOUNT_DEADLINE", 45)
 CFG.setdefault("PROXY_CONNECT_TIMEOUT", 5.0)
 CFG.setdefault("FAILURE_COOLDOWN", 30.0)
 CFG.setdefault("FAST_MODE", False)
+CFG.setdefault("BLACKLIST_CF", 15)
+CFG.setdefault("DEBUG", False)
+CFG.setdefault("PROXY_TEST_FLIGHT", True)
+CFG.setdefault("RETRY_CONNECTION_FAILED", 0)
+CFG.setdefault("MAX_ACCOUNTS", 5000)
+CFG.setdefault("MAX_WORKERS_START", 30)
+CFG.setdefault("DYNAMIC_WORKER_SCALING", True)
+CFG.setdefault("PROXY_MODE", "fallback")
+
+log_startup(
+    f"ACTIVE CONFIG -> mode={CFG.get('MODE_NAME')} workers={CFG.get('MAX_WORKERS_START')} "
+    f"deadline={CFG.get('ACCOUNT_DEADLINE')}s timeout={CFG.get('TIMEOUT')}s "
+    f"proxy_mode={CFG.get('PROXY_MODE')} hosts/domain={CFG.get('MAX_HOSTS_PER_DOMAIN')} "
+    f"starttls={CFG.get('TRY_STARTTLS')} self_signed={CFG.get('ALLOW_SELF_SIGNED')}"
+)
 
 try:
     os.makedirs(CFG["RESULTS_DIR"], exist_ok=True)
@@ -1380,6 +1396,13 @@ def refresh_alive_pool():
         raw = get_filtered_active_proxies()
     except Exception:
         raw = []
+
+    # PROXY_TEST_FLIGHT=off -> trust the raw pool, skip the liveness probe
+    if not CFG.get("PROXY_TEST_FLIGHT", True):
+        with alive_pool_lock:
+            alive_pool[:] = raw
+        return
+
     live = []
     for p in raw:
         if precheck_proxy_fast(p):
@@ -1421,24 +1444,19 @@ def precheck_proxy_fast(proxy_str):
         now = time.time()
         with proxy_lock:
             if proxy_str in circuit_breaker_until and now < circuit_breaker_until[proxy_str]:
-                bad_proxies.add(proxy_str)
                 return False
 
         info = parse_proxy(proxy_str)
         if not info or not SOCKS_OK:
-            bad_proxies.add(proxy_str)
             return False
 
         precheck_timeout = float(CFG.get("PROXY_PRECHECK_TIMEOUT", 3))
         if not is_proxy_alive(info["host"], info["port"], timeout=precheck_timeout):
             record_proxy_attempt(proxy_str, success=False, is_network_error=True)
-            bad_proxies.add(proxy_str)
             return False
 
         return True
     except Exception:
-        if proxy_str:
-            bad_proxies.add(proxy_str)
         return False
 
 def fast_fail_dns_check(host):
@@ -1449,7 +1467,7 @@ def fast_fail_dns_check(host):
         return False
 
 # ============================================================================
-# SOCKET + TLS LAYER  (FIXED)
+# SOCKET + TLS LAYER
 # ============================================================================
 
 def proxy_connect(host, port, proxy_str, timeout=None, remote_dns=True):
@@ -1549,11 +1567,8 @@ def _raw_socket(host, port, proxy_str=None, timeout=None):
 
 
 def ssl_wrap(sock, host, insecure=True):
-    """Wrap ONE fresh socket.
-
-    A socket that already went through a FAILED SSLContext.wrap_socket() is
-    detached (fileno -1) AND has its fd closed by CPython. Never re-wrap it.
-    """
+    """Wrap ONE fresh socket. A socket that already went through a FAILED
+    SSLContext.wrap_socket() is detached (fileno -1) AND has its fd closed."""
     if sock is None:
         raise ssl.SSLError("ssl_wrap: socket is None")
     if sock.fileno() < 0:
@@ -1647,7 +1662,8 @@ def classify_error(err, domain=""):
             return APP
         if any(k in err_str for k in (
             "application-specific password", "app password", "app-password",
-            "basic authentication is disabled", "web login required",
+            "app password required", "basic authentication is disabled",
+            "web login required", "log in via your web browser", "web browser",
             "logindisabled", "login disabled", "two-factor", "2fa", "mfa",
             "enable imap", "imap access is disabled", "token",
         )):
@@ -1660,7 +1676,7 @@ def classify_error(err, domain=""):
             "invalid user name or password", "login failed", "auth failed",
             "bad username", "logon failure", "username and password not accepted",
             "[auth]", "authenticate failed", "pop3 user rejected", "pop3 password rejected",
-            "pop3 password rejected", "login returned non-ok", "login non-ok",
+            "login returned non-ok", "login non-ok",
         )):
             return WRONG
 
@@ -1680,7 +1696,7 @@ def classify_error(err, domain=""):
             "network is unreachable", "name or service not known", "gaierror",
             "reset by peer", "broken pipe", "fast-fail dns check failed",
             "socket.timeout", "connectionrefusederror", "unreachable",
-            "no route to host", "too many", "rate", "throttl",
+            "no route to host", "too many", "rate limit", "throttl",
         )):
             return FAILED
     except Exception:
@@ -1689,9 +1705,15 @@ def classify_error(err, domain=""):
 
 
 def record_proxy_attempt(proxy_str, success, is_network_error=False):
+    """Circuit-breaker is TIME-BOXED and self-clearing.
+
+    bad_proxies is only the permanent seed list; per-run penalties live in
+    circuit_breaker_until so a healthy proxy is never lost for the session.
+    """
     try:
         if not proxy_str:
             return
+        threshold = int(CFG.get("BLACKLIST_CF", 15))
         with proxy_lock:
             if proxy_str not in proxy_meta:
                 proxy_meta[proxy_str] = {"fails": 0, "success": 0, "country": "Unknown", "region": "Unknown", "latency_ms": 0}
@@ -1703,9 +1725,9 @@ def record_proxy_attempt(proxy_str, success, is_network_error=False):
                 m["fails"] = m.get("fails", 0) + 1
                 if is_network_error:
                     consecutive_proxy_failures[proxy_str] += 1
-                    if consecutive_proxy_failures[proxy_str] >= 6:
+                    if consecutive_proxy_failures[proxy_str] >= threshold:
                         circuit_breaker_until[proxy_str] = time.time() + 30.0
-                        bad_proxies.add(proxy_str)
+                        consecutive_proxy_failures[proxy_str] = 0
             m["score"] = compute_real_score(m.get("success", 0), m.get("fails", 0))
     except Exception as e:
         warnings.warn(f"Error recording proxy attempt: {e}")
@@ -1844,7 +1866,7 @@ def verify_and_connect(target_email, target_pass, hosts, proxy_str=None):
 def read_mailbox_messages(email, password, server, proxy_str=None, limit=10):
     mail = None
     try:
-        conf_hosts = get_servers(email).get("imap", [server])
+        conf_hosts = get_servers(email).get("imap", []) or [server]
         verified, mail, active_host = verify_and_connect(email, password, conf_hosts, proxy_str=proxy_str)
         if not verified or not mail:
             return ["Error reading mailbox: True credential verification failed."]
@@ -1897,9 +1919,10 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, 
             trace_logs.append("Architecture: Zero-Access / Bridge detected.")
             return None, "need_app_password", "Zero-Access Architecture | Protocol: Local API / Bridge", None, trace_logs
 
-        proxy_mode = CFG.get("PROXY_MODE", "aggressive")
+        proxy_mode = CFG.get("PROXY_MODE", "fallback")
         prefer_insecure = bool(CFG.get("ALLOW_SELF_SIGNED", True))
         try_starttls = bool(CFG.get("TRY_STARTTLS", True))
+        max_hosts = max(1, int(CFG.get("MAX_HOSTS_PER_DOMAIN", 3)))
 
         px = None
         if proxy_pool and proxy_mode != "off":
@@ -1911,12 +1934,11 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, 
                 px = sample_alive_proxy()
 
         proxies_to_try = [px] if px else [None]
-        if proxy_mode == "fallback" and px:
+        if px and (proxy_mode == "fallback" or CFG.get("RETRY_CONNECTION_FAILED")):
             proxies_to_try.append(None)
 
-        max_attempts = max(1, min(len(conf.get("imap", []) or [""]), 2))
-        imap_hosts = [h for h in (conf.get("imap") or [])[:max_attempts] if h]
-        pop_hosts = [h for h in ((conf.get("pop") or conf.get("pop3") or [])[:max_attempts]) if h]
+        imap_hosts = [h for h in (conf.get("imap") or [])[:max_hosts] if h]
+        pop_hosts = [h for h in ((conf.get("pop") or conf.get("pop3") or [])[:max_hosts]) if h]
 
         # --- Ordered ladder: implicit TLS first (most common), then STARTTLS ---
         plan = []
@@ -1937,6 +1959,8 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, 
 
         for current_px in proxies_to_try:
             if current_px and any(bp in current_px for bp in bad_proxies):
+                continue
+            if current_px and current_px in circuit_breaker_until and time.time() < circuit_breaker_until[current_px]:
                 continue
 
             for proto, server, port, tls_mode in plan:
@@ -2032,6 +2056,12 @@ if start_engine_btn:
     start_alive_refresher()
     refresh_alive_pool()
     log_startup(f"Live checking engine execution triggered in [{CFG['MODE_NAME']}] mode on category: [{engine_action_mode}].")
+    log_startup(
+        f"RUN CONFIG -> workers={CFG.get('MAX_WORKERS_START')} deadline={CFG.get('ACCOUNT_DEADLINE')}s "
+        f"proxy_mode={CFG.get('PROXY_MODE')} hosts/domain={CFG.get('MAX_HOSTS_PER_DOMAIN')} "
+        f"starttls={CFG.get('TRY_STARTTLS')} retry_direct={CFG.get('RETRY_CONNECTION_FAILED')} "
+        f"debug={CFG.get('DEBUG')} test_flight={CFG.get('PROXY_TEST_FLIGHT')}"
+    )
 
     resume_lines = []
     if engine_action_mode == "Resume Unfinished" and unfinished_runs and unfinished_pick and unfinished_pick != "none saved":
@@ -2093,6 +2123,7 @@ if start_engine_btn:
         total_accs = len(all_target_accounts)
         checked_count = 0
         thread_local = threading.local()
+        log_cap = 200 if CFG.get("DEBUG", False) else 50
 
         def check_task(line):
             try:
@@ -2159,7 +2190,7 @@ if start_engine_btn:
 
                                 log_msg = f"[{st_val.upper()}] {res.get('email', '')} -> {res.get('detail', '')}"
                                 str_lit.session_state.log_lines.append(log_msg)
-                                if len(str_lit.session_state.log_lines) > 50:
+                                if len(str_lit.session_state.log_lines) > log_cap:
                                     str_lit.session_state.log_lines.pop(0)
 
                                 trace_text = "\n  ↳ ".join(res.get("trace", ["No trace recorded"]))
