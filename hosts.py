@@ -7,6 +7,7 @@ import time
 import socket
 import tempfile
 import threading
+import concurrent.futures
 
 try:
     import dns.resolver
@@ -111,6 +112,11 @@ COUNTRY = {
     "me.com": ["imap.mail.me.com"],
     "naver.com": ["imap.naver.com"],
     "qq.com": ["imap.qq.com"],
+    # Latin-America / Spanish-language ISPs: 'correo.' and 'webmail.' are common
+    "montevideo.com.uy": ["mail.montevideo.com.uy", "webmail.montevideo.com.uy"],
+    "adinet.com.uy": ["mail.adinet.com.uy"],
+    "antel.com.uy": ["mail.antel.com.uy"],
+    "uy.com": ["mail.uy.com"],
 }
 
 DISPOSABLE_PARTS = (
@@ -176,17 +182,181 @@ MX_PROVIDER_MAP = (
       "netsol", "network solutions", "webhostingpad", "stablehost", "hawkhost"), (None, None)),
 )
 
-# MX / mail-router hostnames that are almost never the user-facing IMAP endpoint.
-# Used only to DEMOTE (never remove) so a live router host still beats a dead one.
-_JUNK_HOST_MARKERS = (
-    "mx", "mx1", "mx2", "mx3", "smtp", "inbound", "outbound", "spool",
-    "filter", "relay", "gateway", "spam", "cluster", "edge", "aspmx",
-    "mailrouter", "eur.olc", "olc.protection", "hs.", "lb.",
+
+# ============================================================================
+# ROUTER / RELAY DETECTION + CANDIDATE RANKING
+#
+# The old test was host.startswith(("mx", "smtp")).  It missed Zimbra-style
+# router names such as "zcs8-mvd-mta-mx7.montevideo.com.uy", which resolve in
+# DNS but serve no IMAP/POP at all.  Those routers then ranked ABOVE the real
+# endpoint (mail.<domain>) and, with MAX_HOSTS_PER_DOMAIN=2, ate the whole
+# ladder with connect timeouts.
+# ============================================================================
+
+_ROUTER_LABEL_EXACT = re.compile(
+    r"^(?:"
+    r"mx|mx\d+|mta|mtas|mta\d+|smtp|smtps|smtpout|smtp-in|smtp-out|"
+    r"inbound|outbound|relay|relay\d+|spool|filter|filters|cluster|clust\d+|"
+    r"edge|edge\d+|gateway|gw|gw\d+|router|mailrouter|aspmx|aspmx\d*|"
+    r"alt\d+|protection|hs|lb|"
+    r"mx-aol|mx-aol\.mail|mx\.google|eur\.olc|olc\.protection"
+    r")$"
 )
+
+_ROUTER_TOKENS = (
+    "mta", "smtp", "relay", "inbound", "outbound", "spool",
+    "filter", "cluster", "mailrouter", "olc.protection",
+    "protection.outlook", "aspmx", "gateway",
+)
+
+_SERVICE_PREFIXES = (
+    "imap", "imaps", "imap2", "mail", "mail2", "pop", "pop3", "pop3s",
+    "webmail", "webmail2", "email", "correo", "zimbra", "zcs",
+    "secure", "ssl", "outlook", "exchange", "owa",
+)
+
+_SKIP_LABELS_FOR_TOKENS = {"mail", "email", "webmail", "imap", "imaps", "pop", "pop3", "smtp", "correo"}
+
+
+def is_junk_host(host, domain=None):
+    """True when a hostname is almost certainly a mail ROUTER (MX/MTA) rather
+    than an IMAP/POP service endpoint. Demotion only - never removal."""
+    h = (host or "").lower().strip().strip(".")
+    if not h:
+        return True
+    if domain and h == (domain or "").lower().strip():
+        return True
+
+    labels = h.split(".")
+    if len(labels) < 2:
+        return False
+
+    for lab in labels[:-1]:
+        if _ROUTER_LABEL_EXACT.match(lab):
+            return True
+
+    for lab in labels[:-1]:
+        if lab in _SKIP_LABELS_FOR_TOKENS:
+            continue
+        if any(tok in lab for tok in _ROUTER_TOKENS):
+            return True
+        if re.search(r"(?:^|[-_])mx\d*(?:$|[-_])", lab):
+            return True
+
+    return False
+
+
+# kept for backwards compatibility with older callers
+_is_junk_host = is_junk_host
+
+
+def host_tier(host, domain):
+    """0 = most likely correct ... 4 = last resort. Ordering only."""
+    h = (host or "").lower().strip().strip(".")
+    d = (domain or "").lower().strip().strip(".")
+    if not h:
+        return 4
+    if d and h == d:
+        return 3                                     # bare domain is usually a router
+    if d and h.endswith("." + d):
+        if is_junk_host(h, d):
+            return 3
+        first = h[: -(len(d) + 1)].split(".")[0]     # left-most label under the domain
+        if first in _SERVICE_PREFIXES:
+            return 0                                 # imap.<d>, mail.<d>, webmail.<d>, correo.<d>
+        return 1
+    if is_junk_host(h, d):
+        return 3
+    return 2                                         # provider endpoint (ssl0.ovh.net, imap.gmail.com)
+
+
+_probe_lock = threading.Lock()
+_probe_cache = {}
+_PROBE_TTL = 600
+
+
+def _port_open(host, port, timeout=1.5):
+    try:
+        s = socket.create_connection((host, port), timeout=timeout)
+        s.close()
+        return True
+    except Exception:
+        return False
+
+
+def probe_live(host, timeout=1.5):
+    """Cheap TCP reachability check on 993 / 143 (cached 10 min).
+
+    This is the signal DNS alone cannot give: a Zimbra MTA router resolves
+    perfectly but hangs on 993, while mail.<domain> answers immediately.
+    """
+    if not host:
+        return False
+    now = time.time()
+    with _probe_lock:
+        hit = _probe_cache.get(host)
+        if hit and now - hit[0] < _PROBE_TTL:
+            return hit[1]
+
+    ok = _port_open(host, 993, timeout) or _port_open(host, 143, timeout)
+
+    with _probe_lock:
+        _probe_cache[host] = (now, ok)
+    return ok
+
+
+def rank_hosts(hosts, domain, probe=True):
+    """Composite ranking, replacing any name-prefix sort.
+
+    Order of precedence:
+      1. tier           - service endpoint before router before bare domain
+      2. DNS resolves   - a dead name fails fast instead of burning a timeout
+      3. port answers   - 993/143 reachable
+      4. discovery index- preserves SRV / autoconfig authority order
+
+    Cheap failures (DNS) are deliberately ordered before expensive ones
+    (connect timeout), and router hosts are demoted before either.
+    """
+    hosts = [h for h in (hosts or []) if h]
+    if not hosts:
+        return []
+
+    indexed = list(enumerate(hosts))
+    if not probe:
+        indexed.sort(key=lambda t: (host_tier(t[1], domain), 0 if host_resolves(t[1]) else 1, t[0]))
+        return [h for _i, h in indexed]
+
+    tiers = {h: host_tier(h, domain) for h in set(hosts)}
+    resolves = {h: host_resolves(h) for h in set(hosts)}
+
+    # Probe in parallel, only for plausible candidates, so a new domain costs
+    # ~1.5s instead of 8 x 1.5s.
+    to_probe = [h for h in dict.fromkeys(hosts) if tiers[h] <= 1 and resolves[h]][:6]
+    live = {}
+    if to_probe:
+        try:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=min(6, len(to_probe))) as ex:
+                futs = {ex.submit(probe_live, h): h for h in to_probe}
+                for fut in concurrent.futures.as_completed(futs, timeout=6):
+                    h = futs[fut]
+                    try:
+                        live[h] = fut.result()
+                    except Exception:
+                        live[h] = False
+        except Exception:
+            pass
+
+    indexed.sort(key=lambda t: (
+        tiers.get(t[1], 4),
+        0 if resolves.get(t[1], False) else 1,
+        0 if live.get(t[1], False) else 1,
+        t[0],
+    ))
+    return [h for _i, h in indexed]
 
 
 # ============================================================================
-# CACHES
+# CACHES  (atomic writes - a killed process must never leave partial JSON)
 # ============================================================================
 
 _CACHE_FILE = "hosts_cache.json"
@@ -200,11 +370,6 @@ _resolve_cache = {}
 
 
 def _atomic_write_json(path, obj, indent=2):
-    """Write JSON via temp file + os.replace() so readers NEVER see a partial file.
-
-    os.replace() is atomic on POSIX and Windows, so the destination is either the
-    complete old file or the complete new file - never a truncated one.
-    """
     directory = os.path.dirname(os.path.abspath(path)) or "."
     try:
         os.makedirs(directory, exist_ok=True)
@@ -232,7 +397,6 @@ def _atomic_write_json(path, obj, indent=2):
             pass
         raise
 
-    # fsync the directory so the rename itself survives a hard power loss (POSIX)
     try:
         dir_fd = os.open(directory, os.O_RDONLY)
         try:
@@ -246,7 +410,6 @@ def _atomic_write_json(path, obj, indent=2):
 
 
 def _load_cache():
-    """Load cache, healing a corrupt/truncated main file from the .bak copy."""
     global _cache
     if _cache is not None:
         return _cache
@@ -260,7 +423,6 @@ def _load_cache():
             if isinstance(parsed, dict):
                 _cache = parsed
                 if candidate.endswith(".bak"):
-                    # main file was corrupt or partial - restore it atomically
                     try:
                         _atomic_write_json(_CACHE_FILE, parsed)
                     except Exception:
@@ -274,7 +436,6 @@ def _load_cache():
 
 
 def _save_cache():
-    """Atomically persist the cache, prune stale entries, keep one .bak copy."""
     try:
         now = time.time()
         with _cache_lock:
@@ -286,43 +447,34 @@ def _save_cache():
             snapshot = dict(data)
 
         payload = _atomic_write_json(_CACHE_FILE, snapshot)
-
         try:
             with open(_CACHE_FILE + ".bak", "w", encoding="utf-8") as f:
                 f.write(payload)
         except Exception:
             pass
-
         return True
     except Exception:
         return False
 
 
 def flush_cache():
-    """Public: force an atomic cache write right now."""
     return _save_cache()
 
 
 def clear_cache():
-    """Public: drop the cache from memory and disk."""
     global _cache
     with _cache_lock:
         _cache = {}
-    try:
-        if os.path.exists(_CACHE_FILE):
-            os.remove(_CACHE_FILE)
-    except Exception:
-        pass
-    try:
-        if os.path.exists(_CACHE_FILE + ".bak"):
-            os.remove(_CACHE_FILE + ".bak")
-    except Exception:
-        pass
+    for p in (_CACHE_FILE, _CACHE_FILE + ".bak"):
+        try:
+            if os.path.exists(p):
+                os.remove(p)
+        except Exception:
+            pass
     return True
 
 
 def cache_stats():
-    """Public: quick health view of the on-disk cache."""
     stats = {"entries": 0, "file_bytes": 0, "path": _CACHE_FILE,
              "has_backup": os.path.exists(_CACHE_FILE + ".bak"), "healthy": True}
     try:
@@ -341,14 +493,6 @@ def _dedupe(seq):
         if x and x not in out:
             out.append(x)
     return out
-
-
-def _is_junk_host(host):
-    h = (host or "").lower()
-    if not h:
-        return True
-    label = h.split(".")[0]
-    return any(label.startswith(m) for m in _JUNK_HOST_MARKERS)
 
 
 # ============================================================================
@@ -391,7 +535,7 @@ def resolve_srv(name):
 
 
 def host_resolves(host):
-    """Cheap existence check so dead guesses don't burn attempts."""
+    """Cheap existence check so dead guesses don't burn a connect timeout."""
     if not host:
         return False
     with _resolve_lock:
@@ -515,6 +659,12 @@ def _provider_from_mx(mx_host):
     return None
 
 
+# IMAP service prefixes, most-likely first. 'correo.'/'webmail.' cover
+# Spanish/Portuguese-speaking ISPs that never publish imap.<domain>.
+_IMAP_PREFIXES = ("imap.", "mail.", "webmail.", "imaps.", "correo.", "secure.", "zimbra.", "email.", "mail2.", "")
+_POP_PREFIXES = ("pop.", "pop3.", "pop3s.", "mail.", "correo.", "")
+
+
 def discover_hosts(domain, email=None, use_cache=True, force_refresh=False):
     """Ordered candidate discovery: SRV -> autoconfig -> autodiscover -> MX -> prefixes.
 
@@ -570,12 +720,22 @@ def discover_hosts(domain, email=None, use_cache=True, force_refresh=False):
             imap.append(p_imap)
             pop.append(p_pop or p_imap)
         else:
-            # shared-hosting platform -> mail.<domain>
             imap.append(f"mail.{domain}")
             pop.append(f"mail.{domain}")
         sources.append("mx-provider")
 
-    # 4. MX-derived hostnames (guessed from the MX parent)
+    # 4. Well-known service names on the domain itself
+    for pfx in _IMAP_PREFIXES:
+        h = f"{pfx}{domain}"
+        if h not in imap:
+            imap.append(h)
+    for pfx in _POP_PREFIXES:
+        h = f"{pfx}{domain}"
+        if h not in pop:
+            pop.append(h)
+    sources.append("prefix")
+
+    # 5. MX-derived hostnames LAST (routers, usually not the endpoint)
     for m in mx_records[:2]:
         if m and m not in imap:
             imap.append(m)
@@ -588,23 +748,7 @@ def discover_hosts(domain, email=None, use_cache=True, force_refresh=False):
                     if h not in imap:
                         imap.append(h)
 
-    # 5. Common-name guesses on the domain itself
-    for pfx in ("imap.", "mail.", "imaps.", "secure.", "webmail.", ""):
-        h = f"{pfx}{domain}"
-        if h not in imap:
-            imap.append(h)
-    for pfx in ("pop.", "pop3.", "mail.", ""):
-        h = f"{pfx}{domain}"
-        if h not in pop:
-            pop.append(h)
-    sources.append("prefix")
-
-    # 6. Rank: LIVE hosts first, then non-junk before mail-router junk.
-    #    Stable sort keeps discovery order inside each tier. Demote, never drop.
-    imap = sorted(imap, key=lambda h: (not host_resolves(h), _is_junk_host(h)))
-    pop = sorted(pop, key=lambda h: (not host_resolves(h), _is_junk_host(h)))
-
-    # 7. Universal fallbacks last
+    # 6. Universal fallbacks
     for fb in UNIVERSAL_IMAP_FALLBACKS:
         if fb not in imap:
             imap.append(fb)
@@ -612,13 +756,13 @@ def discover_hosts(domain, email=None, use_cache=True, force_refresh=False):
         if fb not in pop:
             pop.append(fb)
 
-    imap = _dedupe(imap)[:8]
-    pop = _dedupe(pop)[:6]
+    # 7. Rank: tier -> resolves -> port answers -> discovery index
+    imap = rank_hosts(_dedupe(imap), domain)[:8]
+    pop = rank_hosts(_dedupe(pop), domain)[:6]
 
     with _cache_lock:
         c = _load_cache()
         c[domain] = {"imap": imap, "pop": pop, "sources": sources, "ts": time.time()}
-    # write OUTSIDE the lock so 30 workers don't serialise on disk I/O
     _save_cache()
 
     return {"imap": imap, "pop": pop, "sources": sources}
@@ -632,12 +776,14 @@ def domain_of(email_addr):
     return (email_addr or "").split("@")[-1].lower().strip()
 
 
-def _pair(imap_hosts, pop_hosts):
+def _pair(imap_hosts, pop_hosts, domain=None):
+    if domain:
+        imap_hosts = rank_hosts(imap_hosts, domain, probe=False)
+        pop_hosts = rank_hosts(pop_hosts, domain, probe=False)
     return {"imap": imap_hosts, "pop": pop_hosts, "pop3": pop_hosts}
 
 
 def get_mx_host(domain):
-    """Extract primary mail exchange host (or its known provider IMAP host)."""
     mx_records = resolve_mx(domain)
     if not mx_records:
         return None
@@ -658,26 +804,26 @@ def conf(domain):
     if domain in ZERO_ACCESS:
         return {"imap": [], "pop": [], "pop3": [], "type": "zero_access"}
 
-    # --- Static, instant, no network ---
+    # --- Static, instant, no network (order already curated) ---
     if domain in FRONTIER:
-        return _pair(FRONTIER_IMAP, FRONTIER_POP)
+        return _pair(FRONTIER_IMAP, FRONTIER_POP, domain)
     if domain in ATT_FAMILY:
-        return _pair(ATT_IMAP, ATT_POP)
+        return _pair(ATT_IMAP, ATT_POP, domain)
     if domain in VERIZON:
-        return _pair(VERIZON_IMAP, VERIZON_POP)
+        return _pair(VERIZON_IMAP, VERIZON_POP, domain)
     if domain in CHARTER or domain.endswith(".rr.com"):
-        return _pair(CHARTER_IMAP, CHARTER_POP)
+        return _pair(CHARTER_IMAP, CHARTER_POP, domain)
     if domain in TWC:
-        return _pair(TWC_IMAP, TWC_POP)
+        return _pair(TWC_IMAP, TWC_POP, domain)
     if domain in YAHOO_DOMAINS or domain.endswith(".yahoo.com"):
-        return _pair(YAHOO_IMAP, YAHOO_POP)
+        return _pair(YAHOO_IMAP, YAHOO_POP, domain)
     if domain in MS_DOMAINS or domain.endswith(".outlook.com") or domain.endswith(".hotmail.com"):
-        return _pair(MS_IMAP, MS_POP)
+        return _pair(MS_IMAP, MS_POP, domain)
     if domain in GMAIL_DOMAINS:
-        return _pair(GMAIL_IMAP, GMAIL_POP)
+        return _pair(GMAIL_IMAP, GMAIL_POP, domain)
     known = COUNTRY.get(domain)
     if known:
-        return _pair(known, known)
+        return _pair(known, known, domain)
 
     # --- Discovered ---
     found = discover_hosts(domain)
@@ -690,7 +836,6 @@ def conf(domain):
 
 
 def provider_hosts(email_addr):
-    """Returns (imap_candidates, pop_candidates)."""
     domain = domain_of(email_addr)
     got = conf(domain)
     if got:
@@ -706,7 +851,6 @@ def host_list(email_addr):
 
 
 def ladder(email_addr, max_hosts=3, include_starttls=True):
-    """Ordered attempt plan: [(proto, host, port, mode), ...]"""
     imap_hosts, pop_hosts = provider_hosts(email_addr)
     plan = []
     for h in imap_hosts[:max_hosts]:
@@ -723,7 +867,6 @@ def ladder(email_addr, max_hosts=3, include_starttls=True):
 
 
 def refresh_domain(domain):
-    """Force re-discovery, bypassing the cache."""
     return discover_hosts(domain, use_cache=True, force_refresh=True)
 
 
