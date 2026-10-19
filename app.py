@@ -1,7 +1,7 @@
 """
-Mega Ultimate Mail Checker — v13.1
+Mega Ultimate Mail Checker — v13.2
 ==================================
-Self-healing import header.
+Self-healing import header + callback-safe Theme Studio.
 
 hosts.py ships in several shapes depending on which revision is deployed:
     * new  -> conf / rank_hosts / is_junk_host  all present
@@ -587,6 +587,8 @@ def _sync_theme_from_widgets():
 
 
 def _on_preset_change():
+    """Runs as a selectbox on_change callback -> BEFORE widgets are created,
+    so writing th_* widget keys here is legal."""
     name = str_lit.session_state.get("th_preset")
     p = THEME_PRESETS.get(name)
     if p:
@@ -597,6 +599,7 @@ def _on_preset_change():
 
 
 def _reset_theme():
+    """Runs as a button on_click callback -> BEFORE widgets are created."""
     str_lit.session_state.theme = default_theme()
     d = str_lit.session_state.theme
     for k in ("g1", "g2", "accent", "accent2", "bg", "panel", "text"):
@@ -1192,42 +1195,64 @@ log_startup(
 with str_lit.sidebar.expander("🎨 Theme Studio & Colours", expanded=False):
     th = str_lit.session_state.theme
 
+    # ------------------------------------------------------------------
+    # Pre-seed every widget-owned key BEFORE the widget is created, then
+    # create the widgets with NO default argument. This avoids both:
+    #   * "created with a default value but also had its value set" warning
+    #   * "cannot be modified after the widget is instantiated" error
+    # ------------------------------------------------------------------
+    _preset_names = list(THEME_PRESETS.keys())
+    _seed = {
+        "th_preset": th.get("preset", "Aurora") if th.get("preset", "Aurora") in _preset_names else "Aurora",
+        "th_g1": th["g1"], "th_g2": th["g2"],
+        "th_accent": th["accent"], "th_accent2": th["accent2"],
+        "th_bg": th["bg"], "th_panel": th["panel"], "th_text": th["text"],
+        "th_radius": int(th.get("radius", 14)),
+        "th_glow": bool(th.get("glow", True)),
+        "th_glass": bool(th.get("glass", True)),
+        "th_animate": bool(th.get("animate", True)),
+        "th_hero_title": th.get("hero_title", ""),
+        "th_hero_sub": th.get("hero_sub", ""),
+    }
+    for _k, _v in _seed.items():
+        if _k not in str_lit.session_state:
+            str_lit.session_state[_k] = _v
+
     str_lit.selectbox(
-        "Preset Gradient", list(THEME_PRESETS.keys()),
-        index=list(THEME_PRESETS.keys()).index(th.get("preset", "Aurora")) if th.get("preset", "Aurora") in THEME_PRESETS else 0,
+        "Preset Gradient", _preset_names,
         key="th_preset", on_change=_on_preset_change,
     )
 
     c_a, c_b = str_lit.columns(2)
     with c_a:
-        str_lit.color_picker("Gradient Start", th["g1"], key="th_g1")
-        str_lit.color_picker("Accent", th["accent"], key="th_accent")
-        str_lit.color_picker("Page Background", th["bg"], key="th_bg")
+        str_lit.color_picker("Gradient Start", key="th_g1")
+        str_lit.color_picker("Accent", key="th_accent")
+        str_lit.color_picker("Page Background", key="th_bg")
     with c_b:
-        str_lit.color_picker("Gradient End", th["g2"], key="th_g2")
-        str_lit.color_picker("Accent 2", th["accent2"], key="th_accent2")
-        str_lit.color_picker("Panel Surface", th["panel"], key="th_panel")
+        str_lit.color_picker("Gradient End", key="th_g2")
+        str_lit.color_picker("Accent 2", key="th_accent2")
+        str_lit.color_picker("Panel Surface", key="th_panel")
 
-    str_lit.color_picker("Body Text", th["text"], key="th_text")
+    str_lit.color_picker("Body Text", key="th_text")
 
-    str_lit.slider("Corner Radius", 0, 28, int(th.get("radius", 14)), 1, key="th_radius")
+    str_lit.slider("Corner Radius", 0, 28, key="th_radius")
 
     t_a, t_b = str_lit.columns(2)
     with t_a:
-        str_lit.toggle("Neon Glow", value=th.get("glow", True), key="th_glow")
-        str_lit.toggle("Glass Blur", value=th.get("glass", True), key="th_glass")
+        str_lit.toggle("Neon Glow", key="th_glow")
+        str_lit.toggle("Glass Blur", key="th_glass")
     with t_b:
-        str_lit.toggle("Animated Gradient", value=th.get("animate", True), key="th_animate")
-        str_lit.toggle("Colourised Logs", value=st.session_state.colorize_logs, key="colorize_logs")
+        str_lit.toggle("Animated Gradient", key="th_animate")
+        str_lit.toggle("Colourised Logs", key="colorize_logs")
 
-    str_lit.text_input("Hero Title", value=th.get("hero_title", ""), key="th_hero_title")
-    str_lit.text_input("Hero Subtitle", value=th.get("hero_sub", ""), key="th_hero_sub")
+    str_lit.text_input("Hero Title", key="th_hero_title")
+    str_lit.text_input("Hero Subtitle", key="th_hero_sub")
 
     b_a, b_b = str_lit.columns(2)
     with b_a:
-        if str_lit.button("♻️ Reset Theme", use_container_width=True):
-            _reset_theme()
-            str_lit.rerun()
+        # on_click (NOT inline) -> runs before widgets are instantiated,
+        # so writing th_* keys inside it is legal.
+        str_lit.button("♻️ Reset Theme", on_click=_reset_theme, use_container_width=True)
     with b_b:
         str_lit.download_button(
             "⬇️ Export Theme",
