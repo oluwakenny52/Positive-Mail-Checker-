@@ -337,6 +337,13 @@ def theme_css(th: dict) -> str:
         font-size: .78rem; max-height: 360px; overflow-y: auto;
     }}
 
+    .help-box {{
+        background: {panel}; border-left: 3px solid {ac};
+        padding: 6px 10px; margin: 2px 0 8px 0;
+        font-size: .78rem; color: {text}; opacity: .9;
+        border-radius: 4px; line-height: 1.35;
+    }}
+
     ::-webkit-scrollbar {{ width: 10px; height: 10px; }}
     ::-webkit-scrollbar-track {{ background: {bg}; }}
     ::-webkit-scrollbar-thumb {{ background: {g1}88; border-radius: 8px; }}
@@ -369,7 +376,7 @@ def load_app_proxies() -> List[dict]:
     proxy_files = ["proxies.txt", "proxy_pool.txt", "clean_proxies.txt"]
     dynamic_pool = []
 
-    if "session_proxies" in st.session_state and st.session_state.session_proxies:
+    if st.session_state.get("session_proxies"):
         for p in st.session_state.session_proxies:
             if isinstance(p, dict):
                 dynamic_pool.append(p)
@@ -496,6 +503,7 @@ DEFAULT_APP_CONFIG = {
     "auto_fallback_probing": True,
     "max_batch_retries": 1,
     "try_starttls": True,
+    "try_alt_username": True,
     "allow_self_signed": True,
 }
 
@@ -1801,16 +1809,22 @@ if account_filter_query:
 else:
     valid_dropdown_options = valid if valid else ["none"]
 
+# Preselect: forced_account wins, else last used. The widget itself owns the
+# key afterwards, so we seed/repair the key BEFORE the widget is created.
 default_index = 0
-
-if "forced_account" in st.session_state and st.session_state.forced_account in valid_dropdown_options:
-    default_index = valid_dropdown_options.index(st.session_state.forced_account)
+if st.session_state.get("forced_account") in valid_dropdown_options:
+    default_index = valid_dropdown_options.index(st.session_state["forced_account"])
 else:
     last_acc = load_last_account()
     if last_acc in valid_dropdown_options:
         default_index = valid_dropdown_options.index(last_acc)
 
-pick = st.selectbox("Valid account", valid_dropdown_options, index=default_index, key="selected_account")
+if st.session_state.get("selected_account") not in valid_dropdown_options:
+    st.session_state["selected_account"] = (
+        valid_dropdown_options[default_index] if valid_dropdown_options else "none"
+    )
+
+pick = st.selectbox("Valid account", valid_dropdown_options, key="selected_account")
 
 actual_pick = "none"
 if pick and pick != "none":
@@ -1860,7 +1874,7 @@ with st.sidebar.expander("⚙️ App Configuration Settings", expanded=False):
     new_port = st.number_input("Default IMAP Port", min_value=1, max_value=65535, value=cfg.get("imap_port", 993))
     new_fallback = st.checkbox("Enable Auto-Fallback Host Probing (Spectrum/Charter/TWC)", value=cfg.get("auto_fallback_probing", True))
     new_starttls = st.checkbox("Try STARTTLS / plaintext on port 143 if 993 fails", value=cfg.get("try_starttls", True))
-    new_altuser = st.checkbox("Try local-part username on auth failure", value=cfg.get("try_alt_user", True))
+    new_altuser = st.checkbox("Try local-part username on auth failure", value=cfg.get("try_alt_username", True))
 
     if st.button("💾 Save App Settings", type="secondary", use_container_width=True):
         st.session_state.app_config["connection_timeout"] = new_timeout
@@ -1909,7 +1923,6 @@ if st.sidebar.button("🚀 Validate & Import Batch Accounts", type="primary", us
 
         cfg_timeout = st.session_state.app_config.get("connection_timeout", 15)
         cfg_port = st.session_state.app_config.get("imap_port", 993)
-        cfg_fallback = st.session_state.app_config.get("auto_fallback_probing", True)
         cfg_alt_user = st.session_state.app_config.get("try_alt_username", True)
 
         user_host_overrides = [h.strip() for h in re.split(r'[,;\n]+', batch_host_override_input) if h.strip()]
@@ -2170,6 +2183,10 @@ if st.sidebar.button("🔑 Login & Save Account", type="primary", use_container_
             st.session_state.forced_account = combo
             st.session_state.mb_host = connected_host
             st.session_state.mb_folders = discovered_folders
+            # Push the selection into the dropdown key too, otherwise the
+            # selectbox keeps whatever it already had.
+            if combo in valid_dropdown_options:
+                st.session_state["selected_account"] = combo
             save_session_cache()
             st.sidebar.success(f"Connected: {connected_host} ({len(discovered_folders)} folders)")
             st.rerun()
