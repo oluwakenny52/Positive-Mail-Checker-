@@ -1,7 +1,7 @@
 """
-Mega Ultimate Mail Checker — v13.2
+Mega Ultimate Mail Checker — v13.3
 ==================================
-Self-healing import header + callback-safe Theme Studio.
+Self-healing import header + callback-safe Theme Studio + cached host resolution.
 
 hosts.py ships in several shapes depending on which revision is deployed:
     * new  -> conf / rank_hosts / is_junk_host  all present
@@ -313,7 +313,7 @@ def default_theme() -> dict:
         "g1": p["g1"], "g2": p["g2"], "accent": p["accent"], "accent2": p["accent2"],
         "bg": p["bg"], "panel": p["panel"], "text": p["text"],
         "radius": 14, "glow": True, "animate": True, "glass": True,
-        "colorize_logs": True, "hero_title": "⚡ Mega Ultimate Mail Checker v13.0",
+        "colorize_logs": True, "hero_title": "⚡ Mega Ultimate Mail Checker v13.2",
         "hero_sub": "World-Coverage Edition — router-aware host ranking, multi-scheme auth, anti-spoofing post-auth validation.",
     }
 
@@ -495,6 +495,14 @@ def theme_css(th: dict) -> str:
     .bb-log.skip {{ color: #a78bfa; border-color: #a78bfa; }}
     .bb-log.dim  {{ color: {text}; opacity: .82; border-color: transparent; }}
 
+    /* ---- Instant-help bubble (used by instant_help()) ---- */
+    .help-box {{
+        background: {panel}; border-left: 3px solid {ac};
+        padding: 6px 10px; margin: 2px 0 8px 0;
+        font-size: .78rem; color: {text}; opacity: .9;
+        border-radius: 4px; line-height: 1.35;
+    }}
+
     ::-webkit-scrollbar {{ width: 10px; height: 10px; }}
     ::-webkit-scrollbar-track {{ background: {bg}; }}
     ::-webkit-scrollbar-thumb {{ background: {g1}88; border-radius: 8px; }}
@@ -567,6 +575,11 @@ if "theme" not in str_lit.session_state:
 if "colorize_logs" not in str_lit.session_state:
     str_lit.session_state.colorize_logs = str_lit.session_state.theme.get("colorize_logs", True)
 
+# Materialise theme.json on first boot so the reader always has a file to read
+# (Streamlit Cloud containers are ephemeral; a committed copy wins if present).
+if not os.path.exists(THEME_FILE):
+    save_theme(str_lit.session_state.theme)
+
 
 def _sync_theme_from_widgets():
     th = str_lit.session_state.theme
@@ -618,6 +631,7 @@ def _reset_theme():
 # ============================================================================
 
 SEED_BAD_PROXIES = {"38.154.185.97"}
+DOMAIN_CACHE_TTL = 86400   # 24h — cached host discovery is reused within this
 
 
 def load_persistent_valid_results():
@@ -671,6 +685,7 @@ for _k in ("start_timestamp", "end_timestamp", "total_duration"):
 
 # Buffer used by background threads so they never touch st.session_state.
 # This is what kills the 'missing ScriptRunContext!' flood from the alive-pool.
+# It is also merged back into the Startup panel (see below) so nothing is lost.
 _STARTUP_BUFFER = []
 _STARTUP_BUFFER_LOCK = threading.Lock()
 
@@ -690,6 +705,19 @@ def log_startup(msg, quiet: bool = False):
     except Exception:
         with _STARTUP_BUFFER_LOCK:
             _STARTUP_BUFFER.append(entry)
+
+
+def startup_panel_lines():
+    """Main-thread entries plus whatever the background thread buffered."""
+    try:
+        main = list(str_lit.session_state.startup_entries)
+    except Exception:
+        main = []
+    with _STARTUP_BUFFER_LOCK:
+        buffered = list(_STARTUP_BUFFER)
+    if not buffered:
+        return main
+    return main + ["", "── background thread (quiet mode) ──"] + buffered
 
 
 log_startup("Application process started. Initializing session state and loading configurations...")
@@ -1360,7 +1388,7 @@ section_title("🖥️", "Startup & Under-The-Hood Display Panel",
 
 with str_lit.expander("🔍 View All Startup Entries & What Is Going On In The Hood", expanded=False):
     str_lit.markdown("Real-time activity ledger recording system boot, config injection, proxy health checks, and engine state transitions:")
-    str_lit.code("\n".join(str_lit.session_state.startup_entries), language="text")
+    str_lit.code("\n".join(startup_panel_lines()), language="text")
     col_st1, col_st2 = str_lit.columns(2)
     with col_st1:
         if str_lit.button("🔄 Refresh Startup Screen"):
@@ -1368,6 +1396,8 @@ with str_lit.expander("🔍 View All Startup Entries & What Is Going On In The H
     with col_st2:
         if str_lit.button("🧹 Clear Startup Logs"):
             str_lit.session_state.startup_entries = []
+            with _STARTUP_BUFFER_LOCK:
+                _STARTUP_BUFFER.clear()
             log_startup("Startup logs cleared by user.")
             str_lit.rerun()
 
@@ -1577,7 +1607,7 @@ def clear_unfinished():
         os.remove(path)
 
 
-def check_domain_resolvable(domain):
+def check_domain_resolvable(domain, persist=True):
     with cache_lock:
         if domain in domain_cache and "resolvable" in domain_cache[domain]:
             return domain_cache[domain]["resolvable"]
@@ -1600,7 +1630,8 @@ def check_domain_resolvable(domain):
         resolvable = False
     with cache_lock:
         domain_cache.setdefault(domain, {})["resolvable"] = resolvable
-    save_domain_cache()
+    if persist:
+        save_domain_cache()
     return resolvable
 
 
@@ -1660,9 +1691,12 @@ def process_accounts(text, previous_valid):
             resume_list.append(line); continue
         if ".." in email or email.count("@") != 1:
             continue
-        if not check_domain_resolvable(domain):
+        if not check_domain_resolvable(domain, persist=False):
             dns_fail_list.append(line); continue
         lines.append(f"{email}:{password}")
+
+    # One cache write for the whole batch instead of one per domain
+    save_domain_cache()
 
     seen_email, clean = set(), []
     for line in lines:
@@ -1922,6 +1956,17 @@ def get_servers(email):
                 known["pop"] = _rank_hosts(known["pop"], domain)
             return known
 
+        # --- Cached discovery (24h). Without this, every single account re-runs
+        # MX + CNAME lookups and the run crawls on large lists. ---
+        with cache_lock:
+            cached = domain_cache.get(domain) or {}
+        if cached.get("imap") and (time.time() - float(cached.get("ts", 0))) < DOMAIN_CACHE_TTL:
+            return {
+                "imap": list(cached["imap"]),
+                "pop": list(cached.get("pop") or cached["imap"]),
+                "pop3": list(cached.get("pop3") or cached["imap"]),
+            }
+
         parent_domain = detect_parent_provider(domain)
         if parent_domain in ("yahoo.com", "gmail.com"):
             return known_provider_conf(parent_domain)
@@ -1939,7 +1984,10 @@ def get_servers(email):
 
         with cache_lock:
             domain_cache.setdefault(domain, {})
-            domain_cache[domain].update({"imap": servers["imap"], "pop": servers["pop"], "pop3": servers["pop3"]})
+            domain_cache[domain].update({
+                "imap": servers["imap"], "pop": servers["pop"], "pop3": servers["pop3"],
+                "ts": time.time(),
+            })
         save_domain_cache()
         return servers
     except Exception as e:
@@ -2170,7 +2218,7 @@ def classify_error(err, domain=""):
             "application-specific password", "app password", "app-password", "app password required",
             "basic authentication is disabled", "web login required", "log in via your web browser",
             "web browser", "logindisabled", "login disabled", "two-factor", "2fa", "mfa",
-            "enable imap", "imap access is disabled", "token",
+            "enable imap", "imap access is disabled",
         )):
             return APP
         if any(k in err_str for k in (
@@ -2179,7 +2227,7 @@ def classify_error(err, domain=""):
             "login failed", "auth failed", "bad username", "logon failure",
             "username and password not accepted", "[auth]", "authenticate failed",
             "pop3 user rejected", "pop3 password rejected", "login returned non-ok", "login non-ok",
-            "user rejected", "password rejected",
+            "user rejected", "password rejected", "invalid token", "expired token",
         )):
             return WRONG
         if isinstance(err, ssl.SSLCertVerificationError):
