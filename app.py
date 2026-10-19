@@ -84,7 +84,7 @@ str_lit.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-str_lit.title("⚡ Mega Ultimate Mail Checker v11.7 (Tri-Mode Edition)")
+str_lit.title("⚡ Mega Ultimate Mail Checker v11.9 (Tri-Mode Edition)")
 str_lit.markdown("Asynchronous proxy-backed mail validation engine featuring Fast Mode, Normal Mode, and Deep/Aggressive Mode with strict anti-spoofing post-auth validation.")
 
 def load_persistent_valid_results():
@@ -274,8 +274,9 @@ if checker_mode == "Fast Mode":
         failure_cooldown=60.0
     )
     workers = str_lit.sidebar.slider("Workers Start", min_value=1, max_value=100, value=60, step=5)
-    deadline = str_lit.sidebar.slider("Deadline (Seconds)", min_value=3, max_value=60, value=15, step=5)
-    timeout = str_lit.sidebar.slider("Timeout", min_value=1, max_value=15, value=10, step=1)
+    deadline = str_lit.sidebar.slider("Deadline (Seconds)", min_value=5, max_value=90, value=25, step=5)
+    timeout = str_lit.sidebar.slider("Timeout", min_value=1, max_value=15, value=8, step=1)
+    default_hosts = 2
 elif checker_mode == "Deep / Aggressive Mode":
     engine_config = CheckerConfig(
         mode_name="Deep",
@@ -287,8 +288,9 @@ elif checker_mode == "Deep / Aggressive Mode":
         failure_cooldown=10.0
     )
     workers = str_lit.sidebar.slider("Workers Start", min_value=1, max_value=50, value=15, step=1)
-    deadline = str_lit.sidebar.slider("Deadline (Seconds)", min_value=10, max_value=180, value=45, step=5)
-    timeout = str_lit.sidebar.slider("Timeout", min_value=5, max_value=45, value=10, step=1)
+    deadline = str_lit.sidebar.slider("Deadline (Seconds)", min_value=15, max_value=240, value=60, step=5)
+    timeout = str_lit.sidebar.slider("Timeout", min_value=5, max_value=45, value=12, step=1)
+    default_hosts = 3
 else:  # Normal Mode (Default)
     engine_config = CheckerConfig(
         mode_name="Normal",
@@ -300,15 +302,24 @@ else:  # Normal Mode (Default)
         failure_cooldown=30.0
     )
     workers = str_lit.sidebar.slider("Workers Start", min_value=1, max_value=75, value=30, step=5)
-    deadline = str_lit.sidebar.slider("Deadline (Seconds)", min_value=5, max_value=90, value=25, step=5)
+    deadline = str_lit.sidebar.slider("Deadline (Seconds)", min_value=10, max_value=120, value=45, step=5)
     timeout = str_lit.sidebar.slider("Timeout", min_value=2, max_value=20, value=10, step=1)
+    default_hosts = 2
 
 max_acc = str_lit.sidebar.slider("Max Accounts", min_value=0, max_value=5000, value=5000, step=100)
-blacklist_cf = str_lit.sidebar.slider("Blacklist CF", min_value=0, max_value=500, value=100, step=10)
+blacklist_cf = str_lit.sidebar.slider(
+    "Blacklist CF (consecutive proxy fails)",
+    min_value=3, max_value=100, value=15, step=1,
+    help="A proxy is circuit-broken for 30s after this many consecutive network failures."
+)
 
 str_lit.sidebar.markdown("---")
 str_lit.sidebar.markdown("### 🎛 Advanced Control Rules")
 dynamic_worker_scaling = str_lit.sidebar.toggle("⚡ Thread Auto-Scaling / Dynamic Workers", value=True, help="Let the engine dynamically scale worker threads up or down based on real-time network conditions.")
+max_hosts_per_domain = str_lit.sidebar.slider(
+    "Max Hosts Per Domain", min_value=1, max_value=6, value=default_hosts, step=1,
+    help="How many discovered IMAP hosts to try per account. STARTTLS and POP rungs are capped separately."
+)
 
 custom_whitelist_input = str_lit.sidebar.text_input("Custom Whitelist Domains (comma-separated)", placeholder="gmail.com, outlook.com")
 custom_blacklist_input = str_lit.sidebar.text_input("Custom Blacklist Domains (comma-separated)", placeholder="spamdomain.com")
@@ -590,22 +601,31 @@ else:
 
 str_lit.sidebar.markdown("---")
 
-use_proxy = instant_help("use_proxy", "Route all checker requests through proxy nodes to prevent IP rate-limiting.", "Use Proxy", widget_type="checkbox", value=True)
-retry_cf = instant_help("retry_cf", "Automatically retry connection failures using alternative fallback paths.", "Retry CF", widget_type="checkbox", value=False)
+use_proxy = instant_help("use_proxy", "Route all checker requests through proxy nodes to prevent IP rate-limiting. UNCHECK for a fully direct connection.", "Use Proxy", widget_type="checkbox", value=True)
+retry_cf = instant_help("retry_cf", "After the proxy route fails with a NETWORK error, make one extra pass with a direct connection.", "Retry CF (Direct Retry)", widget_type="checkbox", value=True)
 self_signed = instant_help("self_signed", "Bypass strict SSL certificate validation errors for secure connections.", "Allow Self-Signed", widget_type="checkbox", value=True)
-proxy_test_flight = instant_help("proxy_test_flight", "Perform an initial health and latency probe on proxies prior to live execution.", "Test Flight", widget_type="checkbox", value=True)
+proxy_test_flight = instant_help("proxy_test_flight", "Probe every proxy for liveness before it enters the live pool. Turn OFF to use the raw pool untouched.", "Test Flight", widget_type="checkbox", value=True)
 skip_app = instant_help("skip_app", "Filter out accounts requiring explicit app passwords or token generation upfront.", "Skip Strict App-Only Providers", widget_type="checkbox", value=True)
 debug_mode = instant_help("debug_mode", "Stream verbose logs and error tracing directly into the UI interface.", "Enable Debug Mode", widget_type="checkbox", value=True)
+
+try_starttls_ui = str_lit.sidebar.toggle(
+    "Enable STARTTLS fallback (port 143 / 110)", value=True,
+    help="If implicit TLS on 993/995 fails, retry the host over STARTTLS. Disable for faster worst-case runs."
+)
 
 resolved_proxy_mode = str_lit.sidebar.selectbox(
     "Proxy Mode Engine:",
     options=["aggressive", "fallback", "sticky", "off"],
-    index=1
+    index=1,
+    help="aggressive: proxy only. fallback: proxy then direct. sticky: one proxy per worker thread. off: never use proxies."
 )
 
-# Configuration state management linked strictly to the apply button
-if "applied_cfg" not in str_lit.session_state:
-    str_lit.session_state.applied_cfg = {
+
+# ---------------------------------------------------------------------------
+# Config builder - single source of truth so we can detect unapplied changes
+# ---------------------------------------------------------------------------
+def build_cfg():
+    return {
         "MODE_NAME": engine_config.mode_name,
         "MAX_WORKERS_START": workers,
         "MAX_WORKERS_MAX": max(workers * 2, engine_config.max_concurrent_checks),
@@ -613,11 +633,12 @@ if "applied_cfg" not in str_lit.session_state:
         "ACCOUNT_DEADLINE": deadline,
         "MAX_ACCOUNTS": max_acc,
         "BLACKLIST_CF": blacklist_cf,
-        "PROXY_MODE": "on" if not use_proxy else resolved_proxy_mode,
+        "PROXY_MODE": resolved_proxy_mode if use_proxy else "off",
         "RETRY_CONNECTION_FAILED": 1 if retry_cf else 0,
         "ALLOW_SELF_SIGNED": self_signed,
         "TLS_STRICT": False,
-        "TRY_STARTTLS": True,
+        "TRY_STARTTLS": try_starttls_ui,
+        "MAX_HOSTS_PER_DOMAIN": max_hosts_per_domain,
         "PROXY_TEST_FLIGHT": proxy_test_flight,
         "SKIP_STRICT_APP_PROVIDERS": skip_app,
         "DEBUG": debug_mode,
@@ -637,46 +658,24 @@ if "applied_cfg" not in str_lit.session_state:
         "MAX_PROXY_TRIES": engine_config.max_retries,
         "PROXY_CONNECT_TIMEOUT": engine_config.connect_timeout,
         "FAST_MODE": engine_config.fast_mode,
-        "FAILURE_COOLDOWN": engine_config.failure_cooldown
+        "FAILURE_COOLDOWN": engine_config.failure_cooldown,
     }
 
+
+if "applied_cfg" not in str_lit.session_state:
+    str_lit.session_state.applied_cfg = build_cfg()
+
+_pending_cfg = build_cfg()
+_settings_dirty = _pending_cfg != str_lit.session_state.applied_cfg
+
+if _settings_dirty:
+    str_lit.sidebar.warning("⚠ You have UNAPPLIED settings changes. Click 💾 Apply Settings.")
+
 if str_lit.sidebar.button("💾 Apply Settings", type="primary"):
-    str_lit.session_state.applied_cfg = {
-        "MODE_NAME": engine_config.mode_name,
-        "MAX_WORKERS_START": workers,
-        "MAX_WORKERS_MAX": max(workers * 2, engine_config.max_concurrent_checks),
-        "TIMEOUT": timeout,
-        "ACCOUNT_DEADLINE": deadline,
-        "MAX_ACCOUNTS": max_acc,
-        "BLACKLIST_CF": blacklist_cf,
-        "PROXY_MODE": "on" if not use_proxy else resolved_proxy_mode,
-        "RETRY_CONNECTION_FAILED": 1 if retry_cf else 0,
-        "ALLOW_SELF_SIGNED": self_signed,
-        "TLS_STRICT": False,
-        "TRY_STARTTLS": True,
-        "PROXY_TEST_FLIGHT": proxy_test_flight,
-        "SKIP_STRICT_APP_PROVIDERS": skip_app,
-        "DEBUG": debug_mode,
-        "MIN_PROXY_SCORE": min_proxy_score,
-        "PROXY_PRECHECK_TIMEOUT": proxy_precheck_timeout,
-        "ALLOW_BLACKLIST_IPS": allow_blacklist_ips,
-        "POOL_MODE": pool_mode,
-        "SELECTED_COUNTRIES": selected_countries,
-        "SELECTED_MIX_COUNTRIES": selected_mix_countries,
-        "DYNAMIC_WORKER_SCALING": dynamic_worker_scaling,
-        "CUSTOM_WHITELIST": [d.strip().lower() for d in custom_whitelist_input.split(",") if d.strip()],
-        "CUSTOM_BLACKLIST": [d.strip().lower() for d in custom_blacklist_input.split(",") if d.strip()],
-        "PROXY_FILE": "proxies.txt",
-        "RESULTS_DIR": "mail_results",
-        "CACHE_FILE": "domain_cache.json",
-        "PROXY_META_FILE": "proxy_meta.json",
-        "MAX_PROXY_TRIES": engine_config.max_retries,
-        "PROXY_CONNECT_TIMEOUT": engine_config.connect_timeout,
-        "FAST_MODE": engine_config.fast_mode,
-        "FAILURE_COOLDOWN": engine_config.failure_cooldown
-    }
+    str_lit.session_state.applied_cfg = build_cfg()
     str_lit.sidebar.success("Settings applied successfully!")
     log_startup("User applied new configuration settings via sidebar control panel.")
+    str_lit.rerun()
 
 CFG = str_lit.session_state.applied_cfg
 
@@ -684,10 +683,27 @@ CFG = str_lit.session_state.applied_cfg
 CFG.setdefault("ALLOW_SELF_SIGNED", True)
 CFG.setdefault("TLS_STRICT", False)
 CFG.setdefault("TRY_STARTTLS", True)
+CFG.setdefault("MAX_HOSTS_PER_DOMAIN", 2)
 CFG.setdefault("TIMEOUT", 10)
+CFG.setdefault("ACCOUNT_DEADLINE", 45)
 CFG.setdefault("PROXY_CONNECT_TIMEOUT", 5.0)
 CFG.setdefault("FAILURE_COOLDOWN", 30.0)
 CFG.setdefault("FAST_MODE", False)
+CFG.setdefault("BLACKLIST_CF", 15)
+CFG.setdefault("DEBUG", False)
+CFG.setdefault("PROXY_TEST_FLIGHT", True)
+CFG.setdefault("RETRY_CONNECTION_FAILED", 0)
+CFG.setdefault("MAX_ACCOUNTS", 5000)
+CFG.setdefault("MAX_WORKERS_START", 30)
+CFG.setdefault("DYNAMIC_WORKER_SCALING", True)
+CFG.setdefault("PROXY_MODE", "fallback")
+
+log_startup(
+    f"ACTIVE CONFIG -> mode={CFG.get('MODE_NAME')} workers={CFG.get('MAX_WORKERS_START')} "
+    f"deadline={CFG.get('ACCOUNT_DEADLINE')}s timeout={CFG.get('TIMEOUT')}s "
+    f"proxy_mode={CFG.get('PROXY_MODE')} hosts/domain={CFG.get('MAX_HOSTS_PER_DOMAIN')} "
+    f"starttls={CFG.get('TRY_STARTTLS')} self_signed={CFG.get('ALLOW_SELF_SIGNED')}"
+)
 
 try:
     os.makedirs(CFG["RESULTS_DIR"], exist_ok=True)
@@ -1327,6 +1343,34 @@ def drop_before_check(email):
         return "disposable"
     return ""
 
+
+def _host_rank(host, domain):
+    """Lower = try first. SMTP/web hosts and the bare domain are near-useless
+    on 993/143/995/110 and were burning the whole time budget."""
+    h = (host or "").lower()
+    if not h:
+        return 9
+    if h == domain:
+        return 8
+    if h.startswith(("mx", "smtp", "mailgun", "sendgrid", "amazonses")):
+        return 7
+    if h.startswith(("imap", "imaps")):
+        return 0
+    if h.startswith(("ssl", "secure")):
+        return 1
+    if h.startswith("mail"):
+        return 2
+    if h.startswith(("pop", "pop3", "webmail")):
+        return 3
+    return 4
+
+
+def _rank_hosts(hosts, domain):
+    indexed = list(enumerate(hosts))
+    indexed.sort(key=lambda t: (_host_rank(t[1], domain), t[0]))
+    return [h for _i, h in indexed]
+
+
 def get_servers(email):
     try:
         domain = email.split("@")[-1].lower().strip()
@@ -1335,6 +1379,10 @@ def get_servers(email):
 
         known = known_provider_conf(domain)
         if known:
+            if known.get("imap"):
+                known["imap"] = _rank_hosts(known["imap"], domain)
+            if known.get("pop"):
+                known["pop"] = _rank_hosts(known["pop"], domain)
             return known
 
         parent_domain = detect_parent_provider(domain)
@@ -1349,7 +1397,7 @@ def get_servers(email):
             return PROVIDER_MAP[domain]
 
         mx_records = get_mx_hosts(domain) if parent_domain not in PARENT_PROVIDER_MAPPINGS else []
-        candidate_hosts = [h for h in generate_candidate_hosts(domain, mx_records) if not h.startswith(("smtp.", "secure.", "pop3."))][:4]
+        candidate_hosts = _rank_hosts(generate_candidate_hosts(domain, mx_records), domain)
 
         servers = {
             "imap": candidate_hosts,
@@ -1380,6 +1428,13 @@ def refresh_alive_pool():
         raw = get_filtered_active_proxies()
     except Exception:
         raw = []
+
+    # PROXY_TEST_FLIGHT=off -> trust the raw pool, skip the liveness probe
+    if not CFG.get("PROXY_TEST_FLIGHT", True):
+        with alive_pool_lock:
+            alive_pool[:] = raw
+        return
+
     live = []
     for p in raw:
         if precheck_proxy_fast(p):
@@ -1421,24 +1476,19 @@ def precheck_proxy_fast(proxy_str):
         now = time.time()
         with proxy_lock:
             if proxy_str in circuit_breaker_until and now < circuit_breaker_until[proxy_str]:
-                bad_proxies.add(proxy_str)
                 return False
 
         info = parse_proxy(proxy_str)
         if not info or not SOCKS_OK:
-            bad_proxies.add(proxy_str)
             return False
 
         precheck_timeout = float(CFG.get("PROXY_PRECHECK_TIMEOUT", 3))
         if not is_proxy_alive(info["host"], info["port"], timeout=precheck_timeout):
             record_proxy_attempt(proxy_str, success=False, is_network_error=True)
-            bad_proxies.add(proxy_str)
             return False
 
         return True
     except Exception:
-        if proxy_str:
-            bad_proxies.add(proxy_str)
         return False
 
 def fast_fail_dns_check(host):
@@ -1449,7 +1499,7 @@ def fast_fail_dns_check(host):
         return False
 
 # ============================================================================
-# SOCKET + TLS LAYER  (FIXED)
+# SOCKET + TLS LAYER
 # ============================================================================
 
 def proxy_connect(host, port, proxy_str, timeout=None, remote_dns=True):
@@ -1474,7 +1524,7 @@ def proxy_connect(host, port, proxy_str, timeout=None, remote_dns=True):
             raise RuntimeError(f"Fast-fail DNS check failed: Host '{host}' does not resolve locally")
         s = socket.create_connection((host, port), timeout=effective_timeout)
         s.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
-        s.settimeout(CFG["TIMEOUT"])
+        s.settimeout(effective_timeout)
         return s
 
     info = parse_proxy(proxy_str)
@@ -1495,7 +1545,7 @@ def proxy_connect(host, port, proxy_str, timeout=None, remote_dns=True):
                 kwargs["proxy_password"] = info["pass"]
             s = socks.create_connection((host, port), timeout=effective_timeout, **kwargs)
             s.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
-            s.settimeout(CFG["TIMEOUT"])
+            s.settimeout(effective_timeout)
             return s
         except Exception as proxy_ex:
             last_err = proxy_ex
@@ -1507,7 +1557,7 @@ def proxy_connect(host, port, proxy_str, timeout=None, remote_dns=True):
             warnings.warn(f"All proxy routes failed for {host}:{port}. Initiating direct fallback connection.")
             direct_sock = socket.create_connection((host, port), timeout=effective_timeout)
             direct_sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
-            direct_sock.settimeout(CFG["TIMEOUT"])
+            direct_sock.settimeout(effective_timeout)
             return direct_sock
         except Exception as direct_ex:
             raise RuntimeError(f"Proxy and direct fallback connection both failed: {direct_ex}")
@@ -1536,24 +1586,21 @@ def get_legacy_ssl_context(hostname: str):
 
 
 def _raw_socket(host, port, proxy_str=None, timeout=None):
-    timeout = timeout or CFG["TIMEOUT"]
+    t = timeout or CFG["TIMEOUT"]
     if proxy_str and proxy_str != "direct":
-        s = proxy_connect(host, port, proxy_str, timeout=timeout)
+        s = proxy_connect(host, port, proxy_str, timeout=t)
     else:
         if not fast_fail_dns_check(host):
             raise RuntimeError(f"Fast-fail DNS check failed: Host '{host}' does not resolve locally")
-        s = socket.create_connection((host, port), timeout=timeout)
+        s = socket.create_connection((host, port), timeout=t)
     s.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
-    s.settimeout(CFG["TIMEOUT"])
+    s.settimeout(t)
     return s
 
 
 def ssl_wrap(sock, host, insecure=True):
-    """Wrap ONE fresh socket.
-
-    A socket that already went through a FAILED SSLContext.wrap_socket() is
-    detached (fileno -1) AND has its fd closed by CPython. Never re-wrap it.
-    """
+    """Wrap ONE fresh socket. A socket that already went through a FAILED
+    SSLContext.wrap_socket() is detached (fileno -1) AND has its fd closed."""
     if sock is None:
         raise ssl.SSLError("ssl_wrap: socket is None")
     if sock.fileno() < 0:
@@ -1583,7 +1630,13 @@ def tls_connect(host, port, proxy_str=None, insecure=True, timeout=None):
 
 
 # ============================================================================
-# PROTOCOL CLIENTS  (mirror stdlib open()/_create_socket() exactly)
+# PROTOCOL CLIENTS
+#
+# IMPORTANT: override _create_socket(), NOT open().
+# On Python 3.13+ imaplib.IMAP4.file is a read-only property, so the
+# stdlib open() assigns whatever backing attribute its own version uses.
+# Overriding open() and doing `self.file = ...` raises
+# "property 'file' of 'ProxyIMAP4SSL' object has no setter".
 # ============================================================================
 
 class ProxyIMAP4SSL(imaplib.IMAP4_SSL):
@@ -1592,12 +1645,9 @@ class ProxyIMAP4SSL(imaplib.IMAP4_SSL):
         self._insecure = insecure
         super().__init__(host, port, timeout=timeout)
 
-    def open(self, host="", port=993, timeout=None):
-        self.host = host
-        self.port = port
-        self.sock = tls_connect(host, port, self._proxy_str,
-                                insecure=self._insecure, timeout=timeout)
-        self.file = self.sock.makefile("rb")
+    def _create_socket(self, timeout):
+        return tls_connect(self.host, self.port, self._proxy_str,
+                           insecure=self._insecure, timeout=timeout)
 
 
 class ProxyIMAP4(imaplib.IMAP4):
@@ -1605,11 +1655,8 @@ class ProxyIMAP4(imaplib.IMAP4):
         self._proxy_str = proxy_str
         super().__init__(host, port, timeout=timeout)
 
-    def open(self, host="", port=143, timeout=None):
-        self.host = host
-        self.port = port
-        self.sock = _raw_socket(host, port, self._proxy_str, timeout)
-        self.file = self.sock.makefile("rb")
+    def _create_socket(self, timeout):
+        return _raw_socket(self.host, self.port, self._proxy_str, timeout)
 
 
 class ProxyPOP3SSL(poplib.POP3_SSL):
@@ -1647,7 +1694,8 @@ def classify_error(err, domain=""):
             return APP
         if any(k in err_str for k in (
             "application-specific password", "app password", "app-password",
-            "basic authentication is disabled", "web login required",
+            "app password required", "basic authentication is disabled",
+            "web login required", "log in via your web browser", "web browser",
             "logindisabled", "login disabled", "two-factor", "2fa", "mfa",
             "enable imap", "imap access is disabled", "token",
         )):
@@ -1660,7 +1708,7 @@ def classify_error(err, domain=""):
             "invalid user name or password", "login failed", "auth failed",
             "bad username", "logon failure", "username and password not accepted",
             "[auth]", "authenticate failed", "pop3 user rejected", "pop3 password rejected",
-            "pop3 password rejected", "login returned non-ok", "login non-ok",
+            "login returned non-ok", "login non-ok",
         )):
             return WRONG
 
@@ -1671,6 +1719,7 @@ def classify_error(err, domain=""):
             "certificate verify failed", "hostname mismatch", "certificate has expired",
             "self signed certificate", "self-signed certificate",
             "bad file descriptor", "tlsv1", "wrong version number", "eof occurred",
+            "unexpected_eof", "no setter",
         )):
             return FAILED
 
@@ -1680,7 +1729,7 @@ def classify_error(err, domain=""):
             "network is unreachable", "name or service not known", "gaierror",
             "reset by peer", "broken pipe", "fast-fail dns check failed",
             "socket.timeout", "connectionrefusederror", "unreachable",
-            "no route to host", "too many", "rate", "throttl",
+            "no route to host", "too many", "rate limit", "throttl",
         )):
             return FAILED
     except Exception:
@@ -1689,9 +1738,15 @@ def classify_error(err, domain=""):
 
 
 def record_proxy_attempt(proxy_str, success, is_network_error=False):
+    """Circuit-breaker is TIME-BOXED and self-clearing.
+
+    bad_proxies is only the permanent seed list; per-run penalties live in
+    circuit_breaker_until so a healthy proxy is never lost for the session.
+    """
     try:
         if not proxy_str:
             return
+        threshold = int(CFG.get("BLACKLIST_CF", 15))
         with proxy_lock:
             if proxy_str not in proxy_meta:
                 proxy_meta[proxy_str] = {"fails": 0, "success": 0, "country": "Unknown", "region": "Unknown", "latency_ms": 0}
@@ -1703,9 +1758,9 @@ def record_proxy_attempt(proxy_str, success, is_network_error=False):
                 m["fails"] = m.get("fails", 0) + 1
                 if is_network_error:
                     consecutive_proxy_failures[proxy_str] += 1
-                    if consecutive_proxy_failures[proxy_str] >= 6:
+                    if consecutive_proxy_failures[proxy_str] >= threshold:
                         circuit_breaker_until[proxy_str] = time.time() + 30.0
-                        bad_proxies.add(proxy_str)
+                        consecutive_proxy_failures[proxy_str] = 0
             m["score"] = compute_real_score(m.get("success", 0), m.get("fails", 0))
     except Exception as e:
         warnings.warn(f"Error recording proxy attempt: {e}")
@@ -1715,10 +1770,11 @@ def record_proxy_attempt(proxy_str, success, is_network_error=False):
 # ATTEMPT HELPERS
 # ============================================================================
 
-def imap_once(email, password, server, proxy_str=None, insecure=True, port=993):
+def imap_once(email, password, server, proxy_str=None, insecure=True, port=993, attempt_timeout=None):
+    to = attempt_timeout or CFG["TIMEOUT"]
     mail = None
     try:
-        mail = ProxyIMAP4SSL(server, port, timeout=CFG["TIMEOUT"],
+        mail = ProxyIMAP4SSL(server, port, timeout=to,
                              proxy_str=proxy_str, insecure=insecure)
         typ, data = mail.login(email.strip(), password.strip())
         if typ != 'OK':
@@ -1737,10 +1793,11 @@ def imap_once(email, password, server, proxy_str=None, insecure=True, port=993):
             except Exception: pass
 
 
-def imap_starttls_once(email, password, server, proxy_str=None, insecure=True, port=143):
+def imap_starttls_once(email, password, server, proxy_str=None, insecure=True, port=143, attempt_timeout=None):
+    to = attempt_timeout or CFG["TIMEOUT"]
     mail = None
     try:
-        mail = ProxyIMAP4(server, port, timeout=CFG["TIMEOUT"], proxy_str=proxy_str)
+        mail = ProxyIMAP4(server, port, timeout=to, proxy_str=proxy_str)
         mail.starttls(ssl_context=_tls_context(server, verify=not insecure))
         typ, data = mail.login(email.strip(), password.strip())
         if typ != 'OK':
@@ -1758,14 +1815,15 @@ def imap_starttls_once(email, password, server, proxy_str=None, insecure=True, p
             except Exception: pass
 
 
-def pop_once(email, password, server, proxy_str=None, insecure=True, port=995):
+def pop_once(email, password, server, proxy_str=None, insecure=True, port=995, attempt_timeout=None):
+    to = attempt_timeout or CFG["TIMEOUT"]
     mail = None
     try:
-        mail = ProxyPOP3SSL(server, port, timeout=CFG["TIMEOUT"],
+        mail = ProxyPOP3SSL(server, port, timeout=to,
                             proxy_str=proxy_str, insecure=insecure)
 
         banner = mail.getwelcome()
-        if not banner or (b"+OK" not in banner and "+OK" not in str(banner)):
+        if not banner or b"+OK" not in banner:
             raise RuntimeError(f"POP3 invalid welcome banner: {banner}")
 
         resp_user = mail.user(email.strip())
@@ -1777,8 +1835,10 @@ def pop_once(email, password, server, proxy_str=None, insecure=True, port=995):
             raise RuntimeError(f"POP3 password rejected: {resp_pass}")
 
         # --- Strict post-auth validation (anti captive-portal spoofing) ---
+        # NOTE: POP3.stat() returns the RAW RESPONSE BYTES (b'+OK n size'),
+        # not a tuple. stat_resp[0] is the int 43 -- the byte for '+'.
         stat_resp = mail.stat()
-        if not stat_resp or not stat_resp[0].startswith(b"+OK"):
+        if not stat_resp or not stat_resp.startswith(b"+OK"):
             raise RuntimeError(f"POP3 post-auth stat failed (possible proxy spoofing): {stat_resp}")
 
         try: mail.noop()
@@ -1789,10 +1849,11 @@ def pop_once(email, password, server, proxy_str=None, insecure=True, port=995):
             except Exception: pass
 
 
-def pop_starttls_once(email, password, server, proxy_str=None, insecure=True, port=110):
+def pop_starttls_once(email, password, server, proxy_str=None, insecure=True, port=110, attempt_timeout=None):
+    to = attempt_timeout or CFG["TIMEOUT"]
     mail = None
     try:
-        mail = ProxyPOP3(server, port, timeout=CFG["TIMEOUT"], proxy_str=proxy_str)
+        mail = ProxyPOP3(server, port, timeout=to, proxy_str=proxy_str)
         mail.stls(context=_tls_context(server, verify=not insecure))
 
         resp_user = mail.user(email.strip())
@@ -1804,7 +1865,7 @@ def pop_starttls_once(email, password, server, proxy_str=None, insecure=True, po
             raise RuntimeError(f"POP3 STLS password rejected: {resp_pass}")
 
         stat_resp = mail.stat()
-        if not stat_resp or not stat_resp[0].startswith(b"+OK"):
+        if not stat_resp or not stat_resp.startswith(b"+OK"):
             raise RuntimeError(f"POP3 STLS post-auth stat failed: {stat_resp}")
 
         try: mail.noop()
@@ -1844,7 +1905,7 @@ def verify_and_connect(target_email, target_pass, hosts, proxy_str=None):
 def read_mailbox_messages(email, password, server, proxy_str=None, limit=10):
     mail = None
     try:
-        conf_hosts = get_servers(email).get("imap", [server])
+        conf_hosts = get_servers(email).get("imap", []) or [server]
         verified, mail, active_host = verify_and_connect(email, password, conf_hosts, proxy_str=proxy_str)
         if not verified or not mail:
             return ["Error reading mailbox: True credential verification failed."]
@@ -1891,15 +1952,21 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, 
         elif ts:
             failed_domain_cache.pop(domain, None)
 
+    t_start = time.time()
     current_px = None
     try:
         if conf.get("type") == "zero_access":
             trace_logs.append("Architecture: Zero-Access / Bridge detected.")
             return None, "need_app_password", "Zero-Access Architecture | Protocol: Local API / Bridge", None, trace_logs
 
-        proxy_mode = CFG.get("PROXY_MODE", "aggressive")
+        proxy_mode = CFG.get("PROXY_MODE", "fallback")
         prefer_insecure = bool(CFG.get("ALLOW_SELF_SIGNED", True))
         try_starttls = bool(CFG.get("TRY_STARTTLS", True))
+        max_hosts = max(1, int(CFG.get("MAX_HOSTS_PER_DOMAIN", 2)))
+
+        # --- Per-account wall-clock budget so one dead domain can't stall a run ---
+        budget = max(8.0, float(CFG.get("ACCOUNT_DEADLINE", 45)) * 0.8)
+        per_attempt = max(3.0, min(float(CFG.get("TIMEOUT", 10)), budget / 6.0))
 
         px = None
         if proxy_pool and proxy_mode != "off":
@@ -1910,20 +1977,17 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, 
             else:
                 px = sample_alive_proxy()
 
-        proxies_to_try = [px] if px else [None]
-        if proxy_mode == "fallback" and px:
-            proxies_to_try.append(None)
+        imap_hosts = [h for h in (conf.get("imap") or [])[:max_hosts] if h]
+        pop_hosts = [h for h in ((conf.get("pop") or conf.get("pop3") or [])[:1]) if h]
 
-        max_attempts = max(1, min(len(conf.get("imap", []) or [""]), 2))
-        imap_hosts = [h for h in (conf.get("imap") or [])[:max_attempts] if h]
-        pop_hosts = [h for h in ((conf.get("pop") or conf.get("pop3") or [])[:max_attempts]) if h]
-
-        # --- Ordered ladder: implicit TLS first (most common), then STARTTLS ---
+        # --- Ordered ladder: implicit TLS first, then STARTTLS ---
+        # STARTTLS only for the top-2 hosts, POP only for the top-1 host, so the
+        # worst case stays inside the budget instead of 12+ network round trips.
         plan = []
         for h in imap_hosts:
             plan.append(("IMAP", h, 993, "ssl"))
         if try_starttls:
-            for h in imap_hosts:
+            for h in imap_hosts[:2]:
                 plan.append(("IMAP", h, 143, "starttls"))
         for h in pop_hosts:
             plan.append(("POP", h, 995, "ssl"))
@@ -1935,55 +1999,80 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, 
             trace_logs.append("No candidate hosts for this domain.")
             return None, FAILED, "no candidate hosts", None, trace_logs
 
-        for current_px in proxies_to_try:
-            if current_px and any(bp in current_px for bp in bad_proxies):
-                continue
-
+        def run_plan(px_used):
+            """Returns (result_tuple_or_None, had_network_failure)."""
+            had_net_fail = False
             for proto, server, port, tls_mode in plan:
-                trace_logs.append(f"{px_tag(current_px)} Attempting {proto} {tls_mode.upper()} -> Host: {server}:{port}")
+                if time.time() - t_start > budget:
+                    trace_logs.append(f"Per-account budget {budget:.0f}s reached; stopping ladder.")
+                    return None, had_net_fail
+
+                trace_logs.append(f"{px_tag(px_used)} Attempting {proto} {tls_mode.upper()} -> Host: {server}:{port}")
                 try:
                     if proto == "IMAP":
                         if tls_mode == "ssl":
-                            imap_once(email, password, server, current_px, insecure=prefer_insecure, port=port)
+                            imap_once(email, password, server, px_used, insecure=prefer_insecure,
+                                      port=port, attempt_timeout=per_attempt)
                         else:
-                            imap_starttls_once(email, password, server, current_px, insecure=prefer_insecure, port=port)
+                            imap_starttls_once(email, password, server, px_used, insecure=prefer_insecure,
+                                               port=port, attempt_timeout=per_attempt)
                     else:
                         if tls_mode == "ssl":
-                            pop_once(email, password, server, current_px, insecure=prefer_insecure, port=port)
+                            pop_once(email, password, server, px_used, insecure=prefer_insecure,
+                                     port=port, attempt_timeout=per_attempt)
                         else:
-                            pop_starttls_once(email, password, server, current_px, insecure=prefer_insecure, port=port)
+                            pop_starttls_once(email, password, server, px_used, insecure=prefer_insecure,
+                                              port=port, attempt_timeout=per_attempt)
 
-                    record_proxy_attempt(current_px, success=True)
-                    trace_logs.append(f"{px_tag(current_px)} Post-auth {proto} verification OK on {server}:{port}")
-                    return server, VALID, f"{px_tag(current_px)} {proto} | Host: {server} | Port: {port}", current_px, trace_logs
+                    record_proxy_attempt(px_used, success=True)
+                    trace_logs.append(f"{px_tag(px_used)} Post-auth {proto} verification OK on {server}:{port}")
+                    return (server, VALID, f"{px_tag(px_used)} {proto} | Host: {server} | Port: {port}", px_used, trace_logs), had_net_fail
 
                 except ssl.SSLError as ssl_err:
                     st_val = classify_error(ssl_err, domain)
-                    record_proxy_attempt(current_px, success=False, is_network_error=(st_val == FAILED))
-                    trace_logs.append(f"{px_tag(current_px)} -> TLS FAILED {proto} {server}:{port}: {str(ssl_err)[:90]} [Classified: {st_val}]")
+                    if st_val == FAILED:
+                        had_net_fail = True
+                    record_proxy_attempt(px_used, success=False, is_network_error=(st_val == FAILED))
+                    trace_logs.append(f"{px_tag(px_used)} -> TLS FAILED {proto} {server}:{port}: {str(ssl_err)[:90]} [Classified: {st_val}]")
                     continue
 
                 except (socket.timeout, socket.error, ConnectionRefusedError) as sock_err:
                     st_val = classify_error(sock_err, domain)
-                    record_proxy_attempt(current_px, success=False, is_network_error=True)
-                    trace_logs.append(f"{px_tag(current_px)} -> SOCKET FAILED {proto} {server}:{port}: {str(sock_err)[:90]} [Classified: {st_val}]")
+                    had_net_fail = True
+                    record_proxy_attempt(px_used, success=False, is_network_error=True)
+                    trace_logs.append(f"{px_tag(px_used)} -> SOCKET FAILED {proto} {server}:{port}: {str(sock_err)[:90]} [Classified: {st_val}]")
                     continue
 
                 except (imaplib.IMAP4.error, poplib.error_proto) as proto_err:
                     st_val = classify_error(proto_err, domain)
-                    record_proxy_attempt(current_px, success=False, is_network_error=False)
-                    trace_logs.append(f"{px_tag(current_px)} -> AUTH {proto} {server}:{port}: {str(proto_err)[:90]} [Classified: {st_val}]")
+                    record_proxy_attempt(px_used, success=False, is_network_error=False)
+                    trace_logs.append(f"{px_tag(px_used)} -> AUTH {proto} {server}:{port}: {str(proto_err)[:90]} [Classified: {st_val}]")
                     if st_val in (WRONG, APP):
-                        return None, st_val, f"{px_tag(current_px)} {proto} {server} -> {st_val}", current_px, trace_logs
+                        return (None, st_val, f"{px_tag(px_used)} {proto} {server} -> {st_val}", px_used, trace_logs), had_net_fail
                     continue
 
                 except Exception as e:
                     st_val = classify_error(e, domain)
-                    record_proxy_attempt(current_px, success=False, is_network_error=(st_val == FAILED))
-                    trace_logs.append(f"{px_tag(current_px)} -> FAILED {proto} {server}:{port}: {str(e)[:90]} [Classified: {st_val}]")
+                    if st_val == FAILED:
+                        had_net_fail = True
+                    record_proxy_attempt(px_used, success=False, is_network_error=(st_val == FAILED))
+                    trace_logs.append(f"{px_tag(px_used)} -> FAILED {proto} {server}:{port}: {str(e)[:90]} [Classified: {st_val}]")
                     if st_val in (WRONG, APP):
-                        return None, st_val, f"{px_tag(current_px)} {proto} {server} -> {st_val}", current_px, trace_logs
+                        return (None, st_val, f"{px_tag(px_used)} {proto} {server} -> {st_val}", px_used, trace_logs), had_net_fail
                     continue
+            return None, had_net_fail
+
+        # --- Pass 1: proxy (or direct if proxy is off) ---
+        result, net_fail = run_plan(px)
+        if result:
+            return result
+
+        # --- Pass 2: direct retry, only if the proxy route actually had NETWORK
+        #     failures (if it answered with auth errors, direct won't differ) ---
+        if px and net_fail and (proxy_mode == "fallback" or CFG.get("RETRY_CONNECTION_FAILED")):
+            result, _ = run_plan(None)
+            if result:
+                return result
 
     except Exception as e:
         trace_logs.append(f"Critical Exception in runner: {str(e)}")
@@ -2032,6 +2121,12 @@ if start_engine_btn:
     start_alive_refresher()
     refresh_alive_pool()
     log_startup(f"Live checking engine execution triggered in [{CFG['MODE_NAME']}] mode on category: [{engine_action_mode}].")
+    log_startup(
+        f"RUN CONFIG -> workers={CFG.get('MAX_WORKERS_START')} deadline={CFG.get('ACCOUNT_DEADLINE')}s "
+        f"proxy_mode={CFG.get('PROXY_MODE')} hosts/domain={CFG.get('MAX_HOSTS_PER_DOMAIN')} "
+        f"starttls={CFG.get('TRY_STARTTLS')} retry_direct={CFG.get('RETRY_CONNECTION_FAILED')} "
+        f"debug={CFG.get('DEBUG')} test_flight={CFG.get('PROXY_TEST_FLIGHT')}"
+    )
 
     resume_lines = []
     if engine_action_mode == "Resume Unfinished" and unfinished_runs and unfinished_pick and unfinished_pick != "none saved":
@@ -2093,6 +2188,7 @@ if start_engine_btn:
         total_accs = len(all_target_accounts)
         checked_count = 0
         thread_local = threading.local()
+        log_cap = 200 if CFG.get("DEBUG", False) else 50
 
         def check_task(line):
             try:
@@ -2159,7 +2255,7 @@ if start_engine_btn:
 
                                 log_msg = f"[{st_val.upper()}] {res.get('email', '')} -> {res.get('detail', '')}"
                                 str_lit.session_state.log_lines.append(log_msg)
-                                if len(str_lit.session_state.log_lines) > 50:
+                                if len(str_lit.session_state.log_lines) > log_cap:
                                     str_lit.session_state.log_lines.pop(0)
 
                                 trace_text = "\n  ↳ ".join(res.get("trace", ["No trace recorded"]))
