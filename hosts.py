@@ -5,6 +5,7 @@ import re
 import json
 import time
 import socket
+import tempfile
 import threading
 
 try:
@@ -175,37 +176,163 @@ MX_PROVIDER_MAP = (
       "netsol", "network solutions", "webhostingpad", "stablehost", "hawkhost"), (None, None)),
 )
 
+# MX / mail-router hostnames that are almost never the user-facing IMAP endpoint.
+# Used only to DEMOTE (never remove) so a live router host still beats a dead one.
+_JUNK_HOST_MARKERS = (
+    "mx", "mx1", "mx2", "mx3", "smtp", "inbound", "outbound", "spool",
+    "filter", "relay", "gateway", "spam", "cluster", "edge", "aspmx",
+    "mailrouter", "eur.olc", "olc.protection", "hs.", "lb.",
+)
+
 
 # ============================================================================
 # CACHES
 # ============================================================================
 
 _CACHE_FILE = "hosts_cache.json"
-_CACHE_TTL = 86400  # 24h
-_cache_lock = threading.Lock()
+_CACHE_TTL = 86400          # 24h - entry considered fresh
+_CACHE_MAX_AGE = 7 * 86400  # 7d  - entry pruned entirely
+_cache_lock = threading.RLock()   # RLock: _save_cache() may be called while held
 _cache = None
 
 _resolve_lock = threading.Lock()
 _resolve_cache = {}
 
 
-def _load_cache():
-    global _cache
-    if _cache is None:
+def _atomic_write_json(path, obj, indent=2):
+    """Write JSON via temp file + os.replace() so readers NEVER see a partial file.
+
+    os.replace() is atomic on POSIX and Windows, so the destination is either the
+    complete old file or the complete new file - never a truncated one.
+    """
+    directory = os.path.dirname(os.path.abspath(path)) or "."
+    try:
+        os.makedirs(directory, exist_ok=True)
+    except Exception:
+        pass
+
+    payload = json.dumps(obj, indent=indent)
+    fd, tmp_path = tempfile.mkstemp(
+        prefix=os.path.basename(path) + ".", suffix=".tmp", dir=directory
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(payload)
+            f.flush()
+            try:
+                os.fsync(f.fileno())
+            except Exception:
+                pass
+        os.replace(tmp_path, path)
+    except Exception:
         try:
-            with open(_CACHE_FILE, encoding="utf-8") as f:
-                _cache = json.load(f)
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
         except Exception:
-            _cache = {}
+            pass
+        raise
+
+    # fsync the directory so the rename itself survives a hard power loss (POSIX)
+    try:
+        dir_fd = os.open(directory, os.O_RDONLY)
+        try:
+            os.fsync(dir_fd)
+        finally:
+            os.close(dir_fd)
+    except Exception:
+        pass
+
+    return payload
+
+
+def _load_cache():
+    """Load cache, healing a corrupt/truncated main file from the .bak copy."""
+    global _cache
+    if _cache is not None:
+        return _cache
+
+    for candidate in (_CACHE_FILE, _CACHE_FILE + ".bak"):
+        if not os.path.exists(candidate):
+            continue
+        try:
+            with open(candidate, encoding="utf-8") as f:
+                parsed = json.load(f)
+            if isinstance(parsed, dict):
+                _cache = parsed
+                if candidate.endswith(".bak"):
+                    # main file was corrupt or partial - restore it atomically
+                    try:
+                        _atomic_write_json(_CACHE_FILE, parsed)
+                    except Exception:
+                        pass
+                return _cache
+        except Exception:
+            continue
+
+    _cache = {}
     return _cache
 
 
 def _save_cache():
+    """Atomically persist the cache, prune stale entries, keep one .bak copy."""
     try:
-        with open(_CACHE_FILE, "w", encoding="utf-8") as f:
-            json.dump(_cache, f, indent=2)
+        now = time.time()
+        with _cache_lock:
+            data = _cache if _cache is not None else {}
+            for k in [k for k, v in data.items()
+                      if not isinstance(v, dict)
+                      or (now - float(v.get("ts", 0))) >= _CACHE_MAX_AGE]:
+                data.pop(k, None)
+            snapshot = dict(data)
+
+        payload = _atomic_write_json(_CACHE_FILE, snapshot)
+
+        try:
+            with open(_CACHE_FILE + ".bak", "w", encoding="utf-8") as f:
+                f.write(payload)
+        except Exception:
+            pass
+
+        return True
+    except Exception:
+        return False
+
+
+def flush_cache():
+    """Public: force an atomic cache write right now."""
+    return _save_cache()
+
+
+def clear_cache():
+    """Public: drop the cache from memory and disk."""
+    global _cache
+    with _cache_lock:
+        _cache = {}
+    try:
+        if os.path.exists(_CACHE_FILE):
+            os.remove(_CACHE_FILE)
     except Exception:
         pass
+    try:
+        if os.path.exists(_CACHE_FILE + ".bak"):
+            os.remove(_CACHE_FILE + ".bak")
+    except Exception:
+        pass
+    return True
+
+
+def cache_stats():
+    """Public: quick health view of the on-disk cache."""
+    stats = {"entries": 0, "file_bytes": 0, "path": _CACHE_FILE,
+             "has_backup": os.path.exists(_CACHE_FILE + ".bak"), "healthy": True}
+    try:
+        with _cache_lock:
+            stats["entries"] = len(_load_cache())
+        if os.path.exists(_CACHE_FILE):
+            stats["file_bytes"] = os.path.getsize(_CACHE_FILE)
+    except Exception:
+        stats["healthy"] = False
+    return stats
 
 
 def _dedupe(seq):
@@ -214,6 +341,14 @@ def _dedupe(seq):
         if x and x not in out:
             out.append(x)
     return out
+
+
+def _is_junk_host(host):
+    h = (host or "").lower()
+    if not h:
+        return True
+    label = h.split(".")[0]
+    return any(label.startswith(m) for m in _JUNK_HOST_MARKERS)
 
 
 # ============================================================================
@@ -464,14 +599,10 @@ def discover_hosts(domain, email=None, use_cache=True, force_refresh=False):
             pop.append(h)
     sources.append("prefix")
 
-    # 6. Promote hosts that actually exist in DNS
-    live_imap = [h for h in imap if host_resolves(h)]
-    dead_imap = [h for h in imap if h not in live_imap]
-    imap = live_imap + dead_imap
-
-    live_pop = [h for h in pop if host_resolves(h)]
-    dead_pop = [h for h in pop if h not in live_pop]
-    pop = live_pop + dead_pop
+    # 6. Rank: LIVE hosts first, then non-junk before mail-router junk.
+    #    Stable sort keeps discovery order inside each tier. Demote, never drop.
+    imap = sorted(imap, key=lambda h: (not host_resolves(h), _is_junk_host(h)))
+    pop = sorted(pop, key=lambda h: (not host_resolves(h), _is_junk_host(h)))
 
     # 7. Universal fallbacks last
     for fb in UNIVERSAL_IMAP_FALLBACKS:
@@ -481,14 +612,14 @@ def discover_hosts(domain, email=None, use_cache=True, force_refresh=False):
         if fb not in pop:
             pop.append(fb)
 
-    imap = _dedupe(imap)[:6]
-    pop = _dedupe(pop)[:5]
+    imap = _dedupe(imap)[:8]
+    pop = _dedupe(pop)[:6]
 
-    if use_cache:
-        with _cache_lock:
-            c = _load_cache()
-            c[domain] = {"imap": imap, "pop": pop, "sources": sources, "ts": time.time()}
-            _save_cache()
+    with _cache_lock:
+        c = _load_cache()
+        c[domain] = {"imap": imap, "pop": pop, "sources": sources, "ts": time.time()}
+    # write OUTSIDE the lock so 30 workers don't serialise on disk I/O
+    _save_cache()
 
     return {"imap": imap, "pop": pop, "sources": sources}
 
