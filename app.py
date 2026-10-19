@@ -4,6 +4,8 @@ import poplib
 import ssl
 import json
 import os
+import re
+import html
 import random
 import threading
 import socket
@@ -20,176 +22,9 @@ import pandas as pd
 import concurrent.futures
 from dataclasses import dataclass, field
 from typing import List, Dict, Optional
-import re
-
-# ============================================================================
-# RESILIENT IMPORTS
-#
-# hosts.py exists in two shapes depending on which revision is deployed:
-#   * new  -> exports conf / rank_hosts / is_junk_host
-#   * old  -> exports conf only (no ranking helpers)
-# Everything below falls back locally so app.py can never die on ImportError.
-# ============================================================================
-
-HOSTS_OK = True
-HOSTS_HAS_RANKING = True
-HOSTS_IMPORT_NOTE = ""
-
-try:
-    from hosts import conf as host_conf, STRICT_APP, ZERO_ACCESS, PARENT, MS_DOMAINS, GMAIL_DOMAINS
-except Exception as _hosts_err:
-    HOSTS_OK = False
-    HOSTS_IMPORT_NOTE = f"hosts.py core import failed ({_hosts_err}); using built-in tables."
-    STRICT_APP = {"gmail.com", "googlemail.com", "outlook.com", "hotmail.com", "live.com", "windowslive.com"}
-    ZERO_ACCESS = {"proton.me", "protonmail.com", "pm.me", "tuta.io", "tutanota.com", "tutamail.com", "tuta.com"}
-    PARENT = {"memoad.jp": "biglobe.ne.jp"}
-    MS_DOMAINS = {"outlook.com", "hotmail.com", "live.com", "msn.com", "hotmail.co.uk"}
-    GMAIL_DOMAINS = {"gmail.com", "googlemail.com"}
-
-    def host_conf(domain):
-        return None
-
-try:
-    from hosts import rank_hosts as host_rank_hosts, is_junk_host as host_is_junk
-except Exception:
-    HOSTS_HAS_RANKING = False
-    HOSTS_IMPORT_NOTE = (HOSTS_IMPORT_NOTE + " hosts.py has no rank_hosts/is_junk_host; "
-                         "using built-in router-aware ranking.").strip()
-
-    _BB_ROUTER_LABEL_EXACT = re.compile(
-        r"^(?:"
-        r"mx|mx\d+|mta|mtas|mta\d+|smtp|smtps|smtpout|smtp-in|smtp-out|"
-        r"inbound|outbound|relay|relay\d+|spool|filter|filters|cluster|clust\d+|"
-        r"edge|edge\d+|gateway|gw|gw\d+|router|mailrouter|aspmx|aspmx\d*|"
-        r"alt\d+|protection|hs|lb|"
-        r"mx-aol|mx-aol\.mail|mx\.google|eur\.olc|olc\.protection"
-        r")$"
-    )
-    _BB_ROUTER_TOKENS = (
-        "mta", "smtp", "relay", "inbound", "outbound", "spool",
-        "filter", "cluster", "mailrouter", "olc.protection",
-        "protection.outlook", "aspmx", "gateway",
-    )
-    _BB_SERVICE_PREFIXES = (
-        "imap", "imaps", "imap2", "mail", "mail2", "pop", "pop3", "pop3s",
-        "webmail", "webmail2", "email", "correo", "zimbra", "zcs",
-        "secure", "ssl", "outlook", "exchange", "owa",
-    )
-    _BB_SKIP_LABELS = {"mail", "email", "webmail", "imap", "imaps", "pop", "pop3", "smtp", "correo"}
-
-    def host_is_junk(host, domain=None):
-        """True when a hostname is almost certainly a mail ROUTER (MX/MTA).
-
-        Catches Zimbra-style names such as 'zcs8-mvd-mta-mx7.example.com' that
-        the old startswith(('mx','smtp')) test missed entirely.
-        """
-        h = (host or "").lower().strip().strip(".")
-        if not h:
-            return True
-        if domain and h == (domain or "").lower().strip():
-            return True
-        labels = h.split(".")
-        if len(labels) < 2:
-            return False
-        for lab in labels[:-1]:
-            if _BB_ROUTER_LABEL_EXACT.match(lab):
-                return True
-        for lab in labels[:-1]:
-            if lab in _BB_SKIP_LABELS:
-                continue
-            if any(tok in lab for tok in _BB_ROUTER_TOKENS):
-                return True
-            if re.search(r"(?:^|[-_])mx\d*(?:$|[-_])", lab):
-                return True
-        return False
-
-    def _bb_tier(host, domain):
-        """0 = most likely correct ... 4 = last resort. Ordering only."""
-        h = (host or "").lower().strip().strip(".")
-        d = (domain or "").lower().strip().strip(".")
-        if not h:
-            return 4
-        if d and h == d:
-            return 3
-        if d and h.endswith("." + d):
-            if host_is_junk(h, d):
-                return 3
-            if h[: -(len(d) + 1)].split(".")[0] in _BB_SERVICE_PREFIXES:
-                return 0
-            return 1
-        if host_is_junk(h, d):
-            return 3
-        return 2
-
-    _bb_probe_lock = threading.Lock()
-    _bb_probe_cache = {}
-    _BB_PROBE_TTL = 600
-
-    def _bb_probe(host):
-        if not host:
-            return False
-        now = time.time()
-        with _bb_probe_lock:
-            hit = _bb_probe_cache.get(host)
-            if hit and now - hit[0] < _BB_PROBE_TTL:
-                return hit[1]
-        ok = False
-        for _p in (993, 143):
-            try:
-                _s = socket.create_connection((host, _p), timeout=1.5)
-                _s.close()
-                ok = True
-                break
-            except Exception:
-                pass
-        with _bb_probe_lock:
-            _bb_probe_cache[host] = (now, ok)
-        return ok
-
-    def host_rank_hosts(hosts, domain, probe=True):
-        """Composite ranking: tier -> DNS -> open port -> discovery order."""
-        hosts = [h for h in (hosts or []) if h]
-        if not hosts:
-            return []
-        indexed = list(enumerate(hosts))
-        if not probe:
-            indexed.sort(key=lambda t: (_bb_tier(t[1], domain), 0 if host_resolves(t[1]) else 1, t[0]))
-            return [h for _i, h in indexed]
-
-        tiers = {h: _bb_tier(h, domain) for h in set(hosts)}
-        resolves = {h: host_resolves(h) for h in set(hosts)}
-        to_probe = [h for h in dict.fromkeys(hosts) if tiers[h] <= 1 and resolves[h]][:6]
-        live = {}
-        if to_probe:
-            try:
-                with concurrent.futures.ThreadPoolExecutor(max_workers=min(6, len(to_probe))) as ex:
-                    futs = {ex.submit(_bb_probe, h): h for h in to_probe}
-                    for fut in concurrent.futures.as_completed(futs, timeout=6):
-                        h = futs[fut]
-                        try:
-                            live[h] = fut.result()
-                        except Exception:
-                            live[h] = False
-            except Exception:
-                pass
-
-        indexed.sort(key=lambda t: (
-            tiers.get(t[1], 4),
-            0 if resolves.get(t[1], False) else 1,
-            0 if live.get(t[1], False) else 0 if not to_probe else 1,
-            t[0],
-        ))
-        return [h for _i, h in indexed]
-
-try:
-    from status import VALID, WRONG, APP, FAILED, SKIP, UNKNOWN
-except Exception:
-    VALID = "valid"
-    WRONG = "wrong_password"
-    APP = "need_app_password"
-    FAILED = "connection_failed"
-    SKIP = "skipped_cooldown"
-    UNKNOWN = "unknown"
+from hosts import conf as host_conf, STRICT_APP, ZERO_ACCESS, PARENT, MS_DOMAINS, GMAIL_DOMAINS
+from hosts import rank_hosts as host_rank_hosts, is_junk_host as host_is_junk
+from status import VALID, WRONG, APP, FAILED, SKIP, UNKNOWN
 
 # Optional network libs
 try:
