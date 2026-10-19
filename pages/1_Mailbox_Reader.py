@@ -3,6 +3,7 @@ import imaplib
 import glob
 import os
 import re
+import html
 import base64
 import math
 import time
@@ -116,6 +117,253 @@ def username_candidates(email_addr: str) -> List[str]:
     return list(dict.fromkeys(out))
 
 
+# ============================================================================
+# SHARED THEME ENGINE
+#
+# Reads/writes the SAME theme.json the main checker (app.py) uses, so whatever
+# preset and colours are chosen in the checker's Theme Studio apply here too:
+# hero banner, tabs, buttons, metrics, expanders, inputs, log boxes.
+# ============================================================================
+
+_THIS_DIR = os.path.dirname(os.path.abspath(__file__))
+APP_DIR = os.path.dirname(_THIS_DIR)                      # repo root
+THEME_FILE = os.path.join(APP_DIR, "theme.json")
+
+THEME_PRESETS = {
+    "Aurora":    {"g1": "#667eea", "g2": "#764ba2", "accent": "#8b5cf6", "accent2": "#22d3ee", "bg": "#0b1020", "panel": "#141b30", "text": "#e6ebff"},
+    "Neon":      {"g1": "#f72585", "g2": "#7209b7", "accent": "#f72585", "accent2": "#4cc9f0", "bg": "#0a0118", "panel": "#180a2c", "text": "#f5e9ff"},
+    "Ocean":     {"g1": "#2193b0", "g2": "#6dd5ed", "accent": "#38bdf8", "accent2": "#22d3ee", "bg": "#04141c", "panel": "#0a2432", "text": "#e0f7ff"},
+    "Emerald":   {"g1": "#11998e", "g2": "#38ef7d", "accent": "#34d399", "accent2": "#a3e635", "bg": "#06140f", "panel": "#0e2519", "text": "#e3ffee"},
+    "Sunset":    {"g1": "#ff6b6b", "g2": "#f9a826", "accent": "#fb923c", "accent2": "#ffd166", "bg": "#1a0f0a", "panel": "#2b1a11", "text": "#fff3e6"},
+    "Crimson":   {"g1": "#eb3349", "g2": "#f45c43", "accent": "#f43f5e", "accent2": "#fb923c", "bg": "#160609", "panel": "#270c13", "text": "#ffe8ec"},
+    "Royal":     {"g1": "#243b55", "g2": "#4b6cb7", "accent": "#60a5fa", "accent2": "#c084fc", "bg": "#070b12", "panel": "#111a28", "text": "#e2e8f5"},
+    "Gold":      {"g1": "#b8860b", "g2": "#ffd700", "accent": "#fbbf24", "accent2": "#f59e0b", "bg": "#141005", "panel": "#251d0a", "text": "#fff8dc"},
+    "Candy":     {"g1": "#ff9a9e", "g2": "#fecfef", "accent": "#fb7185", "accent2": "#f9a8d4", "bg": "#1a1016", "panel": "#2b1a24", "text": "#fff0f6"},
+    "Cyber":     {"g1": "#00f5d4", "g2": "#0077b6", "accent": "#00f5d4", "accent2": "#90e0ef", "bg": "#03060d", "panel": "#0a1220", "text": "#dffffb"},
+    "Grape":     {"g1": "#8e2de2", "g2": "#4a00e0", "accent": "#a78bfa", "accent2": "#f472b6", "bg": "#0b0418", "panel": "#180a2b", "text": "#f1e8ff"},
+    "Daylight":  {"g1": "#6366f1", "g2": "#06b6d4", "accent": "#4f46e5", "accent2": "#0891b2", "bg": "#f1f5f9", "panel": "#ffffff", "text": "#0f172a"},
+    "Mono":      {"g1": "#3f3f46", "g2": "#71717a", "accent": "#a1a1aa", "accent2": "#d4d4d8", "bg": "#0a0a0b", "panel": "#19191c", "text": "#f4f4f5"},
+}
+
+DEFAULT_PRESET = "Aurora"
+
+
+def _lum(hex_color: str) -> float:
+    try:
+        h = str(hex_color).lstrip("#")
+        r, g, b = int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
+        return (0.299 * r + 0.587 * g + 0.114 * b) / 255.0
+    except Exception:
+        return 0.0
+
+
+def default_theme() -> dict:
+    p = THEME_PRESETS[DEFAULT_PRESET]
+    return {
+        "preset": DEFAULT_PRESET,
+        "g1": p["g1"], "g2": p["g2"], "accent": p["accent"], "accent2": p["accent2"],
+        "bg": p["bg"], "panel": p["panel"], "text": p["text"],
+        "radius": 14, "glow": True, "animate": True, "glass": True, "colorize_logs": True,
+    }
+
+
+def _theme_candidates() -> List[str]:
+    cands = [THEME_FILE, os.path.abspath("theme.json")]
+    out, seen = [], set()
+    for c in cands:
+        try:
+            ap = os.path.abspath(c)
+        except Exception:
+            continue
+        if ap not in seen:
+            seen.add(ap)
+            out.append(c)
+    return out
+
+
+def load_theme() -> dict:
+    """Same file app.py writes. Falls back to defaults if absent/unreadable."""
+    base = default_theme()
+    for path in _theme_candidates():
+        if not os.path.exists(path):
+            continue
+        try:
+            with open(path, encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                base.update({k: v for k, v in data.items() if k in base})
+                break
+        except Exception:
+            continue
+    return base
+
+
+def save_theme(th: dict) -> None:
+    """Writes back to the shared file so the checker picks the change up too."""
+    for path in (_theme_candidates()[:1] or ["theme.json"]):
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(th, f, indent=2)
+            return
+        except Exception:
+            continue
+
+
+def is_light(th: dict) -> bool:
+    return _lum(th.get("bg", "#000000")) > 0.6
+
+
+def theme_css(th: dict) -> str:
+    g1, g2 = th["g1"], th["g2"]
+    ac, ac2 = th["accent"], th["accent2"]
+    bg, panel, text = th["bg"], th["panel"], th["text"]
+    r = int(th.get("radius", 14))
+    light = is_light(th)
+    border = "rgba(15,23,42,0.14)" if light else "rgba(255,255,255,0.10)"
+    soft = "rgba(15,23,42,0.05)" if light else "rgba(255,255,255,0.04)"
+    dim = "rgba(15,23,42,0.65)" if light else "rgba(230,235,255,0.70)"
+
+    glass_css = "backdrop-filter: blur(6px);" if th.get("glass", True) else ""
+    anim_css = ""
+    if th.get("animate", True):
+        anim_css = """
+    .bb-hero { background-size: 240% 240%; animation: bbShift 14s ease infinite; }
+    @keyframes bbShift { 0%{background-position:0% 50%} 50%{background-position:100% 50%} 100%{background-position:0% 50%} }
+    """
+
+    return f"""
+<style>
+    :root {{
+        --bb-g1: {g1}; --bb-g2: {g2}; --bb-ac: {ac}; --bb-ac2: {ac2};
+        --bb-bg: {bg}; --bb-panel: {panel}; --bb-text: {text}; --bb-r: {r}px;
+    }}
+    .stApp, [data-testid="stAppViewContainer"], section.main {{ background: {bg} !important; color: {text} !important; }}
+    [data-testid="stHeader"] {{ background: transparent !important; }}
+    [data-testid="stSidebar"] {{
+        background: linear-gradient(180deg, {panel} 0%, {bg} 100%) !important;
+        border-right: 1px solid {border};
+    }}
+    [data-testid="stSidebar"] * {{ color: {text}; }}
+    h1, h2, h3, h4, h5, h6 {{ color: {text} !important; letter-spacing: .2px; }}
+    p, span, label, li, small, strong {{ color: {text}; }}
+    hr {{ border-color: {border} !important; }}
+    a {{ color: {ac2} !important; }}
+
+    .stButton > button, .stDownloadButton > button, .stFormSubmitButton > button {{
+        background: {panel} !important; color: {text} !important;
+        border: 1px solid {border} !important; border-radius: {r}px !important;
+        font-weight: 600; transition: all .16s ease;
+    }}
+    .stButton > button:hover, .stDownloadButton > button:hover {{
+        border-color: {ac} !important; transform: translateY(-1px);
+        box-shadow: 0 6px 18px {ac}44;
+    }}
+    .stButton > button[kind="primary"], .stDownloadButton > button[kind="primary"] {{
+        background: linear-gradient(135deg, {g1} 0%, {g2} 100%) !important;
+        color: #fff !important; border: none !important;
+        box-shadow: 0 8px 22px {g1}66;
+    }}
+    .stButton > button[kind="primary"]:hover {{ filter: brightness(1.08); }}
+
+    [data-testid="stMetric"] {{
+        background: {panel} !important; border: 1px solid {border};
+        border-left: 4px solid {ac}; border-radius: {r}px;
+        padding: 14px 16px; {glass_css}
+    }}
+    [data-testid="stMetricValue"] {{ color: {ac} !important; font-weight: 800 !important; }}
+    [data-testid="stMetricLabel"] {{ color: {dim} !important; }}
+
+    .stTabs [data-baseweb="tab-list"] {{ gap: 6px; border-bottom: 1px solid {border}; }}
+    .stTabs [data-baseweb="tab"] {{
+        background: {panel}; border-radius: {r}px {r}px 0 0;
+        color: {text} !important; padding: 8px 16px; font-weight: 600;
+    }}
+    .stTabs [aria-selected="true"] {{
+        background: linear-gradient(135deg, {g1}, {g2}) !important; color: #fff !important;
+    }}
+    .stTabs [data-baseweb="tab-highlight"] {{ background: {ac} !important; }}
+
+    [data-testid="stExpander"] {{
+        border: 1px solid {border} !important; border-radius: {r}px !important;
+        background: {soft} !important; overflow: hidden;
+    }}
+    [data-testid="stExpander"] summary {{ color: {text} !important; font-weight: 600; }}
+
+    input, textarea, select, .stTextInput input, .stTextArea textarea,
+    .stNumberInput input, .stSelectbox div[data-baseweb="select"] > div {{
+        background: {panel} !important; color: {text} !important;
+        border: 1px solid {border} !important; border-radius: 10px !important;
+    }}
+    [data-baseweb="popover"] div {{ background: {panel} !important; color: {text} !important; }}
+    [data-baseweb="tag"] {{ background: {ac}44 !important; color: {text} !important; }}
+
+    .stSlider [data-baseweb="slider"] div[role="slider"] {{ background: {ac} !important; }}
+    .stProgress > div > div > div > div {{ background: linear-gradient(90deg, {g1}, {g2}) !important; }}
+    [data-baseweb="checkbox"] span, [data-baseweb="toggle"] span {{ border-color: {ac} !important; }}
+
+    code, pre, .stCode, .stCodeBlock, [data-testid="stCodeBlock"] {{
+        background: {bg} !important; color: {ac2} !important;
+        border: 1px solid {border} !important; border-radius: 10px !important;
+    }}
+    [data-testid="stDataFrame"] {{ border: 1px solid {border} !important; border-radius: 10px !important; }}
+
+    .bb-hero {{
+        background: linear-gradient(135deg, {g1} 0%, {g2} 100%);
+        padding: 26px 32px; border-radius: {r}px; margin-bottom: 18px;
+        box-shadow: 0 14px 38px {g1}55; border: 1px solid rgba(255,255,255,.10);
+    }}
+    .bb-hero h1 {{ color: #fff !important; margin: 0; font-size: 1.85rem; font-weight: 800; }}
+    .bb-hero p {{ color: rgba(255,255,255,.94) !important; margin: 8px 0 0 0; font-size: .93rem; }}
+    .bb-hero .bb-tags {{ margin-top: 12px; }}
+    .bb-tag {{
+        display: inline-block; padding: 3px 11px; margin: 0 6px 6px 0;
+        border-radius: 999px; font-size: .72rem; font-weight: 700;
+        background: rgba(255,255,255,.20); color: #fff !important;
+        border: 1px solid rgba(255,255,255,.28);
+    }}
+    .bb-section {{
+        display: flex; align-items: center; gap: 12px;
+        margin: 22px 0 12px 0; padding: 11px 18px; border-radius: {r}px;
+        background: linear-gradient(90deg, {g1}38 0%, {g1}10 45%, transparent 85%);
+        border-left: 4px solid {ac};
+    }}
+    .bb-section .bb-ico {{ font-size: 1.2rem; }}
+    .bb-section .bb-t {{ font-weight: 800; font-size: 1.02rem; color: {text}; }}
+    .bb-section .bb-s {{ font-size: .76rem; color: {dim}; margin-left: 8px; }}
+
+    .bb-logbox {{
+        background: {bg}; border: 1px solid {border}; border-radius: {r}px;
+        padding: 10px 12px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+        font-size: .78rem; max-height: 360px; overflow-y: auto;
+    }}
+
+    ::-webkit-scrollbar {{ width: 10px; height: 10px; }}
+    ::-webkit-scrollbar-track {{ background: {bg}; }}
+    ::-webkit-scrollbar-thumb {{ background: {g1}88; border-radius: 8px; }}
+    ::-webkit-scrollbar-thumb:hover {{ background: {ac}; }}
+    {anim_css}
+</style>
+"""
+
+
+def hero(title: str, subtitle: str = "", tags: List[str] = None) -> None:
+    tag_html = "".join(f'<span class="bb-tag">{html.escape(t)}</span>' for t in (tags or []))
+    st.markdown(
+        f'<div class="bb-hero"><h1>{html.escape(title)}</h1>'
+        f'<p>{html.escape(subtitle)}</p><div class="bb-tags">{tag_html}</div></div>',
+        unsafe_allow_html=True,
+    )
+
+
+def section(icon: str, title: str, subtitle: str = "") -> None:
+    sub = f'<span class="bb-s">{html.escape(subtitle)}</span>' if subtitle else ""
+    st.markdown(
+        f'<div class="bb-section"><span class="bb-ico">{icon}</span>'
+        f'<span class="bb-t">{html.escape(title)}</span>{sub}</div>',
+        unsafe_allow_html=True,
+    )
+
+
 # Dynamic Proxy Auto-Fetch Engine
 def load_app_proxies() -> List[dict]:
     proxy_files = ["proxies.txt", "proxy_pool.txt", "clean_proxies.txt"]
@@ -181,6 +429,60 @@ st.markdown(
     """,
     unsafe_allow_html=True
 )
+
+# --- Load shared theme and inject it (must happen before anything renders) ---
+THEME = load_theme()
+st.markdown(theme_css(THEME), unsafe_allow_html=True)
+
+# --- Theme control (writes the same file the checker reads) ---
+# Same pattern as app.py: pre-seed widget keys, create widgets with no
+# defaults, and mutate widget keys only from on_change callbacks.
+with st.sidebar.expander("🎨 Theme (synced with checker)", expanded=False):
+    _names = list(THEME_PRESETS.keys())
+
+    _seed = {
+        "rd_preset": THEME.get("preset", DEFAULT_PRESET) if THEME.get("preset", DEFAULT_PRESET) in _names else DEFAULT_PRESET,
+        "rd_g1": THEME["g1"], "rd_g2": THEME["g2"],
+        "rd_bg": THEME["bg"], "rd_text": THEME["text"],
+    }
+    for _k, _v in _seed.items():
+        if _k not in st.session_state:
+            st.session_state[_k] = _v
+
+    def _rd_apply_preset():
+        p = THEME_PRESETS.get(st.session_state.get("rd_preset"))
+        if p:
+            st.session_state["rd_g1"] = p["g1"]
+            st.session_state["rd_g2"] = p["g2"]
+            st.session_state["rd_bg"] = p["bg"]
+            st.session_state["rd_text"] = p["text"]
+
+    st.selectbox("Preset Gradient", _names, key="rd_preset", on_change=_rd_apply_preset)
+
+    _ca, _cb = st.columns(2)
+    with _ca:
+        st.color_picker("Gradient Start", key="rd_g1")
+        st.color_picker("Background", key="rd_bg")
+    with _cb:
+        st.color_picker("Gradient End", key="rd_g2")
+        st.color_picker("Body Text", key="rd_text")
+
+    if (
+        st.session_state["rd_g1"] != THEME["g1"]
+        or st.session_state["rd_g2"] != THEME["g2"]
+        or st.session_state["rd_bg"] != THEME["bg"]
+        or st.session_state["rd_text"] != THEME["text"]
+        or st.session_state.get("rd_preset") != THEME.get("preset")
+    ):
+        THEME.update({
+            "preset": st.session_state.get("rd_preset", DEFAULT_PRESET),
+            "g1": st.session_state["rd_g1"], "g2": st.session_state["rd_g2"],
+            "bg": st.session_state["rd_bg"], "text": st.session_state["rd_text"],
+        })
+        save_theme(THEME)
+        st.rerun()
+
+    st.caption("Saved to theme.json — the main checker picks it up automatically.")
 
 # Persistent Last Account Management & Session Cache
 LAST_ACCOUNT_FILE = "last_account.txt"
@@ -735,6 +1037,7 @@ def generate_all_mail_zip():
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
         search_paths = glob.glob("mail_results/*.txt") + glob.glob("*.txt")
         added_files = set()
+        added_arcnames = set()
 
         for path in search_paths:
             filename = os.path.basename(path)
@@ -768,6 +1071,17 @@ def generate_all_mail_zip():
                 else:
                     base_wo_ext = os.path.splitext(filename)[0]
                     cat_name = f"{base_wo_ext}_{count}.txt"
+
+                # Two source files can map to the SAME category+count (e.g. two
+                # different valid_*.txt with 13 rows each). Suffix until unique
+                # so ZipFile stops warning about a duplicate name.
+                if cat_name in added_arcnames:
+                    stem, ext = os.path.splitext(cat_name)
+                    n = 2
+                    while f"{stem}_{n}{ext}" in added_arcnames:
+                        n += 1
+                    cat_name = f"{stem}_{n}{ext}"
+                added_arcnames.add(cat_name)
 
                 file_content = "\n".join(clean_lines)
                 zf.writestr(cat_name, file_content)
@@ -1396,18 +1710,19 @@ def fetch_messages_paginated(mail, email_addr, password_val, host_val, target_fo
     return messages
 
 
-# Header
-st.markdown("""
-    <div style="background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); padding: 30px; border-radius: 10px; margin-bottom: 20px;">
-        <h1 style="color: white; margin: 0;">🚀📥 Bobito Mailbox Reader & Portal Hub Advanced IMAP Client</h1>
-        <p style="color: rgba(255,255,255,0.9); margin: 10px 0 0 0;">
-            Interactive Bot Intelligence, Dedicated OTP/Debit Card & Credentials Scanner, 
-            Multi-Field Search, Telegram/Blacklist Filter, Deep Diagnostic Instrumentation.
-        </p>
-    </div>
-""", unsafe_allow_html=True)
+# Header (theme-synced from app.py's Theme Studio)
+hero(
+    "🚀📥 Bobito Mailbox Reader & Portal Hub Advanced IMAP Client",
+    "Interactive Bot Intelligence, Dedicated OTP/Debit Card & Credentials Scanner, "
+    "Multi-Field Search, Telegram/Blacklist Filter, Deep Diagnostic Instrumentation.",
+    tags=["OTP Scanner", "Card / Debit", "Telegram Filter", "Bot Purge", "Deep Search"],
+)
 
-st.caption("Advanced IMAP Client with Interactive Bot Intelligence, Dedicated OTP, Debit/Credit Card & Credentials Scanner, Multi-Field Search, Telegram/Blacklist Filter, and Deep Diagnostic Instrumentation.")
+st.caption(
+    f"Advanced IMAP Client with Interactive Bot Intelligence, Dedicated OTP, Debit/Credit Card & "
+    f"Credentials Scanner, Multi-Field Search, Telegram/Blacklist Filter, and Deep Diagnostic Instrumentation. "
+    f"— Theme in use: **{THEME.get('preset', DEFAULT_PRESET)}** (synced from the checker)"
+)
 
 valid = load_valid()
 
@@ -1545,7 +1860,7 @@ with st.sidebar.expander("⚙️ App Configuration Settings", expanded=False):
     new_port = st.number_input("Default IMAP Port", min_value=1, max_value=65535, value=cfg.get("imap_port", 993))
     new_fallback = st.checkbox("Enable Auto-Fallback Host Probing (Spectrum/Charter/TWC)", value=cfg.get("auto_fallback_probing", True))
     new_starttls = st.checkbox("Try STARTTLS / plaintext on port 143 if 993 fails", value=cfg.get("try_starttls", True))
-    new_altuser = st.checkbox("Try local-part username on auth failure", value=cfg.get("try_alt_username", True))
+    new_altuser = st.checkbox("Try local-part username on auth failure", value=cfg.get("try_alt_user", True))
 
     if st.button("💾 Save App Settings", type="secondary", use_container_width=True):
         st.session_state.app_config["connection_timeout"] = new_timeout
@@ -2608,3 +2923,10 @@ with st.expander("🤖 Mass Bot Purge & Intelligence Hub", expanded=False):
         st.code("\n".join(st.session_state.bot_diag_logs), language="text")
     else:
         st.caption("Bot engine traces will be printed here during purge operations.")
+
+# --- Back to Checker ---
+st.markdown("---")
+try:
+    st.page_link("app.py", label="← Back to the Mail Checker")
+except Exception:
+    st.caption("The main checker lives at app.py")
