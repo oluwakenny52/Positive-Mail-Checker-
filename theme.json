@@ -1,0 +1,17 @@
+{
+  "preset": "Aurora",
+  "g1": "#667eea",
+  "g2": "#764ba2",
+  "accent": "#8b5cf6",
+  "accent2": "#22d3ee",
+  "bg": "#0b1020",
+  "panel": "#141b30",
+  "text": "#e6ebff",
+  "radius": 14,
+  "glow": true,
+  "animate": true,
+  "glass": true,
+  "colorize_logs": true,
+  "hero_title": "⚡ Mega Ultimate Mail Checker v13.2",
+  "hero_sub": "World-Coverage Edition — router-aware host ranking, multi-scheme auth, anti-spoofing post-auth validation."
+}
