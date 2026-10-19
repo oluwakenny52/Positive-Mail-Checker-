@@ -1,6 +1,30 @@
-"""One host table. Primary first, backup second, with MX resolution and universal fallbacks."""
+"""One host table. Primary first, backup second, with SRV/autoconfig/MX discovery."""
 
+import os
+import re
+import json
+import time
 import socket
+import threading
+
+try:
+    import dns.resolver
+    _DNS = True
+except ImportError:
+    _DNS = False
+
+try:
+    import requests
+    import urllib3
+    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+    _REQ = True
+except ImportError:
+    _REQ = False
+
+
+# ============================================================================
+# STATIC PROVIDER TABLES
+# ============================================================================
 
 YAHOO_IMAP = ["imap.mail.yahoo.com"]
 YAHOO_POP = ["pop.mail.yahoo.com"]
@@ -92,6 +116,9 @@ DISPOSABLE_PARTS = (
     "tempmail", "temp-mail", "guerrillamail", "10minutemail", "mailinator",
     "yopmail", "trashmail", "throwaway", "fakeinbox", "sharklasers",
     "rerttymail", "discard.email", "maildrop", "getnada", "moakt",
+    "tempmailo", "1secmail", "dispostable", "mailnesia", "mohmal",
+    "tempinbox", "mailcatch", "spamgourmet", "mytemp", "tmpmail",
+    "emailondeck", "tempail", "grr.la", "pokemail", "spam4.me",
 )
 
 UNIVERSAL_IMAP_FALLBACKS = [
@@ -108,6 +135,367 @@ UNIVERSAL_POP_FALLBACKS = [
     "pop.aol.com"
 ]
 
+# MX-host substring -> (imap_host, pop_host).  ORDER MATTERS: specific first.
+# "aol" MUST come before "yahoo" (AOL MX = mx-aol.mail.gm0.yahoodns.net).
+MX_PROVIDER_MAP = (
+    (("google", "gsuite", "googlemail"), ("imap.gmail.com", "pop.gmail.com")),
+    (("outlook", "microsoft", "office365", "protection.outlook"), ("outlook.office365.com", "outlook.office365.com")),
+    (("aol",), ("imap.aol.com", "pop.aol.com")),
+    (("yahoodns", "yahoo"), ("imap.mail.yahoo.com", "pop.mail.yahoo.com")),
+    (("icloud", "apple", "me.com"), ("imap.mail.me.com", "pop.mail.me.com")),
+    (("zoho",), ("imap.zoho.com", "pop.zoho.com")),
+    (("yandex",), ("imap.yandex.com", "pop.yandex.com")),
+    (("mail.ru", "internet.ru", "bk.ru", "list.ru", "inbox.ru"), ("imap.mail.ru", "pop.mail.ru")),
+    (("gmx", "1and1", "ionos", "schlund", "united-domains"), ("imap.gmx.net", "pop.gmx.net")),
+    (("t-online", "tonline", "tmo"), ("secureimap.t-online.de", "securepop.t-online.de")),
+    (("ovh",), ("ssl0.ovh.net", "ssl0.ovh.net")),
+    (("fastmail", "messagingengine"), ("imap.fastmail.com", "pop.fastmail.com")),
+    (("hostinger",), ("imap.hostinger.com", "pop.hostinger.com")),
+    (("gandi",), ("mail.gandi.net", "mail.gandi.net")),
+    (("rackspace", "emailsrvr"), ("secure.emailsrvr.com", "secure.emailsrvr.com")),
+    (("secureserver", "godaddy"), ("imap.secureserver.net", "pop.secureserver.net")),
+    (("mailbox.org",), ("imap.mailbox.org", "pop3.mailbox.org")),
+    (("posteo",), ("posteo.de", "posteo.de")),
+    (("laposte",), ("imap.laposte.net", "pop.laposte.net")),
+    (("orange", "wanadoo"), ("imap.orange.fr", "pop.orange.fr")),
+    (("proxad",), ("imap.free.fr", "pop.free.fr")),
+    (("bluewin", "swisscom"), ("imaps.bluewin.ch", "pop3s.bluewin.ch")),
+    (("interia",), ("poczta.interia.pl", "poczta.interia.pl")),
+    (("seznam",), ("imap.seznam.cz", "pop3.seznam.cz")),
+    (("naver",), ("imap.naver.com", "pop.naver.com")),
+    (("daum", "hanmail"), ("imap.daum.net", "pop.daum.net")),
+    (("qq.com", "tencent"), ("imap.qq.com", "pop.qq.com")),
+    (("163.com", "126.com", "netease"), ("imap.163.com", "pop.163.com")),
+    (("biglobe",), ("mail.biglobe.ne.jp", "mail.biglobe.ne.jp")),
+    (("nifty",), ("imap.nifty.com", "pop.nifty.com")),
+    (("so-net",), ("imap.so-net.ne.jp", "pop.so-net.ne.jp")),
+    # shared-hosting platforms -> mail.<domain>
+    (("bluehost", "hostgator", "cpanel", "siteground", "namecheap", "dreamhost",
+      "liquidweb", "inmotion", "greengeeks", "a2hosting", "hostpapa",
+      "netsol", "network solutions", "webhostingpad", "stablehost", "hawkhost"), (None, None)),
+)
+
+
+# ============================================================================
+# CACHES
+# ============================================================================
+
+_CACHE_FILE = "hosts_cache.json"
+_CACHE_TTL = 86400  # 24h
+_cache_lock = threading.Lock()
+_cache = None
+
+_resolve_lock = threading.Lock()
+_resolve_cache = {}
+
+
+def _load_cache():
+    global _cache
+    if _cache is None:
+        try:
+            with open(_CACHE_FILE, encoding="utf-8") as f:
+                _cache = json.load(f)
+        except Exception:
+            _cache = {}
+    return _cache
+
+
+def _save_cache():
+    try:
+        with open(_CACHE_FILE, "w", encoding="utf-8") as f:
+            json.dump(_cache, f, indent=2)
+    except Exception:
+        pass
+
+
+def _dedupe(seq):
+    out = []
+    for x in seq:
+        if x and x not in out:
+            out.append(x)
+    return out
+
+
+# ============================================================================
+# DNS HELPERS
+# ============================================================================
+
+def _dns_resolve(name, rdtype):
+    if not _DNS:
+        return []
+    try:
+        fn = getattr(dns.resolver, "resolve", None) or dns.resolver.query
+        return list(fn(name, rdtype, lifetime=3))
+    except Exception:
+        try:
+            return list(dns.resolver.query(name, rdtype))
+        except Exception:
+            return []
+
+
+def resolve_mx(domain):
+    records = _dns_resolve(domain, "MX")
+    if not records:
+        return []
+    try:
+        records = sorted(records, key=lambda r: r.preference)
+    except Exception:
+        pass
+    return _dedupe([str(r.exchange).rstrip(".").lower() for r in records])
+
+
+def resolve_srv(name):
+    records = _dns_resolve(name, "SRV")
+    out = []
+    for r in records:
+        try:
+            out.append((int(r.priority), int(r.weight), str(r.target).rstrip(".").lower()))
+        except Exception:
+            continue
+    return sorted(out)
+
+
+def host_resolves(host):
+    """Cheap existence check so dead guesses don't burn attempts."""
+    if not host:
+        return False
+    with _resolve_lock:
+        cached = _resolve_cache.get(host)
+        if cached is not None:
+            return cached
+
+    ok = False
+    try:
+        if _DNS:
+            try:
+                if _dns_resolve(host, "A"):
+                    ok = True
+            except Exception:
+                pass
+            if not ok:
+                try:
+                    if _dns_resolve(host, "AAAA"):
+                        ok = True
+                except Exception:
+                    pass
+        if not ok:
+            try:
+                socket.gethostbyname(host)
+                ok = True
+            except Exception:
+                ok = False
+    except Exception:
+        ok = False
+
+    with _resolve_lock:
+        _resolve_cache[host] = ok
+    return ok
+
+
+# ============================================================================
+# DISCOVERY: SRV / AUTOCONFIG / AUTODISCOVER / MX
+# ============================================================================
+
+def _thunderbird_autoconfig(domain):
+    if not _REQ:
+        return [], []
+    imap, pop = [], []
+    urls = [
+        f"https://autoconfig.{domain}/mail/config-v1.1.xml",
+        f"https://{domain}/.well-known/autoconfig/mail/config-v1.1.xml",
+    ]
+    for url in urls:
+        try:
+            r = requests.get(url, timeout=4, verify=False,
+                             headers={"User-Agent": "Mozilla/5.0 MailChecker"})
+            if r.status_code != 200 or "<clientConfig" not in r.text:
+                continue
+            for block in re.findall(r"<incomingServer[^>]*>(.*?)</incomingServer>", r.text, re.S | re.I):
+                t = re.search(r"<type>\s*([^<]+?)\s*</type>", block, re.I)
+                h = re.search(r"<hostname>\s*([^<]+?)\s*</hostname>", block, re.I)
+                if not h:
+                    continue
+                host = h.group(1).strip().lower().rstrip(".")
+                stype = (t.group(1).strip().upper() if t else "IMAP")
+                if stype == "POP3":
+                    pop.append(host)
+                else:
+                    imap.append(host)
+            if imap or pop:
+                break
+        except Exception:
+            continue
+    return _dedupe(imap), _dedupe(pop)
+
+
+_AUTODISCOVER_BODY = (
+    '<?xml version="1.0" encoding="utf-8"?>'
+    '<Autodiscover xmlns="http://schemas.microsoft.com/exchange/autodiscover/outlook/requestschema/2006">'
+    '<Request><EMailAddress>{email}</EMailAddress>'
+    '<AcceptableResponseSchema>'
+    'http://schemas.microsoft.com/exchange/autodiscover/outlook/responseschema/2006a'
+    '</AcceptableResponseSchema></Request></Autodiscover>'
+)
+
+
+def _autodiscover(domain, email=None):
+    if not _REQ:
+        return [], []
+    imap, pop = [], []
+    body = _AUTODISCOVER_BODY.format(email=email or f"user@{domain}")
+    urls = [
+        f"https://autodiscover.{domain}/autodiscover/autodiscover.xml",
+        f"https://{domain}/autodiscover/autodiscover.xml",
+    ]
+    for url in urls:
+        try:
+            r = requests.post(url, data=body, timeout=5, verify=False,
+                              headers={"Content-Type": "text/xml; charset=utf-8",
+                                       "User-Agent": "Mozilla/5.0 MailChecker"})
+            if r.status_code != 200:
+                continue
+            for block in re.findall(r"<Protocol>(.*?)</Protocol>", r.text, re.S | re.I):
+                t = re.search(r"<Type>\s*([^<]+?)\s*</Type>", block, re.I)
+                s = re.search(r"<Server>\s*([^<]+?)\s*</Server>", block, re.I)
+                if not (t and s):
+                    continue
+                stype = t.group(1).strip().upper()
+                host = s.group(1).strip().lower().rstrip(".")
+                if stype == "IMAP":
+                    imap.append(host)
+                elif stype == "POP3":
+                    pop.append(host)
+            if imap or pop:
+                break
+        except Exception:
+            continue
+    return _dedupe(imap), _dedupe(pop)
+
+
+def _provider_from_mx(mx_host):
+    m = (mx_host or "").lower()
+    for keys, pair in MX_PROVIDER_MAP:
+        if any(k in m for k in keys):
+            return pair
+    return None
+
+
+def discover_hosts(domain, email=None, use_cache=True, force_refresh=False):
+    """Ordered candidate discovery: SRV -> autoconfig -> autodiscover -> MX -> prefixes.
+
+    Returns {"imap": [...], "pop": [...], "sources": [...]}
+    """
+    domain = (domain or "").lower().strip()
+    if not domain:
+        return {"imap": [], "pop": [], "sources": []}
+
+    if use_cache and not force_refresh:
+        with _cache_lock:
+            entry = _load_cache().get(domain)
+        if entry and (time.time() - entry.get("ts", 0) < _CACHE_TTL):
+            return {"imap": entry.get("imap", []), "pop": entry.get("pop", []),
+                    "sources": entry.get("sources", ["cache"])}
+
+    imap, pop, sources = [], [], []
+
+    # 1. SRV (RFC 6186) - most authoritative when present
+    for svc, bucket in (("_imaps._tcp.", imap), ("_imap._tcp.", imap),
+                        ("_pop3s._tcp.", pop), ("_pop3._tcp.", pop)):
+        for _prio, _weight, target in resolve_srv(f"{svc}{domain}"):
+            if target and target not in bucket:
+                bucket.append(target)
+    if imap or pop:
+        sources.append("srv")
+
+    mx_records = resolve_mx(domain)
+
+    # 2. Autoconfig / Autodiscover (only worth trying if the domain is alive)
+    if _REQ and (mx_records or host_resolves(domain)):
+        a_imap, a_pop = _thunderbird_autoconfig(domain)
+        if a_imap or a_pop:
+            imap.extend(a_imap)
+            pop.extend(a_pop)
+            sources.append("autoconfig")
+        if not imap:
+            d_imap, d_pop = _autodiscover(domain, email)
+            if d_imap or d_pop:
+                imap.extend(d_imap)
+                pop.extend(d_pop)
+                sources.append("autodiscover")
+
+    # 3. MX-derived provider
+    provider = None
+    for m in mx_records:
+        provider = _provider_from_mx(m)
+        if provider:
+            break
+    if provider:
+        p_imap, p_pop = provider
+        if p_imap:
+            imap.append(p_imap)
+            pop.append(p_pop or p_imap)
+        else:
+            # shared-hosting platform -> mail.<domain>
+            imap.append(f"mail.{domain}")
+            pop.append(f"mail.{domain}")
+        sources.append("mx-provider")
+
+    # 4. MX-derived hostnames (guessed from the MX parent)
+    for m in mx_records[:2]:
+        if m and m not in imap:
+            imap.append(m)
+        parts = m.split(".")
+        if len(parts) >= 2:
+            parent = ".".join(parts[-2:])
+            if parent != domain:
+                for pfx in ("imap.", "mail."):
+                    h = f"{pfx}{parent}"
+                    if h not in imap:
+                        imap.append(h)
+
+    # 5. Common-name guesses on the domain itself
+    for pfx in ("imap.", "mail.", "imaps.", "secure.", "webmail.", ""):
+        h = f"{pfx}{domain}"
+        if h not in imap:
+            imap.append(h)
+    for pfx in ("pop.", "pop3.", "mail.", ""):
+        h = f"{pfx}{domain}"
+        if h not in pop:
+            pop.append(h)
+    sources.append("prefix")
+
+    # 6. Promote hosts that actually exist in DNS
+    live_imap = [h for h in imap if host_resolves(h)]
+    dead_imap = [h for h in imap if h not in live_imap]
+    imap = live_imap + dead_imap
+
+    live_pop = [h for h in pop if host_resolves(h)]
+    dead_pop = [h for h in pop if h not in live_pop]
+    pop = live_pop + dead_pop
+
+    # 7. Universal fallbacks last
+    for fb in UNIVERSAL_IMAP_FALLBACKS:
+        if fb not in imap:
+            imap.append(fb)
+    for fb in UNIVERSAL_POP_FALLBACKS:
+        if fb not in pop:
+            pop.append(fb)
+
+    imap = _dedupe(imap)[:6]
+    pop = _dedupe(pop)[:5]
+
+    if use_cache:
+        with _cache_lock:
+            c = _load_cache()
+            c[domain] = {"imap": imap, "pop": pop, "sources": sources, "ts": time.time()}
+            _save_cache()
+
+    return {"imap": imap, "pop": pop, "sources": sources}
+
+
+# ============================================================================
+# PUBLIC API
+# ============================================================================
 
 def domain_of(email_addr):
     return (email_addr or "").split("@")[-1].lower().strip()
@@ -118,30 +506,28 @@ def _pair(imap_hosts, pop_hosts):
 
 
 def get_mx_host(domain):
-    """Extract primary mail exchange host from DNS MX records if available."""
-    try:
-        import dns.resolver
-        answers = dns.resolver.resolve(domain, 'MX')
-        mx_records = sorted(answers, key=lambda x: x.preference)
-        if mx_records:
-            exchange = str(mx_records[0].exchange).rstrip('.')
-            ex_lower = exchange.lower()
-            if "google" in ex_lower or "gsuite" in ex_lower:
-                return "imap.gmail.com"
-            elif "outlook" in ex_lower or "protection.outlook.com" in ex_lower or "microsoft" in ex_lower:
-                return "outlook.office365.com"
-            elif "yahoo" in ex_lower or "yahoodns" in ex_lower:
-                return "imap.mail.yahoo.com"
-            elif "aol" in ex_lower:
-                return "imap.aol.com"
-            return exchange
-    except Exception:
-        pass
-    return None
+    """Extract primary mail exchange host (or its known provider IMAP host)."""
+    mx_records = resolve_mx(domain)
+    if not mx_records:
+        return None
+    exchange = mx_records[0]
+    provider = _provider_from_mx(exchange)
+    if provider and provider[0]:
+        return provider[0]
+    return exchange
 
 
 def conf(domain):
+    """Full server config for a domain. Known providers are instant;
+    everything else goes through cached discovery."""
     domain = (domain or "").lower().strip()
+    if not domain:
+        return None
+
+    if domain in ZERO_ACCESS:
+        return {"imap": [], "pop": [], "pop3": [], "type": "zero_access"}
+
+    # --- Static, instant, no network ---
     if domain in FRONTIER:
         return _pair(FRONTIER_IMAP, FRONTIER_POP)
     if domain in ATT_FAMILY:
@@ -161,39 +547,53 @@ def conf(domain):
     known = COUNTRY.get(domain)
     if known:
         return _pair(known, known)
+
+    # --- Discovered ---
+    found = discover_hosts(domain)
+    if found["imap"] or found["pop"]:
+        imap = found["imap"]
+        pop = found["pop"] or found["imap"]
+        return {"imap": imap, "pop": pop, "pop3": pop, "sources": found["sources"]}
+
     return None
 
 
 def provider_hosts(email_addr):
+    """Returns (imap_candidates, pop_candidates)."""
     domain = domain_of(email_addr)
     got = conf(domain)
     if got:
-        return got["imap"], got["pop"]
-    
-    mx_host = get_mx_host(domain)
-    imap_candidates = []
-    pop_candidates = []
-    
-    if mx_host and mx_host not in imap_candidates:
-        imap_candidates.append(mx_host)
-        pop_candidates.append(mx_host)
-        
-    imap_candidates.extend([f"mail.{domain}", f"imap.{domain}", f"secure.{domain}"])
-    pop_candidates.extend([f"mail.{domain}", f"pop.{domain}"])
-    
-    for fb in UNIVERSAL_IMAP_FALLBACKS:
-        if fb not in imap_candidates:
-            imap_candidates.append(fb)
-    for fb in UNIVERSAL_POP_FALLBACKS:
-        if fb not in pop_candidates:
-            pop_candidates.append(fb)
-            
-    return imap_candidates, pop_candidates
+        return got.get("imap", []), got.get("pop", [])
+
+    found = discover_hosts(domain, email=email_addr)
+    return found["imap"], found["pop"]
 
 
 def host_list(email_addr):
     imap_hosts, _ = provider_hosts(email_addr)
-    return imap_hosts[:6]
+    return imap_hosts[:8]
+
+
+def ladder(email_addr, max_hosts=3, include_starttls=True):
+    """Ordered attempt plan: [(proto, host, port, mode), ...]"""
+    imap_hosts, pop_hosts = provider_hosts(email_addr)
+    plan = []
+    for h in imap_hosts[:max_hosts]:
+        plan.append(("IMAP", h, 993, "ssl"))
+    if include_starttls:
+        for h in imap_hosts[:max_hosts]:
+            plan.append(("IMAP", h, 143, "starttls"))
+    for h in pop_hosts[:max_hosts]:
+        plan.append(("POP", h, 995, "ssl"))
+    if include_starttls:
+        for h in pop_hosts[:max_hosts]:
+            plan.append(("POP", h, 110, "starttls"))
+    return plan
+
+
+def refresh_domain(domain):
+    """Force re-discovery, bypassing the cache."""
+    return discover_hosts(domain, use_cache=True, force_refresh=True)
 
 
 def is_disposable(email_addr):
