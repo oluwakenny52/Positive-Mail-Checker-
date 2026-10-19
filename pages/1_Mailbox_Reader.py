@@ -50,6 +50,12 @@ PROVIDER_FALLBACK_HOSTS = {
     "centurylink.net": ["imap.centurylink.net"],
     "q.com":           ["imap.centurylink.net"],
     "embarqmail.com":  ["imap.centurylink.net"],
+    # Latin-America / Spanish-language ISPs (MX is a Zimbra MTA router, so the
+    # real endpoint must be supplied here - 'imap.<domain>' does not exist).
+    "montevideo.com.uy": ["mail.montevideo.com.uy", "webmail.montevideo.com.uy", "pop3-mvd.montevideo.com.uy"],
+    "adinet.com.uy":     ["mail.adinet.com.uy"],
+    "antel.com.uy":      ["mail.antel.com.uy"],
+    "uy.com":            ["mail.uy.com"],
 }
 
 # These have NO standard IMAP endpoint at all (need Bridge / no IMAP).
@@ -85,9 +91,29 @@ def candidate_hosts(email_addr: str, override_host: str = "") -> List[str]:
     if domain:
         push(f"imap.{domain}")
         push(f"mail.{domain}")
+        push(f"webmail.{domain}")
+        push(f"correo.{domain}")
         push(domain)
 
     return ordered
+
+
+def username_candidates(email_addr: str) -> List[str]:
+    """Full address first, then the bare local part.
+
+    Legacy ISP servers (Zimbra / cPanel / Dovecot deployments that predate
+    full-address logins) authenticate on the local part only. Montevideo COMM
+    documents exactly this: "Nombre de usuario: jperez".
+    """
+    email_addr = (email_addr or "").strip()
+    if not email_addr:
+        return [email_addr]
+    out = [email_addr]
+    if "@" in email_addr:
+        local = email_addr.split("@", 1)[0].strip()
+        if local and local.lower() != email_addr.lower():
+            out.append(local)
+    return list(dict.fromkeys(out))
 
 
 # Dynamic Proxy Auto-Fetch Engine
@@ -364,12 +390,10 @@ def otp_log(msg):
 # ============================================================================
 # CONNECTION LAYER
 #
-# FIX: the proxy IMAP classes now override _create_socket() instead of open().
-# On Python 3.13+ imaplib.IMAP4.file is a read-only property, so the old
-# "self.file = self.sock.makefile('rb')" inside an open() override raised:
+# The proxy IMAP classes override _create_socket(), NOT open(): on Python
+# 3.13+ imaplib.IMAP4.file is a read-only property, so assigning self.file
+# inside an open() override raises
 #     property 'file' of '_ProxyIMAP4' object has no setter
-# Letting the stdlib's own open() bind the backing attribute fixes every
-# version, current and future.
 # ============================================================================
 
 def _mail_tls_context(verify=False):
@@ -537,7 +561,11 @@ class _ProxyIMAP4(imaplib.IMAP4):
 
 
 def open_imap(host, port, timeout, proxy_str=None, try_starttls=None):
-    """Implicit TLS on 993 first, then STARTTLS on 143 as fallback."""
+    """Implicit TLS on 993 first, then STARTTLS on 143, then plaintext 143.
+
+    The plaintext rung matters: legacy / Zimbra servers answer
+    'TLS not supported by server' on 143 but still accept a cleartext LOGIN.
+    """
     if try_starttls is None:
         try_starttls = bool(st.session_state.app_config.get("try_starttls", True))
 
@@ -553,6 +581,13 @@ def open_imap(host, port, timeout, proxy_str=None, try_starttls=None):
         try:
             m = _ProxyIMAP4(host, 143, timeout=timeout, proxy_str=proxy_str)
             m.starttls(ssl_context=_mail_tls_context(False))
+            _ensure_file(m)
+            return m
+        except Exception as e:
+            last = e
+
+        try:
+            m = _ProxyIMAP4(host, 143, timeout=timeout, proxy_str=proxy_str)
             _ensure_file(m)
             return m
         except Exception as e:
@@ -770,7 +805,8 @@ def get_webmail_portal(email_addr):
         "aol.com": "https://mail.aol.com",
         "zoho.com": "https://mail.zoho.com",
         "proton.me": "https://mail.proton.me",
-        "protonmail.com": "https://mail.proton.me"
+        "protonmail.com": "https://mail.proton.me",
+        "montevideo.com.uy": "https://webmail.montevideo.com.uy",
     }
     return portals.get(domain, f"https://www.{domain}")
 
@@ -903,22 +939,38 @@ def list_folders(mail, email_addr: str = "", host_val: str = ""):
 
 
 def open_mail(email_addr, password_val, host_val, timeout=None, proxy_str=None):
+    """Connect + login. Tries the full address first, then the bare local part,
+    because legacy ISP servers authenticate on the local part only."""
     if timeout is None:
         timeout = st.session_state.app_config.get("connection_timeout", 60)
     port_val = st.session_state.app_config.get("imap_port", 993)
     if proxy_str is None:
         proxy_str = _reader_proxy_str()
 
-    mail = open_imap(host_val, port_val, timeout, proxy_str=proxy_str)
-    try:
-        mail.login(email_addr, password_val)
-    except Exception:
+    users = username_candidates(email_addr)
+    last_err = None
+
+    for u_idx, user in enumerate(users):
+        mail = None
         try:
-            mail.logout()
-        except Exception:
-            pass
-        raise
-    return mail
+            mail = open_imap(host_val, port_val, timeout, proxy_str=proxy_str)
+            mail.login(user, password_val)
+            return mail
+        except Exception as ex:
+            last_err = ex
+            if mail:
+                try:
+                    mail.logout()
+                except Exception:
+                    pass
+            # A host-level failure means the username is irrelevant - don't pay
+            # for a second identical connect.
+            if u_idx + 1 < len(users):
+                s = str(ex).lower()
+                if not _looks_like_auth_error(s) and not _looks_like_app_password_error(s):
+                    break
+
+    raise last_err or RuntimeError(f"login failed for {email_addr}")
 
 
 def resolve_active_host(email_addr: str) -> str:
@@ -1492,13 +1544,15 @@ with st.sidebar.expander("⚙️ App Configuration Settings", expanded=False):
     new_timeout = st.number_input("Connection Timeout (seconds)", min_value=5, max_value=300, value=cfg.get("connection_timeout", 15))
     new_port = st.number_input("Default IMAP Port", min_value=1, max_value=65535, value=cfg.get("imap_port", 993))
     new_fallback = st.checkbox("Enable Auto-Fallback Host Probing (Spectrum/Charter/TWC)", value=cfg.get("auto_fallback_probing", True))
-    new_starttls = st.checkbox("Try STARTTLS on port 143 if 993 fails", value=cfg.get("try_starttls", True))
+    new_starttls = st.checkbox("Try STARTTLS / plaintext on port 143 if 993 fails", value=cfg.get("try_starttls", True))
+    new_altuser = st.checkbox("Try local-part username on auth failure", value=cfg.get("try_alt_username", True))
 
     if st.button("💾 Save App Settings", type="secondary", use_container_width=True):
         st.session_state.app_config["connection_timeout"] = new_timeout
         st.session_state.app_config["imap_port"] = new_port
         st.session_state.app_config["auto_fallback_probing"] = new_fallback
         st.session_state.app_config["try_starttls"] = new_starttls
+        st.session_state.app_config["try_alt_username"] = new_altuser
         save_app_config(st.session_state.app_config)
         st.success("App configuration updated and saved globally!")
 
@@ -1541,6 +1595,7 @@ if st.sidebar.button("🚀 Validate & Import Batch Accounts", type="primary", us
         cfg_timeout = st.session_state.app_config.get("connection_timeout", 15)
         cfg_port = st.session_state.app_config.get("imap_port", 993)
         cfg_fallback = st.session_state.app_config.get("auto_fallback_probing", True)
+        cfg_alt_user = st.session_state.app_config.get("try_alt_username", True)
 
         user_host_overrides = [h.strip() for h in re.split(r'[,;\n]+', batch_host_override_input) if h.strip()]
         active_proxy_pool = load_app_proxies() or [{"proxy": None, "country": "Direct", "region": "-"}]
@@ -1577,9 +1632,6 @@ if st.sidebar.button("🚀 Validate & Import Batch Accounts", type="primary", us
                         hosts_to_test.append(h)
             else:
                 hosts_to_test = candidate_hosts(email_val)
-                if cfg_fallback:
-                    # known-good legacy ISP endpoints first
-                    hosts_to_test = candidate_hosts(email_val)
 
             # Zero-access guard: never let the loop be a no-op
             if not hosts_to_test:
@@ -1592,12 +1644,29 @@ if st.sidebar.button("🚀 Validate & Import Batch Accounts", type="primary", us
             auth_err = ""
             trace_steps = []
 
+            users_to_try = username_candidates(email_val) if cfg_alt_user else [email_val]
+
             for h in hosts_to_test:
                 test_m = None
                 try:
-                    trace_steps.append(f"Attempting IMAP TLS -> Host: {h}:{cfg_port} (STARTTLS 143 fallback enabled)")
-                    test_m = open_imap(h, cfg_port, cfg_timeout, proxy_item.get("proxy"))
-                    test_m.login(email_val, pass_val)
+                    trace_steps.append(f"Attempting IMAP TLS -> Host: {h}:{cfg_port} (STARTTLS/plain fallback enabled)")
+                    last_login_err = None
+                    logged_in = False
+                    for u_name in users_to_try:
+                        test_m = open_imap(h, cfg_port, cfg_timeout, proxy_item.get("proxy"))
+                        try:
+                            test_m.login(u_name, pass_val)
+                            logged_in = True
+                            trace_steps.append(f"Authenticated as '{u_name}'")
+                            break
+                        except Exception as lex:
+                            last_login_err = lex
+                            try:
+                                test_m.logout()
+                            except Exception:
+                                pass
+                    if not logged_in:
+                        raise last_login_err or RuntimeError("login failed")
                     test_m.logout()
                     connected_h = h
                     is_success = True
