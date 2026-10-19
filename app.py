@@ -1,4 +1,18 @@
+"""
+Mega Ultimate Mail Checker — v13.1
+==================================
+Self-healing import header.
+
+hosts.py ships in several shapes depending on which revision is deployed:
+    * new  -> conf / rank_hosts / is_junk_host  all present
+    * mid  -> conf only (no ranking helpers)
+    * old  -> neither conf nor ranking helpers
+Everything below falls back locally, so a stale hosts.py can never raise
+ImportError again.  The engine itself is unchanged.
+"""
+
 import streamlit as str_lit
+import streamlit as st
 import imaplib
 import poplib
 import ssl
@@ -22,9 +36,210 @@ import pandas as pd
 import concurrent.futures
 from dataclasses import dataclass, field
 from typing import List, Dict, Optional
-from hosts import conf as host_conf, STRICT_APP, ZERO_ACCESS, PARENT, MS_DOMAINS, GMAIL_DOMAINS
-from hosts import rank_hosts as host_rank_hosts, is_junk_host as host_is_junk
-from status import VALID, WRONG, APP, FAILED, SKIP, UNKNOWN
+
+# ============================================================================
+# RESILIENT IMPORTS
+# ============================================================================
+HOSTS_OK = True
+HOSTS_HAS_RANKING = True
+HOSTS_IMPORT_NOTE = ""
+
+try:
+    from hosts import conf as host_conf, STRICT_APP, ZERO_ACCESS, PARENT, MS_DOMAINS, GMAIL_DOMAINS
+except Exception as _hosts_core_err:
+    HOSTS_OK = False
+    HOSTS_IMPORT_NOTE = f"hosts.py core import failed ({_hosts_core_err}); using built-in tables."
+    STRICT_APP = {"gmail.com", "googlemail.com", "outlook.com", "hotmail.com", "live.com", "windowslive.com"}
+    ZERO_ACCESS = {"proton.me", "protonmail.com", "pm.me", "tuta.io", "tutanota.com", "tutamail.com", "tuta.com"}
+    PARENT = {"memoad.jp": "biglobe.ne.jp"}
+    MS_DOMAINS = {"outlook.com", "hotmail.com", "live.com", "msn.com", "hotmail.co.uk"}
+    GMAIL_DOMAINS = {"gmail.com", "googlemail.com"}
+
+    _BB_STATIC_CONF = {
+        "gmail.com": (["imap.gmail.com"], ["pop.gmail.com"]),
+        "googlemail.com": (["imap.gmail.com"], ["pop.gmail.com"]),
+        "outlook.com": (["outlook.office365.com"], ["outlook.office365.com"]),
+        "hotmail.com": (["outlook.office365.com"], ["outlook.office365.com"]),
+        "live.com": (["outlook.office365.com"], ["outlook.office365.com"]),
+        "msn.com": (["outlook.office365.com"], ["outlook.office365.com"]),
+        "yahoo.com": (["imap.mail.yahoo.com"], ["pop.mail.yahoo.com"]),
+        "ymail.com": (["imap.mail.yahoo.com"], ["pop.mail.yahoo.com"]),
+        "aol.com": (["imap.aol.com"], ["pop.aol.com"]),
+        "icloud.com": (["imap.mail.me.com"], ["pop.mail.me.com"]),
+        "me.com": (["imap.mail.me.com"], ["pop.mail.me.com"]),
+        "zoho.com": (["imap.zoho.com"], ["pop.zoho.com"]),
+        "gmx.net": (["imap.gmx.net"], ["pop.gmx.net"]),
+        "gmx.de": (["imap.gmx.net"], ["pop.gmx.net"]),
+        "web.de": (["imap.web.de"], ["pop3.web.de"]),
+        "t-online.de": (["secureimap.t-online.de"], ["securepop.t-online.de"]),
+        "free.fr": (["imap.free.fr"], ["pop.free.fr"]),
+        "orange.fr": (["imap.orange.fr"], ["pop.orange.fr"]),
+        "qq.com": (["imap.qq.com"], ["pop.qq.com"]),
+        "naver.com": (["imap.naver.com"], ["pop.naver.com"]),
+        "montevideo.com.uy": (["mail.montevideo.com.uy", "webmail.montevideo.com.uy"], ["mail.montevideo.com.uy"]),
+        "adinet.com.uy": (["mail.adinet.com.uy"], ["mail.adinet.com.uy"]),
+        "antel.com.uy": (["mail.antel.com.uy"], ["mail.antel.com.uy"]),
+    }
+
+    def host_conf(domain):
+        domain = (domain or "").lower().strip()
+        if domain in ZERO_ACCESS:
+            return {"imap": [], "pop": [], "pop3": [], "type": "zero_access"}
+        got = _BB_STATIC_CONF.get(domain)
+        if got:
+            return {"imap": list(got[0]), "pop": list(got[1]), "pop3": list(got[1])}
+        return None
+
+try:
+    from hosts import rank_hosts as host_rank_hosts, is_junk_host as host_is_junk
+except Exception as _hosts_rank_err:
+    HOSTS_HAS_RANKING = False
+    _note = f"hosts.py has no rank_hosts/is_junk_host ({_hosts_rank_err}); using built-in router-aware ranking."
+    HOSTS_IMPORT_NOTE = (HOSTS_IMPORT_NOTE + " " + _note).strip() if HOSTS_IMPORT_NOTE else _note
+
+    # --- Exact copy of hosts.py ranking logic, so behaviour is identical ---
+    _BB_ROUTER_LABEL_EXACT = re.compile(
+        r"^(?:"
+        r"mx|mx\d+|mta|mtas|mta\d+|smtp|smtps|smtpout|smtp-in|smtp-out|"
+        r"inbound|outbound|relay|relay\d+|spool|filter|filters|cluster|clust\d+|"
+        r"edge|edge\d+|gateway|gw|gw\d+|router|mailrouter|aspmx|aspmx\d*|"
+        r"alt\d+|protection|hs|lb|"
+        r"mx-aol|mx-aol\.mail|mx\.google|eur\.olc|olc\.protection"
+        r")$"
+    )
+    _BB_ROUTER_TOKENS = (
+        "mta", "smtp", "relay", "inbound", "outbound", "spool",
+        "filter", "cluster", "mailrouter", "olc.protection",
+        "protection.outlook", "aspmx", "gateway",
+    )
+    _BB_SERVICE_PREFIXES = (
+        "imap", "imaps", "imap2", "mail", "mail2", "pop", "pop3", "pop3s",
+        "webmail", "webmail2", "email", "correo", "zimbra", "zcs",
+        "secure", "ssl", "outlook", "exchange", "owa",
+    )
+    _BB_SKIP_LABELS = {"mail", "email", "webmail", "imap", "imaps", "pop", "pop3", "smtp", "correo"}
+
+    def host_is_junk(host, domain=None):
+        """True when a hostname is almost certainly a mail ROUTER (MX/MTA).
+
+        Catches Zimbra-style names such as 'zcs8-mvd-mta-mx7.example.com' that
+        a plain startswith(('mx','smtp')) test misses entirely.
+        """
+        h = (host or "").lower().strip().strip(".")
+        if not h:
+            return True
+        if domain and h == (domain or "").lower().strip():
+            return True
+        labels = h.split(".")
+        if len(labels) < 2:
+            return False
+        for lab in labels[:-1]:
+            if _BB_ROUTER_LABEL_EXACT.match(lab):
+                return True
+        for lab in labels[:-1]:
+            if lab in _BB_SKIP_LABELS:
+                continue
+            if any(tok in lab for tok in _BB_ROUTER_TOKENS):
+                return True
+            if re.search(r"(?:^|[-_])mx\d*(?:$|[-_])", lab):
+                return True
+        return False
+
+    def _bb_tier(host, domain):
+        """0 = most likely correct ... 4 = last resort. Ordering only."""
+        h = (host or "").lower().strip().strip(".")
+        d = (domain or "").lower().strip().strip(".")
+        if not h:
+            return 4
+        if d and h == d:
+            return 3
+        if d and h.endswith("." + d):
+            if host_is_junk(h, d):
+                return 3
+            if h[: -(len(d) + 1)].split(".")[0] in _BB_SERVICE_PREFIXES:
+                return 0
+            return 1
+        if host_is_junk(h, d):
+            return 3
+        return 2
+
+    def _bb_resolves(host):
+        try:
+            socket.getaddrinfo(host, None)
+            return True
+        except Exception:
+            return False
+
+    _bb_probe_lock = threading.Lock()
+    _bb_probe_cache = {}
+    _BB_PROBE_TTL = 600
+
+    def _bb_port_open(host, port, timeout=1.5):
+        try:
+            _s = socket.create_connection((host, port), timeout=timeout)
+            _s.close()
+            return True
+        except Exception:
+            return False
+
+    def _bb_probe(host):
+        if not host:
+            return False
+        now = time.time()
+        with _bb_probe_lock:
+            hit = _bb_probe_cache.get(host)
+            if hit and now - hit[0] < _BB_PROBE_TTL:
+                return hit[1]
+        ok = _bb_port_open(host, 993) or _bb_port_open(host, 143)
+        with _bb_probe_lock:
+            _bb_probe_cache[host] = (now, ok)
+        return ok
+
+    def host_rank_hosts(hosts, domain, probe=True):
+        """Composite ranking: tier -> DNS -> open port -> discovery order."""
+        hosts = [h for h in (hosts or []) if h]
+        if not hosts:
+            return []
+
+        indexed = list(enumerate(hosts))
+        if not probe:
+            indexed.sort(key=lambda t: (_bb_tier(t[1], domain), 0 if _bb_resolves(t[1]) else 1, t[0]))
+            return [h for _i, h in indexed]
+
+        tiers = {h: _bb_tier(h, domain) for h in set(hosts)}
+        resolves = {h: _bb_resolves(h) for h in set(hosts)}
+        to_probe = [h for h in dict.fromkeys(hosts) if tiers[h] <= 1 and resolves[h]][:6]
+        live = {}
+        if to_probe:
+            try:
+                with concurrent.futures.ThreadPoolExecutor(max_workers=min(6, len(to_probe))) as ex:
+                    futs = {ex.submit(_bb_probe, h): h for h in to_probe}
+                    for fut in concurrent.futures.as_completed(futs, timeout=6):
+                        h = futs[fut]
+                        try:
+                            live[h] = fut.result()
+                        except Exception:
+                            live[h] = False
+            except Exception:
+                pass
+
+        indexed.sort(key=lambda t: (
+            tiers.get(t[1], 4),
+            0 if resolves.get(t[1], False) else 1,
+            0 if live.get(t[1], False) else 1,
+            t[0],
+        ))
+        return [h for _i, h in indexed]
+
+try:
+    from status import VALID, WRONG, APP, FAILED, SKIP, UNKNOWN
+except Exception as _status_err:
+    VALID = "valid"
+    WRONG = "wrong_password"
+    APP = "need_app_password"
+    FAILED = "connection_failed"
+    SKIP = "skipped_cooldown"
+    UNKNOWN = "unknown"
 
 # Optional network libs
 try:
@@ -451,14 +666,34 @@ for _k in ("start_timestamp", "end_timestamp", "total_duration"):
         str_lit.session_state[_k] = None
 
 
-def log_startup(msg):
+# Buffer used by background threads so they never touch st.session_state.
+# This is what kills the 'missing ScriptRunContext!' flood from the alive-pool.
+_STARTUP_BUFFER = []
+_STARTUP_BUFFER_LOCK = threading.Lock()
+
+
+def log_startup(msg, quiet: bool = False):
     ts = datetime.now().strftime("%H:%M:%S.%f")[:-3]
     entry = f"[{ts}] [INIT/HOOD] {msg}"
-    if entry not in str_lit.session_state.startup_entries:
-        str_lit.session_state.startup_entries.append(entry)
+    if quiet:
+        with _STARTUP_BUFFER_LOCK:
+            _STARTUP_BUFFER.append(entry)
+            if len(_STARTUP_BUFFER) > 400:
+                del _STARTUP_BUFFER[:-400]
+        return
+    try:
+        if entry not in str_lit.session_state.startup_entries:
+            str_lit.session_state.startup_entries.append(entry)
+    except Exception:
+        with _STARTUP_BUFFER_LOCK:
+            _STARTUP_BUFFER.append(entry)
 
 
 log_startup("Application process started. Initializing session state and loading configurations...")
+log_startup(
+    f"hosts.py status -> loaded={HOSTS_OK} has_ranking={HOSTS_HAS_RANKING} "
+    f"{HOSTS_IMPORT_NOTE}".strip()
+)
 
 cache_lock = threading.Lock()
 proxy_lock = threading.Lock()
@@ -648,22 +883,22 @@ domain_cache = load_json("domain_cache.json", {})
 proxy_meta = load_json("proxy_meta.json", {})
 
 
-def load_proxies():
+def load_proxies(quiet: bool = False):
     if not os.path.exists("proxies.txt") or os.path.getsize("proxies.txt") == 0:
         try:
             with file_write_lock:
                 with open("proxies.txt", "w", encoding="utf-8") as f:
                     f.write("\n".join(OXYLABS_PROXIES[:]) + "\n")
-            log_startup("Initialized default proxies.txt file.")
+            log_startup("Initialized default proxies.txt file.", quiet=quiet)
         except Exception as e:
-            log_startup(f"WARNING: Failed to initialize default proxies.txt: {e}")
+            log_startup(f"WARNING: Failed to initialize default proxies.txt: {e}", quiet=quiet)
     try:
         with open("proxies.txt", encoding="utf-8", errors="ignore") as f:
             raw_list = [l.strip() for l in f if l.strip() and not l.startswith("#")]
-        log_startup(f"Loaded {len(raw_list)} proxies from proxies.txt.")
+        log_startup(f"Loaded {len(raw_list)} proxies from proxies.txt.", quiet=quiet)
         return raw_list if raw_list else OXYLABS_PROXIES
     except Exception as e:
-        log_startup(f"WARNING: Failed to read proxies.txt: {e}")
+        log_startup(f"WARNING: Failed to read proxies.txt: {e}", quiet=quiet)
         return OXYLABS_PROXIES
 
 
@@ -1051,9 +1286,9 @@ def proxy_is_blocked(proxy_str):
     return False
 
 
-def get_filtered_active_proxies():
+def get_filtered_active_proxies(quiet: bool = False):
     try:
-        raw = load_proxies()
+        raw = load_proxies(quiet=quiet)
         filtered = []
         min_score = CFG.get("MIN_PROXY_SCORE", 10)
         mode = CFG.get("POOL_MODE", "all")
@@ -1084,11 +1319,11 @@ def get_filtered_active_proxies():
             else:
                 filtered.append(p)
 
-        log_startup(f"Proxy filtering complete. Active pool contains {len(filtered)} out of {len(raw)} proxies.")
+        log_startup(f"Proxy filtering complete. Active pool contains {len(filtered)} out of {len(raw)} proxies.", quiet=quiet)
         return filtered if filtered else raw
     except Exception as e:
-        log_startup(f"WARNING: Error filtering active proxies: {e}")
-        return load_proxies()
+        log_startup(f"WARNING: Error filtering active proxies: {e}", quiet=quiet)
+        return load_proxies(quiet=quiet)
 
 
 all_proxies = load_proxies()
@@ -1690,8 +1925,10 @@ def get_servers(email):
 
 
 def refresh_alive_pool():
+    # Runs on the background 'alive-pool' thread -> quiet mode keeps it off
+    # st.session_state, which is what removes the ScriptRunContext flood.
     try:
-        raw = get_filtered_active_proxies()
+        raw = get_filtered_active_proxies(quiet=True)
     except Exception:
         raw = []
     if not CFG.get("PROXY_TEST_FLIGHT", True):
