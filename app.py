@@ -1,27 +1,32 @@
 """
-Mega Ultimate Mail Checker — v13.5
+Mega Ultimate Mail Checker — v13.6
 ==================================
-Self-healing import header + callback-safe Theme Studio + cached host resolution.
+Complete rewrite. SMTP reachability is now a PRE-CHECK stage (never inside the
+validator), status classification actually works, and every direct-connection
+line carries the real egress IP / region / country / VPN state.
 
-v13.5 changes
+v13.6 changes
 -------------
-* status.py now actually imports (both naming conventions exported) — the
-  silent fallback constants are gone.
-* NEW statuses: RETRY_LATER (server throttle / IP block) and SMTP_FAILED
-  (DNS ok, SMTP dead). Neither is reported as an account failure any more.
-* NEW: SMTP failed check runs immediately after the fast-fail DNS check.
-* NEW: direct-fallback breadcrumb prints the REAL egress IP / region / country
-  plus your own VPN state, so a phone-side VPN can be seen in the log.
-* NEW sidebar toggles: Proxy Random Rotation (ON by default) and Geo-Call Proxy
-  (prefer a node in the email's country, with automatic fallback).
-* NEW: per-status live dropdowns + RETRY_LATER/SMTP_FAILED in the inspector,
-  the Engine Action Mode and the Live Report Log & Analytics.
-* Live stream colour contract: valid=green, wrong=red, connection failed=yellow,
-  app-password/2FA=blue, RETRY_LATER=white.
-* Start-lag killed: the progress bar renders BEFORE the pool refresh, and the
-  pool refresh is now parallel instead of one-proxy-at-a-time.
-* NO hardcoded proxy IPs and NO faked geo table. Everything is derived from
-  proxies.txt / Streamlit secrets / live DNS / live ip-api.
+* CRITICAL FIX: status.py exports ALL_STATUSES again, so the real classifier is
+  used. Previously the whole status import threw, the stub `st_classify()`
+  returned UNKNOWN for everything, and every auth error was logged as
+  "[Classified: unknown]". That single bug was the source of most false failures.
+* CRITICAL FIX: the SMTP failed check no longer runs inside check_account_sync.
+  It used to burn ~36s of the 40s per-account budget before the ladder even
+  started, which produced "Per-account budget reached; stopping ladder" with zero
+  IMAP attempts and mass SMTP_FAILED / CONNECTION_FAILED results.
+* SMTP Failed is now a PRE-CHECK bucket, displayed immediately AFTER DNS Failed
+  in the filter row, the category inspector and the Engine Action Mode.
+* NEW: per-domain SMTP reachability cache (TTL 15 min) + parallel probing, so the
+  pre-check is a one-time cost and never blocks the UI on a re-run.
+* direct connections now print the real egress IP | region | country | VPN state
+  on EVERY line (px_tag), not the bare word "direct".
+* VPN auto-detection from the egress ISP/org, so a phone-side VPN is visible.
+* Corrected per-account budget split now that SMTP is out of the validator.
+* Status taxonomy kept intact for both naming conventions.
+
+NO hardcoded proxy IPs and NO faked geo table. Everything is derived from
+proxies.txt / Streamlit secrets / live DNS / live ip-api.
 """
 
 import streamlit as str_lit
@@ -236,7 +241,7 @@ except Exception as _hosts_rank_err:
         ))
         return [h for _i, h in indexed]
 
-# --- status.py : both naming conventions are exported, so this always works ---
+# --- status.py : both naming conventions are exported -----------------------
 try:
     from status import (
         VALID, WRONG, WRONG_PASSWORD, APP, NEED_APP_PASSWORD,
@@ -246,8 +251,12 @@ try:
         classify_error as st_classify, is_proxy_level_error as st_proxy_level,
         display as st_display, color as st_color,
     )
+    STATUS_OK = True
+    STATUS_IMPORT_NOTE = "status.py loaded (real classifier active)."
 except Exception as _status_err:
-    warnings.warn(f"status.py import failed ({_status_err}); using inline fallback.")
+    STATUS_OK = False
+    STATUS_IMPORT_NOTE = f"status.py import failed ({_status_err}); using inline fallback."
+    warnings.warn(STATUS_IMPORT_NOTE)
     VALID = "valid"
     WRONG = WRONG_PASSWORD = "wrong_password"
     APP = NEED_APP_PASSWORD = "need_app_password"
@@ -266,7 +275,26 @@ except Exception as _status_err:
         DNS_FAILED: "#f97316", UNKNOWN: "#94a3b8", SKIPPED_COOLDOWN: "#a78bfa",
     }
 
+    _FB_APP = ("app password", "application-specific", "basic authentication is disabled",
+               "web browser", "2fa", "mfa", "two-factor", "enable imap", "login-disabled")
+    _FB_DNS = ("does not resolve", "name or service not known", "gaierror", "getaddrinfo")
+    _FB_RETRY = ("lookup failed", "could not be routed", "temporarily", "too many",
+                 "blacklisted", "rate limit", "throttl", "try again", "unavailable")
+    _FB_CONN = ("timed out", "timeout", "connection refused", "connection reset", "socket error",
+                "eof", "tls not supported", "stls not supported", "ssl", "no route to host",
+                "wrong version number", "proxy and direct fallback", "handshake")
+    _FB_WRONG = ("authenticationfailed", "authentication failed", "authenticate error",
+                 "invalid credentials", "invalid login", "invalid password", "invalid user",
+                 "login incorrect", "login failed", "wrong password", "user rejected",
+                 "password rejected", "logon failure", "error")
+
     def st_classify(raw, domain=""):
+        t = (raw or "").lower()
+        for table, val in ((_FB_APP, NEED_APP_PASSWORD), (_FB_DNS, DNS_FAILED),
+                           (_FB_RETRY, RETRY_LATER), (_FB_CONN, CONNECTION_FAILED),
+                           (_FB_WRONG, WRONG_PASSWORD)):
+            if any(n in t for n in table):
+                return val
         return UNKNOWN
 
     def st_proxy_level(raw):
@@ -357,8 +385,8 @@ def default_theme() -> dict:
         "bg": p["bg"], "panel": p["panel"], "text": p["text"],
         "radius": 14, "glow": True, "animate": True, "glass": True,
         "colorize_logs": True,
-        "hero_title": "⚡ Mega Ultimate Mail Checker v13.5",
-        "hero_sub": "World-Coverage Edition — router-aware host ranking, rotating proxy pool, geo-call routing, retryable IP-block handling, SMTP reachability check, anti-spoofing post-auth validation.",
+        "hero_title": "⚡ Mega Ultimate Mail Checker v13.6",
+        "hero_sub": "World-Coverage Edition — router-aware host ranking, rotating proxy pool, geo-call routing, retryable IP-block handling, SMTP pre-check, anti-spoofing post-auth validation.",
     }
 
 
@@ -555,7 +583,7 @@ def render_hero(th: dict):
                 <span class="bb-tag">Deep / Aggressive</span>
                 <span class="bb-tag">Proxy Backed</span>
                 <span class="bb-tag">Geo-Call Routing</span>
-                <span class="bb-tag">SMTP Reachability</span>
+                <span class="bb-tag">SMTP Pre-Check</span>
                 <span class="bb-tag">Anti-Spoof Post-Auth</span>
             </div>
         </div>
@@ -599,7 +627,6 @@ def _line_color(line: str) -> str:
                 "RETRY_LATER", "SMTP_FAILED", "DNS_FAILED", "VALID", "UNKNOWN", "EXCEPTION", "ERROR"):
         if f"[{tag}]" in up:
             return TAG_COLORS.get(tag, "#cbd5e1")
-    # trace fragments
     if "[CLASSIFIED: VALID]" in up:
         return TAG_COLORS["VALID"]
     if "[CLASSIFIED: WRONG_PASSWORD]" in up:
@@ -691,8 +718,7 @@ def _reset_theme():
 
 DOMAIN_CACHE_TTL = 86400
 
-# --- TLD -> country NAME, matched against ip-api's country string.
-#     Knowledge table, not a faked geo database. ---
+# --- TLD -> country NAME, matched against ip-api's country string. ---
 TLD_COUNTRY = {
     "de": "Germany", "at": "Austria", "ch": "Switzerland", "fr": "France",
     "it": "Italy", "es": "Spain", "pt": "Portugal", "nl": "Netherlands",
@@ -705,8 +731,18 @@ TLD_COUNTRY = {
     "jp": "Japan", "kr": "South Korea", "in": "India", "tr": "Turkey",
     "za": "South Africa", "ru": "Russia", "ua": "Ukraine", "il": "Israel",
     "lt": "Lithuania", "lv": "Latvia", "ee": "Estonia", "bg": "Bulgaria",
-    "hr": "Croatia", "si": "Slovenia", "rs": "Serbia", "mx": "Mexico",
+    "hr": "Croatia", "si": "Slovenia", "rs": "Serbia",
 }
+
+# Tokens that show up in the ISP/org of a hosting provider or VPN.
+_VPN_TOKENS = (
+    "vpn", "nordvpn", "mullvad", "proton", "expressvpn", "surfshark", "cyberghost",
+    "private internet", "ipvanish", "windscribe", "tunnelbear", "hide.me", "purevpn",
+    "datacamp", "packethub", "m247", "leaseweb", "psychz", "quickpacket", "frantech",
+    "digitalocean", "linode", "vultr", "hetzner", "ovh", "contabo", "choopa",
+    "amazon", "aws", "google cloud", "microsoft azure", "cloudflare", "oracle cloud",
+    "hostinger", "colocrossing", "hostwinds", "gcore", "scaleway",
+)
 
 
 def load_persistent_valid_results():
@@ -742,7 +778,8 @@ if "valid_results" not in str_lit.session_state:
     str_lit.session_state.run_valid_count = len(loaded_valid)
 for _k in ("wrong_results", "need_app_results", "conn_results", "retry_results",
            "smtp_results", "dns_results", "skip_results",
-           "report_entries", "log_lines", "startup_entries"):
+           "report_entries", "log_lines", "startup_entries",
+           "pre_dns_failed", "pre_smtp_failed"):
     if _k not in str_lit.session_state:
         str_lit.session_state[_k] = []
 if "zip_bytes" not in str_lit.session_state:
@@ -794,10 +831,8 @@ def startup_panel_lines():
 
 
 log_startup("Application process started. Initializing session state and loading configurations...")
-log_startup(
-    f"hosts.py status -> loaded={HOSTS_OK} has_ranking={HOSTS_HAS_RANKING} "
-    f"{HOSTS_IMPORT_NOTE}".strip()
-)
+log_startup(f"hosts.py status -> loaded={HOSTS_OK} has_ranking={HOSTS_HAS_RANKING} {HOSTS_IMPORT_NOTE}".strip())
+log_startup(f"status.py status -> {STATUS_IMPORT_NOTE}")
 
 cache_lock = threading.Lock()
 proxy_lock = threading.Lock()
@@ -818,7 +853,15 @@ _rr_index = 0
 _GEO_CACHE = {}
 _GEO_LOCK = threading.Lock()
 _PUBLIC_IP = {"ip": "", "ts": 0.0}
-_DIRECT_GEO = {"ts": 0.0, "ip": "", "country": "Unknown", "region": "Unknown"}
+_PUBLIC_IP_LOCK = threading.Lock()
+_DIRECT_GEO = {"ts": 0.0, "ip": "", "country": "Unknown", "region": "Unknown", "vpn": "Auto"}
+_DIRECT_GEO_LOCK = threading.Lock()
+_DIRECT_ISP = {"ts": 0.0, "isp": ""}
+
+# SMTP pre-check cache (per domain)
+_SMTP_DOMAIN_CACHE = {}
+_SMTP_LOCK = threading.Lock()
+_SMTP_CACHE_TTL = 900
 
 
 @dataclass
@@ -979,7 +1022,7 @@ geo_call_proxy = str_lit.sidebar.toggle(
 )
 my_connection = str_lit.sidebar.selectbox(
     "📶 My own connection (stamped on direct fallbacks)", ["Auto", "VPN ON", "VPN OFF"], index=0,
-    help="Purely diagnostic: recorded on every direct-fallback line so a phone-side VPN is visible in the log."
+    help="Diagnostic only. 'Auto' guesses from the egress ISP; a manual choice always wins."
 )
 
 if "pool_mode" not in str_lit.session_state:
@@ -1011,9 +1054,7 @@ proxy_meta = load_json("proxy_meta.json", {})
 
 
 def load_proxies(quiet: bool = False):
-    """Proxies come from proxies.txt only. If the file does not exist we create
-    it from the secret-provided list; if there are no secrets either, the file
-    stays EMPTY and the engine runs fully direct. Nothing is pre-added."""
+    """Proxies come from proxies.txt only. Nothing is pre-added."""
     if not os.path.exists("proxies.txt"):
         try:
             with file_write_lock:
@@ -1103,33 +1144,69 @@ def geo_lookup(ip):
 def public_ip(force=False):
     if not force and _PUBLIC_IP["ip"] and time.time() - _PUBLIC_IP["ts"] < 600:
         return _PUBLIC_IP["ip"]
-    ip = ""
-    try:
-        if requests is not None:
-            ip = (requests.get("https://api.ipify.org", timeout=3).text or "").strip()
-    except Exception:
+    with _PUBLIC_IP_LOCK:
+        if not force and _PUBLIC_IP["ip"] and time.time() - _PUBLIC_IP["ts"] < 600:
+            return _PUBLIC_IP["ip"]
         ip = ""
-    if not ip:
         try:
-            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            s.connect(("8.8.8.8", 80))
-            ip = s.getsockname()[0]
-            s.close()
+            if requests is not None:
+                ip = (requests.get("https://api.ipify.org", timeout=3).text or "").strip()
         except Exception:
             ip = ""
-    if ip:
-        _PUBLIC_IP.update(ip=ip, ts=time.time())
-    return ip or "Unknown"
+        if not ip:
+            try:
+                s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                s.connect(("8.8.8.8", 80))
+                ip = s.getsockname()[0]
+                s.close()
+            except Exception:
+                ip = ""
+        if ip:
+            _PUBLIC_IP.update(ip=ip, ts=time.time())
+        return ip or "Unknown"
+
+
+def direct_isp(force=False):
+    """ISP / org of the direct egress IP — used for VPN auto-detection."""
+    if not force and _DIRECT_ISP["isp"] and time.time() - _DIRECT_ISP["ts"] < 600:
+        return _DIRECT_ISP["isp"]
+    ip = public_ip()
+    isp = ""
+    try:
+        if requests is not None and ip and ip != "Unknown":
+            r = requests.get(f"http://ip-api.com/json/{ip}?fields=status,isp,org,as", timeout=3)
+            if r.status_code == 200:
+                data = r.json()
+                if data.get("status") == "success":
+                    isp = " ".join(str(data.get(k) or "") for k in ("isp", "org", "as")).strip()
+    except Exception:
+        isp = ""
+    _DIRECT_ISP.update(isp=isp, ts=time.time())
+    return isp
+
+
+def vpn_state_label():
+    """Honour the manual stamp; 'Auto' guesses from the egress ISP."""
+    hint = CFG.get("CONNECTION_HINT", "Auto")
+    if hint in ("VPN ON", "VPN OFF"):
+        return hint
+    isp = (direct_isp() or "").lower()
+    if isp and any(t in isp for t in _VPN_TOKENS):
+        return "VPN ON (auto)"
+    return "VPN OFF (auto)"
 
 
 def direct_geo(force=False):
-    """Real egress IP + its geo, for the direct-fallback breadcrumb."""
+    """Real egress IP + its geo + VPN state, for every direct breadcrumb."""
     if not force and time.time() - _DIRECT_GEO["ts"] < 600 and _DIRECT_GEO["ip"]:
         return dict(_DIRECT_GEO)
-    ip = public_ip(force=force)
-    country, region = geo_lookup(ip)
-    _DIRECT_GEO.update(ts=time.time(), ip=ip, country=country, region=region)
-    return dict(_DIRECT_GEO)
+    with _DIRECT_GEO_LOCK:
+        if not force and time.time() - _DIRECT_GEO["ts"] < 600 and _DIRECT_GEO["ip"]:
+            return dict(_DIRECT_GEO)
+        ip = public_ip(force=force)
+        country, region = geo_lookup(ip)
+        _DIRECT_GEO.update(ts=time.time(), ip=ip, country=country, region=region, vpn=vpn_state_label())
+        return dict(_DIRECT_GEO)
 
 
 def tld_country(domain):
@@ -1150,9 +1227,11 @@ def enrich_proxy_geo(proxies, max_workers=8):
                 todo.append((p, info["host"]))
     if not todo:
         return
+
     def _one(item):
         p, host = item
         return p, host, geo_lookup(host)
+
     try:
         with ThreadPoolExecutor(max_workers=max_workers) as ex:
             for p, host, (country, region) in ex.map(_one, todo):
@@ -1303,6 +1382,13 @@ try_starttls_ui = str_lit.sidebar.toggle(
     help="If implicit TLS on 993/995 fails, retry the host over STARTTLS, then over plaintext."
 )
 
+smtp_precheck_ui = str_lit.sidebar.toggle(
+    "📮 SMTP Reachability Pre-Check", value=True,
+    help="Probe SMTP (587/465/25) ONCE per domain BEFORE the validator runs, and bucket dead-SMTP "
+         "accounts under 'SMTP Failed' next to 'DNS Failed'. Cached 15 min. Turn off to check every "
+         "account on IMAP regardless of SMTP state."
+)
+
 resolved_proxy_mode = str_lit.sidebar.selectbox(
     "Proxy Mode Engine:", options=["aggressive", "fallback", "sticky", "off"], index=1,
     help="aggressive: proxy only. fallback: proxy then direct. sticky: one proxy per worker thread. off: never use proxies."
@@ -1345,11 +1431,10 @@ def build_cfg():
         "PROXY_CONNECT_TIMEOUT": engine_config.connect_timeout,
         "FAST_MODE": engine_config.fast_mode,
         "FAILURE_COOLDOWN": engine_config.failure_cooldown,
-        # NEW
         "RANDOM_ROTATION": proxy_random_rotation,
         "GEO_CALL": geo_call_proxy,
         "CONNECTION_HINT": my_connection,
-        "SMTP_CHECK": True,
+        "SMTP_CHECK": smtp_precheck_ui,
     }
 
 
@@ -1385,7 +1470,7 @@ log_startup(
     f"proxy_mode={CFG.get('PROXY_MODE')} hosts/domain={CFG.get('MAX_HOSTS_PER_DOMAIN')} "
     f"starttls={CFG.get('TRY_STARTTLS')} alt_user={CFG.get('TRY_ALT_USERNAME')} "
     f"self_signed={CFG.get('ALLOW_SELF_SIGNED')} allow_blacklist={CFG.get('ALLOW_BLACKLIST_IPS')} "
-    f"random_rotation={CFG.get('RANDOM_ROTATION')} geo_call={CFG.get('GEO_CALL')} smtp_check={CFG.get('SMTP_CHECK')}"
+    f"random_rotation={CFG.get('RANDOM_ROTATION')} geo_call={CFG.get('GEO_CALL')} smtp_precheck={CFG.get('SMTP_CHECK')}"
 )
 
 
@@ -1542,7 +1627,506 @@ def get_filtered_active_proxies(quiet: bool = False):
 all_proxies = load_proxies()
 filtered_pool = get_filtered_active_proxies()
 
-# --- Startup Panel ---
+
+# ============================================================================
+# NETWORK CORE  (defined here so the pre-filter stage can use it)
+# ============================================================================
+
+def fast_fail_dns_check(host):
+    try:
+        socket.gethostbyname(host)
+        return True
+    except Exception:
+        return False
+
+
+def proxy_connect(host, port, proxy_str, timeout=None, remote_dns=True):
+    base_timeout = timeout or CFG["PROXY_CONNECT_TIMEOUT"]
+    try:
+        with proxy_lock:
+            fails = proxy_meta.get(proxy_str, {}).get("fails", 0)
+    except Exception:
+        fails = 0
+    effective_timeout = max(2.0, base_timeout - (fails * 0.1))
+
+    if not proxy_str or proxy_str == "direct":
+        if not fast_fail_dns_check(host):
+            raise RuntimeError(f"Fast-fail DNS check failed: Host '{host}' does not resolve locally")
+        s = socket.create_connection((host, port), timeout=effective_timeout)
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+        s.settimeout(effective_timeout)
+        return s
+
+    info = parse_proxy(proxy_str)
+    if not info or not SOCKS_OK:
+        raise RuntimeError("bad proxy format or socks unavailable")
+
+    last_err = None
+    for ptype in (socks.SOCKS5, socks.HTTP):
+        try:
+            kw = {"proxy_type": ptype, "proxy_addr": info["host"], "proxy_port": info["port"], "proxy_rdns": remote_dns}
+            if info["user"]:
+                kw["proxy_username"] = info["user"]
+                kw["proxy_password"] = info["pass"]
+            s = socks.create_connection((host, port), timeout=effective_timeout, **kw)
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+            s.settimeout(effective_timeout)
+            return s
+        except Exception as proxy_ex:
+            last_err = proxy_ex
+
+    if fast_fail_dns_check(host):
+        try:
+            direct_sock = socket.create_connection((host, port), timeout=effective_timeout)
+            direct_sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+            direct_sock.settimeout(effective_timeout)
+            return direct_sock
+        except Exception as direct_ex:
+            raise RuntimeError(f"Proxy and direct fallback connection both failed: {direct_ex}")
+
+    raise RuntimeError(f"Proxy connection failed for {host}:{port}: {last_err}")
+
+
+def _tls_context(host: str, verify: bool):
+    if verify:
+        ctx = ssl.create_default_context()
+    else:
+        ctx = ssl._create_unverified_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+    try:
+        ctx.set_ciphers('DEFAULT:@SECLEVEL=1')
+    except Exception:
+        pass
+    return ctx
+
+
+def _raw_socket(host, port, proxy_str=None, timeout=None):
+    t = timeout or CFG["TIMEOUT"]
+    if proxy_str and proxy_str != "direct":
+        s = proxy_connect(host, port, proxy_str, timeout=t)
+    else:
+        if not fast_fail_dns_check(host):
+            raise RuntimeError(f"Fast-fail DNS check failed: Host '{host}' does not resolve locally")
+        s = socket.create_connection((host, port), timeout=t)
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+    s.settimeout(t)
+    return s
+
+
+def tls_connect(host, port, proxy_str=None, insecure=True, timeout=None):
+    if insecure or CFG.get("ALLOW_SELF_SIGNED", True):
+        return _tls_context(host, False).wrap_socket(_raw_socket(host, port, proxy_str, timeout), server_hostname=host)
+    raw = _raw_socket(host, port, proxy_str, timeout)
+    try:
+        return _tls_context(host, True).wrap_socket(raw, server_hostname=host)
+    except ssl.SSLError as e:
+        warnings.warn(f"Verified TLS failed for {host} ({e!r}); retrying unverified on a FRESH socket")
+        return _tls_context(host, False).wrap_socket(_raw_socket(host, port, proxy_str, timeout), server_hostname=host)
+
+
+# ---------------------------------------------------------------------------
+# px_tag — EVERY line shows the real egress identity, direct included.
+# ---------------------------------------------------------------------------
+def px_tag(proxy_str):
+    if not proxy_str or proxy_str == "direct":
+        g = direct_geo()
+        return f"direct | {g['ip']} | {g['region']} | {g['country']} | {g['vpn']}"
+    info = parse_proxy(proxy_str)
+    if not info:
+        return "proxy"
+    meta = proxy_meta.get(proxy_str, {})
+    return f"{info.get('host')}:{info.get('port')} | {meta.get('country') or '?'} | {meta.get('region') or '?'}"
+
+
+# ============================================================================
+# PROTOCOL CLIENTS — override _create_socket(), NOT open()
+# ============================================================================
+
+class ProxyIMAP4SSL(imaplib.IMAP4_SSL):
+    def __init__(self, host, port=993, timeout=None, proxy_str=None, insecure=True):
+        self._proxy_str = proxy_str
+        self._insecure = insecure
+        super().__init__(host, port, timeout=timeout)
+
+    def _create_socket(self, timeout):
+        return tls_connect(self.host, self.port, self._proxy_str, insecure=self._insecure, timeout=timeout)
+
+
+class ProxyIMAP4(imaplib.IMAP4):
+    def __init__(self, host, port=143, timeout=None, proxy_str=None):
+        self._proxy_str = proxy_str
+        super().__init__(host, port, timeout=timeout)
+
+    def _create_socket(self, timeout):
+        return _raw_socket(self.host, self.port, self._proxy_str, timeout)
+
+
+class ProxyPOP3SSL(poplib.POP3_SSL):
+    def __init__(self, host, port=995, timeout=None, proxy_str=None, insecure=True):
+        self._proxy_str = proxy_str
+        self._insecure = insecure
+        super().__init__(host, port, timeout=timeout)
+
+    def _create_socket(self, timeout):
+        return tls_connect(self.host, self.port, self._proxy_str, insecure=self._insecure, timeout=timeout)
+
+
+class ProxyPOP3(poplib.POP3):
+    def __init__(self, host, port=110, timeout=None, proxy_str=None):
+        self._proxy_str = proxy_str
+        super().__init__(host, port, timeout=timeout)
+
+    def _create_socket(self, timeout):
+        return _raw_socket(self.host, self.port, self._proxy_str, timeout)
+
+
+def pop3_ok(resp):
+    if resp is None:
+        return False
+    if isinstance(resp, (bytes, bytearray)):
+        return bytes(resp).lstrip().startswith(b"+")
+    if isinstance(resp, str):
+        return resp.lstrip().startswith("+")
+    if isinstance(resp, (tuple, list)):
+        return len(resp) >= 1
+    return True
+
+
+# ============================================================================
+# ERROR CLASSIFICATION
+# ============================================================================
+
+def classify_error(err, domain=""):
+    try:
+        err_str = str(err)
+        if domain in ZERO_ACCESS_PROVIDERS:
+            return APP
+        return st_classify(err_str, domain)
+    except Exception:
+        return UNKNOWN
+
+
+def _is_proxy_level_error(msg):
+    try:
+        return st_proxy_level(msg)
+    except Exception:
+        s = (msg or "").lower()
+        return any(k in s for k in ("407", "proxy auth", "proxy connect", "socks"))
+
+
+def record_proxy_attempt(proxy_str, success, is_network_error=False):
+    try:
+        if not proxy_str:
+            return
+        threshold = int(CFG.get("BLACKLIST_CF", 15))
+        with proxy_lock:
+            if proxy_str not in proxy_meta:
+                proxy_meta[proxy_str] = {"fails": 0, "success": 0, "country": "Unknown", "region": "Unknown", "latency_ms": 0}
+            m = proxy_meta[proxy_str]
+            if success:
+                m["success"] = m.get("success", 0) + 1
+                consecutive_proxy_failures[proxy_str] = 0
+            else:
+                m["fails"] = m.get("fails", 0) + 1
+                if is_network_error:
+                    consecutive_proxy_failures[proxy_str] += 1
+                    if consecutive_proxy_failures[proxy_str] >= threshold:
+                        circuit_breaker_until[proxy_str] = time.time() + 30.0
+                        consecutive_proxy_failures[proxy_str] = 0
+            m["score"] = compute_real_score(m.get("success", 0), m.get("fails", 0))
+    except Exception as e:
+        warnings.warn(f"Error recording proxy attempt: {e}")
+
+
+# ============================================================================
+# SMTP PRE-CHECK  (runs BEFORE the validator — never inside it)
+# ============================================================================
+
+def _smtp_banner_ok(hosts, px, timeout=4.0):
+    """True if any candidate answers with a 220 SMTP banner."""
+    for h in hosts:
+        for port, use_tls in ((587, False), (465, True), (25, False)):
+            s = None
+            try:
+                s = _raw_socket(h, port, px, timeout=timeout)
+                if use_tls:
+                    s = _tls_context(h, False).wrap_socket(s, server_hostname=h)
+                s.settimeout(timeout)
+                banner = s.recv(200)
+                if banner[:3] == b"220":
+                    return True
+            except Exception:
+                pass
+            finally:
+                if s:
+                    try:
+                        s.close()
+                    except Exception:
+                        pass
+    return False
+
+
+def smtp_domain_probe(domain, timeout=4.0):
+    """Per-domain SMTP reachability. True = alive, False = dead, None = no candidate.
+
+    Tries the pool first (when one exists), then a direct pass. Never raises.
+    """
+    try:
+        hosts = host_smtp_candidates(domain) or []
+    except Exception:
+        hosts = []
+    if not hosts:
+        return None
+
+    live = [h for h in hosts[:2] if fast_fail_dns_check(h)]
+    if not live:
+        return False
+
+    with alive_pool_lock:
+        have_pool = bool(alive_pool)
+
+    if have_pool and CFG.get("PROXY_MODE", "fallback") != "off":
+        if _smtp_banner_ok(live, sample_alive_proxy(domain=domain), timeout):
+            return True
+    if _smtp_banner_ok(live, None, timeout):
+        return True
+    return False
+
+
+def smtp_cached(domain):
+    with _SMTP_LOCK:
+        hit = _SMTP_DOMAIN_CACHE.get(domain)
+    return bool(hit and (time.time() - hit[0]) < _SMTP_CACHE_TTL)
+
+
+def smtp_precheck_domains(domains, max_workers=24):
+    """Parallel, cached. Returns {domain: True|False|None}."""
+    results = {}
+    doms = [d for d in dict.fromkeys(d for d in (domains or []) if d)]
+    if not doms:
+        return results
+
+    now = time.time()
+    todo = []
+    with _SMTP_LOCK:
+        for d in doms:
+            hit = _SMTP_DOMAIN_CACHE.get(d)
+            if hit and (now - hit[0]) < _SMTP_CACHE_TTL:
+                results[d] = hit[1]
+            else:
+                todo.append(d)
+
+    if todo:
+        try:
+            with ThreadPoolExecutor(max_workers=min(max_workers, len(todo))) as ex:
+                for d, res in ex.map(lambda x: (x, smtp_domain_probe(x)), todo):
+                    results[d] = res
+                    with _SMTP_LOCK:
+                        _SMTP_DOMAIN_CACHE[d] = (time.time(), res)
+        except Exception as e:
+            log_startup(f"WARNING: SMTP pre-check batch error: {e}", quiet=True)
+            for d in todo:
+                results.setdefault(d, None)
+    return results
+
+
+def smtp_failed_check(domain, px, trace_logs):
+    """Legacy helper kept for ad-hoc use. Returns True / False / None. Never raises."""
+    try:
+        hosts = host_smtp_candidates(domain)
+    except Exception:
+        hosts = []
+    if not hosts:
+        trace_logs.append("SMTP failed check: no SMTP candidate hosts discovered")
+        return None
+    attempted = 0
+    for h in hosts[:2]:
+        if not fast_fail_dns_check(h):
+            trace_logs.append(f"SMTP failed check: {h} does not resolve locally")
+            continue
+        for port, use_tls in ((587, False), (465, True), (25, False)):
+            attempted += 1
+            s = None
+            try:
+                s = _raw_socket(h, port, px, timeout=min(6.0, max(3.0, float(CFG.get("TIMEOUT", 10)))))
+                if use_tls:
+                    s = _tls_context(h, False).wrap_socket(s, server_hostname=h)
+                s.settimeout(min(6.0, max(3.0, float(CFG.get("TIMEOUT", 10)))))
+                banner = s.recv(200)
+                if banner[:3] == b"220":
+                    trace_logs.append(f"SMTP failed check -> {px_tag(px)} {h}:{port} OK")
+                    return True
+                trace_logs.append(f"SMTP failed check -> {px_tag(px)} {h}:{port}: unexpected banner {banner[:40]!r}")
+            except Exception as e:
+                trace_logs.append(f"SMTP failed check -> {px_tag(px)} {h}:{port}: {str(e)[:90]}")
+            finally:
+                if s:
+                    try:
+                        s.close()
+                    except Exception:
+                        pass
+    if attempted:
+        trace_logs.append("SMTP failed check -> all SMTP candidates failed")
+        return False
+    trace_logs.append("SMTP failed check -> no reachable SMTP candidate")
+    return None
+
+
+# ============================================================================
+# PROXY HEALTH / POOL SAMPLING
+# ============================================================================
+
+def sample_alive_proxy(exclude=None, domain=None):
+    """Random rotation (default) or round-robin, with optional geo-call bias."""
+    global _rr_index
+    exclude = set(exclude or ())
+    with alive_pool_lock:
+        pool = [p for p in alive_pool if p and p not in exclude]
+    if not pool:
+        with alive_pool_lock:
+            pool = [p for p in alive_pool if p]
+    if not pool:
+        return None
+
+    if CFG.get("GEO_CALL", False) and domain:
+        want = tld_country(domain)
+        if want:
+            matched = [p for p in pool
+                       if str(proxy_meta.get(p, {}).get("country", "")).lower() == want.lower()]
+            if matched:
+                pool = matched
+
+    if CFG.get("RANDOM_ROTATION", True):
+        return random.choice(pool)
+
+    with _rr_lock:
+        _rr_index = (_rr_index + 1) % len(pool)
+        return pool[_rr_index]
+
+
+_tunnel_cache = {}
+_tunnel_lock = threading.Lock()
+_TUNNEL_TTL = 120
+
+
+def proxy_tunnel_ok(proxy_str, target=("imap.gmail.com", 993), timeout=3.0):
+    try:
+        if not proxy_str:
+            return True
+        info = parse_proxy(proxy_str)
+        if not info or not SOCKS_OK:
+            return False
+        host, port = target
+        for ptype in (socks.HTTP, socks.SOCKS5):
+            s = None
+            try:
+                kw = {"proxy_type": ptype, "proxy_addr": info["host"],
+                      "proxy_port": info["port"], "proxy_rdns": True}
+                if info["user"]:
+                    kw["proxy_username"] = info["user"]
+                    kw["proxy_password"] = info["pass"]
+                s = socks.create_connection((host, port), timeout=timeout, **kw)
+                return True
+            except Exception:
+                continue
+            finally:
+                if s:
+                    try:
+                        s.close()
+                    except Exception:
+                        pass
+        return False
+    except Exception:
+        return False
+
+
+def precheck_proxy_fast(proxy_str):
+    try:
+        if not proxy_str:
+            return True
+        if proxy_is_blocked(proxy_str):
+            return False
+        info = parse_proxy(proxy_str)
+        if not info or not SOCKS_OK:
+            return False
+        if not is_proxy_alive(info["host"], info["port"], timeout=float(CFG.get("PROXY_PRECHECK_TIMEOUT", 3))):
+            record_proxy_attempt(proxy_str, success=False, is_network_error=True)
+            return False
+
+        now = time.time()
+        with _tunnel_lock:
+            hit = _tunnel_cache.get(proxy_str)
+        if hit and now - hit[0] < _TUNNEL_TTL:
+            ok = hit[1]
+        else:
+            ok = proxy_tunnel_ok(proxy_str)
+            with _tunnel_lock:
+                _tunnel_cache[proxy_str] = (now, ok)
+
+        if not ok:
+            record_proxy_attempt(proxy_str, success=False, is_network_error=True)
+        return ok
+    except Exception:
+        return False
+
+
+def refresh_alive_pool():
+    """Parallel — the old one-proxy-at-a-time loop was the whole start lag."""
+    try:
+        raw = get_filtered_active_proxies(quiet=True)
+    except Exception:
+        raw = []
+    if not raw:
+        with alive_pool_lock:
+            alive_pool[:] = []
+        return
+    if not CFG.get("PROXY_TEST_FLIGHT", True):
+        with alive_pool_lock:
+            alive_pool[:] = raw
+        enrich_proxy_geo(raw)
+        return
+    live = []
+    try:
+        with ThreadPoolExecutor(max_workers=16) as ex:
+            f2p = {ex.submit(precheck_proxy_fast, p): p for p in raw}
+            for fut in as_completed(f2p, timeout=45):
+                try:
+                    if fut.result():
+                        live.append(f2p[fut])
+                except Exception:
+                    continue
+    except Exception:
+        live = list(raw)
+    if not live:
+        live = raw
+    with alive_pool_lock:
+        alive_pool[:] = live
+    enrich_proxy_geo(live)
+
+
+def start_alive_refresher():
+    if any(t.name == "alive-pool" for t in threading.enumerate()):
+        return
+
+    def loop():
+        while True:
+            try:
+                refresh_alive_pool()
+            except Exception:
+                pass
+            time.sleep(15)
+
+    threading.Thread(target=loop, daemon=True, name="alive-pool").start()
+
+
+start_alive_refresher()
+
+
+# ============================================================================
+# STARTUP PANEL
+# ============================================================================
+
 section_title("🖥️", "Startup & Under-The-Hood Display Panel",
               "system boot, config injection, proxy health, engine state transitions")
 
@@ -1678,7 +2262,10 @@ with str_lit.sidebar:
         else:
             str_lit.info("No proxy metadata recorded yet.")
 
-# --- Pre-filter Engine ---
+
+# ============================================================================
+# PRE-FILTER ENGINE
+# ============================================================================
 DISPOSABLE = {
     "tempmail.com", "temp-mail.org", "guerrillamail.com", "guerrillamail.org",
     "10minutemail.com", "10minutemail.net", "mailinator.com", "maildrop.cc",
@@ -1822,9 +2409,32 @@ def load_previous_valid():
     return seen
 
 
+def _domains_in_text(text):
+    out = []
+    for line in (text or "").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or ":" not in line:
+            continue
+        em = line.split(":", 1)[0].strip().lower()
+        if "@" in em:
+            d = em.split("@")[-1]
+            if d and d not in out:
+                out.append(d)
+    return out
+
+
 def process_accounts(text, previous_valid):
+    """Pre-filter pipeline.
+
+    Order: syntax -> whitelist/blacklist -> strict-app -> disposable -> typo ->
+    already-valid -> duplicate/format -> DNS -> SMTP.
+
+    DNS Failed and SMTP Failed are the last two buckets, SMTP strictly after DNS.
+    Returns (clean, disposable, typo, resume, app_skip, custom, dns_failed, smtp_failed)
+    """
     lines = []
-    disp_list, typo_list, resume_list, app_skip_list, custom_list, dns_fail_list = [], [], [], [], [], []
+    disp_list, typo_list, resume_list, app_skip_list, custom_list = [], [], [], [], []
+    dns_fail_list, smtp_fail_list = [], []
     whitelist = CFG.get("CUSTOM_WHITELIST", [])
     blacklist = CFG.get("CUSTOM_BLACKLIST", [])
 
@@ -1860,14 +2470,33 @@ def process_accounts(text, previous_valid):
 
     save_domain_cache()
 
+    # ---- SMTP PRE-CHECK (strictly AFTER the DNS filter) ----
+    if CFG.get("SMTP_CHECK", True) and lines:
+        domains = list(dict.fromkeys(l.split(":", 1)[0].split("@")[-1].lower() for l in lines if "@" in l))
+        results = smtp_precheck_domains(domains)
+        keep = []
+        for l in lines:
+            d = l.split(":", 1)[0].split("@")[-1].lower()
+            if results.get(d) is False:
+                smtp_fail_list.append(l)
+            else:
+                keep.append(l)
+        lines = keep
+        dead = sum(1 for v in results.values() if v is False)
+        log_startup(f"SMTP pre-check: {len(results)} domain(s) probed, {dead} dead, {len(smtp_fail_list)} account(s) bucketed.")
+
     seen_email, clean = set(), []
     for line in lines:
         em = line.split(":", 1)[0].strip().lower()
         if em not in seen_email:
             seen_email.add(em)
             clean.append(line)
-    log_startup(f"Processed account input. Clean valid count ready: {len(clean)} (Filtered DNS failures: {len(dns_fail_list)})")
-    return clean, disp_list, typo_list, resume_list, app_skip_list, custom_list, dns_fail_list
+
+    log_startup(
+        f"Processed account input. Clean valid count ready: {len(clean)} "
+        f"(Filtered DNS failures: {len(dns_fail_list)}, SMTP failures: {len(smtp_fail_list)})"
+    )
+    return clean, disp_list, typo_list, resume_list, app_skip_list, custom_list, dns_fail_list, smtp_fail_list
 
 
 # --- Main Input Section ---
@@ -1895,43 +2524,62 @@ with input_tab2:
             str_lit.error(f"Failed decoding uploaded file: {e}")
             raw_text = ""
 
+# Pre-filter bucket labels, in display order. SMTP Failed is LAST, right after DNS Failed.
+PREFILTER_LABELS = [
+    "Ready to Check", "Resume Unfinished", "Disposables", "Typos",
+    "Skip previously valid", "App-Skipped", "Custom Filtered",
+    "DNS Failed", "SMTP Failed",
+]
+
 clean_lines = []
-disp, typo, resume, app_skip, custom_skipped, dns_skipped = [], [], [], [], [], []
+disp, typo, resume, app_skip, custom_skipped, dns_skipped, smtp_skipped = [], [], [], [], [], [], []
 skip_previous = str_lit.checkbox("Skip previously valid", value=True, help="On: lines already in old valid files are not checked again.")
+
 if raw_text:
     previous_valid = load_previous_valid() if skip_previous else set()
-    clean_lines, disp, typo, resume, app_skip, custom_skipped, dns_skipped = process_accounts(raw_text, previous_valid)
+
+    _pending_smtp = [d for d in _domains_in_text(raw_text) if not smtp_cached(d)] if CFG.get("SMTP_CHECK", True) else []
+    if _pending_smtp:
+        with str_lit.spinner(f"🛰 SMTP reachability pre-check on {len(_pending_smtp)} new domain(s)…"):
+            (clean_lines, disp, typo, resume, app_skip,
+             custom_skipped, dns_skipped, smtp_skipped) = process_accounts(raw_text, previous_valid)
+    else:
+        (clean_lines, disp, typo, resume, app_skip,
+         custom_skipped, dns_skipped, smtp_skipped) = process_accounts(raw_text, previous_valid)
+
+    str_lit.session_state.pre_dns_failed = list(dns_skipped)
+    str_lit.session_state.pre_smtp_failed = list(smtp_skipped)
 
     unfinished_count = len(list_unfinished_runs())
-    cols = str_lit.columns(8)
+    cols = str_lit.columns(9)
     for c, (lbl, val) in zip(cols, [
-        ("Ready to Check", len(clean_lines)), ("Resume Unfinished", unfinished_count),
-        ("Disposables", len(disp)), ("Typos", len(typo)), ("Skip previously valid", len(resume)),
-        ("App-Skipped", len(app_skip)), ("Custom Filtered", len(custom_skipped)), ("DNS Failed", len(dns_skipped)),
+        ("Ready to Check", len(clean_lines)),
+        ("Resume Unfinished", unfinished_count),
+        ("Disposables", len(disp)),
+        ("Typos", len(typo)),
+        ("Skip previously valid", len(resume)),
+        ("App-Skipped", len(app_skip)),
+        ("Custom Filtered", len(custom_skipped)),
+        ("DNS Failed", len(dns_skipped)),
+        ("SMTP Failed", len(smtp_skipped)),
     ]):
         c.metric(lbl, val)
 
     # ------------------------------------------------------------------
-    # SELECT CATEGORY TO INSPECT CONTENTS  (pre-filter buckets + result buckets)
+    # SELECT CATEGORY TO INSPECT CONTENTS
     # ------------------------------------------------------------------
     section_title("🔍", "Filter & Result Categories Inspector",
-                  "inspect any bucket, including RETRY_LATER and SMTP Failed results")
+                  "inspect any bucket, including DNS Failed and SMTP Failed")
 
     RESULT_INSPECT = [
         ("✅ Valid Found", "valid_results"),
         ("❌ Wrong Password Found", "wrong_results"),
         ("🔐 App Password / 2FA Found", "need_app_results"),
         ("🕓 RETRY_LATER Found", "retry_results"),
-        ("📮 SMTP Failed Found", "smtp_results"),
-        ("🛰 DNS Failed Found", "dns_results"),
         ("🔌 Connection Failed Found", "conn_results"),
-        ("❔ Unknown Found", "conn_results"),
     ]
 
-    inspect_options = [
-        "Ready to Check", "Resume Unfinished", "Disposables", "Typos",
-        "Skip previously valid", "App-Skipped", "Custom Filtered", "DNS Failed",
-    ] + [label for label, _ in RESULT_INSPECT]
+    inspect_options = list(PREFILTER_LABELS) + [label for label, _ in RESULT_INSPECT]
 
     filter_category_choice = str_lit.selectbox("Select category to inspect contents:", options=inspect_options)
 
@@ -1941,9 +2589,15 @@ if raw_text:
         unfinished_preview.extend(run.get("remaining") or [])
 
     category_map = {
-        "Ready to Check": clean_lines, "Resume Unfinished": unfinished_preview,
-        "Disposables": disp, "Typos": typo, "Skip previously valid": resume,
-        "App-Skipped": app_skip, "Custom Filtered": custom_skipped, "DNS Failed": dns_skipped,
+        "Ready to Check": clean_lines,
+        "Resume Unfinished": unfinished_preview,
+        "Disposables": disp,
+        "Typos": typo,
+        "Skip previously valid": resume,
+        "App-Skipped": app_skip,
+        "Custom Filtered": custom_skipped,
+        "DNS Failed": dns_skipped,
+        "SMTP Failed": smtp_skipped,
     }
     _label_to_key = dict(RESULT_INSPECT)
     if filter_category_choice in _label_to_key:
@@ -1956,7 +2610,10 @@ if raw_text:
     else:
         str_lit.info(f"No items in **{filter_category_choice}**.")
 
-# --- Provider tables / host resolution ---
+
+# ============================================================================
+# PROVIDER TABLES / HOST RESOLUTION
+# ============================================================================
 PROVIDER_MAP = {
     "gmail.com": {"imap": ["imap.gmail.com", "mail.gmail.com"], "pop": ["pop.gmail.com"], "pop3": ["pop.gmail.com"]},
     "googlemail.com": {"imap": ["imap.gmail.com", "mail.gmail.com"], "pop": ["pop.gmail.com"], "pop3": ["pop.gmail.com"]},
@@ -2058,16 +2715,6 @@ def generate_candidate_hosts(domain: str, mx_records: list = None) -> list:
                     candidates.append(f"{prefix}.{parent}")
 
     return _expand_cnames(list(dict.fromkeys(candidates)))
-
-
-def px_tag(proxy_str):
-    if not proxy_str:
-        return "direct"
-    info = parse_proxy(proxy_str)
-    if not info:
-        return "proxy"
-    meta = proxy_meta.get(proxy_str, {})
-    return f"{info.get('host')}:{info.get('port')} | {meta.get('country') or '?'} | {meta.get('region') or '?'}"
 
 
 def known_provider_conf(domain):
@@ -2174,405 +2821,6 @@ def get_servers(email):
         d = email.split('@')[-1] if '@' in email else 'localhost'
         fp = generate_candidate_hosts(d, [])
         return {"imap": fp, "pop": fp, "pop3": fp}
-
-
-def refresh_alive_pool():
-    """Parallel — previously one proxy at a time, which was the whole start lag."""
-    try:
-        raw = get_filtered_active_proxies(quiet=True)
-    except Exception:
-        raw = []
-    if not raw:
-        with alive_pool_lock:
-            alive_pool[:] = []
-        return
-    if not CFG.get("PROXY_TEST_FLIGHT", True):
-        with alive_pool_lock:
-            alive_pool[:] = raw
-        enrich_proxy_geo(raw)
-        return
-    live = []
-    try:
-        with ThreadPoolExecutor(max_workers=16) as ex:
-            f2p = {ex.submit(precheck_proxy_fast, p): p for p in raw}
-            for fut in as_completed(f2p, timeout=45):
-                try:
-                    if fut.result():
-                        live.append(f2p[fut])
-                except Exception:
-                    continue
-    except Exception:
-        live = list(raw)
-    if not live:
-        live = raw
-    with alive_pool_lock:
-        alive_pool[:] = live
-    enrich_proxy_geo(live)
-
-
-def start_alive_refresher():
-    if any(t.name == "alive-pool" for t in threading.enumerate()):
-        return
-
-    def loop():
-        while True:
-            try:
-                refresh_alive_pool()
-            except Exception:
-                pass
-            time.sleep(15)
-
-    threading.Thread(target=loop, daemon=True, name="alive-pool").start()
-
-
-def sample_alive_proxy(exclude=None, domain=None):
-    """Random rotation (default) or round-robin, with optional geo-call bias.
-
-    Geo-call NEVER hard-fails: matched nodes come first, everything else is the
-    fallback, and an excluded matched node simply drops out of the pool.
-    """
-    global _rr_index
-    exclude = set(exclude or ())
-    with alive_pool_lock:
-        pool = [p for p in alive_pool if p and p not in exclude]
-    if not pool:
-        with alive_pool_lock:
-            pool = [p for p in alive_pool if p]
-    if not pool:
-        return None
-
-    if CFG.get("GEO_CALL", False) and domain:
-        want = tld_country(domain)
-        if want:
-            matched = [p for p in pool
-                       if str(proxy_meta.get(p, {}).get("country", "")).lower() == want.lower()]
-            if matched:
-                pool = matched
-
-    if CFG.get("RANDOM_ROTATION", True):
-        return random.choice(pool)
-
-    with _rr_lock:
-        _rr_index = (_rr_index + 1) % len(pool)
-        return pool[_rr_index]
-
-
-# --- Proxy tunnel probe ---
-_tunnel_cache = {}
-_tunnel_lock = threading.Lock()
-_TUNNEL_TTL = 120
-
-
-def proxy_tunnel_ok(proxy_str, target=("imap.gmail.com", 993), timeout=3.0):
-    try:
-        if not proxy_str:
-            return True
-        info = parse_proxy(proxy_str)
-        if not info or not SOCKS_OK:
-            return False
-        host, port = target
-        for ptype in (socks.HTTP, socks.SOCKS5):
-            s = None
-            try:
-                kw = {"proxy_type": ptype, "proxy_addr": info["host"],
-                      "proxy_port": info["port"], "proxy_rdns": True}
-                if info["user"]:
-                    kw["proxy_username"] = info["user"]
-                    kw["proxy_password"] = info["pass"]
-                s = socks.create_connection((host, port), timeout=timeout, **kw)
-                return True
-            except Exception:
-                continue
-            finally:
-                if s:
-                    try:
-                        s.close()
-                    except Exception:
-                        pass
-        return False
-    except Exception:
-        return False
-
-
-def precheck_proxy_fast(proxy_str):
-    try:
-        if not proxy_str:
-            return True
-        if proxy_is_blocked(proxy_str):
-            return False
-        info = parse_proxy(proxy_str)
-        if not info or not SOCKS_OK:
-            return False
-        if not is_proxy_alive(info["host"], info["port"], timeout=float(CFG.get("PROXY_PRECHECK_TIMEOUT", 3))):
-            record_proxy_attempt(proxy_str, success=False, is_network_error=True)
-            return False
-
-        now = time.time()
-        with _tunnel_lock:
-            hit = _tunnel_cache.get(proxy_str)
-        if hit and now - hit[0] < _TUNNEL_TTL:
-            ok = hit[1]
-        else:
-            ok = proxy_tunnel_ok(proxy_str)
-            with _tunnel_lock:
-                _tunnel_cache[proxy_str] = (now, ok)
-
-        if not ok:
-            record_proxy_attempt(proxy_str, success=False, is_network_error=True)
-        return ok
-    except Exception:
-        return False
-
-
-def fast_fail_dns_check(host):
-    try:
-        socket.gethostbyname(host)
-        return True
-    except Exception:
-        return False
-
-
-# ============================================================================
-# SOCKET + TLS LAYER
-# ============================================================================
-
-def proxy_connect(host, port, proxy_str, timeout=None, remote_dns=True):
-    base_timeout = timeout or CFG["PROXY_CONNECT_TIMEOUT"]
-    try:
-        with proxy_lock:
-            fails = proxy_meta.get(proxy_str, {}).get("fails", 0)
-    except Exception:
-        fails = 0
-    effective_timeout = max(2.0, base_timeout - (fails * 0.1))
-
-    if not proxy_str or proxy_str == "direct":
-        if not fast_fail_dns_check(host):
-            raise RuntimeError(f"Fast-fail DNS check failed: Host '{host}' does not resolve locally")
-        s = socket.create_connection((host, port), timeout=effective_timeout)
-        s.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
-        s.settimeout(effective_timeout)
-        return s
-
-    info = parse_proxy(proxy_str)
-    if not info or not SOCKS_OK:
-        raise RuntimeError("bad proxy format or socks unavailable")
-
-    last_err = None
-    for ptype in (socks.SOCKS5, socks.HTTP):
-        try:
-            kw = {"proxy_type": ptype, "proxy_addr": info["host"], "proxy_port": info["port"], "proxy_rdns": remote_dns}
-            if info["user"]:
-                kw["proxy_username"] = info["user"]
-                kw["proxy_password"] = info["pass"]
-            s = socks.create_connection((host, port), timeout=effective_timeout, **kw)
-            s.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
-            s.settimeout(effective_timeout)
-            return s
-        except Exception as proxy_ex:
-            last_err = proxy_ex
-
-    if fast_fail_dns_check(host):
-        try:
-            direct_sock = socket.create_connection((host, port), timeout=effective_timeout)
-            direct_sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
-            direct_sock.settimeout(effective_timeout)
-            return direct_sock
-        except Exception as direct_ex:
-            raise RuntimeError(f"Proxy and direct fallback connection both failed: {direct_ex}")
-
-    raise RuntimeError(f"Proxy connection failed for {host}:{port}: {last_err}")
-
-
-def _tls_context(host: str, verify: bool):
-    if verify:
-        ctx = ssl.create_default_context()
-    else:
-        ctx = ssl._create_unverified_context()
-        ctx.check_hostname = False
-        ctx.verify_mode = ssl.CERT_NONE
-    try:
-        ctx.set_ciphers('DEFAULT:@SECLEVEL=1')
-    except Exception:
-        pass
-    return ctx
-
-
-def _raw_socket(host, port, proxy_str=None, timeout=None):
-    t = timeout or CFG["TIMEOUT"]
-    if proxy_str and proxy_str != "direct":
-        s = proxy_connect(host, port, proxy_str, timeout=t)
-    else:
-        if not fast_fail_dns_check(host):
-            raise RuntimeError(f"Fast-fail DNS check failed: Host '{host}' does not resolve locally")
-        s = socket.create_connection((host, port), timeout=t)
-    s.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
-    s.settimeout(t)
-    return s
-
-
-def tls_connect(host, port, proxy_str=None, insecure=True, timeout=None):
-    if insecure or CFG.get("ALLOW_SELF_SIGNED", True):
-        return _tls_context(host, False).wrap_socket(_raw_socket(host, port, proxy_str, timeout), server_hostname=host)
-    raw = _raw_socket(host, port, proxy_str, timeout)
-    try:
-        return _tls_context(host, True).wrap_socket(raw, server_hostname=host)
-    except ssl.SSLError as e:
-        warnings.warn(f"Verified TLS failed for {host} ({e!r}); retrying unverified on a FRESH socket")
-        return _tls_context(host, False).wrap_socket(_raw_socket(host, port, proxy_str, timeout), server_hostname=host)
-
-
-# ============================================================================
-# PROTOCOL CLIENTS — override _create_socket(), NOT open()
-# ============================================================================
-
-class ProxyIMAP4SSL(imaplib.IMAP4_SSL):
-    def __init__(self, host, port=993, timeout=None, proxy_str=None, insecure=True):
-        self._proxy_str = proxy_str
-        self._insecure = insecure
-        super().__init__(host, port, timeout=timeout)
-
-    def _create_socket(self, timeout):
-        return tls_connect(self.host, self.port, self._proxy_str, insecure=self._insecure, timeout=timeout)
-
-
-class ProxyIMAP4(imaplib.IMAP4):
-    def __init__(self, host, port=143, timeout=None, proxy_str=None):
-        self._proxy_str = proxy_str
-        super().__init__(host, port, timeout=timeout)
-
-    def _create_socket(self, timeout):
-        return _raw_socket(self.host, self.port, self._proxy_str, timeout)
-
-
-class ProxyPOP3SSL(poplib.POP3_SSL):
-    def __init__(self, host, port=995, timeout=None, proxy_str=None, insecure=True):
-        self._proxy_str = proxy_str
-        self._insecure = insecure
-        super().__init__(host, port, timeout=timeout)
-
-    def _create_socket(self, timeout):
-        return tls_connect(self.host, self.port, self._proxy_str, insecure=self._insecure, timeout=timeout)
-
-
-class ProxyPOP3(poplib.POP3):
-    def __init__(self, host, port=110, timeout=None, proxy_str=None):
-        self._proxy_str = proxy_str
-        super().__init__(host, port, timeout=timeout)
-
-    def _create_socket(self, timeout):
-        return _raw_socket(self.host, self.port, self._proxy_str, timeout)
-
-
-def pop3_ok(resp):
-    if resp is None:
-        return False
-    if isinstance(resp, (bytes, bytearray)):
-        return bytes(resp).lstrip().startswith(b"+")
-    if isinstance(resp, str):
-        return resp.lstrip().startswith("+")
-    if isinstance(resp, (tuple, list)):
-        return len(resp) >= 1
-    return True
-
-
-# ============================================================================
-# ERROR CLASSIFICATION
-# ============================================================================
-
-def classify_error(err, domain=""):
-    try:
-        err_str = str(err)
-        if domain in ZERO_ACCESS_PROVIDERS:
-            return APP
-        return st_classify(err_str, domain)
-    except Exception:
-        return UNKNOWN
-
-
-def _is_proxy_level_error(msg):
-    try:
-        return st_proxy_level(msg)
-    except Exception:
-        s = (msg or "").lower()
-        return any(k in s for k in ("407", "proxy auth", "proxy connect", "socks"))
-
-
-def record_proxy_attempt(proxy_str, success, is_network_error=False):
-    try:
-        if not proxy_str:
-            return
-        threshold = int(CFG.get("BLACKLIST_CF", 15))
-        with proxy_lock:
-            if proxy_str not in proxy_meta:
-                proxy_meta[proxy_str] = {"fails": 0, "success": 0, "country": "Unknown", "region": "Unknown", "latency_ms": 0}
-            m = proxy_meta[proxy_str]
-            if success:
-                m["success"] = m.get("success", 0) + 1
-                consecutive_proxy_failures[proxy_str] = 0
-            else:
-                m["fails"] = m.get("fails", 0) + 1
-                if is_network_error:
-                    consecutive_proxy_failures[proxy_str] += 1
-                    if consecutive_proxy_failures[proxy_str] >= threshold:
-                        circuit_breaker_until[proxy_str] = time.time() + 30.0
-                        consecutive_proxy_failures[proxy_str] = 0
-            m["score"] = compute_real_score(m.get("success", 0), m.get("fails", 0))
-    except Exception as e:
-        warnings.warn(f"Error recording proxy attempt: {e}")
-
-
-# ============================================================================
-# SMTP FAILED CHECK
-# ============================================================================
-
-def smtp_failed_check(domain, px, trace_logs):
-    """Runs straight after the DNS fast-fail check.
-
-    Returns True (reachable), False (dead) or None (no candidate / unknown).
-    Never raises. A 220 banner is required for a pass, so a proxy that swallows
-    the connection cannot be mistaken for a healthy SMTP path.
-    """
-    if not CFG.get("SMTP_CHECK", True):
-        return None
-    try:
-        hosts = host_smtp_candidates(domain)
-    except Exception:
-        hosts = []
-    if not hosts:
-        trace_logs.append("SMTP failed check: no SMTP candidate hosts discovered")
-        return None
-
-    attempted = 0
-    for h in hosts[:2]:
-        if not fast_fail_dns_check(h):
-            trace_logs.append(f"SMTP failed check: {h} does not resolve locally")
-            continue
-        for port, use_tls in ((587, False), (465, True), (25, False)):
-            attempted += 1
-            s = None
-            try:
-                s = _raw_socket(h, port, px, timeout=min(6.0, max(3.0, float(CFG.get("TIMEOUT", 10)))))
-                if use_tls:
-                    s = _tls_context(h, False).wrap_socket(s, server_hostname=h)
-                s.settimeout(min(6.0, max(3.0, float(CFG.get("TIMEOUT", 10)))))
-                banner = s.recv(200)
-                if banner[:3] == b"220":
-                    trace_logs.append(f"SMTP failed check -> {px_tag(px)} {h}:{port} OK")
-                    return True
-                trace_logs.append(f"SMTP failed check -> {px_tag(px)} {h}:{port}: unexpected banner {banner[:40]!r}")
-            except Exception as e:
-                trace_logs.append(f"SMTP failed check -> {px_tag(px)} {h}:{port}: {str(e)[:90]}")
-            finally:
-                if s:
-                    try:
-                        s.close()
-                    except Exception:
-                        pass
-    if attempted:
-        trace_logs.append("SMTP failed check -> all SMTP candidates failed")
-        return False
-    trace_logs.append("SMTP failed check -> no reachable SMTP candidate")
-    return None
 
 
 # ============================================================================
@@ -2803,7 +3051,7 @@ def read_mailbox_messages(email, password, server, proxy_str=None, limit=10):
 
 
 # ============================================================================
-# MAIN ORCHESTRATOR
+# MAIN ORCHESTRATOR  (IMAP / POP only — SMTP lives in the pre-check now)
 # ============================================================================
 
 def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, trace_logs=None):
@@ -2821,7 +3069,6 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, 
     t_start = time.time()
     retryable = False
     dns_ok = True
-    smtp_state = {"value": None}
     try:
         if conf.get("type") == "zero_access":
             trace_logs.append("Architecture: Zero-Access / Bridge detected.")
@@ -2833,7 +3080,8 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, 
         try_alt_user = bool(CFG.get("TRY_ALT_USERNAME", True))
         max_hosts = max(1, int(CFG.get("MAX_HOSTS_PER_DOMAIN", 3)))
 
-        budget = max(12.0, float(CFG.get("ACCOUNT_DEADLINE", 45)) * 0.9)
+        # SMTP no longer competes for this budget — the ladder gets nearly all of it.
+        budget = max(12.0, float(CFG.get("ACCOUNT_DEADLINE", 45)) * 0.95)
         primary_deadline = t_start + (budget * 0.72)
         hard_deadline = t_start + budget
         per_attempt = max(3.0, min(float(CFG.get("TIMEOUT", 10)), budget / max(5.0, max_hosts + 3.0)))
@@ -2864,9 +3112,6 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, 
             trace_logs.append("Fast-fail DNS check failed: no candidate host resolves locally")
             if not proxy_pool or proxy_mode == "off":
                 return None, DNS_FAILED, "Fast-fail DNS check failed: no host resolves locally", None, trace_logs
-
-        # ---------------- SMTP FAILED CHECK (right after DNS) ----------------
-        smtp_state["value"] = smtp_failed_check(domain, px, trace_logs)
 
         plan = [("IMAP", h, 993, "ssl") for h in imap_hosts]
         if try_starttls:
@@ -3031,7 +3276,6 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, 
             return result
 
         if px and (net_fail or retryable) and (proxy_mode == "fallback" or CFG.get("RETRY_CONNECTION_FAILED")):
-            # Resolving hosts only, and prefer IMAP over POP so we stop landing on pop.*
             direct_hosts = [h for h in imap_hosts if fast_fail_dns_check(h)]
             if not direct_hosts:
                 direct_hosts = [h for h in pop_hosts if fast_fail_dns_check(h)]
@@ -3044,9 +3288,8 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, 
 
             if retry_plan:
                 dgeo = direct_geo()
-                vpn = CFG.get("CONNECTION_HINT", "Auto")
                 trace_logs.append(
-                    f"direct | {dgeo['ip']} | {dgeo['region']} | {dgeo['country']} | VPN {vpn}"
+                    f"direct | {dgeo['ip']} | {dgeo['region']} | {dgeo['country']} | {dgeo['vpn']}"
                 )
                 trace_logs.append("Proxy pass exhausted -> targeted DIRECT retry on locally-resolving hosts.")
                 result, _nf2, retryable2 = run_plan(None, plan_used=retry_plan, deadline_ts=hard_deadline,
@@ -3065,8 +3308,6 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, 
         failed_domain_cache[domain] = time.time()
     if retryable:
         return None, RETRY, "retryable (proxy / IP-block / rate-limit)", None, trace_logs
-    if smtp_state.get("value") is False:
-        return None, SMTP_FAILED, "SMTP failed check -> all SMTP candidates dead", None, trace_logs
     if not dns_ok:
         return None, DNS_FAILED, "Fast-fail DNS check failed: no host resolves locally", None, trace_logs
     return None, FAILED, "all hosts failed", None, trace_logs
@@ -3079,20 +3320,14 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, 
 section_title("🚀", "Execute Live Checking Engine", "proxy-backed, post-auth verified, resumable")
 
 RESULT_ACTION_MODES = [
-    ("🕓 RETRY_LATER Found", "retry_results"),
-    ("📮 SMTP Failed Found", "smtp_results"),
-    ("🔌 Connection Failed Found", "conn_results"),
-    ("❔ Unknown Found", "conn_results"),
     ("✅ Valid Found", "valid_results"),
     ("❌ Wrong Password Found", "wrong_results"),
     ("🔐 App Password / 2FA Found", "need_app_results"),
+    ("🕓 RETRY_LATER Found", "retry_results"),
+    ("🔌 Connection Failed Found", "conn_results"),
 ]
 
-ACTION_OPTIONS = (
-    ["Ready to Check", "Resume Unfinished", "Disposables", "Typos",
-     "Skip previously valid", "App-Skipped", "Custom Filtered", "DNS Failed"]
-    + [label for label, _ in RESULT_ACTION_MODES]
-)
+ACTION_OPTIONS = list(PREFILTER_LABELS) + [label for label, _ in RESULT_ACTION_MODES]
 
 col_action1, col_action2 = str_lit.columns([0.65, 0.35])
 with col_action1:
@@ -3100,7 +3335,7 @@ with col_action1:
 with col_action2:
     engine_action_mode = str_lit.selectbox(
         "Engine Action Mode:", options=ACTION_OPTIONS, index=0,
-        help="Pick a pre-filter bucket OR a previous result bucket (including RETRY_LATER / SMTP Failed) to re-run."
+        help="Pick a pre-filter bucket (SMTP Failed sits right after DNS Failed) or a previous result bucket to re-run."
     )
     unfinished_runs = list_unfinished_runs()
     unfinished_pick = None
@@ -3111,7 +3346,6 @@ with col_action2:
 active_proxy_pool = get_filtered_active_proxies()
 
 if start_engine_btn:
-    # ---- INSTANT FEEDBACK: the bar exists BEFORE any heavy work -------------
     progress_bar = str_lit.progress(0, text=f"Initializing checking engine for [{engine_action_mode}]...")
     status_text = str_lit.empty()
     status_text.info("⏳ Opening the engine… resolving hosts, pre-testing the proxy pool, geo-tagging nodes.")
@@ -3124,7 +3358,7 @@ if start_engine_btn:
         f"retry_direct={CFG.get('RETRY_CONNECTION_FAILED')} debug={CFG.get('DEBUG')} "
         f"test_flight={CFG.get('PROXY_TEST_FLIGHT')} allow_blacklist={CFG.get('ALLOW_BLACKLIST_IPS')} "
         f"random_rotation={CFG.get('RANDOM_ROTATION')} geo_call={CFG.get('GEO_CALL')} "
-        f"smtp_check={CFG.get('SMTP_CHECK')} connection={CFG.get('CONNECTION_HINT')}"
+        f"smtp_precheck={CFG.get('SMTP_CHECK')} connection={CFG.get('CONNECTION_HINT')}"
     )
 
     resume_lines = []
@@ -3138,9 +3372,15 @@ if start_engine_btn:
         return line.split("|")[0].strip()
 
     category_queue_map = {
-        "Ready to Check": clean_lines, "Resume Unfinished": resume_lines, "Disposables": disp,
-        "Typos": typo, "Skip previously valid": resume, "App-Skipped": app_skip,
-        "Custom Filtered": custom_skipped, "DNS Failed": dns_skipped,
+        "Ready to Check": clean_lines,
+        "Resume Unfinished": resume_lines,
+        "Disposables": disp,
+        "Typos": typo,
+        "Skip previously valid": resume,
+        "App-Skipped": app_skip,
+        "Custom Filtered": custom_skipped,
+        "DNS Failed": dns_skipped,
+        "SMTP Failed": smtp_skipped,
     }
     if engine_action_mode in _label_to_key:
         category_queue_map[engine_action_mode] = [
@@ -3152,8 +3392,6 @@ if start_engine_btn:
     if not accounts_to_check:
         str_lit.warning(f"⚠ No accounts found in the selected category: '{engine_action_mode}'.")
     else:
-        # Pool refresh is parallel now, and the spinner is already on screen.
-        start_alive_refresher()
         filtered_pool[:] = get_filtered_active_proxies()
         if not alive_pool:
             refresh_alive_pool()
@@ -3167,8 +3405,9 @@ if start_engine_btn:
             str_lit.session_state.need_app_results = []
             str_lit.session_state.conn_results = []
             str_lit.session_state.retry_results = []
-            str_lit.session_state.smtp_results = []
-            str_lit.session_state.dns_results = []
+            # DNS / SMTP buckets come from the pre-filter stage, not the validator.
+            str_lit.session_state.smtp_results = list(str_lit.session_state.get("pre_smtp_failed", []))
+            str_lit.session_state.dns_results = list(str_lit.session_state.get("pre_dns_failed", []))
             str_lit.session_state.skip_results = []
             str_lit.session_state.report_entries = []
             str_lit.session_state.log_lines = []
@@ -3193,8 +3432,8 @@ if start_engine_btn:
                 ("conn_results", "🔌 Connection Failed Found"),
                 ("need_app_results", "🔐 App Password / 2FA Found"),
                 ("retry_results", "🕓 RETRY_LATER Found"),
-                ("smtp_results", "📮 SMTP Failed Found"),
-                ("dns_results", "🛰 DNS Failed Found"),
+                ("smtp_results", "📮 SMTP Failed (pre-check)"),
+                ("dns_results", "🛰 DNS Failed (pre-check)"),
             ]
             for _key, _title in BUCKET_SPEC:
                 with str_lit.expander(f"{_title}", expanded=False):
@@ -3521,8 +3760,8 @@ if str_lit.session_state.engine_has_run or load_persistent_valid_results():
         need_len_val = len(str_lit.session_state.need_app_results)
         conn_len_val = len(str_lit.session_state.conn_results)
         retry_len_val = len(str_lit.session_state.retry_results)
-        smtp_len_val = len(str_lit.session_state.smtp_results)
-        dns_len_val = len(str_lit.session_state.dns_results)
+        smtp_len_val = len(str_lit.session_state.get("pre_smtp_failed", []))
+        dns_len_val = len(str_lit.session_state.get("pre_dns_failed", []))
         valid_res_copy = list(str_lit.session_state.valid_results)
         log_lines_copy = list(str_lit.session_state.log_lines)
         report_entries_copy = list(str_lit.session_state.report_entries)
@@ -3537,8 +3776,8 @@ if str_lit.session_state.engine_has_run or load_persistent_valid_results():
             "🔌 Connection Failed Found": list(str_lit.session_state.conn_results),
             "🔐 App Password / 2FA Found": list(str_lit.session_state.need_app_results),
             "🕓 RETRY_LATER Found": list(str_lit.session_state.retry_results),
-            "📮 SMTP Failed Found": list(str_lit.session_state.smtp_results),
-            "🛰 DNS Failed Found": list(str_lit.session_state.dns_results),
+            "🛰 DNS Failed (pre-check)": list(str_lit.session_state.get("pre_dns_failed", [])),
+            "📮 SMTP Failed (pre-check)": list(str_lit.session_state.get("pre_smtp_failed", [])),
         }
 
     str_lit.markdown(f"### {status_label}")
@@ -3556,15 +3795,15 @@ if str_lit.session_state.engine_has_run or load_persistent_valid_results():
     if start_ts_copy and end_ts_copy:
         str_lit.info(f"⏱ **Session Timestamps:** Started **{start_ts_copy}** | Ended **{end_ts_copy}** | Duration **{duration_copy}**")
 
-    c1, c2, c3, c4, c5, c6 = str_lit.columns(6)
+    c1, c2, c3, c4, c5, c6, c7 = str_lit.columns(7)
     c1.metric("✅ Clean Valid", clean_count_val)
     c2.metric("❌ Wrong Password", wrong_len_val)
     c3.metric("🔑 App Password / 2FA", need_len_val)
     c4.metric("🔌 Connection Failed", conn_len_val)
     c5.metric("🕓 RETRY_LATER", retry_len_val)
-    c6.metric("📮 SMTP Failed", smtp_len_val)
+    c6.metric("🛰 DNS Failed", dns_len_val)
+    c7.metric("📮 SMTP Failed", smtp_len_val)
 
-    # --- live per-status dropdowns, collapsed by default ---
     for title, items in summary_buckets.items():
         with str_lit.expander(f"{title} ({len(items)})", expanded=False):
             if not items:
