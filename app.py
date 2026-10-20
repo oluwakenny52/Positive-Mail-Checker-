@@ -1,59 +1,51 @@
 """
-Mega Ultimate Mail Checker — v13.17
+Mega Ultimate Mail Checker — v13.18
 ===================================
 Complete rewrite. SMTP reachability is an OPT-IN pre-check stage (never inside
 the validator), status classification actually works, and every direct-connection
 line carries the real egress IP / region / country / VPN state.
 
+v13.18 changes  (Microsoft XOAUTH2 + read-timeout + dead-host ordering)
+----------------------------------------------------------------------
+* MICROSOFT ACCOUNTS CAN NOW VALIDATE.  hotmail/outlook/live/msn disabled Basic
+  Authentication on 2024-09-16, so every such account was reported
+  NEED_APP_PASSWORD and could never validate without a generated app password.
+  An APP signal on a Microsoft host now triggers a full XOAUTH2 attempt
+  (ms_oauth.py) using the REAL account password.  A VALID verdict is only
+  returned after six IMAP gates: capability advertises XOAUTH2 -> AUTHENTICATE
+  OK -> SELECT INBOX OK -> STATUS INBOX OK -> NOOP OK.  A token alone is never
+  a verdict.
+* READ TIMEOUT FIX.  v13.17 set the post-connect read to t/3 (~2.1s at a 6.4s
+  slot).  Yahoo / ATT / Microsoft greetings routinely need longer than that, so
+  reachable servers were being reported as "read operation timed out" from both
+  the proxy and the direct egress.  Reads now get max(4.0, t/2).
+* DOUBLE-COST FIX.  proxy_connect()'s inner direct fallback is skipped in
+  'fallback' mode, where the outer phase already runs a full direct sweep.
+  Previously a dead rung cost ~2x its slot and phases overran their windows.
+* IMAP rung cap 6 -> 4, so the primary pass can actually finish inside the
+  deadline.
+* ms_oauth errors are triaged: MsTokenTransport never overwrites a verdict,
+  AADSTS50126 -> WRONG_PASSWORD, AADSTS50076/50079 -> NEED_APP_PASSWORD.
+
 v13.17 changes  (phase windows were being blown out by 2x-cost attempts)
 ------------------------------------------------------------------------
-* CRITICAL FIX — ONE ATTEMPT NOW COSTS ~its slot, NOT ~2x it.  proxy_connect()
-  gave the FULL timeout to EACH of its two connect legs and _raw_socket() then
-  gave the FULL timeout to the post-connect read AGAIN, so a dead-proxy rung
-  burned ~10-12s inside a 6s slot.  The phases therefore overran their windows
-  and most rungs were cut: live trace showed "proxy · pass 1: 7 rung(s), ~6.0s
-  each, 41.8s window" followed by only FOUR attempts and "window reached".
-  xpertikus.com reached 4/7 primary rungs, 2/10 legacy rungs and never touched
-  pop.xpertikus.com:110 - a port that HAD answered in the previous run.
-  Each leg and the post-connect read now get a third of the attempt budget, so
-  an attempt costs ~t and a phase fits the number of rungs it was sized for.
-* The phase trace now reports how many rungs the window cut, e.g.
-  "window reached; stopping this pass (3 rung(s) not attempted)".
-* MAILBOX READER FIX — the v13.16 file assigned `success_msgs` while the check
-  reads `success_read`, so a successful read was reported as a failure.
+* CRITICAL FIX — ONE ATTEMPT NOW COSTS ~its slot, NOT ~2x it.
+* The phase trace now reports how many rungs the window cut.
+* MAILBOX READER FIX — v13.16 assigned `success_msgs` while the check read
+  `success_read`, so a successful read was reported as a failure.
 
 v13.16 changes  (legacy 143 starvation + 168s wall time + RBL ambiguity)
 ------------------------------------------------------------------------
-* CRITICAL FIX — THE LEGACY 143/110 RUNGS ARE NO LONGER SKIPPED.  A 993 timeout
-  set timed_out_hosts, and the legacy sweep then skipped that host's 143 rung
-  with "Skip STARTTLS <host>:143 (implicit TLS already timed out)".  Because
-  143 is a DIFFERENT PORT, a filtered 993 says nothing about it - yet on an
-  all-timeout domain (xpertikus.com, tds.net) EVERY 143 rung was skipped, so
-  the reserved legacy tail slice was spent doing literally nothing.
-* SLOWNESS FIX — THE BUDGET FLOOR IS LOWERED.  The old floor
-  (len(primary_plan) * max(TIMEOUT,12) * 2) forced 168s on a 7-rung plan even
-  when the Deadline slider said 43s.  The floor is now one proxy sweep + the
-  reserved legacy tail + one direct sweep, at a per-rung cost capped at 9s:
-  7 rungs -> ~104s.  Lowering the Timeout slider lowers the floor with it.
-* RBL RESTRICTION IS CLASSIFIED (status.RBL_BLOCKED), retained as a fallback
-  verdict, shown in its own bucket and in the ZIP.
-* The terminal CONNECTION_FAILED detail now states that the password could not
-  be tested, so an unreachable domain is distinguishable from a bad password.
+* CRITICAL FIX — THE LEGACY 143/110 RUNGS ARE NO LONGER SKIPPED.
+* SLOWNESS FIX — THE BUDGET FLOOR IS LOWERED.
+* RBL RESTRICTION IS CLASSIFIED (status.RBL_BLOCKED).
+* The terminal CONNECTION_FAILED detail states the password could not be tested.
 
 v13.15 changes  (APP must try the OWN host + pattern before it finalises)
 ------------------------------------------------------------------------
-* CRITICAL FIX — NEED_APP_PASSWORD NO LONGER SHORT-CIRCUITS.  Like WRONG used to,
-  the APP branch returned on the spot. A foreign fallback (outlook.office365.com)
-  answering "Basic authentication is disabled" therefore FINALISED the account
-  before the domain's own host and the local-part username pattern had been
-  tried - the verdict was reached on the wrong evidence.
-  An APP signal is now non-terminal while ANY domain-local host is still
-  untried, and it always tries the local-part username first.
-* CRITICAL FIX — VERDICT PRIORITY.  Retained verdicts are kept by
-  status.PRIORITY, so a specific app-password signal (priority 1) can never be
-  masked by a generic auth rejection (priority 2) collected for the same account.
-* `tried_hosts` records every host actually dialled, so "own host already
-  attempted" is a fact rather than an assumption.
+* CRITICAL FIX — NEED_APP_PASSWORD NO LONGER SHORT-CIRCUITS.
+* CRITICAL FIX — VERDICT PRIORITY.
+* `tried_hosts` records every host actually dialled.
 
 v13.14 changes  (false verdicts from foreign fallbacks + starved 143 rungs)
 --------------------------------------------------------------------------
@@ -387,7 +379,7 @@ except Exception as _status_err:
 
     def st_classify(raw, domain=""):
         t = (raw or "").lower()
-        if t.strip().rstrip(".!:,;").strip() in _FB_BARE:
+        if t.strip().rstrip(".:!,;").strip() in _FB_BARE:
             return WRONG_PASSWORD
         for table, val in ((_FB_APP, NEED_APP_PASSWORD), (_FB_RBL, RBL_BLOCKED),
                            (_FB_WRONG_STRONG, WRONG_PASSWORD),
@@ -411,6 +403,18 @@ try:
     from status import ALL as ST_ALL
 except Exception:
     pass
+
+# --- ms_oauth.py : Microsoft XOAUTH2 (personal accounts) --------------------
+try:
+    import ms_oauth
+    MS_OAUTH_OK = True
+except Exception as _ms_err:
+    ms_oauth = None
+    MS_OAUTH_OK = False
+
+if not MS_OAUTH_OK:
+    warnings.warn("ms_oauth.py unavailable; Microsoft accounts will report "
+                  "NEED_APP_PASSWORD and never validate without an app password.")
 
 # Optional network libs
 try:
@@ -482,8 +486,8 @@ def default_theme() -> dict:
         "bg": p["bg"], "panel": p["panel"], "text": p["text"],
         "radius": 14, "glow": True, "animate": True, "glass": True,
         "colorize_logs": True,
-        "hero_title": "⚡ Mega Ultimate Mail Checker v13.17",
-        "hero_sub": "World-Coverage Edition — router-aware host ranking, rotating proxy pool, geo-call routing, retryable IP-block handling, optional SMTP pre-check, anti-spoofing post-auth validation.",
+        "hero_title": "⚡ Mega Ultimate Mail Checker v13.18",
+        "hero_sub": "World-Coverage Edition — router-aware host ranking, rotating proxy pool, geo-call routing, Microsoft XOAUTH2, retryable IP-block handling, optional SMTP pre-check, anti-spoofing post-auth validation.",
     }
 
 def load_theme() -> dict:
@@ -674,6 +678,7 @@ def render_hero(th: dict):
                 <span class="bb-tag">Normal</span>
                 <span class="bb-tag">Deep / Aggressive</span>
                 <span class="bb-tag">Proxy Backed</span>
+                <span class="bb-tag">Microsoft XOAUTH2</span>
                 <span class="bb-tag">Geo-Call Routing</span>
                 <span class="bb-tag">Optional SMTP Pre-Check</span>
                 <span class="bb-tag">Anti-Spoof Post-Auth</span>
@@ -913,6 +918,7 @@ def startup_panel_lines():
 log_startup("Application process started. Initializing session state and loading configurations...")
 log_startup(f"hosts.py status -> loaded={HOSTS_OK} has_ranking={HOSTS_HAS_RANKING} {HOSTS_IMPORT_NOTE}".strip())
 log_startup(f"status.py status -> {STATUS_IMPORT_NOTE}")
+log_startup(f"ms_oauth.py status -> loaded={MS_OAUTH_OK} (Microsoft XOAUTH2 {'active' if MS_OAUTH_OK else 'INACTIVE'})")
 
 cache_lock = threading.Lock()
 proxy_lock = threading.Lock()
@@ -1264,8 +1270,8 @@ def direct_isp(force=False):
 def vpn_state_label():
     """Honour the manual stamp; 'Auto' guesses from the egress ISP.
 
-    v13.8: 'Auto' defaults to VPN OFF. Only an explicit VPN brand (or the
-    literal 'vpn' token) in the ISP/org flips it to VPN ON (auto).
+    'Auto' defaults to VPN OFF. Only an explicit VPN brand (or the literal 'vpn'
+    token) in the ISP/org flips it to VPN ON (auto).
     """
     hint = CFG.get("CONNECTION_HINT", "Auto")
     if hint in ("VPN ON", "VPN OFF"):
@@ -1700,10 +1706,13 @@ def fast_fail_dns_check(host):
 def proxy_connect(host, port, proxy_str, timeout=None, remote_dns=True):
     """Proxied TCP connect.
 
-    v13.10 — BOUNDED (each leg used to get the FULL timeout).
-    v13.17 — each leg now gets a THIRD of the budget, so connect + connect +
-    read costs ~t instead of ~2t.  That is what let the phases overrun their
-    windows and cut most of the rungs.
+    Each leg gets a THIRD of the budget so connect+connect costs ~t.  The
+    post-connect read gets HALF the budget (min 4s) because Yahoo / ATT / MS
+    greetings routinely need longer than 2s through a laggy rotating proxy.
+
+    The inner direct fallback is skipped in 'fallback' mode, where the outer
+    phase already runs a full direct sweep - keeping it doubled the cost of
+    every dead rung for no benefit.
     """
     base_timeout = timeout or CFG["PROXY_CONNECT_TIMEOUT"]
     try:
@@ -1712,8 +1721,8 @@ def proxy_connect(host, port, proxy_str, timeout=None, remote_dns=True):
     except Exception:
         fails = 0
     effective_timeout = max(2.0, base_timeout - (fails * 0.1))
-    leg_to = max(1.2, effective_timeout / 3.0)          # v13.17 (was / 2.0)
-    read_to = max(2.0, effective_timeout / 3.0)         # v13.17
+    leg_to = max(1.5, effective_timeout / 3.0)
+    read_to = max(4.0, effective_timeout / 2.0)
 
     if not proxy_str or proxy_str == "direct":
         if not fast_fail_dns_check(host):
@@ -1741,7 +1750,9 @@ def proxy_connect(host, port, proxy_str, timeout=None, remote_dns=True):
         except Exception as proxy_ex:
             last_err = proxy_ex
 
-    if fast_fail_dns_check(host):
+    outer_has_direct_sweep = CFG.get("PROXY_MODE", "fallback") == "fallback"
+
+    if fast_fail_dns_check(host) and not outer_has_direct_sweep:
         try:
             direct_sock = socket.create_connection((host, port), timeout=leg_to)
             direct_sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
@@ -1766,11 +1777,13 @@ def _tls_context(host: str, verify: bool):
     return ctx
 
 def _raw_socket(host, port, proxy_str=None, timeout=None):
-    """v13.17 — the post-connect read gets a THIRD of the budget, so the whole
-    attempt (both proxy legs + read) costs ~t rather than ~2t.  A dead-proxy
-    rung therefore fits its slot instead of overrunning it."""
+    """Post-connect read gets HALF the budget (min 4s), not a third.
+
+    The old t/3 read (~2.1s at a 6.4s slot) was cutting Yahoo / ATT / MS
+    greetings off mid-handshake and reporting them as timeouts.
+    """
     t = timeout or CFG["TIMEOUT"]
-    read_to = max(2.0, t / 3.0)
+    read_to = max(4.0, t / 2.0)
     if proxy_str and proxy_str != "direct":
         s = proxy_connect(host, port, proxy_str, timeout=t)
     else:
@@ -2801,7 +2814,7 @@ def _rank_hosts(hosts, domain):
     return host_rank_hosts(hosts, domain)
 
 # ---------------------------------------------------------------------------
-# v13.12 / v13.14 — DOMAIN-LOCAL + ALIAS-ROOT SERVICE-NAME MERGE
+# DOMAIN-LOCAL + ALIAS-ROOT SERVICE-NAME MERGE
 # ---------------------------------------------------------------------------
 _LOCAL_PRIORITY_IMAP = ("imap.", "mail.", "email.", "")
 _LOCAL_PRIORITY_POP = ("pop.", "pop3.", "")
@@ -2863,8 +2876,7 @@ def _is_plain_domain_guess(host, domain, prefixes):
 
 def _merge_domain_guesses(servers, domain):
     """Insert the domain's own AND alias-root resolving service names, ordered
-    LOCAL-PRIORITY -> other local -> FOREIGN.
-    """
+    LOCAL-PRIORITY -> other local -> FOREIGN."""
     if not servers or not domain:
         return servers
 
@@ -3104,8 +3116,25 @@ def pop_plain_once(email, password, server, proxy_str=None, port=110, attempt_ti
                 pass
 
 def verify_and_connect(target_email, target_pass, hosts, proxy_str=None):
+    """Return (True, open_mail, host) on the first method that fully works.
+
+    Microsoft hosts are tried over XOAUTH2 first; everything else uses the
+    original SSL -> STARTTLS -> plaintext ladder.
+    """
     users = username_candidates(target_email)
     for h in hosts:
+        # --- Microsoft XOAUTH2 first (basic auth is disabled on these hosts) ---
+        if MS_OAUTH_OK and h.lower() in ms_oauth.MS_IMAP_HOSTS:
+            try:
+                mail, _exists, _claims = ms_oauth.imap_xoauth2_open(
+                    target_email, target_pass, h, ProxyIMAP4SSL,
+                    port=993, proxy_str=proxy_str, insecure=True, attempt_timeout=15)
+                return True, mail, h
+            except ms_oauth.MsTokenRejected:
+                pass                      # MFA or bad password -> try basic auth below
+            except Exception:
+                pass
+
         for mode, port in (("ssl", 993), ("starttls", 143), ("plain", 143)):
             for user in users:
                 mail = None
@@ -3212,11 +3241,11 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, 
         def note_verdict(st_val, detail):
             """Keep the BEST verdict seen, by status.PRIORITY.
 
-            v13.15 — priority-aware: a specific app-password signal (1) must never
-            be masked by a generic auth rejection (2) collected for the same
-            account, in either order.
-            v13.16 — RBL_BLOCKED is retained too (priority 3), so an IP-reputation
-            block is never reported as a bare CONNECTION_FAILED.
+            Priority-aware: a specific app-password signal (1) must never be
+            masked by a generic auth rejection (2) collected for the same
+            account, in either order.  RBL_BLOCKED is retained too (priority 3),
+            so an IP-reputation block is never reported as a bare
+            CONNECTION_FAILED.
             """
             if st_val not in (VALID, WRONG, APP, RBL):
                 return
@@ -3236,20 +3265,20 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, 
                 px = sample_alive_proxy(domain=domain)
 
         _all_imap = [h for h in (conf.get("imap") or []) if h]
-        _imap_cap = max(max_hosts, 6)
+        _imap_cap = max(max_hosts, 4)
         imap_hosts = _all_imap[:_imap_cap]
         pop_hosts = [h for h in ((conf.get("pop") or conf.get("pop3") or [])[:1]) if h]
         if len(_all_imap) > len(imap_hosts):
             trace_logs.append(
                 f"Host expansion: {len(imap_hosts)}/{len(_all_imap)} IMAP candidate(s) kept (cap {_imap_cap}).")
 
-        # v13.13 — GUARANTEE THE BARE-DOMAIN FALLBACK.
+        # GUARANTEE THE BARE-DOMAIN FALLBACK.
         if domain and domain not in imap_hosts and fast_fail_dns_check(domain):
             imap_hosts = imap_hosts + [domain]
             trace_logs.append(
                 f"Fallback host '{domain}' force-included as a final rung (apex resolves).")
 
-        # v13.14 — which hosts are the DOMAIN'S OWN?
+        # Which hosts are the DOMAIN'S OWN?
         _local_roots = tuple(_domain_roots(domain))
 
         def _is_local_host(h):
@@ -3263,7 +3292,7 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, 
 
         domain_local_hosts = {h for h in (imap_hosts + pop_hosts) if _is_local_host(h)}
 
-        # v13.15 — every host actually dialled.
+        # every host actually dialled.
         tried_hosts = set()
 
         trace_logs.append(f"Host order -> IMAP {imap_hosts} | POP {pop_hosts}")
@@ -3277,7 +3306,7 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, 
             if not proxy_pool or proxy_mode == "off":
                 return None, DNS_FAILED, "Fast-fail DNS check failed: no host resolves locally", None, trace_logs
 
-        # v13.9 host-major plan + v13.10 de-duplication
+        # host-major plan + de-duplication
         imap_set = set(imap_hosts)
         pop_only = [h for h in pop_hosts if h not in imap_set]
         pop_dup = [h for h in pop_hosts if h in imap_set]
@@ -3290,13 +3319,14 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, 
             fallback_plan += [("IMAP", h, 143, "starttls") for h in imap_hosts]
             fallback_plan += [("IMAP", h, 143, "plain") for h in imap_hosts[:2]]
             for h in pop_hosts:
-                fallback_plan += [("POP", h, 110, "starttls"), ("POP", h, 110, "plain")]
+                fallback_plan += [("POP", h, 110, "starttls")]
+                fallback_plan += [("POP", h, 110, "plain")]
 
         if not primary_plan:
             trace_logs.append("No candidate hosts for this domain.")
             return None, FAILED, "no candidate hosts", None, trace_logs
 
-        # v13.16 — BUDGET FLOOR LOWERED (was len(plan) * max(TIMEOUT,12) * 2 = 168s).
+        # BUDGET FLOOR (one proxy sweep + reserved legacy tail + one direct sweep)
         rung_cost = max(5.0, min(configured_to, 9.0))
         work_floor = (len(primary_plan) * rung_cost * 1.5) + 10.0
         budget = max(12.0, float(CFG.get("ACCOUNT_DEADLINE", 45)) * 0.95)
@@ -3307,8 +3337,7 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, 
                 f"instead of the {budget:.0f}s the Deadline slider allows.")
             budget = work_floor
 
-        # v13.14 — reserve the TAIL of each phase for the legacy 143/110 plan.
-        # v13.16 — the legacy tail is widened now that the 143 rungs actually RUN.
+        # reserve the TAIL of each phase for the legacy 143/110 plan.
         proxy_deadline = t_start + (budget * 0.60)
         proxy_primary_deadline = t_start + (budget * 0.40)
         hard_deadline = t_start + budget
@@ -3337,6 +3366,53 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, 
                 else:
                     pop_plain_once(user, password, server, px_used, port=port, attempt_timeout=attempt_to)
 
+        err_text = ""
+
+        def try_ms_xoauth2(server, px_used, attempt_to):
+            """XOAUTH2 attempt for a Microsoft host.
+
+            Returns a VALID result tuple, or None.  Never raises.
+            A token is only a VALID after the full 6-gate IMAP confirmation, so
+            a correct password for a mailbox that has IMAP switched off, or a
+            proxy that fakes an OK, cannot produce a false VALID.
+            """
+            if not MS_OAUTH_OK:
+                return None
+            if server.lower() not in ms_oauth.MS_IMAP_HOSTS:
+                return None
+            if not ms_oauth.should_try_ms_xoauth2(server, err_text, domain):
+                return None
+            try:
+                exists, claims = ms_oauth.imap_xoauth2_once(
+                    email, password, server, ProxyIMAP4SSL, port=993,
+                    proxy_str=px_used, insecure=prefer_insecure,
+                    attempt_timeout=attempt_to)
+                who = claims.get("preferred_username") or email
+                trace_logs.append(
+                    f"{px_tag(px_used)} XOAUTH2 VALID on {server}:993 "
+                    f"(EXISTS={exists}, as={who}, exp={claims.get('exp')})")
+                return (server, VALID,
+                        f"{px_tag(px_used)} XOAUTH2 | Host: {server} | Port: 993 | "
+                        f"real account password (basic auth disabled)",
+                        px_used, trace_logs)
+            except ms_oauth.MsTokenTransport as te:
+                trace_logs.append(
+                    f"{px_tag(px_used)} XOAUTH2 transport issue -> verdict unchanged ({str(te)[:90]})")
+                return None
+            except ms_oauth.MsTokenRejected as tr:
+                if tr.verdict == "wrong_password":
+                    note_verdict(WRONG, f"XOAUTH2 token {tr.code} -> wrong password")
+                    trace_logs.append(f"{px_tag(px_used)} XOAUTH2 token rejected [{tr.code}] -> wrong password")
+                elif tr.verdict == "need_app_password":
+                    note_verdict(APP, f"XOAUTH2 token {tr.code} -> MFA, app password required")
+                    trace_logs.append(f"{px_tag(px_used)} XOAUTH2 token rejected [{tr.code}] -> MFA, app password required")
+                else:
+                    trace_logs.append(f"{px_tag(px_used)} XOAUTH2 token rejected [{tr.code}] -> no verdict change")
+                return None
+            except Exception as xe:
+                trace_logs.append(f"{px_tag(px_used)} XOAUTH2 failed: {str(xe)[:90]}")
+                return None
+
         def sweep(px_used, rungs, deadline_ts, label, allow_rotate=False):
             had_net = False
             saw_retry = False
@@ -3358,8 +3434,6 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, 
                         f"({len(rungs) - rung_idx} rung(s) not attempted).")
                     break
 
-                # v13.16 — NO MORE "implicit TLS already timed out" SKIP.
-                # 143/110 is a DIFFERENT PORT: a filtered 993 says nothing about it.
                 tried_hosts.add(server)
 
                 rotations_left = MAX_ROTATIONS if (allow_rotate and px_used and proxy_mode != "off") else 0
@@ -3425,8 +3499,9 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, 
                             note_verdict(st_val, f"{proto} {server}:{port} -> {st_val}")
 
                             if st_val == APP:
-                                # v13.15 — try the local-part pattern first, and do
-                                # NOT finalise while the domain's own host is untried.
+                                xres = try_ms_xoauth2(server, px_used, attempt_to)
+                                if xres:
+                                    return xres, had_net, saw_retry
                                 if u_idx + 1 < len(users):
                                     trace_logs.append(f"{px_tag(px_used)} App-password signal as '{user}' -> retrying same host as local-part '{users[u_idx + 1]}'")
                                     continue
@@ -3444,8 +3519,6 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, 
                                 else:
                                     rotate_now = True
                             elif st_val == RBL:
-                                # v13.16 — IP-reputation block: not a password verdict,
-                                # not a reachability failure. Note it and move on.
                                 trace_logs.append(f"{px_tag(px_used)} RBL block on {server}:{port} -> IP flagged by server, advancing")
                                 server_level_fail = True
                             elif u_idx + 1 < len(users) and st_val in (WRONG, UNKNOWN):
@@ -3478,6 +3551,9 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, 
                             note_verdict(st_val, f"{proto} {server}:{port} -> {st_val}")
 
                             if st_val == APP:
+                                xres = try_ms_xoauth2(server, px_used, attempt_to)
+                                if xres:
+                                    return xres, had_net, saw_retry
                                 if u_idx + 1 < len(users):
                                     trace_logs.append(f"{px_tag(px_used)} App-password signal as '{user}' -> retrying same host as local-part '{users[u_idx + 1]}'")
                                     continue
