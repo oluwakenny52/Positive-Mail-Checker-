@@ -55,7 +55,6 @@ try:
 except ImportError:
     _REQ = False
 
-
 # ============================================================================
 # STATIC PROVIDER TABLES
 # ============================================================================
@@ -264,7 +263,6 @@ MX_PROVIDER_MAP = (
       "netsol", "network solutions", "webhostingpad", "stablehost", "hawkhost"), (None, None, None)),
 )
 
-
 # ============================================================================
 # ROUTER / RELAY DETECTION + CANDIDATE RANKING
 # ============================================================================
@@ -293,7 +291,6 @@ _SERVICE_PREFIXES = (
 
 _SKIP_LABELS_FOR_TOKENS = {"mail", "email", "webmail", "imap", "imaps", "pop", "pop3", "smtp", "correo"}
 
-
 def is_junk_host(host, domain=None):
     """True when a hostname is almost certainly a mail ROUTER (MX/MTA) rather
     than an IMAP/POP service endpoint. Demotion only - never removal."""
@@ -321,9 +318,7 @@ def is_junk_host(host, domain=None):
 
     return False
 
-
 _is_junk_host = is_junk_host
-
 
 def host_tier(host, domain):
     """0 = most likely correct ... 4 = last resort. Ordering only."""
@@ -344,11 +339,9 @@ def host_tier(host, domain):
         return 3
     return 2                                         # provider endpoint (ssl0.ovh.net, imap.gmail.com)
 
-
 _probe_lock = threading.Lock()
 _probe_cache = {}
 _PROBE_TTL = 600
-
 
 def _port_open(host, port, timeout=1.5):
     try:
@@ -357,7 +350,6 @@ def _port_open(host, port, timeout=1.5):
         return True
     except Exception:
         return False
-
 
 def probe_live(host, timeout=1.5):
     """Cheap TCP reachability check on 993 / 143 (cached 10 min)."""
@@ -374,7 +366,6 @@ def probe_live(host, timeout=1.5):
     with _probe_lock:
         _probe_cache[host] = (now, ok)
     return ok
-
 
 def rank_hosts(hosts, domain, probe=True):
     """Composite ranking.
@@ -426,7 +417,6 @@ def rank_hosts(hosts, domain, probe=True):
     ))
     return [h for _i, h in indexed]
 
-
 # ============================================================================
 # CACHES  (atomic writes)
 # ============================================================================
@@ -439,7 +429,6 @@ _cache = None
 
 _resolve_lock = threading.Lock()
 _resolve_cache = {}
-
 
 def _atomic_write_json(path, obj, indent=2):
     directory = os.path.dirname(os.path.abspath(path)) or "."
@@ -480,7 +469,6 @@ def _atomic_write_json(path, obj, indent=2):
 
     return payload
 
-
 def _load_cache():
     global _cache
     if _cache is not None:
@@ -506,7 +494,6 @@ def _load_cache():
     _cache = {}
     return _cache
 
-
 def _save_cache():
     try:
         now = time.time()
@@ -528,10 +515,8 @@ def _save_cache():
     except Exception:
         return False
 
-
 def flush_cache():
     return _save_cache()
-
 
 def clear_cache():
     global _cache
@@ -545,7 +530,6 @@ def clear_cache():
             pass
     return True
 
-
 def cache_stats():
     stats = {"entries": 0, "file_bytes": 0, "path": _CACHE_FILE,
              "has_backup": os.path.exists(_CACHE_FILE + ".bak"), "healthy": True}
@@ -558,14 +542,12 @@ def cache_stats():
         stats["healthy"] = False
     return stats
 
-
 def _dedupe(seq):
     out = []
     for x in seq:
         if x and x not in out:
             out.append(x)
     return out
-
 
 # ============================================================================
 # DNS HELPERS
@@ -583,11 +565,9 @@ def _dns_resolve(name, rdtype):
         except Exception:
             return []
 
-
 _mx_cache = {}
 _mx_lock = threading.Lock()
 _MX_TTL = 600
-
 
 def resolve_mx(domain):
     domain = (domain or "").lower().strip()
@@ -612,7 +592,6 @@ def resolve_mx(domain):
         _mx_cache[domain] = (now, out)
     return out
 
-
 def resolve_srv(name):
     records = _dns_resolve(name, "SRV")
     out = []
@@ -622,7 +601,6 @@ def resolve_srv(name):
         except Exception:
             continue
     return sorted(out)
-
 
 def host_resolves(host):
     if not host:
@@ -658,7 +636,6 @@ def host_resolves(host):
     with _resolve_lock:
         _resolve_cache[host] = ok
     return ok
-
 
 # ============================================================================
 # v13.12 - DOMAIN-LOCAL + ALIAS-ROOT SERVICE-NAME MERGE
@@ -703,7 +680,6 @@ _DOMAIN_ALIAS_ROOTS = {
     "xplore.net":   ("xplornet.com",),
 }
 
-
 def _domain_roots(domain):
     """The domain itself followed by any known alias root (deduped)."""
     domain = (domain or "").lower().strip()
@@ -712,7 +688,6 @@ def _domain_roots(domain):
         if alt and alt not in roots:
             roots.append(alt)
     return roots
-
 
 def _guess_candidates(domain, prefixes):
     """Every '<prefix><root>' for the domain AND its alias roots that RESOLVES.
@@ -732,7 +707,6 @@ def _guess_candidates(domain, prefixes):
                 out.append(cand)
     return out
 
-
 def _is_plain_domain_guess(host, domain, prefixes):
     """True when host is just '<prefix><domain>' / the bare domain - i.e. a name
     WE generate, not an authoritative provider endpoint."""
@@ -743,7 +717,6 @@ def _is_plain_domain_guess(host, domain, prefixes):
     if h == d:
         return True
     return any(h == f"{p}{d}" for p in prefixes if p)
-
 
 def merge_domain_guesses(servers, domain):
     """Insert the domain's own AND alias-root resolving service names into a
@@ -778,7 +751,6 @@ def merge_domain_guesses(servers, domain):
                 merged.append(h)
         out[key] = merged
     return out
-
 
 # ============================================================================
 # DISCOVERY: SRV / AUTOCONFIG / AUTODISCOVER / MX
@@ -815,7 +787,6 @@ def _thunderbird_autoconfig(domain):
             continue
     return _dedupe(imap), _dedupe(pop)
 
-
 _AUTODISCOVER_BODY = (
     '<?xml version="1.0" encoding="utf-8"?>'
     '<Autodiscover xmlns="http://schemas.microsoft.com/exchange/autodiscover/outlook/requestschema/2006">'
@@ -824,7 +795,6 @@ _AUTODISCOVER_BODY = (
     'http://schemas.microsoft.com/exchange/autodiscover/outlook/responseschema/2006a'
     '</AcceptableResponseSchema></Request></Autodiscover>'
 )
-
 
 def _autodiscover(domain, email=None):
     if not _REQ:
@@ -859,7 +829,6 @@ def _autodiscover(domain, email=None):
             continue
     return _dedupe(imap), _dedupe(pop)
 
-
 def _provider_from_mx(mx_host):
     m = (mx_host or "").lower()
     for keys, pair in MX_PROVIDER_MAP:
@@ -867,11 +836,9 @@ def _provider_from_mx(mx_host):
             return pair
     return None
 
-
 _IMAP_PREFIXES = ("imap.", "mail.", "webmail.", "imaps.", "correo.", "secure.", "zimbra.", "email.", "mail2.", "")
 _POP_PREFIXES = ("pop.", "pop3.", "pop3s.", "mail.", "correo.", "")
 _SMTP_PREFIXES = ("smtp.", "mail.", "smtp-mail.", "send.", "relay.", "")
-
 
 def discover_hosts(domain, email=None, use_cache=True, force_refresh=False):
     """Ordered candidate discovery: SRV -> autoconfig -> autodiscover -> MX -> prefixes.
@@ -986,7 +953,6 @@ def discover_hosts(domain, email=None, use_cache=True, force_refresh=False):
 
     return {"imap": imap, "pop": pop, "smtp": smtp, "sources": sources}
 
-
 # ============================================================================
 # PUBLIC API
 # ============================================================================
@@ -994,13 +960,11 @@ def discover_hosts(domain, email=None, use_cache=True, force_refresh=False):
 def domain_of(email_addr):
     return (email_addr or "").split("@")[-1].lower().strip()
 
-
 def _pair(imap_hosts, pop_hosts, domain=None):
     if domain:
         imap_hosts = rank_hosts(imap_hosts, domain, probe=False)
         pop_hosts = rank_hosts(pop_hosts, domain, probe=False)
     return {"imap": imap_hosts, "pop": pop_hosts, "pop3": pop_hosts}
-
 
 def get_mx_host(domain):
     mx_records = resolve_mx(domain)
@@ -1011,7 +975,6 @@ def get_mx_host(domain):
     if provider and provider[0]:
         return provider[0]
     return exchange
-
 
 def smtp_candidates(domain):
     """SMTP endpoints for the SMTP pre-check (never raises).
@@ -1057,7 +1020,6 @@ def smtp_candidates(domain):
     ranked = rank_hosts(_dedupe(out), domain, probe=False)
     return ranked[:3] if ranked else _dedupe(out)[:3]
 
-
 def _conf_curated(domain):
     """Curated / discovery answer WITHOUT the domain-local merge."""
     domain = (domain or "").lower().strip()
@@ -1095,7 +1057,6 @@ def _conf_curated(domain):
 
     return None
 
-
 def conf(domain):
     """Full server config for a domain.
 
@@ -1114,7 +1075,6 @@ def conf(domain):
         return got
     return merge_domain_guesses(got, domain)
 
-
 def provider_hosts(email_addr):
     domain = domain_of(email_addr)
     got = conf(domain)
@@ -1124,11 +1084,9 @@ def provider_hosts(email_addr):
     found = discover_hosts(domain, email=email_addr)
     return found["imap"], found["pop"]
 
-
 def host_list(email_addr):
     imap_hosts, _ = provider_hosts(email_addr)
     return imap_hosts[:8]
-
 
 def ladder(email_addr, max_hosts=3, include_starttls=True):
     imap_hosts, pop_hosts = provider_hosts(email_addr)
@@ -1145,10 +1103,8 @@ def ladder(email_addr, max_hosts=3, include_starttls=True):
             plan.append(("POP", h, 110, "starttls"))
     return plan
 
-
 def refresh_domain(domain):
     return discover_hosts(domain, use_cache=True, force_refresh=True)
-
 
 def is_disposable(email_addr):
     domain = domain_of(email_addr)
