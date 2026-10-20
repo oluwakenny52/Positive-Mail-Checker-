@@ -2,13 +2,24 @@
 status.py — single source of truth for engine statuses and error classification.
 
 Both naming conventions are exported (VALID + WRONG_PASSWORD, FAILED +
-CONNECTION_FAILED, RBL + RBL_BLOCKED, ...) so `from status import (...)` can
-never break.
+CONNECTION_FAILED, RBL + RBL_BLOCKED, PROXY_UNHEALTHY, ...) so
+`from status import (...)` can never break.
 
 Classification order is deliberate:
     APP -> WRONG_STRONG -> BARE_AUTH -> RBL -> DNS -> RETRY -> CONN -> WRONG -> UNKNOWN
 CONN runs before WRONG so a proxy "Socket error: 407" is never read as an auth
 failure by a generic token.
+
+v13.19
+------
+* NEW STATUS — PROXY_UNHEALTHY.  Returned when every attempt for an account
+  failed in the PROXY hop (407 Proxy Authentication Required) and the mailbox
+  was therefore never reached.  Previously these were reported as
+  CONNECTION_FAILED / "password could not be tested", which looks like a
+  mailbox outage and hides a dead proxy pool.
+* is_proxy_auth_fail() helper so app.py can raise ProxyAuthError on the exact
+  same predicate the classifier uses.
+* classify_proxy_error() — proxy-aware wrapper around classify_error().
 
 v13.18
 ------
@@ -32,6 +43,7 @@ VALID = "valid"
 WRONG = WRONG_PASSWORD = "wrong_password"
 APP = NEED_APP_PASSWORD = "need_app_password"
 FAILED = CONNECTION_FAILED = "connection_failed"
+PROXY_UNHEALTHY = "proxy_unhealthy"
 SKIP = SKIPPED_COOLDOWN = "skipped_cooldown"
 UNKNOWN = "unknown"
 RETRY = RETRY_LATER = "retry_later"
@@ -49,6 +61,7 @@ ALL = [
     SMTP_FAILED,
     DNS_FAILED,
     CONNECTION_FAILED,
+    PROXY_UNHEALTHY,
     UNKNOWN,
     SKIPPED_COOLDOWN,
 ]
@@ -67,8 +80,9 @@ PRIORITY = {
     SMTP_FAILED: 5,
     DNS_FAILED: 6,
     CONNECTION_FAILED: 7,
-    UNKNOWN: 8,
-    SKIPPED_COOLDOWN: 9,
+    PROXY_UNHEALTHY: 8,
+    UNKNOWN: 9,
+    SKIPPED_COOLDOWN: 10,
 }
 
 LABELS = {
@@ -80,6 +94,7 @@ LABELS = {
     SMTP_FAILED: "SMTP_FAILED",
     DNS_FAILED: "DNS_FAILED",
     CONNECTION_FAILED: "CONNECTION_FAILED",
+    PROXY_UNHEALTHY: "PROXY_UNHEALTHY",
     UNKNOWN: "UNKNOWN",
     SKIPPED_COOLDOWN: "SKIPPED_COOLDOWN",
 }
@@ -88,6 +103,7 @@ COLORS = {
     VALID: "#22c55e",
     WRONG_PASSWORD: "#ef4444",
     CONNECTION_FAILED: "#eab308",
+    PROXY_UNHEALTHY: "#e879f9",
     NEED_APP_PASSWORD: "#3b82f6",
     RETRY_LATER: "#ffffff",
     RBL_BLOCKED: "#facc15",
@@ -342,6 +358,7 @@ _BARE_AUTH = (
 _PROXY_LEVEL = (
     "407",
     "proxy authentication required",
+    "proxy authentication",
     "proxy auth",
     "proxyconnect",
     "proxy connect",
@@ -400,6 +417,18 @@ def classify_error(raw, domain=""):
     return UNKNOWN
 
 
+def classify_proxy_error(raw, domain=""):
+    """Proxy-aware wrapper: a 407 / proxy-auth failure is PROXY_UNHEALTHY.
+
+    Use this when the failure happened on a PROXIED attempt and you want the
+    specific reason rather than a generic CONNECTION_FAILED.  The account-level
+    engine still decides the final verdict; this only labels the leg.
+    """
+    if is_proxy_auth_fail(raw):
+        return PROXY_UNHEALTHY
+    return classify_error(raw, domain)
+
+
 def ms_token_status(code):
     """Map a Microsoft AADSTS code to an engine status.
 
@@ -416,6 +445,12 @@ def ms_token_status(code):
 
 def is_retry_signal(raw):
     return _match(_norm(raw), _RETRY)
+
+
+def is_proxy_auth_fail(raw):
+    """True when the PROXY itself rejected us (407). Not a mail-host problem."""
+    t = _norm(raw)
+    return ("407" in t) or ("proxy authentication required" in t)
 
 
 def is_proxy_level_error(raw):
@@ -455,7 +490,7 @@ def is_terminal(status):
 
 
 def is_failure(status):
-    return status in (CONNECTION_FAILED, DNS_FAILED, SMTP_FAILED, UNKNOWN)
+    return status in (CONNECTION_FAILED, PROXY_UNHEALTHY, DNS_FAILED, SMTP_FAILED, UNKNOWN)
 
 
 def display(status):
