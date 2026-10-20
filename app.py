@@ -1,43 +1,54 @@
 """
-Mega Ultimate Mail Checker — v13.9
-==================================
+Mega Ultimate Mail Checker — v13.10
+===================================
 Complete rewrite. SMTP reachability is an OPT-IN pre-check stage (never inside
 the validator), status classification actually works, and every direct-connection
 line carries the real egress IP / region / country / VPN state.
+
+v13.10 changes  (bounded rungs — the direct phase was being starved)
+-------------------------------------------------------------------
+* CRITICAL FIX — proxy_connect() was UNBOUNDED. It gave the FULL timeout to each
+  of its three legs (SOCKS5, HTTP, then a direct fallback), so a single rung
+  could consume ~3x its nominal time. Live evidence: mail.twc.com burned ~15.6s
+  of a 7.8s rung, which ate 8s out of the direct phase and cut its per-attempt
+  timeout from 19.5s/3 to 11.9s/3 = 4.0s — below what these servers need.
+  Each leg now gets half the budget, bounding a rung to ~1.5x.
+* CRITICAL FIX — DUPLICATE RUNG. When pop_hosts[0] is already imap_hosts[0]
+  (mail.twc.com for brighthouse.com), the host was queued TWICE — once IMAP 993
+  and once POP 995 — thinning every per-attempt timeout by a third for zero
+  extra coverage. A POP rung is now only promoted into the primary plan when its
+  host is NOT already an IMAP host; otherwise it is demoted to the fallback phase.
+* The per-account budget now FLOORS to fit the work:
+      rungs * max(TIMEOUT, 12s) * 2
+  so a 2-rung account gets 48s even though the Deadline slider says 45s. Logged
+  explicitly when it fires, so the slider is never silently contradicted.
+* Every attempt is clamped to the phase deadline — a late rung can no longer
+  drag a pass past its own window.
+* The account window is logged up front (proxy Xs / direct Ys) so the split is
+  visible in the trace instead of having to be inferred.
 
 v13.9 changes  (host-major ladder — stop starving host #2 and host #3)
 ---------------------------------------------------------------------
 * CRITICAL FIX — LADDER ORDER. Proxy rotation used to happen INSIDE the per-host
   loop, so a slow host #1 consumed the entire proxy window and hosts #2/#3 were
-  never attempted at all. Live evidence: imap.btinternet.com was hit 3x and
-  mail.btinternet.com / imap.gmail.com were never reached on the proxy pass;
-  mail.twc.com was hit twice and mobile.charter.net never reached.
+  never attempted at all.
   The ladder is now HOST-MAJOR:
     pass 1 — every host exactly once, NO rotation
     pass 2 — only hosts that failed at network level, fresh proxy each, max 2
-  so a single pass always completes over the whole host list.
-* Per-attempt timeout is now derived from the LIVE window (left / rungs_about_to_
-  be_tried), not from a fixed divisor, so pass 1 always fits instead of overrunning
-  on host #1.
-* Legacy 143/110 rungs demoted to a separate fallback_plan so they can no longer
-  crowd out host #2 and host #3. POP 995 is promoted into the primary plan.
-* The DIRECT pass now sweeps ALL locally-resolving hosts (was capped at [:2]).
+* Per-attempt timeout derived from the live window, not a fixed divisor.
+* Legacy 143/110 rungs demoted to a separate fallback_plan.
+* The DIRECT pass sweeps ALL locally-resolving hosts (was capped at [:2]).
 * A connection-refused is HOST-level, not proxy-level — it no longer burns a
-  rotation. A read timeout likewise: TCP+TLS already completed, so the server
-  stalled on the greeting; that is the host, not the proxy.
-* "Per-account budget reached" now reports which window tripped and how much
-  was left, instead of always printing the full budget.
-* hosts.py: BT consumer mail (btinternet.com / bt.com / btopenworld.com /
-  talk21.com) is Yahoo-hosted, so it now maps to imap.mail.yahoo.com instead of
-  the legacy 'imap.<domain>' guess. Sky and Virgin Media get explicit endpoints.
+  rotation. A read timeout likewise.
+* hosts.py: BT consumer mail maps to imap.mail.yahoo.com; Sky and Virgin Media
+  get explicit endpoints.
 
 v13.8 changes  (verdict retention + budget rebalance + 407 breaker)
 -------------------------------------------------------------------
 * CRITICAL FIX — VERDICT RETENTION. check_account_sync keeps a best_verdict the
   first time ANY host hands back VALID / WRONG_PASSWORD / NEED_APP_PASSWORD.
-  Previously a definitive auth answer was thrown away the moment the local-part
-  retry timed out. best_verdict is returned at ladder end, ahead of RETRY /
-  DNS_FAILED / CONNECTION_FAILED, and ahead of the critical-exception fallback.
+  best_verdict is returned at ladder end, ahead of RETRY / DNS_FAILED /
+  CONNECTION_FAILED, and ahead of the critical-exception fallback.
 * BUDGET REBALANCE. The proxy pass gets 55% of the per-account budget (was 72%).
 * 407 BREAKER. After 3 consecutive 407s on the same host, jump straight to DIRECT.
 * 'Lookup failed' falls through to the NEXT HOST instead of rotating proxies.
@@ -47,18 +58,14 @@ v13.8 changes  (verdict retention + budget rebalance + 407 breaker)
 
 v13.7 changes
 -------------
-* SMTP pre-check is now OFF BY DEFAULT. The engine runs IMAP/POP only, so a run
-  starts instantly with no per-domain SMTP connect on the first pass.
+* SMTP pre-check is now OFF BY DEFAULT. The engine runs IMAP/POP only.
 * The SMTP checkbox moved into the "Advanced Control Rules" slide-out section.
-* When enabled: direct-first probing, a 45s wall-clock budget for the pre-check,
-  and 32 parallel workers. Anything unresolved when the budget expires falls
-  through to Ready to Check instead of hanging the page.
+* When enabled: direct-first probing, a 45s wall-clock budget, 32 parallel workers.
 
 v13.6 changes
 -------------
 * CRITICAL FIX: status.py exports ALL_STATUSES again, so the real classifier is
-  used. Previously the whole status import threw, the stub `st_classify()`
-  returned UNKNOWN for everything, and every auth error was logged as
+  used. Previously the whole status import threw and every auth error logged as
   "[Classified: unknown]".
 * CRITICAL FIX: the SMTP failed check no longer runs inside check_account_sync.
 * SMTP Failed is a PRE-CHECK bucket, displayed immediately AFTER DNS Failed.
@@ -127,7 +134,6 @@ except Exception as _hosts_core_err:
         "msn.com": (["outlook.office365.com"], ["outlook.office365.com"]),
         "yahoo.com": (["imap.mail.yahoo.com"], ["pop.mail.yahoo.com"]),
         "ymail.com": (["imap.mail.yahoo.com"], ["pop.mail.yahoo.com"]),
-        # v13.9 — BT consumer mail is Yahoo-hosted.
         "btinternet.com": (["imap.mail.yahoo.com"], ["pop.mail.yahoo.com"]),
         "bt.com": (["imap.mail.yahoo.com"], ["pop.mail.yahoo.com"]),
         "btopenworld.com": (["imap.mail.yahoo.com"], ["pop.mail.yahoo.com"]),
@@ -442,7 +448,7 @@ def default_theme() -> dict:
         "bg": p["bg"], "panel": p["panel"], "text": p["text"],
         "radius": 14, "glow": True, "animate": True, "glass": True,
         "colorize_logs": True,
-        "hero_title": "⚡ Mega Ultimate Mail Checker v13.9",
+        "hero_title": "⚡ Mega Ultimate Mail Checker v13.10",
         "hero_sub": "World-Coverage Edition — router-aware host ranking, rotating proxy pool, geo-call routing, retryable IP-block handling, optional SMTP pre-check, anti-spoofing post-auth validation.",
     }
 
@@ -1661,6 +1667,17 @@ def fast_fail_dns_check(host):
         return False
 
 def proxy_connect(host, port, proxy_str, timeout=None, remote_dns=True):
+    """Proxied TCP connect.
+
+    v13.10 — BOUNDED. Every leg used to get the FULL timeout, so a rung could
+    burn ~3x its nominal time (SOCKS5 timeout + HTTP timeout + direct timeout).
+    Live evidence: mail.twc.com consumed ~15.6s of a 7.8s rung, which ate 8s out
+    of the direct phase and cut its per-attempt timeout to 4.0s.
+
+    Now each leg gets half the budget, so the whole call is bounded to ~1.5x,
+    while the post-connect READ timeout stays at the full effective_timeout so
+    the TLS handshake and the IMAP greeting still get a fair shot.
+    """
     base_timeout = timeout or CFG["PROXY_CONNECT_TIMEOUT"]
     try:
         with proxy_lock:
@@ -1668,11 +1685,12 @@ def proxy_connect(host, port, proxy_str, timeout=None, remote_dns=True):
     except Exception:
         fails = 0
     effective_timeout = max(2.0, base_timeout - (fails * 0.1))
+    leg_to = max(2.0, effective_timeout / 2.0)
 
     if not proxy_str or proxy_str == "direct":
         if not fast_fail_dns_check(host):
             raise RuntimeError(f"Fast-fail DNS check failed: Host '{host}' does not resolve locally")
-        s = socket.create_connection((host, port), timeout=effective_timeout)
+        s = socket.create_connection((host, port), timeout=leg_to)
         s.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
         s.settimeout(effective_timeout)
         return s
@@ -1688,7 +1706,7 @@ def proxy_connect(host, port, proxy_str, timeout=None, remote_dns=True):
             if info["user"]:
                 kw["proxy_username"] = info["user"]
                 kw["proxy_password"] = info["pass"]
-            s = socks.create_connection((host, port), timeout=effective_timeout, **kw)
+            s = socks.create_connection((host, port), timeout=leg_to, **kw)
             s.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
             s.settimeout(effective_timeout)
             return s
@@ -1697,7 +1715,7 @@ def proxy_connect(host, port, proxy_str, timeout=None, remote_dns=True):
 
     if fast_fail_dns_check(host):
         try:
-            direct_sock = socket.create_connection((host, port), timeout=effective_timeout)
+            direct_sock = socket.create_connection((host, port), timeout=leg_to)
             direct_sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
             direct_sock.settimeout(effective_timeout)
             return direct_sock
@@ -1726,7 +1744,7 @@ def _raw_socket(host, port, proxy_str=None, timeout=None):
     else:
         if not fast_fail_dns_check(host):
             raise RuntimeError(f"Fast-fail DNS check failed: Host '{host}' does not resolve locally")
-        s = socket.create_connection((host, port), timeout=t)
+        s = socket.create_connection((host, port), timeout=max(2.0, t / 2.0))
     s.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
     s.settimeout(t)
     return s
@@ -3061,9 +3079,6 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, 
     dns_ok = True
 
     # --- v13.8: VERDICT RETENTION ------------------------------------------
-    # The FIRST definitive verdict any host hands back (VALID / WRONG_PASSWORD /
-    # NEED_APP_PASSWORD) is kept for the whole account. A later timeout, a proxy
-    # rotation or a dead direct sweep must never clobber it.
     best_verdict = {"status": None, "detail": ""}
     # --- v13.8: 407 STORM BREAKER ------------------------------------------
     force_direct = {"flag": False}
@@ -3082,13 +3097,6 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, 
         try_starttls = bool(CFG.get("TRY_STARTTLS", True))
         try_alt_user = bool(CFG.get("TRY_ALT_USERNAME", True))
         max_hosts = max(1, int(CFG.get("MAX_HOSTS_PER_DOMAIN", 3)))
-
-        # SMTP no longer competes for this budget — the ladder gets nearly all of it.
-        # v13.8: the proxy window is capped at 55% so the DIRECT sweep always keeps
-        # ~45% of the wall clock for hosts that only answer over direct.
-        budget = max(12.0, float(CFG.get("ACCOUNT_DEADLINE", 45)) * 0.95)
-        proxy_deadline = t_start + (budget * 0.55)
-        hard_deadline = t_start + budget
         configured_to = max(4.0, float(CFG.get("TIMEOUT", 10)))
 
         users = username_candidates(email) if try_alt_user else [email]
@@ -3126,21 +3134,28 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, 
                 return None, DNS_FAILED, "Fast-fail DNS check failed: no host resolves locally", None, trace_logs
 
         # ------------------------------------------------------------------
-        # v13.9 HOST-MAJOR PLAN
+        # v13.9 HOST-MAJOR PLAN  +  v13.10 DE-DUPLICATION
         #
         # One implicit-TLS rung per host. A read timeout means TCP + TLS already
-        # completed and the server stalled on the greeting — that is a HOST
-        # condition (datacenter egress, no PTR), not a proxy condition. So pass 1
-        # gives every host exactly one attempt and never rotates; only pass 2
-        # spends proxies, and only on hosts that failed at network level.
+        # completed and the server stalled on the greeting — a HOST condition
+        # (datacenter egress, no PTR), not a proxy condition. So pass 1 gives
+        # every host exactly one attempt and never rotates.
         #
-        # Legacy 143/110 rungs are demoted to `fallback_plan` so they can no
-        # longer crowd out host #2 and host #3. POP 995 stays in the primary plan.
+        # v13.10: when pop_hosts[0] is ALREADY imap_hosts[0] (mail.twc.com for
+        # brighthouse.com), the host used to be queued TWICE — once IMAP 993 and
+        # once POP 995 — thinning every per-attempt timeout by a third for zero
+        # extra coverage. A POP rung is now only promoted into the primary plan
+        # when its host is NOT already an IMAP host; otherwise it is demoted to
+        # the fallback phase.
         # ------------------------------------------------------------------
-        primary_plan = [("IMAP", h, 993, "ssl") for h in imap_hosts]
-        primary_plan += [("POP", h, 995, "ssl") for h in pop_hosts]
+        imap_set = set(imap_hosts)
+        pop_only = [h for h in pop_hosts if h not in imap_set]
+        pop_dup = [h for h in pop_hosts if h in imap_set]
 
-        fallback_plan = []
+        primary_plan = [("IMAP", h, 993, "ssl") for h in imap_hosts]
+        primary_plan += [("POP", h, 995, "ssl") for h in pop_only]
+
+        fallback_plan = [("POP", h, 995, "ssl") for h in pop_dup]
         if try_starttls:
             fallback_plan += [("IMAP", h, 143, "starttls") for h in imap_hosts]
             fallback_plan += [("IMAP", h, 143, "plain") for h in imap_hosts[:2]]
@@ -3150,6 +3165,25 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, 
         if not primary_plan:
             trace_logs.append("No candidate hosts for this domain.")
             return None, FAILED, "no candidate hosts", None, trace_logs
+
+        # ------------------------------------------------------------------
+        # v13.10 BUDGET — floored to fit the actual work.
+        # A slow rung can legitimately need the full per-attempt timeout on BOTH
+        # the proxy and direct phase, so the slider value alone is not enough for
+        # a multi-host domain. Floor it, and say so in the trace.
+        # ------------------------------------------------------------------
+        work_floor = len(primary_plan) * max(configured_to, 12.0) * 2.0
+        budget = max(12.0, float(CFG.get("ACCOUNT_DEADLINE", 45)) * 0.95)
+        if work_floor > budget:
+            trace_logs.append(
+                f"Budget floored to fit the work: {work_floor:.0f}s "
+                f"({len(primary_plan)} rung(s) x {max(configured_to, 12.0):.0f}s x 2) "
+                f"instead of the {budget:.0f}s the Deadline slider allows.")
+            budget = work_floor
+        proxy_deadline = t_start + (budget * 0.55)
+        hard_deadline = t_start + budget
+        trace_logs.append(
+            f"Account window {budget:.0f}s -> proxy {budget * 0.55:.0f}s / direct {budget * 0.45:.0f}s.")
 
         timed_out_hosts = set()
 
@@ -3180,9 +3214,8 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, 
                                   host is reached before any proxy is spent twice.
             allow_rotate=True  -> a rung may be retried on a fresh proxy (max 2).
 
-            The per-attempt timeout is derived from the window that is actually
-            left divided by the rungs about to be tried, so the pass always fits
-            instead of overrunning on host #1.
+            v13.10: every attempt is CLAMPED to the phase deadline, so a late
+            rung can no longer drag the pass past its own window.
             """
             had_net = False
             saw_retry = False
@@ -3213,6 +3246,9 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, 
                     if time.time() > deadline_ts:
                         break
 
+                    # clamp so this attempt cannot overrun the phase window
+                    attempt_to = max(3.0, min(per_to, deadline_ts - time.time()))
+
                     trace_logs.append(f"{px_tag(px_used)} Attempting {proto} {tls_mode.upper()} -> Host: {server}:{port}")
                     server_level_fail = False
                     rotate_now = False
@@ -3220,7 +3256,7 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, 
 
                     for u_idx, user in enumerate(users):
                         try:
-                            do_attempt(proto, server, port, tls_mode, user, px_used, per_to)
+                            do_attempt(proto, server, port, tls_mode, user, px_used, attempt_to)
                             record_proxy_attempt(px_used, success=True)
                             note_verdict(VALID, f"{proto} {server}:{port}")
                             note = "" if user == primary_user else f" | User: {user} (local-part)"
@@ -3273,8 +3309,6 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, 
                             if st_val == RETRY:
                                 saw_retry = True
                                 server_level_fail = True
-                                # v13.8: 'Lookup failed' is a host routing miss, not a
-                                # proxy fault -> advance to the next host, no rotation.
                                 if "lookup failed" in err_text.lower():
                                     rotate_now = False
                                     trace_logs.append(f"{px_tag(px_used)} 'Lookup failed' on {server}:{port} -> advancing to next host (no proxy rotation)")
@@ -3412,7 +3446,6 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, 
         trace_logs.append(f"Critical Exception in runner: {str(e)}")
         if CFG.get("FAST_MODE", True):
             failed_domain_cache[domain] = time.time()
-        # v13.8: a retained verdict still outranks a hard crash.
         if best_verdict["status"] is not None:
             return None, best_verdict["status"], best_verdict["detail"] or "retained verdict", None, trace_logs
         return None, FAILED, str(e)[:40], None, trace_logs
