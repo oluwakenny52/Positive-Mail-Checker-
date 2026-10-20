@@ -2,33 +2,27 @@
 status.py — single source of truth for engine statuses and error classification.
 
 Both naming conventions are exported (VALID + WRONG_PASSWORD, FAILED +
-CONNECTION_FAILED, ...) so `from status import (...)` can never break.
+CONNECTION_FAILED, RBL + RBL_BLOCKED, ...) so `from status import (...)` can
+never break.
 
-Classification order is deliberate:  APP -> WRONG_STRONG -> BARE_AUTH -> DNS -> RETRY -> CONN -> WRONG -> UNKNOWN
-CONN runs before WRONG so that a proxy "Socket error: 407" is never read as an
-auth failure by a generic token.
+Classification order is deliberate:
+    APP -> WRONG_STRONG -> BARE_AUTH -> RBL -> DNS -> RETRY -> CONN -> WRONG -> UNKNOWN
+CONN runs before WRONG so a proxy "Socket error: 407" is never read as an auth
+failure by a generic token.
 
-v13.14
+v13.18
 ------
-* BARE_AUTH added.  Several legacy Zimbra / Dovecot fronts answer a failed LOGIN
-  with literally "LOGIN" (or "AUTH", "credentials").  Every phrase table above
-  requires a SECOND word, so these fell through to UNKNOWN and a genuine
-  wrong_password was reported as unknown.  Live trace: imap.pangia.biz and
-  mail.pangia.biz both returned exactly "LOGIN" for a prtc.net account.
-  The bare token is now matched on the whole (punctuation-stripped) message,
-  so it can never shadow a real phrase.
-
-v13.8
------
-* The bare "error" token was DROPPED from the _WRONG tail. It used to swallow
-  anything containing the word "error" — socket errors, ProxyError, OSError —
-  and re-read them as an auth rejection.
-* "realmless login not allowed" is anchored in _WRONG and, more importantly, in
-  _WRONG_STRONG, which is evaluated BEFORE _CONN so a realmless Zimbra refusal
-  can never be shadowed by a proxy/connection token.
-* "via your web browser" added to _APP_PASSWORD — Gmail's
-  "[ALERT] Please log in via your web browser: ... (Failure)" previously matched
-  nothing and landed in CONNECTION_FAILED instead of NEED_APP_PASSWORD.
+* RBL / RBL_BLOCKED ARE NOW DEFINED.  app.py imports them, this file never
+  exported them, so the whole `from status import (...)` block raised
+  ImportError and the engine silently fell back to its inline classifier.
+  The real classifier in this file is now live.
+* Microsoft AADSTS codes added:
+    AADSTS50126 / AADSTS50034           -> WRONG_PASSWORD
+    AADSTS50076 / AADSTS50079 / 50074   -> NEED_APP_PASSWORD (MFA on)
+  so an OAuth token refusal classifies instead of landing in UNKNOWN.
+* ms_token_status() helper for the XOAUTH2 path.
+* RBL is checked before CONN and before WRONG, so an IP-reputation block is
+  never reported as a bare connection failure.
 """
 
 # ---------------------------------------------------------------------------
@@ -41,6 +35,7 @@ FAILED = CONNECTION_FAILED = "connection_failed"
 SKIP = SKIPPED_COOLDOWN = "skipped_cooldown"
 UNKNOWN = "unknown"
 RETRY = RETRY_LATER = "retry_later"
+RBL = RBL_BLOCKED = "rbl_blocked"
 SMTP_FAILED = "smtp_failed"
 DNS_FAILED = "dns_failed"
 ERROR = "error"
@@ -50,6 +45,7 @@ ALL = [
     WRONG_PASSWORD,
     NEED_APP_PASSWORD,
     RETRY_LATER,
+    RBL_BLOCKED,
     SMTP_FAILED,
     DNS_FAILED,
     CONNECTION_FAILED,
@@ -66,12 +62,13 @@ PRIORITY = {
     VALID: 0,
     NEED_APP_PASSWORD: 1,
     WRONG_PASSWORD: 2,
-    RETRY_LATER: 3,
-    SMTP_FAILED: 4,
-    DNS_FAILED: 5,
-    CONNECTION_FAILED: 6,
-    UNKNOWN: 7,
-    SKIPPED_COOLDOWN: 8,
+    RBL_BLOCKED: 3,
+    RETRY_LATER: 4,
+    SMTP_FAILED: 5,
+    DNS_FAILED: 6,
+    CONNECTION_FAILED: 7,
+    UNKNOWN: 8,
+    SKIPPED_COOLDOWN: 9,
 }
 
 LABELS = {
@@ -79,6 +76,7 @@ LABELS = {
     WRONG_PASSWORD: "WRONG_PASSWORD",
     NEED_APP_PASSWORD: "NEED_APP_PASSWORD",
     RETRY_LATER: "RETRY_LATER",
+    RBL_BLOCKED: "RBL_BLOCKED",
     SMTP_FAILED: "SMTP_FAILED",
     DNS_FAILED: "DNS_FAILED",
     CONNECTION_FAILED: "CONNECTION_FAILED",
@@ -92,6 +90,7 @@ COLORS = {
     CONNECTION_FAILED: "#eab308",
     NEED_APP_PASSWORD: "#3b82f6",
     RETRY_LATER: "#ffffff",
+    RBL_BLOCKED: "#facc15",
     SMTP_FAILED: "#a855f7",
     DNS_FAILED: "#f97316",
     UNKNOWN: "#94a3b8",
@@ -104,6 +103,7 @@ COLORS = {
 _APP_PASSWORD = (
     "basic authentication is disabled",
     "basic auth is disabled",
+    "basicauthenticationdisabled",
     "app password",
     "application specific password",
     "application-specific password",
@@ -131,13 +131,18 @@ _APP_PASSWORD = (
     "pop access is disabled",
     "enable pop",
     "web login required",
-    "via your web browser",     # v13.8 — Gmail "[ALERT] Please log in via your web browser"
+    "via your web browser",
     "sign in with",
     "modern authentication",
     "authenticate with",
     "log in with your browser",
     "consent",
     "tenant",
+    # Microsoft OAuth token refusals that mean "MFA is on"
+    "aadsts50076",
+    "aadsts50079",
+    "aadsts50074",
+    "strongauth",
 )
 
 _DNS = (
@@ -238,11 +243,25 @@ _CONN = (
     "connect failed",
 )
 
-# v13.8 — the bare "error" token is deliberately NOT in this table any more.
-# It used to match ANY string containing "error" (socket error, ProxyError,
-# OSError, ...) and re-read a connection failure as an auth rejection. Every
-# phrase that genuinely needs to win now does so explicitly, and the truly
-# unambiguous auth phrases are promoted to _WRONG_STRONG (checked earlier still).
+# IP-reputation / greylist refusals.  Checked BEFORE _CONN and BEFORE _WRONG so
+# a block is never reported as a password verdict or a bare connection failure.
+_RBL = (
+    "rbl restriction",
+    "rbl",
+    "abusix",
+    "dnsbl",
+    "spamhaus",
+    "spam cop",
+    "spamcop",
+    "blacklist",
+    "blacklisted",
+    "blacklisted ip",
+    "ip blocked",
+    "ip is blocked",
+    "blocked ip",
+    "your ip",
+)
+
 _WRONG = (
     "authenticationfailed",
     "authentication failed",
@@ -287,7 +306,7 @@ _WRONG = (
     "internal server error",
 )
 
-# Strong, unambiguous auth phrases checked before the CONN table.
+# Strong, unambiguous auth phrases checked before the CONN and RBL tables.
 _WRONG_STRONG = (
     "realmless login not allowed",
     "authenticationfailed",
@@ -298,13 +317,15 @@ _WRONG_STRONG = (
     "wrong password",
     "authenticate error",
     "invalid login or password",
+    # Microsoft OAuth token refusals that mean "wrong password"
+    "aadsts50126",
+    "aadsts50034",
+    "invalid_grant",
 )
 
-# v13.14 — BARE / TERSE auth replies.  Some legacy Zimbra / Dovecot fronts
-# answer a rejected LOGIN with the single token "LOGIN" (or "AUTH",
-# "credentials").  Every phrase table above needs a SECOND word, so these used
-# to fall through to UNKNOWN.  Matched against the WHOLE punctuation-stripped
-# message, so a longer phrase can never be shadowed by this rule.
+# BARE / TERSE auth replies.  Some legacy Zimbra / Dovecot fronts answer a
+# rejected LOGIN with the single token "LOGIN" (or "AUTH", "credentials").
+# Matched against the WHOLE punctuation-stripped message.
 _BARE_AUTH = (
     "login",
     "logon",
@@ -329,14 +350,18 @@ _PROXY_LEVEL = (
     "socks",
 )
 
+
 def _norm(text):
     return (text or "").strip().lower()
+
 
 def _match(text, needles):
     return any(n in text for n in needles)
 
+
 def _is_bare_auth(text):
-    return text.strip().rstrip(".!:,;").strip() in _BARE_AUTH
+    return text.strip().rstrip(".:!,;").strip() in _BARE_AUTH
+
 
 # ---------------------------------------------------------------------------
 # CLASSIFIER
@@ -344,7 +369,7 @@ def _is_bare_auth(text):
 def classify_error(raw, domain=""):
     """Map a raw server/socket error string to an engine status.
 
-    Order matters: APP -> WRONG_STRONG -> BARE_AUTH -> DNS -> RETRY -> CONN -> WRONG -> UNKNOWN.
+    Order: APP -> WRONG_STRONG -> BARE_AUTH -> RBL -> DNS -> RETRY -> CONN -> WRONG -> UNKNOWN
     """
     t = _norm(raw)
     if not t:
@@ -358,10 +383,12 @@ def classify_error(raw, domain=""):
     if _match(t, _WRONG_STRONG):
         return WRONG_PASSWORD
 
-    # v13.14 — a whole-message bare token ("LOGIN") is an auth rejection.
+    # A whole-message bare token ("LOGIN") is an auth rejection.
     if _is_bare_auth(t):
         return WRONG_PASSWORD
 
+    if _match(t, _RBL):
+        return RBL_BLOCKED
     if _match(t, _DNS):
         return DNS_FAILED
     if _match(t, _RETRY):
@@ -372,22 +399,46 @@ def classify_error(raw, domain=""):
         return WRONG_PASSWORD
     return UNKNOWN
 
+
+def ms_token_status(code):
+    """Map a Microsoft AADSTS code to an engine status.
+
+    Used by the XOAUTH2 path.  Returns None for codes that are not an account
+    verdict (consent / app configuration), so the caller keeps its own verdict.
+    """
+    c = (code or "").upper()
+    if c in ("AADSTS50126", "AADSTS50034"):
+        return WRONG_PASSWORD
+    if c in ("AADSTS50076", "AADSTS50079", "AADSTS50074"):
+        return NEED_APP_PASSWORD
+    return None
+
+
 def is_retry_signal(raw):
     return _match(_norm(raw), _RETRY)
+
 
 def is_proxy_level_error(raw):
     """True when the failure happened in the PROXY hop, not the mail server."""
     return _match(_norm(raw), _PROXY_LEVEL)
 
+
 def is_app_password_signal(raw):
     return _match(_norm(raw), _APP_PASSWORD)
+
 
 def is_dns_signal(raw):
     return _match(_norm(raw), _DNS)
 
+
+def is_rbl_signal(raw):
+    return _match(_norm(raw), _RBL)
+
+
 def is_wrong_password_signal(raw):
     t = _norm(raw)
     return _is_bare_auth(t) or _match(t, _WRONG_STRONG) or _match(t, _WRONG)
+
 
 # ---------------------------------------------------------------------------
 # SMALL HELPERS
@@ -398,17 +449,22 @@ def merge(*statuses):
         return UNKNOWN
     return sorted(cand, key=lambda s: PRIORITY.get(s, 99))[0]
 
+
 def is_terminal(status):
     return status in TERMINAL
+
 
 def is_failure(status):
     return status in (CONNECTION_FAILED, DNS_FAILED, SMTP_FAILED, UNKNOWN)
 
+
 def display(status):
     return LABELS.get(status, status)
 
+
 def color(status):
     return COLORS.get(status, "#cbd5e1")
+
 
 def upper(status):
     return str(status or "").upper()
