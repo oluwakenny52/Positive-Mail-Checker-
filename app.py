@@ -1,9 +1,26 @@
 """
-Mega Ultimate Mail Checker — v13.16
+Mega Ultimate Mail Checker — v13.17
 ===================================
 Complete rewrite. SMTP reachability is an OPT-IN pre-check stage (never inside
 the validator), status classification actually works, and every direct-connection
 line carries the real egress IP / region / country / VPN state.
+
+v13.17 changes  (phase windows were being blown out by 2x-cost attempts)
+------------------------------------------------------------------------
+* CRITICAL FIX — ONE ATTEMPT NOW COSTS ~its slot, NOT ~2x it.  proxy_connect()
+  gave the FULL timeout to EACH of its two connect legs and _raw_socket() then
+  gave the FULL timeout to the post-connect read AGAIN, so a dead-proxy rung
+  burned ~10-12s inside a 6s slot.  The phases therefore overran their windows
+  and most rungs were cut: live trace showed "proxy · pass 1: 7 rung(s), ~6.0s
+  each, 41.8s window" followed by only FOUR attempts and "window reached".
+  xpertikus.com reached 4/7 primary rungs, 2/10 legacy rungs and never touched
+  pop.xpertikus.com:110 - a port that HAD answered in the previous run.
+  Each leg and the post-connect read now get a third of the attempt budget, so
+  an attempt costs ~t and a phase fits the number of rungs it was sized for.
+* The phase trace now reports how many rungs the window cut, e.g.
+  "window reached; stopping this pass (3 rung(s) not attempted)".
+* MAILBOX READER FIX — the v13.16 file assigned `success_msgs` while the check
+  reads `success_read`, so a successful read was reported as a failure.
 
 v13.16 changes  (legacy 143 starvation + 168s wall time + RBL ambiguity)
 ------------------------------------------------------------------------
@@ -12,20 +29,14 @@ v13.16 changes  (legacy 143 starvation + 168s wall time + RBL ambiguity)
   with "Skip STARTTLS <host>:143 (implicit TLS already timed out)".  Because
   143 is a DIFFERENT PORT, a filtered 993 says nothing about it - yet on an
   all-timeout domain (xpertikus.com, tds.net) EVERY 143 rung was skipped, so
-  the reserved legacy tail slice was spent doing literally nothing.  The skip
-  is gone: a host whose 993 timed out (or was refused) is still dialled on
-  143/110, which is exactly where a port-filtered server answers.
+  the reserved legacy tail slice was spent doing literally nothing.
 * SLOWNESS FIX — THE BUDGET FLOOR IS LOWERED.  The old floor
   (len(primary_plan) * max(TIMEOUT,12) * 2) forced 168s on a 7-rung plan even
-  when the Deadline slider said 43s, so a single all-timeout account took
-  ~3 minutes.  The floor is now one proxy sweep + the reserved legacy tail +
-  one direct sweep, at a per-rung cost capped at 9s: 7 rungs -> ~105s.
-* RBL RESTRICTION IS CLASSIFIED.  "Auth-Status: RBL Restriction:
-  https://lookup.abusix.com/..." used to match nothing, land in UNKNOWN and
-  fall through to CONNECTION_FAILED with no explanation.  It is now its own
-  status (status.RBL_BLOCKED), retained as a fallback verdict, shown in its
-  own bucket and in the ZIP - so "server blocked our IP" is never confused
-  with "wrong password".
+  when the Deadline slider said 43s.  The floor is now one proxy sweep + the
+  reserved legacy tail + one direct sweep, at a per-rung cost capped at 9s:
+  7 rungs -> ~104s.  Lowering the Timeout slider lowers the floor with it.
+* RBL RESTRICTION IS CLASSIFIED (status.RBL_BLOCKED), retained as a fallback
+  verdict, shown in its own bucket and in the ZIP.
 * The terminal CONNECTION_FAILED detail now states that the password could not
   be tested, so an unreachable domain is distinguishable from a bad password.
 
@@ -37,15 +48,10 @@ v13.15 changes  (APP must try the OWN host + pattern before it finalises)
   before the domain's own host and the local-part username pattern had been
   tried - the verdict was reached on the wrong evidence.
   An APP signal is now non-terminal while ANY domain-local host is still
-  untried, and it always tries the local-part username first. It only finalises
-  once the account's OWN host and pattern have actually been attempted.
-  Fast path preserved: a domain with NO local host (outlook.com, gmail.com)
-  still finalises immediately, because `domain_local_hosts - tried_hosts` is
-  empty.
-* CRITICAL FIX — VERDICT PRIORITY.  Retained verdicts are now kept by
+  untried, and it always tries the local-part username first.
+* CRITICAL FIX — VERDICT PRIORITY.  Retained verdicts are kept by
   status.PRIORITY, so a specific app-password signal (priority 1) can never be
-  masked by a generic auth rejection (priority 2) collected for the same
-  account. A WRONG is also suppressed while a better verdict is already held.
+  masked by a generic auth rejection (priority 2) collected for the same account.
 * `tried_hosts` records every host actually dialled, so "own host already
   attempted" is a fact rather than an assumption.
 
@@ -476,7 +482,7 @@ def default_theme() -> dict:
         "bg": p["bg"], "panel": p["panel"], "text": p["text"],
         "radius": 14, "glow": True, "animate": True, "glass": True,
         "colorize_logs": True,
-        "hero_title": "⚡ Mega Ultimate Mail Checker v13.16",
+        "hero_title": "⚡ Mega Ultimate Mail Checker v13.17",
         "hero_sub": "World-Coverage Edition — router-aware host ranking, rotating proxy pool, geo-call routing, retryable IP-block handling, optional SMTP pre-check, anti-spoofing post-auth validation.",
     }
 
@@ -1694,10 +1700,10 @@ def fast_fail_dns_check(host):
 def proxy_connect(host, port, proxy_str, timeout=None, remote_dns=True):
     """Proxied TCP connect.
 
-    v13.10 — BOUNDED. Every leg used to get the FULL timeout, so a rung could
-    burn ~3x its nominal time. Each leg now gets half the budget (~1.5x worst
-    case), while the post-connect READ timeout stays at the full
-    effective_timeout so the TLS handshake and IMAP greeting still get a shot.
+    v13.10 — BOUNDED (each leg used to get the FULL timeout).
+    v13.17 — each leg now gets a THIRD of the budget, so connect + connect +
+    read costs ~t instead of ~2t.  That is what let the phases overrun their
+    windows and cut most of the rungs.
     """
     base_timeout = timeout or CFG["PROXY_CONNECT_TIMEOUT"]
     try:
@@ -1706,14 +1712,15 @@ def proxy_connect(host, port, proxy_str, timeout=None, remote_dns=True):
     except Exception:
         fails = 0
     effective_timeout = max(2.0, base_timeout - (fails * 0.1))
-    leg_to = max(2.0, effective_timeout / 2.0)
+    leg_to = max(1.2, effective_timeout / 3.0)          # v13.17 (was / 2.0)
+    read_to = max(2.0, effective_timeout / 3.0)         # v13.17
 
     if not proxy_str or proxy_str == "direct":
         if not fast_fail_dns_check(host):
             raise RuntimeError(f"Fast-fail DNS check failed: Host '{host}' does not resolve locally")
         s = socket.create_connection((host, port), timeout=leg_to)
         s.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
-        s.settimeout(effective_timeout)
+        s.settimeout(read_to)
         return s
 
     info = parse_proxy(proxy_str)
@@ -1729,7 +1736,7 @@ def proxy_connect(host, port, proxy_str, timeout=None, remote_dns=True):
                 kw["proxy_password"] = info["pass"]
             s = socks.create_connection((host, port), timeout=leg_to, **kw)
             s.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
-            s.settimeout(effective_timeout)
+            s.settimeout(read_to)
             return s
         except Exception as proxy_ex:
             last_err = proxy_ex
@@ -1738,7 +1745,7 @@ def proxy_connect(host, port, proxy_str, timeout=None, remote_dns=True):
         try:
             direct_sock = socket.create_connection((host, port), timeout=leg_to)
             direct_sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
-            direct_sock.settimeout(effective_timeout)
+            direct_sock.settimeout(read_to)
             return direct_sock
         except Exception as direct_ex:
             raise RuntimeError(f"Proxy and direct fallback connection both failed: {direct_ex}")
@@ -1759,7 +1766,11 @@ def _tls_context(host: str, verify: bool):
     return ctx
 
 def _raw_socket(host, port, proxy_str=None, timeout=None):
+    """v13.17 — the post-connect read gets a THIRD of the budget, so the whole
+    attempt (both proxy legs + read) costs ~t rather than ~2t.  A dead-proxy
+    rung therefore fits its slot instead of overrunning it."""
     t = timeout or CFG["TIMEOUT"]
+    read_to = max(2.0, t / 3.0)
     if proxy_str and proxy_str != "direct":
         s = proxy_connect(host, port, proxy_str, timeout=t)
     else:
@@ -1767,7 +1778,7 @@ def _raw_socket(host, port, proxy_str=None, timeout=None):
             raise RuntimeError(f"Fast-fail DNS check failed: Host '{host}' does not resolve locally")
         s = socket.create_connection((host, port), timeout=max(2.0, t / 2.0))
     s.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
-    s.settimeout(t)
+    s.settimeout(read_to)
     return s
 
 def tls_connect(host, port, proxy_str=None, insecure=True, timeout=None):
@@ -3285,12 +3296,7 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, 
             trace_logs.append("No candidate hosts for this domain.")
             return None, FAILED, "no candidate hosts", None, trace_logs
 
-        # v13.16 — BUDGET FLOOR LOWERED.
-        # The old floor was len(primary_plan) * max(TIMEOUT, 12) * 2, which forced
-        # 168s on a 7-rung plan even when the Deadline slider said 43s, so a single
-        # all-timeout account took ~3 minutes.  The floor is now one proxy sweep +
-        # the reserved legacy tail + one direct sweep, at a per-rung cost capped at
-        # 9s (a timed-out rung is abandoned by its phase deadline anyway).
+        # v13.16 — BUDGET FLOOR LOWERED (was len(plan) * max(TIMEOUT,12) * 2 = 168s).
         rung_cost = max(5.0, min(configured_to, 9.0))
         work_floor = (len(primary_plan) * rung_cost * 1.5) + 10.0
         budget = max(12.0, float(CFG.get("ACCOUNT_DEADLINE", 45)) * 0.95)
@@ -3302,8 +3308,7 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, 
             budget = work_floor
 
         # v13.14 — reserve the TAIL of each phase for the legacy 143/110 plan.
-        # v13.16 — the legacy tail is widened (20%/22%) now that the 143 rungs
-        # actually RUN instead of being skipped.
+        # v13.16 — the legacy tail is widened now that the 143 rungs actually RUN.
         proxy_deadline = t_start + (budget * 0.60)
         proxy_primary_deadline = t_start + (budget * 0.40)
         hard_deadline = t_start + budget
@@ -3346,15 +3351,15 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, 
             per_to = max(3.5, min(configured_to, left / max(1, len(rungs))))
             trace_logs.append(f"--- {label}: {len(rungs)} rung(s), ~{per_to:.1f}s each, {left:.1f}s window ---")
 
-            for proto, server, port, tls_mode in rungs:
+            for rung_idx, (proto, server, port, tls_mode) in enumerate(rungs):
                 if time.time() > deadline_ts:
-                    trace_logs.append(f"{label}: window reached; stopping this pass.")
+                    trace_logs.append(
+                        f"{label}: window reached; stopping this pass "
+                        f"({len(rungs) - rung_idx} rung(s) not attempted).")
                     break
 
                 # v13.16 — NO MORE "implicit TLS already timed out" SKIP.
-                # 143/110 is a DIFFERENT PORT: a filtered 993 says nothing about
-                # it. Skipping it here starved every 143 rung on all-timeout
-                # domains (xpertikus.com, tds.net) and wasted the reserved slice.
+                # 143/110 is a DIFFERENT PORT: a filtered 993 says nothing about it.
                 tried_hosts.add(server)
 
                 rotations_left = MAX_ROTATIONS if (allow_rotate and px_used and proxy_mode != "off") else 0
@@ -4179,7 +4184,7 @@ else:
                         for srv in imap_hosts:
                             msgs = read_mailbox_messages(acc_email, acc_pass, srv, proxy_str=mailbox_proxy, limit=max_msgs)
                             if msgs and not any("Error reading mailbox" in m for m in msgs):
-                                fetched_msgs, success_msgs = msgs, True
+                                fetched_msgs, success_read = msgs, True
                                 break
                             elif msgs:
                                 fetched_msgs = msgs
