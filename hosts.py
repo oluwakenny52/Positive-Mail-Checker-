@@ -3,17 +3,20 @@ hosts.py
 ========
 One host table. Primary first, backup second, with SRV/autoconfig/MX discovery.
 
+v13.17 changes
+--------------
+* DISCOVERY TIME BUDGET.  Host discovery runs BEFORE an account's check window
+  starts, so its cost is pure added wall time.  SRV lifetime 3s -> 2s, the
+  Thunderbird autoconfig request 4s -> 2.5s and the Autodiscover POST 5s -> 3s.
+  A dead-autoconfig domain used to burn up to ~18s of HTTP timeouts per new
+  domain; it now burns ~11s.
+
 v13.14 changes
 --------------
 * DOMAIN-LOCAL FIRST.  merge_domain_guesses() now orders candidates as
   local-priority (imap./mail./email./apex for the domain AND its alias roots)
   -> other domain-local names (secure./zimbra./webmail./...) -> FOREIGN names
   (provider endpoints, universal fallbacks, family hosts).
-  Previously the "authoritative" bucket held BOTH the domain's own discovery
-  names AND foreign fallbacks, so the domain's own servers were dialled after
-  imap.gmail.com / outlook.office365.com.  A foreign host answering with a
-  generic "Invalid credentials" is NOT the domain's verdict, so it must not
-  outrank the domain's own servers.
 * _guess_candidates() walks the domain's OWN root before any alias root, so the
   domain's own names can never be pushed out of the slice by a rebrand.
 
@@ -569,7 +572,7 @@ def _dns_resolve(name, rdtype):
         return []
     try:
         fn = getattr(dns.resolver, "resolve", None) or dns.resolver.query
-        return list(fn(name, rdtype, lifetime=3))
+        return list(fn(name, rdtype, lifetime=2))       # v13.17 (was 3)
     except Exception:
         try:
             return list(dns.resolver.query(name, rdtype))
@@ -651,18 +654,6 @@ def host_resolves(host):
 # ============================================================================
 # v13.12 / v13.14 - DOMAIN-LOCAL + ALIAS-ROOT SERVICE-NAME MERGE
 # ============================================================================
-#
-# v13.11 appended the domain's own imap./mail./webmail. names. That closed the
-# family-set short-circuit, but three whole CLASSES of real endpoint were still
-# invisible because '<prefix>.<domain>' can never synthesise them:
-#
-#   1. REBRANDED ROOTS.  xplornet.com serves mail on xplore.net.
-#   2. NUMBERED / VARIANT PREFIXES.  imap3.zoominternet.net, mail2.tds.net.
-#   3. BARE-DOMAIN LEGACY HOSTS.  Several small hosts answer IMAP/POP on the
-#      apex itself (xpertikus.com).
-#
-# v13.14 additionally reorders: LOCAL-PRIORITY -> other local -> FOREIGN, so the
-# domain's own servers are dialled BEFORE imap.gmail.com / outlook.office365.com.
 
 # Priority local names - the domain's own most-likely endpoints, placed BEFORE
 # everything else so they can never be sliced off by the MAX_HOSTS cap.
@@ -789,7 +780,7 @@ def _thunderbird_autoconfig(domain):
     ]
     for url in urls:
         try:
-            r = requests.get(url, timeout=4, verify=False,
+            r = requests.get(url, timeout=2.5, verify=False,          # v13.17 (was 4)
                              headers={"User-Agent": "Mozilla/5.0 MailChecker"})
             if r.status_code != 200 or "<clientConfig" not in r.text:
                 continue
@@ -830,7 +821,7 @@ def _autodiscover(domain, email=None):
     ]
     for url in urls:
         try:
-            r = requests.post(url, data=body, timeout=5, verify=False,
+            r = requests.post(url, data=body, timeout=3, verify=False,   # v13.17 (was 5)
                               headers={"Content-Type": "text/xml; charset=utf-8",
                                        "User-Agent": "Mozilla/5.0 MailChecker"})
             if r.status_code != 200:
