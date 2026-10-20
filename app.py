@@ -1,9 +1,25 @@
 """
-Mega Ultimate Mail Checker — v13.12
+Mega Ultimate Mail Checker — v13.13
 ===================================
 Complete rewrite. SMTP reachability is an OPT-IN pre-check stage (never inside
 the validator), status classification actually works, and every direct-connection
 line carries the real egress IP / region / country / VPN state.
+
+v13.13 changes  (the bare-domain FALLBACK host was never dialled)
+----------------------------------------------------------------
+* CRITICAL FIX — APEX FALLBACK GUARANTEED.  The merge already emits '<domain>'
+  (the apex) as a candidate and it RESOLVES, but host_tier() rates a bare domain
+  as a ROUTER (tier 3), so the ranking sinks it below the tier-0 service names
+  (secure./zimbra./email./imap./mail.) AND the tier-2 provider fallbacks.  With
+  13 candidates and a cap of 5, the apex landed at position 6 - one slot past
+  the cut - and was NEVER dialled.
+  Live trace (xpertikus.com): the documented shape is
+      primary mail.xpertikus.com, fallback xpertikus.com
+  and only 'secure./zimbra./email./imap./mail.' were ever attempted.
+  The resolving apex is now FORCE-INCLUDED as a final rung of the primary plan,
+  so a documented bare-domain fallback is always attempted. Purely additive -
+  nothing is pushed out of the slice, so no other domain can regress; the budget
+  floor below scales with the extra rung.
 
 v13.12 changes  (alias-root + numbered-prefix + bare-domain host coverage)
 --------------------------------------------------------------------------
@@ -463,7 +479,7 @@ def default_theme() -> dict:
         "bg": p["bg"], "panel": p["panel"], "text": p["text"],
         "radius": 14, "glow": True, "animate": True, "glass": True,
         "colorize_logs": True,
-        "hero_title": "⚡ Mega Ultimate Mail Checker v13.12",
+        "hero_title": "⚡ Mega Ultimate Mail Checker v13.13",
         "hero_sub": "World-Coverage Edition — router-aware host ranking, rotating proxy pool, geo-call routing, retryable IP-block handling, optional SMTP pre-check, anti-spoofing post-auth validation.",
     }
 
@@ -3219,6 +3235,21 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, 
         if len(_all_imap) > len(imap_hosts):
             trace_logs.append(
                 f"Host expansion: {len(imap_hosts)}/{len(_all_imap)} IMAP candidate(s) kept (cap {_imap_cap}).")
+
+        # v13.13 — GUARANTEE THE BARE-DOMAIN FALLBACK.
+        # The merge already emits '<domain>' (the apex) as a candidate and it
+        # RESOLVES, but host_tier() rates a bare domain as a ROUTER (tier 3), so
+        # the ranking sinks it below the tier-0 service names (secure./zimbra./
+        # email./imap./mail.) AND the tier-2 provider fallbacks. With 13
+        # candidates and a cap of 5 the apex landed at position 6 - one slot
+        # past the cut - and was NEVER dialled. xpertikus.com documents exactly
+        # this shape (primary mail.xpertikus.com, fallback xpertikus.com), so the
+        # fallback must be attempted no matter where it ranked. Appended as a
+        # final rung; the budget floor below scales with the added rung.
+        if domain and domain not in imap_hosts and fast_fail_dns_check(domain):
+            imap_hosts = imap_hosts + [domain]
+            trace_logs.append(
+                f"Fallback host '{domain}' force-included as a final rung (apex resolves).")
 
         trace_logs.append(f"Host order -> IMAP {imap_hosts} | POP {pop_hosts}")
 
