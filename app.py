@@ -1,7 +1,20 @@
 """
-Mega Ultimate Mail Checker — v13.3
+Mega Ultimate Mail Checker — v13.4
 ==================================
 Self-healing import header + callback-safe Theme Studio + cached host resolution.
+
+v13.4 changes
+-------------
+* NEW status: RETRY (retry_later) — server throttling / IP blocks are no longer
+  reported as account failures.
+* classify_error(): recognises "[ALERT] IP blacklisted", "Too many failed
+  attempts", "Login incorrect", "Authenticate error", and friends.
+* Proxy-level failure detection (_is_proxy_level_error) + per-rung proxy
+  ROTATION. One dead/407 proxy can no longer burn the whole ladder.
+* precheck_proxy_fast() now TUNNELS through the proxy, so a 407 node is caught
+  before it ever enters the live pool.
+* Direct retry now targets hosts that resolve on the LOCAL resolver, not just
+  the top-ranked ones.
 
 hosts.py ships in several shapes depending on which revision is deployed:
     * new  -> conf / rank_hosts / is_junk_host  all present
@@ -232,7 +245,7 @@ except Exception as _hosts_rank_err:
         return [h for _i, h in indexed]
 
 try:
-    from status import VALID, WRONG, APP, FAILED, SKIP, UNKNOWN
+    from status import VALID, WRONG, APP, FAILED, SKIP, UNKNOWN, RETRY
 except Exception as _status_err:
     VALID = "valid"
     WRONG = "wrong_password"
@@ -240,6 +253,7 @@ except Exception as _status_err:
     FAILED = "connection_failed"
     SKIP = "skipped_cooldown"
     UNKNOWN = "unknown"
+    RETRY = "retry_later"
 
 # Optional network libs
 try:
@@ -313,8 +327,8 @@ def default_theme() -> dict:
         "g1": p["g1"], "g2": p["g2"], "accent": p["accent"], "accent2": p["accent2"],
         "bg": p["bg"], "panel": p["panel"], "text": p["text"],
         "radius": 14, "glow": True, "animate": True, "glass": True,
-        "colorize_logs": True, "hero_title": "⚡ Mega Ultimate Mail Checker v13.2",
-        "hero_sub": "World-Coverage Edition — router-aware host ranking, multi-scheme auth, anti-spoofing post-auth validation.",
+        "colorize_logs": True, "hero_title": "⚡ Mega Ultimate Mail Checker v13.4",
+        "hero_sub": "World-Coverage Edition — router-aware host ranking, proxy rotation, retryable IP-block handling, anti-spoofing post-auth validation.",
     }
 
 
@@ -554,6 +568,8 @@ def colorize_logs(lines: List[str]) -> str:
             cls = "warn"
         elif "[SKIP]" in up:
             cls = "skip"
+        elif "[RETRY]" in up:
+            cls = "warn"
         elif "[FAILED]" in up or "[EXCEPTION]" in up or "[ERROR]" in up:
             cls = "fail"
         else:
@@ -2009,6 +2025,8 @@ def refresh_alive_pool():
             alive_pool[:] = raw
         return
     live = [p for p in raw if precheck_proxy_fast(p)]
+    if not live:                       # every proxy 407'd / tunnelled badly — raw beats nothing
+        live = raw
     with alive_pool_lock:
         alive_pool[:] = live
 
@@ -2028,10 +2046,54 @@ def start_alive_refresher():
     threading.Thread(target=loop, daemon=True, name="alive-pool").start()
 
 
-def sample_alive_proxy():
+def sample_alive_proxy(exclude=None):
+    """Random live proxy, never one already tried on this rung (unless it's all we have)."""
+    exclude = set(exclude or ())
     with alive_pool_lock:
-        pool = list(alive_pool)
+        pool = [p for p in alive_pool if p and p not in exclude]
+    if not pool:
+        with alive_pool_lock:
+            pool = [p for p in alive_pool if p]
     return random.choice(pool) if pool else None
+
+
+# --- Proxy tunnel probe (catches 407 before a node enters the live pool) ---
+_tunnel_cache = {}
+_tunnel_lock = threading.Lock()
+_TUNNEL_TTL = 120
+
+
+def proxy_tunnel_ok(proxy_str, target=("imap.gmail.com", 993), timeout=3.0):
+    """Actually CONNECT through the proxy. A TCP-only check lets a 407 node into
+    the live pool where it then fails every single account on the ladder."""
+    try:
+        if not proxy_str:
+            return True
+        info = parse_proxy(proxy_str)
+        if not info or not SOCKS_OK:
+            return False
+        host, port = target
+        for ptype in (socks.HTTP, socks.SOCKS5):
+            s = None
+            try:
+                kw = {"proxy_type": ptype, "proxy_addr": info["host"],
+                      "proxy_port": info["port"], "proxy_rdns": True}
+                if info["user"]:
+                    kw["proxy_username"] = info["user"]
+                    kw["proxy_password"] = info["pass"]
+                s = socks.create_connection((host, port), timeout=timeout, **kw)
+                return True
+            except Exception:
+                continue
+            finally:
+                if s:
+                    try:
+                        s.close()
+                    except Exception:
+                        pass
+        return False
+    except Exception:
+        return False
 
 
 def precheck_proxy_fast(proxy_str):
@@ -2046,7 +2108,20 @@ def precheck_proxy_fast(proxy_str):
         if not is_proxy_alive(info["host"], info["port"], timeout=float(CFG.get("PROXY_PRECHECK_TIMEOUT", 3))):
             record_proxy_attempt(proxy_str, success=False, is_network_error=True)
             return False
-        return True
+
+        now = time.time()
+        with _tunnel_lock:
+            hit = _tunnel_cache.get(proxy_str)
+        if hit and now - hit[0] < _TUNNEL_TTL:
+            ok = hit[1]
+        else:
+            ok = proxy_tunnel_ok(proxy_str)
+            with _tunnel_lock:
+                _tunnel_cache[proxy_str] = (now, ok)
+
+        if not ok:
+            record_proxy_attempt(proxy_str, success=False, is_network_error=True)
+        return ok
     except Exception:
         return False
 
@@ -2226,10 +2301,22 @@ def classify_error(err, domain=""):
             "invalid password", "invalid user name", "invalid username", "invalid user name or password",
             "login failed", "auth failed", "bad username", "logon failure",
             "username and password not accepted", "[auth]", "authenticate failed",
+            "login incorrect", "authenticate error", "authentication error",
+            "invalid login or password", "invalid username or password",
             "pop3 user rejected", "pop3 password rejected", "login returned non-ok", "login non-ok",
             "user rejected", "password rejected", "invalid token", "expired token",
         )):
             return WRONG
+
+        # NEW: server-side throttle / IP-block signals. Retryable — NOT the account's fault.
+        if any(k in err_str for k in (
+            "[alert]", "ip blacklisted", "blacklisted", "too many failed attempts",
+            "too many", "rate limit", "throttl", "try again", "temporarily",
+            "greylist", "server busy", "server is busy", "unavailable",
+            "over quota", "quota exceeded", "user could not be routed",
+        )):
+            return RETRY
+
         if isinstance(err, ssl.SSLCertVerificationError):
             return FAILED
         if any(k in err_str for k in (
@@ -2244,12 +2331,21 @@ def classify_error(err, domain=""):
             "proxy connect", "timed out", "timeout", "connection refused", "network is unreachable",
             "name or service not known", "gaierror", "reset by peer", "broken pipe",
             "fast-fail dns check failed", "socket.timeout", "connectionrefusederror", "unreachable",
-            "no route to host", "too many", "rate limit", "throttl",
+            "no route to host",
         )):
             return FAILED
     except Exception:
         pass
     return UNKNOWN
+
+
+def _is_proxy_level_error(msg):
+    """True when the failure happened in the PROXY hop, not the mail server."""
+    s = (msg or "").lower()
+    return any(k in s for k in (
+        "407", "proxy authentication", "proxy auth", "proxyconnect",
+        "proxy connect", "proxy route", "bad proxy format", "socks",
+    ))
 
 
 def record_proxy_attempt(proxy_str, success, is_network_error=False):
@@ -2526,6 +2622,7 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, 
             failed_domain_cache.pop(domain, None)
 
     t_start = time.time()
+    retryable = False
     try:
         if conf.get("type") == "zero_access":
             trace_logs.append("Architecture: Zero-Access / Bridge detected.")
@@ -2599,95 +2696,142 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, 
             deadline_ts = hard_deadline if deadline_ts is None else deadline_ts
             attempt_to = attempt_to or per_attempt
             had_net_fail = False
+            saw_retryable = False
 
             for proto, server, port, tls_mode in active_plan:
                 if time.time() > deadline_ts:
                     trace_logs.append(f"Per-account budget {budget:.0f}s reached; stopping ladder.")
-                    return None, had_net_fail
+                    return None, had_net_fail, saw_retryable
 
                 if tls_mode in ("starttls", "plain") and server in timed_out_hosts:
                     trace_logs.append(f"{px_tag(px_used)} Skip {tls_mode.upper()} {server}:{port} (implicit TLS already timed out)")
                     continue
 
-                trace_logs.append(f"{px_tag(px_used)} Attempting {proto} {tls_mode.upper()} -> Host: {server}:{port}")
+                # Rotation budget for THIS rung: a dead proxy must not eat the whole ladder.
+                rotations_left = 3 if (px_used and proxy_mode != "off") else 0
+                seen_px = {px_used} if px_used else set()
 
-                server_level_fail = False
-                for u_idx, user in enumerate(users):
-                    try:
-                        do_attempt(proto, server, port, tls_mode, user, px_used, attempt_to)
-                        record_proxy_attempt(px_used, success=True)
-                        note = "" if user == primary_user else f" | User: {user} (local-part)"
-                        trace_logs.append(f"{px_tag(px_used)} Post-auth {proto} verification OK on {server}:{port}{note}")
-                        return (server, VALID, f"{px_tag(px_used)} {proto} | Host: {server} | Port: {port}{note}", px_used, trace_logs), had_net_fail
+                while True:
+                    if time.time() > deadline_ts:
+                        trace_logs.append(f"Per-account budget {budget:.0f}s reached; stopping ladder.")
+                        return None, had_net_fail, saw_retryable
 
-                    except ssl.SSLError as ssl_err:
-                        st_val = classify_error(ssl_err, domain)
-                        if st_val == FAILED:
-                            had_net_fail = True
-                        record_proxy_attempt(px_used, success=False, is_network_error=(st_val == FAILED))
-                        trace_logs.append(f"{px_tag(px_used)} -> TLS FAILED {proto} {server}:{port}: {str(ssl_err)[:90]} [Classified: {st_val}]")
-                        server_level_fail = True
+                    trace_logs.append(f"{px_tag(px_used)} Attempting {proto} {tls_mode.upper()} -> Host: {server}:{port}")
+                    server_level_fail = False
+                    rotate_now = False
 
-                    except (socket.timeout, TimeoutError) as to_err:
-                        if proto == "IMAP" and tls_mode == "ssl":
-                            timed_out_hosts.add(server)
-                        had_net_fail = True
-                        record_proxy_attempt(px_used, success=False, is_network_error=True)
-                        trace_logs.append(f"{px_tag(px_used)} -> TIMEOUT {proto} {server}:{port}: {str(to_err)[:90]} [Classified: {FAILED}]")
-                        server_level_fail = True
+                    for u_idx, user in enumerate(users):
+                        try:
+                            do_attempt(proto, server, port, tls_mode, user, px_used, attempt_to)
+                            record_proxy_attempt(px_used, success=True)
+                            note = "" if user == primary_user else f" | User: {user} (local-part)"
+                            trace_logs.append(f"{px_tag(px_used)} Post-auth {proto} verification OK on {server}:{port}{note}")
+                            return (server, VALID,
+                                    f"{px_tag(px_used)} {proto} | Host: {server} | Port: {port}{note}",
+                                    px_used, trace_logs), had_net_fail, saw_retryable
 
-                    except (socket.error, ConnectionRefusedError) as sock_err:
-                        had_net_fail = True
-                        record_proxy_attempt(px_used, success=False, is_network_error=True)
-                        trace_logs.append(f"{px_tag(px_used)} -> SOCKET FAILED {proto} {server}:{port}: {str(sock_err)[:90]} [Classified: {FAILED}]")
-                        server_level_fail = True
+                        except ssl.SSLError as ssl_err:
+                            st_val = classify_error(ssl_err, domain)
+                            if st_val == FAILED:
+                                had_net_fail = True
+                            record_proxy_attempt(px_used, success=False, is_network_error=(st_val == FAILED))
+                            trace_logs.append(f"{px_tag(px_used)} -> TLS FAILED {proto} {server}:{port}: {str(ssl_err)[:90]} [Classified: {st_val}]")
+                            server_level_fail = True
+                            rotate_now = _is_proxy_level_error(str(ssl_err)) or st_val == FAILED
 
-                    except (imaplib.IMAP4.error, poplib.error_proto) as proto_err:
-                        st_val = classify_error(proto_err, domain)
-                        record_proxy_attempt(px_used, success=False, is_network_error=False)
-                        trace_logs.append(f"{px_tag(px_used)} -> AUTH {proto} {server}:{port}: {str(proto_err)[:90]} [Classified: {st_val}]")
-                        if st_val == APP:
-                            return (None, APP, f"{px_tag(px_used)} {proto} {server} -> {st_val}", px_used, trace_logs), had_net_fail
-                        if u_idx + 1 < len(users) and st_val in (WRONG, UNKNOWN):
-                            trace_logs.append(f"{px_tag(px_used)} Rejected as '{user}' -> retrying same host as local-part '{users[u_idx + 1]}'")
-                            continue
-                        if st_val == WRONG:
-                            return (None, WRONG, f"{px_tag(px_used)} {proto} {server} -> {st_val}", px_used, trace_logs), had_net_fail
-                        server_level_fail = True
-
-                    except Exception as e:
-                        st_val = classify_error(e, domain)
-                        if _is_timeout(e):
+                        except (socket.timeout, TimeoutError) as to_err:
                             if proto == "IMAP" and tls_mode == "ssl":
                                 timed_out_hosts.add(server)
                             had_net_fail = True
-                        if st_val == FAILED:
+                            record_proxy_attempt(px_used, success=False, is_network_error=True)
+                            trace_logs.append(f"{px_tag(px_used)} -> TIMEOUT {proto} {server}:{port}: {str(to_err)[:90]} [Classified: {FAILED}]")
+                            server_level_fail = True
+                            rotate_now = True                      # a hang is a proxy symptom -> try another proxy
+
+                        except (socket.error, ConnectionRefusedError) as sock_err:
                             had_net_fail = True
-                        record_proxy_attempt(px_used, success=False, is_network_error=(st_val == FAILED))
-                        trace_logs.append(f"{px_tag(px_used)} -> FAILED {proto} {server}:{port}: {str(e)[:90]} [Classified: {st_val}]")
-                        if st_val == APP:
-                            return (None, APP, f"{px_tag(px_used)} {proto} {server} -> {st_val}", px_used, trace_logs), had_net_fail
-                        if u_idx + 1 < len(users) and st_val in (WRONG, UNKNOWN):
-                            trace_logs.append(f"{px_tag(px_used)} Rejected as '{user}' -> retrying same host as local-part '{users[u_idx + 1]}'")
+                            record_proxy_attempt(px_used, success=False, is_network_error=True)
+                            trace_logs.append(f"{px_tag(px_used)} -> SOCKET FAILED {proto} {server}:{port}: {str(sock_err)[:90]} [Classified: {FAILED}]")
+                            server_level_fail = True
+                            rotate_now = True
+
+                        except (imaplib.IMAP4.error, poplib.error_proto) as proto_err:
+                            st_val = classify_error(proto_err, domain)
+                            record_proxy_attempt(px_used, success=False, is_network_error=False)
+                            trace_logs.append(f"{px_tag(px_used)} -> AUTH {proto} {server}:{port}: {str(proto_err)[:90]} [Classified: {st_val}]")
+                            if st_val == APP:
+                                return (None, APP, f"{px_tag(px_used)} {proto} {server} -> {st_val}", px_used, trace_logs), had_net_fail, saw_retryable
+                            if st_val == RETRY:                    # IP blacklisted / too many attempts
+                                saw_retryable = True
+                                server_level_fail = True
+                                rotate_now = True
+                            elif u_idx + 1 < len(users) and st_val in (WRONG, UNKNOWN):
+                                trace_logs.append(f"{px_tag(px_used)} Rejected as '{user}' -> retrying same host as local-part '{users[u_idx + 1]}'")
+                                continue
+                            elif st_val == WRONG:
+                                return (None, WRONG, f"{px_tag(px_used)} {proto} {server} -> {st_val}", px_used, trace_logs), had_net_fail, saw_retryable
+                            else:
+                                server_level_fail = True
+
+                        except Exception as e:
+                            st_val = classify_error(e, domain)
+                            proxy_level = _is_proxy_level_error(str(e))
+                            if _is_timeout(e):
+                                if proto == "IMAP" and tls_mode == "ssl":
+                                    timed_out_hosts.add(server)
+                                had_net_fail = True
+                            if st_val == FAILED:
+                                had_net_fail = True
+                            record_proxy_attempt(px_used, success=False, is_network_error=(st_val == FAILED))
+                            trace_logs.append(f"{px_tag(px_used)} -> FAILED {proto} {server}:{port}: {str(e)[:90]} [Classified: {st_val}]")
+                            if st_val == APP:
+                                return (None, APP, f"{px_tag(px_used)} {proto} {server} -> {st_val}", px_used, trace_logs), had_net_fail, saw_retryable
+                            if st_val == RETRY:
+                                saw_retryable = True
+                                server_level_fail = True
+                                rotate_now = True
+                            elif u_idx + 1 < len(users) and st_val in (WRONG, UNKNOWN):
+                                trace_logs.append(f"{px_tag(px_used)} Rejected as '{user}' -> retrying same host as local-part '{users[u_idx + 1]}'")
+                                continue
+                            elif st_val == WRONG:
+                                return (None, WRONG, f"{px_tag(px_used)} {proto} {server} -> {st_val}", px_used, trace_logs), had_net_fail, saw_retryable
+                            else:
+                                server_level_fail = True
+                                rotate_now = rotate_now or proxy_level
+
+                        if server_level_fail:
+                            break
+
+                    if rotate_now and px_used and rotations_left > 0:
+                        newpx = sample_alive_proxy(exclude=seen_px)
+                        if newpx and newpx not in seen_px:
+                            seen_px.add(newpx)
+                            px_used = newpx
+                            rotations_left -= 1
+                            trace_logs.append(f"{px_tag(px_used)} Rotating proxy -> retrying {server}:{port}")
                             continue
-                        if st_val == WRONG:
-                            return (None, WRONG, f"{px_tag(px_used)} {proto} {server} -> {st_val}", px_used, trace_logs), had_net_fail
-                        server_level_fail = True
 
-                    if server_level_fail:
-                        break
+                    break
 
-            return None, had_net_fail
+            return None, had_net_fail, saw_retryable
 
-        result, net_fail = run_plan(px, deadline_ts=primary_deadline)
+        result, net_fail, retryable = run_plan(px, deadline_ts=primary_deadline)
         if result:
             return result
 
-        if px and net_fail and (proxy_mode == "fallback" or CFG.get("RETRY_CONNECTION_FAILED")):
-            retry_plan = [p for p in plan if p[0] == "IMAP" and p[2] == 993][:2]
+        if px and (net_fail or retryable) and (proxy_mode == "fallback" or CFG.get("RETRY_CONNECTION_FAILED")):
+            # Pick hosts that ACTUALLY resolve on the local resolver, not just the top-ranked ones.
+            direct_hosts = [h for h in imap_hosts if fast_fail_dns_check(h)]
+            if not direct_hosts:
+                direct_hosts = [h for h in (conf.get("pop") or []) if fast_fail_dns_check(h)]
+            if not direct_hosts:
+                direct_hosts = imap_hosts[:2]
+            retry_plan = [("IMAP", h, 993, "ssl") for h in direct_hosts[:2]]
             if retry_plan:
-                trace_logs.append("Proxy pass exhausted -> targeted DIRECT retry on top hosts.")
-                result, _ = run_plan(None, plan_used=retry_plan, deadline_ts=hard_deadline, attempt_to=max(4.0, per_attempt))
+                trace_logs.append("Proxy pass exhausted -> targeted DIRECT retry on locally-resolving hosts.")
+                result, _nf2, retryable2 = run_plan(None, plan_used=retry_plan, deadline_ts=hard_deadline,
+                                                    attempt_to=max(4.0, per_attempt))
+                retryable = retryable or retryable2
                 if result:
                     return result
 
@@ -2699,6 +2843,8 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, 
 
     if CFG.get("FAST_MODE", True):
         failed_domain_cache[domain] = time.time()
+    if retryable:
+        return None, RETRY, "retryable (proxy / IP-block / rate-limit)", None, trace_logs
     return None, FAILED, "all hosts failed", None, trace_logs
 
 
