@@ -4,9 +4,21 @@ status.py — single source of truth for engine statuses and error classificatio
 Both naming conventions are exported (VALID + WRONG_PASSWORD, FAILED +
 CONNECTION_FAILED, ...) so `from status import (...)` can never break.
 
-Classification order is deliberate:  APP -> DNS -> RETRY -> CONN -> WRONG -> UNKNOWN
+Classification order is deliberate:  APP -> WRONG_STRONG -> DNS -> RETRY -> CONN -> WRONG -> UNKNOWN
 CONN runs before WRONG so that a proxy "Socket error: 407" is never read as an
-auth failure by the catch-all "error" token.
+auth failure by a generic token.
+
+v13.8
+-----
+* The bare "error" token was DROPPED from the _WRONG tail. It used to swallow
+  anything containing the word "error" — socket errors, ProxyError, OSError —
+  and re-read them as an auth rejection.
+* "realmless login not allowed" is anchored in _WRONG and, more importantly, in
+  _WRONG_STRONG, which is evaluated BEFORE _CONN so a realmless Zimbra refusal
+  can never be shadowed by a proxy/connection token.
+* "via your web browser" added to _APP_PASSWORD — Gmail's
+  "[ALERT] Please log in via your web browser: ... (Failure)" previously matched
+  nothing and landed in CONNECTION_FAILED instead of NEED_APP_PASSWORD.
 """
 
 # ---------------------------------------------------------------------------
@@ -76,7 +88,6 @@ COLORS = {
     SKIPPED_COOLDOWN: "#a78bfa",
 }
 
-
 # ---------------------------------------------------------------------------
 # MATCH TABLES
 # ---------------------------------------------------------------------------
@@ -110,6 +121,7 @@ _APP_PASSWORD = (
     "pop access is disabled",
     "enable pop",
     "web login required",
+    "via your web browser",     # v13.8 — Gmail "[ALERT] Please log in via your web browser"
     "sign in with",
     "modern authentication",
     "authenticate with",
@@ -216,6 +228,11 @@ _CONN = (
     "connect failed",
 )
 
+# v13.8 — the bare "error" token is deliberately NOT in this table any more.
+# It used to match ANY string containing "error" (socket error, ProxyError,
+# OSError, ...) and re-read a connection failure as an auth rejection. Every
+# phrase that genuinely needs to win now does so explicitly, and the truly
+# unambiguous auth phrases are promoted to _WRONG_STRONG (checked earlier still).
 _WRONG = (
     "authenticationfailed",
     "authentication failed",
@@ -258,7 +275,6 @@ _WRONG = (
     "invalid token",
     "expired token",
     "internal server error",
-    "error",
 )
 
 # Strong, unambiguous auth phrases checked before the CONN table.
@@ -285,14 +301,11 @@ _PROXY_LEVEL = (
     "socks",
 )
 
-
 def _norm(text):
     return (text or "").strip().lower()
 
-
 def _match(text, needles):
     return any(n in text for n in needles)
-
 
 # ---------------------------------------------------------------------------
 # CLASSIFIER
@@ -300,7 +313,7 @@ def _match(text, needles):
 def classify_error(raw, domain=""):
     """Map a raw server/socket error string to an engine status.
 
-    Order matters: APP -> DNS -> RETRY -> CONN -> WRONG -> UNKNOWN.
+    Order matters: APP -> WRONG_STRONG -> DNS -> RETRY -> CONN -> WRONG -> UNKNOWN.
     """
     t = _norm(raw)
     if not t:
@@ -310,7 +323,7 @@ def classify_error(raw, domain=""):
         return NEED_APP_PASSWORD
 
     # Strong auth phrases win outright — they can otherwise be shadowed by the
-    # generic "error" / "authentication" tokens in the tables below.
+    # generic "authentication" token or by a CONN token in the same message.
     if _match(t, _WRONG_STRONG):
         return WRONG_PASSWORD
 
@@ -324,28 +337,22 @@ def classify_error(raw, domain=""):
         return WRONG_PASSWORD
     return UNKNOWN
 
-
 def is_retry_signal(raw):
     return _match(_norm(raw), _RETRY)
-
 
 def is_proxy_level_error(raw):
     """True when the failure happened in the PROXY hop, not the mail server."""
     return _match(_norm(raw), _PROXY_LEVEL)
 
-
 def is_app_password_signal(raw):
     return _match(_norm(raw), _APP_PASSWORD)
-
 
 def is_dns_signal(raw):
     return _match(_norm(raw), _DNS)
 
-
 def is_wrong_password_signal(raw):
     t = _norm(raw)
     return _match(t, _WRONG_STRONG) or _match(t, _WRONG)
-
 
 # ---------------------------------------------------------------------------
 # SMALL HELPERS
@@ -356,22 +363,17 @@ def merge(*statuses):
         return UNKNOWN
     return sorted(cand, key=lambda s: PRIORITY.get(s, 99))[0]
 
-
 def is_terminal(status):
     return status in TERMINAL
-
 
 def is_failure(status):
     return status in (CONNECTION_FAILED, DNS_FAILED, SMTP_FAILED, UNKNOWN)
 
-
 def display(status):
     return LABELS.get(status, status)
 
-
 def color(status):
     return COLORS.get(status, "#cbd5e1")
-
 
 def upper(status):
     return str(status or "").upper()
