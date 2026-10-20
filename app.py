@@ -1,111 +1,67 @@
 """
-Mega Ultimate Mail Checker — v13.13
+Mega Ultimate Mail Checker — v13.15
 ===================================
 Complete rewrite. SMTP reachability is an OPT-IN pre-check stage (never inside
 the validator), status classification actually works, and every direct-connection
 line carries the real egress IP / region / country / VPN state.
 
+v13.15 changes  (APP must try the OWN host + pattern before it finalises)
+------------------------------------------------------------------------
+* CRITICAL FIX — NEED_APP_PASSWORD NO LONGER SHORT-CIRCUITS.  Like WRONG used to,
+  the APP branch returned on the spot. A foreign fallback (outlook.office365.com)
+  answering "Basic authentication is disabled" therefore FINALISED the account
+  before the domain's own host and the local-part username pattern had been
+  tried - the verdict was reached on the wrong evidence.
+  An APP signal is now non-terminal while ANY domain-local host is still
+  untried, and it always tries the local-part username first. It only finalises
+  once the account's OWN host and pattern have actually been attempted.
+  Fast path preserved: a domain with NO local host (outlook.com, gmail.com)
+  still finalises immediately, because `domain_local_hosts - tried_hosts` is
+  empty.
+* CRITICAL FIX — VERDICT PRIORITY.  Retained verdicts are now kept by
+  status.PRIORITY, so a specific app-password signal (priority 1) can never be
+  masked by a generic auth rejection (priority 2) collected for the same
+  account. A WRONG is also suppressed while a better verdict is already held.
+* `tried_hosts` records every host actually dialled, so "own host already
+  attempted" is a fact rather than an assumption.
+
+v13.14 changes  (false verdicts from foreign fallbacks + starved 143 rungs)
+--------------------------------------------------------------------------
+* CRITICAL FIX — FOREIGN WRONG IS NO LONGER TERMINAL.
+* CRITICAL FIX — ORDERING: LOCAL-PRIORITY -> other local -> FOREIGN.
+* CRITICAL FIX — 143/110 STARVATION: each phase reserves a tail for legacy.
+
 v13.13 changes  (the bare-domain FALLBACK host was never dialled)
 ----------------------------------------------------------------
-* CRITICAL FIX — APEX FALLBACK GUARANTEED.  The merge already emits '<domain>'
-  (the apex) as a candidate and it RESOLVES, but host_tier() rates a bare domain
-  as a ROUTER (tier 3), so the ranking sinks it below the tier-0 service names
-  (secure./zimbra./email./imap./mail.) AND the tier-2 provider fallbacks.  With
-  13 candidates and a cap of 5, the apex landed at position 6 - one slot past
-  the cut - and was NEVER dialled.
-  Live trace (xpertikus.com): the documented shape is
-      primary mail.xpertikus.com, fallback xpertikus.com
-  and only 'secure./zimbra./email./imap./mail.' were ever attempted.
-  The resolving apex is now FORCE-INCLUDED as a final rung of the primary plan,
-  so a documented bare-domain fallback is always attempted. Purely additive -
-  nothing is pushed out of the slice, so no other domain can regress; the budget
-  floor below scales with the extra rung.
+* CRITICAL FIX — APEX FALLBACK GUARANTEED (force-included final rung).
 
 v13.12 changes  (alias-root + numbered-prefix + bare-domain host coverage)
 --------------------------------------------------------------------------
-* CRITICAL FIX — host COVERAGE.  The engine could only ever dial
-  '<prefix>.<domain>', so three classes of real endpoint were invisible:
-    - a rebranded primary on a DIFFERENT root (xplornet.com -> imap.xplore.net);
-    - numbered / variant prefixes (imap3.zoominternet.net, mail2.tds.net);
-    - apex legacy hosts (xpertikus.com).
-  Live traces showed 4/4 hosts resolving and then every rung timing out on all
-  passes - i.e. the authoritative endpoint was never attempted.  The merge now
-  generates alias-root, numbered-prefix and bare-domain candidates (resolve-
-  gated, curated-first, idempotent) and inserts the high-value ones FIRST.
-* Host-order slice no longer discards them: the primary plan may carry a small
-  bounded surplus (cap = max(MAX_HOSTS_PER_DOMAIN, 5)); the budget floor below
-  already scales with the resulting rung count, so nothing is starved.
+* CRITICAL FIX — host COVERAGE for rebrands / numbered prefixes / apex hosts.
 
 v13.11 changes  (the domain's OWN servers were structurally unreachable)
 -----------------------------------------------------------------------
-* CRITICAL FIX — FAMILY DOMAINS NEVER TRIED THEIR OWN HOSTS. get_servers()
-  returned the curated family answer and stopped:
-      known = known_provider_conf(domain); if known: return known
-  brighthouse.com is hardcoded in the TWC family set, so it could only ever
-  produce mail.twc.com + mobile.charter.net. mail.brighthouse.com and
-  imap.brighthouse.com were never attempted at all — the domain's own server was
-  sitting there answering and the ladder could not see it.
-  Every curated answer (and every parent-provider branch reached via MX) is now
-  passed through _merge_domain_guesses(), which APPENDS the domain's own
-  resolving service names after the curated hosts.
-    - curated hosts stay first, so a guess can never push the authoritative
-      endpoint out of the MAX_HOSTS slice;
-    - only guesses that actually RESOLVE are appended, so a dud costs no budget;
-    - idempotent, so it is safe to call at more than one layer.
-  Applies to ATT / FRONTIER / CHARTER / TWC / VERIZON / YAHOO / MS / GMAIL /
-  COUNTRY families, PROVIDER_MAP entries, and the parent-provider branch.
+* CRITICAL FIX — FAMILY DOMAINS NEVER TRIED THEIR OWN HOSTS.
 
 v13.10 changes  (bounded rungs — the direct phase was being starved)
 -------------------------------------------------------------------
-* CRITICAL FIX — proxy_connect() was UNBOUNDED. It gave the FULL timeout to each
-  of its three legs (SOCKS5, HTTP, direct), so one rung could burn ~3x its
-  nominal time. Each leg now gets half the budget, bounding a rung to ~1.5x.
-* CRITICAL FIX — DUPLICATE RUNG. When pop_hosts[0] was already imap_hosts[0],
-  the host was queued TWICE. A POP rung is now only promoted into the primary
-  plan when its host is not already an IMAP host.
-* The per-account budget FLOORS to fit the work: rungs * max(TIMEOUT, 12s) * 2.
-* Every attempt is clamped to the phase deadline.
-* The account window is logged up front (proxy Xs / direct Ys).
+* proxy_connect() bounded to ~1.5x; duplicate rung removed; budget floors.
 
 v13.9 changes  (host-major ladder)
 ----------------------------------
-* CRITICAL FIX — LADDER ORDER. Proxy rotation used to happen INSIDE the per-host
-  loop, so a slow host #1 consumed the entire proxy window and hosts #2/#3 were
-  never attempted. The ladder is now HOST-MAJOR: pass 1 = every host once, no
-  rotation; pass 2 = only network-failed hosts, fresh proxy, max 2.
-* Per-attempt timeout derived from the live window.
-* Legacy 143/110 rungs demoted to a separate fallback_plan.
-* The DIRECT pass sweeps ALL locally-resolving hosts (was capped at [:2]).
-* A connection-refused is HOST-level, not proxy-level.
-* hosts.py: BT consumer mail maps to imap.mail.yahoo.com; Sky/Virgin explicit.
+* Host-major ladder; legacy rungs demoted; direct pass sweeps all hosts.
 
 v13.8 changes  (verdict retention + budget rebalance + 407 breaker)
 -------------------------------------------------------------------
-* CRITICAL FIX — VERDICT RETENTION. best_verdict is kept the first time any host
-  returns VALID / WRONG_PASSWORD / NEED_APP_PASSWORD and returned at ladder end,
-  ahead of RETRY / DNS_FAILED / CONNECTION_FAILED.
-* BUDGET REBALANCE. The proxy pass gets 55% of the per-account budget.
-* 407 BREAKER. After 3 consecutive 407s on the same host, jump straight to DIRECT.
-* 'Lookup failed' falls through to the NEXT HOST instead of rotating proxies.
-* vpn_state_label() only stamps VPN ON (auto) for explicit VPN brands / "vpn".
-* status.py: 'realmless login not allowed' anchored in _WRONG_STRONG; the
-  catch-all "error" token dropped from _WRONG's tail.
+* Verdict retention, 55% proxy budget, 407 breaker, 'lookup failed' falls through.
 
 v13.7 changes
 -------------
-* SMTP pre-check is OFF BY DEFAULT. The engine runs IMAP/POP only.
-* The SMTP checkbox moved into the "Advanced Control Rules" slide-out section.
-* When enabled: direct-first probing, 45s wall-clock budget, 32 parallel workers.
+* SMTP pre-check OFF by default; SMTP checkbox in Advanced Control Rules.
 
 v13.6 changes
 -------------
-* CRITICAL FIX: status.py exports ALL_STATUSES again, so the real classifier is
-  used.
-* CRITICAL FIX: the SMTP failed check no longer runs inside check_account_sync.
-* SMTP Failed is a PRE-CHECK bucket, displayed immediately AFTER DNS Failed.
-* NEW: per-domain SMTP reachability cache (TTL 15 min).
-* direct connections print the real egress IP | region | country | VPN state.
-* VPN auto-detection from the egress ISP/org.
+* status.py exports ALL_STATUSES; SMTP pre-check bucket; direct egress stamping.
 
 NO hardcoded proxy IPs and NO faked geo table. Everything is derived from
 proxies.txt / Streamlit secrets / live DNS / live ip-api.
@@ -337,6 +293,7 @@ try:
         FAILED, CONNECTION_FAILED, SKIP, SKIPPED_COOLDOWN, UNKNOWN,
         RETRY, RETRY_LATER, SMTP_FAILED, DNS_FAILED,
         ALL_STATUSES as ST_ALL, LABELS as ST_LABELS, COLORS as ST_COLORS,
+        PRIORITY as ST_PRIORITY,
         classify_error as st_classify, is_proxy_level_error as st_proxy_level,
         display as st_display, color as st_color,
     )
@@ -363,6 +320,12 @@ except Exception as _status_err:
         NEED_APP_PASSWORD: "#3b82f6", RETRY_LATER: "#ffffff", SMTP_FAILED: "#a855f7",
         DNS_FAILED: "#f97316", UNKNOWN: "#94a3b8", SKIPPED_COOLDOWN: "#a78bfa",
     }
+    # Lower is better. APP outranks WRONG so a specific app-password signal is
+    # never masked by a generic auth rejection on the same account.
+    ST_PRIORITY = {
+        VALID: 0, NEED_APP_PASSWORD: 1, WRONG_PASSWORD: 2, RETRY_LATER: 3,
+        SMTP_FAILED: 4, DNS_FAILED: 5, CONNECTION_FAILED: 6, UNKNOWN: 7, SKIPPED_COOLDOWN: 8,
+    }
 
     _FB_APP = ("app password", "application-specific", "basic authentication is disabled",
                "web browser", "via your web browser", "2fa", "mfa", "two-factor",
@@ -384,9 +347,14 @@ except Exception as _status_err:
                  "bad username", "bad password", "logon failure",
                  "username and password not accepted", "user rejected", "password rejected",
                  "invalid token", "expired token", "internal server error")
+    # v13.14 — whole-message bare auth tokens ("LOGIN") are a rejection.
+    _FB_BARE = ("login", "logon", "auth", "authenticate", "authentication",
+                "sign in", "signin", "sign-in", "credentials", "invalid")
 
     def st_classify(raw, domain=""):
         t = (raw or "").lower()
+        if t.strip().rstrip(".!:,;").strip() in _FB_BARE:
+            return WRONG_PASSWORD
         for table, val in ((_FB_APP, NEED_APP_PASSWORD), (_FB_WRONG_STRONG, WRONG_PASSWORD),
                            (_FB_DNS, DNS_FAILED), (_FB_RETRY, RETRY_LATER),
                            (_FB_CONN, CONNECTION_FAILED), (_FB_WRONG, WRONG_PASSWORD)):
@@ -479,7 +447,7 @@ def default_theme() -> dict:
         "bg": p["bg"], "panel": p["panel"], "text": p["text"],
         "radius": 14, "glow": True, "animate": True, "glass": True,
         "colorize_logs": True,
-        "hero_title": "⚡ Mega Ultimate Mail Checker v13.13",
+        "hero_title": "⚡ Mega Ultimate Mail Checker v13.15",
         "hero_sub": "World-Coverage Edition — router-aware host ranking, rotating proxy pool, geo-call routing, retryable IP-block handling, optional SMTP pre-check, anti-spoofing post-auth validation.",
     }
 
@@ -2788,24 +2756,19 @@ def _rank_hosts(hosts, domain):
     return host_rank_hosts(hosts, domain)
 
 # ---------------------------------------------------------------------------
-# v13.12 — DOMAIN-LOCAL + ALIAS-ROOT SERVICE-NAME MERGE
+# v13.12 / v13.14 — DOMAIN-LOCAL + ALIAS-ROOT SERVICE-NAME MERGE
 # ---------------------------------------------------------------------------
-# Priority order matters - entries most likely to be the real endpoint come
-# first. "" is the apex (a real endpoint for some hosts, and explicitly named
-# as a legacy host by the operator).
+_LOCAL_PRIORITY_IMAP = ("imap.", "mail.", "email.", "")
+_LOCAL_PRIORITY_POP = ("pop.", "pop3.", "")
+
 _DOMAIN_IMAP_GUESS = (
     "imap.", "mail.", "", "imap3.", "imaps.", "imap2.",
-    "webmail.", "mail2.", "imap4.", "correo.",
+    "webmail.", "mail2.", "imap4.", "correo.", "email.", "secure.", "zimbra.",
 )
 _DOMAIN_POP_GUESS = (
     "pop.", "pop3.", "", "pop3s.", "mail.", "pop2.", "pop4.", "mail2.",
 )
 
-# Rebranded / alternate registrable roots.  A root maps to its siblings and
-# every sibling's service names are generated too, so a primary living on a
-# DIFFERENT domain (xplore.net for xplornet.com) finally gets attempted.
-# Add more rebrands here as they surface - a wrong entry only costs a resolving
-# probe, never an authoritative slot.
 _DOMAIN_ALIAS_ROOTS = {
     "xplornet.com": ("xplore.net",),
     "xplore.net":   ("xplornet.com",),
@@ -2820,18 +2783,27 @@ def _domain_roots(domain):
             roots.append(alt)
     return roots
 
+def _is_local_domain_host(host, domain):
+    """True when host is the domain / an alias root, or sits under either."""
+    h = (host or "").lower().strip()
+    if not h:
+        return False
+    for root in _domain_roots(domain):
+        if h == root or h.endswith("." + root):
+            return True
+    return False
+
 def _guess_candidates(domain, prefixes):
     """Every '<prefix><root>' for the domain AND its alias roots that RESOLVES.
 
-    Alias-root names are produced first (a rebrand's live primary), then the
-    domain's own names, each in the caller's prefix-priority order.
+    The domain's OWN root is walked first (v13.14) so its names can never be
+    pushed out of the slice by a rebrand, then any alias root.
     """
     out = []
     roots = _domain_roots(domain)
     if not roots:
         return out
-    ordered_roots = roots[1:] + roots[:1]        # alias roots first, then own
-    for root in ordered_roots:
+    for root in roots:
         for pfx in prefixes:
             cand = f"{pfx}{root}" if pfx else root
             if cand and cand not in out and host_resolves(cand):
@@ -2850,41 +2822,32 @@ def _is_plain_domain_guess(host, domain, prefixes):
     return any(h == f"{p}{d}" for p in prefixes if p)
 
 def _merge_domain_guesses(servers, domain):
-    """Insert the domain's own AND alias-root resolving service names into a
-    curated provider answer.
-
-    v13.12 — v13.11 appended the domain's own imap./mail./webmail. names. That
-    closed the family-set short-circuit, but three whole CLASSES of real endpoint
-    were still invisible because '<prefix>.<domain>' can never synthesise them:
-    a REBRANDED root (xplornet.com -> xplore.net), a NUMBERED / VARIANT prefix
-    (imap3.zoominternet.net, mail2.tds.net) and a BARE-DOMAIN legacy host
-    (xpertikus.com).  This merge generates all three, resolve-gated.
-
-    Guarantees:
-      1. Authoritative curated hosts stay FIRST, in curated order.
-      2. Only candidates that actually RESOLVE are inserted, so a dud costs no
-         budget and does not inflate the per-account window.
-      3. Idempotent — safe to call at more than one layer.
-      4. High-value candidates (alias primary, own primary, apex) are inserted
-         BEFORE the long tail of alternates so they survive the MAX_HOSTS slice.
+    """Insert the domain's own AND alias-root resolving service names, ordered
+    LOCAL-PRIORITY -> other local -> FOREIGN.
     """
     if not servers or not domain:
         return servers
 
     out = dict(servers)
-    for key, prefixes in (("imap", _DOMAIN_IMAP_GUESS),
-                          ("pop", _DOMAIN_POP_GUESS),
-                          ("pop3", _DOMAIN_POP_GUESS)):
+    for key, priority in (("imap", _LOCAL_PRIORITY_IMAP),
+                          ("pop", _LOCAL_PRIORITY_POP),
+                          ("pop3", _LOCAL_PRIORITY_POP)):
         hosts = [h for h in (out.get(key) or []) if h]
         if not hosts:
             continue
 
-        # Split what we were given: real endpoints first, our own guesses second.
-        authoritative = [h for h in hosts if not _is_plain_domain_guess(h, domain, prefixes)]
-        already_guessed = [h for h in hosts if _is_plain_domain_guess(h, domain, prefixes)]
+        local_priority = _guess_candidates(domain, priority)
+        priority_set = set(local_priority)
+
+        local_other = [h for h in hosts
+                       if h not in priority_set and _is_local_domain_host(h, domain)]
+        local_other_set = set(local_other)
+
+        foreign = [h for h in hosts
+                   if h not in priority_set and h not in local_other_set]
 
         merged = []
-        for h in authoritative + _guess_candidates(domain, prefixes) + already_guessed:
+        for h in local_priority + local_other + foreign:
             if h and h not in merged:
                 merged.append(h)
         out[key] = merged
@@ -2896,9 +2859,6 @@ def get_servers(email):
         if domain in ZERO_ACCESS_PROVIDERS:
             return {"imap": [], "pop": [], "pop3": [], "type": "zero_access"}
 
-        # v13.11/v13.12 — every curated answer (and every parent-provider branch)
-        # is passed through _merge_domain_guesses() so the domain's own AND
-        # alias-root resolving service names are inserted after the curated hosts.
         known = known_provider_conf(domain)
         if known:
             if known.get("imap"):
@@ -3210,7 +3170,16 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, 
         primary_user = users[0]
 
         def note_verdict(st_val, detail):
-            if best_verdict["status"] is None and st_val in (VALID, WRONG, APP):
+            """Keep the BEST verdict seen, by status.PRIORITY.
+
+            v13.15 — priority-aware: a specific app-password signal (1) must never
+            be masked by a generic auth rejection (2) collected for the same
+            account, in either order.
+            """
+            if st_val not in (VALID, WRONG, APP):
+                return
+            cur = best_verdict["status"]
+            if cur is None or ST_PRIORITY.get(st_val, 99) < ST_PRIORITY.get(cur, 99):
                 best_verdict["status"] = st_val
                 best_verdict["detail"] = detail
                 trace_logs.append(f"Verdict retained for this account: [{st_val}] ({detail})")
@@ -3224,12 +3193,8 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, 
             else:
                 px = sample_alive_proxy(domain=domain)
 
-        # v13.12 — the merge can legitimately produce more resolving candidates
-        # than MAX_HOSTS_PER_DOMAIN (alias primary / apex / numbered prefixes).
-        # Carry a small bounded surplus so those are actually ATTEMPTED instead
-        # of being sliced away; the budget floor below scales with rung count.
         _all_imap = [h for h in (conf.get("imap") or []) if h]
-        _imap_cap = max(max_hosts, 5)
+        _imap_cap = max(max_hosts, 6)
         imap_hosts = _all_imap[:_imap_cap]
         pop_hosts = [h for h in ((conf.get("pop") or conf.get("pop3") or [])[:1]) if h]
         if len(_all_imap) > len(imap_hosts):
@@ -3237,19 +3202,29 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, 
                 f"Host expansion: {len(imap_hosts)}/{len(_all_imap)} IMAP candidate(s) kept (cap {_imap_cap}).")
 
         # v13.13 — GUARANTEE THE BARE-DOMAIN FALLBACK.
-        # The merge already emits '<domain>' (the apex) as a candidate and it
-        # RESOLVES, but host_tier() rates a bare domain as a ROUTER (tier 3), so
-        # the ranking sinks it below the tier-0 service names (secure./zimbra./
-        # email./imap./mail.) AND the tier-2 provider fallbacks. With 13
-        # candidates and a cap of 5 the apex landed at position 6 - one slot
-        # past the cut - and was NEVER dialled. xpertikus.com documents exactly
-        # this shape (primary mail.xpertikus.com, fallback xpertikus.com), so the
-        # fallback must be attempted no matter where it ranked. Appended as a
-        # final rung; the budget floor below scales with the added rung.
         if domain and domain not in imap_hosts and fast_fail_dns_check(domain):
             imap_hosts = imap_hosts + [domain]
             trace_logs.append(
                 f"Fallback host '{domain}' force-included as a final rung (apex resolves).")
+
+        # v13.14 — which hosts are the DOMAIN'S OWN? A verdict from a FOREIGN
+        # fallback is not the domain's verdict.
+        _local_roots = tuple(_domain_roots(domain))
+
+        def _is_local_host(h):
+            hl = (h or "").lower().strip()
+            if not hl:
+                return False
+            for r in _local_roots:
+                if hl == r or hl.endswith("." + r):
+                    return True
+            return False
+
+        domain_local_hosts = {h for h in (imap_hosts + pop_hosts) if _is_local_host(h)}
+
+        # v13.15 — every host actually dialled, so "own host already attempted"
+        # is a fact rather than an assumption.
+        tried_hosts = set()
 
         trace_logs.append(f"Host order -> IMAP {imap_hosts} | POP {pop_hosts}")
 
@@ -3289,10 +3264,15 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, 
                 f"({len(primary_plan)} rung(s) x {max(configured_to, 12.0):.0f}s x 2) "
                 f"instead of the {budget:.0f}s the Deadline slider allows.")
             budget = work_floor
+
+        # v13.14 — reserve the TAIL of each phase for the legacy 143/110 plan.
         proxy_deadline = t_start + (budget * 0.55)
+        proxy_primary_deadline = t_start + (budget * 0.40)
         hard_deadline = t_start + budget
+        direct_primary_deadline = t_start + (budget * 0.80)
         trace_logs.append(
-            f"Account window {budget:.0f}s -> proxy {budget * 0.55:.0f}s / direct {budget * 0.45:.0f}s.")
+            f"Account window {budget:.0f}s -> proxy {budget * 0.55:.0f}s / direct {budget * 0.45:.0f}s "
+            f"(legacy 143/110 rungs hold a reserved tail slice of each phase).")
 
         timed_out_hosts = set()
 
@@ -3338,6 +3318,8 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, 
                 if tls_mode in ("starttls", "plain") and server in timed_out_hosts:
                     trace_logs.append(f"{px_tag(px_used)} Skip {tls_mode.upper()} {server}:{port} (implicit TLS already timed out)")
                     continue
+
+                tried_hosts.add(server)
 
                 rotations_left = MAX_ROTATIONS if (allow_rotate and px_used and proxy_mode != "off") else 0
                 seen_px = {px_used} if px_used else set()
@@ -3402,9 +3384,19 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, 
                             record_proxy_attempt(px_used, success=False, is_network_error=False)
                             trace_logs.append(f"{px_tag(px_used)} -> AUTH {proto} {server}:{port}: {err_text[:90]} [Classified: {st_val}]")
                             note_verdict(st_val, f"{proto} {server}:{port} -> {st_val}")
+
                             if st_val == APP:
-                                return (None, APP, f"{px_tag(px_used)} {proto} {server} -> {st_val}", px_used, trace_logs), had_net, saw_retry
-                            if st_val == RETRY:
+                                # v13.15 — try the local-part pattern first, and do
+                                # NOT finalise while the domain's own host is untried.
+                                if u_idx + 1 < len(users):
+                                    trace_logs.append(f"{px_tag(px_used)} App-password signal as '{user}' -> retrying same host as local-part '{users[u_idx + 1]}'")
+                                    continue
+                                if server in domain_local_hosts or not (domain_local_hosts - tried_hosts):
+                                    return (None, APP, f"{px_tag(px_used)} {proto} {server} -> {st_val}", px_used, trace_logs), had_net, saw_retry
+                                trace_logs.append(
+                                    f"{px_tag(px_used)} APP on FOREIGN host {server} -> verdict noted, own host still untried, continuing")
+                                server_level_fail = True
+                            elif st_val == RETRY:
                                 saw_retry = True
                                 server_level_fail = True
                                 if "lookup failed" in err_text.lower():
@@ -3416,7 +3408,14 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, 
                                 trace_logs.append(f"{px_tag(px_used)} Rejected as '{user}' -> retrying same host as local-part '{users[u_idx + 1]}'")
                                 continue
                             elif st_val == WRONG:
-                                return (None, WRONG, f"{px_tag(px_used)} {proto} {server} -> {st_val}", px_used, trace_logs), had_net, saw_retry
+                                better = (best_verdict["status"] is not None
+                                          and ST_PRIORITY.get(best_verdict["status"], 99) < ST_PRIORITY.get(WRONG, 99))
+                                if not better and (server in domain_local_hosts or not (domain_local_hosts - tried_hosts)):
+                                    return (None, WRONG, f"{px_tag(px_used)} {proto} {server} -> {st_val}", px_used, trace_logs), had_net, saw_retry
+                                trace_logs.append(
+                                    f"{px_tag(px_used)} WRONG on {'local' if server in domain_local_hosts else 'FOREIGN'} host {server} "
+                                    f"-> noted ({best_verdict['status'] or 'none'} retained), continuing")
+                                server_level_fail = True
                             else:
                                 server_level_fail = True
 
@@ -3435,9 +3434,17 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, 
                             record_proxy_attempt(px_used, success=False, is_network_error=(st_val == FAILED))
                             trace_logs.append(f"{px_tag(px_used)} -> FAILED {proto} {server}:{port}: {err_text[:90]} [Classified: {st_val}]")
                             note_verdict(st_val, f"{proto} {server}:{port} -> {st_val}")
+
                             if st_val == APP:
-                                return (None, APP, f"{px_tag(px_used)} {proto} {server} -> {st_val}", px_used, trace_logs), had_net, saw_retry
-                            if st_val == RETRY:
+                                if u_idx + 1 < len(users):
+                                    trace_logs.append(f"{px_tag(px_used)} App-password signal as '{user}' -> retrying same host as local-part '{users[u_idx + 1]}'")
+                                    continue
+                                if server in domain_local_hosts or not (domain_local_hosts - tried_hosts):
+                                    return (None, APP, f"{px_tag(px_used)} {proto} {server} -> {st_val}", px_used, trace_logs), had_net, saw_retry
+                                trace_logs.append(
+                                    f"{px_tag(px_used)} APP on FOREIGN host {server} -> verdict noted, own host still untried, continuing")
+                                server_level_fail = True
+                            elif st_val == RETRY:
                                 saw_retry = True
                                 server_level_fail = True
                                 if "lookup failed" in err_text.lower():
@@ -3449,7 +3456,14 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, 
                                 trace_logs.append(f"{px_tag(px_used)} Rejected as '{user}' -> retrying same host as local-part '{users[u_idx + 1]}'")
                                 continue
                             elif st_val == WRONG:
-                                return (None, WRONG, f"{px_tag(px_used)} {proto} {server} -> {st_val}", px_used, trace_logs), had_net, saw_retry
+                                better = (best_verdict["status"] is not None
+                                          and ST_PRIORITY.get(best_verdict["status"], 99) < ST_PRIORITY.get(WRONG, 99))
+                                if not better and (server in domain_local_hosts or not (domain_local_hosts - tried_hosts)):
+                                    return (None, WRONG, f"{px_tag(px_used)} {proto} {server} -> {st_val}", px_used, trace_logs), had_net, saw_retry
+                                trace_logs.append(
+                                    f"{px_tag(px_used)} WRONG on {'local' if server in domain_local_hosts else 'FOREIGN'} host {server} "
+                                    f"-> noted ({best_verdict['status'] or 'none'} retained), continuing")
+                                server_level_fail = True
                             else:
                                 server_level_fail = True
                                 rotate_now = rotate_now or proxy_level
@@ -3501,7 +3515,7 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, 
 
         # ------------------------- PROXY PHASE -------------------------
         if px:
-            result, net_fail, ret = run_phase(px, primary_plan, proxy_deadline, "proxy")
+            result, net_fail, ret = run_phase(px, primary_plan, proxy_primary_deadline, "proxy")
             retryable = retryable or ret
             if result:
                 return result
@@ -3527,7 +3541,7 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, 
             trace_logs.append(
                 f"Proxy pass exhausted -> DIRECT sweep over all {len(direct_primary)} locally-resolving host(s).")
 
-            result, _nf2, ret2 = run_phase(None, direct_primary, hard_deadline, "direct")
+            result, _nf2, ret2 = run_phase(None, direct_primary, direct_primary_deadline, "direct")
             retryable = retryable or ret2
             if result:
                 return result
