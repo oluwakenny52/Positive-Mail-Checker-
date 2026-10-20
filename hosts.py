@@ -3,47 +3,22 @@ hosts.py
 ========
 One host table. Primary first, backup second, with SRV/autoconfig/MX discovery.
 
-v13.17 changes
+v13.18 changes
 --------------
-* DISCOVERY TIME BUDGET.  Host discovery runs BEFORE an account's check window
-  starts, so its cost is pure added wall time.  SRV lifetime 3s -> 2s, the
-  Thunderbird autoconfig request 4s -> 2.5s and the Autodiscover POST 5s -> 3s.
-  A dead-autoconfig domain used to burn up to ~18s of HTTP timeouts per new
-  domain; it now burns ~11s.
+* FAMILY_PRIORITY + DEAD_IMAP_HOSTS.  merge_domain_guesses() used to place the
+  domain's own generic names (imap.<d>, mail.<d>, apex <d>) BEFORE the curated
+  provider endpoints.  For every family provider those generic names are dead,
+  so the one host that actually serves IMAP was buried and the account window
+  expired before reaching it.  Live trace for a @yahoo.com account:
 
-v13.14 changes
---------------
-* DOMAIN-LOCAL FIRST.  merge_domain_guesses() now orders candidates as
-  local-priority (imap./mail./email./apex for the domain AND its alias roots)
-  -> other domain-local names (secure./zimbra./webmail./...) -> FOREIGN names
-  (provider endpoints, universal fallbacks, family hosts).
-* _guess_candidates() walks the domain's OWN root before any alias root, so the
-  domain's own names can never be pushed out of the slice by a rebrand.
+      Host order -> IMAP ['mail.yahoo.com', 'email.yahoo.com', 'yahoo.com',
+                          'imap.mail.yahoo.com']
+      every phase timed out on the first three, window reached, and
+      imap.mail.yahoo.com:993 was NEVER dialled in any pass.
 
-v13.12 changes
---------------
-* DOMAIN-LOCAL + ALIAS-ROOT MERGE.  Every curated answer is passed through
-  merge_domain_guesses(), which now ALSO generates the domain's alias roots
-  (xplornet.com -> xplore.net), numbered/variant prefixes (imap3., mail2.,
-  imap4.) and the BARE DOMAIN.
-* Candidates are resolve-gated, curated-first and idempotent.
-
-v13.11 changes
---------------
-* DOMAIN-LOCAL SERVICE-NAME MERGE.  A domain sitting in a provider FAMILY
-  (brighthouse.com in TWC, btinternet.com in Yahoo) previously only ever tried
-  the family's hosts; mail.brighthouse.com was never attempted.
-
-v13.6 changes
--------------
-* smtp_candidates() now consults SMTP_DIRECT and MX_PROVIDER_MAP first, so the
-  SMTP pre-check hits the provider's real endpoint (smtp.freenet.de, mail.gmx.net,
-  securesmtp.t-online.de) instead of guessing mail.<domain> and timing out.
-* rank_hosts() sorts RESOLVES first, then tier, so three dead 'imap.<domain>'
-  guesses can never fill the MAX_HOSTS_PER_DOMAIN slice and push the real
-  provider endpoint (imap.gmail.com / imap.gmx.net) out of the plan.
-* freenet / gmx / web.de / t-online / posteo added to MX_PROVIDER_MAP so the
-  MX alone is enough to find the provider's own endpoint.
+  FAMILY_PRIORITY is now prepended, and DEAD_IMAP_HOSTS is demoted to the tail.
+* MS_IMAP / YAHOO_IMAP / ATT_IMAP / FRONTIER_IMAP / COUNTRY hosts are all
+  registered as family priority, so the real endpoint is always rung 1.
 """
 
 import os
@@ -87,6 +62,8 @@ YAHOO_DOMAINS = {
 MS_DOMAINS = {
     "outlook.com", "hotmail.com", "live.com", "msn.com", "hotmail.co.uk",
     "outlook.com.br", "hotmail.com.br", "live.com.br", "windowslive.com",
+    "hotmail.fr", "hotmail.de", "hotmail.it", "hotmail.es",
+    "outlook.fr", "outlook.de", "outlook.it", "outlook.es", "outlook.co.uk",
 }
 GMAIL_DOMAINS = {"gmail.com", "googlemail.com"}
 STRICT_APP = GMAIL_DOMAINS | {"outlook.com", "hotmail.com", "live.com", "windowslive.com"}
@@ -173,6 +150,73 @@ COUNTRY = {
     "sympatico.ca": ["imap.sympatico.ca"],
 }
 
+# ============================================================================
+# v13.18 - FAMILY PRIORITY + DEAD ENDPOINT DEMOTION
+# ============================================================================
+
+# Hosts that resolve but have NO IMAP listener.  They used to occupy the front
+# of the ladder and consume the entire account window.
+DEAD_IMAP_HOSTS = {
+    "mail.yahoo.com", "email.yahoo.com", "yahoo.com",
+    "mail.hotmail.com", "hotmail.com", "imap.hotmail.com", "email.hotmail.com",
+    "mail.live.com", "live.com", "outlook.com", "mail.outlook.com",
+    "att.net", "sbcglobal.net", "bellsouth.net", "pacbell.net",
+    "frontiernet.net", "myfrontiermail.com",
+    "charter.net", "spectrum.net", "twc.com", "verizon.net",
+    "roadrunner.com", "rr.com",
+}
+
+# domain -> hosts that MUST lead the ladder for that domain.
+FAMILY_PRIORITY = {}
+
+for _d in FRONTIER:
+    FAMILY_PRIORITY[_d] = list(FRONTIER_IMAP)
+for _d in ATT_FAMILY:
+    FAMILY_PRIORITY[_d] = list(ATT_IMAP)
+for _d in VERIZON:
+    FAMILY_PRIORITY[_d] = list(VERIZON_IMAP)
+for _d in CHARTER:
+    FAMILY_PRIORITY[_d] = list(CHARTER_IMAP)
+for _d in TWC:
+    FAMILY_PRIORITY[_d] = list(TWC_IMAP)
+for _d in YAHOO_DOMAINS:
+    FAMILY_PRIORITY[_d] = list(YAHOO_IMAP)
+for _d in MS_DOMAINS:
+    FAMILY_PRIORITY[_d] = list(MS_IMAP)
+for _d in GMAIL_DOMAINS:
+    FAMILY_PRIORITY[_d] = list(GMAIL_IMAP)
+for _d, _h in COUNTRY.items():
+    FAMILY_PRIORITY.setdefault(_d, list(_h))
+
+
+def _family_priority(domain):
+    """Hosts that must lead for this domain, including suffix families."""
+    domain = (domain or "").lower().strip()
+    if not domain:
+        return []
+    if domain in FAMILY_PRIORITY:
+        return list(FAMILY_PRIORITY[domain])
+    if domain.endswith(".rr.com"):
+        return list(CHARTER_IMAP)
+    if domain.endswith(".yahoo.com"):
+        return list(YAHOO_IMAP)
+    if domain.endswith(".outlook.com") or domain.endswith(".hotmail.com") or domain.endswith(".live.com"):
+        return list(MS_IMAP)
+    return []
+
+
+def _order_provider_hosts(hosts, domain):
+    """Family endpoints first, live endpoints next, known-dead endpoints last."""
+    fam = _family_priority(domain)
+    seen, alive, dead = set(), [], []
+    for h in list(fam) + list(hosts or []):
+        if not h or h in seen:
+            continue
+        seen.add(h)
+        (dead if h in DEAD_IMAP_HOSTS else alive).append(h)
+    return alive + dead
+
+
 # Explicit SMTP endpoints for the providers whose SMTP host is NOT derived from
 # their IMAP host. Checked before every guess.
 SMTP_DIRECT = {
@@ -187,7 +231,6 @@ SMTP_DIRECT = {
     "ionos.de": ["smtp.ionos.de"],
     "1und1.de": ["smtp.ionos.de"],
     "arcor.de": ["mail.arcor.de"],
-    "freenet.de ": ["smtp.freenet.de"],
     "netcourrier.com": ["smtp.netcourrier.com", "mail.netcourrier.com"],
     "bbox.fr": ["smtp.bbox.fr"],
     "sfr.fr": ["smtp.sfr.fr"],
@@ -305,6 +348,7 @@ _SERVICE_PREFIXES = (
 
 _SKIP_LABELS_FOR_TOKENS = {"mail", "email", "webmail", "imap", "imaps", "pop", "pop3", "smtp", "correo"}
 
+
 def is_junk_host(host, domain=None):
     """True when a hostname is almost certainly a mail ROUTER (MX/MTA) rather
     than an IMAP/POP service endpoint. Demotion only - never removal."""
@@ -332,7 +376,9 @@ def is_junk_host(host, domain=None):
 
     return False
 
+
 _is_junk_host = is_junk_host
+
 
 def host_tier(host, domain):
     """0 = most likely correct ... 4 = last resort. Ordering only."""
@@ -353,9 +399,11 @@ def host_tier(host, domain):
         return 3
     return 2                                         # provider endpoint (ssl0.ovh.net, imap.gmail.com)
 
+
 _probe_lock = threading.Lock()
 _probe_cache = {}
 _PROBE_TTL = 600
+
 
 def _port_open(host, port, timeout=1.5):
     try:
@@ -364,6 +412,7 @@ def _port_open(host, port, timeout=1.5):
         return True
     except Exception:
         return False
+
 
 def probe_live(host, timeout=1.5):
     """Cheap TCP reachability check on 993 / 143 (cached 10 min)."""
@@ -381,13 +430,12 @@ def probe_live(host, timeout=1.5):
         _probe_cache[host] = (now, ok)
     return ok
 
+
 def rank_hosts(hosts, domain, probe=True):
     """Composite ranking.
 
-    Order of precedence is now:
-      1. DNS RESOLVES    - a name that does not resolve cannot possibly work, so
-                           it must never occupy a MAX_HOSTS_PER_DOMAIN slot
-                           while the provider endpoint sits below the cut.
+    Order of precedence:
+      1. DNS RESOLVES    - a name that does not resolve cannot possibly work.
       2. tier            - service endpoint before router before bare domain
       3. port answers    - 993/143 reachable
       4. discovery index - preserves SRV / autoconfig authority order
@@ -431,6 +479,7 @@ def rank_hosts(hosts, domain, probe=True):
     ))
     return [h for _i, h in indexed]
 
+
 # ============================================================================
 # CACHES  (atomic writes)
 # ============================================================================
@@ -443,6 +492,7 @@ _cache = None
 
 _resolve_lock = threading.Lock()
 _resolve_cache = {}
+
 
 def _atomic_write_json(path, obj, indent=2):
     directory = os.path.dirname(os.path.abspath(path)) or "."
@@ -483,6 +533,7 @@ def _atomic_write_json(path, obj, indent=2):
 
     return payload
 
+
 def _load_cache():
     global _cache
     if _cache is not None:
@@ -508,6 +559,7 @@ def _load_cache():
     _cache = {}
     return _cache
 
+
 def _save_cache():
     try:
         now = time.time()
@@ -529,8 +581,10 @@ def _save_cache():
     except Exception:
         return False
 
+
 def flush_cache():
     return _save_cache()
+
 
 def clear_cache():
     global _cache
@@ -544,6 +598,7 @@ def clear_cache():
             pass
     return True
 
+
 def cache_stats():
     stats = {"entries": 0, "file_bytes": 0, "path": _CACHE_FILE,
              "has_backup": os.path.exists(_CACHE_FILE + ".bak"), "healthy": True}
@@ -556,12 +611,14 @@ def cache_stats():
         stats["healthy"] = False
     return stats
 
+
 def _dedupe(seq):
     out = []
     for x in seq:
         if x and x not in out:
             out.append(x)
     return out
+
 
 # ============================================================================
 # DNS HELPERS
@@ -572,16 +629,18 @@ def _dns_resolve(name, rdtype):
         return []
     try:
         fn = getattr(dns.resolver, "resolve", None) or dns.resolver.query
-        return list(fn(name, rdtype, lifetime=2))       # v13.17 (was 3)
+        return list(fn(name, rdtype, lifetime=2))
     except Exception:
         try:
             return list(dns.resolver.query(name, rdtype))
         except Exception:
             return []
 
+
 _mx_cache = {}
 _mx_lock = threading.Lock()
 _MX_TTL = 600
+
 
 def resolve_mx(domain):
     domain = (domain or "").lower().strip()
@@ -606,6 +665,7 @@ def resolve_mx(domain):
         _mx_cache[domain] = (now, out)
     return out
 
+
 def resolve_srv(name):
     records = _dns_resolve(name, "SRV")
     out = []
@@ -615,6 +675,7 @@ def resolve_srv(name):
         except Exception:
             continue
     return sorted(out)
+
 
 def host_resolves(host):
     if not host:
@@ -651,16 +712,14 @@ def host_resolves(host):
         _resolve_cache[host] = ok
     return ok
 
+
 # ============================================================================
-# v13.12 / v13.14 - DOMAIN-LOCAL + ALIAS-ROOT SERVICE-NAME MERGE
+# DOMAIN-LOCAL + ALIAS-ROOT SERVICE-NAME MERGE
 # ============================================================================
 
-# Priority local names - the domain's own most-likely endpoints, placed BEFORE
-# everything else so they can never be sliced off by the MAX_HOSTS cap.
 _LOCAL_PRIORITY_IMAP = ("imap.", "mail.", "email.", "")
 _LOCAL_PRIORITY_POP = ("pop.", "pop3.", "")
 
-# Full domain-local guess set (used for classification / long tail).
 _DOMAIN_IMAP_GUESS = (
     "imap.", "mail.", "", "imap3.", "imaps.", "imap2.",
     "webmail.", "mail2.", "imap4.", "correo.", "email.", "secure.", "zimbra.",
@@ -669,13 +728,11 @@ _DOMAIN_POP_GUESS = (
     "pop.", "pop3.", "", "pop3s.", "mail.", "pop2.", "pop4.", "mail2.",
 )
 
-# Rebranded / alternate registrable roots.  A root maps to its siblings and
-# every sibling's service names are generated too, so a primary living on a
-# DIFFERENT domain (xplore.net for xplornet.com) finally gets attempted.
 _DOMAIN_ALIAS_ROOTS = {
     "xplornet.com": ("xplore.net",),
     "xplore.net":   ("xplornet.com",),
 }
+
 
 def _domain_roots(domain):
     """The domain itself followed by any known alias root (deduped)."""
@@ -685,6 +742,7 @@ def _domain_roots(domain):
         if alt and alt not in roots:
             roots.append(alt)
     return roots
+
 
 def _is_local_domain_host(host, domain):
     """True when host is the domain / an alias root, or sits under either."""
@@ -696,12 +754,9 @@ def _is_local_domain_host(host, domain):
             return True
     return False
 
-def _guess_candidates(domain, prefixes):
-    """Every '<prefix><root>' for the domain AND its alias roots that RESOLVES.
 
-    The domain's OWN root is walked first (v13.14) so its names can never be
-    pushed out of the slice by a rebrand, then any alias root.
-    """
+def _guess_candidates(domain, prefixes):
+    """Every '<prefix><root>' for the domain AND its alias roots that RESOLVES."""
     out = []
     roots = _domain_roots(domain)
     if not roots:
@@ -713,9 +768,9 @@ def _guess_candidates(domain, prefixes):
                 out.append(cand)
     return out
 
+
 def _is_plain_domain_guess(host, domain, prefixes):
-    """True when host is just '<prefix><domain>' / the bare domain - i.e. a name
-    WE generate, not an authoritative provider endpoint."""
+    """True when host is just '<prefix><domain>' / the bare domain."""
     h = (host or "").lower().strip()
     d = (domain or "").lower().strip()
     if not h or not d:
@@ -724,33 +779,33 @@ def _is_plain_domain_guess(host, domain, prefixes):
         return True
     return any(h == f"{p}{d}" for p in prefixes if p)
 
-def merge_domain_guesses(servers, domain):
-    """Insert the domain's own AND alias-root resolving service names, ordered
-    LOCAL-PRIORITY -> other local -> FOREIGN.
 
-    Guarantees:
-      1. The domain's own most-likely endpoints (imap./mail./email./apex) come
-         FIRST, so they survive the MAX_HOSTS slice.
-      2. Only candidates that actually RESOLVE are inserted - a dud costs no
-         budget and cannot inflate the per-account window.
-      3. Idempotent - safe to call at more than one layer.
-      4. FOREIGN names (provider endpoints, universal fallbacks, family hosts)
-         come LAST: a foreign server's generic "Invalid credentials" is not the
-         domain's verdict and must not outrank the domain's own servers.
+def merge_domain_guesses(servers, domain):
+    """Insert the domain's own AND alias-root resolving service names.
+
+    v13.18 ordering, per bucket:
+        1. FAMILY_PRIORITY  - the curated endpoint for this provider
+        2. local-priority   - imap./mail./email./apex for the domain and aliases
+        3. other local
+        4. FOREIGN          - provider endpoints, universal fallbacks, family hosts
+        5. KNOWN-DEAD hosts - demoted to the very tail
     """
     if not servers or not domain:
         return servers
 
     out = dict(servers)
-    for key, priority, _long in (("imap", _LOCAL_PRIORITY_IMAP, _DOMAIN_IMAP_GUESS),
-                                 ("pop", _LOCAL_PRIORITY_POP, _DOMAIN_POP_GUESS),
-                                 ("pop3", _LOCAL_PRIORITY_POP, _DOMAIN_POP_GUESS)):
+    for key, priority in (("imap", _LOCAL_PRIORITY_IMAP),
+                          ("pop", _LOCAL_PRIORITY_POP),
+                          ("pop3", _LOCAL_PRIORITY_POP)):
         hosts = [h for h in (out.get(key) or []) if h]
         if not hosts:
             continue
 
-        local_priority = _guess_candidates(domain, priority)
-        priority_set = set(local_priority)
+        family = _family_priority(domain)
+
+        local_priority = [h for h in _guess_candidates(domain, priority)
+                          if h not in DEAD_IMAP_HOSTS]
+        priority_set = set(local_priority) | set(family)
 
         local_other = [h for h in hosts
                        if h not in priority_set and _is_local_domain_host(h, domain)]
@@ -760,11 +815,15 @@ def merge_domain_guesses(servers, domain):
                    if h not in priority_set and h not in local_other_set]
 
         merged = []
-        for h in local_priority + local_other + foreign:
+        for h in family + local_priority + local_other + foreign:
             if h and h not in merged:
                 merged.append(h)
-        out[key] = merged
+
+        alive = [h for h in merged if h not in DEAD_IMAP_HOSTS]
+        dead = [h for h in merged if h in DEAD_IMAP_HOSTS]
+        out[key] = alive + dead
     return out
+
 
 # ============================================================================
 # DISCOVERY: SRV / AUTOCONFIG / AUTODISCOVER / MX
@@ -780,7 +839,7 @@ def _thunderbird_autoconfig(domain):
     ]
     for url in urls:
         try:
-            r = requests.get(url, timeout=2.5, verify=False,          # v13.17 (was 4)
+            r = requests.get(url, timeout=2.5, verify=False,
                              headers={"User-Agent": "Mozilla/5.0 MailChecker"})
             if r.status_code != 200 or "<clientConfig" not in r.text:
                 continue
@@ -801,6 +860,7 @@ def _thunderbird_autoconfig(domain):
             continue
     return _dedupe(imap), _dedupe(pop)
 
+
 _AUTODISCOVER_BODY = (
     '<?xml version="1.0" encoding="utf-8"?>'
     '<Autodiscover xmlns="http://schemas.microsoft.com/exchange/autodiscover/outlook/requestschema/2006">'
@@ -809,6 +869,7 @@ _AUTODISCOVER_BODY = (
     'http://schemas.microsoft.com/exchange/autodiscover/outlook/responseschema/2006a'
     '</AcceptableResponseSchema></Request></Autodiscover>'
 )
+
 
 def _autodiscover(domain, email=None):
     if not _REQ:
@@ -821,7 +882,7 @@ def _autodiscover(domain, email=None):
     ]
     for url in urls:
         try:
-            r = requests.post(url, data=body, timeout=3, verify=False,   # v13.17 (was 5)
+            r = requests.post(url, data=body, timeout=3, verify=False,
                               headers={"Content-Type": "text/xml; charset=utf-8",
                                        "User-Agent": "Mozilla/5.0 MailChecker"})
             if r.status_code != 200:
@@ -843,6 +904,7 @@ def _autodiscover(domain, email=None):
             continue
     return _dedupe(imap), _dedupe(pop)
 
+
 def _provider_from_mx(mx_host):
     m = (mx_host or "").lower()
     for keys, pair in MX_PROVIDER_MAP:
@@ -850,9 +912,11 @@ def _provider_from_mx(mx_host):
             return pair
     return None
 
+
 _IMAP_PREFIXES = ("imap.", "mail.", "webmail.", "imaps.", "correo.", "secure.", "zimbra.", "email.", "mail2.", "")
 _POP_PREFIXES = ("pop.", "pop3.", "pop3s.", "mail.", "correo.", "")
 _SMTP_PREFIXES = ("smtp.", "mail.", "smtp-mail.", "send.", "relay.", "")
+
 
 def discover_hosts(domain, email=None, use_cache=True, force_refresh=False):
     """Ordered candidate discovery: SRV -> autoconfig -> autodiscover -> MX -> prefixes.
@@ -955,7 +1019,9 @@ def discover_hosts(domain, email=None, use_cache=True, force_refresh=False):
         if fb not in pop:
             pop.append(fb)
 
-    # 7. Rank: resolves -> tier -> port answers -> discovery index
+    # 7. Family priority first, then rank: resolves -> tier -> port answers -> index
+    imap = _order_provider_hosts(imap, domain)
+    pop = _order_provider_hosts(pop, domain)
     imap = rank_hosts(_dedupe(imap), domain)[:8]
     pop = rank_hosts(_dedupe(pop), domain)[:6]
     smtp = rank_hosts(_dedupe(smtp), domain, probe=False)[:4]
@@ -967,6 +1033,7 @@ def discover_hosts(domain, email=None, use_cache=True, force_refresh=False):
 
     return {"imap": imap, "pop": pop, "smtp": smtp, "sources": sources}
 
+
 # ============================================================================
 # PUBLIC API
 # ============================================================================
@@ -974,11 +1041,13 @@ def discover_hosts(domain, email=None, use_cache=True, force_refresh=False):
 def domain_of(email_addr):
     return (email_addr or "").split("@")[-1].lower().strip()
 
+
 def _pair(imap_hosts, pop_hosts, domain=None):
     if domain:
-        imap_hosts = rank_hosts(imap_hosts, domain, probe=False)
-        pop_hosts = rank_hosts(pop_hosts, domain, probe=False)
+        imap_hosts = _order_provider_hosts(imap_hosts, domain)
+        pop_hosts = _order_provider_hosts(pop_hosts, domain)
     return {"imap": imap_hosts, "pop": pop_hosts, "pop3": pop_hosts}
+
 
 def get_mx_host(domain):
     mx_records = resolve_mx(domain)
@@ -990,16 +1059,9 @@ def get_mx_host(domain):
         return provider[0]
     return exchange
 
-def smtp_candidates(domain):
-    """SMTP endpoints for the SMTP pre-check (never raises).
 
-    Resolution order:
-      1. SMTP_DIRECT    - hand-checked endpoint for providers whose SMTP host
-                          cannot be derived from their IMAP host.
-      2. MX provider    - the smtp_host column of MX_PROVIDER_MAP.
-      3. known IMAP host - imap.<d> / secureimap.<d> rewritten to smtp.<d>.
-      4. generic guesses - smtp.<d>, mail.<d>, send.<d>, <d>.
-    """
+def smtp_candidates(domain):
+    """SMTP endpoints for the SMTP pre-check (never raises)."""
     domain = (domain or "").lower().strip()
     if not domain:
         return []
@@ -1033,6 +1095,7 @@ def smtp_candidates(domain):
 
     ranked = rank_hosts(_dedupe(out), domain, probe=False)
     return ranked[:3] if ranked else _dedupe(out)[:3]
+
 
 def _conf_curated(domain):
     """Curated / discovery answer WITHOUT the domain-local merge."""
@@ -1071,13 +1134,13 @@ def _conf_curated(domain):
 
     return None
 
+
 def conf(domain):
     """Full server config for a domain.
 
     Known providers are instant; everything else goes through cached discovery.
-    v13.12/v13.14: EVERY curated answer is passed through merge_domain_guesses()
-    so the domain's own AND alias-root resolving service names are inserted, in
-    LOCAL-PRIORITY -> other local -> FOREIGN order.
+    EVERY curated answer is passed through merge_domain_guesses() so family
+    priority, local priority and dead-endpoint demotion all apply.
     """
     domain = (domain or "").lower().strip()
     if not domain:
@@ -1090,6 +1153,7 @@ def conf(domain):
         return got
     return merge_domain_guesses(got, domain)
 
+
 def provider_hosts(email_addr):
     domain = domain_of(email_addr)
     got = conf(domain)
@@ -1099,9 +1163,11 @@ def provider_hosts(email_addr):
     found = discover_hosts(domain, email=email_addr)
     return found["imap"], found["pop"]
 
+
 def host_list(email_addr):
     imap_hosts, _ = provider_hosts(email_addr)
     return imap_hosts[:8]
+
 
 def ladder(email_addr, max_hosts=3, include_starttls=True):
     imap_hosts, pop_hosts = provider_hosts(email_addr)
@@ -1118,8 +1184,10 @@ def ladder(email_addr, max_hosts=3, include_starttls=True):
             plan.append(("POP", h, 110, "starttls"))
     return plan
 
+
 def refresh_domain(domain):
     return discover_hosts(domain, use_cache=True, force_refresh=True)
+
 
 def is_disposable(email_addr):
     domain = domain_of(email_addr)
