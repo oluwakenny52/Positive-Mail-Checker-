@@ -3,15 +3,26 @@ hosts.py
 ========
 One host table. Primary first, backup second, with SRV/autoconfig/MX discovery.
 
+v13.14 changes
+--------------
+* DOMAIN-LOCAL FIRST.  merge_domain_guesses() now orders candidates as
+  local-priority (imap./mail./email./apex for the domain AND its alias roots)
+  -> other domain-local names (secure./zimbra./webmail./...) -> FOREIGN names
+  (provider endpoints, universal fallbacks, family hosts).
+  Previously the "authoritative" bucket held BOTH the domain's own discovery
+  names AND foreign fallbacks, so the domain's own servers were dialled after
+  imap.gmail.com / outlook.office365.com.  A foreign host answering with a
+  generic "Invalid credentials" is NOT the domain's verdict, so it must not
+  outrank the domain's own servers.
+* _guess_candidates() walks the domain's OWN root before any alias root, so the
+  domain's own names can never be pushed out of the slice by a rebrand.
+
 v13.12 changes
 --------------
 * DOMAIN-LOCAL + ALIAS-ROOT MERGE.  Every curated answer is passed through
   merge_domain_guesses(), which now ALSO generates the domain's alias roots
   (xplornet.com -> xplore.net), numbered/variant prefixes (imap3., mail2.,
-  imap4.) and the BARE DOMAIN.  Previously only '<prefix>.<domain>' could ever
-  be produced, so a rebranded primary (imap.xplore.net), an alternate
-  (imap3.zoominternet.net) and an apex legacy host (xpertikus.com) were never
-  attempted - even though every candidate that WAS tried resolved fine.
+  imap4.) and the BARE DOMAIN.
 * Candidates are resolve-gated, curated-first and idempotent.
 
 v13.11 changes
@@ -638,33 +649,30 @@ def host_resolves(host):
     return ok
 
 # ============================================================================
-# v13.12 - DOMAIN-LOCAL + ALIAS-ROOT SERVICE-NAME MERGE
+# v13.12 / v13.14 - DOMAIN-LOCAL + ALIAS-ROOT SERVICE-NAME MERGE
 # ============================================================================
 #
 # v13.11 appended the domain's own imap./mail./webmail. names. That closed the
 # family-set short-circuit, but three whole CLASSES of real endpoint were still
 # invisible because '<prefix>.<domain>' can never synthesise them:
 #
-#   1. REBRANDED ROOTS.  xplornet.com serves mail on xplore.net, so the true
-#      primary (imap.xplore.net) was never generated - only the stale
-#      imap.xplornet.com legacy host was ever dialled. Live trace: 4/4 hosts
-#      resolved, every rung timed out, because the authoritative endpoint was
-#      never attempted.
-#   2. NUMBERED / VARIANT PREFIXES.  imap3.zoominternet.net, mail2.tds.net,
-#      imap4.<isp>.net. The old tuple stopped at imap./mail./webmail.
+#   1. REBRANDED ROOTS.  xplornet.com serves mail on xplore.net.
+#   2. NUMBERED / VARIANT PREFIXES.  imap3.zoominternet.net, mail2.tds.net.
 #   3. BARE-DOMAIN LEGACY HOSTS.  Several small hosts answer IMAP/POP on the
-#      apex itself (xpertikus.com). Every old guess carried a prefix.
+#      apex itself (xpertikus.com).
 #
-# The merge keeps v13.11's guarantees and adds a fourth: the candidates most
-# likely to BE the endpoint are inserted first, so they survive the
-# MAX_HOSTS slice instead of being buried under a tail of alternates.
+# v13.14 additionally reorders: LOCAL-PRIORITY -> other local -> FOREIGN, so the
+# domain's own servers are dialled BEFORE imap.gmail.com / outlook.office365.com.
 
-# Priority order matters - entries most likely to be the real endpoint come
-# first. "" is the apex (a real endpoint for some hosts, and explicitly named
-# as a legacy host by the operator).
+# Priority local names - the domain's own most-likely endpoints, placed BEFORE
+# everything else so they can never be sliced off by the MAX_HOSTS cap.
+_LOCAL_PRIORITY_IMAP = ("imap.", "mail.", "email.", "")
+_LOCAL_PRIORITY_POP = ("pop.", "pop3.", "")
+
+# Full domain-local guess set (used for classification / long tail).
 _DOMAIN_IMAP_GUESS = (
     "imap.", "mail.", "", "imap3.", "imaps.", "imap2.",
-    "webmail.", "mail2.", "imap4.", "correo.",
+    "webmail.", "mail2.", "imap4.", "correo.", "email.", "secure.", "zimbra.",
 )
 _DOMAIN_POP_GUESS = (
     "pop.", "pop3.", "", "pop3s.", "mail.", "pop2.", "pop4.", "mail2.",
@@ -673,8 +681,6 @@ _DOMAIN_POP_GUESS = (
 # Rebranded / alternate registrable roots.  A root maps to its siblings and
 # every sibling's service names are generated too, so a primary living on a
 # DIFFERENT domain (xplore.net for xplornet.com) finally gets attempted.
-# Add more rebrands here as they surface - a wrong entry only costs a resolving
-# probe, never an authoritative slot.
 _DOMAIN_ALIAS_ROOTS = {
     "xplornet.com": ("xplore.net",),
     "xplore.net":   ("xplornet.com",),
@@ -689,18 +695,27 @@ def _domain_roots(domain):
             roots.append(alt)
     return roots
 
+def _is_local_domain_host(host, domain):
+    """True when host is the domain / an alias root, or sits under either."""
+    h = (host or "").lower().strip()
+    if not h:
+        return False
+    for root in _domain_roots(domain):
+        if h == root or h.endswith("." + root):
+            return True
+    return False
+
 def _guess_candidates(domain, prefixes):
     """Every '<prefix><root>' for the domain AND its alias roots that RESOLVES.
 
-    Alias-root names are produced first (a rebrand's live primary), then the
-    domain's own names, each in the caller's prefix-priority order.
+    The domain's OWN root is walked first (v13.14) so its names can never be
+    pushed out of the slice by a rebrand, then any alias root.
     """
     out = []
     roots = _domain_roots(domain)
     if not roots:
         return out
-    ordered_roots = roots[1:] + roots[:1]        # alias roots first, then own
-    for root in ordered_roots:
+    for root in roots:
         for pfx in prefixes:
             cand = f"{pfx}{root}" if pfx else root
             if cand and cand not in out and host_resolves(cand):
@@ -719,34 +734,42 @@ def _is_plain_domain_guess(host, domain, prefixes):
     return any(h == f"{p}{d}" for p in prefixes if p)
 
 def merge_domain_guesses(servers, domain):
-    """Insert the domain's own AND alias-root resolving service names into a
-    curated provider answer.
+    """Insert the domain's own AND alias-root resolving service names, ordered
+    LOCAL-PRIORITY -> other local -> FOREIGN.
 
     Guarantees:
-      1. Authoritative curated hosts stay FIRST, in curated order.
+      1. The domain's own most-likely endpoints (imap./mail./email./apex) come
+         FIRST, so they survive the MAX_HOSTS slice.
       2. Only candidates that actually RESOLVE are inserted - a dud costs no
          budget and cannot inflate the per-account window.
       3. Idempotent - safe to call at more than one layer.
-      4. High-value candidates (alias primary, own primary, apex) are placed
-         BEFORE the long tail of alternates so they survive the MAX_HOSTS slice.
+      4. FOREIGN names (provider endpoints, universal fallbacks, family hosts)
+         come LAST: a foreign server's generic "Invalid credentials" is not the
+         domain's verdict and must not outrank the domain's own servers.
     """
     if not servers or not domain:
         return servers
 
     out = dict(servers)
-    for key, prefixes in (("imap", _DOMAIN_IMAP_GUESS),
-                          ("pop", _DOMAIN_POP_GUESS),
-                          ("pop3", _DOMAIN_POP_GUESS)):
+    for key, priority, _long in (("imap", _LOCAL_PRIORITY_IMAP, _DOMAIN_IMAP_GUESS),
+                                 ("pop", _LOCAL_PRIORITY_POP, _DOMAIN_POP_GUESS),
+                                 ("pop3", _LOCAL_PRIORITY_POP, _DOMAIN_POP_GUESS)):
         hosts = [h for h in (out.get(key) or []) if h]
         if not hosts:
             continue
 
-        # Split what we were given: real endpoints first, our own guesses second.
-        authoritative = [h for h in hosts if not _is_plain_domain_guess(h, domain, prefixes)]
-        already_guessed = [h for h in hosts if _is_plain_domain_guess(h, domain, prefixes)]
+        local_priority = _guess_candidates(domain, priority)
+        priority_set = set(local_priority)
+
+        local_other = [h for h in hosts
+                       if h not in priority_set and _is_local_domain_host(h, domain)]
+        local_other_set = set(local_other)
+
+        foreign = [h for h in hosts
+                   if h not in priority_set and h not in local_other_set]
 
         merged = []
-        for h in authoritative + _guess_candidates(domain, prefixes) + already_guessed:
+        for h in local_priority + local_other + foreign:
             if h and h not in merged:
                 merged.append(h)
         out[key] = merged
@@ -1061,8 +1084,9 @@ def conf(domain):
     """Full server config for a domain.
 
     Known providers are instant; everything else goes through cached discovery.
-    v13.12: EVERY curated answer is passed through merge_domain_guesses() so the
-    domain's own AND alias-root resolving service names are inserted.
+    v13.12/v13.14: EVERY curated answer is passed through merge_domain_guesses()
+    so the domain's own AND alias-root resolving service names are inserted, in
+    LOCAL-PRIORITY -> other local -> FOREIGN order.
     """
     domain = (domain or "").lower().strip()
     if not domain:
