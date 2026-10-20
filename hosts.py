@@ -3,16 +3,16 @@ hosts.py
 ========
 One host table. Primary first, backup second, with SRV/autoconfig/MX discovery.
 
-v13.5 changes
+v13.6 changes
 -------------
-* rank_hosts() now sorts RESOLVES first, then tier. Previously tier dominated,
-  so three dead 'imap.<domain>' guesses filled the MAX_HOSTS_PER_DOMAIN slice
-  and pushed the real provider endpoint (imap.gmail.com / imap.gmx.net) out of
-  the plan — which is why the direct retry kept landing on pop.gmx.net /
-  pop.gmail.com instead of an IMAP host.
+* smtp_candidates() now consults SMTP_DIRECT and MX_PROVIDER_MAP first, so the
+  SMTP pre-check hits the provider's real endpoint (smtp.freenet.de, mail.gmx.net,
+  securesmtp.t-online.de) instead of guessing mail.<domain> and timing out.
+* rank_hosts() sorts RESOLVES first, then tier, so three dead 'imap.<domain>'
+  guesses can never fill the MAX_HOSTS_PER_DOMAIN slice and push the real
+  provider endpoint (imap.gmail.com / imap.gmx.net) out of the plan.
 * freenet / gmx / web.de / t-online / posteo added to MX_PROVIDER_MAP so the
   MX alone is enough to find the provider's own endpoint.
-* smtp_candidates() added for the SMTP failed check.
 """
 
 import os
@@ -141,6 +141,43 @@ COUNTRY = {
     "nc-online.de": ["imap.nc-online.de"],
     "cogeco.ca": ["imap.cogeco.ca"],
     "sympatico.ca": ["imap.sympatico.ca"],
+}
+
+# Explicit SMTP endpoints for the providers whose SMTP host is NOT derived from
+# their IMAP host. Checked before every guess.
+SMTP_DIRECT = {
+    "freenet.de": ["smtp.freenet.de", "mail.freenet.de"],
+    "gmx.de": ["mail.gmx.net", "smtp.gmx.net"],
+    "gmx.net": ["mail.gmx.net", "smtp.gmx.net"],
+    "web.de": ["smtp.web.de", "mail.web.de"],
+    "t-online.de": ["securesmtp.t-online.de"],
+    "posteo.de": ["smtp.posteo.de"],
+    "mailbox.org": ["smtp.mailbox.org"],
+    "strato.de": ["smtp.strato.de"],
+    "ionos.de": ["smtp.ionos.de"],
+    "1und1.de": ["smtp.ionos.de"],
+    "arcor.de": ["mail.arcor.de"],
+    "freenet.de ": ["smtp.freenet.de"],
+    "netcourrier.com": ["smtp.netcourrier.com", "mail.netcourrier.com"],
+    "bbox.fr": ["smtp.bbox.fr"],
+    "sfr.fr": ["smtp.sfr.fr"],
+    "orange.fr": ["smtp.orange.fr"],
+    "free.fr": ["smtp.free.fr"],
+    "laposte.net": ["smtp.laposte.net"],
+    "tin.it": ["send.tin.it", "mail.tin.it"],
+    "libero.it": ["smtp.libero.it"],
+    "virgilio.it": ["smtp.virgilio.it"],
+    "tiscali.it": ["smtp.tiscali.it"],
+    "earthlink.net": ["smtpauth.earthlink.net", "mail.earthlink.net"],
+    "comcast.net": ["smtp.comcast.net"],
+    "cox.net": ["smtp.cox.net"],
+    "optonline.net": ["mail.optonline.net"],
+    "cogeco.ca": ["smtp.cogeco.ca"],
+    "sympatico.ca": ["smtp.sympatico.ca"],
+    "bluewin.ch": ["smtpauths.bluewin.ch"],
+    "seznam.cz": ["smtp.seznam.cz"],
+    "naver.com": ["smtp.naver.com"],
+    "qq.com": ["smtp.qq.com"],
 }
 
 DISPOSABLE_PARTS = (
@@ -530,15 +567,33 @@ def _dns_resolve(name, rdtype):
             return []
 
 
+_mx_cache = {}
+_mx_lock = threading.Lock()
+_MX_TTL = 600
+
+
 def resolve_mx(domain):
-    records = _dns_resolve(domain, "MX")
-    if not records:
+    domain = (domain or "").lower().strip()
+    if not domain:
         return []
-    try:
-        records = sorted(records, key=lambda r: r.preference)
-    except Exception:
-        pass
-    return _dedupe([str(r.exchange).rstrip(".").lower() for r in records])
+    now = time.time()
+    with _mx_lock:
+        hit = _mx_cache.get(domain)
+    if hit and now - hit[0] < _MX_TTL:
+        return list(hit[1])
+
+    records = _dns_resolve(domain, "MX")
+    out = []
+    if records:
+        try:
+            records = sorted(records, key=lambda r: r.preference)
+        except Exception:
+            pass
+        out = _dedupe([str(r.exchange).rstrip(".").lower() for r in records])
+
+    with _mx_lock:
+        _mx_cache[domain] = (now, out)
+    return out
 
 
 def resolve_srv(name):
@@ -822,28 +877,48 @@ def get_mx_host(domain):
 
 
 def smtp_candidates(domain):
-    """SMTP endpoints for the SMTP failed check (never raises)."""
+    """SMTP endpoints for the SMTP pre-check (never raises).
+
+    Resolution order:
+      1. SMTP_DIRECT    - hand-checked endpoint for providers whose SMTP host
+                          cannot be derived from their IMAP host.
+      2. MX provider    - the smtp_host column of MX_PROVIDER_MAP.
+      3. known IMAP host - imap.<d> / secureimap.<d> rewritten to smtp.<d>.
+      4. generic guesses - smtp.<d>, mail.<d>, send.<d>, <d>.
+    """
     domain = (domain or "").lower().strip()
     if not domain:
         return []
     if domain in ZERO_ACCESS:
         return []
+
+    out = []
+
+    for h in SMTP_DIRECT.get(domain, []):
+        if h not in out:
+            out.append(h)
+
+    if not out:
+        for m in resolve_mx(domain)[:2]:
+            pair = _provider_from_mx(m)
+            if pair and pair[2] and pair[2] not in out:
+                out.append(pair[2])
+                break
+
     known = COUNTRY.get(domain)
     if known:
-        out = []
         for h in known:
-            for pfx in ("smtp.", "mail."):
-                cand = re.sub(r"^(imap|imaps|pop|pop3|secureimap|securepop)\.", pfx, h)
-                if cand not in out:
-                    out.append(cand)
-        for pfx in _SMTP_PREFIXES:
-            h = f"{pfx}{domain}"
-            if h not in out:
-                out.append(h)
-        return rank_hosts(_dedupe(out), domain, probe=False)[:3]
+            cand = re.sub(r"^(imap|imaps|pop|pop3|secureimap|securepop)\.", "smtp.", h)
+            if cand not in out:
+                out.append(cand)
 
-    found = discover_hosts(domain)
-    return (found.get("smtp") or [])[:3]
+    for pfx in _SMTP_PREFIXES:
+        h = f"{pfx}{domain}"
+        if h not in out:
+            out.append(h)
+
+    ranked = rank_hosts(_dedupe(out), domain, probe=False)
+    return ranked[:3] if ranked else _dedupe(out)[:3]
 
 
 def conf(domain):
