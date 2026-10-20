@@ -1,9 +1,33 @@
 """
-Mega Ultimate Mail Checker — v13.15
+Mega Ultimate Mail Checker — v13.16
 ===================================
 Complete rewrite. SMTP reachability is an OPT-IN pre-check stage (never inside
 the validator), status classification actually works, and every direct-connection
 line carries the real egress IP / region / country / VPN state.
+
+v13.16 changes  (legacy 143 starvation + 168s wall time + RBL ambiguity)
+------------------------------------------------------------------------
+* CRITICAL FIX — THE LEGACY 143/110 RUNGS ARE NO LONGER SKIPPED.  A 993 timeout
+  set timed_out_hosts, and the legacy sweep then skipped that host's 143 rung
+  with "Skip STARTTLS <host>:143 (implicit TLS already timed out)".  Because
+  143 is a DIFFERENT PORT, a filtered 993 says nothing about it - yet on an
+  all-timeout domain (xpertikus.com, tds.net) EVERY 143 rung was skipped, so
+  the reserved legacy tail slice was spent doing literally nothing.  The skip
+  is gone: a host whose 993 timed out (or was refused) is still dialled on
+  143/110, which is exactly where a port-filtered server answers.
+* SLOWNESS FIX — THE BUDGET FLOOR IS LOWERED.  The old floor
+  (len(primary_plan) * max(TIMEOUT,12) * 2) forced 168s on a 7-rung plan even
+  when the Deadline slider said 43s, so a single all-timeout account took
+  ~3 minutes.  The floor is now one proxy sweep + the reserved legacy tail +
+  one direct sweep, at a per-rung cost capped at 9s: 7 rungs -> ~105s.
+* RBL RESTRICTION IS CLASSIFIED.  "Auth-Status: RBL Restriction:
+  https://lookup.abusix.com/..." used to match nothing, land in UNKNOWN and
+  fall through to CONNECTION_FAILED with no explanation.  It is now its own
+  status (status.RBL_BLOCKED), retained as a fallback verdict, shown in its
+  own bucket and in the ZIP - so "server blocked our IP" is never confused
+  with "wrong password".
+* The terminal CONNECTION_FAILED detail now states that the password could not
+  be tested, so an unreachable domain is distinguishable from a bad password.
 
 v13.15 changes  (APP must try the OWN host + pattern before it finalises)
 ------------------------------------------------------------------------
@@ -291,7 +315,7 @@ try:
     from status import (
         VALID, WRONG, WRONG_PASSWORD, APP, NEED_APP_PASSWORD,
         FAILED, CONNECTION_FAILED, SKIP, SKIPPED_COOLDOWN, UNKNOWN,
-        RETRY, RETRY_LATER, SMTP_FAILED, DNS_FAILED,
+        RETRY, RETRY_LATER, RBL, RBL_BLOCKED, SMTP_FAILED, DNS_FAILED,
         ALL_STATUSES as ST_ALL, LABELS as ST_LABELS, COLORS as ST_COLORS,
         PRIORITY as ST_PRIORITY,
         classify_error as st_classify, is_proxy_level_error as st_proxy_level,
@@ -310,26 +334,31 @@ except Exception as _status_err:
     SKIP = SKIPPED_COOLDOWN = "skipped_cooldown"
     UNKNOWN = "unknown"
     RETRY = RETRY_LATER = "retry_later"
+    RBL = RBL_BLOCKED = "rbl_blocked"
     SMTP_FAILED = "smtp_failed"
     DNS_FAILED = "dns_failed"
-    ST_ALL = [VALID, WRONG_PASSWORD, NEED_APP_PASSWORD, RETRY_LATER, SMTP_FAILED,
-              DNS_FAILED, CONNECTION_FAILED, UNKNOWN, SKIPPED_COOLDOWN]
+    ST_ALL = [VALID, WRONG_PASSWORD, NEED_APP_PASSWORD, RETRY_LATER, RBL_BLOCKED,
+              SMTP_FAILED, DNS_FAILED, CONNECTION_FAILED, UNKNOWN, SKIPPED_COOLDOWN]
     ST_LABELS = {s: s.upper() for s in ST_ALL}
     ST_COLORS = {
         VALID: "#22c55e", WRONG_PASSWORD: "#ef4444", CONNECTION_FAILED: "#eab308",
-        NEED_APP_PASSWORD: "#3b82f6", RETRY_LATER: "#ffffff", SMTP_FAILED: "#a855f7",
-        DNS_FAILED: "#f97316", UNKNOWN: "#94a3b8", SKIPPED_COOLDOWN: "#a78bfa",
+        NEED_APP_PASSWORD: "#3b82f6", RETRY_LATER: "#ffffff", RBL_BLOCKED: "#facc15",
+        SMTP_FAILED: "#a855f7", DNS_FAILED: "#f97316", UNKNOWN: "#94a3b8",
+        SKIPPED_COOLDOWN: "#a78bfa",
     }
     # Lower is better. APP outranks WRONG so a specific app-password signal is
     # never masked by a generic auth rejection on the same account.
     ST_PRIORITY = {
-        VALID: 0, NEED_APP_PASSWORD: 1, WRONG_PASSWORD: 2, RETRY_LATER: 3,
-        SMTP_FAILED: 4, DNS_FAILED: 5, CONNECTION_FAILED: 6, UNKNOWN: 7, SKIPPED_COOLDOWN: 8,
+        VALID: 0, NEED_APP_PASSWORD: 1, WRONG_PASSWORD: 2, RBL_BLOCKED: 3,
+        RETRY_LATER: 4, SMTP_FAILED: 5, DNS_FAILED: 6, CONNECTION_FAILED: 7,
+        UNKNOWN: 8, SKIPPED_COOLDOWN: 9,
     }
 
     _FB_APP = ("app password", "application-specific", "basic authentication is disabled",
                "web browser", "via your web browser", "2fa", "mfa", "two-factor",
                "enable imap", "login-disabled")
+    _FB_RBL = ("rbl restriction", "rbl", "abusix", "dnsbl", "spamhaus",
+               "blacklist", "blacklisted", "ip blocked")
     _FB_DNS = ("does not resolve", "name or service not known", "gaierror", "getaddrinfo")
     _FB_RETRY = ("lookup failed", "could not be routed", "temporarily", "too many",
                  "blacklisted", "rate limit", "throttl", "try again", "unavailable")
@@ -347,7 +376,6 @@ except Exception as _status_err:
                  "bad username", "bad password", "logon failure",
                  "username and password not accepted", "user rejected", "password rejected",
                  "invalid token", "expired token", "internal server error")
-    # v13.14 — whole-message bare auth tokens ("LOGIN") are a rejection.
     _FB_BARE = ("login", "logon", "auth", "authenticate", "authentication",
                 "sign in", "signin", "sign-in", "credentials", "invalid")
 
@@ -355,7 +383,8 @@ except Exception as _status_err:
         t = (raw or "").lower()
         if t.strip().rstrip(".!:,;").strip() in _FB_BARE:
             return WRONG_PASSWORD
-        for table, val in ((_FB_APP, NEED_APP_PASSWORD), (_FB_WRONG_STRONG, WRONG_PASSWORD),
+        for table, val in ((_FB_APP, NEED_APP_PASSWORD), (_FB_RBL, RBL_BLOCKED),
+                           (_FB_WRONG_STRONG, WRONG_PASSWORD),
                            (_FB_DNS, DNS_FAILED), (_FB_RETRY, RETRY_LATER),
                            (_FB_CONN, CONNECTION_FAILED), (_FB_WRONG, WRONG_PASSWORD)):
             if any(n in t for n in table):
@@ -447,7 +476,7 @@ def default_theme() -> dict:
         "bg": p["bg"], "panel": p["panel"], "text": p["text"],
         "radius": 14, "glow": True, "animate": True, "glass": True,
         "colorize_logs": True,
-        "hero_title": "⚡ Mega Ultimate Mail Checker v13.15",
+        "hero_title": "⚡ Mega Ultimate Mail Checker v13.16",
         "hero_sub": "World-Coverage Edition — router-aware host ranking, rotating proxy pool, geo-call routing, retryable IP-block handling, optional SMTP pre-check, anti-spoofing post-auth validation.",
     }
 
@@ -659,7 +688,7 @@ def section_title(icon: str, title: str, subtitle: str = ""):
 # ---------------------------------------------------------------------------
 # LIVE EXECUTION STREAM COLOUR CONTRACT
 #   valid = green | wrong = red | connection failed = yellow
-#   app password / 2FA = blue | RETRY_LATER = white
+#   app password / 2FA = blue | RETRY_LATER = white | RBL blocked = amber
 # ---------------------------------------------------------------------------
 TAG_COLORS = {
     "VALID": "#22c55e",
@@ -667,6 +696,7 @@ TAG_COLORS = {
     "CONNECTION_FAILED": "#eab308",
     "NEED_APP_PASSWORD": "#3b82f6",
     "RETRY_LATER": "#ffffff",
+    "RBL_BLOCKED": "#facc15",
     "SMTP_FAILED": "#a855f7",
     "DNS_FAILED": "#f97316",
     "UNKNOWN": "#94a3b8",
@@ -677,8 +707,9 @@ TAG_COLORS = {
 
 def _line_color(line: str) -> str:
     up = str(line).upper()
-    for tag in ("SKIPPED_COOLDOWN", "NEED_APP_PASSWORD", "WRONG_PASSWORD", "CONNECTION_FAILED",
-                "RETRY_LATER", "SMTP_FAILED", "DNS_FAILED", "VALID", "UNKNOWN", "EXCEPTION", "ERROR"):
+    for tag in ("SKIPPED_COOLDOWN", "NEED_APP_PASSWORD", "RBL_BLOCKED", "WRONG_PASSWORD",
+                "CONNECTION_FAILED", "RETRY_LATER", "SMTP_FAILED", "DNS_FAILED",
+                "VALID", "UNKNOWN", "EXCEPTION", "ERROR"):
         if f"[{tag}]" in up:
             return TAG_COLORS.get(tag, "#cbd5e1")
     if "[CLASSIFIED: VALID]" in up:
@@ -687,6 +718,8 @@ def _line_color(line: str) -> str:
         return TAG_COLORS["WRONG_PASSWORD"]
     if "[CLASSIFIED: NEED_APP_PASSWORD]" in up:
         return TAG_COLORS["NEED_APP_PASSWORD"]
+    if "[CLASSIFIED: RBL_BLOCKED]" in up:
+        return TAG_COLORS["RBL_BLOCKED"]
     if "[CLASSIFIED: RETRY_LATER]" in up:
         return TAG_COLORS["RETRY_LATER"]
     if "[CLASSIFIED: SMTP_FAILED]" in up:
@@ -822,7 +855,7 @@ if "valid_results" not in str_lit.session_state:
     str_lit.session_state.clean_valid_count = len(loaded_valid)
     str_lit.session_state.run_valid_count = len(loaded_valid)
 for _k in ("wrong_results", "need_app_results", "conn_results", "retry_results",
-           "smtp_results", "dns_results", "skip_results",
+           "rbl_results", "smtp_results", "dns_results", "skip_results",
            "report_entries", "log_lines", "startup_entries",
            "pre_dns_failed", "pre_smtp_failed"):
     if _k not in str_lit.session_state:
@@ -2565,6 +2598,7 @@ if raw_text:
         ("❌ Wrong Password Found", "wrong_results"),
         ("🔐 App Password / 2FA Found", "need_app_results"),
         ("🕓 RETRY_LATER Found", "retry_results"),
+        ("🚫 RBL Blocked Found", "rbl_results"),
         ("🔌 Connection Failed Found", "conn_results"),
     ]
 
@@ -2794,11 +2828,7 @@ def _is_local_domain_host(host, domain):
     return False
 
 def _guess_candidates(domain, prefixes):
-    """Every '<prefix><root>' for the domain AND its alias roots that RESOLVES.
-
-    The domain's OWN root is walked first (v13.14) so its names can never be
-    pushed out of the slice by a rebrand, then any alias root.
-    """
+    """Every '<prefix><root>' for the domain AND its alias roots that RESOLVES."""
     out = []
     roots = _domain_roots(domain)
     if not roots:
@@ -2811,8 +2841,7 @@ def _guess_candidates(domain, prefixes):
     return out
 
 def _is_plain_domain_guess(host, domain, prefixes):
-    """True when host is just '<prefix><domain>' / the bare domain - i.e. a name
-    WE generate, not an authoritative provider endpoint."""
+    """True when host is just '<prefix><domain>' / the bare domain."""
     h = (host or "").lower().strip()
     d = (domain or "").lower().strip()
     if not h or not d:
@@ -3175,8 +3204,10 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, 
             v13.15 — priority-aware: a specific app-password signal (1) must never
             be masked by a generic auth rejection (2) collected for the same
             account, in either order.
+            v13.16 — RBL_BLOCKED is retained too (priority 3), so an IP-reputation
+            block is never reported as a bare CONNECTION_FAILED.
             """
-            if st_val not in (VALID, WRONG, APP):
+            if st_val not in (VALID, WRONG, APP, RBL):
                 return
             cur = best_verdict["status"]
             if cur is None or ST_PRIORITY.get(st_val, 99) < ST_PRIORITY.get(cur, 99):
@@ -3207,8 +3238,7 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, 
             trace_logs.append(
                 f"Fallback host '{domain}' force-included as a final rung (apex resolves).")
 
-        # v13.14 — which hosts are the DOMAIN'S OWN? A verdict from a FOREIGN
-        # fallback is not the domain's verdict.
+        # v13.14 — which hosts are the DOMAIN'S OWN?
         _local_roots = tuple(_domain_roots(domain))
 
         def _is_local_host(h):
@@ -3222,8 +3252,7 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, 
 
         domain_local_hosts = {h for h in (imap_hosts + pop_hosts) if _is_local_host(h)}
 
-        # v13.15 — every host actually dialled, so "own host already attempted"
-        # is a fact rather than an assumption.
+        # v13.15 — every host actually dialled.
         tried_hosts = set()
 
         trace_logs.append(f"Host order -> IMAP {imap_hosts} | POP {pop_hosts}")
@@ -3256,25 +3285,32 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, 
             trace_logs.append("No candidate hosts for this domain.")
             return None, FAILED, "no candidate hosts", None, trace_logs
 
-        work_floor = len(primary_plan) * max(configured_to, 12.0) * 2.0
+        # v13.16 — BUDGET FLOOR LOWERED.
+        # The old floor was len(primary_plan) * max(TIMEOUT, 12) * 2, which forced
+        # 168s on a 7-rung plan even when the Deadline slider said 43s, so a single
+        # all-timeout account took ~3 minutes.  The floor is now one proxy sweep +
+        # the reserved legacy tail + one direct sweep, at a per-rung cost capped at
+        # 9s (a timed-out rung is abandoned by its phase deadline anyway).
+        rung_cost = max(5.0, min(configured_to, 9.0))
+        work_floor = (len(primary_plan) * rung_cost * 1.5) + 10.0
         budget = max(12.0, float(CFG.get("ACCOUNT_DEADLINE", 45)) * 0.95)
         if work_floor > budget:
             trace_logs.append(
                 f"Budget floored to fit the work: {work_floor:.0f}s "
-                f"({len(primary_plan)} rung(s) x {max(configured_to, 12.0):.0f}s x 2) "
+                f"({len(primary_plan)} rung(s) x {rung_cost:.0f}s x 1.5 + 10s) "
                 f"instead of the {budget:.0f}s the Deadline slider allows.")
             budget = work_floor
 
         # v13.14 — reserve the TAIL of each phase for the legacy 143/110 plan.
-        proxy_deadline = t_start + (budget * 0.55)
+        # v13.16 — the legacy tail is widened (20%/22%) now that the 143 rungs
+        # actually RUN instead of being skipped.
+        proxy_deadline = t_start + (budget * 0.60)
         proxy_primary_deadline = t_start + (budget * 0.40)
         hard_deadline = t_start + budget
-        direct_primary_deadline = t_start + (budget * 0.80)
+        direct_primary_deadline = t_start + (budget * 0.78)
         trace_logs.append(
-            f"Account window {budget:.0f}s -> proxy {budget * 0.55:.0f}s / direct {budget * 0.45:.0f}s "
+            f"Account window {budget:.0f}s -> proxy {budget * 0.60:.0f}s / direct {budget * 0.40:.0f}s "
             f"(legacy 143/110 rungs hold a reserved tail slice of each phase).")
-
-        timed_out_hosts = set()
 
         def _is_timeout(err):
             s = str(err).lower()
@@ -3315,10 +3351,10 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, 
                     trace_logs.append(f"{label}: window reached; stopping this pass.")
                     break
 
-                if tls_mode in ("starttls", "plain") and server in timed_out_hosts:
-                    trace_logs.append(f"{px_tag(px_used)} Skip {tls_mode.upper()} {server}:{port} (implicit TLS already timed out)")
-                    continue
-
+                # v13.16 — NO MORE "implicit TLS already timed out" SKIP.
+                # 143/110 is a DIFFERENT PORT: a filtered 993 says nothing about
+                # it. Skipping it here starved every 143 rung on all-timeout
+                # domains (xpertikus.com, tds.net) and wasted the reserved slice.
                 tried_hosts.add(server)
 
                 rotations_left = MAX_ROTATIONS if (allow_rotate and px_used and proxy_mode != "off") else 0
@@ -3360,8 +3396,6 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, 
 
                         except (socket.timeout, TimeoutError) as to_err:
                             err_text = str(to_err)
-                            if proto == "IMAP" and tls_mode == "ssl":
-                                timed_out_hosts.add(server)
                             had_net = True
                             net_failed_hosts.add(server)
                             record_proxy_attempt(px_used, success=False, is_network_error=True)
@@ -3404,6 +3438,11 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, 
                                     trace_logs.append(f"{px_tag(px_used)} 'Lookup failed' on {server}:{port} -> advancing to next host (no proxy rotation)")
                                 else:
                                     rotate_now = True
+                            elif st_val == RBL:
+                                # v13.16 — IP-reputation block: not a password verdict,
+                                # not a reachability failure. Note it and move on.
+                                trace_logs.append(f"{px_tag(px_used)} RBL block on {server}:{port} -> IP flagged by server, advancing")
+                                server_level_fail = True
                             elif u_idx + 1 < len(users) and st_val in (WRONG, UNKNOWN):
                                 trace_logs.append(f"{px_tag(px_used)} Rejected as '{user}' -> retrying same host as local-part '{users[u_idx + 1]}'")
                                 continue
@@ -3424,8 +3463,6 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, 
                             st_val = classify_error(e, domain)
                             proxy_level = _is_proxy_level_error(err_text)
                             if _is_timeout(e):
-                                if proto == "IMAP" and tls_mode == "ssl":
-                                    timed_out_hosts.add(server)
                                 had_net = True
                                 net_failed_hosts.add(server)
                             if st_val == FAILED:
@@ -3452,6 +3489,9 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, 
                                     trace_logs.append(f"{px_tag(px_used)} 'Lookup failed' on {server}:{port} -> advancing to next host (no proxy rotation)")
                                 else:
                                     rotate_now = True
+                            elif st_val == RBL:
+                                trace_logs.append(f"{px_tag(px_used)} RBL block on {server}:{port} -> IP flagged by server, advancing")
+                                server_level_fail = True
                             elif u_idx + 1 < len(users) and st_val in (WRONG, UNKNOWN):
                                 trace_logs.append(f"{px_tag(px_used)} Rejected as '{user}' -> retrying same host as local-part '{users[u_idx + 1]}'")
                                 continue
@@ -3570,7 +3610,7 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, 
         return None, RETRY, "retryable (proxy / IP-block / rate-limit)", None, trace_logs
     if not dns_ok:
         return None, DNS_FAILED, "Fast-fail DNS check failed: no host resolves locally", None, trace_logs
-    return None, FAILED, "all hosts failed", None, trace_logs
+    return None, FAILED, "all hosts unreachable (timeouts/refused) - password could not be tested", None, trace_logs
 
 # ============================================================================
 # EXECUTION TRIGGER
@@ -3583,6 +3623,7 @@ RESULT_ACTION_MODES = [
     ("❌ Wrong Password Found", "wrong_results"),
     ("🔐 App Password / 2FA Found", "need_app_results"),
     ("🕓 RETRY_LATER Found", "retry_results"),
+    ("🚫 RBL Blocked Found", "rbl_results"),
     ("🔌 Connection Failed Found", "conn_results"),
 ]
 
@@ -3664,6 +3705,7 @@ if start_engine_btn:
             str_lit.session_state.need_app_results = []
             str_lit.session_state.conn_results = []
             str_lit.session_state.retry_results = []
+            str_lit.session_state.rbl_results = []
             str_lit.session_state.smtp_results = list(str_lit.session_state.get("pre_smtp_failed", []))
             str_lit.session_state.dns_results = list(str_lit.session_state.get("pre_dns_failed", []))
             str_lit.session_state.skip_results = []
@@ -3690,6 +3732,7 @@ if start_engine_btn:
                 ("conn_results", "🔌 Connection Failed Found"),
                 ("need_app_results", "🔐 App Password / 2FA Found"),
                 ("retry_results", "🕓 RETRY_LATER Found"),
+                ("rbl_results", "🚫 RBL Blocked Found"),
                 ("smtp_results", "📮 SMTP Failed (pre-check)"),
                 ("dns_results", "🛰 DNS Failed (pre-check)"),
             ]
@@ -3718,8 +3761,8 @@ if start_engine_btn:
                     col = TAG_COLORS.get({
                         "valid_results": "VALID", "wrong_results": "WRONG_PASSWORD",
                         "conn_results": "CONNECTION_FAILED", "need_app_results": "NEED_APP_PASSWORD",
-                        "retry_results": "RETRY_LATER", "smtp_results": "SMTP_FAILED",
-                        "dns_results": "DNS_FAILED",
+                        "retry_results": "RETRY_LATER", "rbl_results": "RBL_BLOCKED",
+                        "smtp_results": "SMTP_FAILED", "dns_results": "DNS_FAILED",
                     }.get(key, ""), "#cbd5e1")
                     for ln in items[-250:]:
                         str_lit.markdown(
@@ -3791,6 +3834,8 @@ if start_engine_btn:
                                     str_lit.session_state.need_app_results.append(res["line"])
                                 elif st_val == RETRY:
                                     str_lit.session_state.retry_results.append(res["line"])
+                                elif st_val == RBL:
+                                    str_lit.session_state.rbl_results.append(res["line"])
                                 elif st_val == SMTP_FAILED:
                                     str_lit.session_state.smtp_results.append(res["line"])
                                 elif st_val == DNS_FAILED:
@@ -3819,6 +3864,7 @@ if start_engine_btn:
                                 need_len = len(str_lit.session_state.need_app_results)
                                 conn_len = len(str_lit.session_state.conn_results)
                                 retry_len = len(str_lit.session_state.retry_results)
+                                rbl_len = len(str_lit.session_state.rbl_results)
                                 smtp_len = len(str_lit.session_state.smtp_results)
                                 current_logs = list(str_lit.session_state.log_lines)
                                 current_reports = list(str_lit.session_state.report_entries)
@@ -3828,6 +3874,7 @@ if start_engine_btn:
                                     "conn_results": list(str_lit.session_state.conn_results),
                                     "need_app_results": list(str_lit.session_state.need_app_results),
                                     "retry_results": list(str_lit.session_state.retry_results),
+                                    "rbl_results": list(str_lit.session_state.rbl_results),
                                     "smtp_results": list(str_lit.session_state.smtp_results),
                                     "dns_results": list(str_lit.session_state.dns_results),
                                 }
@@ -3840,13 +3887,14 @@ if start_engine_btn:
                                 log_container.code("\n".join(current_logs), language="text")
 
                             with report_metrics_placeholder.container():
-                                r_col1, r_col2, r_col3, r_col4, r_col5, r_col6 = str_lit.columns(6)
+                                r_col1, r_col2, r_col3, r_col4, r_col5, r_col6, r_col7 = str_lit.columns(7)
                                 r_col1.metric("✅ Valid", valid_len)
                                 r_col2.metric("❌ Wrong", wrong_len)
                                 r_col3.metric("🔑 AppPass/2FA", need_len)
                                 r_col4.metric("🔌 Conn Failed", conn_len)
-                                r_col5.metric("🕓 RETRY_LATER", retry_len)
-                                r_col6.metric("📮 SMTP Failed", smtp_len)
+                                r_col5.metric("🚫 RBL", rbl_len)
+                                r_col6.metric("🕓 RETRY_LATER", retry_len)
+                                r_col7.metric("📮 SMTP Failed", smtp_len)
 
                             render_buckets(bucket_snapshot)
                             report_log_container.dataframe(pd.DataFrame(current_reports[::-1]), use_container_width=True, height=320)
@@ -3937,6 +3985,7 @@ if start_engine_btn:
             need_snapshot = list(str_lit.session_state.need_app_results)
             conn_snapshot = list(str_lit.session_state.conn_results)
             retry_snapshot = list(str_lit.session_state.retry_results)
+            rbl_snapshot = list(str_lit.session_state.rbl_results)
             smtp_snapshot = list(str_lit.session_state.smtp_results)
             dns_snapshot = list(str_lit.session_state.dns_results)
 
@@ -3950,6 +3999,7 @@ if start_engine_btn:
             need_path = os.path.join(CFG["RESULTS_DIR"], f"need_app_{stamp}.txt")
             failed_path = os.path.join(CFG["RESULTS_DIR"], f"failed_{stamp}.txt")
             retry_path = os.path.join(CFG["RESULTS_DIR"], f"retry_later_{stamp}.txt")
+            rbl_path = os.path.join(CFG["RESULTS_DIR"], f"rbl_blocked_{stamp}.txt")
             smtp_path = os.path.join(CFG["RESULTS_DIR"], f"smtp_failed_{stamp}.txt")
             dns_path = os.path.join(CFG["RESULTS_DIR"], f"dns_failed_{stamp}.txt")
             try:
@@ -3961,8 +4011,8 @@ if start_engine_btn:
             with file_write_lock:
                 for path, snap in ((valid_path, valid_snapshot), (wrong_path, wrong_snapshot),
                                    (need_path, need_snapshot), (failed_path, conn_snapshot),
-                                   (retry_path, retry_snapshot), (smtp_path, smtp_snapshot),
-                                   (dns_path, dns_snapshot)):
+                                   (retry_path, retry_snapshot), (rbl_path, rbl_snapshot),
+                                   (smtp_path, smtp_snapshot), (dns_path, dns_snapshot)):
                     with open(path, "w", encoding="utf-8") as f:
                         f.write(hdr)
                         f.write("\n".join(str(i) for i in snap) + ("\n" if snap else ""))
@@ -3985,6 +4035,7 @@ if start_engine_btn:
                                (need_path, os.path.basename(need_path)),
                                (failed_path, os.path.basename(failed_path)),
                                (retry_path, os.path.basename(retry_path)),
+                               (rbl_path, os.path.basename(rbl_path)),
                                (smtp_path, os.path.basename(smtp_path)),
                                (dns_path, os.path.basename(dns_path))):
                     if os.path.exists(p):
@@ -4017,6 +4068,7 @@ if str_lit.session_state.engine_has_run or load_persistent_valid_results():
         need_len_val = len(str_lit.session_state.need_app_results)
         conn_len_val = len(str_lit.session_state.conn_results)
         retry_len_val = len(str_lit.session_state.retry_results)
+        rbl_len_val = len(str_lit.session_state.rbl_results)
         smtp_len_val = len(str_lit.session_state.get("pre_smtp_failed", []))
         dns_len_val = len(str_lit.session_state.get("pre_dns_failed", []))
         valid_res_copy = list(str_lit.session_state.valid_results)
@@ -4033,6 +4085,7 @@ if str_lit.session_state.engine_has_run or load_persistent_valid_results():
             "🔌 Connection Failed Found": list(str_lit.session_state.conn_results),
             "🔐 App Password / 2FA Found": list(str_lit.session_state.need_app_results),
             "🕓 RETRY_LATER Found": list(str_lit.session_state.retry_results),
+            "🚫 RBL Blocked Found": list(str_lit.session_state.rbl_results),
             "🛰 DNS Failed (pre-check)": list(str_lit.session_state.get("pre_dns_failed", [])),
             "📮 SMTP Failed (pre-check)": list(str_lit.session_state.get("pre_smtp_failed", [])),
         }
@@ -4052,14 +4105,15 @@ if str_lit.session_state.engine_has_run or load_persistent_valid_results():
     if start_ts_copy and end_ts_copy:
         str_lit.info(f"⏱ **Session Timestamps:** Started **{start_ts_copy}** | Ended **{end_ts_copy}** | Duration **{duration_copy}**")
 
-    c1, c2, c3, c4, c5, c6, c7 = str_lit.columns(7)
+    c1, c2, c3, c4, c5, c6, c7, c8 = str_lit.columns(8)
     c1.metric("✅ Clean Valid", clean_count_val)
     c2.metric("❌ Wrong Password", wrong_len_val)
     c3.metric("🔑 App Password / 2FA", need_len_val)
     c4.metric("🔌 Connection Failed", conn_len_val)
-    c5.metric("🕓 RETRY_LATER", retry_len_val)
-    c6.metric("🛰 DNS Failed", dns_len_val)
-    c7.metric("📮 SMTP Failed", smtp_len_val)
+    c5.metric("🚫 RBL Blocked", rbl_len_val)
+    c6.metric("🕓 RETRY_LATER", retry_len_val)
+    c7.metric("🛰 DNS Failed", dns_len_val)
+    c8.metric("📮 SMTP Failed", smtp_len_val)
 
     for title, items in summary_buckets.items():
         with str_lit.expander(f"{title} ({len(items)})", expanded=False):
@@ -4125,7 +4179,7 @@ else:
                         for srv in imap_hosts:
                             msgs = read_mailbox_messages(acc_email, acc_pass, srv, proxy_str=mailbox_proxy, limit=max_msgs)
                             if msgs and not any("Error reading mailbox" in m for m in msgs):
-                                fetched_msgs, success_read = msgs, True
+                                fetched_msgs, success_msgs = msgs, True
                                 break
                             elif msgs:
                                 fetched_msgs = msgs
