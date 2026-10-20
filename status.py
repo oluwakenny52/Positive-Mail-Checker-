@@ -9,6 +9,11 @@ Exports BOTH naming conventions on purpose:
                                   CONNECTION_FAILED / RETRY_LATER / SMTP_FAILED / DNS_FAILED
 Values are identical, so the two never drift.
 
+`ALL` and `ALL_STATUSES` are BOTH exported. app.py imports `ALL_STATUSES as ST_ALL`.
+Missing that alias used to throw the entire `from status import (...)` block in
+app.py, which silently swapped the real classifier for a stub that returned
+UNKNOWN for everything -- every auth error then logged "[Classified: unknown]".
+
 Every UI surface (Live Execution Stream colours, live per-status dropdowns,
 "Select category to inspect contents", "Engine Action Mode", Live Report Log &
 Analytics) reads from here.
@@ -46,6 +51,9 @@ ALL = [
     VALID, WRONG_PASSWORD, NEED_APP_PASSWORD, RETRY_LATER, SMTP_FAILED,
     DNS_FAILED, CONNECTION_FAILED, UNKNOWN, SKIPPED_COOLDOWN,
 ]
+
+# app.py does:  from status import (... ALL_STATUSES as ST_ALL ...)
+ALL_STATUSES = ALL
 
 LABELS = {
     VALID: "✅ Valid",
@@ -107,31 +115,42 @@ def is_failure(status):
 # --------------------------------------------------------------------------
 _APP_PASSWORD = (
     "application-specific password", "application specific password",
-    "app-specific password", "app password", "app-password",
+    "app-specific password", "app specific password", "app password",
+    "app-password", "apppassword",
     "basic authentication is disabled", "basic auth is disabled",
-    "imap access is disabled", "web login required",
-    "log in via your web browser", "login via web browser", "web browser",
-    "logindisabled", "login disabled", "two-factor", "2fa", "mfa",
-    "enable imap", "authentication is disabled",
+    "authentication is disabled", "authentication disabled",
+    "imap access is disabled", "imap access disabled", "imap disabled",
+    "web login required", "web login", "log in via your web browser",
+    "login via web browser", "web browser", "webmail required",
+    "logindisabled", "login disabled", "login-disabled", "login disabled",
+    "two-factor", "two factor", "2fa", "mfa", "otp required",
+    "enable imap", "enable less secure",
 )
 
 _DNS = (
-    "fast-fail dns check failed", "does not resolve", "name or service not known",
-    "nodename nor servname", "getaddrinfo failed", "no address associated",
-    "temporary failure in name resolution", "gaierror",
+    "fast-fail dns check failed", "does not resolve", "does not resolve locally",
+    "host does not resolve", "no candidate host resolves", "no host resolves",
+    "name or service not known", "nodename nor servname", "getaddrinfo failed",
+    "no address associated", "temporary failure in name resolution", "gaierror",
 )
 
 _RETRY = (
     "lookup failed", "could not be routed", "user could not be routed",
-    "could not route", "try again", "temporarily", "temporary", "server busy",
-    "server is busy", "too many connections", "too many failed attempts",
-    "too many login", "too many", "ip blacklisted", "blacklisted", "rate limit",
-    "ratelimit", "throttl", "greylist", "greylisted", "unavailable",
-    "maintenance", "over quota", "quota exceeded", "exceeded",
-    "internal server error", "system error", "please retry",
-    "resource temporarily unavailable", "connection limit", "[alert]",
+    "could not route", "cannot route", "try again", "try again later",
+    "temporarily", "temporary", "server busy", "server is busy",
+    "system busy", "server not available", "service not available",
+    "too many connections", "too many failed attempts", "too many login",
+    "too many simultaneous", "too many", "ip blacklisted", "blacklisted",
+    "rate limit", "ratelimit", "throttl", "greylist", "greylisted",
+    "unavailable", "maintenance", "over quota", "quota exceeded",
+    "exceeded", "internal server error", "system error", "please retry",
+    "resource temporarily unavailable", "connection limit", "limit exceeded",
 )
 
+# NOTE: "[alert]" is deliberately NOT here. Gmail answers
+#   "[ALERT] Invalid credentials (Failure)"  -> that is a WRONG password, and
+#   "[ALERT] Please log in via your web browser" -> that is an APP password.
+# Treating every [ALERT] as retryable mislabelled all of Gmail's auth failures.
 _CONN = (
     "timed out", "timeout", "connection refused", "connection reset",
     "connection closed", "connection aborted", "connectionrefusederror",
@@ -144,6 +163,7 @@ _CONN = (
     "certificate verify failed", "hostname mismatch", "certificate has expired",
     "self signed certificate", "self-signed certificate", "tlsv1",
     "proxy and direct fallback", "bad proxy format", "socks",
+    "transport endpoint", "connection lost",
 )
 
 _WRONG = (
@@ -211,6 +231,10 @@ def is_app_password_signal(raw):
 
 def is_dns_signal(raw):
     return _match(_norm(raw), _DNS)
+
+
+def is_auth_signal(raw):
+    return _match(_norm(raw), _WRONG)
 
 
 def display(status):
