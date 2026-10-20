@@ -1,66 +1,70 @@
 """
-Mega Ultimate Mail Checker — v13.8
+Mega Ultimate Mail Checker — v13.9
 ==================================
 Complete rewrite. SMTP reachability is an OPT-IN pre-check stage (never inside
 the validator), status classification actually works, and every direct-connection
 line carries the real egress IP / region / country / VPN state.
 
+v13.9 changes  (host-major ladder — stop starving host #2 and host #3)
+---------------------------------------------------------------------
+* CRITICAL FIX — LADDER ORDER. Proxy rotation used to happen INSIDE the per-host
+  loop, so a slow host #1 consumed the entire proxy window and hosts #2/#3 were
+  never attempted at all. Live evidence: imap.btinternet.com was hit 3x and
+  mail.btinternet.com / imap.gmail.com were never reached on the proxy pass;
+  mail.twc.com was hit twice and mobile.charter.net never reached.
+  The ladder is now HOST-MAJOR:
+    pass 1 — every host exactly once, NO rotation
+    pass 2 — only hosts that failed at network level, fresh proxy each, max 2
+  so a single pass always completes over the whole host list.
+* Per-attempt timeout is now derived from the LIVE window (left / rungs_about_to_
+  be_tried), not from a fixed divisor, so pass 1 always fits instead of overrunning
+  on host #1.
+* Legacy 143/110 rungs demoted to a separate fallback_plan so they can no longer
+  crowd out host #2 and host #3. POP 995 is promoted into the primary plan.
+* The DIRECT pass now sweeps ALL locally-resolving hosts (was capped at [:2]).
+* A connection-refused is HOST-level, not proxy-level — it no longer burns a
+  rotation. A read timeout likewise: TCP+TLS already completed, so the server
+  stalled on the greeting; that is the host, not the proxy.
+* "Per-account budget reached" now reports which window tripped and how much
+  was left, instead of always printing the full budget.
+* hosts.py: BT consumer mail (btinternet.com / bt.com / btopenworld.com /
+  talk21.com) is Yahoo-hosted, so it now maps to imap.mail.yahoo.com instead of
+  the legacy 'imap.<domain>' guess. Sky and Virgin Media get explicit endpoints.
+
 v13.8 changes  (verdict retention + budget rebalance + 407 breaker)
 -------------------------------------------------------------------
-* CRITICAL FIX — VERDICT RETENTION. check_account_sync now keeps a best_verdict
-  the first time ANY host hands back VALID / WRONG_PASSWORD / NEED_APP_PASSWORD.
+* CRITICAL FIX — VERDICT RETENTION. check_account_sync keeps a best_verdict the
+  first time ANY host hands back VALID / WRONG_PASSWORD / NEED_APP_PASSWORD.
   Previously a definitive auth answer was thrown away the moment the local-part
-  retry timed out: run_plan returned None, the ladder rotated on, and the account
-  was finally reported as CONNECTION_FAILED. That is exactly why rows with a
-  definitive answer landed in CONNECTION_FAILED, and why genuinely-valid accounts
-  that only answer over DIRECT also failed. best_verdict is returned at ladder
-  end, ahead of RETRY / DNS_FAILED / CONNECTION_FAILED, and ahead of the
-  critical-exception fallback too.
-* BUDGET REBALANCE. The proxy pass now gets 55% of the per-account budget (was
-  72%) so the DIRECT pass always keeps ~45% of the wall clock. Rotations per host
-  cut from 4 to 2 — the proxy pool no longer eats the budget before the direct
-  line is ever tried.
-* 407 BREAKER. 407 is treated as proxy-level, and after 3 consecutive 407s on the
-  same host the engine stops burning proxies on it and jumps straight to DIRECT
-  (the imap.sympatico.ca storm).
-* 'Lookup failed' now falls through to the NEXT HOST instead of rotating proxies
-  — it is a host routing miss, not a proxy fault.
-* vpn_state_label() only stamps VPN ON (auto) for explicit VPN brands / the
-  literal "vpn" token. Cloud / hosting ISPs (Google Cloud, Amazon, Hetzner,
-  DigitalOcean, m247, ...) no longer lie about being a VPN.
-* status.py: 'realmless login not allowed' is anchored in _WRONG via
-  _WRONG_STRONG, and the catch-all "error" token was dropped from _WRONG's tail
-  so it stops swallowing connection errors.
+  retry timed out. best_verdict is returned at ladder end, ahead of RETRY /
+  DNS_FAILED / CONNECTION_FAILED, and ahead of the critical-exception fallback.
+* BUDGET REBALANCE. The proxy pass gets 55% of the per-account budget (was 72%).
+* 407 BREAKER. After 3 consecutive 407s on the same host, jump straight to DIRECT.
+* 'Lookup failed' falls through to the NEXT HOST instead of rotating proxies.
+* vpn_state_label() only stamps VPN ON (auto) for explicit VPN brands / "vpn".
+* status.py: 'realmless login not allowed' anchored in _WRONG via _WRONG_STRONG,
+  and the catch-all "error" token dropped from _WRONG's tail.
 
 v13.7 changes
 -------------
 * SMTP pre-check is now OFF BY DEFAULT. The engine runs IMAP/POP only, so a run
-  starts instantly with no per-domain SMTP connect on the first pass. Flip the
-  checkbox in Advanced Control Rules to enable it.
+  starts instantly with no per-domain SMTP connect on the first pass.
 * The SMTP checkbox moved into the "Advanced Control Rules" slide-out section.
-* When enabled: direct-first probing (skips the proxy handshake), a wall-clock
-  budget of 45s for the whole pre-check, and 32 parallel workers. Anything still
-  unresolved when the budget expires is treated as "unknown" and falls through to
-  Ready to Check instead of hanging the page.
+* When enabled: direct-first probing, a 45s wall-clock budget for the pre-check,
+  and 32 parallel workers. Anything unresolved when the budget expires falls
+  through to Ready to Check instead of hanging the page.
 
 v13.6 changes
 -------------
 * CRITICAL FIX: status.py exports ALL_STATUSES again, so the real classifier is
   used. Previously the whole status import threw, the stub `st_classify()`
   returned UNKNOWN for everything, and every auth error was logged as
-  "[Classified: unknown]". That single bug was the source of most false failures.
+  "[Classified: unknown]".
 * CRITICAL FIX: the SMTP failed check no longer runs inside check_account_sync.
-  It used to burn ~36s of the 40s per-account budget before the ladder even
-  started, which produced "Per-account budget reached; stopping ladder" with zero
-  IMAP attempts and mass SMTP_FAILED / CONNECTION_FAILED results.
-* SMTP Failed is a PRE-CHECK bucket, displayed immediately AFTER DNS Failed in
-  the filter row, the category inspector and the Engine Action Mode.
+* SMTP Failed is a PRE-CHECK bucket, displayed immediately AFTER DNS Failed.
 * NEW: per-domain SMTP reachability cache (TTL 15 min).
-* direct connections now print the real egress IP | region | country | VPN state
-  on EVERY line (px_tag), not the bare word "direct".
-* VPN auto-detection from the egress ISP/org, so a phone-side VPN is visible.
-* Corrected per-account budget split now that SMTP is out of the validator.
-* Status taxonomy kept intact for both naming conventions.
+* direct connections print the real egress IP | region | country | VPN state.
+* VPN auto-detection from the egress ISP/org.
 
 NO hardcoded proxy IPs and NO faked geo table. Everything is derived from
 proxies.txt / Streamlit secrets / live DNS / live ip-api.
@@ -123,6 +127,15 @@ except Exception as _hosts_core_err:
         "msn.com": (["outlook.office365.com"], ["outlook.office365.com"]),
         "yahoo.com": (["imap.mail.yahoo.com"], ["pop.mail.yahoo.com"]),
         "ymail.com": (["imap.mail.yahoo.com"], ["pop.mail.yahoo.com"]),
+        # v13.9 — BT consumer mail is Yahoo-hosted.
+        "btinternet.com": (["imap.mail.yahoo.com"], ["pop.mail.yahoo.com"]),
+        "bt.com": (["imap.mail.yahoo.com"], ["pop.mail.yahoo.com"]),
+        "btopenworld.com": (["imap.mail.yahoo.com"], ["pop.mail.yahoo.com"]),
+        "talk21.com": (["imap.mail.yahoo.com"], ["pop.mail.yahoo.com"]),
+        "sky.com": (["imap.tools.sky.com"], ["imap.tools.sky.com"]),
+        "virginmedia.com": (["imap.virginmedia.com"], ["imap.virginmedia.com"]),
+        "ntlworld.com": (["imap.virginmedia.com"], ["imap.virginmedia.com"]),
+        "blueyonder.co.uk": (["imap.virginmedia.com"], ["imap.virginmedia.com"]),
         "aol.com": (["imap.aol.com"], ["pop.aol.com"]),
         "icloud.com": (["imap.mail.me.com"], ["pop.mail.me.com"]),
         "me.com": (["imap.mail.me.com"], ["pop.mail.me.com"]),
@@ -429,7 +442,7 @@ def default_theme() -> dict:
         "bg": p["bg"], "panel": p["panel"], "text": p["text"],
         "radius": 14, "glow": True, "animate": True, "glass": True,
         "colorize_logs": True,
-        "hero_title": "⚡ Mega Ultimate Mail Checker v13.8",
+        "hero_title": "⚡ Mega Ultimate Mail Checker v13.9",
         "hero_sub": "World-Coverage Edition — router-aware host ranking, rotating proxy pool, geo-call routing, retryable IP-block handling, optional SMTP pre-check, anti-spoofing post-auth validation.",
     }
 
@@ -2610,6 +2623,15 @@ PROVIDER_MAP = {
     "hotmail.com": {"imap": ["outlook.office365.com", "mail.hotmail.com"], "pop": ["outlook.office365.com"], "pop3": ["outlook.office365.com"]},
     "live.com": {"imap": ["outlook.office365.com", "mail.live.com"], "pop": ["outlook.office365.com"], "pop3": ["outlook.office365.com"]},
     "yahoo.com": {"imap": ["imap.mail.yahoo.com", "mail.yahoo.com"], "pop": ["pop.mail.yahoo.com"], "pop3": ["pop.mail.yahoo.com"]},
+    # v13.9 — BT consumer mail is Yahoo-hosted; 'imap.<domain>' stalls.
+    "btinternet.com": {"imap": ["imap.mail.yahoo.com"], "pop": ["pop.mail.yahoo.com"], "pop3": ["pop.mail.yahoo.com"]},
+    "bt.com": {"imap": ["imap.mail.yahoo.com"], "pop": ["pop.mail.yahoo.com"], "pop3": ["pop.mail.yahoo.com"]},
+    "btopenworld.com": {"imap": ["imap.mail.yahoo.com"], "pop": ["pop.mail.yahoo.com"], "pop3": ["pop.mail.yahoo.com"]},
+    "talk21.com": {"imap": ["imap.mail.yahoo.com"], "pop": ["pop.mail.yahoo.com"], "pop3": ["pop.mail.yahoo.com"]},
+    "sky.com": {"imap": ["imap.tools.sky.com"], "pop": ["imap.tools.sky.com"], "pop3": ["imap.tools.sky.com"]},
+    "virginmedia.com": {"imap": ["imap.virginmedia.com"], "pop": ["imap.virginmedia.com"], "pop3": ["imap.virginmedia.com"]},
+    "ntlworld.com": {"imap": ["imap.virginmedia.com"], "pop": ["imap.virginmedia.com"], "pop3": ["imap.virginmedia.com"]},
+    "blueyonder.co.uk": {"imap": ["imap.virginmedia.com"], "pop": ["imap.virginmedia.com"], "pop3": ["imap.virginmedia.com"]},
     "icloud.com": {"imap": ["imap.mail.me.com", "mail.icloud.com"], "pop": ["pop.mail.me.com"], "pop3": ["pop.mail.me.com"]},
     "naver.com": {"imap": ["imap.naver.com", "mail.naver.com"], "pop": ["pop.naver.com"], "pop3": ["pop.naver.com"]},
     "qq.com": {"imap": ["imap.qq.com", "mail.qq.com"], "pop": ["pop.qq.com"], "pop3": ["pop.qq.com"]},
@@ -3041,15 +3063,15 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, 
     # --- v13.8: VERDICT RETENTION ------------------------------------------
     # The FIRST definitive verdict any host hands back (VALID / WRONG_PASSWORD /
     # NEED_APP_PASSWORD) is kept for the whole account. A later timeout, a proxy
-    # rotation or a dead direct pass must never clobber it. Without this, a host
-    # that says "wrong password", followed by a local-part retry that times out,
-    # ended up as CONNECTION_FAILED.
+    # rotation or a dead direct sweep must never clobber it.
     best_verdict = {"status": None, "detail": ""}
     # --- v13.8: 407 STORM BREAKER ------------------------------------------
-    # 407 is proxy-level. After 3 consecutive 407s on the SAME host we stop
-    # burning proxies on it and go straight to the direct pass.
     force_direct = {"flag": False}
     host_407 = {}
+    # --- v13.9: ladder bookkeeping -----------------------------------------
+    net_failed_hosts = set()
+    MAX_ROTATIONS = 2
+
     try:
         if conf.get("type") == "zero_access":
             trace_logs.append("Architecture: Zero-Access / Bridge detected.")
@@ -3062,13 +3084,12 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, 
         max_hosts = max(1, int(CFG.get("MAX_HOSTS_PER_DOMAIN", 3)))
 
         # SMTP no longer competes for this budget — the ladder gets nearly all of it.
-        # v13.8: the proxy pass is now capped at 55% of the budget (was 72%), so the
-        # DIRECT pass always keeps ~45% of the wall clock for hosts that only
-        # answer over direct.
+        # v13.8: the proxy window is capped at 55% so the DIRECT sweep always keeps
+        # ~45% of the wall clock for hosts that only answer over direct.
         budget = max(12.0, float(CFG.get("ACCOUNT_DEADLINE", 45)) * 0.95)
         proxy_deadline = t_start + (budget * 0.55)
         hard_deadline = t_start + budget
-        per_attempt = max(3.0, min(float(CFG.get("TIMEOUT", 10)), budget / max(5.0, max_hosts + 3.0)))
+        configured_to = max(4.0, float(CFG.get("TIMEOUT", 10)))
 
         users = username_candidates(email) if try_alt_user else [email]
         primary_user = users[0]
@@ -3104,16 +3125,29 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, 
             if not proxy_pool or proxy_mode == "off":
                 return None, DNS_FAILED, "Fast-fail DNS check failed: no host resolves locally", None, trace_logs
 
-        plan = [("IMAP", h, 993, "ssl") for h in imap_hosts]
-        if try_starttls:
-            plan += [("IMAP", h, 143, "starttls") for h in imap_hosts[:3]]
-            plan += [("IMAP", h, 143, "plain") for h in imap_hosts[:2]]
-        plan += [("POP", h, 995, "ssl") for h in pop_hosts]
-        if try_starttls:
-            for h in pop_hosts:
-                plan += [("POP", h, 110, "starttls"), ("POP", h, 110, "plain")]
+        # ------------------------------------------------------------------
+        # v13.9 HOST-MAJOR PLAN
+        #
+        # One implicit-TLS rung per host. A read timeout means TCP + TLS already
+        # completed and the server stalled on the greeting — that is a HOST
+        # condition (datacenter egress, no PTR), not a proxy condition. So pass 1
+        # gives every host exactly one attempt and never rotates; only pass 2
+        # spends proxies, and only on hosts that failed at network level.
+        #
+        # Legacy 143/110 rungs are demoted to `fallback_plan` so they can no
+        # longer crowd out host #2 and host #3. POP 995 stays in the primary plan.
+        # ------------------------------------------------------------------
+        primary_plan = [("IMAP", h, 993, "ssl") for h in imap_hosts]
+        primary_plan += [("POP", h, 995, "ssl") for h in pop_hosts]
 
-        if not plan:
+        fallback_plan = []
+        if try_starttls:
+            fallback_plan += [("IMAP", h, 143, "starttls") for h in imap_hosts]
+            fallback_plan += [("IMAP", h, 143, "plain") for h in imap_hosts[:2]]
+            for h in pop_hosts:
+                fallback_plan += [("POP", h, 110, "starttls"), ("POP", h, 110, "plain")]
+
+        if not primary_plan:
             trace_logs.append("No candidate hosts for this domain.")
             return None, FAILED, "no candidate hosts", None, trace_logs
 
@@ -3139,30 +3173,45 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, 
                 else:
                     pop_plain_once(user, password, server, px_used, port=port, attempt_timeout=attempt_to)
 
-        def run_plan(px_used, plan_used=None, deadline_ts=None, attempt_to=None):
-            active_plan = plan if plan_used is None else plan_used
-            deadline_ts = hard_deadline if deadline_ts is None else deadline_ts
-            attempt_to = attempt_to or per_attempt
-            had_net_fail = False
-            saw_retryable = False
+        def sweep(px_used, rungs, deadline_ts, label, allow_rotate=False):
+            """Ordered pass over `rungs`.
 
-            for proto, server, port, tls_mode in active_plan:
+            allow_rotate=False -> each rung gets exactly ONE attempt, so every
+                                  host is reached before any proxy is spent twice.
+            allow_rotate=True  -> a rung may be retried on a fresh proxy (max 2).
+
+            The per-attempt timeout is derived from the window that is actually
+            left divided by the rungs about to be tried, so the pass always fits
+            instead of overrunning on host #1.
+            """
+            had_net = False
+            saw_retry = False
+            if not rungs:
+                return None, had_net, saw_retry
+
+            left = deadline_ts - time.time()
+            if left <= 1.5:
+                trace_logs.append(f"{label}: no window left ({left:.1f}s).")
+                return None, had_net, saw_retry
+
+            per_to = max(3.5, min(configured_to, left / max(1, len(rungs))))
+            trace_logs.append(f"--- {label}: {len(rungs)} rung(s), ~{per_to:.1f}s each, {left:.1f}s window ---")
+
+            for proto, server, port, tls_mode in rungs:
                 if time.time() > deadline_ts:
-                    trace_logs.append(f"Per-account budget {budget:.0f}s reached; stopping ladder.")
-                    return None, had_net_fail, saw_retryable
+                    trace_logs.append(f"{label}: window reached; stopping this pass.")
+                    break
 
                 if tls_mode in ("starttls", "plain") and server in timed_out_hosts:
                     trace_logs.append(f"{px_tag(px_used)} Skip {tls_mode.upper()} {server}:{port} (implicit TLS already timed out)")
                     continue
 
-                # v13.8: 2 rotations per host (was 4) — the pool must not eat the budget.
-                rotations_left = 2 if (px_used and proxy_mode != "off") else 0
+                rotations_left = MAX_ROTATIONS if (allow_rotate and px_used and proxy_mode != "off") else 0
                 seen_px = {px_used} if px_used else set()
 
                 while True:
                     if time.time() > deadline_ts:
-                        trace_logs.append(f"Per-account budget {budget:.0f}s reached; stopping ladder.")
-                        return None, had_net_fail, saw_retryable
+                        break
 
                     trace_logs.append(f"{px_tag(px_used)} Attempting {proto} {tls_mode.upper()} -> Host: {server}:{port}")
                     server_level_fail = False
@@ -3171,20 +3220,21 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, 
 
                     for u_idx, user in enumerate(users):
                         try:
-                            do_attempt(proto, server, port, tls_mode, user, px_used, attempt_to)
+                            do_attempt(proto, server, port, tls_mode, user, px_used, per_to)
                             record_proxy_attempt(px_used, success=True)
                             note_verdict(VALID, f"{proto} {server}:{port}")
                             note = "" if user == primary_user else f" | User: {user} (local-part)"
                             trace_logs.append(f"{px_tag(px_used)} Post-auth {proto} verification OK on {server}:{port}{note}")
                             return (server, VALID,
                                     f"{px_tag(px_used)} {proto} | Host: {server} | Port: {port}{note}",
-                                    px_used, trace_logs), had_net_fail, saw_retryable
+                                    px_used, trace_logs), had_net, saw_retry
 
                         except ssl.SSLError as ssl_err:
                             err_text = str(ssl_err)
                             st_val = classify_error(ssl_err, domain)
                             if st_val == FAILED:
-                                had_net_fail = True
+                                had_net = True
+                                net_failed_hosts.add(server)
                             record_proxy_attempt(px_used, success=False, is_network_error=(st_val == FAILED))
                             trace_logs.append(f"{px_tag(px_used)} -> TLS FAILED {proto} {server}:{port}: {err_text[:90]} [Classified: {st_val}]")
                             note_verdict(st_val, f"{proto} {server}:{port} -> {st_val}")
@@ -3195,7 +3245,8 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, 
                             err_text = str(to_err)
                             if proto == "IMAP" and tls_mode == "ssl":
                                 timed_out_hosts.add(server)
-                            had_net_fail = True
+                            had_net = True
+                            net_failed_hosts.add(server)
                             record_proxy_attempt(px_used, success=False, is_network_error=True)
                             trace_logs.append(f"{px_tag(px_used)} -> TIMEOUT {proto} {server}:{port}: {err_text[:90]} [Classified: {FAILED}]")
                             server_level_fail = True
@@ -3203,11 +3254,13 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, 
 
                         except (socket.error, ConnectionRefusedError) as sock_err:
                             err_text = str(sock_err)
-                            had_net_fail = True
+                            had_net = True
+                            net_failed_hosts.add(server)
                             record_proxy_attempt(px_used, success=False, is_network_error=True)
                             trace_logs.append(f"{px_tag(px_used)} -> SOCKET FAILED {proto} {server}:{port}: {err_text[:90]} [Classified: {FAILED}]")
                             server_level_fail = True
-                            rotate_now = True
+                            # v13.9 — connection-refused is HOST-level, not proxy-level
+                            rotate_now = _is_proxy_level_error(err_text)
 
                         except (imaplib.IMAP4.error, poplib.error_proto) as proto_err:
                             err_text = str(proto_err)
@@ -3216,9 +3269,9 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, 
                             trace_logs.append(f"{px_tag(px_used)} -> AUTH {proto} {server}:{port}: {err_text[:90]} [Classified: {st_val}]")
                             note_verdict(st_val, f"{proto} {server}:{port} -> {st_val}")
                             if st_val == APP:
-                                return (None, APP, f"{px_tag(px_used)} {proto} {server} -> {st_val}", px_used, trace_logs), had_net_fail, saw_retryable
+                                return (None, APP, f"{px_tag(px_used)} {proto} {server} -> {st_val}", px_used, trace_logs), had_net, saw_retry
                             if st_val == RETRY:
-                                saw_retryable = True
+                                saw_retry = True
                                 server_level_fail = True
                                 # v13.8: 'Lookup failed' is a host routing miss, not a
                                 # proxy fault -> advance to the next host, no rotation.
@@ -3231,7 +3284,7 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, 
                                 trace_logs.append(f"{px_tag(px_used)} Rejected as '{user}' -> retrying same host as local-part '{users[u_idx + 1]}'")
                                 continue
                             elif st_val == WRONG:
-                                return (None, WRONG, f"{px_tag(px_used)} {proto} {server} -> {st_val}", px_used, trace_logs), had_net_fail, saw_retryable
+                                return (None, WRONG, f"{px_tag(px_used)} {proto} {server} -> {st_val}", px_used, trace_logs), had_net, saw_retry
                             else:
                                 server_level_fail = True
 
@@ -3242,16 +3295,18 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, 
                             if _is_timeout(e):
                                 if proto == "IMAP" and tls_mode == "ssl":
                                     timed_out_hosts.add(server)
-                                had_net_fail = True
+                                had_net = True
+                                net_failed_hosts.add(server)
                             if st_val == FAILED:
-                                had_net_fail = True
+                                had_net = True
+                                net_failed_hosts.add(server)
                             record_proxy_attempt(px_used, success=False, is_network_error=(st_val == FAILED))
                             trace_logs.append(f"{px_tag(px_used)} -> FAILED {proto} {server}:{port}: {err_text[:90]} [Classified: {st_val}]")
                             note_verdict(st_val, f"{proto} {server}:{port} -> {st_val}")
                             if st_val == APP:
-                                return (None, APP, f"{px_tag(px_used)} {proto} {server} -> {st_val}", px_used, trace_logs), had_net_fail, saw_retryable
+                                return (None, APP, f"{px_tag(px_used)} {proto} {server} -> {st_val}", px_used, trace_logs), had_net, saw_retry
                             if st_val == RETRY:
-                                saw_retryable = True
+                                saw_retry = True
                                 server_level_fail = True
                                 if "lookup failed" in err_text.lower():
                                     rotate_now = False
@@ -3262,7 +3317,7 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, 
                                 trace_logs.append(f"{px_tag(px_used)} Rejected as '{user}' -> retrying same host as local-part '{users[u_idx + 1]}'")
                                 continue
                             elif st_val == WRONG:
-                                return (None, WRONG, f"{px_tag(px_used)} {proto} {server} -> {st_val}", px_used, trace_logs), had_net_fail, saw_retryable
+                                return (None, WRONG, f"{px_tag(px_used)} {proto} {server} -> {st_val}", px_used, trace_logs), had_net, saw_retry
                             else:
                                 server_level_fail = True
                                 rotate_now = rotate_now or proxy_level
@@ -3278,9 +3333,13 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, 
                                 f"{px_tag(px_used)} 407 storm: {host_407[server]} consecutive proxy-auth "
                                 f"failures on {server} -> skipping the remaining proxies, going DIRECT.")
                             force_direct["flag"] = True
-                            return None, had_net_fail, saw_retryable
+                            return None, had_net, saw_retry
 
-                    if rotate_now and px_used and rotations_left > 0:
+                    can_rotate = (
+                        rotate_now and px_used and rotations_left > 0
+                        and (deadline_ts - time.time()) > per_to
+                    )
+                    if can_rotate:
                         newpx = sample_alive_proxy(exclude=seen_px, domain=domain)
                         if newpx and newpx not in seen_px:
                             seen_px.add(newpx)
@@ -3291,36 +3350,61 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, 
 
                     break
 
-            return None, had_net_fail, saw_retryable
+            return None, had_net, saw_retry
 
-        result, net_fail, retryable = run_plan(px, deadline_ts=proxy_deadline)
-        if result:
-            return result
+        def run_phase(px_used, plan_used, deadline_ts, tag):
+            """pass 1 = every host once, no rotation.
+            pass 2 = fresh proxy on the hosts that failed at network level, only
+                     if the window still allows it."""
+            if not plan_used:
+                return None, False, False
+
+            res, net, ret = sweep(px_used, plan_used, deadline_ts, f"{tag} · pass 1", allow_rotate=False)
+            if res or force_direct["flag"]:
+                return res, net, ret
+
+            if net and (deadline_ts - time.time()) > 3.0:
+                retry_rungs = [r for r in plan_used if r[1] in net_failed_hosts]
+                if retry_rungs:
+                    res2, net2, ret2 = sweep(px_used, retry_rungs, deadline_ts,
+                                             f"{tag} · pass 2 (fresh proxy per failed host)", allow_rotate=True)
+                    return res2, (net or net2), (ret or ret2)
+            return None, net, ret
+
+        # ------------------------- PROXY PHASE -------------------------
+        if px:
+            result, net_fail, ret = run_phase(px, primary_plan, proxy_deadline, "proxy")
+            retryable = retryable or ret
+            if result:
+                return result
+            if not force_direct["flag"] and (proxy_deadline - time.time()) > 4.0:
+                result, _n, _r = run_phase(px, fallback_plan, proxy_deadline, "proxy/legacy")
+                if result:
+                    return result
+        else:
+            net_fail = False
 
         if force_direct["flag"]:
-            trace_logs.append("407 storm breaker tripped -> bypassing the rest of the proxy pool and running the DIRECT pass now.")
+            trace_logs.append("407 storm breaker tripped -> bypassing the rest of the proxy pool and running the DIRECT sweep now.")
 
-        if px and (net_fail or retryable or force_direct["flag"]) and (
-                proxy_mode == "fallback" or CFG.get("RETRY_CONNECTION_FAILED") or force_direct["flag"]):
-            direct_hosts = [h for h in imap_hosts if fast_fail_dns_check(h)]
-            if not direct_hosts:
-                direct_hosts = [h for h in pop_hosts if fast_fail_dns_check(h)]
-            if not direct_hosts:
-                direct_hosts = imap_hosts[:2]
+        # ------------------------- DIRECT PHASE -------------------------
+        go_direct = (px is None) or bool(net_fail) or retryable or force_direct["flag"]
+        if go_direct and (px is None or proxy_mode == "fallback"
+                          or CFG.get("RETRY_CONNECTION_FAILED") or force_direct["flag"]):
+            direct_primary = [r for r in primary_plan if fast_fail_dns_check(r[1])] or primary_plan
+            direct_fallback = [r for r in fallback_plan if fast_fail_dns_check(r[1])]
 
-            retry_plan = [("IMAP", h, 993, "ssl") for h in direct_hosts[:2]]
-            if try_starttls and direct_hosts:
-                retry_plan.append(("IMAP", direct_hosts[0], 143, "starttls"))
+            dgeo = direct_geo()
+            trace_logs.append(f"direct | {dgeo['ip']} | {dgeo['region']} | {dgeo['country']} | {dgeo['vpn']}")
+            trace_logs.append(
+                f"Proxy pass exhausted -> DIRECT sweep over all {len(direct_primary)} locally-resolving host(s).")
 
-            if retry_plan:
-                dgeo = direct_geo()
-                trace_logs.append(
-                    f"direct | {dgeo['ip']} | {dgeo['region']} | {dgeo['country']} | {dgeo['vpn']}"
-                )
-                trace_logs.append("Proxy pass exhausted -> targeted DIRECT retry on locally-resolving hosts.")
-                result, _nf2, retryable2 = run_plan(None, plan_used=retry_plan, deadline_ts=hard_deadline,
-                                                    attempt_to=max(4.0, per_attempt))
-                retryable = retryable or retryable2
+            result, _nf2, ret2 = run_phase(None, direct_primary, hard_deadline, "direct")
+            retryable = retryable or ret2
+            if result:
+                return result
+            if (hard_deadline - time.time()) > 4.0:
+                result, _nf3, _r3 = run_phase(None, direct_fallback, hard_deadline, "direct/legacy")
                 if result:
                     return result
 
@@ -3337,8 +3421,6 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, 
         failed_domain_cache[domain] = time.time()
 
     # --- v13.8: RETAINED VERDICT WINS -------------------------------------
-    # A definitive answer collected anywhere in the ladder outranks any later
-    # timeout / retryable / DNS / connection failure.
     if best_verdict["status"] is not None:
         trace_logs.append(
             f"Ladder exhausted with no live answer -> returning retained verdict [{best_verdict['status']}]."
