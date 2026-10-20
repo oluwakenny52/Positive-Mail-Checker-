@@ -373,6 +373,10 @@ def section(icon: str, title: str, subtitle: str = "") -> None:
 
 # Dynamic Proxy Auto-Fetch Engine
 def load_app_proxies() -> List[dict]:
+    """Proxies come from the same files the checker uses. NO hardcoded IP.
+
+    Returns [] when nothing is configured, so every connection goes direct.
+    """
     proxy_files = ["proxies.txt", "proxy_pool.txt", "clean_proxies.txt"]
     dynamic_pool = []
 
@@ -413,9 +417,7 @@ def load_app_proxies() -> List[dict]:
             if dynamic_pool:
                 return dynamic_pool
 
-    return [
-        {"proxy": "dc.oxylabs.info:8000", "country": "Canada", "region": "Ontario", "latency": 1514}
-    ]
+    return dynamic_pool
 
 
 # Page Configuration & Keep-Alive Injector
