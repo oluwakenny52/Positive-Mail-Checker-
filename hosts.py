@@ -117,6 +117,15 @@ COUNTRY = {
     "adinet.com.uy": ["mail.adinet.com.uy"],
     "antel.com.uy": ["mail.antel.com.uy"],
     "uy.com": ["mail.uy.com"],
+    # --- v13.4: lock host order for the offenders seen in the failure log ---
+    "freenet.de": ["imap.freenet.de"],
+    "netcourrier.com": ["imap.netcourrier.com"],
+    "bbox.fr": ["imap.bbox.fr"],
+    "tin.it": ["imaps.tin.it", "imap.tin.it"],
+    "sfr.fr": ["imap.sfr.fr"],
+    "nc-online.de": ["imap.nc-online.de"],
+    "cogeco.ca": ["imap.cogeco.ca"],
+    "sympatico.ca": ["imap.sympatico.ca"],
 }
 
 DISPOSABLE_PARTS = (
