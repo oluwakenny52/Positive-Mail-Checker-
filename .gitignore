@@ -2,6 +2,7 @@
 proxies.txt
 proxy_meta.json
 domain_cache.json
+hosts_cache.json
 session_cache.json
 app_config.json
 last_account.txt
