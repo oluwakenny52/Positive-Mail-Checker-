@@ -1,9 +1,20 @@
 """
-Mega Ultimate Mail Checker — v13.6
+Mega Ultimate Mail Checker — v13.7
 ==================================
-Complete rewrite. SMTP reachability is now a PRE-CHECK stage (never inside the
-validator), status classification actually works, and every direct-connection
+Complete rewrite. SMTP reachability is an OPT-IN pre-check stage (never inside
+the validator), status classification actually works, and every direct-connection
 line carries the real egress IP / region / country / VPN state.
+
+v13.7 changes
+-------------
+* SMTP pre-check is now OFF BY DEFAULT. The engine runs IMAP/POP only, so a run
+  starts instantly with no per-domain SMTP connect on the first pass. Flip the
+  checkbox in Advanced Control Rules to enable it.
+* The SMTP checkbox moved into the "Advanced Control Rules" slide-out section.
+* When enabled: direct-first probing (skips the proxy handshake), a wall-clock
+  budget of 45s for the whole pre-check, and 32 parallel workers. Anything still
+  unresolved when the budget expires is treated as "unknown" and falls through to
+  Ready to Check instead of hanging the page.
 
 v13.6 changes
 -------------
@@ -15,10 +26,9 @@ v13.6 changes
   It used to burn ~36s of the 40s per-account budget before the ladder even
   started, which produced "Per-account budget reached; stopping ladder" with zero
   IMAP attempts and mass SMTP_FAILED / CONNECTION_FAILED results.
-* SMTP Failed is now a PRE-CHECK bucket, displayed immediately AFTER DNS Failed
-  in the filter row, the category inspector and the Engine Action Mode.
-* NEW: per-domain SMTP reachability cache (TTL 15 min) + parallel probing, so the
-  pre-check is a one-time cost and never blocks the UI on a re-run.
+* SMTP Failed is a PRE-CHECK bucket, displayed immediately AFTER DNS Failed in
+  the filter row, the category inspector and the Engine Action Mode.
+* NEW: per-domain SMTP reachability cache (TTL 15 min).
 * direct connections now print the real egress IP | region | country | VPN state
   on EVERY line (px_tag), not the bare word "direct".
 * VPN auto-detection from the egress ISP/org, so a phone-side VPN is visible.
@@ -385,8 +395,8 @@ def default_theme() -> dict:
         "bg": p["bg"], "panel": p["panel"], "text": p["text"],
         "radius": 14, "glow": True, "animate": True, "glass": True,
         "colorize_logs": True,
-        "hero_title": "⚡ Mega Ultimate Mail Checker v13.6",
-        "hero_sub": "World-Coverage Edition — router-aware host ranking, rotating proxy pool, geo-call routing, retryable IP-block handling, SMTP pre-check, anti-spoofing post-auth validation.",
+        "hero_title": "⚡ Mega Ultimate Mail Checker v13.7",
+        "hero_sub": "World-Coverage Edition — router-aware host ranking, rotating proxy pool, geo-call routing, retryable IP-block handling, optional SMTP pre-check, anti-spoofing post-auth validation.",
     }
 
 
@@ -583,7 +593,7 @@ def render_hero(th: dict):
                 <span class="bb-tag">Deep / Aggressive</span>
                 <span class="bb-tag">Proxy Backed</span>
                 <span class="bb-tag">Geo-Call Routing</span>
-                <span class="bb-tag">SMTP Pre-Check</span>
+                <span class="bb-tag">Optional SMTP Pre-Check</span>
                 <span class="bb-tag">Anti-Spoof Post-Auth</span>
             </div>
         </div>
@@ -862,6 +872,8 @@ _DIRECT_ISP = {"ts": 0.0, "isp": ""}
 _SMTP_DOMAIN_CACHE = {}
 _SMTP_LOCK = threading.Lock()
 _SMTP_CACHE_TTL = 900
+_SMTP_PRECHECK_BUDGET = 45.0
+_SMTP_PRECHECK_WORKERS = 32
 
 
 @dataclass
@@ -994,6 +1006,15 @@ max_hosts_per_domain = str_lit.sidebar.slider(
 try_alt_username_ui = str_lit.sidebar.toggle(
     "Try local-part username on auth failure", value=True,
     help="Many legacy ISP servers (Zimbra / cPanel / Dovecot) expect 'user' rather than 'user@domain'. On an auth rejection the engine retries the same host with the local part before moving on."
+)
+
+smtp_precheck_ui = str_lit.sidebar.checkbox(
+    "📮 Enable SMTP pre-check  (OFF by default)",
+    value=False,
+    help="OFF (default): the engine only does IMAP/POP. Fastest start, and the 'SMTP Failed' bucket stays at 0.\n\n"
+         "ON: before checking, every unseen domain gets one SMTP probe on 587/465/25 and dead-SMTP domains "
+         "are bucketed under 'SMTP Failed' (right after 'DNS Failed') and removed from the check queue. "
+         "Costs an extra connect per new domain on the first run; cached 15 min after that."
 )
 
 custom_whitelist_input = str_lit.sidebar.text_input("Custom Whitelist Domains (comma-separated)", placeholder="gmail.com, outlook.com")
@@ -1382,13 +1403,6 @@ try_starttls_ui = str_lit.sidebar.toggle(
     help="If implicit TLS on 993/995 fails, retry the host over STARTTLS, then over plaintext."
 )
 
-smtp_precheck_ui = str_lit.sidebar.toggle(
-    "📮 SMTP Reachability Pre-Check", value=True,
-    help="Probe SMTP (587/465/25) ONCE per domain BEFORE the validator runs, and bucket dead-SMTP "
-         "accounts under 'SMTP Failed' next to 'DNS Failed'. Cached 15 min. Turn off to check every "
-         "account on IMAP regardless of SMTP state."
-)
-
 resolved_proxy_mode = str_lit.sidebar.selectbox(
     "Proxy Mode Engine:", options=["aggressive", "fallback", "sticky", "off"], index=1,
     help="aggressive: proxy only. fallback: proxy then direct. sticky: one proxy per worker thread. off: never use proxies."
@@ -1460,7 +1474,7 @@ for _k, _v in (
     ("FAST_MODE", False), ("BLACKLIST_CF", 15), ("DEBUG", False), ("PROXY_TEST_FLIGHT", True),
     ("RETRY_CONNECTION_FAILED", 0), ("MAX_ACCOUNTS", 5000), ("MAX_WORKERS_START", 30),
     ("DYNAMIC_WORKER_SCALING", True), ("PROXY_MODE", "fallback"), ("ALLOW_BLACKLIST_IPS", False),
-    ("RANDOM_ROTATION", True), ("GEO_CALL", False), ("CONNECTION_HINT", "Auto"), ("SMTP_CHECK", True),
+    ("RANDOM_ROTATION", True), ("GEO_CALL", False), ("CONNECTION_HINT", "Auto"), ("SMTP_CHECK", False),
 ):
     CFG.setdefault(_k, _v)
 
@@ -1840,10 +1854,10 @@ def record_proxy_attempt(proxy_str, success, is_network_error=False):
 
 
 # ============================================================================
-# SMTP PRE-CHECK  (runs BEFORE the validator — never inside it)
+# SMTP PRE-CHECK  (OPT-IN — runs BEFORE the validator, never inside it)
 # ============================================================================
 
-def _smtp_banner_ok(hosts, px, timeout=4.0):
+def _smtp_banner_ok(hosts, px, timeout=3.5):
     """True if any candidate answers with a 220 SMTP banner."""
     for h in hosts:
         for port, use_tls in ((587, False), (465, True), (25, False)):
@@ -1867,10 +1881,11 @@ def _smtp_banner_ok(hosts, px, timeout=4.0):
     return False
 
 
-def smtp_domain_probe(domain, timeout=4.0):
+def smtp_domain_probe(domain, timeout=3.5):
     """Per-domain SMTP reachability. True = alive, False = dead, None = no candidate.
 
-    Tries the pool first (when one exists), then a direct pass. Never raises.
+    DIRECT first — it skips the proxy handshake and is the fastest path. Only if
+    direct fails do we spend a second pass through the pool. Never raises.
     """
     try:
         hosts = host_smtp_candidates(domain) or []
@@ -1883,14 +1898,14 @@ def smtp_domain_probe(domain, timeout=4.0):
     if not live:
         return False
 
+    if _smtp_banner_ok(live, None, timeout):          # direct pass first
+        return True
+
     with alive_pool_lock:
         have_pool = bool(alive_pool)
-
     if have_pool and CFG.get("PROXY_MODE", "fallback") != "off":
         if _smtp_banner_ok(live, sample_alive_proxy(domain=domain), timeout):
             return True
-    if _smtp_banner_ok(live, None, timeout):
-        return True
     return False
 
 
@@ -1900,8 +1915,16 @@ def smtp_cached(domain):
     return bool(hit and (time.time() - hit[0]) < _SMTP_CACHE_TTL)
 
 
-def smtp_precheck_domains(domains, max_workers=24):
-    """Parallel, cached. Returns {domain: True|False|None}."""
+def smtp_precheck_domains(domains, max_workers=None, budget=None):
+    """Parallel, cached, and wall-clock bounded. Returns {domain: True|False|None}.
+
+    If `budget` seconds elapse, any domain still unresolved is returned as None
+    (i.e. "unknown"), so those accounts fall through to Ready to Check instead of
+    holding the whole page hostage.
+    """
+    max_workers = max_workers or _SMTP_PRECHECK_WORKERS
+    budget = budget or _SMTP_PRECHECK_BUDGET
+
     results = {}
     doms = [d for d in dict.fromkeys(d for d in (domains or []) if d)]
     if not doms:
@@ -1917,17 +1940,27 @@ def smtp_precheck_domains(domains, max_workers=24):
             else:
                 todo.append(d)
 
-    if todo:
-        try:
-            with ThreadPoolExecutor(max_workers=min(max_workers, len(todo))) as ex:
-                for d, res in ex.map(lambda x: (x, smtp_domain_probe(x)), todo):
-                    results[d] = res
-                    with _SMTP_LOCK:
-                        _SMTP_DOMAIN_CACHE[d] = (time.time(), res)
-        except Exception as e:
-            log_startup(f"WARNING: SMTP pre-check batch error: {e}", quiet=True)
-            for d in todo:
-                results.setdefault(d, None)
+    if not todo:
+        return results
+
+    deadline = time.time() + budget
+    try:
+        with ThreadPoolExecutor(max_workers=min(max_workers, len(todo))) as ex:
+            futs = {ex.submit(smtp_domain_probe, d): d for d in todo}
+            for fut in as_completed(futs, timeout=max(1.0, deadline - time.time())):
+                d = futs[fut]
+                try:
+                    res = fut.result()
+                except Exception:
+                    res = None
+                results[d] = res
+                with _SMTP_LOCK:
+                    _SMTP_DOMAIN_CACHE[d] = (time.time(), res)
+    except Exception as e:
+        log_startup(f"WARNING: SMTP pre-check batch timeout/error: {e}", quiet=True)
+
+    for d in todo:
+        results.setdefault(d, None)
     return results
 
 
@@ -2427,7 +2460,7 @@ def process_accounts(text, previous_valid):
     """Pre-filter pipeline.
 
     Order: syntax -> whitelist/blacklist -> strict-app -> disposable -> typo ->
-    already-valid -> duplicate/format -> DNS -> SMTP.
+    already-valid -> duplicate/format -> DNS -> [SMTP, only when enabled].
 
     DNS Failed and SMTP Failed are the last two buckets, SMTP strictly after DNS.
     Returns (clean, disposable, typo, resume, app_skip, custom, dns_failed, smtp_failed)
@@ -2470,8 +2503,8 @@ def process_accounts(text, previous_valid):
 
     save_domain_cache()
 
-    # ---- SMTP PRE-CHECK (strictly AFTER the DNS filter) ----
-    if CFG.get("SMTP_CHECK", True) and lines:
+    # ---- SMTP PRE-CHECK (strictly AFTER the DNS filter) — OPT-IN ----
+    if CFG.get("SMTP_CHECK", False) and lines:
         domains = list(dict.fromkeys(l.split(":", 1)[0].split("@")[-1].lower() for l in lines if "@" in l))
         results = smtp_precheck_domains(domains)
         keep = []
@@ -2538,7 +2571,8 @@ skip_previous = str_lit.checkbox("Skip previously valid", value=True, help="On: 
 if raw_text:
     previous_valid = load_previous_valid() if skip_previous else set()
 
-    _pending_smtp = [d for d in _domains_in_text(raw_text) if not smtp_cached(d)] if CFG.get("SMTP_CHECK", True) else []
+    _pending_smtp = ([d for d in _domains_in_text(raw_text) if not smtp_cached(d)]
+                     if CFG.get("SMTP_CHECK", False) else [])
     if _pending_smtp:
         with str_lit.spinner(f"🛰 SMTP reachability pre-check on {len(_pending_smtp)} new domain(s)…"):
             (clean_lines, disp, typo, resume, app_skip,
@@ -3051,7 +3085,7 @@ def read_mailbox_messages(email, password, server, proxy_str=None, limit=10):
 
 
 # ============================================================================
-# MAIN ORCHESTRATOR  (IMAP / POP only — SMTP lives in the pre-check now)
+# MAIN ORCHESTRATOR  (IMAP / POP only — SMTP lives in the opt-in pre-check)
 # ============================================================================
 
 def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, trace_logs=None):
