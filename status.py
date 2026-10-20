@@ -4,9 +4,19 @@ status.py — single source of truth for engine statuses and error classificatio
 Both naming conventions are exported (VALID + WRONG_PASSWORD, FAILED +
 CONNECTION_FAILED, ...) so `from status import (...)` can never break.
 
-Classification order is deliberate:  APP -> WRONG_STRONG -> DNS -> RETRY -> CONN -> WRONG -> UNKNOWN
+Classification order is deliberate:  APP -> WRONG_STRONG -> BARE_AUTH -> DNS -> RETRY -> CONN -> WRONG -> UNKNOWN
 CONN runs before WRONG so that a proxy "Socket error: 407" is never read as an
 auth failure by a generic token.
+
+v13.14
+------
+* BARE_AUTH added.  Several legacy Zimbra / Dovecot fronts answer a failed LOGIN
+  with literally "LOGIN" (or "AUTH", "credentials").  Every phrase table above
+  requires a SECOND word, so these fell through to UNKNOWN and a genuine
+  wrong_password was reported as unknown.  Live trace: imap.pangia.biz and
+  mail.pangia.biz both returned exactly "LOGIN" for a prtc.net account.
+  The bare token is now matched on the whole (punctuation-stripped) message,
+  so it can never shadow a real phrase.
 
 v13.8
 -----
@@ -290,6 +300,24 @@ _WRONG_STRONG = (
     "invalid login or password",
 )
 
+# v13.14 — BARE / TERSE auth replies.  Some legacy Zimbra / Dovecot fronts
+# answer a rejected LOGIN with the single token "LOGIN" (or "AUTH",
+# "credentials").  Every phrase table above needs a SECOND word, so these used
+# to fall through to UNKNOWN.  Matched against the WHOLE punctuation-stripped
+# message, so a longer phrase can never be shadowed by this rule.
+_BARE_AUTH = (
+    "login",
+    "logon",
+    "auth",
+    "authenticate",
+    "authentication",
+    "sign in",
+    "signin",
+    "sign-in",
+    "credentials",
+    "invalid",
+)
+
 _PROXY_LEVEL = (
     "407",
     "proxy authentication required",
@@ -307,13 +335,16 @@ def _norm(text):
 def _match(text, needles):
     return any(n in text for n in needles)
 
+def _is_bare_auth(text):
+    return text.strip().rstrip(".!:,;").strip() in _BARE_AUTH
+
 # ---------------------------------------------------------------------------
 # CLASSIFIER
 # ---------------------------------------------------------------------------
 def classify_error(raw, domain=""):
     """Map a raw server/socket error string to an engine status.
 
-    Order matters: APP -> WRONG_STRONG -> DNS -> RETRY -> CONN -> WRONG -> UNKNOWN.
+    Order matters: APP -> WRONG_STRONG -> BARE_AUTH -> DNS -> RETRY -> CONN -> WRONG -> UNKNOWN.
     """
     t = _norm(raw)
     if not t:
@@ -325,6 +356,10 @@ def classify_error(raw, domain=""):
     # Strong auth phrases win outright — they can otherwise be shadowed by the
     # generic "authentication" token or by a CONN token in the same message.
     if _match(t, _WRONG_STRONG):
+        return WRONG_PASSWORD
+
+    # v13.14 — a whole-message bare token ("LOGIN") is an auth rejection.
+    if _is_bare_auth(t):
         return WRONG_PASSWORD
 
     if _match(t, _DNS):
@@ -352,7 +387,7 @@ def is_dns_signal(raw):
 
 def is_wrong_password_signal(raw):
     t = _norm(raw)
-    return _match(t, _WRONG_STRONG) or _match(t, _WRONG)
+    return _is_bare_auth(t) or _match(t, _WRONG_STRONG) or _match(t, _WRONG)
 
 # ---------------------------------------------------------------------------
 # SMALL HELPERS
