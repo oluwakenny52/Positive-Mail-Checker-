@@ -1,86 +1,45 @@
 """
-status.py
-=========
-Status taxonomy + error classification for the Positive Mail Checker engine.
+status.py — single source of truth for engine statuses and error classification.
 
-Exports BOTH naming conventions on purpose:
-    app.py historically imported  VALID / WRONG / APP / FAILED / SKIP / UNKNOWN / RETRY
-    newer UI code uses            VALID / WRONG_PASSWORD / NEED_APP_PASSWORD /
-                                  CONNECTION_FAILED / RETRY_LATER / SMTP_FAILED / DNS_FAILED
-Values are identical, so the two never drift.
+Both naming conventions are exported (VALID + WRONG_PASSWORD, FAILED +
+CONNECTION_FAILED, ...) so `from status import (...)` can never break.
 
-`ALL` and `ALL_STATUSES` are BOTH exported. app.py imports `ALL_STATUSES as ST_ALL`.
-Missing that alias used to throw the entire `from status import (...)` block in
-app.py, which silently swapped the real classifier for a stub that returned
-UNKNOWN for everything -- every auth error then logged "[Classified: unknown]".
-
-Every UI surface (Live Execution Stream colours, live per-status dropdowns,
-"Select category to inspect contents", "Engine Action Mode", Live Report Log &
-Analytics) reads from here.
+Classification order is deliberate:  APP -> DNS -> RETRY -> CONN -> WRONG -> UNKNOWN
+CONN runs before WRONG so that a proxy "Socket error: 407" is never read as an
+auth failure by the catch-all "error" token.
 """
 
-# --------------------------------------------------------------------------
-# Statuses  (values are the canonical lowercase wire strings)
-# --------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# CANONICAL STATUSES  (every alias points at the same string)
+# ---------------------------------------------------------------------------
 VALID = "valid"
-
-WRONG_PASSWORD = "wrong_password"
-WRONG = WRONG_PASSWORD
-
-NEED_APP_PASSWORD = "need_app_password"
-APP = NEED_APP_PASSWORD
-
-RETRY_LATER = "retry_later"
-RETRY = RETRY_LATER
-
+WRONG = WRONG_PASSWORD = "wrong_password"
+APP = NEED_APP_PASSWORD = "need_app_password"
+FAILED = CONNECTION_FAILED = "connection_failed"
+SKIP = SKIPPED_COOLDOWN = "skipped_cooldown"
+UNKNOWN = "unknown"
+RETRY = RETRY_LATER = "retry_later"
 SMTP_FAILED = "smtp_failed"
 DNS_FAILED = "dns_failed"
-
-CONNECTION_FAILED = "connection_failed"
-FAILED = CONNECTION_FAILED
-
-UNKNOWN = "unknown"
-
-SKIPPED_COOLDOWN = "skipped_cooldown"
-SKIP = SKIPPED_COOLDOWN
-
-GOOD = [VALID]
-RETRYABLE = [RETRY_LATER, SMTP_FAILED]
+ERROR = "error"
 
 ALL = [
-    VALID, WRONG_PASSWORD, NEED_APP_PASSWORD, RETRY_LATER, SMTP_FAILED,
-    DNS_FAILED, CONNECTION_FAILED, UNKNOWN, SKIPPED_COOLDOWN,
+    VALID,
+    WRONG_PASSWORD,
+    NEED_APP_PASSWORD,
+    RETRY_LATER,
+    SMTP_FAILED,
+    DNS_FAILED,
+    CONNECTION_FAILED,
+    UNKNOWN,
+    SKIPPED_COOLDOWN,
 ]
-
-# app.py does:  from status import (... ALL_STATUSES as ST_ALL ...)
 ALL_STATUSES = ALL
 
-LABELS = {
-    VALID: "✅ Valid",
-    WRONG_PASSWORD: "❌ Wrong Password",
-    NEED_APP_PASSWORD: "🔐 App Password / 2FA",
-    RETRY_LATER: "🕓 RETRY_LATER",
-    SMTP_FAILED: "📮 SMTP Failed",
-    DNS_FAILED: "🛰 DNS Failed",
-    CONNECTION_FAILED: "🔌 Connection Failed",
-    UNKNOWN: "❔ Unknown",
-    SKIPPED_COOLDOWN: "⏭ Skipped",
-}
+TERMINAL = {VALID, WRONG_PASSWORD, NEED_APP_PASSWORD}
 
-# Live Execution Stream colour contract
-COLORS = {
-    VALID: "#22c55e",              # green
-    WRONG_PASSWORD: "#ef4444",     # red
-    CONNECTION_FAILED: "#eab308",  # yellow
-    NEED_APP_PASSWORD: "#3b82f6",  # blue
-    RETRY_LATER: "#ffffff",        # white
-    SMTP_FAILED: "#a855f7",
-    DNS_FAILED: "#f97316",
-    UNKNOWN: "#94a3b8",
-    SKIPPED_COOLDOWN: "#a78bfa",
-}
-
-# Lower rank wins when several probes disagree.
+# Lower value = "better" answer. Used by merge() and by the engine when it has
+# to pick between two verdicts it collected on the same account.
 PRIORITY = {
     VALID: 0,
     NEED_APP_PASSWORD: 1,
@@ -93,94 +52,237 @@ PRIORITY = {
     SKIPPED_COOLDOWN: 8,
 }
 
+LABELS = {
+    VALID: "VALID",
+    WRONG_PASSWORD: "WRONG_PASSWORD",
+    NEED_APP_PASSWORD: "NEED_APP_PASSWORD",
+    RETRY_LATER: "RETRY_LATER",
+    SMTP_FAILED: "SMTP_FAILED",
+    DNS_FAILED: "DNS_FAILED",
+    CONNECTION_FAILED: "CONNECTION_FAILED",
+    UNKNOWN: "UNKNOWN",
+    SKIPPED_COOLDOWN: "SKIPPED_COOLDOWN",
+}
 
-def merge(*statuses):
-    """Highest-confidence status from a set of observations."""
-    ranked = [s for s in statuses if s]
-    if not ranked:
-        return UNKNOWN
-    return sorted(ranked, key=lambda s: PRIORITY.get(s, 99))[0]
+COLORS = {
+    VALID: "#22c55e",
+    WRONG_PASSWORD: "#ef4444",
+    CONNECTION_FAILED: "#eab308",
+    NEED_APP_PASSWORD: "#3b82f6",
+    RETRY_LATER: "#ffffff",
+    SMTP_FAILED: "#a855f7",
+    DNS_FAILED: "#f97316",
+    UNKNOWN: "#94a3b8",
+    SKIPPED_COOLDOWN: "#a78bfa",
+}
 
 
-def is_terminal(status):
-    return status in (VALID, WRONG_PASSWORD, NEED_APP_PASSWORD)
-
-
-def is_failure(status):
-    return status in (CONNECTION_FAILED, UNKNOWN, SMTP_FAILED, DNS_FAILED)
-
-
-# --------------------------------------------------------------------------
-# Classification tables
-# --------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# MATCH TABLES
+# ---------------------------------------------------------------------------
 _APP_PASSWORD = (
-    "application-specific password", "application specific password",
-    "app-specific password", "app specific password", "app password",
-    "app-password", "apppassword",
-    "basic authentication is disabled", "basic auth is disabled",
-    "authentication is disabled", "authentication disabled",
-    "imap access is disabled", "imap access disabled", "imap disabled",
-    "web login required", "web login", "log in via your web browser",
-    "login via web browser", "web browser", "webmail required",
-    "logindisabled", "login disabled", "login-disabled", "login disabled",
-    "two-factor", "two factor", "2fa", "mfa", "otp required",
-    "enable imap", "enable less secure",
+    "basic authentication is disabled",
+    "basic auth is disabled",
+    "app password",
+    "application specific password",
+    "application-specific password",
+    "app-specific password",
+    "app specific password",
+    "two-factor",
+    "two factor",
+    "2fa",
+    "2-step",
+    "2 step",
+    "mfa",
+    "multi-factor",
+    "multi factor",
+    "less secure app",
+    "less secure apps",
+    "lesssecureapp",
+    "oauth",
+    "oauth2",
+    "token required",
+    "an app password is required",
+    "use an app password",
+    "enable imap",
+    "imap access is disabled",
+    "imap is disabled",
+    "pop access is disabled",
+    "enable pop",
+    "web login required",
+    "sign in with",
+    "modern authentication",
+    "authenticate with",
+    "log in with your browser",
+    "consent",
+    "tenant",
 )
 
 _DNS = (
-    "fast-fail dns check failed", "does not resolve", "does not resolve locally",
-    "host does not resolve", "no candidate host resolves", "no host resolves",
-    "name or service not known", "nodename nor servname", "getaddrinfo failed",
-    "no address associated", "temporary failure in name resolution", "gaierror",
+    "does not resolve",
+    "failed to resolve",
+    "name or service not known",
+    "nodename nor servname",
+    "getaddrinfo",
+    "gaierror",
+    "no address associated",
+    "temporary failure in name resolution",
+    "dns",
+    "nxdomain",
+    "servfail",
 )
 
 _RETRY = (
-    "lookup failed", "could not be routed", "user could not be routed",
-    "could not route", "cannot route", "try again", "try again later",
-    "temporarily", "temporary", "server busy", "server is busy",
-    "system busy", "server not available", "service not available",
-    "too many connections", "too many failed attempts", "too many login",
-    "too many simultaneous", "too many", "ip blacklisted", "blacklisted",
-    "rate limit", "ratelimit", "throttl", "greylist", "greylisted",
-    "unavailable", "maintenance", "over quota", "quota exceeded",
-    "exceeded", "internal server error", "system error", "please retry",
-    "resource temporarily unavailable", "connection limit", "limit exceeded",
+    "lookup failed",
+    "user could not be routed",
+    "could not route",
+    "retry",
+    "retry later",
+    "try again",
+    "temporarily unavailable",
+    "temporary failure",
+    "try again later",
+    "service unavailable",
+    "server busy",
+    "too many",
+    "rate limit",
+    "rate-limit",
+    "ratelimit",
+    "throttle",
+    "throttled",
+    "over quota",
+    "quota exceeded",
+    "mailbox full",
+    "system busy",
+    "try later",
+    "unavailable",
+    "authentication services unavailable",
+    "backend",
+    "upstream",
+    "downstream",
+    "greylist",
+    "greylisted",
+    "unexpected extra arguments",
+    "connection reset by peer",
 )
 
-# NOTE: "[alert]" is deliberately NOT here. Gmail answers
-#   "[ALERT] Invalid credentials (Failure)"  -> that is a WRONG password, and
-#   "[ALERT] Please log in via your web browser" -> that is an APP password.
-# Treating every [ALERT] as retryable mislabelled all of Gmail's auth failures.
 _CONN = (
-    "timed out", "timeout", "connection refused", "connection reset",
-    "connection closed", "connection aborted", "connectionrefusederror",
-    "socket error", "socket fail", "socket.timeout", "eof", "unexpected_eof",
-    "unexpected eof", "tls not supported", "stls not supported", "ssl",
-    "proxy connection failed", "proxy authentication required", "proxy auth",
-    "proxyconnect", "proxy connect", "proxy route", "407",
-    "network is unreachable", "unreachable", "broken pipe", "handshake",
-    "no route to host", "bad file descriptor", "wrong version number",
-    "certificate verify failed", "hostname mismatch", "certificate has expired",
-    "self signed certificate", "self-signed certificate", "tlsv1",
-    "proxy and direct fallback", "bad proxy format", "socks",
-    "transport endpoint", "connection lost",
+    "407",
+    "proxy authentication",
+    "proxy auth",
+    "proxyconnect",
+    "proxy connect",
+    "proxy route",
+    "bad proxy format",
+    "proxy",
+    "socks",
+    "timed out",
+    "timeout",
+    "timedout",
+    "connection refused",
+    "connection reset",
+    "connection aborted",
+    "connection closed",
+    "connection dropped",
+    "connection lost",
+    "connection failure",
+    "connection negotiation failure",
+    "negotiation failure",
+    "socket error",
+    "socket closed",
+    "socket timeout",
+    "eof",
+    "broken pipe",
+    "network is unreachable",
+    "no route to host",
+    "host is down",
+    "reset by peer",
+    "ssl",
+    "tls",
+    "wrong version number",
+    "handshake",
+    "certificate",
+    "cert verify",
+    "unexpected eof",
+    "bad file descriptor",
+    "not supported by server",
+    "stls not supported",
+    "starttls not supported",
+    "tls not supported",
+    "imap4rev1",
+    "cannot connect",
+    "unable to connect",
+    "failed to connect",
+    "connect failed",
 )
 
 _WRONG = (
-    "[authenticationfailed]", "authenticationfailed", "authentication failed",
-    "authenticate error", "authenticate failed", "authentication error",
-    "invalid credentials", "invalid login", "invalid password", "invalid user",
-    "invalid username", "invalid user name", "login incorrect", "login failed",
-    "login returned non-ok", "login non-ok", "password incorrect",
-    "wrong password", "realmless login not allowed", "auth error", "[auth]",
-    "not authenticated", "bad credentials", "bad username", "logon failure",
-    "username and password not accepted", "user rejected", "password rejected",
-    "invalid token", "expired token", "error",
+    "authenticationfailed",
+    "authentication failed",
+    "authenticate error",
+    "authenticate failed",
+    "authentication error",
+    "auth failed",
+    "auth failure",
+    "invalid credentials",
+    "invalid credential",
+    "invalid login",
+    "invalid password",
+    "invalid user",
+    "invalid username",
+    "invalid user name",
+    "invalid account",
+    "login incorrect",
+    "login failed",
+    "login failure",
+    "login returned non-ok",
+    "login non-ok",
+    "login error",
+    "password incorrect",
+    "password invalid",
+    "wrong password",
+    "incorrect password",
+    "realmless login not allowed",
+    "realmless",
+    "auth error",
+    "[auth]",
+    "authentication",
+    "not authenticated",
+    "bad credentials",
+    "bad username",
+    "bad password",
+    "logon failure",
+    "username and password not accepted",
+    "user rejected",
+    "password rejected",
+    "invalid token",
+    "expired token",
+    "internal server error",
+    "error",
+)
+
+# Strong, unambiguous auth phrases checked before the CONN table.
+_WRONG_STRONG = (
+    "realmless login not allowed",
+    "authenticationfailed",
+    "authentication failed",
+    "invalid credentials",
+    "invalid user name or password",
+    "login incorrect",
+    "wrong password",
+    "authenticate error",
+    "invalid login or password",
 )
 
 _PROXY_LEVEL = (
-    "407", "proxy authentication required", "proxy auth", "proxyconnect",
-    "proxy connect", "proxy route", "bad proxy format", "socks",
+    "407",
+    "proxy authentication required",
+    "proxy auth",
+    "proxyconnect",
+    "proxy connect",
+    "proxy route",
+    "bad proxy format",
+    "socks",
 )
 
 
@@ -192,12 +294,13 @@ def _match(text, needles):
     return any(n in text for n in needles)
 
 
+# ---------------------------------------------------------------------------
+# CLASSIFIER
+# ---------------------------------------------------------------------------
 def classify_error(raw, domain=""):
     """Map a raw server/socket error string to an engine status.
 
     Order matters: APP -> DNS -> RETRY -> CONN -> WRONG -> UNKNOWN.
-    CONN is checked before WRONG so that 'Socket error: 407' is not read as
-    an auth problem by the catch-all 'error' token.
     """
     t = _norm(raw)
     if not t:
@@ -205,6 +308,12 @@ def classify_error(raw, domain=""):
 
     if _match(t, _APP_PASSWORD):
         return NEED_APP_PASSWORD
+
+    # Strong auth phrases win outright — they can otherwise be shadowed by the
+    # generic "error" / "authentication" tokens in the tables below.
+    if _match(t, _WRONG_STRONG):
+        return WRONG_PASSWORD
+
     if _match(t, _DNS):
         return DNS_FAILED
     if _match(t, _RETRY):
@@ -233,8 +342,27 @@ def is_dns_signal(raw):
     return _match(_norm(raw), _DNS)
 
 
-def is_auth_signal(raw):
-    return _match(_norm(raw), _WRONG)
+def is_wrong_password_signal(raw):
+    t = _norm(raw)
+    return _match(t, _WRONG_STRONG) or _match(t, _WRONG)
+
+
+# ---------------------------------------------------------------------------
+# SMALL HELPERS
+# ---------------------------------------------------------------------------
+def merge(*statuses):
+    cand = [s for s in statuses if s]
+    if not cand:
+        return UNKNOWN
+    return sorted(cand, key=lambda s: PRIORITY.get(s, 99))[0]
+
+
+def is_terminal(status):
+    return status in TERMINAL
+
+
+def is_failure(status):
+    return status in (CONNECTION_FAILED, DNS_FAILED, SMTP_FAILED, UNKNOWN)
 
 
 def display(status):
@@ -246,5 +374,4 @@ def color(status):
 
 
 def upper(status):
-    """Report-table spelling, e.g. 'retry_later' -> 'RETRY_LATER'."""
-    return (status or "").upper()
+    return str(status or "").upper()
