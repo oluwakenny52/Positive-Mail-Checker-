@@ -1,4 +1,19 @@
-"""One host table. Primary first, backup second, with SRV/autoconfig/MX discovery."""
+"""
+hosts.py
+========
+One host table. Primary first, backup second, with SRV/autoconfig/MX discovery.
+
+v13.5 changes
+-------------
+* rank_hosts() now sorts RESOLVES first, then tier. Previously tier dominated,
+  so three dead 'imap.<domain>' guesses filled the MAX_HOSTS_PER_DOMAIN slice
+  and pushed the real provider endpoint (imap.gmail.com / imap.gmx.net) out of
+  the plan — which is why the direct retry kept landing on pop.gmx.net /
+  pop.gmail.com instead of an IMAP host.
+* freenet / gmx / web.de / t-online / posteo added to MX_PROVIDER_MAP so the
+  MX alone is enough to find the provider's own endpoint.
+* smtp_candidates() added for the SMTP failed check.
+"""
 
 import os
 import re
@@ -117,7 +132,7 @@ COUNTRY = {
     "adinet.com.uy": ["mail.adinet.com.uy"],
     "antel.com.uy": ["mail.antel.com.uy"],
     "uy.com": ["mail.uy.com"],
-    # --- v13.4: lock host order for the offenders seen in the failure log ---
+    # offenders seen in the failure log
     "freenet.de": ["imap.freenet.de"],
     "netcourrier.com": ["imap.netcourrier.com"],
     "bbox.fr": ["imap.bbox.fr"],
@@ -141,65 +156,63 @@ UNIVERSAL_IMAP_FALLBACKS = [
     "imap.gmail.com",
     "outlook.office365.com",
     "imap.mail.yahoo.com",
-    "imap.aol.com"
+    "imap.aol.com",
 ]
 
 UNIVERSAL_POP_FALLBACKS = [
     "pop.gmail.com",
     "outlook.office365.com",
     "pop.mail.yahoo.com",
-    "pop.aol.com"
+    "pop.aol.com",
 ]
 
-# MX-host substring -> (imap_host, pop_host).  ORDER MATTERS: specific first.
+# MX-host substring -> (imap_host, pop_host, smtp_host).  ORDER MATTERS: specific first.
 # "aol" MUST come before "yahoo" (AOL MX = mx-aol.mail.gm0.yahoodns.net).
 MX_PROVIDER_MAP = (
-    (("google", "gsuite", "googlemail"), ("imap.gmail.com", "pop.gmail.com")),
-    (("outlook", "microsoft", "office365", "protection.outlook"), ("outlook.office365.com", "outlook.office365.com")),
-    (("aol",), ("imap.aol.com", "pop.aol.com")),
-    (("yahoodns", "yahoo"), ("imap.mail.yahoo.com", "pop.mail.yahoo.com")),
-    (("icloud", "apple", "me.com"), ("imap.mail.me.com", "pop.mail.me.com")),
-    (("zoho",), ("imap.zoho.com", "pop.zoho.com")),
-    (("yandex",), ("imap.yandex.com", "pop.yandex.com")),
-    (("mail.ru", "internet.ru", "bk.ru", "list.ru", "inbox.ru"), ("imap.mail.ru", "pop.mail.ru")),
-    (("gmx", "1and1", "ionos", "schlund", "united-domains"), ("imap.gmx.net", "pop.gmx.net")),
-    (("t-online", "tonline", "tmo"), ("secureimap.t-online.de", "securepop.t-online.de")),
-    (("ovh",), ("ssl0.ovh.net", "ssl0.ovh.net")),
-    (("fastmail", "messagingengine"), ("imap.fastmail.com", "pop.fastmail.com")),
-    (("hostinger",), ("imap.hostinger.com", "pop.hostinger.com")),
-    (("gandi",), ("mail.gandi.net", "mail.gandi.net")),
-    (("rackspace", "emailsrvr"), ("secure.emailsrvr.com", "secure.emailsrvr.com")),
-    (("secureserver", "godaddy"), ("imap.secureserver.net", "pop.secureserver.net")),
-    (("mailbox.org",), ("imap.mailbox.org", "pop3.mailbox.org")),
-    (("posteo",), ("posteo.de", "posteo.de")),
-    (("laposte",), ("imap.laposte.net", "pop.laposte.net")),
-    (("orange", "wanadoo"), ("imap.orange.fr", "pop.orange.fr")),
-    (("proxad",), ("imap.free.fr", "pop.free.fr")),
-    (("bluewin", "swisscom"), ("imaps.bluewin.ch", "pop3s.bluewin.ch")),
-    (("interia",), ("poczta.interia.pl", "poczta.interia.pl")),
-    (("seznam",), ("imap.seznam.cz", "pop3.seznam.cz")),
-    (("naver",), ("imap.naver.com", "pop.naver.com")),
-    (("daum", "hanmail"), ("imap.daum.net", "pop.daum.net")),
-    (("qq.com", "tencent"), ("imap.qq.com", "pop.qq.com")),
-    (("163.com", "126.com", "netease"), ("imap.163.com", "pop.163.com")),
-    (("biglobe",), ("mail.biglobe.ne.jp", "mail.biglobe.ne.jp")),
-    (("nifty",), ("imap.nifty.com", "pop.nifty.com")),
-    (("so-net",), ("imap.so-net.ne.jp", "pop.so-net.ne.jp")),
+    (("google", "gsuite", "googlemail"), ("imap.gmail.com", "pop.gmail.com", "smtp.gmail.com")),
+    (("outlook", "microsoft", "office365", "protection.outlook"), ("outlook.office365.com", "outlook.office365.com", "smtp.office365.com")),
+    (("aol",), ("imap.aol.com", "pop.aol.com", "smtp.aol.com")),
+    (("yahoodns", "yahoo"), ("imap.mail.yahoo.com", "pop.mail.yahoo.com", "smtp.mail.yahoo.com")),
+    (("icloud", "apple", "me.com"), ("imap.mail.me.com", "pop.mail.me.com", "smtp.mail.me.com")),
+    # --- the offenders: provider identity is NOT the same as the MX brand ---
+    (("freenet",), ("imap.freenet.de", "pop.freenet.de", "smtp.freenet.de")),
+    (("gmx", "1and1", "ionos", "schlund", "united-domains", "kasserver", "udag"), ("imap.gmx.net", "pop.gmx.net", "mail.gmx.net")),
+    (("web.de",), ("imap.web.de", "pop3.web.de", "smtp.web.de")),
+    (("t-online", "tonline", "tmo"), ("secureimap.t-online.de", "securepop.t-online.de", "securesmtp.t-online.de")),
+    (("posteo",), ("imap.posteo.de", "pop.posteo.de", "smtp.posteo.de")),
+    (("mailbox.org",), ("imap.mailbox.org", "pop3.mailbox.org", "smtp.mailbox.org")),
+    (("strato",), ("imap.strato.de", "pop.strato.de", "smtp.strato.de")),
+    (("zoho",), ("imap.zoho.com", "pop.zoho.com", "smtp.zoho.com")),
+    (("yandex",), ("imap.yandex.com", "pop.yandex.com", "smtp.yandex.com")),
+    (("mail.ru", "internet.ru", "bk.ru", "list.ru", "inbox.ru"), ("imap.mail.ru", "pop.mail.ru", "smtp.mail.ru")),
+    (("ovh",), ("ssl0.ovh.net", "ssl0.ovh.net", "ssl0.ovh.net")),
+    (("fastmail", "messagingengine"), ("imap.fastmail.com", "pop.fastmail.com", "smtp.fastmail.com")),
+    (("hostinger",), ("imap.hostinger.com", "pop.hostinger.com", "smtp.hostinger.com")),
+    (("gandi",), ("mail.gandi.net", "mail.gandi.net", "mail.gandi.net")),
+    (("rackspace", "emailsrvr"), ("secure.emailsrvr.com", "secure.emailsrvr.com", "secure.emailsrvr.com")),
+    (("secureserver", "godaddy"), ("imap.secureserver.net", "pop.secureserver.net", "smtpout.secureserver.net")),
+    (("laposte",), ("imap.laposte.net", "pop.laposte.net", "smtp.laposte.net")),
+    (("orange", "wanadoo"), ("imap.orange.fr", "pop.orange.fr", "smtp.orange.fr")),
+    (("proxad",), ("imap.free.fr", "pop.free.fr", "smtp.free.fr")),
+    (("bluewin", "swisscom"), ("imaps.bluewin.ch", "pop3s.bluewin.ch", "smtpauths.bluewin.ch")),
+    (("interia",), ("poczta.interia.pl", "poczta.interia.pl", "poczta.interia.pl")),
+    (("seznam",), ("imap.seznam.cz", "pop3.seznam.cz", "smtp.seznam.cz")),
+    (("naver",), ("imap.naver.com", "pop.naver.com", "smtp.naver.com")),
+    (("daum", "hanmail"), ("imap.daum.net", "pop.daum.net", "smtp.daum.net")),
+    (("qq.com", "tencent"), ("imap.qq.com", "pop.qq.com", "smtp.qq.com")),
+    (("163.com", "126.com", "netease"), ("imap.163.com", "pop.163.com", "smtp.163.com")),
+    (("biglobe",), ("mail.biglobe.ne.jp", "mail.biglobe.ne.jp", "mail.biglobe.ne.jp")),
+    (("nifty",), ("imap.nifty.com", "pop.nifty.com", "smtp.nifty.com")),
+    (("so-net",), ("imap.so-net.ne.jp", "pop.so-net.ne.jp", "smtp.so-net.ne.jp")),
     # shared-hosting platforms -> mail.<domain>
     (("bluehost", "hostgator", "cpanel", "siteground", "namecheap", "dreamhost",
       "liquidweb", "inmotion", "greengeeks", "a2hosting", "hostpapa",
-      "netsol", "network solutions", "webhostingpad", "stablehost", "hawkhost"), (None, None)),
+      "netsol", "network solutions", "webhostingpad", "stablehost", "hawkhost"), (None, None, None)),
 )
 
 
 # ============================================================================
 # ROUTER / RELAY DETECTION + CANDIDATE RANKING
-#
-# The old test was host.startswith(("mx", "smtp")).  It missed Zimbra-style
-# router names such as "zcs8-mvd-mta-mx7.montevideo.com.uy", which resolve in
-# DNS but serve no IMAP/POP at all.  Those routers then ranked ABOVE the real
-# endpoint (mail.<domain>) and, with MAX_HOSTS_PER_DOMAIN=2, ate the whole
-# ladder with connect timeouts.
 # ============================================================================
 
 _ROUTER_LABEL_EXACT = re.compile(
@@ -255,7 +268,6 @@ def is_junk_host(host, domain=None):
     return False
 
 
-# kept for backwards compatibility with older callers
 _is_junk_host = is_junk_host
 
 
@@ -294,11 +306,7 @@ def _port_open(host, port, timeout=1.5):
 
 
 def probe_live(host, timeout=1.5):
-    """Cheap TCP reachability check on 993 / 143 (cached 10 min).
-
-    This is the signal DNS alone cannot give: a Zimbra MTA router resolves
-    perfectly but hangs on 993, while mail.<domain> answers immediately.
-    """
+    """Cheap TCP reachability check on 993 / 143 (cached 10 min)."""
     if not host:
         return False
     now = time.time()
@@ -315,16 +323,15 @@ def probe_live(host, timeout=1.5):
 
 
 def rank_hosts(hosts, domain, probe=True):
-    """Composite ranking, replacing any name-prefix sort.
+    """Composite ranking.
 
-    Order of precedence:
-      1. tier           - service endpoint before router before bare domain
-      2. DNS resolves   - a dead name fails fast instead of burning a timeout
-      3. port answers   - 993/143 reachable
-      4. discovery index- preserves SRV / autoconfig authority order
-
-    Cheap failures (DNS) are deliberately ordered before expensive ones
-    (connect timeout), and router hosts are demoted before either.
+    Order of precedence is now:
+      1. DNS RESOLVES    - a name that does not resolve cannot possibly work, so
+                           it must never occupy a MAX_HOSTS_PER_DOMAIN slot
+                           while the provider endpoint sits below the cut.
+      2. tier            - service endpoint before router before bare domain
+      3. port answers    - 993/143 reachable
+      4. discovery index - preserves SRV / autoconfig authority order
     """
     hosts = [h for h in (hosts or []) if h]
     if not hosts:
@@ -332,14 +339,16 @@ def rank_hosts(hosts, domain, probe=True):
 
     indexed = list(enumerate(hosts))
     if not probe:
-        indexed.sort(key=lambda t: (host_tier(t[1], domain), 0 if host_resolves(t[1]) else 1, t[0]))
+        indexed.sort(key=lambda t: (
+            0 if host_resolves(t[1]) else 1,
+            host_tier(t[1], domain),
+            t[0],
+        ))
         return [h for _i, h in indexed]
 
     tiers = {h: host_tier(h, domain) for h in set(hosts)}
     resolves = {h: host_resolves(h) for h in set(hosts)}
 
-    # Probe in parallel, only for plausible candidates, so a new domain costs
-    # ~1.5s instead of 8 x 1.5s.
     to_probe = [h for h in dict.fromkeys(hosts) if tiers[h] <= 1 and resolves[h]][:6]
     live = {}
     if to_probe:
@@ -356,8 +365,8 @@ def rank_hosts(hosts, domain, probe=True):
             pass
 
     indexed.sort(key=lambda t: (
-        tiers.get(t[1], 4),
         0 if resolves.get(t[1], False) else 1,
+        tiers.get(t[1], 4),
         0 if live.get(t[1], False) else 1,
         t[0],
     ))
@@ -365,13 +374,13 @@ def rank_hosts(hosts, domain, probe=True):
 
 
 # ============================================================================
-# CACHES  (atomic writes - a killed process must never leave partial JSON)
+# CACHES  (atomic writes)
 # ============================================================================
 
 _CACHE_FILE = "hosts_cache.json"
-_CACHE_TTL = 86400          # 24h - entry considered fresh
-_CACHE_MAX_AGE = 7 * 86400  # 7d  - entry pruned entirely
-_cache_lock = threading.RLock()   # RLock: _save_cache() may be called while held
+_CACHE_TTL = 86400
+_CACHE_MAX_AGE = 7 * 86400
+_cache_lock = threading.RLock()
 _cache = None
 
 _resolve_lock = threading.Lock()
@@ -544,7 +553,6 @@ def resolve_srv(name):
 
 
 def host_resolves(host):
-    """Cheap existence check so dead guesses don't burn a connect timeout."""
     if not host:
         return False
     with _resolve_lock:
@@ -668,29 +676,28 @@ def _provider_from_mx(mx_host):
     return None
 
 
-# IMAP service prefixes, most-likely first. 'correo.'/'webmail.' cover
-# Spanish/Portuguese-speaking ISPs that never publish imap.<domain>.
 _IMAP_PREFIXES = ("imap.", "mail.", "webmail.", "imaps.", "correo.", "secure.", "zimbra.", "email.", "mail2.", "")
 _POP_PREFIXES = ("pop.", "pop3.", "pop3s.", "mail.", "correo.", "")
+_SMTP_PREFIXES = ("smtp.", "mail.", "smtp-mail.", "send.", "relay.", "")
 
 
 def discover_hosts(domain, email=None, use_cache=True, force_refresh=False):
     """Ordered candidate discovery: SRV -> autoconfig -> autodiscover -> MX -> prefixes.
 
-    Returns {"imap": [...], "pop": [...], "sources": [...]}
+    Returns {"imap": [...], "pop": [...], "smtp": [...], "sources": [...]}
     """
     domain = (domain or "").lower().strip()
     if not domain:
-        return {"imap": [], "pop": [], "sources": []}
+        return {"imap": [], "pop": [], "smtp": [], "sources": []}
 
     if use_cache and not force_refresh:
         with _cache_lock:
             entry = _load_cache().get(domain)
         if entry and (time.time() - entry.get("ts", 0) < _CACHE_TTL):
             return {"imap": entry.get("imap", []), "pop": entry.get("pop", []),
-                    "sources": entry.get("sources", ["cache"])}
+                    "smtp": entry.get("smtp", []), "sources": entry.get("sources", ["cache"])}
 
-    imap, pop, sources = [], [], []
+    imap, pop, smtp, sources = [], [], [], []
 
     # 1. SRV (RFC 6186) - most authoritative when present
     for svc, bucket in (("_imaps._tcp.", imap), ("_imap._tcp.", imap),
@@ -724,13 +731,15 @@ def discover_hosts(domain, email=None, use_cache=True, force_refresh=False):
         if provider:
             break
     if provider:
-        p_imap, p_pop = provider
+        p_imap, p_pop, p_smtp = provider
         if p_imap:
             imap.append(p_imap)
             pop.append(p_pop or p_imap)
+            smtp.append(p_smtp or f"mail.{domain}")
         else:
             imap.append(f"mail.{domain}")
             pop.append(f"mail.{domain}")
+            smtp.append(f"mail.{domain}")
         sources.append("mx-provider")
 
     # 4. Well-known service names on the domain itself
@@ -742,6 +751,10 @@ def discover_hosts(domain, email=None, use_cache=True, force_refresh=False):
         h = f"{pfx}{domain}"
         if h not in pop:
             pop.append(h)
+    for pfx in _SMTP_PREFIXES:
+        h = f"{pfx}{domain}"
+        if h not in smtp:
+            smtp.append(h)
     sources.append("prefix")
 
     # 5. MX-derived hostnames LAST (routers, usually not the endpoint)
@@ -756,6 +769,10 @@ def discover_hosts(domain, email=None, use_cache=True, force_refresh=False):
                     h = f"{pfx}{parent}"
                     if h not in imap:
                         imap.append(h)
+                for pfx in ("smtp.", "mail."):
+                    h = f"{pfx}{parent}"
+                    if h not in smtp:
+                        smtp.append(h)
 
     # 6. Universal fallbacks
     for fb in UNIVERSAL_IMAP_FALLBACKS:
@@ -765,16 +782,17 @@ def discover_hosts(domain, email=None, use_cache=True, force_refresh=False):
         if fb not in pop:
             pop.append(fb)
 
-    # 7. Rank: tier -> resolves -> port answers -> discovery index
+    # 7. Rank: resolves -> tier -> port answers -> discovery index
     imap = rank_hosts(_dedupe(imap), domain)[:8]
     pop = rank_hosts(_dedupe(pop), domain)[:6]
+    smtp = rank_hosts(_dedupe(smtp), domain, probe=False)[:4]
 
     with _cache_lock:
         c = _load_cache()
-        c[domain] = {"imap": imap, "pop": pop, "sources": sources, "ts": time.time()}
+        c[domain] = {"imap": imap, "pop": pop, "smtp": smtp, "sources": sources, "ts": time.time()}
     _save_cache()
 
-    return {"imap": imap, "pop": pop, "sources": sources}
+    return {"imap": imap, "pop": pop, "smtp": smtp, "sources": sources}
 
 
 # ============================================================================
@@ -803,6 +821,31 @@ def get_mx_host(domain):
     return exchange
 
 
+def smtp_candidates(domain):
+    """SMTP endpoints for the SMTP failed check (never raises)."""
+    domain = (domain or "").lower().strip()
+    if not domain:
+        return []
+    if domain in ZERO_ACCESS:
+        return []
+    known = COUNTRY.get(domain)
+    if known:
+        out = []
+        for h in known:
+            for pfx in ("smtp.", "mail."):
+                cand = re.sub(r"^(imap|imaps|pop|pop3|secureimap|securepop)\.", pfx, h)
+                if cand not in out:
+                    out.append(cand)
+        for pfx in _SMTP_PREFIXES:
+            h = f"{pfx}{domain}"
+            if h not in out:
+                out.append(h)
+        return rank_hosts(_dedupe(out), domain, probe=False)[:3]
+
+    found = discover_hosts(domain)
+    return (found.get("smtp") or [])[:3]
+
+
 def conf(domain):
     """Full server config for a domain. Known providers are instant;
     everything else goes through cached discovery."""
@@ -813,7 +856,6 @@ def conf(domain):
     if domain in ZERO_ACCESS:
         return {"imap": [], "pop": [], "pop3": [], "type": "zero_access"}
 
-    # --- Static, instant, no network (order already curated) ---
     if domain in FRONTIER:
         return _pair(FRONTIER_IMAP, FRONTIER_POP, domain)
     if domain in ATT_FAMILY:
@@ -834,12 +876,11 @@ def conf(domain):
     if known:
         return _pair(known, known, domain)
 
-    # --- Discovered ---
     found = discover_hosts(domain)
     if found["imap"] or found["pop"]:
         imap = found["imap"]
         pop = found["pop"] or found["imap"]
-        return {"imap": imap, "pop": pop, "pop3": pop, "sources": found["sources"]}
+        return {"imap": imap, "pop": pop, "pop3": pop, "smtp": found.get("smtp", [])}
 
     return None
 
