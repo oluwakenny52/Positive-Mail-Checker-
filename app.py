@@ -1,72 +1,75 @@
 """
-Mega Ultimate Mail Checker — v13.10
+Mega Ultimate Mail Checker — v13.11
 ===================================
 Complete rewrite. SMTP reachability is an OPT-IN pre-check stage (never inside
 the validator), status classification actually works, and every direct-connection
 line carries the real egress IP / region / country / VPN state.
 
+v13.11 changes  (the domain's OWN servers were structurally unreachable)
+-----------------------------------------------------------------------
+* CRITICAL FIX — FAMILY DOMAINS NEVER TRIED THEIR OWN HOSTS. get_servers()
+  returned the curated family answer and stopped:
+      known = known_provider_conf(domain); if known: return known
+  brighthouse.com is hardcoded in the TWC family set, so it could only ever
+  produce mail.twc.com + mobile.charter.net. mail.brighthouse.com and
+  imap.brighthouse.com were never attempted at all — the domain's own server was
+  sitting there answering and the ladder could not see it.
+  Every curated answer (and every parent-provider branch reached via MX) is now
+  passed through _merge_domain_guesses(), which APPENDS the domain's own
+  resolving service names after the curated hosts.
+    - curated hosts stay first, so a guess can never push the authoritative
+      endpoint out of the MAX_HOSTS slice;
+    - only guesses that actually RESOLVE are appended, so a dud costs no budget;
+    - idempotent, so it is safe to call at more than one layer.
+  Applies to ATT / FRONTIER / CHARTER / TWC / VERIZON / YAHOO / MS / GMAIL /
+  COUNTRY families, PROVIDER_MAP entries, and the parent-provider branch.
+
 v13.10 changes  (bounded rungs — the direct phase was being starved)
 -------------------------------------------------------------------
 * CRITICAL FIX — proxy_connect() was UNBOUNDED. It gave the FULL timeout to each
-  of its three legs (SOCKS5, HTTP, then a direct fallback), so a single rung
-  could consume ~3x its nominal time. Live evidence: mail.twc.com burned ~15.6s
-  of a 7.8s rung, which ate 8s out of the direct phase and cut its per-attempt
-  timeout from 19.5s/3 to 11.9s/3 = 4.0s — below what these servers need.
-  Each leg now gets half the budget, bounding a rung to ~1.5x.
-* CRITICAL FIX — DUPLICATE RUNG. When pop_hosts[0] is already imap_hosts[0]
-  (mail.twc.com for brighthouse.com), the host was queued TWICE — once IMAP 993
-  and once POP 995 — thinning every per-attempt timeout by a third for zero
-  extra coverage. A POP rung is now only promoted into the primary plan when its
-  host is NOT already an IMAP host; otherwise it is demoted to the fallback phase.
-* The per-account budget now FLOORS to fit the work:
-      rungs * max(TIMEOUT, 12s) * 2
-  so a 2-rung account gets 48s even though the Deadline slider says 45s. Logged
-  explicitly when it fires, so the slider is never silently contradicted.
-* Every attempt is clamped to the phase deadline — a late rung can no longer
-  drag a pass past its own window.
-* The account window is logged up front (proxy Xs / direct Ys) so the split is
-  visible in the trace instead of having to be inferred.
+  of its three legs (SOCKS5, HTTP, direct), so one rung could burn ~3x its
+  nominal time. Each leg now gets half the budget, bounding a rung to ~1.5x.
+* CRITICAL FIX — DUPLICATE RUNG. When pop_hosts[0] was already imap_hosts[0],
+  the host was queued TWICE. A POP rung is now only promoted into the primary
+  plan when its host is not already an IMAP host.
+* The per-account budget FLOORS to fit the work: rungs * max(TIMEOUT, 12s) * 2.
+* Every attempt is clamped to the phase deadline.
+* The account window is logged up front (proxy Xs / direct Ys).
 
-v13.9 changes  (host-major ladder — stop starving host #2 and host #3)
----------------------------------------------------------------------
+v13.9 changes  (host-major ladder)
+----------------------------------
 * CRITICAL FIX — LADDER ORDER. Proxy rotation used to happen INSIDE the per-host
   loop, so a slow host #1 consumed the entire proxy window and hosts #2/#3 were
-  never attempted at all.
-  The ladder is now HOST-MAJOR:
-    pass 1 — every host exactly once, NO rotation
-    pass 2 — only hosts that failed at network level, fresh proxy each, max 2
-* Per-attempt timeout derived from the live window, not a fixed divisor.
+  never attempted. The ladder is now HOST-MAJOR: pass 1 = every host once, no
+  rotation; pass 2 = only network-failed hosts, fresh proxy, max 2.
+* Per-attempt timeout derived from the live window.
 * Legacy 143/110 rungs demoted to a separate fallback_plan.
 * The DIRECT pass sweeps ALL locally-resolving hosts (was capped at [:2]).
-* A connection-refused is HOST-level, not proxy-level — it no longer burns a
-  rotation. A read timeout likewise.
-* hosts.py: BT consumer mail maps to imap.mail.yahoo.com; Sky and Virgin Media
-  get explicit endpoints.
+* A connection-refused is HOST-level, not proxy-level.
+* hosts.py: BT consumer mail maps to imap.mail.yahoo.com; Sky/Virgin explicit.
 
 v13.8 changes  (verdict retention + budget rebalance + 407 breaker)
 -------------------------------------------------------------------
-* CRITICAL FIX — VERDICT RETENTION. check_account_sync keeps a best_verdict the
-  first time ANY host hands back VALID / WRONG_PASSWORD / NEED_APP_PASSWORD.
-  best_verdict is returned at ladder end, ahead of RETRY / DNS_FAILED /
-  CONNECTION_FAILED, and ahead of the critical-exception fallback.
-* BUDGET REBALANCE. The proxy pass gets 55% of the per-account budget (was 72%).
+* CRITICAL FIX — VERDICT RETENTION. best_verdict is kept the first time any host
+  returns VALID / WRONG_PASSWORD / NEED_APP_PASSWORD and returned at ladder end,
+  ahead of RETRY / DNS_FAILED / CONNECTION_FAILED.
+* BUDGET REBALANCE. The proxy pass gets 55% of the per-account budget.
 * 407 BREAKER. After 3 consecutive 407s on the same host, jump straight to DIRECT.
 * 'Lookup failed' falls through to the NEXT HOST instead of rotating proxies.
 * vpn_state_label() only stamps VPN ON (auto) for explicit VPN brands / "vpn".
-* status.py: 'realmless login not allowed' anchored in _WRONG via _WRONG_STRONG,
-  and the catch-all "error" token dropped from _WRONG's tail.
+* status.py: 'realmless login not allowed' anchored in _WRONG_STRONG; the
+  catch-all "error" token dropped from _WRONG's tail.
 
 v13.7 changes
 -------------
-* SMTP pre-check is now OFF BY DEFAULT. The engine runs IMAP/POP only.
+* SMTP pre-check is OFF BY DEFAULT. The engine runs IMAP/POP only.
 * The SMTP checkbox moved into the "Advanced Control Rules" slide-out section.
-* When enabled: direct-first probing, a 45s wall-clock budget, 32 parallel workers.
+* When enabled: direct-first probing, 45s wall-clock budget, 32 parallel workers.
 
 v13.6 changes
 -------------
 * CRITICAL FIX: status.py exports ALL_STATUSES again, so the real classifier is
-  used. Previously the whole status import threw and every auth error logged as
-  "[Classified: unknown]".
+  used.
 * CRITICAL FIX: the SMTP failed check no longer runs inside check_account_sync.
 * SMTP Failed is a PRE-CHECK bucket, displayed immediately AFTER DNS Failed.
 * NEW: per-domain SMTP reachability cache (TTL 15 min).
@@ -265,7 +268,6 @@ except Exception as _hosts_rank_err:
         return ok
 
     def host_rank_hosts(hosts, domain, probe=True):
-        """Resolves first, then tier, then port, then discovery order."""
         hosts = [h for h in (hosts or []) if h]
         if not hosts:
             return []
@@ -331,8 +333,6 @@ except Exception as _status_err:
         DNS_FAILED: "#f97316", UNKNOWN: "#94a3b8", SKIPPED_COOLDOWN: "#a78bfa",
     }
 
-    # v13.8: mirrors status.py — no bare "error" token in the WRONG table, and
-    # the Gmail "via your web browser" app-password phrase is present.
     _FB_APP = ("app password", "application-specific", "basic authentication is disabled",
                "web browser", "via your web browser", "2fa", "mfa", "two-factor",
                "enable imap", "login-disabled")
@@ -448,7 +448,7 @@ def default_theme() -> dict:
         "bg": p["bg"], "panel": p["panel"], "text": p["text"],
         "radius": 14, "glow": True, "animate": True, "glass": True,
         "colorize_logs": True,
-        "hero_title": "⚡ Mega Ultimate Mail Checker v13.10",
+        "hero_title": "⚡ Mega Ultimate Mail Checker v13.11",
         "hero_sub": "World-Coverage Edition — router-aware host ranking, rotating proxy pool, geo-call routing, retryable IP-block handling, optional SMTP pre-check, anti-spoofing post-auth validation.",
     }
 
@@ -783,10 +783,6 @@ TLD_COUNTRY = {
 }
 
 # v13.8 — EXPLICIT VPN / anonymiser brands only.
-# A hosting or cloud egress (34.127.0.121 = Google Cloud) is NOT a VPN, so
-# "google cloud", "amazon", "m247", "datacamp", "gcore", "hetzner", "ovh",
-# "digitalocean", ... must not stamp VPN ON. Only a real VPN brand, or the
-# literal "vpn" token, does.
 _VPN_BRANDS = (
     "vpn", "nordvpn", "mullvad", "proton", "expressvpn", "surfshark", "cyberghost",
     "private internet", "ipvanish", "windscribe", "tunnelbear", "hide.me", "purevpn",
@@ -794,7 +790,6 @@ _VPN_BRANDS = (
     "azirevpn", "airvpn", "openvpn", "wireguard",
 )
 
-# Kept for backwards compatibility with anything that still reads the old name.
 _VPN_TOKENS = _VPN_BRANDS
 
 def load_persistent_valid_results():
@@ -1232,9 +1227,7 @@ def vpn_state_label():
     """Honour the manual stamp; 'Auto' guesses from the egress ISP.
 
     v13.8: 'Auto' defaults to VPN OFF. Only an explicit VPN brand (or the
-    literal 'vpn' token) in the ISP/org flips it to VPN ON (auto). Cloud and
-    hosting ISPs — Google Cloud, Amazon, Hetzner, DigitalOcean, m247, ... — are
-    no longer mislabelled as a VPN.
+    literal 'vpn' token) in the ISP/org flips it to VPN ON (auto).
     """
     hint = CFG.get("CONNECTION_HINT", "Auto")
     if hint in ("VPN ON", "VPN OFF"):
@@ -1670,13 +1663,9 @@ def proxy_connect(host, port, proxy_str, timeout=None, remote_dns=True):
     """Proxied TCP connect.
 
     v13.10 — BOUNDED. Every leg used to get the FULL timeout, so a rung could
-    burn ~3x its nominal time (SOCKS5 timeout + HTTP timeout + direct timeout).
-    Live evidence: mail.twc.com consumed ~15.6s of a 7.8s rung, which ate 8s out
-    of the direct phase and cut its per-attempt timeout to 4.0s.
-
-    Now each leg gets half the budget, so the whole call is bounded to ~1.5x,
-    while the post-connect READ timeout stays at the full effective_timeout so
-    the TLS handshake and the IMAP greeting still get a fair shot.
+    burn ~3x its nominal time. Each leg now gets half the budget (~1.5x worst
+    case), while the post-connect READ timeout stays at the full
+    effective_timeout so the TLS handshake and IMAP greeting still get a shot.
     """
     base_timeout = timeout or CFG["PROXY_CONNECT_TIMEOUT"]
     try:
@@ -1892,11 +1881,7 @@ def _smtp_banner_ok(hosts, px, timeout=3.5):
     return False
 
 def smtp_domain_probe(domain, timeout=3.5):
-    """Per-domain SMTP reachability. True = alive, False = dead, None = no candidate.
-
-    DIRECT first — it skips the proxy handshake and is the fastest path. Only if
-    direct fails do we spend a second pass through the pool. Never raises.
-    """
+    """Per-domain SMTP reachability. True = alive, False = dead, None = no candidate."""
     try:
         hosts = host_smtp_candidates(domain) or []
     except Exception:
@@ -1908,7 +1893,7 @@ def smtp_domain_probe(domain, timeout=3.5):
     if not live:
         return False
 
-    if _smtp_banner_ok(live, None, timeout):          # direct pass first
+    if _smtp_banner_ok(live, None, timeout):
         return True
 
     with alive_pool_lock:
@@ -1924,12 +1909,7 @@ def smtp_cached(domain):
     return bool(hit and (time.time() - hit[0]) < _SMTP_CACHE_TTL)
 
 def smtp_precheck_domains(domains, max_workers=None, budget=None):
-    """Parallel, cached, and wall-clock bounded. Returns {domain: True|False|None}.
-
-    If `budget` seconds elapse, any domain still unresolved is returned as None
-    (i.e. "unknown"), so those accounts fall through to Ready to Check instead of
-    holding the whole page hostage.
-    """
+    """Parallel, cached, and wall-clock bounded. Returns {domain: True|False|None}."""
     max_workers = max_workers or _SMTP_PRECHECK_WORKERS
     budget = budget or _SMTP_PRECHECK_BUDGET
 
@@ -2445,14 +2425,8 @@ def _domains_in_text(text):
     return out
 
 def process_accounts(text, previous_valid):
-    """Pre-filter pipeline.
-
-    Order: syntax -> whitelist/blacklist -> strict-app -> disposable -> typo ->
-    already-valid -> duplicate/format -> DNS -> [SMTP, only when enabled].
-
-    DNS Failed and SMTP Failed are the last two buckets, SMTP strictly after DNS.
-    Returns (clean, disposable, typo, resume, app_skip, custom, dns_failed, smtp_failed)
-    """
+    """Pre-filter pipeline: syntax -> whitelist/blacklist -> strict-app ->
+    disposable -> typo -> already-valid -> duplicate/format -> DNS -> [SMTP]."""
     lines = []
     disp_list, typo_list, resume_list, app_skip_list, custom_list = [], [], [], [], []
     dns_fail_list, smtp_fail_list = [], []
@@ -2491,7 +2465,6 @@ def process_accounts(text, previous_valid):
 
     save_domain_cache()
 
-    # ---- SMTP PRE-CHECK (strictly AFTER the DNS filter) — OPT-IN ----
     if CFG.get("SMTP_CHECK", False) and lines:
         domains = list(dict.fromkeys(l.split(":", 1)[0].split("@")[-1].lower() for l in lines if "@" in l))
         results = smtp_precheck_domains(domains)
@@ -2544,7 +2517,6 @@ with input_tab2:
             str_lit.error(f"Failed decoding uploaded file: {e}")
             raw_text = ""
 
-# Pre-filter bucket labels, in display order. SMTP Failed is LAST, right after DNS Failed.
 PREFILTER_LABELS = [
     "Ready to Check", "Resume Unfinished", "Disposables", "Typos",
     "Skip previously valid", "App-Skipped", "Custom Filtered",
@@ -2586,9 +2558,6 @@ if raw_text:
     ]):
         c.metric(lbl, val)
 
-    # ------------------------------------------------------------------
-    # SELECT CATEGORY TO INSPECT CONTENTS
-    # ------------------------------------------------------------------
     section_title("🔍", "Filter & Result Categories Inspector",
                   "inspect any bucket, including DNS Failed and SMTP Failed")
 
@@ -2641,7 +2610,6 @@ PROVIDER_MAP = {
     "hotmail.com": {"imap": ["outlook.office365.com", "mail.hotmail.com"], "pop": ["outlook.office365.com"], "pop3": ["outlook.office365.com"]},
     "live.com": {"imap": ["outlook.office365.com", "mail.live.com"], "pop": ["outlook.office365.com"], "pop3": ["outlook.office365.com"]},
     "yahoo.com": {"imap": ["imap.mail.yahoo.com", "mail.yahoo.com"], "pop": ["pop.mail.yahoo.com"], "pop3": ["pop.mail.yahoo.com"]},
-    # v13.9 — BT consumer mail is Yahoo-hosted; 'imap.<domain>' stalls.
     "btinternet.com": {"imap": ["imap.mail.yahoo.com"], "pop": ["pop.mail.yahoo.com"], "pop3": ["pop.mail.yahoo.com"]},
     "bt.com": {"imap": ["imap.mail.yahoo.com"], "pop": ["pop.mail.yahoo.com"], "pop3": ["pop.mail.yahoo.com"]},
     "btopenworld.com": {"imap": ["imap.mail.yahoo.com"], "pop": ["pop.mail.yahoo.com"], "pop3": ["pop.mail.yahoo.com"]},
@@ -2788,39 +2756,88 @@ def _is_junk_host(host, domain):
 def _rank_hosts(hosts, domain):
     return host_rank_hosts(hosts, domain)
 
+# ---------------------------------------------------------------------------
+# v13.11 — DOMAIN-LOCAL SERVICE-NAME MERGE
+# ---------------------------------------------------------------------------
+_DOMAIN_IMAP_GUESS = ("imap.", "mail.", "webmail.")
+_DOMAIN_POP_GUESS = ("pop.", "pop3.", "mail.")
+
+def _merge_domain_guesses(servers, domain):
+    """Append the domain's OWN service names after a curated provider list.
+
+    v13.11 — a domain that sits in a provider FAMILY (brighthouse.com in TWC,
+    sbcglobal.net in ATT, btinternet.com in Yahoo) previously only ever produced
+    the family's hosts. mail.brighthouse.com was NEVER attempted, so when the
+    family host stalled the account was unwinnable even though the domain's own
+    server was sitting there answering.
+
+    Three guarantees:
+      1. Curated hosts stay FIRST and in curated order — a guess can never push
+         the authoritative endpoint out of the MAX_HOSTS slice.
+      2. Only guesses that actually RESOLVE are appended, so a dud costs no
+         budget and does not inflate the per-account window.
+      3. Idempotent — safe to call at more than one layer.
+    """
+    if not servers or not domain:
+        return servers
+
+    out = dict(servers)
+    for key, prefixes in (("imap", _DOMAIN_IMAP_GUESS),
+                          ("pop", _DOMAIN_POP_GUESS),
+                          ("pop3", _DOMAIN_POP_GUESS)):
+        hosts = [h for h in (out.get(key) or []) if h]
+        if not hosts:
+            continue
+        for pfx in prefixes:
+            cand = f"{pfx}{domain}"
+            if cand in hosts:
+                continue
+            if host_resolves(cand):
+                hosts.append(cand)
+        out[key] = hosts
+    return out
+
 def get_servers(email):
     try:
         domain = email.split("@")[-1].lower().strip()
         if domain in ZERO_ACCESS_PROVIDERS:
             return {"imap": [], "pop": [], "pop3": [], "type": "zero_access"}
 
+        # v13.11 — every curated answer (and every parent-provider branch) is
+        # passed through _merge_domain_guesses() so the domain's own resolving
+        # service names are appended after the curated hosts.
         known = known_provider_conf(domain)
         if known:
             if known.get("imap"):
                 known["imap"] = _rank_hosts(known["imap"], domain)
             if known.get("pop"):
                 known["pop"] = _rank_hosts(known["pop"], domain)
-            return known
+            return _merge_domain_guesses(known, domain)
 
         with cache_lock:
             cached = domain_cache.get(domain) or {}
         if cached.get("imap") and (time.time() - float(cached.get("ts", 0))) < DOMAIN_CACHE_TTL:
-            return {
+            return _merge_domain_guesses({
                 "imap": list(cached["imap"]),
                 "pop": list(cached.get("pop") or cached["imap"]),
                 "pop3": list(cached.get("pop3") or cached["imap"]),
-            }
+            }, domain)
 
         parent_domain = detect_parent_provider(domain)
         if parent_domain in ("yahoo.com", "gmail.com"):
-            return known_provider_conf(parent_domain)
+            res = _merge_domain_guesses(known_provider_conf(parent_domain), domain)
+            if res:
+                return res
         if parent_domain == "outlook.office365.com":
-            return known_provider_conf("outlook.com")
+            res = _merge_domain_guesses(known_provider_conf("outlook.com"), domain)
+            if res:
+                return res
         if parent_domain == "biglobe.ne.jp":
-            return {"imap": ["mail.biglobe.ne.jp"], "pop": ["mail.biglobe.ne.jp"], "pop3": ["mail.biglobe.ne.jp"]}
+            return _merge_domain_guesses(
+                {"imap": ["mail.biglobe.ne.jp"], "pop": ["mail.biglobe.ne.jp"], "pop3": ["mail.biglobe.ne.jp"]}, domain)
 
         if domain in PROVIDER_MAP:
-            return PROVIDER_MAP[domain]
+            return _merge_domain_guesses(PROVIDER_MAP[domain], domain)
 
         mx_records = get_mx_hosts(domain) if parent_domain not in PARENT_PROVIDER_MAPPINGS else []
         candidate_hosts = _rank_hosts(generate_candidate_hosts(domain, mx_records), domain)
@@ -3078,12 +3095,9 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, 
     retryable = False
     dns_ok = True
 
-    # --- v13.8: VERDICT RETENTION ------------------------------------------
     best_verdict = {"status": None, "detail": ""}
-    # --- v13.8: 407 STORM BREAKER ------------------------------------------
     force_direct = {"flag": False}
     host_407 = {}
-    # --- v13.9: ladder bookkeeping -----------------------------------------
     net_failed_hosts = set()
     MAX_ROTATIONS = 2
 
@@ -3103,7 +3117,6 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, 
         primary_user = users[0]
 
         def note_verdict(st_val, detail):
-            """Retain the first definitive verdict seen for this account."""
             if best_verdict["status"] is None and st_val in (VALID, WRONG, APP):
                 best_verdict["status"] = st_val
                 best_verdict["detail"] = detail
@@ -3123,7 +3136,6 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, 
 
         trace_logs.append(f"Host order -> IMAP {imap_hosts} | POP {pop_hosts}")
 
-        # ---------------- DNS FAST-FAIL CHECK ----------------
         resolvable = [h for h in (imap_hosts + pop_hosts) if fast_fail_dns_check(h)]
         dns_ok = bool(resolvable)
         if dns_ok:
@@ -3133,21 +3145,7 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, 
             if not proxy_pool or proxy_mode == "off":
                 return None, DNS_FAILED, "Fast-fail DNS check failed: no host resolves locally", None, trace_logs
 
-        # ------------------------------------------------------------------
-        # v13.9 HOST-MAJOR PLAN  +  v13.10 DE-DUPLICATION
-        #
-        # One implicit-TLS rung per host. A read timeout means TCP + TLS already
-        # completed and the server stalled on the greeting — a HOST condition
-        # (datacenter egress, no PTR), not a proxy condition. So pass 1 gives
-        # every host exactly one attempt and never rotates.
-        #
-        # v13.10: when pop_hosts[0] is ALREADY imap_hosts[0] (mail.twc.com for
-        # brighthouse.com), the host used to be queued TWICE — once IMAP 993 and
-        # once POP 995 — thinning every per-attempt timeout by a third for zero
-        # extra coverage. A POP rung is now only promoted into the primary plan
-        # when its host is NOT already an IMAP host; otherwise it is demoted to
-        # the fallback phase.
-        # ------------------------------------------------------------------
+        # v13.9 host-major plan + v13.10 de-duplication
         imap_set = set(imap_hosts)
         pop_only = [h for h in pop_hosts if h not in imap_set]
         pop_dup = [h for h in pop_hosts if h in imap_set]
@@ -3166,12 +3164,6 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, 
             trace_logs.append("No candidate hosts for this domain.")
             return None, FAILED, "no candidate hosts", None, trace_logs
 
-        # ------------------------------------------------------------------
-        # v13.10 BUDGET — floored to fit the actual work.
-        # A slow rung can legitimately need the full per-attempt timeout on BOTH
-        # the proxy and direct phase, so the slider value alone is not enough for
-        # a multi-host domain. Floor it, and say so in the trace.
-        # ------------------------------------------------------------------
         work_floor = len(primary_plan) * max(configured_to, 12.0) * 2.0
         budget = max(12.0, float(CFG.get("ACCOUNT_DEADLINE", 45)) * 0.95)
         if work_floor > budget:
@@ -3208,15 +3200,6 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, 
                     pop_plain_once(user, password, server, px_used, port=port, attempt_timeout=attempt_to)
 
         def sweep(px_used, rungs, deadline_ts, label, allow_rotate=False):
-            """Ordered pass over `rungs`.
-
-            allow_rotate=False -> each rung gets exactly ONE attempt, so every
-                                  host is reached before any proxy is spent twice.
-            allow_rotate=True  -> a rung may be retried on a fresh proxy (max 2).
-
-            v13.10: every attempt is CLAMPED to the phase deadline, so a late
-            rung can no longer drag the pass past its own window.
-            """
             had_net = False
             saw_retry = False
             if not rungs:
@@ -3246,7 +3229,6 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, 
                     if time.time() > deadline_ts:
                         break
 
-                    # clamp so this attempt cannot overrun the phase window
                     attempt_to = max(3.0, min(per_to, deadline_ts - time.time()))
 
                     trace_logs.append(f"{px_tag(px_used)} Attempting {proto} {tls_mode.upper()} -> Host: {server}:{port}")
@@ -3295,7 +3277,6 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, 
                             record_proxy_attempt(px_used, success=False, is_network_error=True)
                             trace_logs.append(f"{px_tag(px_used)} -> SOCKET FAILED {proto} {server}:{port}: {err_text[:90]} [Classified: {FAILED}]")
                             server_level_fail = True
-                            # v13.9 — connection-refused is HOST-level, not proxy-level
                             rotate_now = _is_proxy_level_error(err_text)
 
                         except (imaplib.IMAP4.error, poplib.error_proto) as proto_err:
@@ -3359,7 +3340,6 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, 
                         if server_level_fail:
                             break
 
-                    # --- v13.8: 407 storm breaker ---------------------------
                     if "407" in err_text:
                         host_407[server] = host_407.get(server, 0) + 1
                         if host_407[server] >= 3:
@@ -3387,9 +3367,6 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, 
             return None, had_net, saw_retry
 
         def run_phase(px_used, plan_used, deadline_ts, tag):
-            """pass 1 = every host once, no rotation.
-            pass 2 = fresh proxy on the hosts that failed at network level, only
-                     if the window still allows it."""
             if not plan_used:
                 return None, False, False
 
@@ -3453,7 +3430,6 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, 
     if CFG.get("FAST_MODE", True):
         failed_domain_cache[domain] = time.time()
 
-    # --- v13.8: RETAINED VERDICT WINS -------------------------------------
     if best_verdict["status"] is not None:
         trace_logs.append(
             f"Ladder exhausted with no live answer -> returning retained verdict [{best_verdict['status']}]."
@@ -3557,7 +3533,6 @@ if start_engine_btn:
             str_lit.session_state.need_app_results = []
             str_lit.session_state.conn_results = []
             str_lit.session_state.retry_results = []
-            # DNS / SMTP buckets come from the pre-filter stage, not the validator.
             str_lit.session_state.smtp_results = list(str_lit.session_state.get("pre_smtp_failed", []))
             str_lit.session_state.dns_results = list(str_lit.session_state.get("pre_dns_failed", []))
             str_lit.session_state.skip_results = []
