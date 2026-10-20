@@ -1,9 +1,24 @@
 """
-Mega Ultimate Mail Checker — v13.11
+Mega Ultimate Mail Checker — v13.12
 ===================================
 Complete rewrite. SMTP reachability is an OPT-IN pre-check stage (never inside
 the validator), status classification actually works, and every direct-connection
 line carries the real egress IP / region / country / VPN state.
+
+v13.12 changes  (alias-root + numbered-prefix + bare-domain host coverage)
+--------------------------------------------------------------------------
+* CRITICAL FIX — host COVERAGE.  The engine could only ever dial
+  '<prefix>.<domain>', so three classes of real endpoint were invisible:
+    - a rebranded primary on a DIFFERENT root (xplornet.com -> imap.xplore.net);
+    - numbered / variant prefixes (imap3.zoominternet.net, mail2.tds.net);
+    - apex legacy hosts (xpertikus.com).
+  Live traces showed 4/4 hosts resolving and then every rung timing out on all
+  passes - i.e. the authoritative endpoint was never attempted.  The merge now
+  generates alias-root, numbered-prefix and bare-domain candidates (resolve-
+  gated, curated-first, idempotent) and inserts the high-value ones FIRST.
+* Host-order slice no longer discards them: the primary plan may carry a small
+  bounded surplus (cap = max(MAX_HOSTS_PER_DOMAIN, 5)); the budget floor below
+  already scales with the resulting rung count, so nothing is starved.
 
 v13.11 changes  (the domain's OWN servers were structurally unreachable)
 -----------------------------------------------------------------------
@@ -448,7 +463,7 @@ def default_theme() -> dict:
         "bg": p["bg"], "panel": p["panel"], "text": p["text"],
         "radius": 14, "glow": True, "animate": True, "glass": True,
         "colorize_logs": True,
-        "hero_title": "⚡ Mega Ultimate Mail Checker v13.11",
+        "hero_title": "⚡ Mega Ultimate Mail Checker v13.12",
         "hero_sub": "World-Coverage Edition — router-aware host ranking, rotating proxy pool, geo-call routing, retryable IP-block handling, optional SMTP pre-check, anti-spoofing post-auth validation.",
     }
 
@@ -2757,26 +2772,85 @@ def _rank_hosts(hosts, domain):
     return host_rank_hosts(hosts, domain)
 
 # ---------------------------------------------------------------------------
-# v13.11 — DOMAIN-LOCAL SERVICE-NAME MERGE
+# v13.12 — DOMAIN-LOCAL + ALIAS-ROOT SERVICE-NAME MERGE
 # ---------------------------------------------------------------------------
-_DOMAIN_IMAP_GUESS = ("imap.", "mail.", "webmail.")
-_DOMAIN_POP_GUESS = ("pop.", "pop3.", "mail.")
+# Priority order matters - entries most likely to be the real endpoint come
+# first. "" is the apex (a real endpoint for some hosts, and explicitly named
+# as a legacy host by the operator).
+_DOMAIN_IMAP_GUESS = (
+    "imap.", "mail.", "", "imap3.", "imaps.", "imap2.",
+    "webmail.", "mail2.", "imap4.", "correo.",
+)
+_DOMAIN_POP_GUESS = (
+    "pop.", "pop3.", "", "pop3s.", "mail.", "pop2.", "pop4.", "mail2.",
+)
+
+# Rebranded / alternate registrable roots.  A root maps to its siblings and
+# every sibling's service names are generated too, so a primary living on a
+# DIFFERENT domain (xplore.net for xplornet.com) finally gets attempted.
+# Add more rebrands here as they surface - a wrong entry only costs a resolving
+# probe, never an authoritative slot.
+_DOMAIN_ALIAS_ROOTS = {
+    "xplornet.com": ("xplore.net",),
+    "xplore.net":   ("xplornet.com",),
+}
+
+def _domain_roots(domain):
+    """The domain itself followed by any known alias root (deduped)."""
+    domain = (domain or "").lower().strip()
+    roots = [domain] if domain else []
+    for alt in _DOMAIN_ALIAS_ROOTS.get(domain, ()):
+        if alt and alt not in roots:
+            roots.append(alt)
+    return roots
+
+def _guess_candidates(domain, prefixes):
+    """Every '<prefix><root>' for the domain AND its alias roots that RESOLVES.
+
+    Alias-root names are produced first (a rebrand's live primary), then the
+    domain's own names, each in the caller's prefix-priority order.
+    """
+    out = []
+    roots = _domain_roots(domain)
+    if not roots:
+        return out
+    ordered_roots = roots[1:] + roots[:1]        # alias roots first, then own
+    for root in ordered_roots:
+        for pfx in prefixes:
+            cand = f"{pfx}{root}" if pfx else root
+            if cand and cand not in out and host_resolves(cand):
+                out.append(cand)
+    return out
+
+def _is_plain_domain_guess(host, domain, prefixes):
+    """True when host is just '<prefix><domain>' / the bare domain - i.e. a name
+    WE generate, not an authoritative provider endpoint."""
+    h = (host or "").lower().strip()
+    d = (domain or "").lower().strip()
+    if not h or not d:
+        return False
+    if h == d:
+        return True
+    return any(h == f"{p}{d}" for p in prefixes if p)
 
 def _merge_domain_guesses(servers, domain):
-    """Append the domain's OWN service names after a curated provider list.
+    """Insert the domain's own AND alias-root resolving service names into a
+    curated provider answer.
 
-    v13.11 — a domain that sits in a provider FAMILY (brighthouse.com in TWC,
-    sbcglobal.net in ATT, btinternet.com in Yahoo) previously only ever produced
-    the family's hosts. mail.brighthouse.com was NEVER attempted, so when the
-    family host stalled the account was unwinnable even though the domain's own
-    server was sitting there answering.
+    v13.12 — v13.11 appended the domain's own imap./mail./webmail. names. That
+    closed the family-set short-circuit, but three whole CLASSES of real endpoint
+    were still invisible because '<prefix>.<domain>' can never synthesise them:
+    a REBRANDED root (xplornet.com -> xplore.net), a NUMBERED / VARIANT prefix
+    (imap3.zoominternet.net, mail2.tds.net) and a BARE-DOMAIN legacy host
+    (xpertikus.com).  This merge generates all three, resolve-gated.
 
-    Three guarantees:
-      1. Curated hosts stay FIRST and in curated order — a guess can never push
-         the authoritative endpoint out of the MAX_HOSTS slice.
-      2. Only guesses that actually RESOLVE are appended, so a dud costs no
+    Guarantees:
+      1. Authoritative curated hosts stay FIRST, in curated order.
+      2. Only candidates that actually RESOLVE are inserted, so a dud costs no
          budget and does not inflate the per-account window.
       3. Idempotent — safe to call at more than one layer.
+      4. High-value candidates (alias primary, own primary, apex) are inserted
+         BEFORE the long tail of alternates so they survive the MAX_HOSTS slice.
     """
     if not servers or not domain:
         return servers
@@ -2788,13 +2862,16 @@ def _merge_domain_guesses(servers, domain):
         hosts = [h for h in (out.get(key) or []) if h]
         if not hosts:
             continue
-        for pfx in prefixes:
-            cand = f"{pfx}{domain}"
-            if cand in hosts:
-                continue
-            if host_resolves(cand):
-                hosts.append(cand)
-        out[key] = hosts
+
+        # Split what we were given: real endpoints first, our own guesses second.
+        authoritative = [h for h in hosts if not _is_plain_domain_guess(h, domain, prefixes)]
+        already_guessed = [h for h in hosts if _is_plain_domain_guess(h, domain, prefixes)]
+
+        merged = []
+        for h in authoritative + _guess_candidates(domain, prefixes) + already_guessed:
+            if h and h not in merged:
+                merged.append(h)
+        out[key] = merged
     return out
 
 def get_servers(email):
@@ -2803,9 +2880,9 @@ def get_servers(email):
         if domain in ZERO_ACCESS_PROVIDERS:
             return {"imap": [], "pop": [], "pop3": [], "type": "zero_access"}
 
-        # v13.11 — every curated answer (and every parent-provider branch) is
-        # passed through _merge_domain_guesses() so the domain's own resolving
-        # service names are appended after the curated hosts.
+        # v13.11/v13.12 — every curated answer (and every parent-provider branch)
+        # is passed through _merge_domain_guesses() so the domain's own AND
+        # alias-root resolving service names are inserted after the curated hosts.
         known = known_provider_conf(domain)
         if known:
             if known.get("imap"):
@@ -2850,12 +2927,12 @@ def get_servers(email):
                 "ts": time.time(),
             })
         save_domain_cache()
-        return servers
+        return _merge_domain_guesses(servers, domain)
     except Exception as e:
         warnings.warn(f"Error resolving servers for {email}: {e}")
         d = email.split('@')[-1] if '@' in email else 'localhost'
         fp = generate_candidate_hosts(d, [])
-        return {"imap": fp, "pop": fp, "pop3": fp}
+        return _merge_domain_guesses({"imap": fp, "pop": fp, "pop3": fp}, d)
 
 # ============================================================================
 # ATTEMPT HELPERS
@@ -3131,8 +3208,17 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, 
             else:
                 px = sample_alive_proxy(domain=domain)
 
-        imap_hosts = [h for h in (conf.get("imap") or [])[:max_hosts] if h]
+        # v13.12 — the merge can legitimately produce more resolving candidates
+        # than MAX_HOSTS_PER_DOMAIN (alias primary / apex / numbered prefixes).
+        # Carry a small bounded surplus so those are actually ATTEMPTED instead
+        # of being sliced away; the budget floor below scales with rung count.
+        _all_imap = [h for h in (conf.get("imap") or []) if h]
+        _imap_cap = max(max_hosts, 5)
+        imap_hosts = _all_imap[:_imap_cap]
         pop_hosts = [h for h in ((conf.get("pop") or conf.get("pop3") or [])[:1]) if h]
+        if len(_all_imap) > len(imap_hosts):
+            trace_logs.append(
+                f"Host expansion: {len(imap_hosts)}/{len(_all_imap)} IMAP candidate(s) kept (cap {_imap_cap}).")
 
         trace_logs.append(f"Host order -> IMAP {imap_hosts} | POP {pop_hosts}")
 
