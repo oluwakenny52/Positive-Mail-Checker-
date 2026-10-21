@@ -3,28 +3,28 @@ hosts.py
 ========
 One host table. Primary first, backup second, with SRV/autoconfig/MX discovery.
 
+v13.30 changes
+--------------
+* THE LAST POP/IMAP CROSSOVER IS GONE.  FAMILY_PRIORITY_POP (v13.26) fixed the
+  family tables, but _conf_curated() still did `_pair(known, known, domain)` for
+  every COUNTRY entry, so the POP rung dialled an IMAP-only hostname on 995 for
+  all ~50 of them.  NEW COUNTRY_POP + _pop_for(): a POP bucket gets a curated
+  POP list where one exists, otherwise a POP list DERIVED from the IMAP hosts
+  (prefix rewrite + pop.<domain>/pop3.<domain> when they resolve).
+* WINDSTREAM_POP IS NOW POP-ONLY.  It used to be
+  ["pop.windstream.net", "imap.windstream.net"], and the file's own comment said
+  imap.windstream.net does not serve POP3.
+* NEW DEAD_POP_HOSTS, applied to POP buckets only, so the two ladders demote
+  independently.
+
 v13.26 changes
 --------------
-* POP IS NO LONGER POINTED AT THE IMAP HOST.  FAMILY_PRIORITY is an IMAP list
-  and _pair()/merge_domain_guesses() applied it to the pop / pop3 buckets as
-  well, so for every family whose POP endpoint has a different name the POP
-  rung dialled the IMAP host on 995 and the real POP host was never reached.
-  NEW FAMILY_PRIORITY_POP, applied to the pop / pop3 buckets only.
-* WINDSTREAM / KINETIC FAMILY CORRECTED.
-    - secure.windstream.net -> webportal.garnet.synacor.com (129.158.39.150),
-      a WEB PORTAL, not an IMAP host.  It is now in DEAD_IMAP_HOSTS, and
-      discovery ("secure." is in _IMAP_PREFIXES) can no longer lead a rung
-      with it.
-    - real POP service is pop.windstream.net, NOT imap.windstream.net:995.
-    - kinetic.net (Windstream's current brand) registered on the same family.
+* POP IS NO LONGER POINTED AT THE IMAP HOST.  NEW FAMILY_PRIORITY_POP.
+* WINDSTREAM / KINETIC FAMILY CORRECTED (secure.* is a Synacor web portal).
 
 v13.24 changes
 --------------
-* suddenlink.net now carries its REAL post-migration endpoints.  Suddenlink was
-  folded into Optimum (Altice), so the curated entry gains mail.optimum.net and
-  imap.optimum.net alongside the legacy imap.suddenlink.net.  optimum.net and
-  suddenlinkmail.com are registered too.  The Altice/Openwave MX now maps to the
-  Optimum endpoints instead of resolving to an SMTP router name.
+* suddenlink.net now carries its REAL post-migration endpoints.
 * _with_discovery(): a CURATED provider still benefits from live discovery.
 
 v13.18 changes
@@ -112,14 +112,13 @@ VERIZON_IMAP = ["imap.aol.com", "imap.verizon.net"]
 VERIZON_POP = ["pop.aol.com", "pop.verizon.net"]
 
 # v13.26 - Windstream / Kinetic.
-# Windstream was absorbed into Kinetic (Synacor/Zimbra backend).
 #   imap.windstream.net  -> mail.windstream.syn-alias.com -> 193.122.179.25
 #   pop.windstream.net   -> same IP
 #   secure.windstream.net-> webportal.garnet.synacor.com (129.158.39.150)  <-- PORTAL
-# so secure.* must never lead a rung, and the POP service is pop.windstream.net.
+# v13.30: WINDSTREAM_POP is POP-ONLY.  imap.windstream.net does NOT serve POP3.
 WINDSTREAM = {"windstream.net", "kinetic.net"}
 WINDSTREAM_IMAP = ["imap.windstream.net", "mail.windstream.net"]
-WINDSTREAM_POP = ["pop.windstream.net", "imap.windstream.net"]
+WINDSTREAM_POP = ["pop.windstream.net"]
 
 COUNTRY = {
     "bluewin.ch": ["imaps.bluewin.ch"],
@@ -138,10 +137,6 @@ COUNTRY = {
     "t-online.de": ["secureimap.t-online.de"],
     "comcast.net": ["imap.comcast.net"],
     "windstream.net": ["imap.windstream.net", "mail.windstream.net"],
-    # v13.24: Suddenlink was folded into Optimum (Altice).  The legacy endpoint
-    # imap.suddenlink.net is kept first (it is still the officially documented
-    # one) and the real Optimum endpoints follow, so a migrated mailbox is
-    # reached even when the legacy name is dead.
     "suddenlink.net": ["imap.suddenlink.net", "mail.optimum.net", "imap.optimum.net", "mail.suddenlink.net"],
     "suddenlinkmail.com": ["mail.optimum.net", "imap.optimum.net", "imap.suddenlink.net"],
     "optimum.net": ["mail.optimum.net", "imap.optimum.net"],
@@ -161,12 +156,10 @@ COUNTRY = {
     "me.com": ["imap.mail.me.com"],
     "naver.com": ["imap.naver.com"],
     "qq.com": ["imap.qq.com"],
-    # Latin-America / Spanish-language ISPs: 'correo.' and 'webmail.' are common
     "montevideo.com.uy": ["mail.montevideo.com.uy", "webmail.montevideo.com.uy"],
     "adinet.com.uy": ["mail.adinet.com.uy"],
     "antel.com.uy": ["mail.antel.com.uy"],
     "uy.com": ["mail.uy.com"],
-    # offenders seen in the failure log
     "freenet.de": ["imap.freenet.de"],
     "netcourrier.com": ["imap.netcourrier.com"],
     "bbox.fr": ["imap.bbox.fr"],
@@ -177,12 +170,43 @@ COUNTRY = {
     "sympatico.ca": ["imap.sympatico.ca"],
 }
 
+# ---------------------------------------------------------------------------
+# v13.30 - POP ENDPOINTS FOR COUNTRY ENTRIES
+# ---------------------------------------------------------------------------
+# Only the entries whose POP service is NOT a prefix-rewrite of their IMAP host
+# need an explicit list.  Everything else is derived by _pop_for().
+COUNTRY_POP = {
+    "bluewin.ch": ["pop3s.bluewin.ch"],
+    "t-online.de": ["securepop.t-online.de"],
+    "gmx.de": ["pop.gmx.net"],
+    "gmx.net": ["pop.gmx.net"],
+    "web.de": ["pop3.web.de"],
+    "cox.net": ["pop.cox.net"],
+    "suddenlink.net": ["pop.optimum.net", "pop.suddenlink.net"],
+    "suddenlinkmail.com": ["pop.optimum.net"],
+    "optimum.net": ["pop.optimum.net"],
+    "optonline.net": ["pop.optimum.net"],
+    "mediacombb.net": ["mail.mediacombb.net", "pop.mediacombb.net"],
+    "mchsi.com": ["mail.mediacombb.net"],
+    "astound.net": ["pop.wavecable.com"],
+    "wavemail.com": ["pop.wavecable.com"],
+    "icloud.com": ["pop.mail.me.com"],
+    "me.com": ["pop.mail.me.com"],
+    "naver.com": ["pop.naver.com"],
+    "qq.com": ["pop.qq.com"],
+    "freenet.de": ["pop.freenet.de"],
+    "tin.it": ["pop.tin.it"],
+    "interia.pl": ["poczta.interia.pl"],
+    "wp.pl": ["pop3.wp.pl"],
+    "onet.pl": ["pop3.onet.pl"],
+    "o2.pl": ["poczta.o2.pl"],
+}
+
 # ============================================================================
 # v13.18 - FAMILY PRIORITY + DEAD ENDPOINT DEMOTION
 # ============================================================================
 
-# Hosts that resolve but have NO IMAP listener.  They used to occupy the front
-# of the ladder and consume the entire account window.
+# Hosts that resolve but have NO IMAP listener.
 DEAD_IMAP_HOSTS = {
     "mail.yahoo.com", "email.yahoo.com", "yahoo.com",
     "mail.hotmail.com", "hotmail.com", "imap.hotmail.com", "email.hotmail.com",
@@ -191,9 +215,26 @@ DEAD_IMAP_HOSTS = {
     "frontiernet.net", "myfrontiermail.com",
     "charter.net", "spectrum.net", "twc.com", "verizon.net",
     "roadrunner.com", "rr.com",
-    # v13.26: secure.windstream.net is a Synacor WEB PORTAL, not IMAP.  It gets
-    # injected by discovery because "secure." is in _IMAP_PREFIXES.
     "secure.windstream.net",
+}
+
+# v13.30: same idea for the POP ladder, kept SEPARATE so the two ladders demote
+# independently.  These resolve but have no POP3 listener.
+DEAD_POP_HOSTS = {
+    "imap.windstream.net",
+    "imap.gmail.com", "mail.gmail.com",
+    "imap-mail.outlook.com",
+    "imap.mail.yahoo.com", "mail.yahoo.com", "email.yahoo.com",
+    "imap.aol.com",
+    "imap.mail.me.com",
+    "imap.free.fr", "imap.orange.fr", "imap.web.de",
+    "imap.gmx.net", "secureimap.t-online.de",
+    "imap.comcast.net", "imap.cox.net",
+    "imap.naver.com", "imap.qq.com",
+    "imap.wavecable.com", "imap.earthlink.net", "imap.armstrong.net",
+    "imap.centurylink.net",
+    "imap.suddenlink.net", "imap.optimum.net",
+    "imap.mediacombb.net",
 }
 
 # domain -> hosts that MUST lead the ladder for that domain.
@@ -218,14 +259,8 @@ for _d in GMAIL_DOMAINS:
 for _d, _h in COUNTRY.items():
     FAMILY_PRIORITY.setdefault(_d, list(_h))
 
-# ---------------------------------------------------------------------------
-# v13.26 - FAMILY PRIORITY, POP BUCKET
-# ---------------------------------------------------------------------------
-# FAMILY_PRIORITY is an IMAP list.  _pair() and merge_domain_guesses() applied
-# it to the pop / pop3 buckets as well, so the POP rung dialled the IMAP host on
-# 995 (imap.windstream.net:995) and the real POP host was pushed down the ladder
-# or cut by the cap.  This is the same idea, for pop / pop3 only.
-
+# v13.26 / v13.30 - FAMILY PRIORITY, POP BUCKET.
+# FAMILY_PRIORITY is an IMAP list; a POP bucket must never be led by it.
 FAMILY_PRIORITY_POP = {}
 
 for _d in FRONTIER:
@@ -244,8 +279,10 @@ for _d in MS_DOMAINS:
     FAMILY_PRIORITY_POP[_d] = list(MS_POP)
 for _d in GMAIL_DOMAINS:
     FAMILY_PRIORITY_POP[_d] = list(GMAIL_POP)
+# v13.30: COUNTRY entries use their curated POP list, or a derived one.
 for _d, _h in COUNTRY.items():
-    FAMILY_PRIORITY_POP.setdefault(_d, list(_h))
+    FAMILY_PRIORITY_POP.setdefault(_d, list(COUNTRY_POP.get(_d) or []))
+
 for _d in WINDSTREAM:
     FAMILY_PRIORITY[_d] = list(WINDSTREAM_IMAP)
     FAMILY_PRIORITY_POP[_d] = list(WINDSTREAM_POP)
@@ -286,17 +323,71 @@ def _family_priority_pop(domain):
 def _order_provider_hosts(hosts, domain, pop=False):
     """Family endpoints first, live endpoints next, known-dead endpoints last.
 
-    pop=True selects the POP family list so a POP bucket is never led by an
-    IMAP-only hostname.
+    pop=True selects the POP family list and the POP dead-list, so a POP bucket
+    is never led by an IMAP-only hostname.
     """
     fam = _family_priority_pop(domain) if pop else _family_priority(domain)
+    dead_set = DEAD_POP_HOSTS if pop else DEAD_IMAP_HOSTS
     seen, alive, dead = set(), [], []
     for h in list(fam) + list(hosts or []):
         if not h or h in seen:
             continue
         seen.add(h)
-        (dead if h in DEAD_IMAP_HOSTS else alive).append(h)
+        (dead if h in dead_set else alive).append(h)
     return alive + dead
+
+
+# v13.30: derive a POP list from an IMAP list when no curated POP list exists.
+# A COUNTRY entry used to be handed to BOTH buckets verbatim, so the POP rung
+# dialled an IMAP-only hostname on 995 and the real POP host was never reached.
+_POP_REWRITE = (
+    ("imaps.", "pop3s."),
+    ("imapmail.", "pop."),
+    ("secureimap.", "securepop."),
+    ("imap.", "pop."),
+    ("in.", "pop."),
+    ("imap", "pop"),
+)
+
+
+def _pop_for(domain, imap_hosts):
+    """A POP3 host list for this domain: curated first, otherwise derived."""
+    domain = (domain or "").lower().strip()
+    curated = COUNTRY_POP.get(domain)
+    if curated:
+        return list(curated)
+
+    out = []
+    for h in (imap_hosts or []):
+        hl = (h or "").lower().strip()
+        if not hl:
+            continue
+        if hl in DEAD_POP_HOSTS:
+            continue
+        if hl.endswith("." + domain):
+            leaf = hl[: -(len(domain) + 1)].split(".")[0]
+            for src, dst in _POP_REWRITE:
+                if leaf == src.rstrip(".") or leaf == src:
+                    cand = f"{dst}{domain}"
+                    if cand not in out and host_resolves(cand):
+                        out.append(cand)
+                    break
+            else:
+                if hl not in out:
+                    out.append(hl)
+        elif hl not in out:
+            out.append(hl)
+
+    for pfx in ("pop.", "pop3."):
+        cand = f"{pfx}{domain}"
+        if cand not in out and host_resolves(cand):
+            out.append(cand)
+
+    for h in (imap_hosts or []):
+        if h and h not in out:
+            out.append(h)
+    return out
+
 
 # Explicit SMTP endpoints for the providers whose SMTP host is NOT derived from
 # their IMAP host. Checked before every guess.
@@ -358,20 +449,14 @@ UNIVERSAL_POP_FALLBACKS = [
 ]
 
 # MX-host substring -> (imap_host, pop_host, smtp_host).  ORDER MATTERS: specific first.
-# "aol" MUST come before "yahoo" (AOL MX = mx-aol.mail.gm0.yahoodns.net).
 MX_PROVIDER_MAP = (
     (("google", "gsuite", "googlemail"), ("imap.gmail.com", "pop.gmail.com", "smtp.gmail.com")),
     (("outlook", "microsoft", "office365", "protection.outlook"), ("outlook.office365.com", "outlook.office365.com", "smtp.office365.com")),
     (("aol",), ("imap.aol.com", "pop.aol.com", "smtp.aol.com")),
     (("yahoodns", "yahoo"), ("imap.mail.yahoo.com", "pop.mail.yahoo.com", "smtp.mail.yahoo.com")),
     (("icloud", "apple", "me.com"), ("imap.mail.me.com", "pop.mail.me.com", "smtp.mail.me.com")),
-    # v13.24: suddenlink.net MX is mx.altice.prod.cloud.openwave.ai - a ROUTER
-    # name that matches nothing else.  Without this entry discovery never
-    # surfaced the Optimum endpoint for a Suddenlink mailbox.
     (("altice", "openwave", "optimum"), ("mail.optimum.net", "pop.optimum.net", "mail.optimum.net")),
-    # v13.26: windstream/Kinetic MX is a synacor name -> real endpoints.
     (("synacor", "syn-alias", "windstream", "kinetic"), ("imap.windstream.net", "pop.windstream.net", "mail.windstream.net")),
-    # --- the offenders: provider identity is NOT the same as the MX brand ---
     (("freenet",), ("imap.freenet.de", "pop.freenet.de", "smtp.freenet.de")),
     (("gmx", "1and1", "ionos", "schlund", "united-domains", "kasserver", "udag"), ("imap.gmx.net", "pop.gmx.net", "mail.gmx.net")),
     (("web.de",), ("imap.web.de", "pop3.web.de", "smtp.web.de")),
@@ -401,7 +486,6 @@ MX_PROVIDER_MAP = (
     (("biglobe",), ("mail.biglobe.ne.jp", "mail.biglobe.ne.jp", "mail.biglobe.ne.jp")),
     (("nifty",), ("imap.nifty.com", "pop.nifty.com", "smtp.nifty.com")),
     (("so-net",), ("imap.so-net.ne.jp", "pop.so-net.ne.jp", "smtp.so-net.ne.jp")),
-    # shared-hosting platforms -> mail.<domain>
     (("bluehost", "hostgator", "cpanel", "siteground", "namecheap", "dreamhost",
       "liquidweb", "inmotion", "greengeeks", "a2hosting", "hostpapa",
       "netsol", "network solutions", "webhostingpad", "stablehost", "hawkhost"), (None, None, None)),
@@ -474,17 +558,17 @@ def host_tier(host, domain):
     if not h:
         return 4
     if d and h == d:
-        return 3                                     # bare domain is usually a router
+        return 3
     if d and h.endswith("." + d):
         if is_junk_host(h, d):
             return 3
-        first = h[: -(len(d) + 1)].split(".")[0]     # left-most label under the domain
+        first = h[: -(len(d) + 1)].split(".")[0]
         if first in _SERVICE_PREFIXES:
-            return 0                                 # imap.<d>, mail.<d>, webmail.<d>, correo.<d>
+            return 0
         return 1
     if is_junk_host(h, d):
         return 3
-    return 2                                         # provider endpoint (ssl0.ovh.net, imap.gmail.com)
+    return 2
 
 
 _probe_lock = threading.Lock()
@@ -519,14 +603,7 @@ def probe_live(host, timeout=1.5):
 
 
 def rank_hosts(hosts, domain, probe=True):
-    """Composite ranking.
-
-    Order of precedence:
-      1. DNS RESOLVES    - a name that does not resolve cannot possibly work.
-      2. tier            - service endpoint before router before bare domain
-      3. port answers    - 993/143 reachable
-      4. discovery index - preserves SRV / autoconfig authority order
-    """
+    """Composite ranking: resolves -> tier -> port answers -> discovery index."""
     hosts = [h for h in (hosts or []) if h]
     if not hosts:
         return []
@@ -822,7 +899,6 @@ _DOMAIN_ALIAS_ROOTS = {
 
 
 def _domain_roots(domain):
-    """The domain itself followed by any known alias root (deduped)."""
     domain = (domain or "").lower().strip()
     roots = [domain] if domain else []
     for alt in _DOMAIN_ALIAS_ROOTS.get(domain, ()):
@@ -832,7 +908,6 @@ def _domain_roots(domain):
 
 
 def _is_local_domain_host(host, domain):
-    """True when host is the domain / an alias root, or sits under either."""
     h = (host or "").lower().strip()
     if not h:
         return False
@@ -843,7 +918,6 @@ def _is_local_domain_host(host, domain):
 
 
 def _guess_candidates(domain, prefixes):
-    """Every '<prefix><root>' for the domain AND its alias roots that RESOLVES."""
     out = []
     roots = _domain_roots(domain)
     if not roots:
@@ -857,7 +931,6 @@ def _guess_candidates(domain, prefixes):
 
 
 def _is_plain_domain_guess(host, domain, prefixes):
-    """True when host is just '<prefix><domain>' / the bare domain."""
     h = (host or "").lower().strip()
     d = (domain or "").lower().strip()
     if not h or not d:
@@ -870,13 +943,12 @@ def _is_plain_domain_guess(host, domain, prefixes):
 def merge_domain_guesses(servers, domain):
     """Insert the domain's own AND alias-root resolving service names.
 
-    v13.26 ordering, per bucket:
-        1. FAMILY_PRIORITY / FAMILY_PRIORITY_POP - the curated endpoint for this
-           provider (POP bucket gets the POP list, never the IMAP list)
-        2. local-priority   - imap./mail./email./apex (pop./pop3./apex for POP)
+    Ordering, per bucket:
+        1. FAMILY_PRIORITY / FAMILY_PRIORITY_POP
+        2. local-priority
         3. other local
-        4. FOREIGN          - provider endpoints, universal fallbacks, family hosts
-        5. KNOWN-DEAD hosts - demoted to the very tail
+        4. FOREIGN
+        5. KNOWN-DEAD hosts - demoted to the very tail (bucket-specific list)
     """
     if not servers or not domain:
         return servers
@@ -889,11 +961,12 @@ def merge_domain_guesses(servers, domain):
         if not hosts:
             continue
 
-        # v13.26: the POP buckets get the POP family list.
-        family = _family_priority_pop(domain) if key in ("pop", "pop3") else _family_priority(domain)
+        is_pop = key in ("pop", "pop3")
+        family = _family_priority_pop(domain) if is_pop else _family_priority(domain)
+        dead_set = DEAD_POP_HOSTS if is_pop else DEAD_IMAP_HOSTS
 
         local_priority = [h for h in _guess_candidates(domain, priority)
-                          if h not in DEAD_IMAP_HOSTS]
+                          if h not in dead_set]
         priority_set = set(local_priority) | set(family)
 
         local_other = [h for h in hosts
@@ -908,8 +981,8 @@ def merge_domain_guesses(servers, domain):
             if h and h not in merged:
                 merged.append(h)
 
-        alive = [h for h in merged if h not in DEAD_IMAP_HOSTS]
-        dead = [h for h in merged if h in DEAD_IMAP_HOSTS]
+        alive = [h for h in merged if h not in dead_set]
+        dead = [h for h in merged if h in dead_set]
         out[key] = alive + dead
     return out
 
@@ -1108,7 +1181,7 @@ def discover_hosts(domain, email=None, use_cache=True, force_refresh=False):
         if fb not in pop:
             pop.append(fb)
 
-    # 7. Family priority first, then rank: resolves -> tier -> port answers -> index
+    # 7. Family priority first, then rank
     imap = _order_provider_hosts(imap, domain)
     pop = _order_provider_hosts(pop, domain, pop=True)
     imap = rank_hosts(_dedupe(imap), domain)[:8]
@@ -1139,20 +1212,17 @@ def _pair(imap_hosts, pop_hosts, domain=None):
 
 
 def _with_discovery(got, domain):
-    """v13.24: append discovery-derived IMAP hosts (SRV/autoconfig/MX) to a
-    CURATED answer.  Universal fallbacks are dropped (they would only add
-    noise to a provider whose endpoint is already known).  The result keeps the
-    curated order; discovery extras land in the tail via merge_domain_guesses().
-    """
+    """Append discovery-derived hosts to a CURATED answer (order preserved)."""
     try:
         found = discover_hosts(domain)
     except Exception:
         return got
-    extra = [h for h in (found.get("imap") or []) if h not in UNIVERSAL_IMAP_FALLBACKS]
-    if not extra:
+    extra_imap = [h for h in (found.get("imap") or []) if h not in UNIVERSAL_IMAP_FALLBACKS]
+    extra_pop = [h for h in (found.get("pop") or []) if h not in UNIVERSAL_POP_FALLBACKS]
+    if not extra_imap and not extra_pop:
         return got
     out = dict(got)
-    for key in ("imap", "pop", "pop3"):
+    for key, extra in (("imap", extra_imap), ("pop", extra_pop), ("pop3", extra_pop)):
         cur = [h for h in (out.get(key) or []) if h]
         for h in extra:
             if h not in cur:
@@ -1211,7 +1281,12 @@ def smtp_candidates(domain):
 
 
 def _conf_curated(domain):
-    """Curated / discovery answer WITHOUT the domain-local merge."""
+    """Curated / discovery answer WITHOUT the domain-local merge.
+
+    v13.30: EVERY bucket gets the list that belongs to it.  A COUNTRY entry used
+    to be passed to _pair(known, known) so its IMAP hostnames became POP
+    hostnames and the POP rung dialled them on 995.
+    """
     domain = (domain or "").lower().strip()
     if not domain:
         return None
@@ -1219,8 +1294,6 @@ def _conf_curated(domain):
     if domain in ZERO_ACCESS:
         return {"imap": [], "pop": [], "pop3": [], "type": "zero_access"}
 
-    # v13.26: Windstream / Kinetic first - the POP bucket must be its own list,
-    # because the IMAP family (imap.windstream.net) does not serve POP3.
     if domain in WINDSTREAM:
         return _with_discovery(_pair(WINDSTREAM_IMAP, WINDSTREAM_POP, domain), domain)
     if domain in FRONTIER:
@@ -1241,13 +1314,13 @@ def _conf_curated(domain):
         return _pair(GMAIL_IMAP, GMAIL_POP, domain)
     known = COUNTRY.get(domain)
     if known:
-        # v13.24: a curated provider still benefits from live discovery.
-        return _with_discovery(_pair(known, known, domain), domain)
+        pop = _pop_for(domain, known)
+        return _with_discovery(_pair(known, pop, domain), domain)
 
     found = discover_hosts(domain)
     if found["imap"] or found["pop"]:
         imap = found["imap"]
-        pop = found["pop"] or found["imap"]
+        pop = found["pop"] or _pop_for(domain, imap)
         return {"imap": imap, "pop": pop, "pop3": pop, "smtp": found.get("smtp", [])}
 
     return None
