@@ -1,9 +1,40 @@
 """
-Mega Ultimate Mail Checker — v13.19
+Mega Ultimate Mail Checker — v13.20
 ===================================
 Complete rewrite. SMTP reachability is an OPT-IN pre-check stage (never inside
 the validator), status classification actually works, and every direct-connection
 line carries the real egress IP / region / country / VPN state.
+
+v13.20 changes  (the tunnel probe now tells the truth)
+------------------------------------------------------
+* THE PROBE REPORTS WHY.  proxy_tunnel_ok() returned a bare True/False, so a
+  407-dead pool, a slow pool and a genuinely dead pool all rendered as the same
+  "Alive: 0" and nothing could say which.  tunnel_probe() now classifies every
+  failure as auth / timeout / dead / tcp / format and records it.
+  proxy_tunnel_ok() is kept as a thin wrapper so existing callers still work.
+* 407s ARE NO LONGER INVISIBLE IN THE POOL.  precheck_proxy_fast() filed every
+  tunnel failure as a generic network error, so the 407s column sat at 0 while
+  every node was being rejected.  A probe auth failure now calls
+  record_proxy_attempt(is_proxy_auth=True) and increments 407s.
+* PROBE SUCCESS IS RECORDED.  The precheck path never called
+  record_proxy_attempt(success=True), so Score / Successes in the dashboard
+  were stale history from an earlier session.  A passing probe now counts.
+* PROBE TIMEOUT 3s -> 8s, AND IT IS A SLIDER.  Some providers need longer than
+  3s to complete a CONNECT to an IMAP port; those nodes were dropped as dead.
+* PROBE TARGET IS SELECTABLE.  993 (IMAP) / 443 (HTTPS) / both.  A node that
+  tunnels 443 but blocks 993 is now distinguishable instead of just "dead".
+* STRICT PROBE SWITCH.  v13.19 silently did `if not live: live = raw`, masking
+  a fully dead pool as a healthy 90-node pool.  Strict ON (default) keeps the
+  pool honest; Strict OFF restores the old fallback.
+* POOL DEDUPLICATION.  proxies.txt routinely repeats the same host:port dozens
+  of times, so "90 nodes failing at once" was really ~10 boxes failing and the
+  fail counters were inflated ~10x.  Duplicates are collapsed on load.
+* FETCH & TEST USES THE REAL PROBE.  The button blessed nodes with a 53/udp
+  tunnel, which then failed the 993 tunnel probe — producing a pool that looked
+  alive in the file and dead in the app.  It now runs the same probe the pool does.
+* DASHBOARD TELEMETRY.  New Last Probe column, a pass / 407 / timeout / dead
+  summary line, and a "Re-probe pool now" button that clears the tunnel cache
+  and re-probes without restarting the app.
 
 v13.19 changes  (proxy-layer 407 was being blamed on the MAIL HOST)
 -------------------------------------------------------------------
@@ -427,13 +458,29 @@ str_lit.set_page_config(
 )
 
 # ============================================================================
-# PROXY-LAYER FAILURE CONTRACT  (v13.19)
+# PROXY-LAYER FAILURE CONTRACT  (v13.20)
 # ============================================================================
 # A 407 is a PROXY problem.  The mail host behind it is still untested, so the
 # engine must rotate the proxy and retry the SAME host - never advance the host.
+#
+# v13.20 adds an HONEST probe.  The tunnel probe reports WHY a node failed
+# (auth / timeout / dead / tcp / format) instead of a bare False, records a
+# SUCCESS when it passes, and surfaces both in the dashboard.  Probe timeout and
+# probe target are configurable, and a strict/lenient switch decides whether a
+# fully-failed probe leaves the pool empty (honest) or falls back to the raw file.
 
 PROXY_407_QUARANTINE = 2          # 407s on a node before it leaves the pool
 PROXY_407_FORCE_DIRECT = 2        # 407s on an account with no fresh proxy -> go direct
+
+DEDUPE_PROXIES_DEFAULT = True     # collapse duplicate host:port lines in proxies.txt
+PROBE_TIMEOUT_DEFAULT = 8.0       # seconds for the CONNECT tunnel probe (was hardcoded 3.0)
+PROBE_TARGET_DEFAULT = "993 (IMAP)"
+PROBE_STRICT_DEFAULT = True       # True: only probe-passing nodes enter the pool
+PROBE_TARGET_PORTS = {
+    "993 (IMAP)": [("imap.gmail.com", 993, "993")],
+    "443 (HTTPS)": [("api.ipify.org", 443, "443")],
+    "both (either)": [("imap.gmail.com", 993, "993"), ("api.ipify.org", 443, "443")],
+}
 
 
 class ProxyAuthError(ConnectionError):
@@ -443,6 +490,72 @@ class ProxyAuthError(ConnectionError):
 def _is_proxy_auth_fail(msg) -> bool:
     m = (msg or "").lower()
     return ("407" in m) or ("proxy authentication required" in m)
+
+
+# --- v13.20 probe telemetry -------------------------------------------------
+# node -> {"ok": bool, "reason": str, "ts": float, "latency_ms": int, "target": str, "scheme": int|None}
+probe_stats = {}
+probe_stats_lock = threading.Lock()
+
+_PROBE_REASON_LABEL = {
+    "ok": "pass",
+    "auth": "407 auth",
+    "timeout": "timeout",
+    "dead": "dead",
+    "tcp": "tcp dead",
+    "format": "bad format",
+    "nosocks": "no PySocks",
+    "blocked": "circuit-broken",
+}
+
+
+def record_probe_result(proxy_str, ok, reason, latency_ms=0, target="", scheme=None):
+    """Store the most recent probe outcome for a node (dashboard + summary)."""
+    if not proxy_str:
+        return
+    with probe_stats_lock:
+        probe_stats[proxy_str] = {
+            "ok": bool(ok),
+            "reason": reason or ("ok" if ok else "dead"),
+            "ts": time.time(),
+            "latency_ms": int(latency_ms or 0),
+            "target": target or "",
+            "scheme": scheme,
+        }
+
+
+def probe_summary():
+    """(passed, auth, timeout, dead) over the most recent probe of each node."""
+    with probe_stats_lock:
+        snap = list(probe_stats.values())
+    passed = sum(1 for v in snap if v.get("ok"))
+    auth = sum(1 for v in snap if not v.get("ok") and v.get("reason") == "auth")
+    timeout = sum(1 for v in snap if not v.get("ok") and v.get("reason") == "timeout")
+    dead = sum(1 for v in snap if not v.get("ok") and v.get("reason") not in ("auth", "timeout"))
+    return passed, auth, timeout, dead
+
+
+def clear_tunnel_cache():
+    """Drop the probe cache and telemetry so the next refresh re-probes live."""
+    with _tunnel_lock:
+        _tunnel_cache.clear()
+    with probe_stats_lock:
+        probe_stats.clear()
+
+
+def probe_timeout() -> float:
+    try:
+        return float(CFG.get("PROBE_TIMEOUT", PROBE_TIMEOUT_DEFAULT))
+    except Exception:
+        return PROBE_TIMEOUT_DEFAULT
+
+
+def probe_targets():
+    try:
+        name = CFG.get("PROBE_TARGET", PROBE_TARGET_DEFAULT)
+    except Exception:
+        name = PROBE_TARGET_DEFAULT
+    return PROBE_TARGET_PORTS.get(name) or PROBE_TARGET_PORTS[PROBE_TARGET_DEFAULT]
 
 
 # ============================================================================
@@ -483,7 +596,7 @@ def default_theme() -> dict:
         "bg": p["bg"], "panel": p["panel"], "text": p["text"],
         "radius": 14, "glow": True, "animate": True, "glass": True,
         "colorize_logs": True,
-        "hero_title": "⚡ Mega Ultimate Mail Checker v13.19",
+        "hero_title": "⚡ Mega Ultimate Mail Checker v13.20",
         "hero_sub": "World-Coverage Edition — router-aware host ranking, rotating proxy pool with 407 quarantine, geo-call routing, Microsoft XOAUTH2, retryable IP-block handling, optional SMTP pre-check, anti-spoofing post-auth validation.",
     }
 
@@ -934,7 +1047,7 @@ failed_domain_cache = {}
 _host_dns_cache = {}
 _host_dns_lock = threading.Lock()
 
-# v13.19 — proxy-layer health
+# v13.20 — proxy-layer health
 proxy_quarantine = set()                # nodes that 407'd, out for this run
 proxy_quarantine_lock = threading.Lock()
 _proxy_407 = defaultdict(int)           # node -> 407 strike count
@@ -1102,7 +1215,27 @@ custom_blacklist_input = str_lit.sidebar.text_input("Custom Blacklist Domains (c
 str_lit.sidebar.markdown("---")
 str_lit.sidebar.markdown("### 🌐 Proxy / Pool Configuration")
 min_proxy_score = str_lit.sidebar.slider("Min Proxy Score", 0, 100, 40, 10)
-proxy_precheck_timeout = str_lit.sidebar.slider("Proxy Pre-Check Timeout (Sec)", 1, 10, 3, 1)
+proxy_precheck_timeout = str_lit.sidebar.slider("Proxy Pre-Check Timeout (Sec)", 1, 10, 5, 1)
+probe_timeout_ui = str_lit.sidebar.slider(
+    "Tunnel Probe Timeout (Sec)", 3, 20, 8, 1,
+    help="How long a node gets to open a real CONNECT tunnel to the probe target. Some providers need "
+         "more than 3s on an IMAP port; at 3s those nodes were being dropped as dead."
+)
+probe_target_ui = str_lit.sidebar.selectbox(
+    "Tunnel Probe Target", ["993 (IMAP)", "443 (HTTPS)", "both (either)"], index=0,
+    help="993 proves the node can carry IMAP. 443 proves it can carry HTTPS. "
+         "'both (either)' passes if either one works."
+)
+probe_strict_ui = str_lit.sidebar.toggle(
+    "Strict tunnel probe", value=True,
+    help="ON (default): only nodes that pass the probe enter the live pool, so 'Alive: 0' means what it says. "
+         "OFF: if the entire pool fails the probe it is used anyway (the old v13.19 behaviour)."
+)
+dedupe_proxies_ui = str_lit.sidebar.toggle(
+    "Deduplicate proxy pool", value=True,
+    help="ON (default): collapse repeated host:port lines in proxies.txt so the pool, the scores and the fail "
+         "counters reflect distinct boxes instead of duplicates."
+)
 allow_blacklist_ips = str_lit.sidebar.toggle(
     "Allow Blacklisted / Flagged Proxy IPs", value=False,
     help="When disabled (default), circuit-broken proxies are excluded from BOTH the pool AND the live ladder."
@@ -1157,7 +1290,11 @@ domain_cache = load_json("domain_cache.json", {})
 proxy_meta = load_json("proxy_meta.json", {})
 
 def load_proxies(quiet: bool = False):
-    """Proxies come from proxies.txt only. Nothing is pre-added."""
+    """Proxies come from proxies.txt only. Nothing is pre-added.
+
+    v13.20: duplicate host:port lines are collapsed (first-seen order kept) so
+    the pool, the scores and the fail counters reflect distinct boxes.
+    """
     if not os.path.exists("proxies.txt"):
         try:
             with file_write_lock:
@@ -1170,7 +1307,18 @@ def load_proxies(quiet: bool = False):
     try:
         with open("proxies.txt", encoding="utf-8", errors="ignore") as f:
             raw_list = [l.strip() for l in f if l.strip() and not l.startswith("#")]
-        log_startup(f"Loaded {len(raw_list)} proxies from proxies.txt.", quiet=quiet)
+        try:
+            dedupe = bool(CFG.get("DEDUPE_PROXIES", DEDUPE_PROXIES_DEFAULT))
+        except Exception:
+            dedupe = DEDUPE_PROXIES_DEFAULT
+        if dedupe:
+            uniq = list(dict.fromkeys(raw_list))
+            if len(uniq) != len(raw_list):
+                log_startup(f"Loaded {len(raw_list)} proxies from proxies.txt "
+                            f"({len(uniq)} unique after dedupe).", quiet=quiet)
+            raw_list = uniq
+        else:
+            log_startup(f"Loaded {len(raw_list)} proxies from proxies.txt.", quiet=quiet)
         return raw_list
     except Exception as e:
         log_startup(f"WARNING: Failed to read proxies.txt: {e}", quiet=quiet)
@@ -1215,7 +1363,7 @@ def parse_proxy(proxy_str):
     return None
 
 # ---------------------------------------------------------------------------
-# PROXY-LAYER HELPERS  (v13.19)
+# PROXY-LAYER HELPERS  (v13.20)
 # ---------------------------------------------------------------------------
 def proxy_is_quarantined(proxy_str) -> bool:
     if not proxy_str:
@@ -1393,61 +1541,47 @@ def enrich_proxy_geo(proxies, max_workers=8):
     except Exception as e:
         log_startup(f"WARNING: proxy geo enrichment error: {e}", quiet=True)
 
-def test_single_proxy(proxy_str):
+def test_single_proxy(proxy_str, target=None):
+    """v13.20: probe the SAME way the live pool does (a real CONNECT tunnel),
+    never the old 53/udp tunnel that blessed nodes the pool then dropped."""
     try:
         info = parse_proxy(proxy_str)
         if not info or not SOCKS_OK:
             return False, "Invalid Format", "Unknown", 0
-        if not is_proxy_alive(info["host"], info["port"], timeout=2.0):
+        if not is_proxy_alive(info["host"], info["port"], timeout=float(CFG.get("PROXY_PRECHECK_TIMEOUT", 5))):
+            record_probe_result(proxy_str, False, "tcp")
             return False, "TCP Connection Timeout", "Unknown", 0
 
-        start = time.time()
-        test_success = False
-        for ptype in _scheme_order(proxy_str):
-            sock = None
-            try:
-                kw = {"proxy_type": ptype, "proxy_addr": info["host"], "proxy_port": info["port"]}
-                if info["user"]:
-                    kw["proxy_username"] = info["user"]
-                    kw["proxy_password"] = info["pass"]
-                sock = socks.create_connection(("8.8.8.8", 53), timeout=2.5, **kw)
-                test_success = True
-                _remember_scheme(proxy_str, ptype)
-                break
-            except Exception:
-                continue
-            finally:
-                if sock:
-                    try:
-                        sock.close()
-                    except Exception:
-                        pass
+        res = tunnel_probe(proxy_str)
+        latency = int(res.get("latency_ms", 0) or 0)
+        record_probe_result(proxy_str, res["ok"], res["reason"],
+                            latency_ms=latency, target=res.get("target", ""), scheme=res.get("scheme"))
 
-        latency = int((time.time() - start) * 1000)
-        initial_score = max(0, min(100, 100 - int(latency / 15)))
         country = proxy_meta.get(proxy_str, {}).get("country", "Unknown")
         region = proxy_meta.get(proxy_str, {}).get("region", "Unknown")
-
         if country == "Unknown":
             country, region = geo_lookup(info["host"])
 
+        initial_score = max(0, min(100, 100 - int(latency / 15)))
         with proxy_lock:
-            if proxy_str not in proxy_meta:
-                proxy_meta[proxy_str] = {"fails": 0, "success": 0}
-            m = proxy_meta[proxy_str]
-            if test_success:
+            m = proxy_meta.setdefault(
+                proxy_str,
+                {"fails": 0, "success": 0, "country": "Unknown", "region": "Unknown", "latency_ms": 0})
+            if res["ok"]:
                 m["success"] = m.get("success", 0) + 1
                 consecutive_proxy_failures[proxy_str] = 0
             else:
                 m["fails"] = m.get("fails", 0) + 1
                 consecutive_proxy_failures[proxy_str] += 1
-            m["score"] = compute_real_score(m.get("success", 0), m.get("fails", 0), initial_latency_score=initial_score)
+            m["score"] = compute_real_score(m.get("success", 0), m.get("fails", 0),
+                                            initial_latency_score=initial_score)
             m["country"], m["region"], m["latency_ms"] = country, region, latency
             current_score = m["score"]
 
-        if test_success:
+        if res["ok"]:
             return True, f"{latency}ms", f"{country}, {region}", current_score
-        return False, "Connection Failed", f"{country}, {region}", current_score
+        label = _PROBE_REASON_LABEL.get(res["reason"], res["reason"])
+        return False, f"Probe failed: {label}", f"{country}, {region}", current_score
     except Exception as e:
         return False, f"Error: {str(e)[:30]}", "Unknown", 0
 
@@ -1557,6 +1691,10 @@ def build_cfg():
         "DEBUG": debug_mode,
         "MIN_PROXY_SCORE": min_proxy_score,
         "PROXY_PRECHECK_TIMEOUT": proxy_precheck_timeout,
+        "PROBE_TIMEOUT": probe_timeout_ui,
+        "PROBE_TARGET": probe_target_ui,
+        "PROBE_STRICT": probe_strict_ui,
+        "DEDUPE_PROXIES": dedupe_proxies_ui,
         "ALLOW_BLACKLIST_IPS": allow_blacklist_ips,
         "QUARANTINE_407": proxy_quarantine_ui,
         "POOL_MODE": pool_mode,
@@ -1602,7 +1740,9 @@ for _k, _v in (
     ("RETRY_CONNECTION_FAILED", 0), ("MAX_ACCOUNTS", 5000), ("MAX_WORKERS_START", 30),
     ("DYNAMIC_WORKER_SCALING", True), ("PROXY_MODE", "fallback"), ("ALLOW_BLACKLIST_IPS", False),
     ("RANDOM_ROTATION", True), ("GEO_CALL", False), ("CONNECTION_HINT", "Auto"), ("SMTP_CHECK", False),
-    ("QUARANTINE_407", True),
+    ("QUARANTINE_407", True), ("MIN_PROXY_SCORE", 10), ("PROXY_PRECHECK_TIMEOUT", 5),
+    ("PROBE_TIMEOUT", PROBE_TIMEOUT_DEFAULT), ("PROBE_TARGET", PROBE_TARGET_DEFAULT),
+    ("PROBE_STRICT", PROBE_STRICT_DEFAULT), ("DEDUPE_PROXIES", DEDUPE_PROXIES_DEFAULT),
 ):
     CFG.setdefault(_k, _v)
 
@@ -1613,7 +1753,9 @@ log_startup(
     f"starttls={CFG.get('TRY_STARTTLS')} alt_user={CFG.get('TRY_ALT_USERNAME')} "
     f"self_signed={CFG.get('ALLOW_SELF_SIGNED')} allow_blacklist={CFG.get('ALLOW_BLACKLIST_IPS')} "
     f"random_rotation={CFG.get('RANDOM_ROTATION')} geo_call={CFG.get('GEO_CALL')} "
-    f"smtp_precheck={CFG.get('SMTP_CHECK')} quarantine_407={CFG.get('QUARANTINE_407')}"
+    f"smtp_precheck={CFG.get('SMTP_CHECK')} quarantine_407={CFG.get('QUARANTINE_407')} "
+    f"probe_target={CFG.get('PROBE_TARGET')} probe_timeout={CFG.get('PROBE_TIMEOUT')}s "
+    f"probe_strict={CFG.get('PROBE_STRICT')} dedupe={CFG.get('DEDUPE_PROXIES')}"
 )
 
 # ============================================================================
@@ -1725,6 +1867,12 @@ def get_filtered_active_proxies(quiet: bool = False):
         raw = load_proxies(quiet=quiet)
         if not raw:
             return []
+        try:
+            dedupe = bool(CFG.get("DEDUPE_PROXIES", DEDUPE_PROXIES_DEFAULT))
+        except Exception:
+            dedupe = DEDUPE_PROXIES_DEFAULT
+        if dedupe:
+            raw = list(dict.fromkeys(raw))
         filtered = []
         min_score = CFG.get("MIN_PROXY_SCORE", 10)
         mode = CFG.get("POOL_MODE", "all")
@@ -2218,19 +2366,34 @@ _tunnel_cache = {}
 _tunnel_lock = threading.Lock()
 _TUNNEL_TTL = 120
 
-def proxy_tunnel_ok(proxy_str, target=("imap.gmail.com", 993), timeout=3.0):
-    """Open a real tunnel through the node. A 407 raises inside PySocks and is
-    caught here, so a 407-dead node is reported False instead of entering the
-    pool."""
-    try:
-        if not proxy_str:
-            return True
-        info = parse_proxy(proxy_str)
-        if not info or not SOCKS_OK:
-            return False
-        host, port = target
+
+def tunnel_probe(proxy_str, targets=None, timeout=None):
+    """Open a REAL CONNECT tunnel through the node and classify the outcome.
+
+    v13.20: returns {"ok","reason","latency_ms","target","scheme"} instead of a
+    bare bool, so a 407 pool, a slow pool and a dead pool are distinguishable.
+    reason is one of: ok / format / nosocks / auth / timeout / dead.
+    """
+    out = {"ok": False, "reason": "dead", "latency_ms": 0, "target": "", "scheme": None}
+    if not proxy_str:
+        out["ok"] = True
+        out["reason"] = "ok"
+        return out
+    info = parse_proxy(proxy_str)
+    if not info:
+        out["reason"] = "format"
+        return out
+    if not SOCKS_OK:
+        out["reason"] = "nosocks"
+        return out
+
+    targets = targets or probe_targets()
+    timeout = timeout if timeout is not None else probe_timeout()
+
+    for host, port, label in targets:
         for ptype in _scheme_order(proxy_str):
             s = None
+            started = time.time()
             try:
                 kw = {"proxy_type": ptype, "proxy_addr": info["host"],
                       "proxy_port": info["port"], "proxy_rdns": True}
@@ -2239,50 +2402,94 @@ def proxy_tunnel_ok(proxy_str, target=("imap.gmail.com", 993), timeout=3.0):
                     kw["proxy_password"] = info["pass"]
                 s = socks.create_connection((host, port), timeout=timeout, **kw)
                 _remember_scheme(proxy_str, ptype)
-                return True
-            except Exception:
-                continue
+                out.update(ok=True, reason="ok", scheme=ptype, target=label,
+                           latency_ms=int((time.time() - started) * 1000))
+                return out
+            except Exception as e:
+                msg = str(e)
+                if _is_proxy_auth_fail(msg):
+                    out["reason"] = "auth"
+                elif isinstance(e, (socket.timeout, TimeoutError)) or "timed out" in msg.lower():
+                    if out["reason"] != "auth":
+                        out["reason"] = "timeout"
+                else:
+                    if out["reason"] != "auth":
+                        out["reason"] = "dead"
+                out["target"] = label
+                out["latency_ms"] = int((time.time() - started) * 1000)
             finally:
                 if s:
                     try:
                         s.close()
                     except Exception:
                         pass
-        return False
-    except Exception:
-        return False
+    return out
+
+
+def proxy_tunnel_ok(proxy_str, target=("imap.gmail.com", 993), timeout=None):
+    """Backwards-compatible bool wrapper around tunnel_probe()."""
+    if not proxy_str:
+        return True
+    if target == ("imap.gmail.com", 993):
+        tgts = [("imap.gmail.com", 993, "993")]
+    else:
+        tgts = [(target[0], target[1], str(target[1]))]
+    return tunnel_probe(proxy_str, targets=tgts, timeout=timeout)["ok"]
+
+
+def _cached_probe(proxy_str):
+    now = time.time()
+    with _tunnel_lock:
+        hit = _tunnel_cache.get(proxy_str)
+    if hit and now - hit[0] < _TUNNEL_TTL:
+        return hit[1]
+    res = tunnel_probe(proxy_str)
+    with _tunnel_lock:
+        _tunnel_cache[proxy_str] = (now, res)
+    return res
+
 
 def precheck_proxy_fast(proxy_str):
+    """v13.20: records success on a pass, records a 407 as auth, and files a
+    probe reason for the dashboard. Returns True only when the tunnel opened."""
     try:
         if not proxy_str:
             return True
         if proxy_is_blocked(proxy_str):
+            record_probe_result(proxy_str, False, "blocked")
             return False
         info = parse_proxy(proxy_str)
-        if not info or not SOCKS_OK:
+        if not info:
+            record_probe_result(proxy_str, False, "format")
             return False
-        if not is_proxy_alive(info["host"], info["port"], timeout=float(CFG.get("PROXY_PRECHECK_TIMEOUT", 3))):
+        if not SOCKS_OK:
+            record_probe_result(proxy_str, False, "nosocks")
+            return False
+        if not is_proxy_alive(info["host"], info["port"], timeout=float(CFG.get("PROXY_PRECHECK_TIMEOUT", 5))):
             record_proxy_attempt(proxy_str, success=False, is_network_error=True)
+            record_probe_result(proxy_str, False, "tcp")
             return False
 
-        now = time.time()
-        with _tunnel_lock:
-            hit = _tunnel_cache.get(proxy_str)
-        if hit and now - hit[0] < _TUNNEL_TTL:
-            ok = hit[1]
+        res = _cached_probe(proxy_str)
+        record_probe_result(proxy_str, res["ok"], res["reason"],
+                            latency_ms=res.get("latency_ms", 0),
+                            target=res.get("target", ""), scheme=res.get("scheme"))
+
+        if res["ok"]:
+            record_proxy_attempt(proxy_str, success=True)
+            return True
+
+        if res["reason"] == "auth":
+            record_proxy_attempt(proxy_str, success=False, is_network_error=True, is_proxy_auth=True)
         else:
-            ok = proxy_tunnel_ok(proxy_str)
-            with _tunnel_lock:
-                _tunnel_cache[proxy_str] = (now, ok)
-
-        if not ok:
             record_proxy_attempt(proxy_str, success=False, is_network_error=True)
-        return ok
+        return False
     except Exception:
         return False
 
+
 def refresh_alive_pool():
-    """Parallel — the old one-proxy-at-a-time loop was the whole start lag."""
+    """Parallel. v13.20: honors PROBE_STRICT and logs the failure breakdown."""
     try:
         raw = get_filtered_active_proxies(quiet=True)
     except Exception:
@@ -2295,26 +2502,43 @@ def refresh_alive_pool():
         with alive_pool_lock:
             alive_pool[:] = raw
         enrich_proxy_geo(raw)
+        log_startup(f"Test Flight OFF: pool set to all {len(raw)} candidate(s) without probing.", quiet=True)
         return
+
     live = []
+    batch_timed_out = False
     try:
         with ThreadPoolExecutor(max_workers=16) as ex:
             f2p = {ex.submit(precheck_proxy_fast, p): p for p in raw}
-            for fut in as_completed(f2p, timeout=45):
+            for fut in as_completed(f2p, timeout=max(60, len(raw) * 2)):
                 try:
                     if fut.result():
                         live.append(f2p[fut])
                 except Exception:
                     continue
     except Exception:
-        live = list(raw)
-    if not live:
+        batch_timed_out = True
+
+    strict = bool(CFG.get("PROBE_STRICT", PROBE_STRICT_DEFAULT))
+    note = ""
+    if not live and not strict:
         live = raw
+        note = " | STRICT OFF: fell back to the raw pool"
+    elif not live and batch_timed_out:
+        note = " | probe batch timed out"
+
     with alive_pool_lock:
         alive_pool[:] = live
     enrich_proxy_geo(live)
-    log_startup(f"Alive pool refreshed: {len(live)} node(s) passed the tunnel probe "
-                f"out of {len(raw)} candidate(s).", quiet=True)
+
+    passed, auth, timeout_n, dead = probe_summary()
+    log_startup(
+        f"Alive pool refreshed: {len(live)} node(s) passed the tunnel probe "
+        f"out of {len(raw)} candidate(s). Probe breakdown -> pass={passed} auth407={auth} "
+        f"timeout={timeout_n} dead={dead} | target={CFG.get('PROBE_TARGET')} "
+        f"budget={probe_timeout():.0f}s strict={strict}{note}",
+        quiet=True)
+
 
 def start_alive_refresher():
     if any(t.name == "alive-pool" for t in threading.enumerate()):
@@ -2329,6 +2553,7 @@ def start_alive_refresher():
             time.sleep(15)
 
     threading.Thread(target=loop, daemon=True, name="alive-pool").start()
+
 
 start_alive_refresher()
 
@@ -2360,14 +2585,48 @@ with str_lit.sidebar:
     _q_now = quarantine_size()
     _alive_now = len(alive_pool)
     str_lit.info(f"Loaded Proxies: **{len(all_proxies)}** | Filtered Pool: **{len(filtered_pool)}** | Alive: **{_alive_now}**")
+
+    _p_ok, _p_auth, _p_to, _p_dead = probe_summary()
+    str_lit.caption(
+        f"Probe ({CFG.get('PROBE_TARGET', PROBE_TARGET_DEFAULT)}, {probe_timeout():.0f}s): "
+        f"pass **{_p_ok}** | 407 auth **{_p_auth}** | timeout **{_p_to}** | dead **{_p_dead}**"
+        + ("  ·  STRICT OFF" if not CFG.get("PROBE_STRICT", True) else "")
+    )
+
     if _q_now:
         str_lit.warning(f"🩹 Quarantined for 407: **{_q_now}** node(s)")
     if not all_proxies:
         str_lit.caption("No proxies configured — the engine will run fully DIRECT until you add some.")
     elif _alive_now == 0:
         str_lit.warning("⚠ No node passed the tunnel probe. The run will go fully DIRECT.")
+        if _p_auth and not _p_to and not _p_dead:
+            str_lit.caption("Every failure was a 407 → the nodes are REACHABLE but REJECTING you. "
+                            "Fix the user:pass in proxies.txt, or renew the plan. No code change helps.")
+        elif _p_to:
+            str_lit.caption(f"{_p_to} node(s) timed out at {probe_timeout():.0f}s → raise the "
+                            "Tunnel Probe Timeout slider before blaming the pool.")
+        elif _p_dead:
+            str_lit.caption(f"{_p_dead} node(s) were unreachable/refused → re-fetch the pool.")
     else:
         str_lit.caption("A 407 means the PROXY rejected you, not the mailbox. Quarantined nodes are retried automatically once the whole pool is out.")
+
+    _rc1, _rc2 = str_lit.columns(2)
+    with _rc1:
+        if str_lit.button("🔁 Re-probe pool now", use_container_width=True):
+            clear_tunnel_cache()
+            refresh_alive_pool()
+            str_lit.success("Pool re-probed.")
+            str_lit.rerun()
+    with _rc2:
+        if str_lit.button("🧾 Show raw proxies.txt", use_container_width=True):
+            try:
+                with open(CFG["PROXY_FILE"], encoding="utf-8", errors="ignore") as _pf:
+                    _lines = [l.rstrip() for l in _pf if l.strip()]
+                _uniq = list(dict.fromkeys(_lines))
+                str_lit.caption(f"{len(_lines)} line(s), {len(_uniq)} unique")
+                str_lit.code("\n".join(_lines[:60]), language="text")
+            except Exception as _pf_err:
+                str_lit.error(f"Could not read proxies.txt: {_pf_err}")
 
     with str_lit.expander("➕ Add Custom Proxies", expanded=False):
         custom_proxy_text = str_lit.text_area("Paste proxies (host:port or user:pass@host:port)", placeholder="123.45.67.89:8080", height=100)
@@ -2379,6 +2638,7 @@ with str_lit.sidebar:
                     with file_write_lock:
                         with open(CFG["PROXY_FILE"], "w", encoding="utf-8") as f:
                             f.write("\n".join(combined) + "\n")
+                    clear_tunnel_cache()
                     log_startup(f"Added {len(new_proxies)} custom proxies successfully.")
                     str_lit.success(f"Added {len(new_proxies)} custom proxies successfully!")
                     str_lit.rerun()
@@ -2419,14 +2679,17 @@ with str_lit.sidebar:
                 all_raw.extend(OXYLABS_PROXIES)
                 all_raw = list(dict.fromkeys(all_raw))
 
+                # v13.20: probe exactly like the live pool (CONNECT tunnel), so a
+                # node saved here cannot then fail the pool probe.
                 alive = []
                 if all_raw:
+                    clear_tunnel_cache()
                     try:
                         with ThreadPoolExecutor(max_workers=16) as ex:
-                            f2p = {ex.submit(test_single_proxy, p): p for p in all_raw}
-                            for fut in as_completed(f2p, timeout=30):
+                            f2p = {ex.submit(precheck_proxy_fast, p): p for p in all_raw}
+                            for fut in as_completed(f2p, timeout=max(60, len(all_raw) * 2)):
                                 try:
-                                    if fut.result(timeout=2)[0]:
+                                    if fut.result():
                                         alive.append(f2p[fut])
                                 except Exception:
                                     continue
@@ -2434,7 +2697,7 @@ with str_lit.sidebar:
                         warnings.warn(f"Proxy test batch error: {e}")
                         alive = all_raw[:20]
 
-                alive = alive or all_raw[:20]
+                alive = list(dict.fromkeys(alive)) or all_raw[:20]
 
                 try:
                     with file_write_lock:
@@ -2449,10 +2712,19 @@ with str_lit.sidebar:
             str_lit.rerun()
 
     with str_lit.expander("📊 Proxy Health & Geo Dashboard", expanded=False):
+        with probe_stats_lock:
+            _pstats = dict(probe_stats)
         if proxy_meta:
             rows = []
             for p_str, meta in proxy_meta.items():
                 info = parse_proxy(p_str)
+                _ps = _pstats.get(p_str) or {}
+                if _ps:
+                    _rlabel = _PROBE_REASON_LABEL.get(_ps.get("reason", ""), _ps.get("reason", ""))
+                    _age = f"{int(time.time() - _ps.get('ts', time.time()))}s ago"
+                    _last = f"{_rlabel} · {_age}"
+                else:
+                    _last = "—"
                 rows.append({
                     "Proxy": f"{info['host']}:{info['port']}" if info else "Unknown",
                     "Latency": f"{meta.get('latency_ms', 'N/A')} ms",
@@ -2462,14 +2734,26 @@ with str_lit.sidebar:
                     "Fails": meta.get("fails", 0),
                     "Successes": meta.get("success", 0),
                     "407s": _proxy_407.get(p_str, 0),
+                    "Last Probe": _last,
                     "Quarantined": "yes" if proxy_is_quarantined(p_str) else "",
                 })
+            str_lit.caption(
+                f"Probe target {CFG.get('PROBE_TARGET', PROBE_TARGET_DEFAULT)} · "
+                f"budget {probe_timeout():.0f}s · strict={CFG.get('PROBE_STRICT', True)} · "
+                f"dedupe={CFG.get('DEDUPE_PROXIES', True)}"
+            )
             str_lit.dataframe(pd.DataFrame(rows), use_container_width=True)
-            col_ref1, col_ref2, col_ref3 = str_lit.columns(3)
+            col_ref1, col_ref2, col_ref3, col_ref4 = str_lit.columns(4)
             with col_ref1:
                 if str_lit.button("🔄 Refresh Dashboard"):
                     str_lit.rerun()
             with col_ref2:
+                if str_lit.button("🔁 Re-probe All"):
+                    clear_tunnel_cache()
+                    refresh_alive_pool()
+                    str_lit.success("Re-probed.")
+                    str_lit.rerun()
+            with col_ref3:
                 if str_lit.button("🧹 Clean Dead / Low-Score"):
                     with proxy_lock:
                         for k, m in list(proxy_meta.items()):
@@ -2478,7 +2762,7 @@ with str_lit.sidebar:
                     save_proxy_meta()
                     str_lit.success("Cleaned!")
                     str_lit.rerun()
-            with col_ref3:
+            with col_ref4:
                 if str_lit.button("♻️ Lift 407 Quarantine"):
                     clear_proxy_quarantine()
                     str_lit.success("Quarantine lifted.")
@@ -3993,7 +4277,12 @@ if start_engine_btn:
         filtered_pool[:] = get_filtered_active_proxies()
         if not alive_pool:
             refresh_alive_pool()
-        active_proxy_pool = list(alive_pool) or list(filtered_pool)
+        if alive_pool:
+            active_proxy_pool = list(alive_pool)
+        elif CFG.get("PROBE_STRICT", PROBE_STRICT_DEFAULT):
+            active_proxy_pool = []
+        else:
+            active_proxy_pool = list(filtered_pool)
 
         log_startup(
             f"PROXY HEALTH BANNER -> loaded={len(all_proxies)} filtered={len(filtered_pool)} "
