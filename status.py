@@ -6,34 +6,37 @@ CONNECTION_FAILED, RBL + RBL_BLOCKED, PROXY_UNHEALTHY, ...) so
 `from status import (...)` can never break.
 
 Classification order is deliberate:
-    APP -> WRONG_STRONG -> BARE_AUTH -> RBL -> DNS -> RETRY -> CONN -> WRONG -> UNKNOWN
-CONN runs before WRONG so a proxy "Socket error: 407" is never read as an auth
-failure by a generic token.
+    APP -> WRONG_STRONG -> BARE_AUTH -> RBL -> DNS -> CONN_STRONG -> RETRY -> CONN -> WRONG -> UNKNOWN
+
+v13.30
+------
+* CONN_STRONG IS TESTED BEFORE RETRY.  "connection reset by peer" sat in BOTH
+  the _RETRY and _CONN tables, and _RETRY was tested first - so a plain socket
+  reset was reported as RETRY_LATER ("rate-limited, try again") instead of
+  CONNECTION_FAILED, and RETRY_LATER outranks CONNECTION_FAILED in PRIORITY.
+  An unambiguous transport token now wins over the soft retry table, so a reset
+  is a reset.
+* _RETRY NO LONGER CONTAINS "connection reset by peer".  Belt and braces with
+  the ordering above.
+* is_conn_signal() helper for callers that want the raw predicate.
 
 v13.19
 ------
 * NEW STATUS — PROXY_UNHEALTHY.  Returned when every attempt for an account
   failed in the PROXY hop (407 Proxy Authentication Required) and the mailbox
-  was therefore never reached.  Previously these were reported as
-  CONNECTION_FAILED / "password could not be tested", which looks like a
-  mailbox outage and hides a dead proxy pool.
+  was therefore never reached.
 * is_proxy_auth_fail() helper so app.py can raise ProxyAuthError on the exact
   same predicate the classifier uses.
 * classify_proxy_error() — proxy-aware wrapper around classify_error().
 
 v13.18
 ------
-* RBL / RBL_BLOCKED ARE NOW DEFINED.  app.py imports them, this file never
-  exported them, so the whole `from status import (...)` block raised
-  ImportError and the engine silently fell back to its inline classifier.
-  The real classifier in this file is now live.
+* RBL / RBL_BLOCKED ARE NOW DEFINED.
 * Microsoft AADSTS codes added:
     AADSTS50126 / AADSTS50034           -> WRONG_PASSWORD
     AADSTS50076 / AADSTS50079 / 50074   -> NEED_APP_PASSWORD (MFA on)
-  so an OAuth token refusal classifies instead of landing in UNKNOWN.
 * ms_token_status() helper for the XOAUTH2 path.
-* RBL is checked before CONN and before WRONG, so an IP-reputation block is
-  never reported as a bare connection failure.
+* RBL is checked before CONN and before WRONG.
 """
 
 # ---------------------------------------------------------------------------
@@ -175,6 +178,9 @@ _DNS = (
     "servfail",
 )
 
+# SOFT, retryable conditions.  Kept NARROW on purpose: anything in here means
+# "the server answered, but not now", so it must not swallow a hard transport
+# failure.  "connection reset by peer" now lives in _CONN_STRONG, not here.
 _RETRY = (
     "lookup failed",
     "user could not be routed",
@@ -206,7 +212,50 @@ _RETRY = (
     "greylist",
     "greylisted",
     "unexpected extra arguments",
+)
+
+# v13.30: UNAMBIGUOUS transport failures.  Tested BEFORE _RETRY so a reset can
+# never be reported as a rate-limit.
+_CONN_STRONG = (
     "connection reset by peer",
+    "connection reset",
+    "reset by peer",
+    "connection refused",
+    "connection aborted",
+    "connection closed",
+    "connection dropped",
+    "connection lost",
+    "connection failure",
+    "broken pipe",
+    "unexpected eof",
+    "eof occurred",
+    "socket error",
+    "socket closed",
+    "socket timeout",
+    "bad file descriptor",
+    "network is unreachable",
+    "no route to host",
+    "host is down",
+    "timed out",
+    "timeout",
+    "timedout",
+    "ssl",
+    "tls",
+    "wrong version number",
+    "handshake",
+    "certificate",
+    "cert verify",
+    "cannot connect",
+    "unable to connect",
+    "failed to connect",
+    "connect failed",
+    "connection negotiation failure",
+    "negotiation failure",
+    "not supported by server",
+    "stls not supported",
+    "starttls not supported",
+    "tls not supported",
+    "imap4rev1",
 )
 
 _CONN = (
@@ -219,44 +268,6 @@ _CONN = (
     "bad proxy format",
     "proxy",
     "socks",
-    "timed out",
-    "timeout",
-    "timedout",
-    "connection refused",
-    "connection reset",
-    "connection aborted",
-    "connection closed",
-    "connection dropped",
-    "connection lost",
-    "connection failure",
-    "connection negotiation failure",
-    "negotiation failure",
-    "socket error",
-    "socket closed",
-    "socket timeout",
-    "eof",
-    "broken pipe",
-    "network is unreachable",
-    "no route to host",
-    "host is down",
-    "reset by peer",
-    "ssl",
-    "tls",
-    "wrong version number",
-    "handshake",
-    "certificate",
-    "cert verify",
-    "unexpected eof",
-    "bad file descriptor",
-    "not supported by server",
-    "stls not supported",
-    "starttls not supported",
-    "tls not supported",
-    "imap4rev1",
-    "cannot connect",
-    "unable to connect",
-    "failed to connect",
-    "connect failed",
 )
 
 # IP-reputation / greylist refusals.  Checked BEFORE _CONN and BEFORE _WRONG so
@@ -386,7 +397,12 @@ def _is_bare_auth(text):
 def classify_error(raw, domain=""):
     """Map a raw server/socket error string to an engine status.
 
-    Order: APP -> WRONG_STRONG -> BARE_AUTH -> RBL -> DNS -> RETRY -> CONN -> WRONG -> UNKNOWN
+    Order:
+      APP -> WRONG_STRONG -> BARE_AUTH -> RBL -> DNS -> CONN_STRONG -> RETRY -> CONN -> WRONG -> UNKNOWN
+
+    CONN_STRONG runs BEFORE RETRY (v13.30) so a transport reset is never read as
+    a soft "try again"; RETRY runs before CONN so a proxy "Socket error: 407" is
+    never read as an auth failure by a generic token.
     """
     t = _norm(raw)
     if not t:
@@ -408,6 +424,8 @@ def classify_error(raw, domain=""):
         return RBL_BLOCKED
     if _match(t, _DNS):
         return DNS_FAILED
+    if _match(t, _CONN_STRONG):
+        return CONNECTION_FAILED
     if _match(t, _RETRY):
         return RETRY_LATER
     if _match(t, _CONN):
@@ -418,23 +436,14 @@ def classify_error(raw, domain=""):
 
 
 def classify_proxy_error(raw, domain=""):
-    """Proxy-aware wrapper: a 407 / proxy-auth failure is PROXY_UNHEALTHY.
-
-    Use this when the failure happened on a PROXIED attempt and you want the
-    specific reason rather than a generic CONNECTION_FAILED.  The account-level
-    engine still decides the final verdict; this only labels the leg.
-    """
+    """Proxy-aware wrapper: a 407 / proxy-auth failure is PROXY_UNHEALTHY."""
     if is_proxy_auth_fail(raw):
         return PROXY_UNHEALTHY
     return classify_error(raw, domain)
 
 
 def ms_token_status(code):
-    """Map a Microsoft AADSTS code to an engine status.
-
-    Used by the XOAUTH2 path.  Returns None for codes that are not an account
-    verdict (consent / app configuration), so the caller keeps its own verdict.
-    """
+    """Map a Microsoft AADSTS code to an engine status."""
     c = (code or "").upper()
     if c in ("AADSTS50126", "AADSTS50034"):
         return WRONG_PASSWORD
@@ -444,7 +453,16 @@ def ms_token_status(code):
 
 
 def is_retry_signal(raw):
-    return _match(_norm(raw), _RETRY)
+    t = _norm(raw)
+    if _match(t, _CONN_STRONG):
+        return False
+    return _match(t, _RETRY)
+
+
+def is_conn_signal(raw):
+    """v13.30: True for an unambiguous transport failure."""
+    t = _norm(raw)
+    return _match(t, _CONN_STRONG) or _match(t, _CONN)
 
 
 def is_proxy_auth_fail(raw):
