@@ -3,6 +3,19 @@ hosts.py
 ========
 One host table. Primary first, backup second, with SRV/autoconfig/MX discovery.
 
+v13.24 changes
+--------------
+* suddenlink.net now carries its REAL post-migration endpoints.  Suddenlink was
+  folded into Optimum (Altice), so the curated entry gains mail.optimum.net and
+  imap.optimum.net alongside the legacy imap.suddenlink.net.  optimum.net and
+  suddenlinkmail.com are registered too.  The Altice/Openwave MX now maps to the
+  Optimum endpoints instead of resolving to an SMTP router name.
+* _with_discovery(): a CURATED provider still benefits from live discovery.
+  _conf_curated() short-circuited for every COUNTRY domain, so SRV/autoconfig/MX
+  were never consulted for exactly the ISPs that needed them.  Discovery output
+  (minus universal fallbacks, which would only add noise) is now appended to the
+  curated answer and lands in the tail via merge_domain_guesses().
+
 v13.18 changes
 --------------
 * FAMILY_PRIORITY + DEAD_IMAP_HOSTS.  merge_domain_guesses() used to place the
@@ -117,13 +130,19 @@ COUNTRY = {
     "t-online.de": ["secureimap.t-online.de"],
     "comcast.net": ["imap.comcast.net"],
     "windstream.net": ["imap.windstream.net", "mail.windstream.net"],
-    "suddenlink.net": ["imap.suddenlink.net", "mail.suddenlink.net"],
+    # v13.24: Suddenlink was folded into Optimum (Altice).  The legacy endpoint
+    # imap.suddenlink.net is kept first (it is still the officially documented
+    # one) and the real Optimum endpoints follow, so a migrated mailbox is
+    # reached even when the legacy name is dead.
+    "suddenlink.net": ["imap.suddenlink.net", "mail.optimum.net", "imap.optimum.net", "mail.suddenlink.net"],
+    "suddenlinkmail.com": ["mail.optimum.net", "imap.optimum.net", "imap.suddenlink.net"],
+    "optimum.net": ["mail.optimum.net", "imap.optimum.net"],
+    "optonline.net": ["mail.optimum.net", "imap.optimum.net"],
     "cox.net": ["imap.cox.net", "imap.mail.yahoo.com"],
-    "optonline.net": ["mail.optimum.net"],
     "centurylink.net": ["mail.centurylink.net"],
     "embarqmail.com": ["mail.centurylink.net"],
     "centurytel.net": ["mail.centurylink.net"],
-    "mediacombb.net": ["mail.mediacombb.net"],
+    "mediacombb.net": ["mail.mediacombb.net", "imap.mediacombb.net"],
     "mchsi.com": ["mail.mediacombb.net"],
     "earthlink.net": ["imap.earthlink.net"],
     "breezeline.net": ["mail.breezeline.net"],
@@ -284,6 +303,10 @@ MX_PROVIDER_MAP = (
     (("aol",), ("imap.aol.com", "pop.aol.com", "smtp.aol.com")),
     (("yahoodns", "yahoo"), ("imap.mail.yahoo.com", "pop.mail.yahoo.com", "smtp.mail.yahoo.com")),
     (("icloud", "apple", "me.com"), ("imap.mail.me.com", "pop.mail.me.com", "smtp.mail.me.com")),
+    # v13.24: suddenlink.net MX is mx.altice.prod.cloud.openwave.ai - a ROUTER
+    # name that matches nothing else.  Without this entry discovery never
+    # surfaced the Optimum endpoint for a Suddenlink mailbox.
+    (("altice", "openwave", "optimum"), ("mail.optimum.net", "pop.optimum.net", "mail.optimum.net")),
     # --- the offenders: provider identity is NOT the same as the MX brand ---
     (("freenet",), ("imap.freenet.de", "pop.freenet.de", "smtp.freenet.de")),
     (("gmx", "1and1", "ionos", "schlund", "united-domains", "kasserver", "udag"), ("imap.gmx.net", "pop.gmx.net", "mail.gmx.net")),
@@ -1049,6 +1072,30 @@ def _pair(imap_hosts, pop_hosts, domain=None):
     return {"imap": imap_hosts, "pop": pop_hosts, "pop3": pop_hosts}
 
 
+def _with_discovery(got, domain):
+    """v13.24: append discovery-derived IMAP hosts (SRV/autoconfig/MX) to a
+    CURATED answer.  Universal fallbacks are dropped (they would only add
+    noise to a provider whose endpoint is already known).  The result keeps the
+    curated order; discovery extras land in the tail via merge_domain_guesses().
+    """
+    try:
+        found = discover_hosts(domain)
+    except Exception:
+        return got
+    extra = [h for h in (found.get("imap") or []) if h not in UNIVERSAL_IMAP_FALLBACKS]
+    if not extra:
+        return got
+    out = dict(got)
+    for key in ("imap", "pop", "pop3"):
+        cur = [h for h in (out.get(key) or []) if h]
+        for h in extra:
+            if h not in cur:
+                cur.append(h)
+        if cur:
+            out[key] = cur
+    return out
+
+
 def get_mx_host(domain):
     mx_records = resolve_mx(domain)
     if not mx_records:
@@ -1124,7 +1171,8 @@ def _conf_curated(domain):
         return _pair(GMAIL_IMAP, GMAIL_POP, domain)
     known = COUNTRY.get(domain)
     if known:
-        return _pair(known, known, domain)
+        # v13.24: a curated provider still benefits from live discovery.
+        return _with_discovery(_pair(known, known, domain), domain)
 
     found = discover_hosts(domain)
     if found["imap"] or found["pop"]:
