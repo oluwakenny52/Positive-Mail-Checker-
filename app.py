@@ -1,9 +1,47 @@
 """
-Mega Ultimate Mail Checker — v13.33
+Mega Ultimate Mail Checker — v13.34
 ===================================
 Complete rewrite. SMTP reachability is an OPT-IN pre-check stage (never inside
 the validator), status classification actually works, and every direct-connection
 line carries the real egress IP / region / country / VPN state.
+
+v13.34 changes  (PLUG AND PLAY — click Fetch & Test, then press Start)
+---------------------------------------------------------------------
+Every "go into the sidebar and change this" recommendation from v13.33 is now a
+DEFAULT, and the fetch validates AND arms the pool so nothing has to be probed
+again at Start.
+
+* PROBE TARGET DEFAULTS TO 443 (HTTPS).  api.ipify.org:443 is not a mail server,
+  so ALL probe traffic lands on the websites meter instead of the email-servers
+  meter - the one that got blown.  A node that can reach it is a live node;
+  whether it can also reach Windstream is what the check itself is for.
+  'auto (from combo list)' is still selectable if you prefer host-accurate probes.
+
+* THE 407 CONTROLS ARE NOW THE DEFAULTS.  PROXY_SUBUSER_CONCURRENCY 2 -> 1,
+  PROXY_IP_CONCURRENCY 2 -> 1, PROXY_CONCURRENCY 4 -> 4 with those sub-caps, so
+  the worst case is 4 simultaneous tunnels, one per IP, one per sub-user.
+  A blocked gate now WAITS (up to ~6-8s) instead of barging through and
+  collecting a 407 it did not need to collect.
+
+* SAME_HOST_RETRIES 1 -> 0.  Each retry is a fresh CONNECT.
+
+* FETCH & TEST ALL PROXIES NOW ARMS THE APP.  It used to write proxies.txt and
+  leave alive_pool stale, so the next Start paid for a whole cold re-probe.
+  It now validates every line, writes the file, sets the live pool, geo-tags it,
+  clears the 407 quarantine, stamps last_probe_ts and says READY.  Start is
+  immediate and spends nothing extra.
+
+* ZERO-CLICK BOOTSTRAP.  Fresh box, WEBSHARE_KEYS in secrets, no proxies.txt:
+  the fetch + validation runs itself on first page load.  You never see an
+  empty pool and you never click anything to get one.
+
+* AUTO CONFIG MIGRATION (CFG_VERSION).  New defaults adopt themselves, so the
+  "click 💾 Apply Settings" step stops being required.  A widget you HAVE
+  touched keeps your value; one you have not picks up the new default.
+
+* PROBE_BATCH_BUDGET 45s -> 120s so a full validated cycle finishes comfortably
+  inside the new, gentler concurrency caps.  The spinner exits as soon as the
+  probe finishes - the budget is only a ceiling.
 
 v13.33 changes  (REQUEST FRUGALITY — THE PROXY BILL)
 ----------------------------------------------------
@@ -15,42 +53,30 @@ HOUR, purely for having the tab open.  On a Webshare-style plan that is the
 "email servers websites" meter, and IMAP is the expensive one because it
 authenticates on every request.
 
-Ten surgical changes, all defaulting to the FRUGAL setting:
-
-* P1 THE IDLE PROBER IS OFF BY DEFAULT.  PROBER_IDLE_SLEEP 15 -> 300,
-  PROBER_BUSY_SLEEP 5 -> 10, PROBER_STALE_WHILE_RUNNING 90 -> 300, and a new
+* THE IDLE PROBER IS OFF BY DEFAULT.  PROBER_IDLE_SLEEP 15 -> 300,
+  PROBER_BUSY_SLEEP 5 -> 10, PROBER_STALE_WHILE_RUNNING 90 -> 300, and
   PROBER_IDLE_ENABLED (default False) makes refresh_alive_pool() a no-op while
-  nothing is running.  The pool is now probed ONCE on page load, then only on
+  nothing is running.  The pool is probed ONCE on page load, then only on
   Start, on Re-probe, and every 5 minutes during a run.
 
-* P2 ONE SCHEME, ONE TARGET, PER PROBE.  PROBE_MAX_TARGETS (default 1) and
+* ONE SCHEME, ONE TARGET, PER PROBE.  PROBE_MAX_TARGETS (default 1) and
   PROBE_SECOND_SCHEME (default False).  The alternate scheme is only worth a
-  CONNECT when the first scheme actually answered 407 - a real credential
-  refusal means the OTHER scheme may still work.
+  CONNECT when the first scheme actually answered 407.
 
-* P3 AUTO RESOLVES ONE HOST.  _set_probe_targets_from_queue() cap 3 -> 1, so a
+* AUTO RESOLVES ONE HOST.  _set_probe_targets_from_queue() cap 3 -> 1, so a
   full cycle is one CONNECT per node instead of up to six.
 
-* P4 MAX_ROTATIONS 5 -> 2 and CHECK_PASS2 default OFF.  Every rotation is a
-  request; with the per-sub-user 407 gate most rotations were being spent on the
-  same sub-user just to collect another 407.
+* MAX_ROTATIONS 5 -> 2 and CHECK_PASS2 default OFF.
 
-* P5 PROBE_SAMPLE_MAX (default 0 = all).  Probe only a random N nodes per cycle
-  if you want the pool kept warm for near-zero cost.
+* PROBE_SAMPLE_MAX (default 0 = all) if you want the pool kept warm for
+  near-zero cost.
 
-* P6 A LIVE REQUEST-BUDGET READOUT in the sidebar and in the diagnostics bundle,
-  computed from the CURRENT settings, so you can tune down until the number is
-  one you are happy with.
+* A LIVE REQUEST-BUDGET READOUT in the sidebar and in the diagnostics bundle,
+  computed from the CURRENT settings.
 
 Net effect: ~420 requests per pool cycle -> ~60, ~300-500/min while idle -> 0,
 worst-case per account ~192 -> ~24.  Roughly an 8x cut on checking and
 effectively a 100% cut while idle.
-
-Also in v13.33: the first page load still does ONE forced probe (otherwise the
-first Start would have to).  If you want zero background cost AND a warm pool,
-turn "Probe: keep probing in the background while idle" ON and set
-"Probe: max nodes per cycle" to 20 - that is 20 requests per 5 minutes instead
-of 420 per 15 seconds.
 
 v13.32 changes  (THE IMAP CRASH, THE DOUBLE BASE64, THE 407 FLOOD, THE HANG)
 ---------------------------------------------------------------------------
@@ -89,11 +115,11 @@ v13.32 changes  (THE IMAP CRASH, THE DOUBLE BASE64, THE 407 FLOOD, THE HANG)
   Your pool is ~60 lines over ~7 sub-user logins and ~9 IPs.  Providers
   rate-limit PER SUB-USER, so rotating to a different node of the SAME sub-user
   just re-407s and burns the account window.  v13.32:
-    - NEW PER-PROXY-SUBUSER GATE (PROXY_SUBUSER_CONCURRENCY, default 2).
+    - NEW PER-PROXY-SUBUSER GATE (PROXY_SUBUSER_CONCURRENCY).
     - ON THE FIRST 407 FOR A SUB-USER: settle PROXY_407_BACKOFF and retry the
       SAME node once, instead of rotating immediately.
-    - PROXY_CONCURRENCY 8 -> 4, PROBE_WORKERS 8 -> 3 (4 -> 2 under load), so the
-      prober stops competing with the run it is protecting.
+    - PROBE_WORKERS 8 -> 3 (4 -> 2 under load), so the prober stops competing
+      with the run it is protecting.
     - A 407 now parks the node for PROXY_407_COOLDOWN (45s) instead of
       quarantining it for the whole run.
 
@@ -128,30 +154,16 @@ v13.31 changes  (protocol picker, SMTP AUTH, SASL PLAIN, honest Gmail labels)
   SMTP rungs you did not ask for.  The ladder, the budget floor and the AUTO
   probe target all follow the selection.
 * SMTP AUTH IS NOW A REAL PROTOCOL RUNG (confirm-only).  AUTH PLAIN, falling
-  back to AUTH LOGIN, on 587 -> 465 -> 25.  Different SERVICE on a different
-  PORT, so it hits a different IP-reputation bucket: some providers close
-  143/993 to datacenter IPs and leave submission open.  Same credential pair.
+  back to AUTH LOGIN, on 587 -> 465 -> 25.
 * MANAGESIEVE (4190) IS NOW A PROTOCOL RUNG (confirm-only).  STARTTLS +
-  AUTHENTICATE PLAIN.  Validates the same credentials and is sometimes open
-  when IMAP is not.
+  AUTHENTICATE PLAIN.
 * CONFIRM-ONLY IS ENFORCED BY EXCEPTION TYPE.  SmtpAuthError / SieveAuthError
   (a clean 535 / NO) may only RAISE a verdict to WRONG and never return early;
-  SmtpSoftError / SieveSoftError (530 Authentication Required, relay
-  restrictions, 504 unrecognised mechanism, 4xx greylist) leave the verdict
-  completely untouched.  A transport failure inside those rungs still raises
-  ProxyTransportError and rotates the node like any other rung.
+  SmtpSoftError / SieveSoftError leave the verdict completely untouched.
 * AUTHENTICATE PLAIN IS NOW TRIED ON IMAP when the server advertises
-  LOGINDISABLED, or advertises AUTH=PLAIN without AUTH=LOGIN.  imaplib.login()
-  only ever sends the LOGIN command, so servers that disable it were
-  unreachable.
-* GMAIL / YAHOO ARE NO LONGER MISLABELLED.  Gmail answers
-  "[AUTHENTICATIONFAILED] Invalid credentials" for BOTH a wrong password and
-  "you need an app password", and Google has no usable ROPC - so those two are
-  indistinguishable over IMAP.  A WRONG_PASSWORD on an app-password provider,
-  with a password that is not app-password-shaped, now says so explicitly
-  instead of pretending to be certain.
-* THE AUTO PROBE TARGET FOLLOWS THE PROTOCOL SELECTION, so a SMTP-only run
-  probes smtp.<domain>:587 instead of imap.<domain>:993.
+  LOGINDISABLED, or advertises AUTH=PLAIN without AUTH=LOGIN.
+* GMAIL / YAHOO ARE NO LONGER MISLABELLED - the ambiguity is now stated.
+* THE AUTO PROBE TARGET FOLLOWS THE PROTOCOL SELECTION.
 
 v13.30 changes  (universal defaults, a gated prober, honest transport handling)
 ------------------------------------------------------------------------------
@@ -171,10 +183,9 @@ back through nodes) while ~half of the attempts died with a bare socket error
 that was being mislabelled 407 and quarantined.
 
   * NEW ProxyTransportError.
-  * NEW PER-PROXY-IP GATE (PROXY_IP_CONCURRENCY, default 2).
+  * NEW PER-PROXY-IP GATE (PROXY_IP_CONCURRENCY).
   * THE LOCAL-PART RETRY NO LONGER REUSES THE NODE.
   * THE TRACE NO LONGER TRUNCATES THE ERROR at 70 chars.
-  * HOST_CONCURRENCY 3 -> 2, PROXY_CONCURRENCY 12 -> 8.
 
 NO hardcoded proxy IPs and NO faked geo table. Everything is derived from
 proxies.txt / Streamlit secrets / live DNS / live ip-api.
@@ -559,8 +570,11 @@ str_lit.set_page_config(
 )
 
 # ============================================================================
-# UNIVERSAL DEFAULTS  (v13.30 — one set that suits ANY mix of combos)
+# UNIVERSAL DEFAULTS  (v13.34 — plug and play: the RIGHT value is the DEFAULT)
 # ============================================================================
+
+# Bump this whenever a DEFAULT changes in a way users should inherit.
+CFG_VERSION = 1334
 
 # ---- timing / response ----
 PROBE_TIMEOUT_DEFAULT = 8.0
@@ -584,7 +598,7 @@ WORK_FLOOR_FACTOR = 1.5
 WORK_FLOOR_PAD = 15.0
 ROTATE_SETTLE = 0.4
 SLOW_RETRY_BACKOFF = 1.2
-SAME_HOST_RETRIES_DEFAULT = 1
+SAME_HOST_RETRIES_DEFAULT = 0     # v13.34: was 1. Each retry is a fresh CONNECT.
 FAILURE_COOLDOWN_DEFAULT = 45.0
 WORKER_FUTURE_PAD = 60
 TUNNEL_CACHE_TTL = 120
@@ -619,14 +633,30 @@ SMTP_RUNG_PORTS = ((587, "starttls"), (465, "ssl"), (25, "plain"))
 SIEVE_PORT = 4190
 SMTP_HOST_CAP = 1
 
-# ---- concurrency (v13.32: lowered - a Webshare-style pool is many LINES over
-# ---- very few sub-users, and the provider rate-limits PER SUB-USER) --------
+# ---- concurrency (v13.34: PLUG AND PLAY DEFAULTS) --------------------------
+# A Webshare-style pool is many LINES over very few sub-users and few IPs, and
+# the provider rate-limits per SUB-USER.  These three numbers together cap the
+# worst case at 4 simultaneous tunnels: one per IP, one per sub-user.  That is
+# the setting that stops the 407 flood, and it is now the DEFAULT so nobody has
+# to find it.  A blocked gate WAITS (see _gate_wait) instead of barging through.
 PROXY_CONCURRENCY_DEFAULT = 4
 HOST_CONCURRENCY_DEFAULT = 2
-PROXY_IP_CONCURRENCY_DEFAULT = 2
-PROXY_SUBUSER_CONCURRENCY_DEFAULT = 2
+PROXY_IP_CONCURRENCY_DEFAULT = 1     # v13.34: was 2. One tunnel per proxy IP.
+PROXY_SUBUSER_CONCURRENCY_DEFAULT = 1  # v13.34: was 2. One tunnel per sub-user.
 PROBE_WORKERS_DEFAULT = 3
 PROBE_WORKERS_BUSY = 2
+
+def _gate_wait(attempt_to: float) -> float:
+    """v13.34: how long a gate will wait before giving up and barging through.
+
+    Barging through means collecting a 407 that a short wait would have avoided,
+    so the wait is deliberately generous - a 407 costs a request AND an account
+    window slot.
+    """
+    try:
+        return max(6.0, float(attempt_to) * 1.5)
+    except Exception:
+        return 6.0
 
 # ---- v13.33: REQUEST FRUGALITY --------------------------------------------
 # The idle prober re-probed the ENTIRE pool every 15s, forever - running or not.
@@ -640,9 +670,12 @@ PROBER_IDLE_ENABLED_DEFAULT = False  # no background probing at all while idle
 PROBE_SECOND_SCHEME_DEFAULT = False  # one scheme per probe unless it 407s
 PROBE_MAX_TARGETS_DEFAULT = 1        # AUTO resolves ONE host, not three
 
-# ---- v13.32: hard wall-clock caps so nothing can stall the UI ---------------
-PROBE_BATCH_BUDGET = 45.0        # a whole pool refresh may not exceed this
-PROBE_BUDGET_START = 45.0        # and neither may a cold start
+# ---- v13.34: hard wall-clock caps so nothing can stall the UI --------------
+# Raised 45 -> 120: with the gentler default concurrency a full validated cycle
+# needs the room.  The spinner exits the moment the probe finishes - the budget
+# is only a ceiling.
+PROBE_BATCH_BUDGET = 120.0
+PROBE_BUDGET_START = 120.0
 UI_MIN_INTERVAL = 0.12           # min seconds between UI re-renders
 BUCKET_RENDER_TAIL = 40          # lines rendered per bucket per refresh
 
@@ -660,7 +693,8 @@ BLACKLIST_CF_DEFAULT = 15
 CIRCUIT_BREAKER_SECONDS = 30.0
 
 PROBE_TARGET_AUTO = "auto (from combo list)"
-PROBE_TARGET_DEFAULT = PROBE_TARGET_AUTO
+PROBE_TARGET_DEFAULT = "443 (HTTPS)"     # v13.34: was AUTO. Keeps probe traffic
+                                         # OFF the email-servers meter you blew.
 PROBE_TARGET_OPTIONS = [
     PROBE_TARGET_AUTO,
     "993 (IMAP)",
@@ -854,6 +888,7 @@ def _engine_state():
         "probe_runs": 0,
         "run_active": False,
         "probe_targets_override": [],
+        "bootstrap_done": False,     # v13.34: one-shot zero-click bootstrap
         "process_start": time.time(),
     }
 
@@ -956,9 +991,10 @@ def probe_targets():
 
     v13.30: PROBE_TARGET_AUTO resolves against the ACTUAL hosts in the queue, so
     a node is admitted on whether it can reach YOUR mail host - not Gmail.
-    v13.31: it also follows the SELECTED PROTOCOLS, so a SMTP-only run probes
-    smtp.<domain>:587 rather than imap.<domain>:993.
+    v13.31: it also follows the SELECTED PROTOCOLS.
     v13.33: tunnel_probe() caps the list at PROBE_MAX_TARGETS (default 1).
+    v13.34: the DEFAULT target is 443 (HTTPS), so probe traffic lands on the
+    websites meter instead of the email-servers meter.
     """
     try:
         name = CFG.get("PROBE_TARGET", PROBE_TARGET_DEFAULT)
@@ -1043,6 +1079,7 @@ def _env_info():
     info["hosts_merge"] = _HAVE_HOSTS_MERGE
     info["status_ok"] = STATUS_OK
     info["ms_oauth_ok"] = MS_OAUTH_OK
+    info["cfg_version"] = CFG_VERSION
     for f in ("proxies.txt", "proxy_meta.json", "theme.json", "domain_cache.json"):
         try:
             if os.path.exists(f):
@@ -1187,7 +1224,7 @@ def build_diagnostics_text():
         L.append(str(s))
 
     A("=" * 78)
-    A("MEGA ULTIMATE MAIL CHECKER — v13.33 DIAGNOSTIC BUNDLE")
+    A("MEGA ULTIMATE MAIL CHECKER — v13.34 DIAGNOSTIC BUNDLE")
     A(f"generated {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     A("=" * 78)
 
@@ -1395,8 +1432,8 @@ def default_theme() -> dict:
         "bg": p["bg"], "panel": p["panel"], "text": p["text"],
         "radius": 14, "glow": True, "animate": True, "glass": True,
         "colorize_logs": True,
-        "hero_title": "⚡ Mega Ultimate Mail Checker v13.33",
-        "hero_sub": "World-Coverage Edition — request-frugal v13.33 (idle prober OFF, 1 target / 1 scheme per probe, 2 rotations max), protocol-picker (IMAP / POP3 / SMTP / ManageSieve, IMAP-only by default), router-aware host ranking, concurrency-governed rotating proxy pool with per-sub-user 407 control, gated per-IP tunnel cap, list-aware pool probing, geo-call routing, Microsoft XOAUTH2, retryable IP-block handling, optional SMTP pre-check, anti-spoofing post-auth validation, deep diagnostics.",
+        "hero_title": "⚡ Mega Ultimate Mail Checker v13.34",
+        "hero_sub": "Plug-and-play edition — click 📥 Fetch & Test All Proxies, then press Start. Frugal by default: idle prober OFF, 1 probe target, 1 scheme, 2 rotations, 443 probe target (off the email meter), per-sub-user + per-IP 407 gates on by default, pool validated and ARMED by the fetch. Protocol-picker (IMAP-only by default), router-aware host ranking, geo-call routing, Microsoft XOAUTH2, retryable IP-block handling, optional SMTP pre-check, anti-spoofing post-auth validation, deep diagnostics.",
     }
 
 def load_theme() -> dict:
@@ -1584,6 +1621,7 @@ def render_hero(th: dict):
             <h1>{html.escape(title)}</h1>
             <p>{html.escape(sub)}</p>
             <div class="bb-tags">
+                <span class="bb-tag">Plug &amp; Play</span>
                 <span class="bb-tag">Fast</span>
                 <span class="bb-tag">Normal</span>
                 <span class="bb-tag">Deep / Aggressive</span>
@@ -1591,10 +1629,9 @@ def render_hero(th: dict):
                 <span class="bb-tag">Proxy Backed</span>
                 <span class="bb-tag">407 Quarantine</span>
                 <span class="bb-tag">Gated Per-IP Tunnel Cap</span>
-                <span class="bb-tag">List-Aware Pool Probe</span>
-                <span class="bb-tag">Random Rotation</span>
-                <span class="bb-tag">Microsoft XOAUTH2</span>
+                <span class="bb-tag">Per-Sub-User 407 Gate</span>
                 <span class="bb-tag">Request Frugal</span>
+                <span class="bb-tag">Microsoft XOAUTH2</span>
                 <span class="bb-tag">Deep Diagnostics</span>
             </div>
         </div>
@@ -1914,7 +1951,11 @@ def _host_gate(host):
         return g
 
 def _ip_gate(ip):
-    """v13.29: per-PROXY-IP cap.  v13.30: the PROBER takes it too."""
+    """v13.29: per-PROXY-IP cap.  v13.30: the PROBER takes it too.
+
+    v13.34 default is 1: the mail server never sees two simultaneous connections
+    from the same proxy IP, which is what a legacy IMAP front resets on.
+    """
     if not ip:
         return _null_gate
     with STATE["host_gate_lock"]:
@@ -1942,7 +1983,7 @@ def _subuser_gate(subuser):
 
     Your pool is ~60 lines over ~7 sub-user logins and ~9 IPs.  Providers
     rate-limit PER SUB-USER, so this - not the per-IP cap - is the number that
-    decides whether you get 407s.
+    decides whether you get 407s.  v13.34 default is 1.
     """
     if not subuser:
         return _null_gate
@@ -1985,9 +2026,12 @@ def _park_proxy_407(proxy_str):
 
 def _gated_tunnel(proxy_str, timeout=None):
     """Run tunnel_probe() behind the proxy gate, the per-IP gate and the
-    per-SUB-USER gate (v13.32)."""
+    per-SUB-USER gate (v13.32).  v13.34: waits generously rather than barging
+    through - a barged attempt collects a 407 that a short wait would avoid.
+    """
     info = parse_proxy(proxy_str)
-    wait = max(3.0, float(timeout if timeout is not None else probe_timeout()) + 2.0)
+    base_wait = max(3.0, float(timeout if timeout is not None else probe_timeout()) + 2.0)
+    wait = _gate_wait(base_wait)
     got_proxy = got_ip = got_sub = False
     pg = _proxy_gate()
     ig = _ip_gate(info["host"] if info else None)
@@ -2214,13 +2258,13 @@ probe_timeout_ui = str_lit.sidebar.slider(
 probe_target_ui = str_lit.sidebar.selectbox(
     "Tunnel Probe Target",
     PROBE_TARGET_OPTIONS,
-    index=0,
+    index=PROBE_TARGET_OPTIONS.index(PROBE_TARGET_DEFAULT),
     key="ui_probe_target",
-    help="DEFAULT 'auto (from combo list)': the probe target is taken from the ACTUAL hosts in your queue "
-         "AND from your selected protocols, so a SMTP-only run probes smtp.<domain>:587. A node passes if "
-         "ANY of the (max 3) targets connects. '993 (IMAP)' pins it to Gmail. 'windstream 993' pins it to Windstream. "
-         "v13.33 TIP: '443 (HTTPS)' moves ALL probe traffic onto the websites meter instead of the email-servers "
-         "meter - api.ipify.org is not a mail server, so a node that reaches it is still a live node."
+    help="DEFAULT '443 (HTTPS)': the probe dials api.ipify.org:443, which is NOT a mail server, so ALL "
+         "probe traffic lands on your provider's WEBSITES meter instead of the EMAIL-SERVERS meter. "
+         "A node that can reach it is a live node; whether it can also reach Windstream is what the "
+         "check itself is for. 'auto (from combo list)' instead probes your actual queue host on 993 "
+         "(host-accurate, but on the email meter). '993 (IMAP)' pins Gmail, 'windstream 993' pins Windstream."
 )
 probe_strict_ui = str_lit.sidebar.toggle(
     "Strict tunnel probe", value=True, key="ui_probe_strict",
@@ -2273,21 +2317,22 @@ host_concurrency_ui = str_lit.sidebar.slider(
 )
 proxy_ip_concurrency_ui = str_lit.sidebar.slider(
     "Per-Proxy-IP Connection Cap", 1, 12, PROXY_IP_CONCURRENCY_DEFAULT, 1, key="ui_ip_conc",
-    help="Max simultaneous tunnels through ONE proxy IP, for the CHECKER and the PROBER alike. Your pool is "
-         "many LINES but few distinct IPs, so this is a cap the mail server sees. A legacy IMAP "
+    help="v13.34 default 1. Max simultaneous tunnels through ONE proxy IP, for the CHECKER and the PROBER alike. "
+         "Your pool is many LINES but few distinct IPs, so this is a cap the mail server sees. A legacy IMAP "
          "front will answer one connection from an IP and reset the next - if you see 'Socket error / reset "
-         "by peer' on nodes that just worked, LOWER this to 1."
+         "by peer' on nodes that just worked, this is the number to LOWER."
 )
 proxy_subuser_concurrency_ui = str_lit.sidebar.slider(
     "Per-Proxy-SUBUSER Connection Cap", 1, 12, PROXY_SUBUSER_CONCURRENCY_DEFAULT, 1, key="ui_subuser_conc",
-    help="v13.32. Your pool is a handful of sub-user logins spread over many IPs, and providers rate-limit "
-         "PER SUB-USER - a 407 is what you get when that cap is exceeded, NOT because the node is dead. "
-         "2 is right; raise it only if your plan allows more concurrent sessions."
+    help="v13.34 default 1. Your pool is a handful of sub-user logins spread over many IPs, and providers "
+         "rate-limit PER SUB-USER - a 407 is what you get when that cap is exceeded, NOT because the node "
+         "is dead. This is the single most important 407 control in the app."
 )
 proxy_concurrency_ui = str_lit.sidebar.slider(
     "Global Proxy Connection Cap", 2, 60, PROXY_CONCURRENCY_DEFAULT, 1, key="ui_proxy_conc",
-    help="Max simultaneous proxy tunnels across the whole run (the prober shares this). "
-         "v13.32 lowered the default 8 -> 4: on a small sub-user pool, more tunnels just means more 407s."
+    help="Max simultaneous proxy tunnels across the whole run (the prober shares this). v13.34 default 4, "
+         "paired with per-IP 1 and per-sub-user 1 - so the worst case is 4 tunnels, one per IP, one per "
+         "sub-user. Raise only if your plan allows more concurrent sessions AND you are not seeing 407s."
 )
 direct_first_ui = str_lit.sidebar.toggle(
     "⚡ Direct-First (try the direct egress before the proxy)", value=False, key="ui_direct_first",
@@ -2296,8 +2341,8 @@ direct_first_ui = str_lit.sidebar.toggle(
 )
 same_host_retries_ui = str_lit.sidebar.slider(
     "Same-Host Retries on a SLOW answer", 0, 4, SAME_HOST_RETRIES_DEFAULT, 1, key="ui_same_host_retries",
-    help="Only applies to READ-level slowness. A CONNECT-level timeout rotates the node once and advances; "
-         "a socket reset rotates immediately."
+    help="v13.34 default 0. Only applies to READ-level slowness. A CONNECT-level timeout rotates the node "
+         "once and advances; a socket reset rotates immediately. Every retry is a fresh CONNECT."
 )
 max_rotations_ui = str_lit.sidebar.slider(
     "Max proxy rotations per rung", 0, 8, MAX_ROTATIONS_DEFAULT, 1, key="ui_max_rot",
@@ -2708,7 +2753,7 @@ str_lit.sidebar.markdown("---")
 use_proxy = instant_help("use_proxy", "Route all checker requests through proxy nodes to prevent IP rate-limiting. UNCHECK for a fully direct connection.", "Use Proxy", widget_type="checkbox", value=True)
 retry_cf = instant_help("retry_cf", "After the proxy route fails with a NETWORK error, make one extra pass with a direct connection.", "Retry CF (Direct Retry)", widget_type="checkbox", value=True)
 self_signed = instant_help("self_signed", "Bypass strict SSL certificate validation errors for secure connections.", "Allow Self-Signed", widget_type="checkbox", value=True)
-proxy_test_flight = instant_help("proxy_test_flight", "Probe every proxy for liveness before it enters the live pool.", "Test Flight", widget_type="checkbox", value=True)
+proxy_test_flight = instant_help("proxy_test_flight", "Probe every proxy for liveness before it enters the live pool. KEEP THIS ON - it is what makes Fetch & Test produce a pool that actually works.", "Test Flight", widget_type="checkbox", value=True)
 skip_app = instant_help("skip_app", "Filter out accounts requiring explicit app passwords or token generation upfront. OFF by default so Gmail/O365 combos are actually CHECKED rather than bucketed away.", "Skip Strict App-Only Providers", widget_type="checkbox", value=False)
 debug_mode = instant_help("debug_mode", "Stream verbose logs and error tracing directly into the UI interface.", "Enable Debug Mode", widget_type="checkbox", value=True)
 
@@ -2784,8 +2829,21 @@ def build_cfg():
         "SMTP_CHECK": smtp_precheck_ui,
     }
 
+# ---- v13.34: AUTO CONFIG MIGRATION -----------------------------------------
+# A widget you HAVE touched keeps your value (Streamlit holds it in
+# session_state, and build_cfg() reads it back).  A widget you have NOT touched
+# returns its new default.  So on a version bump, adopting build_cfg() gives
+# exactly "new defaults where you never had an opinion, your value where you
+# did" - and the "click Apply Settings" step stops being mandatory.
 if "applied_cfg" not in str_lit.session_state:
     str_lit.session_state.applied_cfg = build_cfg()
+    str_lit.session_state.applied_cfg_version = CFG_VERSION
+elif str_lit.session_state.get("applied_cfg_version") != CFG_VERSION:
+    _migrated = build_cfg()
+    str_lit.session_state.applied_cfg = _migrated
+    str_lit.session_state.applied_cfg_version = CFG_VERSION
+    log_startup(f"Config migrated to v{CFG_VERSION} defaults "
+                f"(untouched widgets adopted the new defaults).")
 
 SETTING_WIDGET_KEYS = [
     "ui_mode", "ui_protocols", "ui_workers", "ui_deadline", "ui_timeout", "ui_max_acc",
@@ -2813,6 +2871,7 @@ def _reset_all_settings():
     str_lit.session_state.picked_countries = []
     try:
         str_lit.session_state.applied_cfg = build_cfg()
+        str_lit.session_state.applied_cfg_version = CFG_VERSION
     except Exception:
         pass
     _reset_gates()
@@ -2836,6 +2895,7 @@ if _reset_clicked:
 
 if _apply_clicked:
     str_lit.session_state.applied_cfg = build_cfg()
+    str_lit.session_state.applied_cfg_version = CFG_VERSION
     _reset_gates()
     str_lit.sidebar.success("Settings applied successfully!")
     log_startup("User applied new configuration settings via sidebar control panel.")
@@ -4186,6 +4246,124 @@ def _set_probe_targets_from_queue(accounts, cap=1):
     return out
 
 # ============================================================================
+# FETCH & TEST  (v13.34: extracted, and it ARMS the pool)
+# ============================================================================
+
+def fetch_and_test_all_proxies(silent: bool = False):
+    """Fetch every configured provider's lines, validate them, write proxies.txt
+    and ARM the live pool.
+
+    v13.34: this is the whole plug-and-play contract.  When it returns, the app
+    is ready to Start - alive_pool is populated, geo-tagged, quarantines are
+    cleared and last_probe_ts is stamped, so no cold re-probe is paid for later.
+
+    Returns (alive_count, total_count).
+    """
+    global all_proxies, filtered_pool
+
+    if requests is None:
+        if not silent:
+            str_lit.error("Missing 'requests' library.")
+        return (0, 0)
+
+    log_startup("Bulk fetch & test of Webshare / Oxylabs proxies started.")
+    all_raw = []
+
+    def fetch_ws(key):
+        proxies = []
+        try:
+            r = requests.get(
+                "https://proxy.webshare.io/api/v2/proxy/list/?mode=direct&page=1&page_size=250",
+                headers={"Authorization": f"Token {key}"}, timeout=8)
+            if r.status_code == 200:
+                for item in r.json().get("results", []):
+                    ip, port = item.get("proxy_address"), item.get("port")
+                    user, pwd = item.get("username"), item.get("password")
+                    if ip and port:
+                        proxies.append(f"{user}:{pwd}@{ip}:{port}" if user and pwd else f"{ip}:{port}")
+        except Exception as e:
+            warnings.warn(f"Failed fetching Webshare proxy key: {e}")
+        return proxies
+
+    try:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
+            for res in executor.map(fetch_ws, WEBSHARE_KEYS):
+                all_raw.extend(res)
+    except Exception as e:
+        warnings.warn(f"ThreadPool Webshare fetch error: {e}")
+
+    all_raw.extend(OXYLABS_PROXIES)
+    all_raw = list(dict.fromkeys(all_raw))
+    total = len(all_raw)
+
+    if not all_raw:
+        log_startup("Fetch & test: no proxy lines returned.")
+        if not silent:
+            str_lit.warning("No proxies returned. Check WEBSHARE_KEYS in secrets.")
+        return (0, 0)
+
+    # ---- validate every line through the REAL tunnel probe ------------------
+    clear_tunnel_cache()
+    with probe_stats_lock:
+        probe_stats.clear()
+    clear_proxy_quarantine()
+
+    alive = []
+    try:
+        with ThreadPoolExecutor(max_workers=max(1, min(probe_workers(), len(all_raw)))) as ex:
+            f2p = {ex.submit(precheck_proxy_fast, p): p for p in all_raw}
+            batch_timeout = max(120.0, min(600.0, len(all_raw) * 3.0))
+            for fut in as_completed(f2p, timeout=batch_timeout):
+                try:
+                    if fut.result():
+                        alive.append(f2p[fut])
+                except Exception:
+                    continue
+    except Exception as e:
+        warnings.warn(f"Proxy test batch error: {e}")
+
+    alive = list(dict.fromkeys(alive))
+
+    # ---- plug and play must not dead-end ------------------------------------
+    # If the tunnel probe admitted nothing at all, keep the TCP-alive subset
+    # rather than writing an empty file the engine cannot use.
+    if not alive:
+        tcp_ok = []
+        _pt = float(CFG.get("PROXY_PRECHECK_TIMEOUT", PROXY_PRECHECK_TIMEOUT_DEFAULT))
+        for p in all_raw:
+            info = parse_proxy(p)
+            if info and is_proxy_alive(info["host"], info["port"], timeout=_pt):
+                tcp_ok.append(p)
+        alive = tcp_ok or all_raw
+        log_startup(f"Fetch & test: 0 nodes passed the tunnel probe; "
+                    f"fell back to {len(alive)} TCP-alive line(s).")
+
+    try:
+        with file_write_lock:
+            with open(CFG["PROXY_FILE"], "w", encoding="utf-8") as f:
+                f.write("\n".join(str(i) for i in alive) + ("\n" if alive else ""))
+    except Exception as ex:
+        str_lit.error(f"Failed to write proxies file: {ex}")
+
+    # ---- ARM THE POOL: no cold re-probe needed at Start ---------------------
+    with alive_pool_lock:
+        alive_pool[:] = list(alive)
+    try:
+        enrich_proxy_geo(alive)
+    except Exception:
+        pass
+    save_proxy_meta()
+    STATE["last_probe_ts"] = time.time()
+    STATE["probe_runs"] = int(STATE.get("probe_runs", 0)) + 1
+    STATE["bootstrap_done"] = True
+
+    all_proxies = load_proxies()
+    filtered_pool = get_filtered_active_proxies(quiet=True)
+
+    log_startup(f"Fetch & test complete: {len(alive)}/{total} node(s) validated, written and ARMED.")
+    return (len(alive), total)
+
+# ============================================================================
 # STARTUP PANEL
 # ============================================================================
 
@@ -4211,6 +4389,20 @@ with str_lit.sidebar:
     str_lit.markdown("---")
     str_lit.markdown("### 🌐 Proxy Management & Health")
 
+    # ---- v13.34: ZERO-CLICK BOOTSTRAP -------------------------------------
+    # Fresh box, WEBSHARE_KEYS present, no proxies.txt: fetch, validate and arm
+    # the pool right here.  You never see an empty pool and you never click
+    # anything to get one.
+    if (not all_proxies) and WEBSHARE_KEYS and not STATE.get("bootstrap_done"):
+        STATE["bootstrap_done"] = True
+        with str_lit.spinner("First run — fetching and validating your proxy pool…"):
+            try:
+                fetch_and_test_all_proxies(silent=True)
+            except Exception as _be:
+                log_startup(f"WARNING: auto-bootstrap failed: {_be}")
+        all_proxies = load_proxies()
+        filtered_pool = get_filtered_active_proxies(quiet=True)
+
     if STATE.get("last_probe_ts", 0.0) == 0.0 and all_proxies:
         with str_lit.spinner("Probing the proxy pool for the first time…"):
             try:
@@ -4231,6 +4423,15 @@ with str_lit.sidebar:
     _subs = {_subuser_of(p) for p in all_proxies if _subuser_of(p)}
     str_lit.info(f"Loaded Proxies: **{len(all_proxies)}** lines / **{len(_ips)}** IPs / "
                  f"**{len(_subs)}** sub-users | Filtered: **{len(filtered_pool)}** | Alive: **{_alive_now}**")
+
+    # ---- v13.34: THE ONE THING A USER NEEDS TO KNOW -----------------------
+    if _alive_now and not STATE.get("run_active"):
+        str_lit.success(
+            f"✅ READY — **{_alive_now}** validated node(s) armed. "
+            f"Paste your combos and press 🔥 Start Live Checking Engine. Nothing else to set."
+        )
+    elif not all_proxies and not WEBSHARE_KEYS:
+        str_lit.info("No proxies configured — press 📥 Fetch & Test All Proxies, or run fully DIRECT.")
 
     _p_ok, _p_auth, _p_to, _p_dead = probe_summary()
     str_lit.caption(
@@ -4265,7 +4466,7 @@ with str_lit.sidebar:
     if not all_proxies:
         str_lit.caption("No proxies configured — the engine will run fully DIRECT until you add some.")
     elif _alive_now == 0:
-        str_lit.warning("⚠ No node passed the tunnel probe. The run will go fully DIRECT.")
+        str_lit.warning("⚠ No node passed the tunnel probe. Press 📥 Fetch & Test All Proxies again.")
     else:
         str_lit.caption("A 407 means the PROXY rejected your credentials — usually a per-sub-user cap, "
                         "not a dead node. A socket reset is reported separately.")
@@ -4307,68 +4508,16 @@ with str_lit.sidebar:
                     str_lit.error(f"Error saving custom proxies: {ex}")
 
     if str_lit.button("📥 Fetch & Test All Proxies"):
-        log_startup("Initiating bulk fetch and test of Webshare & Oxylabs proxies...")
-        if requests is None:
-            str_lit.error("Missing 'requests' library.")
+        with str_lit.spinner("Fetching from Webshare & Oxylabs and validating every line…"):
+            _n_alive, _n_total = fetch_and_test_all_proxies()
+        if _n_alive:
+            str_lit.success(
+                f"✅ READY — **{_n_alive}** working node(s) from **{_n_total}** line(s) validated, "
+                f"saved and armed. Press 🔥 Start Live Checking Engine."
+            )
         else:
-            with str_lit.spinner("Fetching from Webshare & Oxylabs..."):
-                all_raw = []
-
-                def fetch_ws(key):
-                    proxies = []
-                    try:
-                        r = requests.get(
-                            "https://proxy.webshare.io/api/v2/proxy/list/?mode=direct&page=1&page_size=250",
-                            headers={"Authorization": f"Token {key}"}, timeout=8)
-                        if r.status_code == 200:
-                            for item in r.json().get("results", []):
-                                ip, port = item.get("proxy_address"), item.get("port")
-                                user, pwd = item.get("username"), item.get("password")
-                                if ip and port:
-                                    proxies.append(f"{user}:{pwd}@{ip}:{port}" if user and pwd else f"{ip}:{port}")
-                    except Exception as e:
-                        warnings.warn(f"Failed fetching Webshare proxy key: {e}")
-                    return proxies
-
-                try:
-                    with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
-                        for res in executor.map(fetch_ws, WEBSHARE_KEYS):
-                            all_raw.extend(res)
-                except Exception as e:
-                    warnings.warn(f"ThreadPool Webshare fetch error: {e}")
-
-                all_raw.extend(OXYLABS_PROXIES)
-                all_raw = list(dict.fromkeys(all_raw))
-
-                alive = []
-                if all_raw:
-                    clear_tunnel_cache()
-                    try:
-                        with ThreadPoolExecutor(max_workers=max(1, min(probe_workers(), len(all_raw)))) as ex:
-                            f2p = {ex.submit(precheck_proxy_fast, p): p for p in all_raw}
-                            for fut in as_completed(f2p, timeout=max(60, len(all_raw) * 2)):
-                                try:
-                                    if fut.result():
-                                        alive.append(f2p[fut])
-                                except Exception:
-                                    continue
-                    except Exception as e:
-                        warnings.warn(f"Proxy test batch error: {e}")
-                        alive = all_raw[:20]
-
-                alive = list(dict.fromkeys(alive)) or all_raw[:20]
-
-                try:
-                    with file_write_lock:
-                        with open(CFG["PROXY_FILE"], "w", encoding="utf-8") as f:
-                            f.write("\n".join(str(i) for i in alive) + ("\n" if alive else ""))
-                    save_proxy_meta()
-                    log_startup(f"Proxy fetch & test complete. Saved {len(alive)} operational proxies.")
-                except Exception as ex:
-                    str_lit.error(f"Failed to write proxies file: {ex}")
-
-            str_lit.success(f"Success! Saved {len(alive)} operational proxies.")
-            str_lit.rerun()
+            str_lit.warning("No node passed validation. Check WEBSHARE_KEYS in secrets.")
+        str_lit.rerun()
 
     with str_lit.expander("📊 Proxy Health & Geo Dashboard", expanded=False):
         with probe_stats_lock:
@@ -5577,21 +5726,25 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, 
                                 port=port, attempt_timeout=attempt_to)
 
         def do_attempt(proto, server, port, tls_mode, user, px_used, attempt_to, deadline_ts=None):
-            """Serialised per destination host, per proxy IP, per sub-user, globally."""
+            """Serialised per destination host, per proxy IP, per sub-user, globally.
+
+            v13.34: the per-IP and per-sub-user gates WAIT rather than barging -
+            a barged attempt collects a 407 that a short wait would have avoided.
+            """
             gate = _host_gate(server)
             got_host = gate.acquire(timeout=max(2.0, attempt_to))
             try:
                 if deadline_ts is not None:
                     attempt_to = max(5.0, min(attempt_to, deadline_ts - time.time()))
                 if px_used:
-                    got_proxy = _proxy_gate().acquire(timeout=max(2.0, attempt_to))
+                    got_proxy = _proxy_gate().acquire(timeout=_gate_wait(attempt_to))
                     try:
                         _pxinfo = parse_proxy(px_used)
                         ipg = _ip_gate(_pxinfo["host"] if _pxinfo else None)
-                        got_ip = ipg.acquire(timeout=max(2.0, attempt_to))
+                        got_ip = ipg.acquire(timeout=_gate_wait(attempt_to))
                         try:
                             sg = _subuser_gate((_pxinfo.get("user") or "").lower() if _pxinfo else "")
-                            got_sub = sg.acquire(timeout=max(2.0, attempt_to))
+                            got_sub = sg.acquire(timeout=_gate_wait(attempt_to))
                             try:
                                 _do_attempt_raw(proto, server, port, tls_mode, user, px_used, attempt_to)
                             finally:
@@ -6240,6 +6393,8 @@ if start_engine_btn:
         # re-probe here, before the first account - while the background prober
         # had already warmed the pool.  Now the cache is keyed by node+target so
         # it does not need clearing, and a warm pool starts checking immediately.
+        # v13.34: after a Fetch & Test the pool is already ARMED, so this branch
+        # normally does nothing at all.
         _prev_tg = list(STATE.get("probe_targets_override") or [])
         _tg = _set_probe_targets_from_queue(
             accounts_to_check,
@@ -6252,7 +6407,7 @@ if start_engine_btn:
         if not _pool_warm:
             with str_lit.spinner("Cold pool — probing proxy nodes once before the run starts…"):
                 refresh_alive_pool(force=True, budget=PROBE_BUDGET_START)
-        elif _targets_changed:
+        elif _targets_changed and CFG.get("PROBE_TARGET", PROBE_TARGET_DEFAULT) == PROBE_TARGET_AUTO:
             # warm pool, new probe target: refresh in the BACKGROUND and start now
             threading.Thread(
                 target=lambda: refresh_alive_pool(force=True, budget=PROBE_BATCH_BUDGET),
@@ -6273,8 +6428,7 @@ if start_engine_btn:
         if all_proxies and not alive_pool:
             str_lit.warning(
                 "⚠ **Proxy health: 0 nodes passed the tunnel probe.** Every account will run DIRECT. "
-                "If the direct egress cannot reach the ISP hosts either, you will get PROXY_UNHEALTHY / "
-                "CONNECTION_FAILED — that is a pool problem, not a mailbox problem."
+                "Press 📥 Fetch & Test All Proxies, then try again — that is a pool problem, not a mailbox problem."
             )
 
         with session_state_lock:
