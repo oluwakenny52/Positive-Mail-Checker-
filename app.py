@@ -1,9 +1,31 @@
 """
-Mega Ultimate Mail Checker — v13.22
+Mega Ultimate Mail Checker — v13.23
 ===================================
 Complete rewrite. SMTP reachability is an OPT-IN pre-check stage (never inside
 the validator), status classification actually works, and every direct-connection
 line carries the real egress IP / region / country / VPN state.
+
+v13.23 changes  (bookkeeping stops lying about a pool that changed)
+------------------------------------------------------------------
+* FIX — QUARANTINE / STRIKE TABLES ARE NOW PRUNED.  refresh_alive_pool() pruned
+  proxy_meta and probe_stats down to what proxies.txt actually holds, but never
+  touched proxy_quarantine or _proxy_407.  A node dropped from the file (e.g. the
+  two dead Oxylabs entries that Fetch & Test replaced) therefore stayed
+  "quarantined" forever and kept being counted against a pool it was no longer
+  part of.  Both tables are now pruned with the rest.
+* FIX — STRIKE COUNTER IS CAPPED AT THE THRESHOLD.  record_proxy_attempt() kept
+  incrementing _proxy_407 even after quarantine_proxy() had already pulled the
+  node out, so a permanently-dead node drifted to 7 strikes against a threshold
+  of 2.  A node is only counted while it is still in play.
+* FIX — SCHEME PREFERENCE IS LEARNED FROM AUTH FAILURES, NOT JUST SUCCESSES.
+  _remember_scheme() only ran when a tunnel actually opened, so a node that is
+  HTTP-only (its SOCKS5 leg never authenticates) re-paid the dead leg on every
+  single cycle forever.  When exactly one scheme is REJECTED by the proxy (an
+  auth reply) and no scheme succeeds, that scheme is now remembered so it is
+  tried first next time.
+* _is_proxy_auth_fail() now also matches a SOCKS5 auth rejection, so a proxy
+  refusing SOCKS creds is classified (and quarantined) the same way an HTTP 407
+  is, instead of being blamed on the mail host.
 
 v13.22 changes  (a diagnostic bundle you can actually paste)
 -----------------------------------------------------------
@@ -454,14 +476,16 @@ str_lit.set_page_config(
 )
 
 # ============================================================================
-# PROXY-LAYER FAILURE CONTRACT  (v13.22)
+# PROXY-LAYER FAILURE CONTRACT  (v13.23)
 # ============================================================================
 # A 407 is a PROXY problem.  The mail host behind it is still untested, so the
 # engine must rotate the proxy and retry the SAME host - never advance the host.
 #
 # v13.20 added an HONEST probe (it reports WHY a node failed instead of a bare
-# False).  v13.21 made the whole proxy layer PERSISTENT.  v13.22 adds a full
-# diagnostic bundle you can copy out and paste back.
+# False).  v13.21 made the whole proxy layer PERSISTENT.  v13.22 added a full
+# diagnostic bundle.  v13.23 makes the bookkeeping honest: quarantine/strike
+# tables are pruned with the rest, the strike count stops at the threshold, and
+# a node's working scheme is learned from an auth rejection as well as a success.
 
 PROXY_407_QUARANTINE = 2          # 407s on a node before it leaves the pool
 PROXY_407_FORCE_DIRECT = 2        # 407s on an account with no fresh proxy -> go direct
@@ -482,8 +506,18 @@ class ProxyAuthError(ConnectionError):
 
 
 def _is_proxy_auth_fail(msg) -> bool:
+    """True when the PROXY ITSELF rejected us, as opposed to a transport failure.
+
+    v13.23: a SOCKS5 auth rejection is the same signal as an HTTP 407 - both mean
+    "creds refused", and both must quarantine the node instead of being blamed on
+    the mail host.  Previously only a literal 407 matched, so a SOCKS5-only auth
+    failure was classified as a generic dead node.
+    """
     m = (msg or "").lower()
-    return ("407" in m) or ("proxy authentication required" in m)
+    return ("407" in m
+            or "proxy authentication required" in m
+            or "socks5 authentication failed" in m
+            or "socks authentication failed" in m)
 
 
 # ============================================================================
@@ -788,7 +822,7 @@ def build_diagnostics_text():
         L.append(str(s))
 
     A("=" * 78)
-    A("MEGA ULTIMATE MAIL CHECKER — v13.22 DIAGNOSTIC BUNDLE")
+    A("MEGA ULTIMATE MAIL CHECKER — v13.23 DIAGNOSTIC BUNDLE")
     A(f"generated {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     A("=" * 78)
 
@@ -961,7 +995,7 @@ def default_theme() -> dict:
         "bg": p["bg"], "panel": p["panel"], "text": p["text"],
         "radius": 14, "glow": True, "animate": True, "glass": True,
         "colorize_logs": True,
-        "hero_title": "⚡ Mega Ultimate Mail Checker v13.22",
+        "hero_title": "⚡ Mega Ultimate Mail Checker v13.23",
         "hero_sub": "World-Coverage Edition — router-aware host ranking, rotating proxy pool with 407 quarantine, geo-call routing, Microsoft XOAUTH2, retryable IP-block handling, optional SMTP pre-check, anti-spoofing post-auth validation, deep diagnostics.",
     }
 
@@ -1726,7 +1760,7 @@ def parse_proxy(proxy_str):
     return None
 
 # ---------------------------------------------------------------------------
-# PROXY-LAYER HELPERS  (v13.22)
+# PROXY-LAYER HELPERS  (v13.23)
 # ---------------------------------------------------------------------------
 def proxy_is_quarantined(proxy_str) -> bool:
     if not proxy_str:
@@ -2478,11 +2512,16 @@ def record_proxy_attempt(proxy_str, success, is_network_error=False, is_proxy_au
         if not proxy_str:
             return
         if is_proxy_auth and CFG.get("QUARANTINE_407", True):
-            with proxy_quarantine_lock:
-                _proxy_407[proxy_str] += 1
-                strikes = _proxy_407[proxy_str]
-            if strikes >= PROXY_407_QUARANTINE:
-                quarantine_proxy(proxy_str, f"{strikes}x 407")
+            # v13.23: only count a strike while the node is still IN PLAY.
+            # record_proxy_attempt() used to keep incrementing _proxy_407 after
+            # quarantine_proxy() had already pulled the node out, so a
+            # permanently-dead node drifted to 7 strikes against a threshold of 2.
+            if not proxy_is_quarantined(proxy_str):
+                with proxy_quarantine_lock:
+                    _proxy_407[proxy_str] += 1
+                    strikes = _proxy_407[proxy_str]
+                if strikes >= PROXY_407_QUARANTINE:
+                    quarantine_proxy(proxy_str, f"{strikes}x 407")
         threshold = int(CFG.get("BLACKLIST_CF", 15))
         with proxy_lock:
             if proxy_str not in proxy_meta:
@@ -2693,6 +2732,10 @@ def tunnel_probe(proxy_str, targets=None, timeout=None):
 
     v13.22: also returns the exception text in "error", so a failing node says
     WHY instead of just "dead".  reason: ok / format / nosocks / auth / timeout / dead.
+    v13.23: if exactly one scheme is REJECTED by the proxy (an auth reply) and no
+    scheme succeeds, that scheme is remembered so the dead leg is not re-paid on
+    every future cycle.  A node that is HTTP-only no longer burns its SOCKS5 leg
+    forever just because it never once succeeded.
     """
     out = {"ok": False, "reason": "dead", "latency_ms": 0, "target": "", "scheme": None, "error": ""}
     if not proxy_str:
@@ -2712,6 +2755,7 @@ def tunnel_probe(proxy_str, targets=None, timeout=None):
     targets = targets or probe_targets()
     timeout = timeout if timeout is not None else probe_timeout()
     errors = []
+    auth_schemes = set()
 
     for host, port, label in targets:
         for ptype in _scheme_order(proxy_str):
@@ -2734,6 +2778,7 @@ def tunnel_probe(proxy_str, targets=None, timeout=None):
                               f"{type(e).__name__}: {msg[:100]}")
                 if _is_proxy_auth_fail(msg):
                     out["reason"] = "auth"
+                    auth_schemes.add(ptype)
                 elif isinstance(e, (socket.timeout, TimeoutError)) or "timed out" in msg.lower():
                     if out["reason"] != "auth":
                         out["reason"] = "timeout"
@@ -2748,6 +2793,13 @@ def tunnel_probe(proxy_str, targets=None, timeout=None):
                         s.close()
                     except Exception:
                         pass
+
+    # v13.23: one scheme was refused, the other never even spoke the protocol.
+    # That scheme is the one this node actually speaks - remember it so the dead
+    # leg is not re-attempted first on every future cycle.
+    if len(auth_schemes) == 1:
+        _remember_scheme(proxy_str, next(iter(auth_schemes)))
+
     out["error"] = " ; ".join(errors)[:200]
     return out
 
@@ -2821,11 +2873,11 @@ def precheck_proxy_fast(proxy_str):
 
         if res["reason"] == "auth":
             record_proxy_attempt(proxy_str, success=False, is_network_error=True, is_proxy_auth=True)
-            log_probe_event(f"AUTH407 {info['host']}:{info['port']} -> {res.get('error','')[:90]}")
+            log_probe_event(f"AUTH407 {info['host']}:{info['port']} -> {res.get('error','')[:160]}")
         else:
             record_proxy_attempt(proxy_str, success=False, is_network_error=True)
             if res["reason"] in ("timeout", "dead"):
-                log_probe_event(f"{res['reason'].upper()} {info['host']}:{info['port']} -> {res.get('error','')[:90]}")
+                log_probe_event(f"{res['reason'].upper()} {info['host']}:{info['port']} -> {res.get('error','')[:160]}")
         return False
     except Exception:
         return False
@@ -2833,7 +2885,8 @@ def precheck_proxy_fast(proxy_str):
 
 def refresh_alive_pool():
     """Parallel. Honors PROBE_STRICT, logs the breakdown, PERSISTS the meta,
-    and prunes proxy_meta / probe_stats down to what proxies.txt actually holds."""
+    and prunes proxy_meta / probe_stats / quarantine / strikes down to what
+    proxies.txt actually holds."""
     if STATE.get("probe_in_flight"):
         return
     STATE["probe_in_flight"] = True
@@ -2850,6 +2903,9 @@ def refresh_alive_pool():
 
         # v13.22: kill ghost keys. proxy_meta / probe_stats only ever grew, so a
         # 90-node pool rendered as a 100+ row dashboard full of stale duplicates.
+        # v13.23: the quarantine and strike tables were NEVER pruned, so a node
+        # dropped from proxies.txt (e.g. by Fetch & Test) stayed "quarantined"
+        # forever and kept being counted against a pool it was no longer in.
         try:
             file_keys = set(load_proxies(quiet=True))
         except Exception:
@@ -2863,6 +2919,15 @@ def refresh_alive_pool():
                 for k in list(probe_stats.keys()):
                     if k not in file_keys:
                         probe_stats.pop(k, None)
+            with proxy_quarantine_lock:
+                for k in list(proxy_quarantine):
+                    if k not in file_keys:
+                        proxy_quarantine.discard(k)
+                        _proxy_407.pop(k, None)
+            with _proxy_scheme_lock:
+                for k in list(_proxy_scheme.keys()):
+                    if k not in file_keys:
+                        _proxy_scheme.pop(k, None)
 
         if not CFG.get("PROXY_TEST_FLIGHT", True):
             with alive_pool_lock:
