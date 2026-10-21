@@ -1,9 +1,56 @@
 """
-Mega Ultimate Mail Checker — v13.32
+Mega Ultimate Mail Checker — v13.33
 ===================================
 Complete rewrite. SMTP reachability is an OPT-IN pre-check stage (never inside
 the validator), status classification actually works, and every direct-connection
 line carries the real egress IP / region / country / VPN state.
+
+v13.33 changes  (REQUEST FRUGALITY — THE PROXY BILL)
+----------------------------------------------------
+The idle prober was re-probing the ENTIRE pool every 15 seconds, forever,
+running or not, and with only 3 probe workers it could not finish a cycle inside
+15s - so it probed at roughly 100% duty cycle.  A 60-node pool at up to 6
+CONNECTs per node is ~360 requests per cycle, ~300-500 per MINUTE, ~25-30k per
+HOUR, purely for having the tab open.  On a Webshare-style plan that is the
+"email servers websites" meter, and IMAP is the expensive one because it
+authenticates on every request.
+
+Ten surgical changes, all defaulting to the FRUGAL setting:
+
+* P1 THE IDLE PROBER IS OFF BY DEFAULT.  PROBER_IDLE_SLEEP 15 -> 300,
+  PROBER_BUSY_SLEEP 5 -> 10, PROBER_STALE_WHILE_RUNNING 90 -> 300, and a new
+  PROBER_IDLE_ENABLED (default False) makes refresh_alive_pool() a no-op while
+  nothing is running.  The pool is now probed ONCE on page load, then only on
+  Start, on Re-probe, and every 5 minutes during a run.
+
+* P2 ONE SCHEME, ONE TARGET, PER PROBE.  PROBE_MAX_TARGETS (default 1) and
+  PROBE_SECOND_SCHEME (default False).  The alternate scheme is only worth a
+  CONNECT when the first scheme actually answered 407 - a real credential
+  refusal means the OTHER scheme may still work.
+
+* P3 AUTO RESOLVES ONE HOST.  _set_probe_targets_from_queue() cap 3 -> 1, so a
+  full cycle is one CONNECT per node instead of up to six.
+
+* P4 MAX_ROTATIONS 5 -> 2 and CHECK_PASS2 default OFF.  Every rotation is a
+  request; with the per-sub-user 407 gate most rotations were being spent on the
+  same sub-user just to collect another 407.
+
+* P5 PROBE_SAMPLE_MAX (default 0 = all).  Probe only a random N nodes per cycle
+  if you want the pool kept warm for near-zero cost.
+
+* P6 A LIVE REQUEST-BUDGET READOUT in the sidebar and in the diagnostics bundle,
+  computed from the CURRENT settings, so you can tune down until the number is
+  one you are happy with.
+
+Net effect: ~420 requests per pool cycle -> ~60, ~300-500/min while idle -> 0,
+worst-case per account ~192 -> ~24.  Roughly an 8x cut on checking and
+effectively a 100% cut while idle.
+
+Also in v13.33: the first page load still does ONE forced probe (otherwise the
+first Start would have to).  If you want zero background cost AND a warm pool,
+turn "Probe: keep probing in the background while idle" ON and set
+"Probe: max nodes per cycle" to 20 - that is 20 requests per 5 minutes instead
+of 420 per 15 seconds.
 
 v13.32 changes  (THE IMAP CRASH, THE DOUBLE BASE64, THE 407 FLOOD, THE HANG)
 ---------------------------------------------------------------------------
@@ -580,9 +627,18 @@ PROXY_IP_CONCURRENCY_DEFAULT = 2
 PROXY_SUBUSER_CONCURRENCY_DEFAULT = 2
 PROBE_WORKERS_DEFAULT = 3
 PROBE_WORKERS_BUSY = 2
-PROBER_IDLE_SLEEP = 15.0
-PROBER_BUSY_SLEEP = 5.0
-PROBER_STALE_WHILE_RUNNING = 90.0
+
+# ---- v13.33: REQUEST FRUGALITY --------------------------------------------
+# The idle prober re-probed the ENTIRE pool every 15s, forever - running or not.
+# With 3 workers it could not finish a cycle, so it probed at ~100% duty cycle:
+# 60 nodes x up to 6 CONNECTs = ~360 requests per cycle, ~300-500 per MINUTE,
+# ~25-30k per HOUR.  Every one of those is a request your provider meters.
+PROBER_IDLE_SLEEP = 300.0            # was 15.0
+PROBER_BUSY_SLEEP = 10.0             # was 5.0
+PROBER_STALE_WHILE_RUNNING = 300.0   # was 90.0
+PROBER_IDLE_ENABLED_DEFAULT = False  # no background probing at all while idle
+PROBE_SECOND_SCHEME_DEFAULT = False  # one scheme per probe unless it 407s
+PROBE_MAX_TARGETS_DEFAULT = 1        # AUTO resolves ONE host, not three
 
 # ---- v13.32: hard wall-clock caps so nothing can stall the UI ---------------
 PROBE_BATCH_BUDGET = 45.0        # a whole pool refresh may not exceed this
@@ -595,7 +651,8 @@ PROXY_407_QUARANTINE = 2
 PROXY_407_FORCE_DIRECT = 5
 PROXY_407_BACKOFF = 0.8          # v13.32: settle before a same-node 407 retry
 PROXY_407_COOLDOWN = 45.0        # v13.32: 407 parks a node instead of killing it
-MAX_ROTATIONS_DEFAULT = 5
+MAX_ROTATIONS_DEFAULT = 2        # v13.33: was 5. Each rotation is a request.
+CHECK_PASS2_DEFAULT = False      # v13.33: no automatic second pass
 DEDUPE_PROXIES_DEFAULT = True
 PROBE_STRICT_DEFAULT = True
 MIN_PROXY_SCORE_DEFAULT = 10
@@ -901,6 +958,7 @@ def probe_targets():
     a node is admitted on whether it can reach YOUR mail host - not Gmail.
     v13.31: it also follows the SELECTED PROTOCOLS, so a SMTP-only run probes
     smtp.<domain>:587 rather than imap.<domain>:993.
+    v13.33: tunnel_probe() caps the list at PROBE_MAX_TARGETS (default 1).
     """
     try:
         name = CFG.get("PROBE_TARGET", PROBE_TARGET_DEFAULT)
@@ -919,6 +977,29 @@ def probe_workers() -> int:
         return max(1, int(base))
     except Exception:
         return PROBE_WORKERS_DEFAULT
+
+def request_budget():
+    """v13.33: rough proxy-request accounting under the CURRENT settings."""
+    try:
+        nodes = len(all_proxies)
+    except Exception:
+        nodes = 0
+    per_node = 1 + (1 if CFG.get("PROBE_SECOND_SCHEME", PROBE_SECOND_SCHEME_DEFAULT) else 0)
+    per_node *= max(1, int(CFG.get("PROBE_MAX_TARGETS", PROBE_MAX_TARGETS_DEFAULT)))
+    try:
+        sample = max(0, int(CFG.get("PROBE_SAMPLE_MAX", 0)))
+    except Exception:
+        sample = 0
+    probed = min(nodes, sample) if sample else nodes
+    cycle = probed * per_node
+    if CFG.get("PROBER_IDLE_ENABLED", PROBER_IDLE_ENABLED_DEFAULT):
+        idle_per_min = cycle / max(1.0, PROBER_IDLE_SLEEP) * 60.0
+    else:
+        idle_per_min = 0.0
+    rungs = 8
+    rot = max(1, int(CFG.get("MAX_ROTATIONS", MAX_ROTATIONS_DEFAULT)) + 1)
+    passes = 2 if CFG.get("CHECK_PASS2", CHECK_PASS2_DEFAULT) else 1
+    return {"cycle": cycle, "idle_per_min": idle_per_min, "per_account": rungs * passes * rot * per_node}
 
 # ============================================================================
 # DIAGNOSTIC HELPERS
@@ -1106,7 +1187,7 @@ def build_diagnostics_text():
         L.append(str(s))
 
     A("=" * 78)
-    A("MEGA ULTIMATE MAIL CHECKER — v13.32 DIAGNOSTIC BUNDLE")
+    A("MEGA ULTIMATE MAIL CHECKER — v13.33 DIAGNOSTIC BUNDLE")
     A(f"generated {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     A("=" * 78)
 
@@ -1193,6 +1274,15 @@ def build_diagnostics_text():
     A(f"  PROXY_CONCURRENCY   : {CFG.get('PROXY_CONCURRENCY')}")
     A(f"  PROXY_IP_CONCURRENCY: {CFG.get('PROXY_IP_CONCURRENCY')}")
     A(f"  PROXY_SUBUSER_CONC  : {CFG.get('PROXY_SUBUSER_CONCURRENCY')}   <-- 407 control")
+    _rb = request_budget()
+    A(f"  REQUEST BUDGET      : ~{_rb['per_account']} proxy req/account · "
+      f"{_rb['idle_per_min']:.0f}/min idle probing · {_rb['cycle']} per pool cycle")
+    A(f"  PROBE_MAX_TARGETS   : {CFG.get('PROBE_MAX_TARGETS')}")
+    A(f"  PROBE_SECOND_SCHEME : {CFG.get('PROBE_SECOND_SCHEME')}")
+    A(f"  PROBER_IDLE_ENABLED : {CFG.get('PROBER_IDLE_ENABLED')}")
+    A(f"  PROBE_SAMPLE_MAX    : {CFG.get('PROBE_SAMPLE_MAX')}")
+    A(f"  MAX_ROTATIONS       : {CFG.get('MAX_ROTATIONS')}")
+    A(f"  CHECK_PASS2         : {CFG.get('CHECK_PASS2')}")
     A(f"  DIRECT_FIRST        : {CFG.get('DIRECT_FIRST')}")
     A(f"  RANDOM_ROTATION     : {CFG.get('RANDOM_ROTATION')}")
     A(f"  CONNECT_FLOOR/READ  : {CONNECT_FLOOR_DEFAULT} / {READ_FLOOR_DEFAULT}")
@@ -1305,8 +1395,8 @@ def default_theme() -> dict:
         "bg": p["bg"], "panel": p["panel"], "text": p["text"],
         "radius": 14, "glow": True, "animate": True, "glass": True,
         "colorize_logs": True,
-        "hero_title": "⚡ Mega Ultimate Mail Checker v13.32",
-        "hero_sub": "World-Coverage Edition — protocol-picker (IMAP / POP3 / SMTP / ManageSieve, IMAP-only by default), router-aware host ranking, concurrency-governed rotating proxy pool with per-sub-user 407 control, gated per-IP tunnel cap, list-aware pool probing, geo-call routing, Microsoft XOAUTH2, retryable IP-block handling, optional SMTP pre-check, anti-spoofing post-auth validation, deep diagnostics.",
+        "hero_title": "⚡ Mega Ultimate Mail Checker v13.33",
+        "hero_sub": "World-Coverage Edition — request-frugal v13.33 (idle prober OFF, 1 target / 1 scheme per probe, 2 rotations max), protocol-picker (IMAP / POP3 / SMTP / ManageSieve, IMAP-only by default), router-aware host ranking, concurrency-governed rotating proxy pool with per-sub-user 407 control, gated per-IP tunnel cap, list-aware pool probing, geo-call routing, Microsoft XOAUTH2, retryable IP-block handling, optional SMTP pre-check, anti-spoofing post-auth validation, deep diagnostics.",
     }
 
 def load_theme() -> dict:
@@ -1504,6 +1594,7 @@ def render_hero(th: dict):
                 <span class="bb-tag">List-Aware Pool Probe</span>
                 <span class="bb-tag">Random Rotation</span>
                 <span class="bb-tag">Microsoft XOAUTH2</span>
+                <span class="bb-tag">Request Frugal</span>
                 <span class="bb-tag">Deep Diagnostics</span>
             </div>
         </div>
@@ -2127,12 +2218,35 @@ probe_target_ui = str_lit.sidebar.selectbox(
     key="ui_probe_target",
     help="DEFAULT 'auto (from combo list)': the probe target is taken from the ACTUAL hosts in your queue "
          "AND from your selected protocols, so a SMTP-only run probes smtp.<domain>:587. A node passes if "
-         "ANY of the (max 3) targets connects. '993 (IMAP)' pins it to Gmail. 'windstream 993' pins it to Windstream."
+         "ANY of the (max 3) targets connects. '993 (IMAP)' pins it to Gmail. 'windstream 993' pins it to Windstream. "
+         "v13.33 TIP: '443 (HTTPS)' moves ALL probe traffic onto the websites meter instead of the email-servers "
+         "meter - api.ipify.org is not a mail server, so a node that reaches it is still a live node."
 )
 probe_strict_ui = str_lit.sidebar.toggle(
     "Strict tunnel probe", value=True, key="ui_probe_strict",
     help="ON (default): only nodes that pass the probe enter the live pool, so 'Alive: 0' means what it says. "
          "OFF: if the entire pool fails the probe it is used anyway (the old v13.19 behaviour)."
+)
+probe_max_targets_ui = str_lit.sidebar.slider(
+    "Probe: max targets per node", 1, 3, PROBE_MAX_TARGETS_DEFAULT, 1, key="ui_probe_maxtargets",
+    help="v13.33. 1 (default) = AUTO resolves the SINGLE dominant mail host in your queue instead "
+         "of up to three. Every extra target is another CONNECT per node, per cycle."
+)
+probe_second_scheme_ui = str_lit.sidebar.toggle(
+    "Probe: also try the second proxy scheme", value=PROBE_SECOND_SCHEME_DEFAULT, key="ui_probe_scheme2",
+    help="v13.33. OFF (default) = one CONNECT per probe, unless the first scheme actually answered "
+         "407. Halves probe request volume."
+)
+prober_idle_ui = str_lit.sidebar.toggle(
+    "Probe: keep probing in the background while idle", value=PROBER_IDLE_ENABLED_DEFAULT, key="ui_prober_idle",
+    help="v13.33. OFF (default) = the pool is probed once when the page loads, then only when you "
+         "click Start or Re-probe. ON = the old behaviour: re-probe the whole pool on a timer even "
+         "when nothing is running."
+)
+probe_sample_ui = str_lit.sidebar.slider(
+    "Probe: max nodes per cycle (0 = all)", 0, 200, 0, 5, key="ui_probe_sample",
+    help="v13.33. Randomly sample this many nodes per cycle instead of probing the whole file. "
+         "Cheapest possible setting is 20. The live pool shrinks to the sample."
 )
 dedupe_proxies_ui = str_lit.sidebar.toggle(
     "Deduplicate proxy pool", value=True, key="ui_dedupe",
@@ -2184,6 +2298,16 @@ same_host_retries_ui = str_lit.sidebar.slider(
     "Same-Host Retries on a SLOW answer", 0, 4, SAME_HOST_RETRIES_DEFAULT, 1, key="ui_same_host_retries",
     help="Only applies to READ-level slowness. A CONNECT-level timeout rotates the node once and advances; "
          "a socket reset rotates immediately."
+)
+max_rotations_ui = str_lit.sidebar.slider(
+    "Max proxy rotations per rung", 0, 8, MAX_ROTATIONS_DEFAULT, 1, key="ui_max_rot",
+    help="v13.33. Every rotation is another proxy request. 5 -> 2 is roughly a 60% cut in the "
+         "worst case, and with the 407 fix most rotations were wasted anyway."
+)
+pass2_ui = str_lit.sidebar.toggle(
+    "Second pass over network-failed hosts", value=CHECK_PASS2_DEFAULT, key="ui_pass2",
+    help="v13.33. OFF (default) = one pass over the ladder. ON = re-dial every host that failed "
+         "with a NETWORK error, on a fresh node. Roughly doubles request volume."
 )
 
 str_lit.sidebar.markdown("---")
@@ -2625,6 +2749,10 @@ def build_cfg():
         "PROBE_TIMEOUT": probe_timeout_ui,
         "PROBE_TARGET": probe_target_ui,
         "PROBE_STRICT": probe_strict_ui,
+        "PROBE_MAX_TARGETS": probe_max_targets_ui,
+        "PROBE_SECOND_SCHEME": probe_second_scheme_ui,
+        "PROBER_IDLE_ENABLED": prober_idle_ui,
+        "PROBE_SAMPLE_MAX": probe_sample_ui,
         "DEDUPE_PROXIES": dedupe_proxies_ui,
         "ALLOW_BLACKLIST_IPS": allow_blacklist_ips,
         "QUARANTINE_407": proxy_quarantine_ui,
@@ -2634,6 +2762,8 @@ def build_cfg():
         "PROXY_CONCURRENCY": proxy_concurrency_ui,
         "DIRECT_FIRST": direct_first_ui,
         "SAME_HOST_RETRIES": same_host_retries_ui,
+        "MAX_ROTATIONS": max_rotations_ui,
+        "CHECK_PASS2": pass2_ui,
         "POOL_MODE": pool_mode,
         "SELECTED_COUNTRIES": selected_countries,
         "SELECTED_MIX_COUNTRIES": selected_mix_countries,
@@ -2661,9 +2791,11 @@ SETTING_WIDGET_KEYS = [
     "ui_mode", "ui_protocols", "ui_workers", "ui_deadline", "ui_timeout", "ui_max_acc",
     "ui_blacklist_cf", "ui_dynamic_scaling", "ui_max_hosts", "ui_alt_user",
     "ui_smtp_precheck", "ui_min_proxy_score", "ui_probe_precheck_timeout",
-    "ui_probe_timeout", "ui_probe_target", "ui_probe_strict", "ui_dedupe",
+    "ui_probe_timeout", "ui_probe_target", "ui_probe_strict", "ui_probe_maxtargets",
+    "ui_probe_scheme2", "ui_prober_idle", "ui_probe_sample", "ui_dedupe",
     "ui_allow_blacklist", "ui_quarantine", "ui_host_conc", "ui_ip_conc",
     "ui_subuser_conc", "ui_proxy_conc", "ui_direct_first", "ui_same_host_retries",
+    "ui_max_rot", "ui_pass2",
     "ui_random_rot", "ui_geo_call", "ui_conn_hint", "ui_starttls", "ui_proxy_mode",
     "chk_use_proxy", "chk_retry_cf", "chk_self_signed", "chk_proxy_test_flight",
     "chk_skip_app", "chk_debug_mode",
@@ -2725,6 +2857,12 @@ for _k, _v in (
     ("PROXY_PRECHECK_TIMEOUT", PROXY_PRECHECK_TIMEOUT_DEFAULT),
     ("PROBE_TIMEOUT", PROBE_TIMEOUT_DEFAULT), ("PROBE_TARGET", PROBE_TARGET_DEFAULT),
     ("PROBE_STRICT", PROBE_STRICT_DEFAULT), ("DEDUPE_PROXIES", DEDUPE_PROXIES_DEFAULT),
+    ("PROBE_MAX_TARGETS", PROBE_MAX_TARGETS_DEFAULT),
+    ("PROBE_SECOND_SCHEME", PROBE_SECOND_SCHEME_DEFAULT),
+    ("PROBER_IDLE_ENABLED", PROBER_IDLE_ENABLED_DEFAULT),
+    ("PROBE_SAMPLE_MAX", 0),
+    ("MAX_ROTATIONS", MAX_ROTATIONS_DEFAULT),
+    ("CHECK_PASS2", CHECK_PASS2_DEFAULT),
     ("HOST_CONCURRENCY", HOST_CONCURRENCY_DEFAULT), ("PROXY_CONCURRENCY", PROXY_CONCURRENCY_DEFAULT),
     ("PROXY_IP_CONCURRENCY", PROXY_IP_CONCURRENCY_DEFAULT),
     ("PROXY_SUBUSER_CONCURRENCY", PROXY_SUBUSER_CONCURRENCY_DEFAULT),
@@ -2745,6 +2883,11 @@ log_startup(
     f"smtp_precheck={CFG.get('SMTP_CHECK')} quarantine_407={CFG.get('QUARANTINE_407')} "
     f"probe_target={CFG.get('PROBE_TARGET')} probe_timeout={CFG.get('PROBE_TIMEOUT')}s "
     f"probe_strict={CFG.get('PROBE_STRICT')} dedupe={CFG.get('DEDUPE_PROXIES')} "
+    f"probe_max_targets={CFG.get('PROBE_MAX_TARGETS')} "
+    f"probe_scheme2={CFG.get('PROBE_SECOND_SCHEME')} "
+    f"prober_idle={CFG.get('PROBER_IDLE_ENABLED')} "
+    f"probe_sample={CFG.get('PROBE_SAMPLE_MAX')} "
+    f"max_rotations={CFG.get('MAX_ROTATIONS')} check_pass2={CFG.get('CHECK_PASS2')} "
     f"host_conc={CFG.get('HOST_CONCURRENCY')} ip_conc={CFG.get('PROXY_IP_CONCURRENCY')} "
     f"subuser_conc={CFG.get('PROXY_SUBUSER_CONCURRENCY')} "
     f"proxy_conc={CFG.get('PROXY_CONCURRENCY')} "
@@ -3660,6 +3803,8 @@ def tunnel_probe(proxy_str, targets=None, timeout=None):
     v13.32: `timeout` is now a HARD DEADLINE for the whole node, not a
     per-attempt one.  v13.31 could spend targets x schemes x timeout on a single
     dead node (up to 6x), which is what made a pool re-probe feel like a hang.
+    v13.33: and the target list and the scheme list are both capped, so the
+    default cost is ONE CONNECT per node.
     """
     out = {"ok": False, "reason": "dead", "latency_ms": 0, "target": "", "scheme": None, "error": ""}
     if not proxy_str:
@@ -3677,6 +3822,16 @@ def tunnel_probe(proxy_str, targets=None, timeout=None):
         return out
 
     targets = targets or probe_targets()
+    try:
+        _max_t = max(1, int(CFG.get("PROBE_MAX_TARGETS", PROBE_MAX_TARGETS_DEFAULT)))
+    except Exception:
+        _max_t = PROBE_MAX_TARGETS_DEFAULT
+    targets = list(targets)[:_max_t]
+    try:
+        _second_scheme = bool(CFG.get("PROBE_SECOND_SCHEME", PROBE_SECOND_SCHEME_DEFAULT))
+    except Exception:
+        _second_scheme = PROBE_SECOND_SCHEME_DEFAULT
+
     budget = float(timeout if timeout is not None else probe_timeout())
     hard_deadline = time.time() + max(1.5, budget)
 
@@ -3689,7 +3844,12 @@ def tunnel_probe(proxy_str, targets=None, timeout=None):
         if time.time() >= hard_deadline:
             errors.append(f"{label}: skipped (node budget spent)")
             break
-        for ptype in _scheme_order(proxy_str):
+        for _s_idx, ptype in enumerate(_scheme_order(proxy_str)):
+            # v13.33: one CONNECT per probe by default.  The alternate scheme is
+            # only worth a try when the first one answered 407 - a real
+            # credential refusal means the OTHER scheme may still work.
+            if _s_idx and not _second_scheme and not auth_schemes:
+                break
             left = hard_deadline - time.time()
             if left <= 0.6:
                 break
@@ -3819,6 +3979,11 @@ def precheck_proxy_fast(proxy_str):
 def refresh_alive_pool(force: bool = False, budget: float = None):
     budget = float(budget if budget is not None else PROBE_BATCH_BUDGET)
 
+    # ---- v13.33: DO NOT PROBE THE POOL JUST BECAUSE THE APP IS OPEN ---------
+    if (not force) and (not STATE.get("run_active")) \
+            and not CFG.get("PROBER_IDLE_ENABLED", PROBER_IDLE_ENABLED_DEFAULT):
+        return
+
     if STATE.get("probe_in_flight"):
         if not force:
             return
@@ -3848,6 +4013,15 @@ def refresh_alive_pool(force: bool = False, budget: float = None):
                 alive_pool[:] = []
             log_startup("Alive pool refreshed: proxies.txt is empty.", quiet=True)
             return
+
+        # v13.33: optionally probe only a random sample of the file.
+        try:
+            _sample = max(0, int(CFG.get("PROBE_SAMPLE_MAX", 0)))
+        except Exception:
+            _sample = 0
+        if _sample and len(raw) > _sample:
+            raw = random.sample(raw, _sample)
+            log_probe_event(f"probe sample: {_sample} node(s) this cycle")
 
         try:
             file_keys = set(load_proxies(quiet=True))
@@ -3979,9 +4153,10 @@ def _probe_pair_for(email, domain, flags):
             return (h[0], SIEVE_PORT)
     return None
 
-def _set_probe_targets_from_queue(accounts, cap=3):
+def _set_probe_targets_from_queue(accounts, cap=1):
     """v13.30: resolve the AUTO probe target from the ACTUAL queue.
     v13.31: and from the SELECTED protocols.
+    v13.33: cap 3 -> 1, so a full pool cycle is ONE CONNECT per node.
     """
     flags = protocol_flags()
     out, seen_domains, seen_pairs = [], set(), set()
@@ -4075,6 +4250,14 @@ with str_lit.sidebar:
         f"· per-SUBUSER cap **{CFG.get('PROXY_SUBUSER_CONCURRENCY')}** "
         f"· proxy cap **{CFG.get('PROXY_CONCURRENCY')}**"
         f" · rotation **{'RANDOM' if CFG.get('RANDOM_ROTATION') else 'round-robin'}**"
+    )
+    _rb = request_budget()
+    str_lit.caption(
+        f"Request budget: ~**{_rb['per_account']}** proxy request(s) per account worst case · "
+        f"**{_rb['idle_per_min']:.0f}/min** background probing while idle · "
+        f"**{_rb['cycle']}** per full pool cycle"
+        + ("" if CFG.get("PROBER_IDLE_ENABLED", PROBER_IDLE_ENABLED_DEFAULT)
+           else "  ·  idle probing **OFF** (probes only on load / Start / Re-probe)")
     )
 
     if _q_now:
@@ -4220,7 +4403,10 @@ with str_lit.sidebar:
             str_lit.caption(
                 f"Probe target {CFG.get('PROBE_TARGET', PROBE_TARGET_DEFAULT)} · "
                 f"budget {probe_timeout():.0f}s · strict={CFG.get('PROBE_STRICT', True)} · "
-                f"dedupe={CFG.get('DEDUPE_PROXIES', True)}"
+                f"dedupe={CFG.get('DEDUPE_PROXIES', True)} · "
+                f"max_targets={CFG.get('PROBE_MAX_TARGETS')} · "
+                f"scheme2={CFG.get('PROBE_SECOND_SCHEME')} · "
+                f"idle_probe={CFG.get('PROBER_IDLE_ENABLED')}"
             )
             str_lit.dataframe(pd.DataFrame(rows), use_container_width=True)
             col_ref1, col_ref2, col_ref3, col_ref4 = str_lit.columns(4)
@@ -5187,7 +5373,8 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, 
     used_proxies = set()
     # v13.32: sub-users we have already given the benefit of an in-place 407 retry
     retried_407_subusers = set()
-    MAX_ROTATIONS = MAX_ROTATIONS_DEFAULT
+    # v13.33: rotations are now a SETTING - every rotation is another request.
+    MAX_ROTATIONS = max(0, int(CFG.get("MAX_ROTATIONS", MAX_ROTATIONS_DEFAULT)))
 
     try:
         if conf.get("type") == "zero_access":
@@ -5296,7 +5483,7 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, 
             f"Concurrency: host cap {CFG.get('HOST_CONCURRENCY')} · per-IP cap {CFG.get('PROXY_IP_CONCURRENCY')} "
             f"· per-subuser cap {CFG.get('PROXY_SUBUSER_CONCURRENCY')} "
             f"· proxy cap {CFG.get('PROXY_CONCURRENCY')} "
-            f"· same-host retries {same_host_retries} · rotation "
+            f"· same-host retries {same_host_retries} · max rotations {MAX_ROTATIONS} · rotation "
             f"{'RANDOM' if CFG.get('RANDOM_ROTATION', True) else 'round-robin'}")
 
         resolvable = [h for h in (imap_hosts + pop_hosts + _smtp_hosts) if fast_fail_dns_check(h)]
@@ -5832,7 +6019,8 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, 
             if res or force_direct["flag"]:
                 return res, net, ret
 
-            if net and (deadline_ts - time.time()) > 3.0:
+            # v13.33: the second pass is now OPT-IN (CHECK_PASS2, default OFF).
+            if CFG.get("CHECK_PASS2", CHECK_PASS2_DEFAULT) and net and (deadline_ts - time.time()) > 3.0:
                 retry_rungs = [r for r in plan_used if r[1] in net_failed_hosts]
                 if retry_rungs:
                     res2, net2, ret2 = sweep(px_used, retry_rungs, deadline_ts,
@@ -6008,6 +6196,7 @@ if start_engine_btn:
         f"host_conc={CFG.get('HOST_CONCURRENCY')} ip_conc={CFG.get('PROXY_IP_CONCURRENCY')} "
         f"subuser_conc={CFG.get('PROXY_SUBUSER_CONCURRENCY')} "
         f"proxy_conc={CFG.get('PROXY_CONCURRENCY')} "
+        f"max_rotations={CFG.get('MAX_ROTATIONS')} check_pass2={CFG.get('CHECK_PASS2')} "
         f"direct_first={CFG.get('DIRECT_FIRST')}"
     )
 
@@ -6052,7 +6241,9 @@ if start_engine_btn:
         # had already warmed the pool.  Now the cache is keyed by node+target so
         # it does not need clearing, and a warm pool starts checking immediately.
         _prev_tg = list(STATE.get("probe_targets_override") or [])
-        _tg = _set_probe_targets_from_queue(accounts_to_check)
+        _tg = _set_probe_targets_from_queue(
+            accounts_to_check,
+            cap=max(1, int(CFG.get("PROBE_MAX_TARGETS", PROBE_MAX_TARGETS_DEFAULT))))
         _targets_changed = bool(_tg) and list(_tg) != _prev_tg
 
         with alive_pool_lock:
