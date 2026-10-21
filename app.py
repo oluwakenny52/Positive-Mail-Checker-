@@ -1,9 +1,75 @@
 """
-Mega Ultimate Mail Checker — v13.34
+Mega Ultimate Mail Checker — v13.35
 ===================================
 Complete rewrite. SMTP reachability is an OPT-IN pre-check stage (never inside
 the validator), status classification actually works, and every direct-connection
 line carries the real egress IP / region / country / VPN state.
+
+v13.35 changes  (THE "Importing a module script failed." PANIC, THE DEAD RESET
+                 BUTTON, AND THE LAG)
+-----------------------------------------------------------------------------
+* `TypeError: Importing a module script failed.` IS NOT A PYTHON ERROR.
+  That exact string is what Safari / iOS WebView throws when a DYNAMICALLY
+  IMPORTED JAVASCRIPT CHUNK fails to load.  Streamlit 1.66's frontend lazy-loads
+  chunks whose filenames contain a content hash; a redeploy changes every hash,
+  so a tab that was ALREADY OPEN keeps requesting the OLD filenames, gets a 404,
+  and renders one red box per failed lazy component - repeated on every rerun,
+  which is why they stacked up.  NOTHING IN app.py CAUSES IT and nothing in
+  app.py can fix it: HARD-REFRESH the tab (Ctrl/Cmd+Shift+R).  v13.35 says so in
+  the sidebar so it stops looking like a crash.  The Python side is now also
+  guarded end-to-end, so a REAL error can never again hide behind a generic
+  message.
+
+* RESET DEFAULTS ACTUALLY RESETS NOW.  It was genuinely broken, and the cause is
+  a Streamlit rule, not a typo:
+    - SessionState.__setitem__ RAISES StreamlitWidgetAlreadyInstantiatedError if
+      you assign to a widget key AFTER the widget was created this run.  The
+      button sits at the BOTTOM of the settings block, so by the time it fired
+      every widget already existed - assigning was impossible, only pop()/del.
+    - But __delitem__ removes the key, and register_widget() then derives
+      widget_value_changed from `(user_key in _new_session_state) or
+      restored_bound_value or restored_session_state_value or ...`, ALL of which
+      a delete clears.  With widget_value_changed False Streamlit never tells
+      the BROWSER to adopt anything, so the widget kept rendering the old value
+      and the reset looked like a no-op.
+    - And applied_cfg was rebuilt with build_cfg(), which reads module globals
+      still bound to the OLD widget values, so the ENGINE kept the old config
+      too and _settings_dirty screamed "unapplied changes" forever.
+  FIX: the button only raises a flag and reruns.  The flag is consumed at the
+  very TOP of the script - before a single widget exists - where we can safely
+  ASSIGN every default.  Assigning sets is_new_state_value, which makes
+  widget_value_changed True, which is what actually pushes the value to the
+  browser.  applied_cfg is stamped from a pure-constant default_cfg(), so the
+  engine and the widgets land on the SAME defaults and the warning clears.
+
+* THE UI NO LONGER FREEZES ON LOAD.  The first-load pool probe ran SYNCHRONOUSLY
+  in the sidebar before the main body rendered, then sat in a
+  `while probe_in_flight: sleep(0.25)` loop for up to 130s.  Now it is a
+  background thread and the page renders immediately; Start waits for it
+  properly instead of racing it.
+
+* PROBE BATCH BUDGET IS NOW A REAL CEILING.  `with ThreadPoolExecutor(...)`
+  calls shutdown(wait=True) on exit, so a budget "timeout" did not actually
+  return - it waited for every straggler.  New _run_batch() collects what
+  finished inside the budget and leaves the rest to the daemon workers.
+
+* PROBE OWNERSHIP IS ATOMIC.  probe_in_flight was a plain read-then-write on a
+  dict, so the sidebar probe, the alive-pool loop and the Start refresh could
+  all slip past the guard at once and triple-spend.  A real lock owns it now.
+
+* CHEAPER RERUNS.  process_accounts() (with its per-domain DNS work),
+  load_previous_valid() and load_persistent_valid_results() were re-run on EVERY
+  widget interaction.  All three are now fingerprinted / TTL-cached - that is
+  where most of the "lag" actually came from.
+
+* REACHABILITY PROBE 6s -> 3s, cached 60s -> 300s (it is drawn in the sidebar on
+  every rerun).
+
+* THE PRE-FILTER BLOCK IS WRAPPED IN try/except WITH str_lit.exception, so the
+  next failure shows a real traceback instead of a bare one-liner.
+
+* DIAGNOSTICS report live thread count, ThreadPoolExecutor/ScriptRunner thread
+  counts, probe ownership, and the frontend-chunk explanation.
 
 v13.34 changes  (PLUG AND PLAY — click Fetch & Test, then press Start)
 ---------------------------------------------------------------------
@@ -574,7 +640,7 @@ str_lit.set_page_config(
 # ============================================================================
 
 # Bump this whenever a DEFAULT changes in a way users should inherit.
-CFG_VERSION = 1334
+CFG_VERSION = 1335
 
 # ---- timing / response ----
 PROBE_TIMEOUT_DEFAULT = 8.0
@@ -645,6 +711,10 @@ PROXY_IP_CONCURRENCY_DEFAULT = 1     # v13.34: was 2. One tunnel per proxy IP.
 PROXY_SUBUSER_CONCURRENCY_DEFAULT = 1  # v13.34: was 2. One tunnel per sub-user.
 PROBE_WORKERS_DEFAULT = 3
 PROBE_WORKERS_BUSY = 2
+# v13.35: the explicit Fetch & Test is user-initiated and runs with no checker
+# competing for the concurrency gates, so it may use more workers than the
+# background prober.
+PROBE_WORKERS_BULK = 6
 
 def _gate_wait(attempt_to: float) -> float:
     """v13.34: how long a gate will wait before giving up and barging through.
@@ -673,7 +743,7 @@ PROBE_MAX_TARGETS_DEFAULT = 1        # AUTO resolves ONE host, not three
 # ---- v13.34: hard wall-clock caps so nothing can stall the UI --------------
 # Raised 45 -> 120: with the gentler default concurrency a full validated cycle
 # needs the room.  The spinner exits the moment the probe finishes - the budget
-# is only a ceiling.
+# is only a ceiling.  v13.35: and _run_batch() now makes it a REAL ceiling.
 PROBE_BATCH_BUDGET = 120.0
 PROBE_BUDGET_START = 120.0
 UI_MIN_INTERVAL = 0.12           # min seconds between UI re-renders
@@ -711,6 +781,135 @@ PROBE_TARGET_PORTS = {
     "windstream 995": [("pop.windstream.net", 995, "ws-pop995")],
     "both (either)": [("imap.gmail.com", 993, "993"), ("api.ipify.org", 443, "443")],
 }
+
+# ============================================================================
+# v13.35: SETTING DEFAULTS + default_cfg()  (defined HERE, high in the file,
+# because the Reset Defaults handler runs at the TOP of the script - before any
+# widget exists - so that it can ASSIGN instead of delete.  See the reset block
+# immediately before the sidebar.)
+# ============================================================================
+
+SETTING_DEFAULTS = {
+    "ui_mode": "Normal Mode",
+    "ui_protocols": list(PROTOCOL_SELECTION_DEFAULT),
+    "ui_workers": WORKERS_NORMAL,
+    "ui_deadline": int(DEADLINE_NORMAL),
+    "ui_timeout": ATTEMPT_TIMEOUT_NORMAL,
+    "ui_max_acc": 5000,
+    "ui_blacklist_cf": BLACKLIST_CF_DEFAULT,
+    "ui_dynamic_scaling": True,
+    "ui_max_hosts": 3,
+    "ui_alt_user": True,
+    "ui_smtp_precheck": False,
+    "ui_min_proxy_score": MIN_PROXY_SCORE_DEFAULT,
+    "ui_probe_precheck_timeout": PROXY_PRECHECK_TIMEOUT_DEFAULT,
+    "ui_probe_timeout": int(PROBE_TIMEOUT_DEFAULT),
+    "ui_probe_target": PROBE_TARGET_DEFAULT,
+    "ui_probe_strict": PROBE_STRICT_DEFAULT,
+    "ui_probe_maxtargets": PROBE_MAX_TARGETS_DEFAULT,
+    "ui_probe_scheme2": PROBE_SECOND_SCHEME_DEFAULT,
+    "ui_prober_idle": PROBER_IDLE_ENABLED_DEFAULT,
+    "ui_probe_sample": 0,
+    "ui_dedupe": DEDUPE_PROXIES_DEFAULT,
+    "ui_allow_blacklist": False,
+    "ui_quarantine": True,
+    "ui_host_conc": HOST_CONCURRENCY_DEFAULT,
+    "ui_ip_conc": PROXY_IP_CONCURRENCY_DEFAULT,
+    "ui_subuser_conc": PROXY_SUBUSER_CONCURRENCY_DEFAULT,
+    "ui_proxy_conc": PROXY_CONCURRENCY_DEFAULT,
+    "ui_direct_first": False,
+    "ui_same_host_retries": SAME_HOST_RETRIES_DEFAULT,
+    "ui_max_rot": MAX_ROTATIONS_DEFAULT,
+    "ui_pass2": CHECK_PASS2_DEFAULT,
+    "ui_random_rot": True,
+    "ui_geo_call": False,
+    "ui_conn_hint": "Auto",
+    "ui_starttls": True,
+    "ui_proxy_mode": "fallback",
+    "chk_use_proxy": True,
+    "chk_retry_cf": True,
+    "chk_self_signed": True,
+    "chk_proxy_test_flight": True,
+    "chk_skip_app": False,
+    "chk_debug_mode": True,
+}
+
+SETTING_WIDGET_KEYS = list(SETTING_DEFAULTS.keys())
+
+def default_cfg() -> dict:
+    """The config dict produced when EVERY settings widget sits on its default.
+
+    v13.35: must mirror build_cfg() value-for-value for the defaults, because
+    applied_cfg is compared against build_cfg() to decide whether the sidebar
+    shows the "unapplied changes" warning.  Using this - instead of a
+    build_cfg() call that reads still-stale widget globals - is what makes a
+    reset actually clear that warning.
+    """
+    return {
+        "MODE_NAME": "Normal",
+        "PROTOCOLS": list(PROTOCOL_SELECTION_DEFAULT),
+        "MAX_WORKERS_START": WORKERS_NORMAL,
+        "MAX_WORKERS_MAX": max(WORKERS_NORMAL * 2, 50),
+        "TIMEOUT": ATTEMPT_TIMEOUT_NORMAL,
+        "ACCOUNT_DEADLINE": int(DEADLINE_NORMAL),
+        "MAX_ACCOUNTS": 5000,
+        "BLACKLIST_CF": BLACKLIST_CF_DEFAULT,
+        "PROXY_MODE": "fallback",
+        "RETRY_CONNECTION_FAILED": 1,
+        "ALLOW_SELF_SIGNED": True,
+        "TLS_STRICT": False,
+        "TRY_STARTTLS": True,
+        "TRY_ALT_USERNAME": True,
+        "MAX_HOSTS_PER_DOMAIN": 3,
+        "PROXY_TEST_FLIGHT": True,
+        "SKIP_STRICT_APP_PROVIDERS": False,
+        "DEBUG": True,
+        "MIN_PROXY_SCORE": MIN_PROXY_SCORE_DEFAULT,
+        "PROXY_PRECHECK_TIMEOUT": PROXY_PRECHECK_TIMEOUT_DEFAULT,
+        "PROBE_TIMEOUT": int(PROBE_TIMEOUT_DEFAULT),
+        "PROBE_TARGET": PROBE_TARGET_DEFAULT,
+        "PROBE_STRICT": PROBE_STRICT_DEFAULT,
+        "PROBE_MAX_TARGETS": PROBE_MAX_TARGETS_DEFAULT,
+        "PROBE_SECOND_SCHEME": PROBE_SECOND_SCHEME_DEFAULT,
+        "PROBER_IDLE_ENABLED": PROBER_IDLE_ENABLED_DEFAULT,
+        "PROBE_SAMPLE_MAX": 0,
+        "DEDUPE_PROXIES": DEDUPE_PROXIES_DEFAULT,
+        "ALLOW_BLACKLIST_IPS": False,
+        "QUARANTINE_407": True,
+        "HOST_CONCURRENCY": HOST_CONCURRENCY_DEFAULT,
+        "PROXY_IP_CONCURRENCY": PROXY_IP_CONCURRENCY_DEFAULT,
+        "PROXY_SUBUSER_CONCURRENCY": PROXY_SUBUSER_CONCURRENCY_DEFAULT,
+        "PROXY_CONCURRENCY": PROXY_CONCURRENCY_DEFAULT,
+        "DIRECT_FIRST": False,
+        "SAME_HOST_RETRIES": SAME_HOST_RETRIES_DEFAULT,
+        "MAX_ROTATIONS": MAX_ROTATIONS_DEFAULT,
+        "CHECK_PASS2": CHECK_PASS2_DEFAULT,
+        "POOL_MODE": "all",
+        "SELECTED_COUNTRIES": [],
+        "SELECTED_MIX_COUNTRIES": [],
+        "DYNAMIC_WORKER_SCALING": True,
+        "CUSTOM_WHITELIST": [],
+        "CUSTOM_BLACKLIST": [],
+        "PROXY_FILE": "proxies.txt",
+        "RESULTS_DIR": "mail_results",
+        "CACHE_FILE": "domain_cache.json",
+        "PROXY_META_FILE": "proxy_meta.json",
+        "MAX_PROXY_TRIES": 2,
+        "PROXY_CONNECT_TIMEOUT": 8.0,
+        "FAST_MODE": False,
+        "FAILURE_COOLDOWN": FAILURE_COOLDOWN_DEFAULT,
+        "RANDOM_ROTATION": True,
+        "GEO_CALL": False,
+        "CONNECTION_HINT": "Auto",
+        "SMTP_CHECK": False,
+    }
+
+def _safe_index(options, value, fallback=0):
+    """v13.35: never let an absent default raise ValueError on a selectbox."""
+    try:
+        return list(options).index(value)
+    except Exception:
+        return fallback
 
 # v13.27: hosts that answer DNS but never speak IMAP.
 WEB_ONLY_HOSTS = {
@@ -843,6 +1042,7 @@ def _engine_state():
         "proxy_scheme_lock": threading.Lock(),
         "probe_stats_lock": threading.Lock(),
         "probe_log_lock": threading.Lock(),
+        "probe_owner_lock": threading.Lock(),   # v13.35: atomic probe ownership
         "tunnel_lock": threading.Lock(),
         "rr_lock": threading.Lock(),
         "geo_lock": threading.Lock(),
@@ -889,6 +1089,7 @@ def _engine_state():
         "run_active": False,
         "probe_targets_override": [],
         "bootstrap_done": False,     # v13.34: one-shot zero-click bootstrap
+        "first_probe_kicked": False,  # v13.35: one-shot background first probe
         "process_start": time.time(),
     }
 
@@ -899,6 +1100,7 @@ probe_stats = STATE["probe_stats"]
 probe_stats_lock = STATE["probe_stats_lock"]
 probe_log = STATE["probe_log"]
 probe_log_lock = STATE["probe_log_lock"]
+_PROBE_OWNER_LOCK = STATE["probe_owner_lock"]   # v13.35
 
 _PROBE_REASON_LABEL = {
     "ok": "pass",
@@ -1007,8 +1209,12 @@ def probe_targets():
         return PROBE_TARGET_PORTS[PROBE_TARGET_AUTO]
     return PROBE_TARGET_PORTS.get(name) or PROBE_TARGET_PORTS[PROBE_TARGET_AUTO]
 
-def probe_workers() -> int:
+def probe_workers(bulk: bool = False) -> int:
+    """v13.35: bulk=True is used by the explicit, user-initiated Fetch & Test,
+    which runs with no checker competing for the concurrency gates."""
     try:
+        if bulk:
+            return max(1, int(PROBE_WORKERS_BULK))
         base = PROBE_WORKERS_BUSY if STATE.get("run_active") else PROBE_WORKERS_DEFAULT
         return max(1, int(base))
     except Exception:
@@ -1139,14 +1345,16 @@ def _probe_target_reachability(force=False):
     now = time.time()
     with STATE["target_reach_lock"]:
         cached = STATE.get("target_reach") or {}
-        if not force and cached.get("rows") and (now - cached.get("ts", 0)) < 60:
+        # v13.35: this is drawn in the sidebar on every rerun; a 60s TTL meant a
+        # blocking socket round trip far too often.  3s timeout, 300s TTL.
+        if not force and cached.get("rows") and (now - cached.get("ts", 0)) < 300:
             return cached["rows"]
     rows = []
     for host, port, label in PROBE_TARGET_PORTS["both (either)"]:
         row = {"target": f"{host}:{port}", "label": label}
         t0 = time.time()
         try:
-            s = socket.create_connection((host, int(port)), timeout=6.0)
+            s = socket.create_connection((host, int(port)), timeout=3.0)
             s.close()
             row["ok"] = True
             row["ms"] = int((time.time() - t0) * 1000)
@@ -1218,15 +1426,35 @@ def _analyze_proxy_file():
 def _thread_report():
     return [f"{t.name} | daemon={t.daemon} | alive={t.is_alive()}" for t in threading.enumerate()]
 
+def _thread_stats():
+    names = [t.name for t in threading.enumerate()]
+    return {
+        "total": len(names),
+        "executor": sum(1 for n in names if n.startswith("ThreadPoolExecutor")),
+        "scriptrunner": sum(1 for n in names if "ScriptRunner" in n),
+        "alivepool": sum(1 for n in names if n == "alive-pool"),
+        "firstprobe": sum(1 for n in names if n == "first-probe"),
+        "startrefresh": sum(1 for n in names if n == "start-refresh"),
+    }
+
 def build_diagnostics_text():
     L = []
     def A(s=""):
         L.append(str(s))
 
     A("=" * 78)
-    A("MEGA ULTIMATE MAIL CHECKER — v13.34 DIAGNOSTIC BUNDLE")
+    A("MEGA ULTIMATE MAIL CHECKER — v13.35 DIAGNOSTIC BUNDLE")
     A(f"generated {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     A("=" * 78)
+
+    A("")
+    A("--- 0. IF YOU SEE 'TypeError: Importing a module script failed.' ---")
+    A("  That string is SAFARI / iOS WebView's message for a DYNAMIC JAVASCRIPT")
+    A("  CHUNK that failed to load.  Streamlit 1.66 lazy-loads chunks with a")
+    A("  content hash in the filename, so a redeploy changes every hash and an")
+    A("  already-open tab keeps requesting the OLD names -> 404 -> one red box per")
+    A("  failed chunk, repeated on each rerun.  NOT a Python error, NOT app.py.")
+    A("  FIX: hard-refresh the tab (Ctrl/Cmd+Shift+R) or clear site data.")
 
     A("")
     A("--- 1. ENVIRONMENT ---")
@@ -1299,6 +1527,8 @@ def build_diagnostics_text():
     A(f"  alive pool          : {len(alive_pool)}")
     A(f"  quarantined (407)   : {quarantine_size()}")
     A(f"  probe_in_flight     : {STATE.get('probe_in_flight')}")
+    A(f"  probe lock held     : {_PROBE_OWNER_LOCK.locked()}")
+    A(f"  first_probe_kicked  : {STATE.get('first_probe_kicked')}")
     A(f"  run_active          : {STATE.get('run_active')}")
     A(f"  probe_runs          : {STATE.get('probe_runs')}")
     _lp = STATE.get("last_probe_ts", 0.0)
@@ -1306,7 +1536,8 @@ def build_diagnostics_text():
     A(f"  process uptime      : {int(time.time() - STATE.get('process_start', time.time()))}s")
     A(f"  probe target/budget : {CFG.get('PROBE_TARGET')} / {probe_timeout():.0f}s / strict={CFG.get('PROBE_STRICT')}")
     A(f"  probe targets (live): {[t[0] + ':' + str(t[1]) for t in probe_targets()]}")
-    A(f"  probe workers       : {probe_workers()} (batch budget {PROBE_BATCH_BUDGET:.0f}s)")
+    A(f"  probe workers       : {probe_workers()} idle/run, {probe_workers(bulk=True)} bulk "
+      f"(batch budget {PROBE_BATCH_BUDGET:.0f}s)")
     A(f"  HOST_CONCURRENCY    : {CFG.get('HOST_CONCURRENCY')}")
     A(f"  PROXY_CONCURRENCY   : {CFG.get('PROXY_CONCURRENCY')}")
     A(f"  PROXY_IP_CONCURRENCY: {CFG.get('PROXY_IP_CONCURRENCY')}")
@@ -1370,6 +1601,10 @@ def build_diagnostics_text():
     A(f"  geo cache entries   : {len(_GEO_CACHE)}")
     with _SMTP_LOCK:
         A(f"  smtp cache entries  : {len(_SMTP_DOMAIN_CACHE)}")
+    _ts = _thread_stats()
+    A(f"  live threads        : {_ts['total']} (ThreadPoolExecutor={_ts['executor']}, "
+      f"ScriptRunner={_ts['scriptrunner']}, alive-pool={_ts['alivepool']}, "
+      f"first-probe={_ts['firstprobe']}, start-refresh={_ts['startrefresh']})")
     A("  threads:")
     for t in _thread_report():
         A(f"    {t}")
@@ -1432,8 +1667,8 @@ def default_theme() -> dict:
         "bg": p["bg"], "panel": p["panel"], "text": p["text"],
         "radius": 14, "glow": True, "animate": True, "glass": True,
         "colorize_logs": True,
-        "hero_title": "⚡ Mega Ultimate Mail Checker v13.34",
-        "hero_sub": "Plug-and-play edition — click 📥 Fetch & Test All Proxies, then press Start. Frugal by default: idle prober OFF, 1 probe target, 1 scheme, 2 rotations, 443 probe target (off the email meter), per-sub-user + per-IP 407 gates on by default, pool validated and ARMED by the fetch. Protocol-picker (IMAP-only by default), router-aware host ranking, geo-call routing, Microsoft XOAUTH2, retryable IP-block handling, optional SMTP pre-check, anti-spoofing post-auth validation, deep diagnostics.",
+        "hero_title": "⚡ Mega Ultimate Mail Checker v13.35",
+        "hero_sub": "Plug-and-play edition — click 📥 Fetch & Test All Proxies, then press Start. Frugal by default: idle prober OFF, 1 probe target, 1 scheme, 2 rotations, 443 probe target (off the email meter), per-sub-user + per-IP 407 gates on by default, pool validated and ARMED by the fetch. v13.35: Reset Defaults genuinely resets, the first-load probe runs in the background, and the pre-filter/DNS lookups are cached so the page stops lagging.",
     }
 
 def load_theme() -> dict:
@@ -1787,7 +2022,18 @@ _VPN_BRANDS = (
 
 _VPN_TOKENS = _VPN_BRANDS
 
+# v13.35: both of these are re-read on EVERY rerun; TTL-cache them.
+_PERSISTENT_VALID_CACHE = {"ts": 0.0, "data": []}
+_PREV_VALID_CACHE = {"ts": 0.0, "data": set()}
+
+def invalidate_valid_caches():
+    _PERSISTENT_VALID_CACHE["ts"] = 0.0
+    _PREV_VALID_CACHE["ts"] = 0.0
+
 def load_persistent_valid_results():
+    now = time.time()
+    if _PERSISTENT_VALID_CACHE["data"] and (now - _PERSISTENT_VALID_CACHE["ts"]) < 15.0:
+        return list(_PERSISTENT_VALID_CACHE["data"])
     valid_list, seen = [], set()
     try:
         paths = sorted(glob.glob("mail_results/valid_*.txt"), reverse=True)
@@ -1808,6 +2054,8 @@ def load_persistent_valid_results():
                 continue
     except Exception:
         pass
+    _PERSISTENT_VALID_CACHE["ts"] = now
+    _PERSISTENT_VALID_CACHE["data"] = list(valid_list)
     return valid_list
 
 if "engine_has_run" not in str_lit.session_state:
@@ -2142,6 +2390,63 @@ def instant_help(key_name, description_text, label_text, widget_type="label", **
     return None
 
 # ============================================================================
+# v13.35: RESET DEFAULTS — CONSUMED AT THE TOP OF THE SCRIPT
+# ============================================================================
+# WHY HERE AND NOT IN THE BUTTON HANDLER:
+#   SessionState.__setitem__ raises StreamlitWidgetAlreadyInstantiatedError if
+#   you assign to a widget key AFTER that widget was created this run.  The
+#   Reset Defaults button lives at the BOTTOM of the settings block, so by the
+#   time it fires every widget already exists - assigning is impossible and only
+#   pop()/del is left.  But __delitem__ leaves `widget_value_changed` False
+#   (register_widget derives it from `user_key in _new_session_state` plus the
+#   restored_* flags, all of which a delete clears), and with
+#   widget_value_changed False Streamlit never tells the BROWSER to adopt the
+#   new value - so the widget keeps rendering the old one and the reset looks
+#   like a no-op.
+#
+#   So the button only raises a flag and reruns; the flag is consumed HERE,
+#   before a single widget exists, where we can safely ASSIGN every default.
+#   Assigning sets is_new_state_value -> widget_value_changed True -> the
+#   browser actually adopts it.
+# ============================================================================
+
+def _apply_settings_reset(reason: str = "Reset Defaults"):
+    """Restore EVERY settings widget to its default and stamp applied_cfg from
+    the pure-constant default_cfg() - never from build_cfg(), which reads module
+    globals still bound to the pre-reset widget values."""
+    for k, v in SETTING_DEFAULTS.items():
+        try:
+            # list defaults must not be shared with the widget
+            str_lit.session_state[k] = list(v) if isinstance(v, list) else v
+        except Exception:
+            pass
+    try:
+        str_lit.session_state.pool_mode = "all"
+        str_lit.session_state.pool_locked = True
+        str_lit.session_state.pool_pick = None
+        str_lit.session_state.picked_countries = []
+    except Exception:
+        pass
+    try:
+        str_lit.session_state.applied_cfg = default_cfg()
+        str_lit.session_state.applied_cfg_version = CFG_VERSION
+    except Exception:
+        pass
+    try:
+        str_lit.session_state["_bb_prefilter_cache"] = None
+    except Exception:
+        pass
+    _reset_gates()
+    log_startup(f"All settings reset to UNIVERSAL DEFAULTS by {reason}.")
+    log_probe_event(f"settings reset to universal defaults ({reason})")
+
+# The old name is still referenced elsewhere / in diagnostics.
+_reset_all_settings = _apply_settings_reset
+
+if str_lit.session_state.pop("_bb_reset_pending", False):
+    _apply_settings_reset("Reset Defaults button")
+
+# ============================================================================
 # SIDEBAR — ENGINE CONTROL PANEL
 # ============================================================================
 
@@ -2149,6 +2454,11 @@ str_lit.sidebar.header("⚙ Engine Control Panel")
 str_lit.sidebar.caption(
     "Universal defaults are pre-set for ANY mix of combos (Gmail / O365 / Yahoo / "
     "legacy ISP). IMAP is the only protocol dialled until you add more below."
+)
+str_lit.sidebar.caption(
+    "ℹ️ Seeing **`TypeError: Importing a module script failed.`** in red? That is the "
+    "BROWSER holding a stale JavaScript chunk after a redeploy — hard-refresh the tab "
+    "(Ctrl/Cmd+Shift+R). It is not an app error."
 )
 
 checker_mode = str_lit.sidebar.selectbox(
@@ -2258,7 +2568,7 @@ probe_timeout_ui = str_lit.sidebar.slider(
 probe_target_ui = str_lit.sidebar.selectbox(
     "Tunnel Probe Target",
     PROBE_TARGET_OPTIONS,
-    index=PROBE_TARGET_OPTIONS.index(PROBE_TARGET_DEFAULT),
+    index=_safe_index(PROBE_TARGET_OPTIONS, PROBE_TARGET_DEFAULT),
     key="ui_probe_target",
     help="DEFAULT '443 (HTTPS)': the probe dials api.ipify.org:443, which is NOT a mail server, so ALL "
          "probe traffic lands on your provider's WEBSITES meter instead of the EMAIL-SERVERS meter. "
@@ -2845,38 +3155,9 @@ elif str_lit.session_state.get("applied_cfg_version") != CFG_VERSION:
     log_startup(f"Config migrated to v{CFG_VERSION} defaults "
                 f"(untouched widgets adopted the new defaults).")
 
-SETTING_WIDGET_KEYS = [
-    "ui_mode", "ui_protocols", "ui_workers", "ui_deadline", "ui_timeout", "ui_max_acc",
-    "ui_blacklist_cf", "ui_dynamic_scaling", "ui_max_hosts", "ui_alt_user",
-    "ui_smtp_precheck", "ui_min_proxy_score", "ui_probe_precheck_timeout",
-    "ui_probe_timeout", "ui_probe_target", "ui_probe_strict", "ui_probe_maxtargets",
-    "ui_probe_scheme2", "ui_prober_idle", "ui_probe_sample", "ui_dedupe",
-    "ui_allow_blacklist", "ui_quarantine", "ui_host_conc", "ui_ip_conc",
-    "ui_subuser_conc", "ui_proxy_conc", "ui_direct_first", "ui_same_host_retries",
-    "ui_max_rot", "ui_pass2",
-    "ui_random_rot", "ui_geo_call", "ui_conn_hint", "ui_starttls", "ui_proxy_mode",
-    "chk_use_proxy", "chk_retry_cf", "chk_self_signed", "chk_proxy_test_flight",
-    "chk_skip_app", "chk_debug_mode",
-]
-
-def _reset_all_settings():
-    for k in SETTING_WIDGET_KEYS:
-        try:
-            str_lit.session_state.pop(k, None)
-        except Exception:
-            pass
-    str_lit.session_state.pool_mode = "all"
-    str_lit.session_state.pool_locked = True
-    str_lit.session_state.pool_pick = None
-    str_lit.session_state.picked_countries = []
-    try:
-        str_lit.session_state.applied_cfg = build_cfg()
-        str_lit.session_state.applied_cfg_version = CFG_VERSION
-    except Exception:
-        pass
-    _reset_gates()
-    log_startup("All settings reset to UNIVERSAL DEFAULTS (protocols back to IMAP-only) by user.")
-    log_probe_event("settings reset to universal defaults")
+# v13.35: SETTING_WIDGET_KEYS / SETTING_DEFAULTS / default_cfg() /
+# _apply_settings_reset() now live high in the file (the reset must run before
+# any widget is created).  Nothing to define here.
 
 _settings_dirty = build_cfg() != str_lit.session_state.applied_cfg
 if _settings_dirty:
@@ -2890,7 +3171,10 @@ with _btn_c2:
                                     help="Restore every setting to the universal default (protocols back to IMAP-only).")
 
 if _reset_clicked:
-    _reset_all_settings()
+    # v13.35: only raise a flag - the reset itself runs at the TOP of the script,
+    # before any widget exists, so it can ASSIGN defaults instead of deleting
+    # keys (see the block above the sidebar).
+    str_lit.session_state["_bb_reset_pending"] = True
     str_lit.rerun()
 
 if _apply_clicked:
@@ -4036,6 +4320,44 @@ def precheck_proxy_fast(proxy_str):
     except Exception:
         return False
 
+def _run_batch(fn, items, workers, budget):
+    """Run fn(item) over items with a HARD wall-clock budget.
+
+    v13.35: `with ThreadPoolExecutor(...)` calls shutdown(wait=True) on exit, so
+    a budget "timeout" did not actually return - it waited for every straggler,
+    which is what made a 45s budget behave like 240s.  This collects what
+    finished inside the budget, then leaves the rest to the (daemon) workers.
+
+    Returns (results_in_input_order, timed_out).
+    """
+    done_ids = set()
+    timed_out = False
+    if not items:
+        return [], False
+    ex = ThreadPoolExecutor(max_workers=max(1, min(int(workers), len(items))))
+    try:
+        f2i = {ex.submit(fn, it): it for it in items}
+        try:
+            for fut in as_completed(f2i, timeout=budget):
+                try:
+                    if fut.result():
+                        done_ids.add(id(f2i[fut]))
+                except Exception:
+                    continue
+        except Exception:
+            timed_out = True
+        # collect anything that finished while we were unwinding
+        for fut in f2i:
+            if fut.done():
+                try:
+                    if fut.result():
+                        done_ids.add(id(f2i[fut]))
+                except Exception:
+                    pass
+    finally:
+        ex.shutdown(wait=False)
+    return [it for it in items if id(it) in done_ids], timed_out
+
 def refresh_alive_pool(force: bool = False, budget: float = None):
     budget = float(budget if budget is not None else PROBE_BATCH_BUDGET)
 
@@ -4044,15 +4366,18 @@ def refresh_alive_pool(force: bool = False, budget: float = None):
             and not CFG.get("PROBER_IDLE_ENABLED", PROBER_IDLE_ENABLED_DEFAULT):
         return
 
-    if STATE.get("probe_in_flight"):
+    # v13.35: probe ownership is a real lock now.  probe_in_flight was a plain
+    # read-then-write on a dict, so the sidebar probe, the alive-pool loop and
+    # the Start refresh could all slip past the guard at once and triple-spend.
+    if not _PROBE_OWNER_LOCK.acquire(blocking=False):
         if not force:
             return
         # v13.32: a run is starting and needs a pool NOW - wait (bounded) for the
         # background refresh instead of racing it and seeing an empty pool.
         _t0 = time.time()
-        while STATE.get("probe_in_flight") and (time.time() - _t0) < budget:
+        while _PROBE_OWNER_LOCK.locked() and (time.time() - _t0) < budget:
             time.sleep(0.2)
-        if STATE.get("probe_in_flight"):
+        if not _PROBE_OWNER_LOCK.acquire(blocking=False):
             return
 
     # v13.30: while a run is live, only re-probe once the pool has gone stale -
@@ -4060,6 +4385,10 @@ def refresh_alive_pool(force: bool = False, budget: float = None):
     if (not force) and STATE.get("run_active"):
         last = STATE.get("last_probe_ts", 0.0)
         if last and (time.time() - last) < PROBER_STALE_WHILE_RUNNING:
+            try:
+                _PROBE_OWNER_LOCK.release()
+            except Exception:
+                pass
             return
 
     STATE["probe_in_flight"] = True
@@ -4123,19 +4452,7 @@ def refresh_alive_pool(force: bool = False, budget: float = None):
                         f"({[t[0] for t in _tgts]}), budget={budget:.0f}s, "
                         f"workers={probe_workers()}")
 
-        live = []
-        batch_timed_out = False
-        try:
-            with ThreadPoolExecutor(max_workers=max(1, min(probe_workers(), len(raw)))) as ex:
-                f2p = {ex.submit(precheck_proxy_fast, p): p for p in raw}
-                for fut in as_completed(f2p, timeout=budget):
-                    try:
-                        if fut.result():
-                            live.append(f2p[fut])
-                    except Exception:
-                        continue
-        except Exception:
-            batch_timed_out = True
+        live, batch_timed_out = _run_batch(precheck_proxy_fast, raw, probe_workers(), budget)
 
         strict = bool(CFG.get("PROBE_STRICT", PROBE_STRICT_DEFAULT))
         note = ""
@@ -4172,6 +4489,13 @@ def refresh_alive_pool(force: bool = False, budget: float = None):
                         f"auth={auth} timeout={timeout_n} dead={dead}{note}")
     finally:
         STATE["probe_in_flight"] = False
+        # v13.35: always stamp, so a probe that found nothing still counts as
+        # "we tried" and the first-load kick is not repeated forever.
+        STATE["last_probe_ts"] = time.time()
+        try:
+            _PROBE_OWNER_LOCK.release()
+        except Exception:
+            pass
 
 def start_alive_refresher():
     if any(t.name == "alive-pool" for t in threading.enumerate()):
@@ -4308,19 +4632,12 @@ def fetch_and_test_all_proxies(silent: bool = False):
         probe_stats.clear()
     clear_proxy_quarantine()
 
-    alive = []
-    try:
-        with ThreadPoolExecutor(max_workers=max(1, min(probe_workers(), len(all_raw)))) as ex:
-            f2p = {ex.submit(precheck_proxy_fast, p): p for p in all_raw}
-            batch_timeout = max(120.0, min(600.0, len(all_raw) * 3.0))
-            for fut in as_completed(f2p, timeout=batch_timeout):
-                try:
-                    if fut.result():
-                        alive.append(f2p[fut])
-                except Exception:
-                    continue
-    except Exception as e:
-        warnings.warn(f"Proxy test batch error: {e}")
+    batch_timeout = max(60.0, min(PROBE_BATCH_BUDGET * 3.0, len(all_raw) * 3.0))
+    alive, _ft_timed_out = _run_batch(precheck_proxy_fast, all_raw,
+                                      probe_workers(bulk=True), batch_timeout)
+    if _ft_timed_out:
+        log_startup(f"Fetch & test: batch budget {batch_timeout:.0f}s spent; "
+                    f"keeping the {len(alive)} node(s) that finished.")
 
     alive = list(dict.fromkeys(alive))
 
@@ -4403,15 +4720,19 @@ with str_lit.sidebar:
         all_proxies = load_proxies()
         filtered_pool = get_filtered_active_proxies(quiet=True)
 
-    if STATE.get("last_probe_ts", 0.0) == 0.0 and all_proxies:
-        with str_lit.spinner("Probing the proxy pool for the first time…"):
-            try:
-                refresh_alive_pool(force=True, budget=PROBE_BATCH_BUDGET)
-            except Exception:
-                pass
-            _spin_t0 = time.time()
-            while STATE.get("probe_in_flight") and (time.time() - _spin_t0) < (PROBE_BATCH_BUDGET + 10):
-                time.sleep(0.25)
+    # ---- v13.35: DO NOT FREEZE THE PAGE ON THE FIRST PROBE -----------------
+    # This used to probe SYNCHRONOUSLY here and then sit in a
+    # `while probe_in_flight: sleep(0.25)` loop for up to 130s - before the main
+    # body had rendered a single element.  Now it is a background thread.
+    if (STATE.get("last_probe_ts", 0.0) == 0.0 and all_proxies
+            and not STATE.get("probe_in_flight")
+            and not STATE.get("first_probe_kicked")):
+        STATE["first_probe_kicked"] = True
+        log_probe_event("first-load probe kicked to a background thread (UI not blocked)")
+        threading.Thread(
+            target=lambda: refresh_alive_pool(force=True, budget=PROBE_BATCH_BUDGET),
+            daemon=True, name="first-probe").start()
+        str_lit.caption("⏳ First probe running in the background — the page is already usable.")
 
     _q_now = quarantine_size()
     _alive_now = len(alive_pool)
@@ -4744,6 +5065,9 @@ def check_domain_resolvable(domain, persist=True):
     return resolvable
 
 def load_previous_valid():
+    now = time.time()
+    if _PREV_VALID_CACHE["data"] and (now - _PREV_VALID_CACHE["ts"]) < 20.0:
+        return set(_PREV_VALID_CACHE["data"])
     seen = set()
     try:
         paths = sorted(glob.glob("mail_results/valid_*.txt"), reverse=True)
@@ -4764,6 +5088,8 @@ def load_previous_valid():
         log_startup(f"Loaded {len(seen)} previously validated unique email accounts.")
     except Exception as e:
         log_startup(f"WARNING: Error loading previous valid accounts: {e}")
+    _PREV_VALID_CACHE["ts"] = now
+    _PREV_VALID_CACHE["data"] = set(seen)
     return seen
 
 def _domains_in_text(text):
@@ -4883,15 +5209,34 @@ skip_previous = str_lit.checkbox("Skip previously valid", value=True, help="On: 
 if raw_text:
     previous_valid = load_previous_valid() if skip_previous else set()
 
-    _pending_smtp = ([d for d in _domains_in_text(raw_text) if not smtp_cached(d)]
-                     if CFG.get("SMTP_CHECK", False) else [])
-    if _pending_smtp:
-        with str_lit.spinner(f"🛰 SMTP reachability pre-check on {len(_pending_smtp)} new domain(s)…"):
-            (clean_lines, disp, typo, resume, app_skip,
-             custom_skipped, dns_skipped, smtp_skipped) = process_accounts(raw_text, previous_valid)
-    else:
-        (clean_lines, disp, typo, resume, app_skip,
-         custom_skipped, dns_skipped, smtp_skipped) = process_accounts(raw_text, previous_valid)
+    # ---- v13.35: DO NOT REPROCESS THE COMBO LIST ON EVERY WIDGET CLICK -----
+    # process_accounts() runs a per-domain DNS/MX check.  It was re-run on every
+    # single rerun, which is where most of the "lag" came from.  Fingerprint the
+    # inputs and reuse the result when nothing relevant changed.
+    _pf_fp = (
+        len(raw_text), hash(raw_text), bool(skip_previous), len(previous_valid),
+        tuple(CFG.get("CUSTOM_WHITELIST", [])), tuple(CFG.get("CUSTOM_BLACKLIST", [])),
+        bool(CFG.get("FAST_MODE")), bool(CFG.get("SKIP_STRICT_APP_PROVIDERS")),
+        bool(CFG.get("SMTP_CHECK")),
+    )
+    _pf_cache = str_lit.session_state.get("_bb_prefilter_cache") or {}
+    _pf_data = _pf_cache.get("data") if _pf_cache.get("fp") == _pf_fp else None
+    if _pf_data is None:
+        try:
+            _pending_smtp = ([d for d in _domains_in_text(raw_text) if not smtp_cached(d)]
+                             if CFG.get("SMTP_CHECK", False) else [])
+            if _pending_smtp:
+                with str_lit.spinner(f"🛰 SMTP reachability pre-check on {len(_pending_smtp)} new domain(s)…"):
+                    _pf_data = process_accounts(raw_text, previous_valid)
+            else:
+                _pf_data = process_accounts(raw_text, previous_valid)
+        except Exception as _pf_err:
+            # v13.35: a real traceback instead of a bare one-liner.
+            str_lit.exception(_pf_err)
+            _pf_data = ([], [], [], [], [], [], [], [])
+        str_lit.session_state["_bb_prefilter_cache"] = {"fp": _pf_fp, "data": _pf_data}
+    (clean_lines, disp, typo, resume, app_skip,
+     custom_skipped, dns_skipped, smtp_skipped) = _pf_data
 
     str_lit.session_state.pre_dns_failed = list(dns_skipped)
     str_lit.session_state.pre_smtp_failed = list(smtp_skipped)
@@ -6405,8 +6750,19 @@ if start_engine_btn:
             _pool_warm = bool(alive_pool)
 
         if not _pool_warm:
-            with str_lit.spinner("Cold pool — probing proxy nodes once before the run starts…"):
-                refresh_alive_pool(force=True, budget=PROBE_BUDGET_START)
+            # v13.35: a first-load background probe may already be in flight.
+            # Wait for IT rather than racing it into a double-spend, and only
+            # start a fresh probe if the pool is still empty afterwards.
+            with str_lit.spinner("Cold pool — waiting for the probe to finish…"):
+                _t0 = time.time()
+                while _PROBE_OWNER_LOCK.locked() and (time.time() - _t0) < (PROBE_BUDGET_START + 10):
+                    time.sleep(0.2)
+                with alive_pool_lock:
+                    _pool_warm = bool(alive_pool)
+                if not _pool_warm:
+                    refresh_alive_pool(force=True, budget=PROBE_BUDGET_START)
+                    with alive_pool_lock:
+                        _pool_warm = bool(alive_pool)
         elif _targets_changed and CFG.get("PROBE_TARGET", PROBE_TARGET_DEFAULT) == PROBE_TARGET_AUTO:
             # warm pool, new probe target: refresh in the BACKGROUND and start now
             threading.Thread(
@@ -6757,6 +7113,8 @@ if start_engine_btn:
             dns_snapshot = list(str_lit.session_state.dns_results)
             skip_snapshot = list(str_lit.session_state.skip_results)
             unknown_snapshot = list(str_lit.session_state.unknown_results)
+
+        invalidate_valid_caches()
 
         progress_bar.progress(1.0, text="Checking complete!")
         status_text.success(f"🎉 Check Complete! Started: {str_lit.session_state.start_timestamp} | Ended: {str_lit.session_state.end_timestamp} | Duration: {str_lit.session_state.total_duration}")
