@@ -1,9 +1,34 @@
 """
-Mega Ultimate Mail Checker — v13.27
+Mega Ultimate Mail Checker — v13.28
 ===================================
 Complete rewrite. SMTP reachability is an OPT-IN pre-check stage (never inside
 the validator), status classification actually works, and every direct-connection
 line carries the real egress IP / region / country / VPN state.
+
+v13.28 changes  (a 407 is no longer invented by a dead SOCKS5 listener)
+-----------------------------------------------------------------------
+A provider that ACCEPTS your credentials over HTTP CONNECT but REJECTS them over
+SOCKS5 (255) was turning every ordinary transport failure into a fake 407.
+
+  * THE HTTP SCHEME IS NOW THE DEFAULT.  _scheme_order() led with SOCKS5, so
+    every fresh node paid a wasted SOCKS5 round trip - and, worse, a SOCKS5
+    "authentication failed" poisoned proxy_connect()'s proxy_auth_err even when
+    the HTTP attempt that followed had merely TIMED OUT.  proxy_connect() now
+    raises ProxyAuthError ONLY when the scheme it PREFERS auth-failed; a failure
+    on the fallback scheme is a transport failure.
+  * tunnel_probe() APPLIES THE SAME RULE.  A node whose SOCKS5 port 255s while
+    its HTTP port is simply unreachable used to be filed as reason="auth" and
+    the dashboard read 407 for a node that was never rejected.
+  * THE POOL PROBE CAN NOW TARGET THE ACTUAL MAIL HOST.  New "windstream 993"
+    probe target, because imap.gmail.com:993 says nothing about whether a node
+    can reach imap.windstream.net:993.  A pool that is "60/60 alive" against
+    Gmail can be 0/60 against Windstream, and the sidebar now lets you see it.
+  * _remember_scheme() no longer locks onto a scheme that 255s.  When the
+    preferred scheme is the one that auth-fails, the other one is remembered.
+
+  Net effect: "the node cannot reach Windstream" is reported as
+  CONNECTION_FAILED, not PROXY_UNHEALTHY, and a reachable pool is no longer
+  quarantined to death by a SOCKS5 artefact.
 
 v13.27 changes
 --------------
@@ -451,7 +476,7 @@ str_lit.set_page_config(
 )
 
 # ============================================================================
-# PROXY-LAYER FAILURE CONTRACT  (v13.25 / v13.27)
+# PROXY-LAYER FAILURE CONTRACT  (v13.25 / v13.27 / v13.28)
 # ============================================================================
 PROXY_407_QUARANTINE = 2          # 407s on a node before it leaves the pool
 PROXY_407_FORCE_DIRECT = 5        # v13.27: was 2 - with 85 nodes, 4 proves nothing
@@ -463,6 +488,10 @@ PROBE_STRICT_DEFAULT = True       # True: only probe-passing nodes enter the poo
 PROBE_TARGET_PORTS = {
     "993 (IMAP)": [("imap.gmail.com", 993, "993")],
     "443 (HTTPS)": [("api.ipify.org", 443, "443")],
+    # v13.28: gmail says nothing about whether a node can reach the MAIL host.
+    # A pool can be 60/60 alive against Gmail and 0/60 against Windstream.
+    "windstream 993": [("imap.windstream.net", 993, "ws-imap993")],
+    "windstream 995": [("pop.windstream.net", 995, "ws-pop995")],
     "both (either)": [("imap.gmail.com", 993, "993"), ("api.ipify.org", 443, "443")],
 }
 
@@ -800,7 +829,7 @@ def build_diagnostics_text():
         L.append(str(s))
 
     A("=" * 78)
-    A("MEGA ULTIMATE MAIL CHECKER — v13.27 DIAGNOSTIC BUNDLE")
+    A("MEGA ULTIMATE MAIL CHECKER — v13.28 DIAGNOSTIC BUNDLE")
     A(f"generated {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     A("=" * 78)
 
@@ -977,7 +1006,7 @@ def default_theme() -> dict:
         "bg": p["bg"], "panel": p["panel"], "text": p["text"],
         "radius": 14, "glow": True, "animate": True, "glass": True,
         "colorize_logs": True,
-        "hero_title": "⚡ Mega Ultimate Mail Checker v13.27",
+        "hero_title": "⚡ Mega Ultimate Mail Checker v13.28",
         "hero_sub": "World-Coverage Edition — router-aware host ranking, concurrency-governed rotating proxy pool with 407 quarantine, geo-call routing, Microsoft XOAUTH2, retryable IP-block handling, optional SMTP pre-check, anti-spoofing post-auth validation, deep diagnostics.",
     }
 
@@ -1659,8 +1688,12 @@ probe_timeout_ui = str_lit.sidebar.slider(
          "more than 3s on an IMAP port; at 3s those nodes were being dropped as dead."
 )
 probe_target_ui = str_lit.sidebar.selectbox(
-    "Tunnel Probe Target", ["993 (IMAP)", "443 (HTTPS)", "both (either)"], index=0,
+    "Tunnel Probe Target",
+    ["993 (IMAP)", "443 (HTTPS)", "windstream 993", "windstream 995", "both (either)"],
+    index=0,
     help="993 proves the node can carry IMAP. 443 proves it can carry HTTPS. "
+         "'windstream 993' proves the node can reach the ACTUAL mail host - a pool that is "
+         "60/60 against Gmail can be 0/60 against Windstream. "
          "'both (either)' passes if either one works."
 )
 probe_strict_ui = str_lit.sidebar.toggle(
@@ -1828,7 +1861,7 @@ def parse_proxy(proxy_str):
     return None
 
 # ---------------------------------------------------------------------------
-# PROXY-LAYER HELPERS  (v13.25)
+# PROXY-LAYER HELPERS  (v13.25 / v13.28)
 # ---------------------------------------------------------------------------
 def proxy_is_quarantined(proxy_str) -> bool:
     if not proxy_str:
@@ -1863,14 +1896,18 @@ def clear_proxy_quarantine():
     log_probe_event("quarantine cleared by user")
 
 def _scheme_order(proxy_str):
-    """Try the scheme that last worked for this node FIRST (halves connect cost)."""
+    """Try the scheme that last worked for this node FIRST (halves connect cost).
+
+    v13.28: HTTP IS NOW THE DEFAULT.  A Webshare-style node very often speaks
+    HTTP CONNECT with the same credentials it REJECTS over SOCKS5 (255).  Leading
+    with SOCKS5 cost a wasted round trip on every fresh node AND poisoned the 407
+    path (see proxy_connect).
+    """
     with _proxy_scheme_lock:
         pref = _proxy_scheme.get(proxy_str)
-    if pref == socks.HTTP:
-        return (socks.HTTP, socks.SOCKS5)
     if pref == socks.SOCKS5:
         return (socks.SOCKS5, socks.HTTP)
-    return (socks.SOCKS5, socks.HTTP)
+    return (socks.HTTP, socks.SOCKS5)
 
 def _remember_scheme(proxy_str, ptype):
     with _proxy_scheme_lock:
@@ -2433,8 +2470,9 @@ def proxy_connect(host, port, proxy_str, timeout=None, remote_dns=True):
         raise RuntimeError("bad proxy format or socks unavailable")
 
     last_err = None
-    proxy_auth_err = None
-    for ptype in _scheme_order(proxy_str):
+    auth_schemes = set()
+    order = _scheme_order(proxy_str)
+    for ptype in order:
         try:
             kw = {"proxy_type": ptype, "proxy_addr": info["host"], "proxy_port": info["port"], "proxy_rdns": remote_dns}
             if info["user"]:
@@ -2448,12 +2486,15 @@ def proxy_connect(host, port, proxy_str, timeout=None, remote_dns=True):
         except Exception as proxy_ex:
             last_err = proxy_ex
             if _is_proxy_auth_fail(str(proxy_ex)):
-                proxy_auth_err = proxy_ex
+                auth_schemes.add(ptype)
 
     outer_has_direct_sweep = CFG.get("PROXY_MODE", "fallback") == "fallback"
 
-    if proxy_auth_err is not None:
-        raise ProxyAuthError(f"Proxy authentication required for {host}:{port}: {proxy_auth_err}")
+    # v13.28: only a rejection on the scheme we actually PREFER is a real 407.
+    # A dead SOCKS5 listener that 255s while HTTP merely TIMES OUT is a TRANSPORT
+    # failure, not an auth failure - and must not be quarantined as one.
+    if order and order[0] in auth_schemes:
+        raise ProxyAuthError(f"Proxy authentication required for {host}:{port}: {last_err}")
 
     if fast_fail_dns_check(host) and not outer_has_direct_sweep:
         try:
@@ -2512,7 +2553,10 @@ def px_tag(proxy_str):
         return "proxy"
     meta = proxy_meta.get(proxy_str, {})
     q = " [QUARANTINED]" if proxy_is_quarantined(proxy_str) else ""
-    return f"{info.get('host')}:{info.get('port')} | {meta.get('country') or '?'} | {meta.get('region') or '?'}{q}"
+    # v13.28: show the USERNAME too.  With 7 sub-users sharing one IP a bare
+    # host:port trace could not tell you which sub-user was used.
+    who = f"{info.get('user')}@" if info.get("user") else ""
+    return f"{who}{info.get('host')}:{info.get('port')} | {meta.get('country') or '?'} | {meta.get('region') or '?'}{q}"
 
 # ============================================================================
 # PROTOCOL CLIENTS
@@ -2838,6 +2882,8 @@ def tunnel_probe(proxy_str, targets=None, timeout=None):
     timeout = timeout if timeout is not None else probe_timeout()
     errors = []
     auth_schemes = set()
+    # v13.28: the scheme we PREFER.  Only its rejection is a genuine 407.
+    preferred = _scheme_order(proxy_str)[0]
 
     for host, port, label in targets:
         for ptype in _scheme_order(proxy_str):
@@ -2859,8 +2905,12 @@ def tunnel_probe(proxy_str, targets=None, timeout=None):
                 errors.append(f"{label}/{'HTTP' if ptype == socks.HTTP else 'SOCKS5'}: "
                               f"{type(e).__name__}: {msg[:100]}")
                 if _is_proxy_auth_fail(msg):
-                    out["reason"] = "auth"
                     auth_schemes.add(ptype)
+                    # v13.28: a dead SOCKS5 listener must not label the node 'auth'.
+                    if ptype == preferred:
+                        out["reason"] = "auth"
+                    elif out["reason"] != "auth":
+                        out["reason"] = "dead"
                 elif isinstance(e, (socket.timeout, TimeoutError)) or "timed out" in msg.lower():
                     if out["reason"] != "auth":
                         out["reason"] = "timeout"
@@ -2876,8 +2926,10 @@ def tunnel_probe(proxy_str, targets=None, timeout=None):
                     except Exception:
                         pass
 
-    if len(auth_schemes) == 1:
-        _remember_scheme(proxy_str, next(iter(auth_schemes)))
+    # If ONLY the non-preferred scheme auth-failed, remember the other one.
+    if auth_schemes and preferred in auth_schemes and len(auth_schemes) == 1:
+        other = socks.SOCKS5 if preferred == socks.HTTP else socks.HTTP
+        _remember_scheme(proxy_str, other)
 
     out["error"] = " ; ".join(errors)[:200]
     return out
@@ -3262,6 +3314,7 @@ with str_lit.sidebar:
                     _last = "—"
                 rows.append({
                     "Proxy": f"{info['host']}:{info['port']}" if info else "Unknown",
+                    "User": (info.get("user") if info else "") or "",
                     "Latency": f"{meta.get('latency_ms', 'N/A')} ms",
                     "Country": meta.get("country", "Unknown"),
                     "Region": meta.get("region", "Unknown"),
