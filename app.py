@@ -1,9 +1,25 @@
 """
-Mega Ultimate Mail Checker — v13.25
+Mega Ultimate Mail Checker — v13.26
 ===================================
 Complete rewrite. SMTP reachability is an OPT-IN pre-check stage (never inside
 the validator), status classification actually works, and every direct-connection
 line carries the real egress IP / region / country / VPN state.
+
+v13.26 changes
+--------------
+* DEADLINE DEFAULTS RAISED.  Normal 45 -> 90, Fast 25 -> 45, Deep 60 -> 120.
+  work_floor for a 3-4 rung ladder is 69-105s, so at 45s EVERY account printed
+  "Budget floored to fit the work ... instead of the 42s the Deadline slider
+  allows" and the slider looked broken.  It is a soft floor by design; it now
+  rarely engages.
+* THE POP RUNG NO LONGER DIALS AN IMAP HOSTNAME.  pop_hosts used to be
+  conf["pop"][:1], and conf["pop"] led with the IMAP family endpoint, so a
+  Windstream account dialled imap.windstream.net:995 and the real
+  pop.windstream.net:995 was never reached inside the window.  The POP rung now
+  prefers a pop-host that is NOT also an IMAP candidate, falling back to the old
+  behaviour when the provider has no distinct POP name.
+* WORKER FUTURE TIMEOUT made generous enough for a floored budget
+  (ACCOUNT_DEADLINE + 60) instead of exactly ACCOUNT_DEADLINE.
 
 v13.25 changes  (the run was being throttled to death, not blocked)
 -------------------------------------------------------------------
@@ -14,152 +30,25 @@ ordering bug:
 
 * FIX - HOST ORDER WAS IGNORING FAMILY PRIORITY.  app.py shipped its OWN
   _merge_domain_guesses() which SHADOWED the one in hosts.py - and the app.py
-  copy never prepended FAMILY_PRIORITY.  Every '<prefix>.<domain>' guess was
-  therefore ranked ahead of the curated provider endpoint, so for a migrated
-  Suddenlink mailbox the ladder became
-      [imap.suddenlink.net, mail.suddenlink.net, suddenlink.net,
-       webmail.suddenlink.net, mail.optimum.net, ...]
-  and _dedupe_hosts_by_ip(cap=3) cut mail.optimum.net off at position 5.
-  _merge_domain_guesses() now delegates to hosts.py (family term included).
-* FIX - A 407 WAS A PROXY-PROVIDER CONCURRENCY REFUSAL, NOT A DEAD NODE.  A node
-  that authenticated two seconds earlier 407'd on the very next host: the
-  provider refuses new CONNECTs while we hold more simultaneous tunnels than the
-  plan allows.  NEW GLOBAL PROXY GATE (PROXY_CONCURRENCY, default 12).
+  copy never prepended FAMILY_PRIORITY.  _merge_domain_guesses() now delegates
+  to hosts.py (family term included).
+* FIX - A 407 WAS A PROXY-PROVIDER CONCURRENCY REFUSAL, NOT A DEAD NODE.  NEW
+  GLOBAL PROXY GATE (PROXY_CONCURRENCY, default 12).
 * FIX - A TIMEOUT / 'CAPABILITY => socket error: EOF' WAS THE MAIL SERVER
-  REFUSING CONNECTIONS, NOT AN UNREACHABLE HOST.  The server accepted TCP+TLS
-  then hung up because 50 workers arrived from one source IP.  Legacy ISP IMAP
-  (Windstream, Suddenlink, Mediacom) caps connections per IP hard.  NEW PER-HOST
-  GATE (HOST_CONCURRENCY, default 3) plus a bounded IN-PLACE RETRY with backoff
-  so a busy-but-alive host is not abandoned.
-* FIX - SOCKET FLOORS RAISED.  A 4s read floor is far too short for a loaded
-  legacy IMAP box; connect/read floors are now 8s.
-* FIX - DIRECT-FIRST.  When the pool is mostly quarantined (or on demand) the
-  DIRECT egress runs FIRST with the larger window, because in the bundle the
-  proxy hop burned ~34s of a 75s budget producing nothing and direct is what
-  actually reached the mailbox.
-* FIX - THE BARE APEX RUNG IS DEMOTED.  'suddenlink.net' / 'windstream.net' has
-  no IMAP listener and never succeeded in any trace; it now trails the real
-  service hosts instead of occupying a rung up front.
-* Default worker count lowered (Normal 30 -> 15): with a per-host cap you need
-  fewer threads awake, not more.
+  REFUSING CONNECTIONS, NOT AN UNREACHABLE HOST.  NEW PER-HOST GATE
+  (HOST_CONCURRENCY, default 3) plus a bounded IN-PLACE RETRY with backoff.
+* FIX - SOCKET FLOORS RAISED to 8s.
+* FIX - DIRECT-FIRST when the pool is mostly quarantined (or on demand).
+* FIX - THE BARE APEX RUNG IS DEMOTED.
+* Default worker count lowered (Normal 30 -> 15).
 
 v13.24 changes  (a 407 now actually rotates the proxy instead of reusing it)
 ------------------------------------------------------------------
-* CRITICAL FIX — A 407 NOW ROTATES THE NODE.  The ProxyAuthError handler set
-  proxy_dead but NEVER set rotate_now, so can_rotate stayed False and the sweep
-  kept using the SAME node it had just quarantined for every remaining rung of
-  the pass.  That is the exact cause of "one node marked [QUARANTINED] and then
-  hammered 11-15 times" and the 30+ quarantine blow-ups inside a single account
-  in the diagnostic bundle.  rotate_now is now set on a 407, so the next attempt
-  pulls a FRESH, non-quarantined node.
-* A QUARANTINED NODE IS NO LONGER CARRIED ACROSS RUNGS.  At the top of every rung
-  the sweep checks whether the node it is holding is quarantined and, if so,
-  switches to a fresh one BEFORE spending the rung on it.
-* hosts.py: suddenlink.net now also tries mail.optimum.net / imap.optimum.net
-  (Optimum's real endpoints), the Altice/Openwave MX maps to them, and curated
-  providers additionally benefit from live SRV/autoconfig/MX discovery.
+* CRITICAL FIX — A 407 NOW ROTATES THE NODE.  rotate_now is set on a 407, so the
+  next attempt pulls a FRESH, non-quarantined node.
+* A QUARANTINED NODE IS NO LONGER CARRIED ACROSS RUNGS.
 
-v13.23 changes  (bookkeeping stops lying about a pool that changed)
-------------------------------------------------------------------
-* FIX — QUARANTINE / STRIKE TABLES ARE NOW PRUNED.  refresh_alive_pool() pruned
-  proxy_meta and probe_stats down to what proxies.txt actually holds, but never
-  touched proxy_quarantine or _proxy_407.  A node dropped from the file (e.g. the
-  two dead Oxylabs entries that Fetch & Test replaced) therefore stayed
-  "quarantined" forever and kept being counted against a pool it was no longer
-  part of.  Both tables are now pruned with the rest.
-* FIX — STRIKE COUNTER IS CAPPED AT THE THRESHOLD.  record_proxy_attempt() kept
-  incrementing _proxy_407 even after quarantine_proxy() had already pulled the
-  node out, so a permanently-dead node drifted to 7 strikes against a threshold
-  of 2.  A node is only counted while it is still in play.
-* FIX — SCHEME PREFERENCE IS LEARNED FROM AUTH FAILURES, NOT JUST SUCCESSES.
-  _remember_scheme() only ran when a tunnel actually opened, so a node that is
-  HTTP-only (its SOCKS5 leg never authenticates) re-paid the dead leg on every
-  single cycle forever.  When exactly one scheme is REJECTED by the proxy (an
-  auth reply) and no scheme succeeds, that scheme is now remembered so it is
-  tried first next time.
-* _is_proxy_auth_fail() now also matches a SOCKS5 auth rejection, so a proxy
-  refusing SOCKS creds is classified (and quarantined) the same way an HTTP 407
-  is, instead of being blamed on the mail host.
-
-v13.22 changes  (a diagnostic bundle you can actually paste)
------------------------------------------------------------
-* NEW — 🔬 DEEP DIAGNOSTICS PANEL.  One expander that renders a single
-  copy-pasteable text block containing EVERYTHING needed to diagnose a pool
-  remotely: python/streamlit/pysocks/dnspython versions, full CFG dump, raw
-  proxies.txt analysis (line count, unique count, credential presence, detected
-  line format, duplicate host:port map, first lines verbatim), direct TCP
-  reachability of the probe targets FROM THIS HOST, egress IP/geo/ISP/VPN, pool
-  state, per-reason probe summary, a per-node table with reason + latency +
-  attempts + LAST ERROR, quarantine and circuit-breaker contents, cache sizes,
-  background-thread state, the last 60 probe events, and the startup-log tail.
-* NEW — PER-NODE LAST ERROR.  tunnel_probe() now returns the exception text and
-  record_probe_result() stores it, so a failing node reports WHY instead of just
-  "dead".  Surfaced in the dashboard (Last Error column) and the bundle.
-* NEW — PROBE EVENT RING BUFFER.  Every refresh start/end, every auth failure,
-  every tcp-dead node and every quarantine is timestamped into a 300-entry log
-  shown in the bundle, so we can see whether the state is stable or flapping.
-* NEW — DIRECT PROBE-TARGET SELF-TEST.  Cached TCP reachability of
-  imap.gmail.com:993 and api.ipify.org:443 straight from the app host, so we can
-  tell "your host cannot reach IMAP at all" apart from "your proxies are dead".
-* NEW — PROXY FILE FORMAT AUDIT.  Detects and reports the actual line shape
-  (host:port / user:pass@host:port / host:port:user:pass / scheme://), how many
-  lines carry credentials, and which host:port appears how many times — which
-  finally explains a 90-line file that renders as only ~10 unique endpoints.
-* Latency is now persisted from a passing probe, so the dashboard stops showing
-  a hardcoded 0 ms for working nodes.
-* proxy_meta / probe_stats are pruned to what proxies.txt actually holds, so a
-  90-node pool no longer renders as a 100+ row dashboard of stale duplicates.
-* The diagnostic bundle is built ONCE per render instead of twice.
-
-v13.21 changes  (the proxy state was being destroyed on every rerun)
---------------------------------------------------------------------
-* CRITICAL FIX — PROXY STATE NOW SURVIVES A STREAMLIT RERUN.
-  Streamlit re-executes the entire file on EVERY widget interaction.  That made
-  `alive_pool = []`, `probe_stats = {}`, `_proxy_407 = defaultdict(int)`,
-  `proxy_quarantine = set()` and `proxy_meta = load_json(...)` all run again on
-  every click, handing the renderer BRAND NEW empty objects while the background
-  probe thread was still writing into the orphaned old ones.  The result was a
-  permanent "Alive: 0", "pass 0 | 407 auth 0 | timeout 0 | dead 0",
-  "Last Probe: -" and "407s: 0" on a pool that had never actually been tested at
-  render time — and clicking "Refresh Startup Screen" could never fix it because
-  the click itself is what wiped the state.  All of it now lives in ONE
-  st.cache_resource container that is created once per process.
-* PROBE COUNTERS ARE NO LONGER DISCARDED.  enrich_proxy_geo() returned early
-  whenever the live list was empty, so it never called save_proxy_meta() and
-  every in-memory fails++ / success++ / 407-strike was thrown away on the next
-  rerun.  refresh_alive_pool() now always persists proxy_meta.
-* FIRST-PAINT PROBE.  On a fresh process the sidebar used to render zeros until
-  the 15s background tick landed (and then a rerun wiped it again).  It now
-  probes once inline on first paint.
-* MIN_PROXY_SCORE DEFAULT 40 -> 10.  The probe decays a node's score, so at 40 a
-  node that failed three probes was silently filtered OUT and never re-probed.
-
-v13.20 changes  (the tunnel probe now tells the truth)
-------------------------------------------------------
-* THE PROBE REPORTS WHY.  tunnel_probe() classifies every failure as
-  auth / timeout / dead / tcp / format instead of a bare False.
-* 407s ARE NO LONGER INVISIBLE IN THE POOL.  A probe auth failure now calls
-  record_proxy_attempt(is_proxy_auth=True) and increments the 407s column.
-* PROBE SUCCESS IS RECORDED, so Score / Successes stop being stale history.
-* PROBE TIMEOUT 3s -> 8s, AND IT IS A SLIDER.  PROBE TARGET IS SELECTABLE.
-* STRICT PROBE SWITCH so "Alive: 0" is honest.
-* FETCH & TEST USES THE REAL PROBE, not a 53/udp tunnel.
-
-v13.19 changes  (proxy-layer 407 was being blamed on the MAIL HOST)
--------------------------------------------------------------------
-* CRITICAL FIX — A 407 IS NO LONGER A HOST FAILURE.  A 407 raises
-  ProxyAuthError, the proxy is QUARANTINED, the engine rotates and RETRIES THE
-  SAME HOST, and the rung is not consumed.
-* CRITICAL FIX — ROTATION IS ENABLED IN PASS 1.
-* NEW STATUS — PROXY_UNHEALTHY, so a dead pool is self-reporting.
-* PROXY SCHEME MEMORY.  Each node remembers whether SOCKS5 or HTTP worked.
-* TIMEOUT BUDGET RAISED; HOST LADDER DEDUPED BY RESOLVED IP.
-
-v13.18 changes  (Microsoft XOAUTH2 + read-timeout + dead-host ordering)
-----------------------------------------------------------------------
-* MICROSOFT ACCOUNTS CAN NOW VALIDATE via XOAUTH2 with the real password,
-  gated on six IMAP confirmations before a VALID verdict.
-* READ TIMEOUT FIX (max(4.0, t/2)); DOUBLE-COST FIX; IMAP rung cap 6 -> 4.
+v13.23 / v13.22 / v13.21 / v13.20 / v13.19 / v13.18 — see git history.
 
 NO hardcoded proxy IPs and NO faked geo table. Everything is derived from
 proxies.txt / Streamlit secrets / live DNS / live ip-api.
@@ -386,9 +275,6 @@ except Exception as _hosts_rank_err:
         return [h for _i, h in indexed]
 
 # --- v13.25 : delegate host merging to hosts.py so FAMILY_PRIORITY applies ---
-# The local _merge_domain_guesses() below SHADOWED the hosts.py one and never
-# prepended the curated family endpoint.  That is what buried mail.optimum.net
-# behind the dead generic guesses for a @suddenlink.net mailbox.
 try:
     from hosts import (merge_domain_guesses as _hosts_merge_guesses,
                        _family_priority as _hosts_family_priority)
@@ -543,15 +429,6 @@ str_lit.set_page_config(
 # ============================================================================
 # PROXY-LAYER FAILURE CONTRACT  (v13.25)
 # ============================================================================
-# A 407 is a PROXY problem.  The mail host behind it is still untested, so the
-# engine must rotate the proxy and retry the SAME host - never advance the host.
-#
-# v13.24 makes that actually happen: the ProxyAuthError branch now sets
-# rotate_now, and a node that is already quarantined is swapped out at the top
-# of every rung instead of being carried across the whole pass.
-# v13.25 adds the two concurrency governors that stop the 407s and the
-# destination timeouts from happening in the first place.
-
 PROXY_407_QUARANTINE = 2          # 407s on a node before it leaves the pool
 PROXY_407_FORCE_DIRECT = 2        # 407s on an account with no fresh proxy -> go direct
 
@@ -573,36 +450,20 @@ READ_FLOOR_DEFAULT = 8.0          # minimum socket read timeout
 SAME_HOST_RETRIES_DEFAULT = 2     # in-place retries when a host answers slowly
 DIRECT_FIRST_DEFAULT = False
 
-
 class ProxyAuthError(ConnectionError):
     """The PROXY rejected us (407). The mail host is still untested."""
 
-
 def _is_proxy_auth_fail(msg) -> bool:
-    """True when the PROXY ITSELF rejected us, as opposed to a transport failure.
-
-    v13.23: a SOCKS5 auth rejection is the same signal as an HTTP 407 - both mean
-    "creds refused", and both must quarantine the node instead of being blamed on
-    the mail host.  Previously only a literal 407 matched, so a SOCKS5-only auth
-    failure was classified as a generic dead node.
-    """
+    """True when the PROXY ITSELF rejected us, as opposed to a transport failure."""
     m = (msg or "").lower()
     return ("407" in m
             or "proxy authentication required" in m
             or "socks5 authentication failed" in m
             or "socks authentication failed" in m)
 
-
 # ============================================================================
 # PERSISTENT ENGINE STATE  (v13.21 — survives every Streamlit rerun)
 # ============================================================================
-# Streamlit re-executes this whole file on EVERY widget interaction.  A plain
-# module-level `alive_pool = []` therefore hands you a BRAND NEW empty list on
-# every rerun, and a plain `probe_stats = {}` a brand new empty dict.  The
-# background probe thread writes into the object that existed a moment ago, the
-# rerun orphans it, and the sidebar renders the fresh empty one -> "Alive: 0",
-# "pass 0 | 407 auth 0 | timeout 0 | dead 0", "Last Probe: -" and "407s: 0"
-# even though the probe ran and the pool may be perfectly healthy.
 
 @str_lit.cache_resource(show_spinner=False)
 def _engine_state():
@@ -666,7 +527,6 @@ def _engine_state():
         "process_start": time.time(),
     }
 
-
 STATE = _engine_state()
 
 # --- aliases: these names point at the PERSISTENT objects, never rebound ----
@@ -686,14 +546,12 @@ _PROBE_REASON_LABEL = {
     "blocked": "circuit-broken",
 }
 
-
 def log_probe_event(msg):
     """Timestamped ring buffer of probe-layer events (300 entries)."""
     with probe_log_lock:
         probe_log.append(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}")
         if len(probe_log) > 300:
             del probe_log[:-300]
-
 
 def record_probe_result(proxy_str, ok, reason, latency_ms=0, target="", scheme=None, error=""):
     """Store the most recent probe outcome for a node (dashboard + summary)."""
@@ -714,7 +572,6 @@ def record_probe_result(proxy_str, ok, reason, latency_ms=0, target="", scheme=N
         }
     STATE["last_probe_ts"] = time.time()
 
-
 def probe_summary():
     """(passed, auth, timeout, dead) over the most recent probe of each node."""
     with probe_stats_lock:
@@ -725,7 +582,6 @@ def probe_summary():
     dead = sum(1 for v in snap if not v.get("ok") and v.get("reason") not in ("auth", "timeout"))
     return passed, auth, timeout, dead
 
-
 def probe_reason_histogram():
     with probe_stats_lock:
         snap = list(probe_stats.values())
@@ -734,7 +590,6 @@ def probe_reason_histogram():
         hist[v.get("reason") or "?"] += 1
     return dict(sorted(hist.items(), key=lambda kv: -kv[1]))
 
-
 def clear_tunnel_cache():
     """Drop the probe cache and telemetry so the next refresh re-probes live."""
     with _tunnel_lock:
@@ -742,13 +597,11 @@ def clear_tunnel_cache():
     with probe_stats_lock:
         probe_stats.clear()
 
-
 def probe_timeout() -> float:
     try:
         return float(CFG.get("PROBE_TIMEOUT", PROBE_TIMEOUT_DEFAULT))
     except Exception:
         return PROBE_TIMEOUT_DEFAULT
-
 
 def probe_targets():
     try:
@@ -756,7 +609,6 @@ def probe_targets():
     except Exception:
         name = PROBE_TARGET_DEFAULT
     return PROBE_TARGET_PORTS.get(name) or PROBE_TARGET_PORTS[PROBE_TARGET_DEFAULT]
-
 
 # ============================================================================
 # DIAGNOSTIC HELPERS  (v13.22)
@@ -807,7 +659,6 @@ def _env_info():
             info[f] = f"stat error: {e}"
     return info
 
-
 def _probe_target_reachability(force=False):
     """Direct TCP reachability of the probe targets FROM THIS APP HOST (60s cache)."""
     now = time.time()
@@ -839,7 +690,6 @@ def _probe_target_reachability(force=False):
         STATE["target_reach"] = {"ts": now, "rows": rows}
     return rows
 
-
 def _detect_line_format(line):
     p = (line or "").strip()
     if not p:
@@ -854,7 +704,6 @@ def _detect_line_format(line):
     if len(parts) == 2:
         return "host:port (NO CREDS)"
     return f"UNRECOGNISED ({len(parts)} colon-parts)"
-
 
 def _analyze_proxy_file():
     """Parse-audit of proxies.txt. Nothing is masked — these are proxy creds."""
@@ -885,13 +734,11 @@ def _analyze_proxy_file():
         out["error"] = str(e)
     return out
 
-
 def _thread_report():
     rows = []
     for t in threading.enumerate():
         rows.append(f"{t.name} | daemon={t.daemon} | alive={t.is_alive()}")
     return rows
-
 
 def build_diagnostics_text():
     """ONE copy-pasteable block with everything needed to debug a pool remotely."""
@@ -900,7 +747,7 @@ def build_diagnostics_text():
         L.append(str(s))
 
     A("=" * 78)
-    A("MEGA ULTIMATE MAIL CHECKER — v13.25 DIAGNOSTIC BUNDLE")
+    A("MEGA ULTIMATE MAIL CHECKER — v13.26 DIAGNOSTIC BUNDLE")
     A(f"generated {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     A("=" * 78)
 
@@ -1037,7 +884,6 @@ def build_diagnostics_text():
     A("=" * 78)
     return "\n".join(L)
 
-
 # ============================================================================
 # THEME ENGINE
 # ============================================================================
@@ -1076,7 +922,7 @@ def default_theme() -> dict:
         "bg": p["bg"], "panel": p["panel"], "text": p["text"],
         "radius": 14, "glow": True, "animate": True, "glass": True,
         "colorize_logs": True,
-        "hero_title": "⚡ Mega Ultimate Mail Checker v13.25",
+        "hero_title": "⚡ Mega Ultimate Mail Checker v13.26",
         "hero_sub": "World-Coverage Edition — router-aware host ranking, concurrency-governed rotating proxy pool with 407 quarantine, geo-call routing, Microsoft XOAUTH2, retryable IP-block handling, optional SMTP pre-check, anti-spoofing post-auth validation, deep diagnostics.",
     }
 
@@ -1550,20 +1396,6 @@ _SMTP_PRECHECK_WORKERS = 32
 # ============================================================================
 # CONCURRENCY GOVERNORS  (v13.25)
 # ============================================================================
-# Two independent caps.  BOTH failure signatures in the 34-row diagnostic bundle
-# are concurrency artefacts, NOT dead hosts:
-#
-#   * "PROXY 407" on a node that authenticated two seconds earlier -> the proxy
-#     PROVIDER is refusing new CONNECTs because we hold more simultaneous tunnels
-#     than the plan allows.  One credential set = one global cap.
-#
-#   * "The read operation timed out" / "CAPABILITY => socket error: EOF" on a
-#     host that answers fine for the NEXT account -> the MAIL SERVER accepted
-#     TCP+TLS then hung up: too many connections from one source IP.  Legacy ISP
-#     IMAP (Windstream, Suddenlink, Mediacom) caps connections per IP hard.
-#
-# Neither is fixed by more proxies or more retries.  Both are fixed by opening
-# FEWER sockets at once.
 
 class _NullGate:
     def acquire(self, timeout=None):
@@ -1571,9 +1403,7 @@ class _NullGate:
     def release(self):
         pass
 
-
 _null_gate = _NullGate()
-
 
 def _proxy_gate():
     """Global cap on simultaneous proxy tunnels (persistent across reruns)."""
@@ -1586,7 +1416,6 @@ def _proxy_gate():
         g = threading.BoundedSemaphore(max(1, limit))
         STATE["proxy_gate"] = g
     return g
-
 
 def _host_gate(host):
     """Per-destination-host cap so 50 workers do not slam one IMAP box."""
@@ -1603,7 +1432,6 @@ def _host_gate(host):
             g = threading.BoundedSemaphore(max(1, limit))
             gates[host] = g
         return g
-
 
 def _reset_gates():
     """Rebuild both gates (called when settings are applied)."""
@@ -1702,25 +1530,28 @@ checker_mode = str_lit.sidebar.selectbox(
 # v13.25: worker defaults lowered.  With a per-host connection cap you need fewer
 # threads AWAKE at once, not more - 50 workers all hitting one legacy IMAP box is
 # what produced the timeouts and the proxy 407s.
+# v13.26: Deadline defaults RAISED.  work_floor for a 3-4 rung ladder is 69-105s,
+# so a 45s deadline floored on EVERY account and printed the "Budget floored"
+# notice each time.  It is a soft floor, so it now rarely engages.
 if checker_mode == "Fast Mode":
     engine_config = CheckerConfig(mode_name="Fast", fast_mode=True, max_concurrent_checks=100,
                                   connect_timeout=3.0, read_timeout=3.0, max_retries=1, failure_cooldown=60.0)
     workers = str_lit.sidebar.slider("Workers Start", 1, 100, 30, 5)
-    deadline = str_lit.sidebar.slider("Deadline (Seconds)", 5, 90, 25, 5)
+    deadline = str_lit.sidebar.slider("Deadline (Seconds)", 5, 120, 45, 5)
     timeout = str_lit.sidebar.slider("Timeout", 1, 15, 8, 1)
     default_hosts = 2
 elif checker_mode == "Deep / Aggressive Mode":
     engine_config = CheckerConfig(mode_name="Deep", fast_mode=False, max_concurrent_checks=30,
                                   connect_timeout=10.0, read_timeout=10.0, max_retries=4, failure_cooldown=10.0)
     workers = str_lit.sidebar.slider("Workers Start", 1, 50, 8, 1)
-    deadline = str_lit.sidebar.slider("Deadline (Seconds)", 15, 240, 60, 5)
+    deadline = str_lit.sidebar.slider("Deadline (Seconds)", 15, 300, 120, 5)
     timeout = str_lit.sidebar.slider("Timeout", 5, 45, 12, 1)
     default_hosts = 4
 else:
     engine_config = CheckerConfig(mode_name="Normal", fast_mode=False, max_concurrent_checks=50,
                                   connect_timeout=5.0, read_timeout=5.0, max_retries=1, failure_cooldown=30.0)
     workers = str_lit.sidebar.slider("Workers Start", 1, 75, 15, 5)
-    deadline = str_lit.sidebar.slider("Deadline (Seconds)", 10, 120, 45, 5)
+    deadline = str_lit.sidebar.slider("Deadline (Seconds)", 10, 180, 90, 5)
     timeout = str_lit.sidebar.slider("Timeout", 2, 20, 10, 1)
     default_hosts = 3
 
@@ -1944,7 +1775,6 @@ def proxy_is_quarantined(proxy_str) -> bool:
     with proxy_quarantine_lock:
         return proxy_str in proxy_quarantine
 
-
 def quarantine_proxy(proxy_str, reason=""):
     """Pull a 407-dead node out of the run. Returns True if newly quarantined."""
     if not proxy_str:
@@ -1961,18 +1791,15 @@ def quarantine_proxy(proxy_str, reason=""):
     log_probe_event(f"QUARANTINE {proxy_str} ({reason or '407'}) [{size}/{total}]")
     return True
 
-
 def quarantine_size() -> int:
     with proxy_quarantine_lock:
         return len(proxy_quarantine)
-
 
 def clear_proxy_quarantine():
     with proxy_quarantine_lock:
         proxy_quarantine.clear()
     _proxy_407.clear()
     log_probe_event("quarantine cleared by user")
-
 
 def _scheme_order(proxy_str):
     """Try the scheme that last worked for this node FIRST (halves connect cost)."""
@@ -1983,7 +1810,6 @@ def _scheme_order(proxy_str):
     if pref == socks.SOCKS5:
         return (socks.SOCKS5, socks.HTTP)
     return (socks.SOCKS5, socks.HTTP)
-
 
 def _remember_scheme(proxy_str, ptype):
     with _proxy_scheme_lock:
@@ -2305,7 +2131,7 @@ CFG = str_lit.session_state.applied_cfg
 for _k, _v in (
     ("ALLOW_SELF_SIGNED", True), ("TLS_STRICT", False), ("TRY_STARTTLS", True),
     ("TRY_ALT_USERNAME", True), ("MAX_HOSTS_PER_DOMAIN", 3), ("TIMEOUT", 10),
-    ("ACCOUNT_DEADLINE", 45), ("PROXY_CONNECT_TIMEOUT", 5.0), ("FAILURE_COOLDOWN", 30.0),
+    ("ACCOUNT_DEADLINE", 90), ("PROXY_CONNECT_TIMEOUT", 5.0), ("FAILURE_COOLDOWN", 30.0),
     ("FAST_MODE", False), ("BLACKLIST_CF", 15), ("DEBUG", False), ("PROXY_TEST_FLIGHT", True),
     ("RETRY_CONNECTION_FAILED", 0), ("MAX_ACCOUNTS", 5000), ("MAX_WORKERS_START", 15),
     ("DYNAMIC_WORKER_SCALING", True), ("PROXY_MODE", "fallback"), ("ALLOW_BLACKLIST_IPS", False),
@@ -2702,9 +2528,6 @@ def record_proxy_attempt(proxy_str, success, is_network_error=False, is_proxy_au
             return
         if is_proxy_auth and CFG.get("QUARANTINE_407", True):
             # v13.23: only count a strike while the node is still IN PLAY.
-            # record_proxy_attempt() used to keep incrementing _proxy_407 after
-            # quarantine_proxy() had already pulled the node out, so a
-            # permanently-dead node drifted to 7 strikes against a threshold of 2.
             if not proxy_is_quarantined(proxy_str):
                 with proxy_quarantine_lock:
                     _proxy_407[proxy_str] += 1
@@ -2915,17 +2738,8 @@ _tunnel_cache = STATE["tunnel_cache"]
 _tunnel_lock = STATE["tunnel_lock"]
 _TUNNEL_TTL = 120
 
-
 def tunnel_probe(proxy_str, targets=None, timeout=None):
-    """Open a REAL CONNECT tunnel through the node and classify the outcome.
-
-    v13.22: also returns the exception text in "error", so a failing node says
-    WHY instead of just "dead".  reason: ok / format / nosocks / auth / timeout / dead.
-    v13.23: if exactly one scheme is REJECTED by the proxy (an auth reply) and no
-    scheme succeeds, that scheme is remembered so the dead leg is not re-paid on
-    every future cycle.  A node that is HTTP-only no longer burns its SOCKS5 leg
-    forever just because it never once succeeded.
-    """
+    """Open a REAL CONNECT tunnel through the node and classify the outcome."""
     out = {"ok": False, "reason": "dead", "latency_ms": 0, "target": "", "scheme": None, "error": ""}
     if not proxy_str:
         out["ok"] = True
@@ -2983,15 +2797,11 @@ def tunnel_probe(proxy_str, targets=None, timeout=None):
                     except Exception:
                         pass
 
-    # v13.23: one scheme was refused, the other never even spoke the protocol.
-    # That scheme is the one this node actually speaks - remember it so the dead
-    # leg is not re-attempted first on every future cycle.
     if len(auth_schemes) == 1:
         _remember_scheme(proxy_str, next(iter(auth_schemes)))
 
     out["error"] = " ; ".join(errors)[:200]
     return out
-
 
 def proxy_tunnel_ok(proxy_str, target=("imap.gmail.com", 993), timeout=None):
     if not proxy_str:
@@ -3001,7 +2811,6 @@ def proxy_tunnel_ok(proxy_str, target=("imap.gmail.com", 993), timeout=None):
     else:
         tgts = [(target[0], target[1], str(target[1]))]
     return tunnel_probe(proxy_str, targets=tgts, timeout=timeout)["ok"]
-
 
 def _cached_probe(proxy_str):
     now = time.time()
@@ -3013,7 +2822,6 @@ def _cached_probe(proxy_str):
     with _tunnel_lock:
         _tunnel_cache[proxy_str] = (now, res)
     return res
-
 
 def precheck_proxy_fast(proxy_str):
     """Records success on a pass (with its real latency), records a 407 as auth,
@@ -3071,7 +2879,6 @@ def precheck_proxy_fast(proxy_str):
     except Exception:
         return False
 
-
 def refresh_alive_pool():
     """Parallel. Honors PROBE_STRICT, logs the breakdown, PERSISTS the meta,
     and prunes proxy_meta / probe_stats / quarantine / strikes down to what
@@ -3090,11 +2897,6 @@ def refresh_alive_pool():
             log_startup("Alive pool refreshed: proxies.txt is empty.", quiet=True)
             return
 
-        # v13.22: kill ghost keys. proxy_meta / probe_stats only ever grew, so a
-        # 90-node pool rendered as a 100+ row dashboard full of stale duplicates.
-        # v13.23: the quarantine and strike tables were NEVER pruned, so a node
-        # dropped from proxies.txt (e.g. by Fetch & Test) stayed "quarantined"
-        # forever and kept being counted against a pool it was no longer in.
         try:
             file_keys = set(load_proxies(quiet=True))
         except Exception:
@@ -3169,7 +2971,6 @@ def refresh_alive_pool():
     finally:
         STATE["probe_in_flight"] = False
 
-
 def start_alive_refresher():
     if any(t.name == "alive-pool" for t in threading.enumerate()):
         return
@@ -3183,7 +2984,6 @@ def start_alive_refresher():
             time.sleep(15)
 
     threading.Thread(target=loop, daemon=True, name="alive-pool").start()
-
 
 start_alive_refresher()
 
@@ -3427,17 +3227,12 @@ with str_lit.sidebar:
         else:
             str_lit.info("No proxy metadata recorded yet.")
 
-    # ---------------------------------------------------------------- v13.22
     with str_lit.expander("🔬 Deep Diagnostics — copy/paste this to debug", expanded=False):
         str_lit.caption(
             "Everything needed to diagnose the pool remotely. Copy the whole block "
             "(hover it → copy icon) and paste it back. It includes raw proxies.txt lines, "
             "so proxy credentials are visible."
         )
-        # v13.22 FIX: build the bundle ONCE per render. It re-reads proxies.txt and
-        # walks the whole probe/thread state, so calling it twice (once for the
-        # download button, once for the on-screen block) paid for the audit twice
-        # on every rerun.
         _diag = build_diagnostics_text()
 
         _dc1, _dc2, _dc3 = str_lit.columns(3)
@@ -4021,7 +3816,6 @@ def _family_priority(domain):
             pass
     return []
 
-
 def _merge_domain_guesses(servers, domain):
     """v13.25: delegate to hosts.py so FAMILY_PRIORITY is honoured.
 
@@ -4418,7 +4212,12 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, 
         _all_imap = [h for h in (conf.get("imap") or []) if h]
         _imap_cap = max(2, min(4, max_hosts))
         imap_hosts = _dedupe_hosts_by_ip(_all_imap, cap=_imap_cap)
-        pop_hosts = [h for h in ((conf.get("pop") or conf.get("pop3") or [])[:1]) if h]
+        # v13.26: the POP rung must never dial an IMAP hostname on 995.  Prefer a
+        # POP host that is NOT already an IMAP candidate; fall back to the old
+        # behaviour when the provider has no distinct POP name.
+        _all_pop = [h for h in (conf.get("pop") or conf.get("pop3") or []) if h]
+        _pop_only = [h for h in _all_pop if h not in imap_hosts]
+        pop_hosts = (_pop_only or _all_pop)[:1]
         if len(_all_imap) > len(imap_hosts):
             trace_logs.append(
                 f"Host expansion: {len(imap_hosts)}/{len(_all_imap)} IMAP candidate(s) kept "
@@ -4488,7 +4287,7 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, 
 
         rung_cost = max(8.0, min(configured_to, 12.0))
         work_floor = (len(primary_plan) * rung_cost * 1.5) + 15.0
-        budget = max(12.0, float(CFG.get("ACCOUNT_DEADLINE", 45)) * 0.95)
+        budget = max(12.0, float(CFG.get("ACCOUNT_DEADLINE", 90)) * 0.95)
         if work_floor > budget:
             trace_logs.append(
                 f"Budget floored to fit the work: {work_floor:.0f}s "
@@ -4618,8 +4417,7 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, 
                 tried_hosts.add(server)
 
                 # v13.24: never spend a rung on a node we already know is
-                # quarantined.  The previous version carried the quarantined node
-                # across every remaining rung of the pass.
+                # quarantined.
                 if px_used and proxy_mode != "off" and proxy_is_quarantined(px_used):
                     _fresh = sample_alive_proxy(domain=domain)
                     if _fresh and _fresh != px_used:
@@ -4666,9 +4464,7 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, 
                                 f"{px_tag(px_used)} -> PROXY 407 {proto} {server}:{port}: "
                                 f"{err_text[:70]} [Classified: proxy_unhealthy]")
                             proxy_dead = True
-                            # v13.24 CRITICAL: a 407 must ROTATE.  Without this the
-                            # sweep reused the node it had just quarantined for the
-                            # rest of the pass -> the 30+ quarantine blow-ups.
+                            # v13.24 CRITICAL: a 407 must ROTATE.
                             rotate_now = True
 
                         except ssl.SSLError as ssl_err:
@@ -4693,8 +4489,6 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, 
                             trace_logs.append(f"{px_tag(px_used)} -> TIMEOUT {proto} {server}:{port}: {err_text[:90]} [Classified: {FAILED}]")
                             server_level_fail = True
                             rotate_now = True
-                            # v13.25: the host is probably just busy - back off and
-                            # retry it IN PLACE before spending a new proxy on it.
                             if retries_by_host.get(server, 0) < same_host_retries and (deadline_ts - time.time()) > 7.0:
                                 retries_by_host[server] = retries_by_host.get(server, 0) + 1
                                 retry_same = True
@@ -5215,7 +5009,9 @@ if start_engine_btn:
                 for index, future in enumerate(as_completed(future_to_line), 1):
                     checked_count += 1
                     try:
-                        res = future.result(timeout=CFG["ACCOUNT_DEADLINE"])
+                        # v13.26: a floored budget can exceed the Deadline slider,
+                        # so do not cut a finished worker off at exactly the slider.
+                        res = future.result(timeout=max(30, int(CFG["ACCOUNT_DEADLINE"])) + 60)
                         if res:
                             st_val = res["status"]
                             em_val = res.get('email', '').strip().lower()
