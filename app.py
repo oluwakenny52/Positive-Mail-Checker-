@@ -1,9 +1,25 @@
 """
-Mega Ultimate Mail Checker — v13.23
+Mega Ultimate Mail Checker — v13.24
 ===================================
 Complete rewrite. SMTP reachability is an OPT-IN pre-check stage (never inside
 the validator), status classification actually works, and every direct-connection
 line carries the real egress IP / region / country / VPN state.
+
+v13.24 changes  (a 407 now actually rotates the proxy instead of reusing it)
+------------------------------------------------------------------
+* CRITICAL FIX — A 407 NOW ROTATES THE NODE.  The ProxyAuthError handler set
+  proxy_dead but NEVER set rotate_now, so can_rotate stayed False and the sweep
+  kept using the SAME node it had just quarantined for every remaining rung of
+  the pass.  That is the exact cause of "one node marked [QUARANTINED] and then
+  hammered 11-15 times" and the 30+ quarantine blow-ups inside a single account
+  in the diagnostic bundle.  rotate_now is now set on a 407, so the next attempt
+  pulls a FRESH, non-quarantined node.
+* A QUARANTINED NODE IS NO LONGER CARRIED ACROSS RUNGS.  At the top of every rung
+  the sweep checks whether the node it is holding is quarantined and, if so,
+  switches to a fresh one BEFORE spending the rung on it.
+* hosts.py: suddenlink.net now also tries mail.optimum.net / imap.optimum.net
+  (Optimum's real endpoints), the Altice/Openwave MX maps to them, and curated
+  providers additionally benefit from live SRV/autoconfig/MX discovery.
 
 v13.23 changes  (bookkeeping stops lying about a pool that changed)
 ------------------------------------------------------------------
@@ -476,16 +492,14 @@ str_lit.set_page_config(
 )
 
 # ============================================================================
-# PROXY-LAYER FAILURE CONTRACT  (v13.23)
+# PROXY-LAYER FAILURE CONTRACT  (v13.24)
 # ============================================================================
 # A 407 is a PROXY problem.  The mail host behind it is still untested, so the
 # engine must rotate the proxy and retry the SAME host - never advance the host.
 #
-# v13.20 added an HONEST probe (it reports WHY a node failed instead of a bare
-# False).  v13.21 made the whole proxy layer PERSISTENT.  v13.22 added a full
-# diagnostic bundle.  v13.23 makes the bookkeeping honest: quarantine/strike
-# tables are pruned with the rest, the strike count stops at the threshold, and
-# a node's working scheme is learned from an auth rejection as well as a success.
+# v13.24 makes that actually happen: the ProxyAuthError branch now sets
+# rotate_now, and a node that is already quarantined is swapped out at the top
+# of every rung instead of being carried across the whole pass.
 
 PROXY_407_QUARANTINE = 2          # 407s on a node before it leaves the pool
 PROXY_407_FORCE_DIRECT = 2        # 407s on an account with no fresh proxy -> go direct
@@ -822,7 +836,7 @@ def build_diagnostics_text():
         L.append(str(s))
 
     A("=" * 78)
-    A("MEGA ULTIMATE MAIL CHECKER — v13.23 DIAGNOSTIC BUNDLE")
+    A("MEGA ULTIMATE MAIL CHECKER — v13.24 DIAGNOSTIC BUNDLE")
     A(f"generated {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     A("=" * 78)
 
@@ -995,7 +1009,7 @@ def default_theme() -> dict:
         "bg": p["bg"], "panel": p["panel"], "text": p["text"],
         "radius": 14, "glow": True, "animate": True, "glass": True,
         "colorize_logs": True,
-        "hero_title": "⚡ Mega Ultimate Mail Checker v13.23",
+        "hero_title": "⚡ Mega Ultimate Mail Checker v13.24",
         "hero_sub": "World-Coverage Edition — router-aware host ranking, rotating proxy pool with 407 quarantine, geo-call routing, Microsoft XOAUTH2, retryable IP-block handling, optional SMTP pre-check, anti-spoofing post-auth validation, deep diagnostics.",
     }
 
@@ -1760,7 +1774,7 @@ def parse_proxy(proxy_str):
     return None
 
 # ---------------------------------------------------------------------------
-# PROXY-LAYER HELPERS  (v13.23)
+# PROXY-LAYER HELPERS  (v13.24)
 # ---------------------------------------------------------------------------
 def proxy_is_quarantined(proxy_str) -> bool:
     if not proxy_str:
@@ -2291,7 +2305,8 @@ def get_filtered_active_proxies(quiet: bool = False):
             else:
                 filtered.append(p)
 
-        log_startup(f"Proxy filtering complete. Active pool contains {len(filtered)} out of {len(raw)} proxies.", quiet=quiet)
+        log_startup(f"Proxy filtering complete. Active pool contains {len(filtered)} "
+                    f"of {len(raw)} candidate(s) (score/geo filter).", quiet=quiet)
         return filtered if filtered else raw
     except Exception as e:
         log_startup(f"WARNING: Error filtering active proxies: {e}", quiet=quiet)
@@ -4363,6 +4378,16 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, 
 
                 tried_hosts.add(server)
 
+                # v13.24: never spend a rung on a node we already know is
+                # quarantined.  The previous version carried the quarantined node
+                # across every remaining rung of the pass.
+                if px_used and proxy_mode != "off" and proxy_is_quarantined(px_used):
+                    _fresh = sample_alive_proxy(domain=domain)
+                    if _fresh and _fresh != px_used:
+                        px_used = _fresh
+                        trace_logs.append(
+                            f"Quarantined node in hand -> switched to fresh node {px_tag(px_used)}")
+
                 rotations_left = MAX_ROTATIONS if (allow_rotate and px_used and proxy_mode != "off") else 0
                 seen_px = {px_used} if px_used else set()
                 acct_407 = 0
@@ -4401,6 +4426,10 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, 
                                 f"{px_tag(px_used)} -> PROXY 407 {proto} {server}:{port}: "
                                 f"{err_text[:70]} [Classified: proxy_unhealthy]")
                             proxy_dead = True
+                            # v13.24 CRITICAL: a 407 must ROTATE.  Without this the
+                            # sweep reused the node it had just quarantined for the
+                            # rest of the pass -> the 30+ quarantine blow-ups.
+                            rotate_now = True
 
                         except ssl.SSLError as ssl_err:
                             err_text = str(ssl_err)
