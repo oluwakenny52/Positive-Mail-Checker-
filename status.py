@@ -8,25 +8,27 @@ CONNECTION_FAILED, RBL + RBL_BLOCKED, PROXY_UNHEALTHY, ...) so
 Classification order is deliberate:
     APP -> WRONG_STRONG -> BARE_AUTH -> RBL -> DNS -> CONN_STRONG -> RETRY -> CONN -> WRONG -> UNKNOWN
 
+v13.31
+------
+* "535" ADDED TO _WRONG.  SMTP submission answers a rejected credential with
+  "535 5.7.8 Username and Password not accepted".  app.py handles SmtpAuthError
+  with its own handler, but this is the safety net if one ever escapes.
+* No behavioural change for IMAP / POP3.
+
 v13.30
 ------
 * CONN_STRONG IS TESTED BEFORE RETRY.  "connection reset by peer" sat in BOTH
   the _RETRY and _CONN tables, and _RETRY was tested first - so a plain socket
   reset was reported as RETRY_LATER ("rate-limited, try again") instead of
   CONNECTION_FAILED, and RETRY_LATER outranks CONNECTION_FAILED in PRIORITY.
-  An unambiguous transport token now wins over the soft retry table, so a reset
-  is a reset.
-* _RETRY NO LONGER CONTAINS "connection reset by peer".  Belt and braces with
-  the ordering above.
-* is_conn_signal() helper for callers that want the raw predicate.
+* _RETRY NO LONGER CONTAINS "connection reset by peer".
+* is_conn_signal() helper.
 
 v13.19
 ------
 * NEW STATUS — PROXY_UNHEALTHY.  Returned when every attempt for an account
-  failed in the PROXY hop (407 Proxy Authentication Required) and the mailbox
-  was therefore never reached.
-* is_proxy_auth_fail() helper so app.py can raise ProxyAuthError on the exact
-  same predicate the classifier uses.
+  failed in the PROXY hop (407 Proxy Authentication Required).
+* is_proxy_auth_fail() helper.
 * classify_proxy_error() — proxy-aware wrapper around classify_error().
 
 v13.18
@@ -178,9 +180,7 @@ _DNS = (
     "servfail",
 )
 
-# SOFT, retryable conditions.  Kept NARROW on purpose: anything in here means
-# "the server answered, but not now", so it must not swallow a hard transport
-# failure.  "connection reset by peer" now lives in _CONN_STRONG, not here.
+# SOFT, retryable conditions.  Kept NARROW on purpose.
 _RETRY = (
     "lookup failed",
     "user could not be routed",
@@ -214,8 +214,7 @@ _RETRY = (
     "unexpected extra arguments",
 )
 
-# v13.30: UNAMBIGUOUS transport failures.  Tested BEFORE _RETRY so a reset can
-# never be reported as a rate-limit.
+# v13.30: UNAMBIGUOUS transport failures.  Tested BEFORE _RETRY.
 _CONN_STRONG = (
     "connection reset by peer",
     "connection reset",
@@ -270,8 +269,7 @@ _CONN = (
     "socks",
 )
 
-# IP-reputation / greylist refusals.  Checked BEFORE _CONN and BEFORE _WRONG so
-# a block is never reported as a password verdict or a bare connection failure.
+# IP-reputation / greylist refusals.  Checked BEFORE _CONN and BEFORE _WRONG.
 _RBL = (
     "rbl restriction",
     "rbl",
@@ -331,6 +329,8 @@ _WRONG = (
     "invalid token",
     "expired token",
     "internal server error",
+    # v13.31: SMTP submission credential rejection
+    "535",
 )
 
 # Strong, unambiguous auth phrases checked before the CONN and RBL tables.
@@ -350,9 +350,7 @@ _WRONG_STRONG = (
     "invalid_grant",
 )
 
-# BARE / TERSE auth replies.  Some legacy Zimbra / Dovecot fronts answer a
-# rejected LOGIN with the single token "LOGIN" (or "AUTH", "credentials").
-# Matched against the WHOLE punctuation-stripped message.
+# BARE / TERSE auth replies.
 _BARE_AUTH = (
     "login",
     "logon",
@@ -411,12 +409,9 @@ def classify_error(raw, domain=""):
     if _match(t, _APP_PASSWORD):
         return NEED_APP_PASSWORD
 
-    # Strong auth phrases win outright — they can otherwise be shadowed by the
-    # generic "authentication" token or by a CONN token in the same message.
     if _match(t, _WRONG_STRONG):
         return WRONG_PASSWORD
 
-    # A whole-message bare token ("LOGIN") is an auth rejection.
     if _is_bare_auth(t):
         return WRONG_PASSWORD
 
