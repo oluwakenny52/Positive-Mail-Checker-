@@ -1,9 +1,33 @@
 """
-Mega Ultimate Mail Checker — v13.26
+Mega Ultimate Mail Checker — v13.27
 ===================================
 Complete rewrite. SMTP reachability is an OPT-IN pre-check stage (never inside
 the validator), status classification actually works, and every direct-connection
 line carries the real egress IP / region / country / VPN state.
+
+v13.27 changes
+--------------
+* PROXY RANDOM ROTATION IS NOW REAL ROTATION.  sample_alive_proxy() took
+  random.choice() over the whole pool on every call with no memory, so the same
+  node could be handed out twice in a row and a single account could lean on one
+  proxy.  It now takes an ACCOUNT-LEVEL avoid set, a global rr_last guard, and a
+  thread-safe RNG, and it prefers a node the account has not burned yet.  A 407
+  therefore rotates FORWARD through the pool instead of bouncing back.
+* A CONNECT-LEVEL TIMEOUT NO LONGER RETRIES IN PLACE.  "timed out" means the SYN
+  or the TLS handshake never completed - retrying the same host 1.2s later is
+  pure waste.  It now rotates the node once and ADVANCES.  "The read operation
+  timed out" means the server DID answer and is merely slow, so that one still
+  retries.  This is what let a dead host eat 30s of a 38s window.
+* THE POP RUNG IS NO LONGER LAST.  pop.windstream.net:995 was printed in the
+  host order but never dialled, because the IMAP ladder always exhausted the
+  window first.  POP is now interleaved at rung 2.
+* WEB-ONLY HOSTS DROPPED FROM THE LADDER.  secure.windstream.net is a Synacor
+  web portal and the bare apex is the web host; the trace shows BOTH timing out
+  on 993 and on 143.  Each was costing a full rung.
+* CONNECT / READ FLOORS RAISED 8 -> 10 / 8 -> 15.  mail.mediacombb.net returned
+  "The read operation timed out" - a LIVE server that could not greet inside 8s.
+* STORM BREAKER WIDENED.  MAX_ROTATIONS 3 -> 5, PROXY_407_FORCE_DIRECT 2 -> 5.
+  With an 85-node pool, 4 failures is not a representative sample.
 
 v13.26 changes
 --------------
@@ -427,10 +451,10 @@ str_lit.set_page_config(
 )
 
 # ============================================================================
-# PROXY-LAYER FAILURE CONTRACT  (v13.25)
+# PROXY-LAYER FAILURE CONTRACT  (v13.25 / v13.27)
 # ============================================================================
 PROXY_407_QUARANTINE = 2          # 407s on a node before it leaves the pool
-PROXY_407_FORCE_DIRECT = 2        # 407s on an account with no fresh proxy -> go direct
+PROXY_407_FORCE_DIRECT = 5        # v13.27: was 2 - with 85 nodes, 4 proves nothing
 
 DEDUPE_PROXIES_DEFAULT = True     # collapse duplicate host:port lines in proxies.txt
 PROBE_TIMEOUT_DEFAULT = 8.0       # seconds for the CONNECT tunnel probe (was hardcoded 3.0)
@@ -445,10 +469,23 @@ PROBE_TARGET_PORTS = {
 # v13.25 concurrency + scheduling defaults
 PROXY_CONCURRENCY_DEFAULT = 12    # simultaneous proxy tunnels, globally
 HOST_CONCURRENCY_DEFAULT = 3      # simultaneous connections to ONE mail host
-CONNECT_FLOOR_DEFAULT = 8.0       # minimum TCP connect timeout
-READ_FLOOR_DEFAULT = 8.0          # minimum socket read timeout
-SAME_HOST_RETRIES_DEFAULT = 2     # in-place retries when a host answers slowly
+# v13.27: a connect-level timeout no longer retries in place, so the retry budget
+# is only spent on genuinely slow (read-level) servers.
+CONNECT_FLOOR_DEFAULT = 10.0      # minimum TCP connect timeout
+READ_FLOOR_DEFAULT = 15.0         # minimum socket read timeout (was 8s)
+SAME_HOST_RETRIES_DEFAULT = 1     # in-place retries when a host answers SLOWLY
 DIRECT_FIRST_DEFAULT = False
+
+# v13.27: hosts that answer DNS but never speak IMAP.  Discovery injects them
+# because 'secure.' / 'webmail.' are in the prefix list, and every one of them
+# burns a full rung before failing.
+WEB_ONLY_HOSTS = {
+    "secure.windstream.net",
+    "webmail.windstream.net",
+    "secure.suddenlink.net",
+    "webmail.suddenlink.net",
+    "secure.optimum.net",
+}
 
 class ProxyAuthError(ConnectionError):
     """The PROXY rejected us (407). The mail host is still untested."""
@@ -460,6 +497,21 @@ def _is_proxy_auth_fail(msg) -> bool:
             or "proxy authentication required" in m
             or "socks5 authentication failed" in m
             or "socks authentication failed" in m)
+
+def _timeout_kind(err) -> str:
+    """v13.27: 'connect' | 'read' | ''.
+
+    'timed out'                     -> the SYN or the TLS handshake never finished.
+                                       Retrying the SAME node 1.2s later is waste.
+    'The read operation timed out'  -> the socket CONNECTED and the server is
+                                       merely slow.  Worth one in-place retry.
+    """
+    low = str(err).lower()
+    if "read operation timed out" in low:
+        return "read"
+    if "timed out" in low or "timeout" in low:
+        return "connect"
+    return ""
 
 # ============================================================================
 # PERSISTENT ENGINE STATE  (v13.21 — survives every Streamlit rerun)
@@ -512,6 +564,7 @@ def _engine_state():
         "meta": _meta,
         "tunnel_cache": {},
         "rr_index": 0,
+        "rr_last": None,          # v13.27: last node handed out by the rotator
         # caches that must not be rebuilt on every click
         "geo_cache": {},
         "public_ip": {"ip": "", "ts": 0.0},
@@ -747,7 +800,7 @@ def build_diagnostics_text():
         L.append(str(s))
 
     A("=" * 78)
-    A("MEGA ULTIMATE MAIL CHECKER — v13.26 DIAGNOSTIC BUNDLE")
+    A("MEGA ULTIMATE MAIL CHECKER — v13.27 DIAGNOSTIC BUNDLE")
     A(f"generated {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     A("=" * 78)
 
@@ -816,6 +869,8 @@ def build_diagnostics_text():
     A(f"  HOST_CONCURRENCY    : {CFG.get('HOST_CONCURRENCY')}")
     A(f"  PROXY_CONCURRENCY   : {CFG.get('PROXY_CONCURRENCY')}")
     A(f"  DIRECT_FIRST        : {CFG.get('DIRECT_FIRST')}")
+    A(f"  RANDOM_ROTATION     : {CFG.get('RANDOM_ROTATION')}")
+    A(f"  CONNECT_FLOOR/READ  : {CONNECT_FLOOR_DEFAULT} / {READ_FLOOR_DEFAULT}")
 
     A("")
     A("--- 7. PROBE REASON HISTOGRAM (most recent probe per node) ---")
@@ -922,7 +977,7 @@ def default_theme() -> dict:
         "bg": p["bg"], "panel": p["panel"], "text": p["text"],
         "radius": 14, "glow": True, "animate": True, "glass": True,
         "colorize_logs": True,
-        "hero_title": "⚡ Mega Ultimate Mail Checker v13.26",
+        "hero_title": "⚡ Mega Ultimate Mail Checker v13.27",
         "hero_sub": "World-Coverage Edition — router-aware host ranking, concurrency-governed rotating proxy pool with 407 quarantine, geo-call routing, Microsoft XOAUTH2, retryable IP-block handling, optional SMTP pre-check, anti-spoofing post-auth validation, deep diagnostics.",
     }
 
@@ -1115,6 +1170,7 @@ def render_hero(th: dict):
                 <span class="bb-tag">Deep / Aggressive</span>
                 <span class="bb-tag">Proxy Backed</span>
                 <span class="bb-tag">407 Quarantine</span>
+                <span class="bb-tag">Random Rotation</span>
                 <span class="bb-tag">Concurrency Governed</span>
                 <span class="bb-tag">Microsoft XOAUTH2</span>
                 <span class="bb-tag">Geo-Call Routing</span>
@@ -1533,26 +1589,29 @@ checker_mode = str_lit.sidebar.selectbox(
 # v13.26: Deadline defaults RAISED.  work_floor for a 3-4 rung ladder is 69-105s,
 # so a 45s deadline floored on EVERY account and printed the "Budget floored"
 # notice each time.  It is a soft floor, so it now rarely engages.
+# v13.27: Timeout defaults RAISED with the connect/read floors, because a
+# connect-level timeout no longer burns a retry - the rung budget is the only
+# thing standing between a dead host and the next rung.
 if checker_mode == "Fast Mode":
     engine_config = CheckerConfig(mode_name="Fast", fast_mode=True, max_concurrent_checks=100,
                                   connect_timeout=3.0, read_timeout=3.0, max_retries=1, failure_cooldown=60.0)
     workers = str_lit.sidebar.slider("Workers Start", 1, 100, 30, 5)
     deadline = str_lit.sidebar.slider("Deadline (Seconds)", 5, 120, 45, 5)
-    timeout = str_lit.sidebar.slider("Timeout", 1, 15, 8, 1)
+    timeout = str_lit.sidebar.slider("Timeout", 1, 25, 10, 1)
     default_hosts = 2
 elif checker_mode == "Deep / Aggressive Mode":
     engine_config = CheckerConfig(mode_name="Deep", fast_mode=False, max_concurrent_checks=30,
                                   connect_timeout=10.0, read_timeout=10.0, max_retries=4, failure_cooldown=10.0)
     workers = str_lit.sidebar.slider("Workers Start", 1, 50, 8, 1)
     deadline = str_lit.sidebar.slider("Deadline (Seconds)", 15, 300, 120, 5)
-    timeout = str_lit.sidebar.slider("Timeout", 5, 45, 12, 1)
+    timeout = str_lit.sidebar.slider("Timeout", 5, 45, 15, 1)
     default_hosts = 4
 else:
     engine_config = CheckerConfig(mode_name="Normal", fast_mode=False, max_concurrent_checks=50,
                                   connect_timeout=5.0, read_timeout=5.0, max_retries=1, failure_cooldown=30.0)
     workers = str_lit.sidebar.slider("Workers Start", 1, 75, 15, 5)
     deadline = str_lit.sidebar.slider("Deadline (Seconds)", 10, 180, 90, 5)
-    timeout = str_lit.sidebar.slider("Timeout", 2, 20, 10, 1)
+    timeout = str_lit.sidebar.slider("Timeout", 2, 30, 12, 1)
     default_hosts = 3
 
 max_acc = str_lit.sidebar.slider("Max Accounts", 0, 5000, 5000, 100)
@@ -1646,16 +1705,18 @@ direct_first_ui = str_lit.sidebar.toggle(
          "quarantined."
 )
 same_host_retries_ui = str_lit.sidebar.slider(
-    "Same-Host Retries on a Slow Answer", 0, 4, SAME_HOST_RETRIES_DEFAULT, 1,
-    help="When a host times out or answers with EOF, back off ~1.2s and retry the SAME host this many times before "
-         "advancing. A busy-but-alive server usually answers on the retry."
+    "Same-Host Retries on a SLOW answer", 0, 4, SAME_HOST_RETRIES_DEFAULT, 1,
+    help="Only applies to READ-level slowness (the socket connected but the server is slow to greet). "
+         "A CONNECT-level timeout never retries in place - it rotates the node once and advances, because a "
+         "host that never finished its handshake will not finish it 1.2s later."
 )
 
 str_lit.sidebar.markdown("---")
 str_lit.sidebar.markdown("### 🔀 Proxy Routing Intelligence")
 proxy_random_rotation = str_lit.sidebar.toggle(
     "🔀 Proxy Random Rotation", value=True,
-    help="ON: a different random node is used for every attempt (best against per-node 407 caps). "
+    help="ON (default): a DIFFERENT random node is used for every attempt, with a per-account avoid-set so one "
+         "account can never lean on one proxy and two consecutive attempts never share a node. "
          "OFF: the pool is walked in file order, round-robin."
 )
 geo_call_proxy = str_lit.sidebar.toggle(
@@ -2130,7 +2191,7 @@ CFG = str_lit.session_state.applied_cfg
 
 for _k, _v in (
     ("ALLOW_SELF_SIGNED", True), ("TLS_STRICT", False), ("TRY_STARTTLS", True),
-    ("TRY_ALT_USERNAME", True), ("MAX_HOSTS_PER_DOMAIN", 3), ("TIMEOUT", 10),
+    ("TRY_ALT_USERNAME", True), ("MAX_HOSTS_PER_DOMAIN", 3), ("TIMEOUT", 12),
     ("ACCOUNT_DEADLINE", 90), ("PROXY_CONNECT_TIMEOUT", 5.0), ("FAILURE_COOLDOWN", 30.0),
     ("FAST_MODE", False), ("BLACKLIST_CF", 15), ("DEBUG", False), ("PROXY_TEST_FLIGHT", True),
     ("RETRY_CONNECTION_FAILED", 0), ("MAX_ACCOUNTS", 5000), ("MAX_WORKERS_START", 15),
@@ -2355,9 +2416,9 @@ def proxy_connect(host, port, proxy_str, timeout=None, remote_dns=True):
     except Exception:
         fails = 0
     effective_timeout = max(3.0, base_timeout - (fails * 0.1))
-    # v13.25: floors raised - 4s read is far too short for a loaded legacy IMAP.
-    leg_to = max(4.0, effective_timeout * 0.45)
-    read_to = max(READ_FLOOR_DEFAULT, effective_timeout * 0.6)
+    # v13.27: connect fast, read patiently.
+    leg_to = max(CONNECT_FLOOR_DEFAULT, effective_timeout * 0.6)
+    read_to = max(READ_FLOOR_DEFAULT, effective_timeout * 0.9)
 
     if not proxy_str or proxy_str == "direct":
         if not fast_fail_dns_check(host):
@@ -2420,8 +2481,8 @@ def _tls_context(host: str, verify: bool):
 
 def _raw_socket(host, port, proxy_str=None, timeout=None):
     t = timeout or CFG["TIMEOUT"]
-    # v13.25: floors raised to 8s.
-    read_to = max(READ_FLOOR_DEFAULT, t * 0.6)
+    # v13.27: the connect side fails fast, the read side waits.
+    read_to = max(READ_FLOOR_DEFAULT, t * 0.9)
     if proxy_str and proxy_str != "direct":
         s = proxy_connect(host, port, proxy_str, timeout=t)
     else:
@@ -2665,10 +2726,10 @@ def smtp_failed_check(domain, px, trace_logs):
             attempted += 1
             s = None
             try:
-                s = _raw_socket(h, port, px, timeout=min(6.0, max(3.0, float(CFG.get("TIMEOUT", 10)))))
+                s = _raw_socket(h, port, px, timeout=min(6.0, max(3.0, float(CFG.get("TIMEOUT", 12)))))
                 if use_tls:
                     s = _tls_context(h, False).wrap_socket(s, server_hostname=h)
-                s.settimeout(min(6.0, max(3.0, float(CFG.get("TIMEOUT", 10)))))
+                s.settimeout(min(6.0, max(3.0, float(CFG.get("TIMEOUT", 12)))))
                 banner = s.recv(200)
                 if banner[:3] == b"220":
                     trace_logs.append(f"SMTP failed check -> {px_tag(px)} {h}:{port} OK")
@@ -2692,13 +2753,18 @@ def smtp_failed_check(domain, px, trace_logs):
 # PROXY HEALTH / POOL SAMPLING
 # ============================================================================
 
-def sample_alive_proxy(exclude=None, domain=None):
+def sample_alive_proxy(exclude=None, domain=None, avoid=None):
+    """v13.27 — RANDOM ROTATION with an account-level avoid set.
+
+    Guarantees a DIFFERENT node on every call for as long as the healthy pool
+    still holds one the caller has not already burned, so a single account never
+    leans on one proxy and two consecutive attempts never share a node.
+    Falls back gracefully when everything is quarantined or excluded.
+    """
     exclude = set(exclude or ())
+    avoid = set(avoid or ())
     with alive_pool_lock:
-        pool = [p for p in alive_pool if p and p not in exclude]
-    if not pool:
-        with alive_pool_lock:
-            pool = [p for p in alive_pool if p]
+        pool = [p for p in alive_pool if p]
     if not pool:
         return None
 
@@ -2706,16 +2772,16 @@ def sample_alive_proxy(exclude=None, domain=None):
         with proxy_quarantine_lock:
             q = set(proxy_quarantine)
         fresh = [p for p in pool if p not in q]
-        if not fresh:
+        if not fresh and q:
             with alive_pool_lock:
                 whole = set(alive_pool)
-            if q and whole and q >= whole:
+            if whole and q >= whole:
                 with proxy_quarantine_lock:
                     proxy_quarantine.clear()
                 _proxy_407.clear()
                 log_startup("Quarantine lifted: every pool node had 407'd - retrying them all.", quiet=True)
                 log_probe_event("quarantine auto-lifted (whole pool was quarantined)")
-                fresh = pool
+            fresh = pool
         if fresh:
             pool = fresh
 
@@ -2727,12 +2793,25 @@ def sample_alive_proxy(exclude=None, domain=None):
             if matched:
                 pool = matched
 
-    if CFG.get("RANDOM_ROTATION", True):
-        return random.choice(pool)
+    # 1st choice: never used by this account and not excluded
+    cand = [p for p in pool if p not in exclude and p not in avoid]
+    if not cand:
+        cand = [p for p in pool if p not in exclude]
+    if not cand:
+        cand = pool
+
+    if not CFG.get("RANDOM_ROTATION", True):
+        with STATE["rr_lock"]:
+            STATE["rr_index"] = (STATE["rr_index"] + 1) % len(pool)
+            return pool[STATE["rr_index"]]
 
     with STATE["rr_lock"]:
-        STATE["rr_index"] = (STATE["rr_index"] + 1) % len(pool)
-        return pool[STATE["rr_index"]]
+        last = STATE.get("rr_last")
+        if len(cand) > 1 and last in cand:
+            cand = [p for p in cand if p != last]
+        pick = random.choice(cand)
+        STATE["rr_last"] = pick
+        return pick
 
 _tunnel_cache = STATE["tunnel_cache"]
 _tunnel_lock = STATE["tunnel_lock"]
@@ -3047,6 +3126,7 @@ with str_lit.sidebar:
     str_lit.caption(
         f"Concurrency: host cap **{CFG.get('HOST_CONCURRENCY')}** · proxy cap **{CFG.get('PROXY_CONCURRENCY')}**"
         f" · direct-first **{'ON' if CFG.get('DIRECT_FIRST') else 'auto'}**"
+        f" · rotation **{'RANDOM' if CFG.get('RANDOM_ROTATION') else 'round-robin'}**"
     )
 
     if _q_now:
@@ -4173,7 +4253,13 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, 
     host_407 = {}
     net_failed_hosts = set()
     retries_by_host = {}
-    MAX_ROTATIONS = 3
+    # v13.27: a connect-level timeout is not retried in place; it gets ONE proxy
+    # rotation for that host, then the ladder advances past it.
+    conn_rotated = {}
+    # v13.27: RANDOM ROTATION must not reuse a node inside one account.
+    used_proxies = set()
+    # v13.27: was 3 - a random sample of 3 out of 85 proves nothing.
+    MAX_ROTATIONS = 5
 
     try:
         if conf.get("type") == "zero_access":
@@ -4185,7 +4271,7 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, 
         try_starttls = bool(CFG.get("TRY_STARTTLS", True))
         try_alt_user = bool(CFG.get("TRY_ALT_USERNAME", True))
         max_hosts = max(1, int(CFG.get("MAX_HOSTS_PER_DOMAIN", 3)))
-        configured_to = max(4.0, float(CFG.get("TIMEOUT", 10)))
+        configured_to = max(4.0, float(CFG.get("TIMEOUT", 12)))
         same_host_retries = max(0, int(CFG.get("SAME_HOST_RETRIES", SAME_HOST_RETRIES_DEFAULT)))
 
         users = username_candidates(email) if try_alt_user else [email]
@@ -4208,6 +4294,8 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, 
                 px = thread_state["sticky_proxy"]
             else:
                 px = sample_alive_proxy(domain=domain)
+            if px:
+                used_proxies.add(px)
 
         _all_imap = [h for h in (conf.get("imap") or []) if h]
         _imap_cap = max(2, min(4, max_hosts))
@@ -4234,6 +4322,23 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, 
         if domain in imap_hosts:
             imap_hosts = [h for h in imap_hosts if h != domain] + [domain]
 
+        # v13.27: secure.* is a Synacor WEB PORTAL and the bare apex is the web
+        # host.  The trace shows BOTH timing out on 993 AND 143, and each was
+        # costing a full ~10s rung.  Drop them from this family entirely.
+        if domain.endswith("windstream.net") or domain.endswith("kinetic.net"):
+            _drop = {domain, "secure.windstream.net", "webmail.windstream.net"}
+            _kept = [h for h in imap_hosts if h.lower() not in _drop]
+            if _kept and len(_kept) != len(imap_hosts):
+                trace_logs.append(
+                    f"Web-only hosts dropped from the IMAP ladder (never answer on 993/143): "
+                    f"{[h for h in imap_hosts if h.lower() in _drop]}")
+                imap_hosts = _kept
+
+        # v13.27: generic web-only demotion for the rest of the world.
+        _web = [h for h in imap_hosts if h.lower() in WEB_ONLY_HOSTS]
+        if _web and len(_web) < len(imap_hosts):
+            imap_hosts = [h for h in imap_hosts if h.lower() not in WEB_ONLY_HOSTS] + _web
+
         _local_roots = tuple(_domain_roots(domain))
 
         def _is_local_host(h):
@@ -4255,7 +4360,8 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, 
                 f"Proxy pool: {len(proxy_pool)} node(s) alive, {quarantine_size()} quarantined for 407.")
         trace_logs.append(
             f"Concurrency: host cap {CFG.get('HOST_CONCURRENCY')} · proxy cap {CFG.get('PROXY_CONCURRENCY')} "
-            f"· same-host retries {same_host_retries}")
+            f"· same-host retries {same_host_retries} · rotation "
+            f"{'RANDOM' if CFG.get('RANDOM_ROTATION', True) else 'round-robin'}")
 
         resolvable = [h for h in (imap_hosts + pop_hosts) if fast_fail_dns_check(h)]
         dns_ok = bool(resolvable)
@@ -4270,8 +4376,17 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, 
         pop_only = [h for h in pop_hosts if h not in imap_set]
         pop_dup = [h for h in pop_hosts if h in imap_set]
 
-        primary_plan = [("IMAP", h, 993, "ssl") for h in imap_hosts]
-        primary_plan += [("POP", h, 995, "ssl") for h in pop_only]
+        # v13.27: POP is a DIFFERENT service on a DIFFERENT port (995).  It used
+        # to be the LAST rung, and the IMAP ladder always ate the window first -
+        # pop.windstream.net:995 was printed in the host order but NEVER dialled.
+        # Interleave it at position 2 so it always gets a slot.
+        primary_plan = []
+        if imap_hosts:
+            primary_plan.append(("IMAP", imap_hosts[0], 993, "ssl"))
+        for _ph in pop_only:
+            primary_plan.append(("POP", _ph, 995, "ssl"))
+        for _h in imap_hosts[1:]:
+            primary_plan.append(("IMAP", _h, 993, "ssl"))
 
         fallback_plan = [("POP", h, 995, "ssl") for h in pop_dup]
         if try_starttls:
@@ -4419,14 +4534,17 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, 
                 # v13.24: never spend a rung on a node we already know is
                 # quarantined.
                 if px_used and proxy_mode != "off" and proxy_is_quarantined(px_used):
-                    _fresh = sample_alive_proxy(domain=domain)
+                    _fresh = sample_alive_proxy(domain=domain, avoid=used_proxies)
                     if _fresh and _fresh != px_used:
                         px_used = _fresh
+                        used_proxies.add(_fresh)
                         trace_logs.append(
                             f"Quarantined node in hand -> switched to fresh node {px_tag(px_used)}")
 
                 rotations_left = MAX_ROTATIONS if (allow_rotate and px_used and proxy_mode != "off") else 0
-                seen_px = {px_used} if px_used else set()
+                # v13.27: seen_px IS the account-level used set, so a node burned
+                # on an earlier rung cannot come back later in the same account.
+                seen_px = used_proxies
                 acct_407 = 0
 
                 while True:
@@ -4488,10 +4606,29 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, 
                             record_proxy_attempt(px_used, success=False, is_network_error=True)
                             trace_logs.append(f"{px_tag(px_used)} -> TIMEOUT {proto} {server}:{port}: {err_text[:90]} [Classified: {FAILED}]")
                             server_level_fail = True
-                            rotate_now = True
-                            if retries_by_host.get(server, 0) < same_host_retries and (deadline_ts - time.time()) > 7.0:
-                                retries_by_host[server] = retries_by_host.get(server, 0) + 1
-                                retry_same = True
+
+                            # v13.27: split the two very different timeouts.
+                            _kind = _timeout_kind(to_err)
+                            if _kind == "connect":
+                                # The SYN / TLS handshake never finished.  A 1.2s
+                                # in-place retry on the SAME node is waste.
+                                if px_used and proxy_mode != "off" and not conn_rotated.get(server):
+                                    conn_rotated[server] = True
+                                    rotate_now = True
+                                    trace_logs.append(
+                                        f"{px_tag(px_used)} Connect-level timeout -> rotating node ONCE, "
+                                        f"no in-place retry")
+                                else:
+                                    rotate_now = False
+                                    trace_logs.append(
+                                        f"{px_tag(px_used)} Connect-level timeout -> advancing past "
+                                        f"{server}:{port} (no in-place retry)")
+                            else:
+                                # The socket CONNECTED, the server is just slow.
+                                rotate_now = True
+                                if retries_by_host.get(server, 0) < same_host_retries and (deadline_ts - time.time()) > 7.0:
+                                    retries_by_host[server] = retries_by_host.get(server, 0) + 1
+                                    retry_same = True
 
                         except (socket.error, ConnectionRefusedError) as sock_err:
                             err_text = str(sock_err)
@@ -4619,6 +4756,10 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, 
                             else:
                                 server_level_fail = True
                                 rotate_now = rotate_now or proxy_level
+                                if (_is_timeout(e) and _timeout_kind(e) == "connect"
+                                        and not conn_rotated.get(server)):
+                                    conn_rotated[server] = True
+                                    rotate_now = True
 
                         if proxy_dead:
                             break
@@ -4626,6 +4767,7 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, 
                             break
 
                     # v13.25: in-place retry on a slow/EOF host before rotating.
+                    # v13.27: read-level only - connect-level never lands here.
                     if retry_same and (deadline_ts - time.time()) > 5.0:
                         trace_logs.append(
                             f"{px_tag(px_used)} Host answered slowly -> backoff 1.2s, retrying "
@@ -4638,7 +4780,7 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, 
                         and (deadline_ts - time.time()) > max(2.0, per_to * 0.5)
                     )
                     if can_rotate:
-                        newpx = sample_alive_proxy(exclude=seen_px, domain=domain)
+                        newpx = sample_alive_proxy(exclude=seen_px, avoid=seen_px, domain=domain)
                         if newpx and newpx not in seen_px:
                             seen_px.add(newpx)
                             px_used = newpx
