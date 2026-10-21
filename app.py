@@ -1,9 +1,40 @@
 """
-Mega Ultimate Mail Checker — v13.20
+Mega Ultimate Mail Checker — v13.21
 ===================================
 Complete rewrite. SMTP reachability is an OPT-IN pre-check stage (never inside
 the validator), status classification actually works, and every direct-connection
 line carries the real egress IP / region / country / VPN state.
+
+v13.21 changes  (the proxy state was being destroyed on every rerun)
+--------------------------------------------------------------------
+* CRITICAL FIX — PROXY STATE NOW SURVIVES A STREAMLIT RERUN.
+  Streamlit re-executes the entire file on EVERY widget interaction.  That made
+  `alive_pool = []`, `probe_stats = {}`, `_proxy_407 = defaultdict(int)`,
+  `proxy_quarantine = set()` and `proxy_meta = load_json(...)` all run again on
+  every click, handing the renderer BRAND NEW empty objects while the background
+  probe thread was still writing into the orphaned old ones.  The result was a
+  permanent "Alive: 0", "pass 0 | 407 auth 0 | timeout 0 | dead 0",
+  "Last Probe: -" and "407s: 0" on a pool that had never actually been tested at
+  render time — and clicking "Refresh Startup Screen" could never fix it because
+  the click itself is what wiped the state.  All of it now lives in ONE
+  st.cache_resource container that is created once per process and returned
+  unchanged on every rerun.
+* CRITICAL FIX — PROBE COUNTERS ARE NO LONGER DISCARDED.
+  enrich_proxy_geo() returned early whenever the live list was empty, so it
+  never called save_proxy_meta() and every in-memory fails++ / success++ /
+  407-strike was thrown away on the next rerun.  refresh_alive_pool() now always
+  persists proxy_meta, so Fails / Successes / 407s finally move.
+* FIRST-PAINT PROBE.  On a fresh process the sidebar used to render zeros until
+  the 15s background tick landed (and then a rerun wiped it again).  It now
+  probes once inline on first paint, so the counters are real immediately.
+* MIN_PROXY_SCORE DEFAULT 40 -> 10.  The probe decays a node's score, so at 40 a
+  node that failed three probes was silently filtered OUT of the pool and never
+  re-probed.  A slightly slow probe could empty the whole pool.
+* DASHBOARD STALENESS.  The health panel now shows "last probe Ns ago" and a
+  probe-run counter, so a stale reading is obvious instead of looking live.
+* OTHER PERSISTENT STATE.  Geo cache, public-IP cache, direct-egress geo, the
+  SMTP domain cache, the round-robin index and the circuit-breaker table all
+  survive reruns too, instead of being rebuilt and re-fetched on every click.
 
 v13.20 changes  (the tunnel probe now tells the truth)
 ------------------------------------------------------
@@ -26,15 +57,12 @@ v13.20 changes  (the tunnel probe now tells the truth)
 * STRICT PROBE SWITCH.  v13.19 silently did `if not live: live = raw`, masking
   a fully dead pool as a healthy 90-node pool.  Strict ON (default) keeps the
   pool honest; Strict OFF restores the old fallback.
-* POOL DEDUPLICATION.  proxies.txt routinely repeats the same host:port dozens
-  of times, so "90 nodes failing at once" was really ~10 boxes failing and the
-  fail counters were inflated ~10x.  Duplicates are collapsed on load.
+* POOL DEDUPLICATION.  Duplicate host:port lines are collapsed on load.
 * FETCH & TEST USES THE REAL PROBE.  The button blessed nodes with a 53/udp
   tunnel, which then failed the 993 tunnel probe — producing a pool that looked
   alive in the file and dead in the app.  It now runs the same probe the pool does.
-* DASHBOARD TELEMETRY.  New Last Probe column, a pass / 407 / timeout / dead
-  summary line, and a "Re-probe pool now" button that clears the tunnel cache
-  and re-probes without restarting the app.
+* DASHBOARD TELEMETRY.  New Last Probe column plus a pass / 407 / timeout /
+  dead summary line, and a "Re-probe pool now" button.
 
 v13.19 changes  (proxy-layer 407 was being blamed on the MAIL HOST)
 -------------------------------------------------------------------
@@ -458,16 +486,16 @@ str_lit.set_page_config(
 )
 
 # ============================================================================
-# PROXY-LAYER FAILURE CONTRACT  (v13.20)
+# PROXY-LAYER FAILURE CONTRACT  (v13.21)
 # ============================================================================
 # A 407 is a PROXY problem.  The mail host behind it is still untested, so the
 # engine must rotate the proxy and retry the SAME host - never advance the host.
 #
-# v13.20 adds an HONEST probe.  The tunnel probe reports WHY a node failed
-# (auth / timeout / dead / tcp / format) instead of a bare False, records a
-# SUCCESS when it passes, and surfaces both in the dashboard.  Probe timeout and
-# probe target are configurable, and a strict/lenient switch decides whether a
-# fully-failed probe leaves the pool empty (honest) or falls back to the raw file.
+# v13.20 added an HONEST probe (it reports WHY a node failed instead of a bare
+# False).  v13.21 makes the whole proxy layer PERSISTENT, because Streamlit
+# re-executes this file on every interaction and was handing the renderer a
+# brand-new empty state while the background probe thread wrote into the
+# orphaned old one.
 
 PROXY_407_QUARANTINE = 2          # 407s on a node before it leaves the pool
 PROXY_407_FORCE_DIRECT = 2        # 407s on an account with no fresh proxy -> go direct
@@ -492,10 +520,80 @@ def _is_proxy_auth_fail(msg) -> bool:
     return ("407" in m) or ("proxy authentication required" in m)
 
 
-# --- v13.20 probe telemetry -------------------------------------------------
-# node -> {"ok": bool, "reason": str, "ts": float, "latency_ms": int, "target": str, "scheme": int|None}
-probe_stats = {}
-probe_stats_lock = threading.Lock()
+# ============================================================================
+# PERSISTENT ENGINE STATE  (v13.21 — survives every Streamlit rerun)
+# ============================================================================
+# Streamlit re-executes this whole file on EVERY widget interaction.  A plain
+# module-level `alive_pool = []` therefore hands you a BRAND NEW empty list on
+# every rerun, and a plain `probe_stats = {}` a brand new empty dict.  The
+# background probe thread writes into the object that existed a moment ago, the
+# rerun orphans it, and the sidebar renders the fresh empty one -> "Alive: 0",
+# "pass 0 | 407 auth 0 | timeout 0 | dead 0", "Last Probe: -" and "407s: 0"
+# even though the probe ran and the pool may be perfectly healthy.  Clicking
+# "Refresh Startup Screen" could never fix it because the click IS the rerun
+# that wipes the state.
+#
+# st.cache_resource gives us ONE container object per process, returned
+# unchanged on every rerun, so the state actually sticks.
+
+@str_lit.cache_resource(show_spinner=False)
+def _engine_state():
+    _meta = {}
+    try:
+        if os.path.exists("proxy_meta.json"):
+            with open("proxy_meta.json", encoding="utf-8") as _f:
+                _meta = json.load(_f) or {}
+    except Exception:
+        _meta = {}
+    return {
+        # locks
+        "cache_lock": threading.Lock(),
+        "proxy_lock": threading.Lock(),
+        "file_write_lock": threading.Lock(),
+        "session_state_lock": threading.Lock(),
+        "alive_pool_lock": threading.Lock(),
+        "host_dns_lock": threading.Lock(),
+        "proxy_quarantine_lock": threading.Lock(),
+        "proxy_scheme_lock": threading.Lock(),
+        "probe_stats_lock": threading.Lock(),
+        "tunnel_lock": threading.Lock(),
+        "rr_lock": threading.Lock(),
+        "geo_lock": threading.Lock(),
+        "public_ip_lock": threading.Lock(),
+        "direct_geo_lock": threading.Lock(),
+        "smtp_lock": threading.Lock(),
+        # engine / proxy state
+        "bad_proxies": set(),
+        "alive_pool": [],
+        "consecutive_proxy_failures": defaultdict(int),
+        "circuit_breaker_until": {},
+        "failed_domain_cache": {},
+        "host_dns_cache": {},
+        "proxy_quarantine": set(),
+        "strikes_407": defaultdict(int),
+        "proxy_scheme": {},
+        "probe_stats": {},
+        "meta": _meta,
+        "tunnel_cache": {},
+        "rr_index": 0,
+        # caches that must not be rebuilt on every click
+        "geo_cache": {},
+        "public_ip": {"ip": "", "ts": 0.0},
+        "direct_geo": {"ts": 0.0, "ip": "", "country": "Unknown", "region": "Unknown", "vpn": "Auto"},
+        "direct_isp": {"ts": 0.0, "isp": ""},
+        "smtp_domain_cache": {},
+        # probe bookkeeping
+        "probe_in_flight": False,
+        "last_probe_ts": 0.0,
+        "probe_runs": 0,
+    }
+
+
+STATE = _engine_state()
+
+# --- aliases: these names point at the PERSISTENT objects, never rebound ----
+probe_stats = STATE["probe_stats"]
+probe_stats_lock = STATE["probe_stats_lock"]
 
 _PROBE_REASON_LABEL = {
     "ok": "pass",
@@ -522,6 +620,7 @@ def record_probe_result(proxy_str, ok, reason, latency_ms=0, target="", scheme=N
             "target": target or "",
             "scheme": scheme,
         }
+    STATE["last_probe_ts"] = time.time()
 
 
 def probe_summary():
@@ -596,7 +695,7 @@ def default_theme() -> dict:
         "bg": p["bg"], "panel": p["panel"], "text": p["text"],
         "radius": 14, "glow": True, "animate": True, "glass": True,
         "colorize_logs": True,
-        "hero_title": "⚡ Mega Ultimate Mail Checker v13.20",
+        "hero_title": "⚡ Mega Ultimate Mail Checker v13.21",
         "hero_sub": "World-Coverage Edition — router-aware host ranking, rotating proxy pool with 407 quarantine, geo-call routing, Microsoft XOAUTH2, retryable IP-block handling, optional SMTP pre-check, anti-spoofing post-auth validation.",
     }
 
@@ -918,7 +1017,7 @@ def _reset_theme():
     save_theme(d)
 
 # ============================================================================
-# GLOBAL STATE
+# GLOBAL STATE  (all of it persistent — see _engine_state above)
 # ============================================================================
 
 DOMAIN_CACHE_TTL = 86400
@@ -1034,40 +1133,40 @@ log_startup(f"hosts.py status -> loaded={HOSTS_OK} has_ranking={HOSTS_HAS_RANKIN
 log_startup(f"status.py status -> {STATUS_IMPORT_NOTE}")
 log_startup(f"ms_oauth.py status -> loaded={MS_OAUTH_OK} (Microsoft XOAUTH2 {'active' if MS_OAUTH_OK else 'INACTIVE'})")
 
-cache_lock = threading.Lock()
-proxy_lock = threading.Lock()
-file_write_lock = threading.Lock()
-session_state_lock = threading.Lock()
-bad_proxies = set()                     # NOTHING pre-seeded
-alive_pool = []
-alive_pool_lock = threading.Lock()
-consecutive_proxy_failures = defaultdict(int)
-circuit_breaker_until = {}
-failed_domain_cache = {}
-_host_dns_cache = {}
-_host_dns_lock = threading.Lock()
+# --- bind the persistent containers to plain module names -------------------
+cache_lock = STATE["cache_lock"]
+proxy_lock = STATE["proxy_lock"]
+file_write_lock = STATE["file_write_lock"]
+session_state_lock = STATE["session_state_lock"]
+bad_proxies = STATE["bad_proxies"]                      # NOTHING pre-seeded
+alive_pool = STATE["alive_pool"]
+alive_pool_lock = STATE["alive_pool_lock"]
+consecutive_proxy_failures = STATE["consecutive_proxy_failures"]
+circuit_breaker_until = STATE["circuit_breaker_until"]
+failed_domain_cache = STATE["failed_domain_cache"]
+_host_dns_cache = STATE["host_dns_cache"]
+_host_dns_lock = STATE["host_dns_lock"]
 
-# v13.20 — proxy-layer health
-proxy_quarantine = set()                # nodes that 407'd, out for this run
-proxy_quarantine_lock = threading.Lock()
-_proxy_407 = defaultdict(int)           # node -> 407 strike count
-_proxy_scheme = {}                      # node -> socks.HTTP / socks.SOCKS5 that worked
-_proxy_scheme_lock = threading.Lock()
+# v13.21 — proxy-layer health (persistent across reruns)
+proxy_quarantine = STATE["proxy_quarantine"]
+proxy_quarantine_lock = STATE["proxy_quarantine_lock"]
+_proxy_407 = STATE["strikes_407"]                       # node -> 407 strike count
+_proxy_scheme = STATE["proxy_scheme"]                   # node -> socks.HTTP / socks.SOCKS5 that worked
+_proxy_scheme_lock = STATE["proxy_scheme_lock"]
 
-_rr_lock = threading.Lock()
-_rr_index = 0
+_rr_lock = STATE["rr_lock"]
 
-_GEO_CACHE = {}
-_GEO_LOCK = threading.Lock()
-_PUBLIC_IP = {"ip": "", "ts": 0.0}
-_PUBLIC_IP_LOCK = threading.Lock()
-_DIRECT_GEO = {"ts": 0.0, "ip": "", "country": "Unknown", "region": "Unknown", "vpn": "Auto"}
-_DIRECT_GEO_LOCK = threading.Lock()
-_DIRECT_ISP = {"ts": 0.0, "isp": ""}
+_GEO_CACHE = STATE["geo_cache"]
+_GEO_LOCK = STATE["geo_lock"]
+_PUBLIC_IP = STATE["public_ip"]
+_PUBLIC_IP_LOCK = STATE["public_ip_lock"]
+_DIRECT_GEO = STATE["direct_geo"]
+_DIRECT_GEO_LOCK = STATE["direct_geo_lock"]
+_DIRECT_ISP = STATE["direct_isp"]
 
 # SMTP pre-check cache (per domain)
-_SMTP_DOMAIN_CACHE = {}
-_SMTP_LOCK = threading.Lock()
+_SMTP_DOMAIN_CACHE = STATE["smtp_domain_cache"]
+_SMTP_LOCK = STATE["smtp_lock"]
 _SMTP_CACHE_TTL = 900
 _SMTP_PRECHECK_BUDGET = 45.0
 _SMTP_PRECHECK_WORKERS = 32
@@ -1214,7 +1313,11 @@ custom_blacklist_input = str_lit.sidebar.text_input("Custom Blacklist Domains (c
 
 str_lit.sidebar.markdown("---")
 str_lit.sidebar.markdown("### 🌐 Proxy / Pool Configuration")
-min_proxy_score = str_lit.sidebar.slider("Min Proxy Score", 0, 100, 40, 10)
+min_proxy_score = str_lit.sidebar.slider(
+    "Min Proxy Score", 0, 100, 10, 10,
+    help="A node is dropped from the pool once its score falls below this. The probe decays the score, so at 40 a "
+         "node that fails three probes was silently excluded and never re-probed. Set to 0 to keep every node."
+)
 proxy_precheck_timeout = str_lit.sidebar.slider("Proxy Pre-Check Timeout (Sec)", 1, 10, 5, 1)
 probe_timeout_ui = str_lit.sidebar.slider(
     "Tunnel Probe Timeout (Sec)", 3, 20, 8, 1,
@@ -1287,7 +1390,7 @@ def load_json(path, default=None):
     return default
 
 domain_cache = load_json("domain_cache.json", {})
-proxy_meta = load_json("proxy_meta.json", {})
+proxy_meta = STATE["meta"]
 
 def load_proxies(quiet: bool = False):
     """Proxies come from proxies.txt only. Nothing is pre-added.
@@ -1363,7 +1466,7 @@ def parse_proxy(proxy_str):
     return None
 
 # ---------------------------------------------------------------------------
-# PROXY-LAYER HELPERS  (v13.20)
+# PROXY-LAYER HELPERS  (v13.21)
 # ---------------------------------------------------------------------------
 def proxy_is_quarantined(proxy_str) -> bool:
     if not proxy_str:
@@ -1396,8 +1499,6 @@ def quarantine_size() -> int:
 def clear_proxy_quarantine():
     with proxy_quarantine_lock:
         proxy_quarantine.clear()
-    with _proxy_scheme_lock:
-        pass
     _proxy_407.clear()
 
 
@@ -1537,7 +1638,6 @@ def enrich_proxy_geo(proxies, max_workers=8):
                 with proxy_lock:
                     m = proxy_meta.setdefault(p, {"fails": 0, "success": 0, "score": 60, "latency_ms": 0})
                     m["country"], m["region"] = country, region
-        save_proxy_meta()
     except Exception as e:
         log_startup(f"WARNING: proxy geo enrichment error: {e}", quiet=True)
 
@@ -2320,7 +2420,6 @@ def sample_alive_proxy(exclude=None, domain=None):
     is quarantined the quarantine is lifted for the pool so the run is never
     left with no path at all.
     """
-    global _rr_index
     exclude = set(exclude or ())
     with alive_pool_lock:
         pool = [p for p in alive_pool if p and p not in exclude]
@@ -2340,8 +2439,7 @@ def sample_alive_proxy(exclude=None, domain=None):
             if q and whole and q >= whole:
                 with proxy_quarantine_lock:
                     proxy_quarantine.clear()
-                with proxy_quarantine_lock:
-                    _proxy_407.clear()
+                _proxy_407.clear()
                 log_startup("Quarantine lifted: every pool node had 407'd - retrying them all.", quiet=True)
                 fresh = pool
         if fresh:
@@ -2358,12 +2456,12 @@ def sample_alive_proxy(exclude=None, domain=None):
     if CFG.get("RANDOM_ROTATION", True):
         return random.choice(pool)
 
-    with _rr_lock:
-        _rr_index = (_rr_index + 1) % len(pool)
-        return pool[_rr_index]
+    with STATE["rr_lock"]:
+        STATE["rr_index"] = (STATE["rr_index"] + 1) % len(pool)
+        return pool[STATE["rr_index"]]
 
-_tunnel_cache = {}
-_tunnel_lock = threading.Lock()
+_tunnel_cache = STATE["tunnel_cache"]
+_tunnel_lock = STATE["tunnel_lock"]
 _TUNNEL_TTL = 120
 
 
@@ -2489,55 +2587,74 @@ def precheck_proxy_fast(proxy_str):
 
 
 def refresh_alive_pool():
-    """Parallel. v13.20: honors PROBE_STRICT and logs the failure breakdown."""
-    try:
-        raw = get_filtered_active_proxies(quiet=True)
-    except Exception:
-        raw = []
-    if not raw:
-        with alive_pool_lock:
-            alive_pool[:] = []
+    """Parallel. Honors PROBE_STRICT, logs the breakdown, PERSISTS the meta.
+
+    v13.21: the result is written into the PERSISTENT alive_pool, and
+    proxy_meta is always saved, so a rerun no longer discards the outcome.
+    """
+    if STATE.get("probe_in_flight"):
         return
-    if not CFG.get("PROXY_TEST_FLIGHT", True):
-        with alive_pool_lock:
-            alive_pool[:] = raw
-        enrich_proxy_geo(raw)
-        log_startup(f"Test Flight OFF: pool set to all {len(raw)} candidate(s) without probing.", quiet=True)
-        return
-
-    live = []
-    batch_timed_out = False
+    STATE["probe_in_flight"] = True
     try:
-        with ThreadPoolExecutor(max_workers=16) as ex:
-            f2p = {ex.submit(precheck_proxy_fast, p): p for p in raw}
-            for fut in as_completed(f2p, timeout=max(60, len(raw) * 2)):
-                try:
-                    if fut.result():
-                        live.append(f2p[fut])
-                except Exception:
-                    continue
-    except Exception:
-        batch_timed_out = True
+        try:
+            raw = get_filtered_active_proxies(quiet=True)
+        except Exception:
+            raw = []
+        if not raw:
+            with alive_pool_lock:
+                alive_pool[:] = []
+            log_startup("Alive pool refreshed: proxies.txt is empty.", quiet=True)
+            return
+        if not CFG.get("PROXY_TEST_FLIGHT", True):
+            with alive_pool_lock:
+                alive_pool[:] = raw
+            enrich_proxy_geo(raw)
+            save_proxy_meta()
+            log_startup(f"Test Flight OFF: pool set to all {len(raw)} candidate(s) without probing.", quiet=True)
+            return
 
-    strict = bool(CFG.get("PROBE_STRICT", PROBE_STRICT_DEFAULT))
-    note = ""
-    if not live and not strict:
-        live = raw
-        note = " | STRICT OFF: fell back to the raw pool"
-    elif not live and batch_timed_out:
-        note = " | probe batch timed out"
+        live = []
+        batch_timed_out = False
+        try:
+            with ThreadPoolExecutor(max_workers=16) as ex:
+                f2p = {ex.submit(precheck_proxy_fast, p): p for p in raw}
+                for fut in as_completed(f2p, timeout=max(60, len(raw) * 2)):
+                    try:
+                        if fut.result():
+                            live.append(f2p[fut])
+                    except Exception:
+                        continue
+        except Exception:
+            batch_timed_out = True
 
-    with alive_pool_lock:
-        alive_pool[:] = live
-    enrich_proxy_geo(live)
+        strict = bool(CFG.get("PROBE_STRICT", PROBE_STRICT_DEFAULT))
+        note = ""
+        if not live and not strict:
+            live = raw
+            note = " | STRICT OFF: fell back to the raw pool"
+        elif not live and batch_timed_out:
+            note = " | probe batch timed out"
 
-    passed, auth, timeout_n, dead = probe_summary()
-    log_startup(
-        f"Alive pool refreshed: {len(live)} node(s) passed the tunnel probe "
-        f"out of {len(raw)} candidate(s). Probe breakdown -> pass={passed} auth407={auth} "
-        f"timeout={timeout_n} dead={dead} | target={CFG.get('PROBE_TARGET')} "
-        f"budget={probe_timeout():.0f}s strict={strict}{note}",
-        quiet=True)
+        with alive_pool_lock:
+            alive_pool[:] = live
+        enrich_proxy_geo(live)
+
+        # v13.21 FIX: always persist. enrich_proxy_geo() used to return early on
+        # an empty live list and never save, so every in-memory fails++ /
+        # success++ / 407-strike was thrown away on the next rerun.
+        save_proxy_meta()
+        STATE["last_probe_ts"] = time.time()
+        STATE["probe_runs"] = int(STATE.get("probe_runs", 0)) + 1
+
+        passed, auth, timeout_n, dead = probe_summary()
+        log_startup(
+            f"Alive pool refreshed: {len(live)} node(s) passed the tunnel probe "
+            f"out of {len(raw)} candidate(s). Probe breakdown -> pass={passed} auth407={auth} "
+            f"timeout={timeout_n} dead={dead} | target={CFG.get('PROBE_TARGET')} "
+            f"budget={probe_timeout():.0f}s strict={strict}{note}",
+            quiet=True)
+    finally:
+        STATE["probe_in_flight"] = False
 
 
 def start_alive_refresher():
@@ -2582,14 +2699,32 @@ with str_lit.expander("🔍 View All Startup Entries & What Is Going On In The H
 with str_lit.sidebar:
     str_lit.markdown("---")
     str_lit.markdown("### 🌐 Proxy Management & Health")
+
+    # v13.21: first paint on a fresh process — probe once inline so the counters
+    # are real immediately instead of showing zeros until the 15s tick lands.
+    if STATE.get("last_probe_ts", 0.0) == 0.0 and all_proxies:
+        with str_lit.spinner("Probing the proxy pool for the first time…"):
+            try:
+                refresh_alive_pool()
+            except Exception:
+                pass
+            _spin_t0 = time.time()
+            while STATE.get("probe_in_flight") and (time.time() - _spin_t0) < 60:
+                time.sleep(0.25)
+
     _q_now = quarantine_size()
     _alive_now = len(alive_pool)
+    _last_ts = STATE.get("last_probe_ts", 0.0)
+    _age = int(time.time() - _last_ts) if _last_ts else -1
+    _age_txt = f"{_age}s ago" if _age >= 0 else "never"
+
     str_lit.info(f"Loaded Proxies: **{len(all_proxies)}** | Filtered Pool: **{len(filtered_pool)}** | Alive: **{_alive_now}**")
 
     _p_ok, _p_auth, _p_to, _p_dead = probe_summary()
     str_lit.caption(
         f"Probe ({CFG.get('PROBE_TARGET', PROBE_TARGET_DEFAULT)}, {probe_timeout():.0f}s): "
         f"pass **{_p_ok}** | 407 auth **{_p_auth}** | timeout **{_p_to}** | dead **{_p_dead}**"
+        f"  ·  last probe {_age_txt}  ·  runs {STATE.get('probe_runs', 0)}"
         + ("  ·  STRICT OFF" if not CFG.get("PROBE_STRICT", True) else "")
     )
 
@@ -2623,7 +2758,8 @@ with str_lit.sidebar:
                 with open(CFG["PROXY_FILE"], encoding="utf-8", errors="ignore") as _pf:
                     _lines = [l.rstrip() for l in _pf if l.strip()]
                 _uniq = list(dict.fromkeys(_lines))
-                str_lit.caption(f"{len(_lines)} line(s), {len(_uniq)} unique")
+                str_lit.caption(f"{len(_lines)} line(s), {len(_uniq)} unique, "
+                                f"{'CREDS present' if any('@' in l for l in _lines) else 'NO CREDS (@ absent)'}")
                 str_lit.code("\n".join(_lines[:60]), language="text")
             except Exception as _pf_err:
                 str_lit.error(f"Could not read proxies.txt: {_pf_err}")
