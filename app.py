@@ -1,9 +1,77 @@
 """
-Mega Ultimate Mail Checker — v13.31
+Mega Ultimate Mail Checker — v13.32
 ===================================
 Complete rewrite. SMTP reachability is an OPT-IN pre-check stage (never inside
 the validator), status classification actually works, and every direct-connection
 line carries the real egress IP / region / country / VPN state.
+
+v13.32 changes  (THE IMAP CRASH, THE DOUBLE BASE64, THE 407 FLOOD, THE HANG)
+---------------------------------------------------------------------------
+* FATAL BUG FIXED - EVERY IMAP ATTEMPT CRASHED IN v13.31.
+  imaplib.IMAP4._get_capabilities() does
+      dat = str(dat[-1], self._encoding); self.capabilities = tuple(dat.split())
+  so `mail.capabilities` is a tuple of **str**, not bytes.  v13.31 did
+  b" ".join(mail.capabilities), which raises
+      TypeError: sequence item 0: expected a bytes-like object, str found
+  on the FIRST line of _imap_wants_plain(), i.e. before any auth, on EVERY IMAP
+  rung.  An IMAP-only run therefore returned 100% CONNECTION_FAILED while an
+  all-protocols run survived on POP3 - not because POP3 is better, but because
+  POP3 is a completely separate code path that never touched that line.
+  NEW _imap_caps(): normalises every capability token to an uppercase str set,
+  is cached on the object, and can never raise.
+
+* DOUBLE BASE64 ON AUTHENTICATE PLAIN FIXED.
+  imaplib._Authenticator.process() base64-encodes whatever the authobject
+  returns ("It should return bytes data that will be base64 encoded and sent to
+  the server").  v13.31 pre-encoded the payload and let imaplib encode it a
+  second time, so the server base64-decoded once and saw a base64 STRING as the
+  SASL payload.  AUTHENTICATE PLAIN now returns the RAW \\0user\\0pass.
+  (ms_oauth.py always did this correctly - which is why XOAUTH2 worked.)
+
+* NO MORE PER-ATTEMPT CAPABILITY ROUND TRIP.
+  The v13.31 guard was `if joined in (b"", b"IMAP4REV1")` - comparing a bytes
+  literal against str data - so it was ALWAYS false and always issued an extra
+  mail.capability() network round trip through the proxy, on every attempt.
+  _imap_caps() reads the already-populated attribute, so it is free.
+
+* AUTHENTICATE PLAIN CAN NO LONGER KILL AN ATTEMPT.
+  A clean rejection still propagates as a real answer; anything else (unsupported
+  mechanism, odd SASL error) falls back to LOGIN once, on the same connection.
+
+* THE 407 FLOOD IS NOW TREATED AS WHAT IT IS - A PER-SUB-USER CONCURRENCY CAP.
+  Your pool is ~60 lines over ~7 sub-user logins and ~9 IPs.  Providers
+  rate-limit PER SUB-USER, so rotating to a different node of the SAME sub-user
+  just re-407s and burns the account window.  v13.32:
+    - NEW PER-PROXY-SUBUSER GATE (PROXY_SUBUSER_CONCURRENCY, default 2).
+    - ON THE FIRST 407 FOR A SUB-USER: settle PROXY_407_BACKOFF and retry the
+      SAME node once, instead of rotating immediately.
+    - PROXY_CONCURRENCY 8 -> 4, PROBE_WORKERS 8 -> 3 (4 -> 2 under load), so the
+      prober stops competing with the run it is protecting.
+    - A 407 now parks the node for PROXY_407_COOLDOWN (45s) instead of
+      quarantining it for the whole run.
+
+* START LIVE CHECKING NO LONGER HANGS.
+  The Start button used to clear_tunnel_cache() and run a FULL synchronous
+  re-probe of every node BEFORE the first account - while the background prober
+  had already warmed the pool.  Now:
+    - the tunnel cache is keyed by (node, probe target), so it survives a target
+      change and does not need clearing;
+    - if the pool is already warm, Start kicks the re-probe onto a background
+      thread and begins checking immediately;
+    - the ONLY case that blocks is a completely cold pool, and then it is capped
+      by PROBE_BATCH_BUDGET.
+  tunnel_probe() also now enforces a TOTAL per-node deadline (it used to try up
+  to 3 targets x 2 schemes x the full timeout = up to 6x the timeout per node),
+  and refresh_alive_pool() has a hard batch budget.
+
+* THE UI NO LONGER STALLS MID-RUN.
+  Every completed account used to re-render all 11 buckets (up to 250 lines
+  each) plus a full dataframe - roughly 2,750 markdown calls per account.
+  Rendering is now throttled to UI_MIN_INTERVAL and buckets show the last
+  BUCKET_RENDER_TAIL lines.
+
+* DIAGNOSTICS: the bundle reports the sub-user gate, the live capabilities type
+  and runs an _imap_caps() regression self-test.
 
 v13.31 changes  (protocol picker, SMTP AUTH, SASL PLAIN, honest Gmail labels)
 ---------------------------------------------------------------------------
@@ -28,7 +96,7 @@ v13.31 changes  (protocol picker, SMTP AUTH, SASL PLAIN, honest Gmail labels)
 * AUTHENTICATE PLAIN IS NOW TRIED ON IMAP when the server advertises
   LOGINDISABLED, or advertises AUTH=PLAIN without AUTH=LOGIN.  imaplib.login()
   only ever sends the LOGIN command, so servers that disable it were
-  unreachable.  Costs zero extra round trips in the common case.
+  unreachable.
 * GMAIL / YAHOO ARE NO LONGER MISLABELLED.  Gmail answers
   "[AUTHENTICATIONFAILED] Invalid credentials" for BOTH a wrong password and
   "you need an app password", and Google has no usable ROPC - so those two are
@@ -60,25 +128,6 @@ that was being mislabelled 407 and quarantined.
   * THE LOCAL-PART RETRY NO LONGER REUSES THE NODE.
   * THE TRACE NO LONGER TRUNCATES THE ERROR at 70 chars.
   * HOST_CONCURRENCY 3 -> 2, PROXY_CONCURRENCY 12 -> 8.
-
-v13.28 changes  (a 407 is no longer invented by a dead SOCKS5 listener)
------------------------------------------------------------------------
-  * THE HTTP SCHEME IS NOW THE DEFAULT.
-  * tunnel_probe() APPLIES THE SAME RULE.
-  * THE POOL PROBE CAN NOW TARGET THE ACTUAL MAIL HOST.
-  * _remember_scheme() no longer locks onto a scheme that 255s.
-
-v13.27 changes
---------------
-* PROXY RANDOM ROTATION IS NOW REAL ROTATION, with an account-level avoid set.
-* A CONNECT-LEVEL TIMEOUT NO LONGER RETRIES IN PLACE.
-* THE POP RUNG IS NO LONGER LAST.
-* WEB-ONLY HOSTS DROPPED FROM THE LADDER.
-* CONNECT / READ FLOORS RAISED 8 -> 10 / 8 -> 15.
-* STORM BREAKER WIDENED.  MAX_ROTATIONS 3 -> 5, PROXY_407_FORCE_DIRECT 2 -> 5.
-
-v13.26 / v13.25 / v13.24 / v13.23 / v13.22 / v13.21 / v13.20 / v13.19 / v13.18
-— see git history.
 
 NO hardcoded proxy IPs and NO faked geo table. Everything is derived from
 proxies.txt / Streamlit secrets / live DNS / live ip-api.
@@ -523,19 +572,29 @@ SMTP_RUNG_PORTS = ((587, "starttls"), (465, "ssl"), (25, "plain"))
 SIEVE_PORT = 4190
 SMTP_HOST_CAP = 1
 
-# ---- concurrency ----
-PROXY_CONCURRENCY_DEFAULT = 8
+# ---- concurrency (v13.32: lowered - a Webshare-style pool is many LINES over
+# ---- very few sub-users, and the provider rate-limits PER SUB-USER) --------
+PROXY_CONCURRENCY_DEFAULT = 4
 HOST_CONCURRENCY_DEFAULT = 2
 PROXY_IP_CONCURRENCY_DEFAULT = 2
-PROBE_WORKERS_DEFAULT = 8
-PROBE_WORKERS_BUSY = 4
+PROXY_SUBUSER_CONCURRENCY_DEFAULT = 2
+PROBE_WORKERS_DEFAULT = 3
+PROBE_WORKERS_BUSY = 2
 PROBER_IDLE_SLEEP = 15.0
 PROBER_BUSY_SLEEP = 5.0
 PROBER_STALE_WHILE_RUNNING = 90.0
 
+# ---- v13.32: hard wall-clock caps so nothing can stall the UI ---------------
+PROBE_BATCH_BUDGET = 45.0        # a whole pool refresh may not exceed this
+PROBE_BUDGET_START = 45.0        # and neither may a cold start
+UI_MIN_INTERVAL = 0.12           # min seconds between UI re-renders
+BUCKET_RENDER_TAIL = 40          # lines rendered per bucket per refresh
+
 # ---- proxy-layer failure contract ----
 PROXY_407_QUARANTINE = 2
 PROXY_407_FORCE_DIRECT = 5
+PROXY_407_BACKOFF = 0.8          # v13.32: settle before a same-node 407 retry
+PROXY_407_COOLDOWN = 45.0        # v13.32: 407 parks a node instead of killing it
 MAX_ROTATIONS_DEFAULT = 5
 DEDUPE_PROXIES_DEFAULT = True
 PROBE_STRICT_DEFAULT = True
@@ -705,6 +764,7 @@ def _engine_state():
         "host_gate_lock": threading.Lock(),
         "host_gates": {},
         "ip_gates": {},
+        "subuser_gates": {},          # v13.32
         "proxy_gate": None,
         # engine / proxy state
         "bad_proxies": set(),
@@ -879,6 +939,10 @@ def _env_info():
     except Exception:
         info["pandas"] = "unknown"
     try:
+        info["imaplib"] = getattr(imaplib, "__version__", "unknown")
+    except Exception:
+        info["imaplib"] = "unknown"
+    try:
         import socks as _s
         info["pysocks"] = getattr(_s, "__version__", "present(no __version__)")
     except Exception:
@@ -908,6 +972,50 @@ def _env_info():
         except Exception as e:
             info[f] = f"stat error: {e}"
     return info
+
+def _imap_caps_selftest():
+    """v13.32 regression check: the exact v13.31 crash, on a fake connection.
+
+    imaplib gives `capabilities` as a tuple of STR (and `capability()` as a list
+    of BYTES).  Both shapes must survive, and neither may raise.
+    """
+    class _Fake:
+        def __init__(self, caps):
+            self.capabilities = caps
+        def capability(self):
+            return "OK", [b"IMAP4REV1 AUTH=PLAIN LOGINDISABLED"]
+
+    lines = []
+    cases = {
+        "str tuple (what CPython 3.x really gives)": ("IMAP4REV1", "AUTH=PLAIN", "LOGINDISABLED"),
+        "bytes tuple (what v13.31 assumed)": (b"IMAP4REV1", b"AUTH=PLAIN", b"LOGINDISABLED"),
+        "empty tuple (forces the capability() call)": (),
+        "None": None,
+        "single str (not a tuple)": "IMAP4REV1 AUTH=PLAIN",
+    }
+    for label, caps in cases.items():
+        try:
+            m = _Fake(caps)
+            got = sorted(_imap_caps(m))
+            wants = "LOGINDISABLED" in got
+            verdict = "wants AUTHENTICATE PLAIN" if wants else "will use LOGIN"
+            lines.append(f"  OK   {label:46} -> caps={len(got):2} {verdict}")
+        except Exception as e:
+            lines.append(f"  FAIL {label:46} -> {type(e).__name__}: {e}")
+    try:
+        bad = b" ".join(("IMAP4REV1",))     # the v13.31 expression
+        lines.append("  repro: b' '.join(str tuple) raises "
+                     f"{type(_e_for(lambda: b' '.join(('IMAP4REV1',)))).__name__}")
+    except Exception:
+        pass
+    return lines
+
+def _e_for(fn):
+    try:
+        fn()
+        return Exception("no error")
+    except Exception as e:
+        return e
 
 def _probe_target_reachability(force=False):
     now = time.time()
@@ -998,7 +1106,7 @@ def build_diagnostics_text():
         L.append(str(s))
 
     A("=" * 78)
-    A("MEGA ULTIMATE MAIL CHECKER — v13.31 DIAGNOSTIC BUNDLE")
+    A("MEGA ULTIMATE MAIL CHECKER — v13.32 DIAGNOSTIC BUNDLE")
     A(f"generated {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     A("=" * 78)
 
@@ -1006,6 +1114,18 @@ def build_diagnostics_text():
     A("--- 1. ENVIRONMENT ---")
     for k, v in _env_info().items():
         A(f"  {k:16}: {v}")
+    try:
+        _cap = getattr(imaplib.IMAP4, "capabilities", None)
+        A("  imaplib caps   : _get_capabilities() decodes with str(dat[-1], enc) "
+          "=> mail.capabilities is a tuple of STR on CPython 3.x")
+        A("  v13.31 bug     : b' '.join(str tuple) -> 'sequence item 0: expected a bytes-like object, str found'")
+    except Exception:
+        pass
+
+    A("")
+    A("--- 1b. _imap_caps() REGRESSION SELF-TEST (v13.32) ---")
+    for line in _imap_caps_selftest():
+        A(line)
 
     A("")
     A("--- 2. ACTIVE CONFIG (CFG) ---")
@@ -1022,7 +1142,7 @@ def build_diagnostics_text():
     A(f"  total lines       : {fa.get('total')}")
     A(f"  unique lines      : {fa.get('unique')}")
     A(f"  DISTINCT IPs      : {fa.get('distinct_ips')}   <-- the number that matters")
-    A(f"  DISTINCT users    : {fa.get('distinct_users')}")
+    A(f"  DISTINCT users    : {fa.get('distinct_users')}   <-- the 407 limit is per USER, not per IP")
     A(f"  lines with '@'    : {fa.get('with_creds')}")
     A(f"  unparsable lines  : {fa.get('unparsable')}")
     A(f"  detected formats  : {fa.get('formats')}")
@@ -1068,10 +1188,11 @@ def build_diagnostics_text():
     A(f"  process uptime      : {int(time.time() - STATE.get('process_start', time.time()))}s")
     A(f"  probe target/budget : {CFG.get('PROBE_TARGET')} / {probe_timeout():.0f}s / strict={CFG.get('PROBE_STRICT')}")
     A(f"  probe targets (live): {[t[0] + ':' + str(t[1]) for t in probe_targets()]}")
-    A(f"  probe workers       : {probe_workers()}")
+    A(f"  probe workers       : {probe_workers()} (batch budget {PROBE_BATCH_BUDGET:.0f}s)")
     A(f"  HOST_CONCURRENCY    : {CFG.get('HOST_CONCURRENCY')}")
     A(f"  PROXY_CONCURRENCY   : {CFG.get('PROXY_CONCURRENCY')}")
     A(f"  PROXY_IP_CONCURRENCY: {CFG.get('PROXY_IP_CONCURRENCY')}")
+    A(f"  PROXY_SUBUSER_CONC  : {CFG.get('PROXY_SUBUSER_CONCURRENCY')}   <-- 407 control")
     A(f"  DIRECT_FIRST        : {CFG.get('DIRECT_FIRST')}")
     A(f"  RANDOM_ROTATION     : {CFG.get('RANDOM_ROTATION')}")
     A(f"  CONNECT_FLOOR/READ  : {CONNECT_FLOOR_DEFAULT} / {READ_FLOOR_DEFAULT}")
@@ -1108,12 +1229,14 @@ def build_diagnostics_text():
     now = time.time()
     A(f"  circuit-broken (30s): "
       f"{ {k: f'{v - now:.0f}s left' for k, v in circuit_breaker_until.items() if v > now} }")
-    A(f"  scheme memory: {dict(_proxy_scheme)}")
+    with _proxy_scheme_lock:
+        A(f"  scheme memory: {dict(_proxy_scheme)}")
+    A(f"  407 cooldown map entries: {len(STATE.get('proxy_407_until') or {})}")
 
     A("")
     A("--- 10. CACHES & THREADS ---")
     with _tunnel_lock:
-        A(f"  tunnel_cache entries: {len(_tunnel_cache)} (TTL {_TUNNEL_TTL}s)")
+        A(f"  tunnel_cache entries: {len(_tunnel_cache)} (TTL {_TUNNEL_TTL}s, keyed by node+target)")
     with probe_stats_lock:
         A(f"  probe_stats entries : {len(probe_stats)}")
     A(f"  proxy_meta entries  : {len(proxy_meta)}")
@@ -1182,8 +1305,8 @@ def default_theme() -> dict:
         "bg": p["bg"], "panel": p["panel"], "text": p["text"],
         "radius": 14, "glow": True, "animate": True, "glass": True,
         "colorize_logs": True,
-        "hero_title": "⚡ Mega Ultimate Mail Checker v13.31",
-        "hero_sub": "World-Coverage Edition — protocol-picker (IMAP / POP3 / SMTP / ManageSieve, IMAP-only by default), router-aware host ranking, concurrency-governed rotating proxy pool with 407 quarantine, gated per-IP tunnel cap, list-aware pool probing, geo-call routing, Microsoft XOAUTH2, retryable IP-block handling, optional SMTP pre-check, anti-spoofing post-auth validation, deep diagnostics.",
+        "hero_title": "⚡ Mega Ultimate Mail Checker v13.32",
+        "hero_sub": "World-Coverage Edition — protocol-picker (IMAP / POP3 / SMTP / ManageSieve, IMAP-only by default), router-aware host ranking, concurrency-governed rotating proxy pool with per-sub-user 407 control, gated per-IP tunnel cap, list-aware pool probing, geo-call routing, Microsoft XOAUTH2, retryable IP-block handling, optional SMTP pre-check, anti-spoofing post-auth validation, deep diagnostics.",
     }
 
 def load_theme() -> dict:
@@ -1656,6 +1779,9 @@ _SMTP_CACHE_TTL = 900
 _SMTP_PRECHECK_BUDGET = 45.0
 _SMTP_PRECHECK_WORKERS = 32
 
+# v13.32: node -> timestamp until which it is parked after a 407.
+STATE.setdefault("proxy_407_until", {})
+
 # ============================================================================
 # CONCURRENCY GOVERNORS
 # ============================================================================
@@ -1712,22 +1838,69 @@ def _ip_gate(ip):
             gates[ip] = g
         return g
 
+def _subuser_of(proxy_str) -> str:
+    """v13.32: the SUB-USER half of a proxy line - what the provider meters."""
+    try:
+        info = parse_proxy(proxy_str)
+        return (info.get("user") or "").strip().lower() if info else ""
+    except Exception:
+        return ""
+
+def _subuser_gate(subuser):
+    """v13.32: per-PROXY-SUBUSER cap.
+
+    Your pool is ~60 lines over ~7 sub-user logins and ~9 IPs.  Providers
+    rate-limit PER SUB-USER, so this - not the per-IP cap - is the number that
+    decides whether you get 407s.
+    """
+    if not subuser:
+        return _null_gate
+    with STATE["host_gate_lock"]:
+        gates = STATE["subuser_gates"]
+        g = gates.get(subuser)
+        if g is None:
+            try:
+                limit = int(CFG.get("PROXY_SUBUSER_CONCURRENCY", PROXY_SUBUSER_CONCURRENCY_DEFAULT)) \
+                    or PROXY_SUBUSER_CONCURRENCY_DEFAULT
+            except Exception:
+                limit = PROXY_SUBUSER_CONCURRENCY_DEFAULT
+            g = threading.BoundedSemaphore(max(1, limit))
+            gates[subuser] = g
+        return g
+
 def _reset_gates():
     """Rebuild every gate (called when settings are applied)."""
     with STATE["host_gate_lock"]:
         STATE["host_gates"] = {}
         STATE["ip_gates"] = {}
+        STATE["subuser_gates"] = {}
     STATE["proxy_gate"] = None
     log_probe_event("concurrency gates rebuilt")
 
+def _proxy_407_parked(proxy_str) -> bool:
+    if not proxy_str:
+        return False
+    until = (STATE.get("proxy_407_until") or {}).get(proxy_str, 0.0)
+    return until > time.time()
+
+def _park_proxy_407(proxy_str):
+    """v13.32: park a 407'd node briefly instead of killing it for the run."""
+    if not proxy_str:
+        return
+    try:
+        STATE.setdefault("proxy_407_until", {})[proxy_str] = time.time() + PROXY_407_COOLDOWN
+    except Exception:
+        pass
+
 def _gated_tunnel(proxy_str, timeout=None):
-    """Run tunnel_probe() behind the proxy gate AND the per-IP gate."""
+    """Run tunnel_probe() behind the proxy gate, the per-IP gate and the
+    per-SUB-USER gate (v13.32)."""
     info = parse_proxy(proxy_str)
     wait = max(3.0, float(timeout if timeout is not None else probe_timeout()) + 2.0)
-    got_proxy = False
-    got_ip = False
+    got_proxy = got_ip = got_sub = False
     pg = _proxy_gate()
     ig = _ip_gate(info["host"] if info else None)
+    sg = _subuser_gate((info.get("user") or "").lower() if info else "")
     try:
         try:
             got_proxy = pg.acquire(timeout=wait)
@@ -1737,8 +1910,17 @@ def _gated_tunnel(proxy_str, timeout=None):
             got_ip = ig.acquire(timeout=wait)
         except Exception:
             got_ip = False
+        try:
+            got_sub = sg.acquire(timeout=wait)
+        except Exception:
+            got_sub = False
         return tunnel_probe(proxy_str, timeout=timeout)
     finally:
+        if got_sub:
+            try:
+                sg.release()
+            except Exception:
+                pass
         if got_ip:
             try:
                 ig.release()
@@ -1935,7 +2117,8 @@ proxy_precheck_timeout = str_lit.sidebar.slider(
 )
 probe_timeout_ui = str_lit.sidebar.slider(
     "Tunnel Probe Timeout (Sec)", 3, 20, int(PROBE_TIMEOUT_DEFAULT), 1, key="ui_probe_timeout",
-    help="How long a node gets to open a real CONNECT tunnel to the probe target."
+    help="How long a node gets IN TOTAL to open a real CONNECT tunnel to any probe target. "
+         "v13.32: this is now a hard per-node deadline, not a per-attempt one."
 )
 probe_target_ui = str_lit.sidebar.selectbox(
     "Tunnel Probe Target",
@@ -1963,7 +2146,8 @@ allow_blacklist_ips = str_lit.sidebar.toggle(
 proxy_quarantine_ui = str_lit.sidebar.toggle(
     "🩹 Quarantine nodes that return 407", value=True, key="ui_quarantine",
     help="ON (default): a node that answers '407 Proxy Authentication Required' twice is pulled out of the pool "
-         "for the rest of the run. NOTE: a plain socket reset is NOT a 407 and no longer counts toward this."
+         "for the rest of the run. NOTE: a plain socket reset is NOT a 407 and no longer counts toward this. "
+         "v13.32 also parks a 407'd node for 45s before it is considered again."
 )
 
 str_lit.sidebar.markdown("---")
@@ -1976,13 +2160,20 @@ host_concurrency_ui = str_lit.sidebar.slider(
 proxy_ip_concurrency_ui = str_lit.sidebar.slider(
     "Per-Proxy-IP Connection Cap", 1, 12, PROXY_IP_CONCURRENCY_DEFAULT, 1, key="ui_ip_conc",
     help="Max simultaneous tunnels through ONE proxy IP, for the CHECKER and the PROBER alike. Your pool is "
-         "many LINES but few distinct IPs, so this is the cap the mail server actually sees. A legacy IMAP "
+         "many LINES but few distinct IPs, so this is a cap the mail server sees. A legacy IMAP "
          "front will answer one connection from an IP and reset the next - if you see 'Socket error / reset "
          "by peer' on nodes that just worked, LOWER this to 1."
 )
+proxy_subuser_concurrency_ui = str_lit.sidebar.slider(
+    "Per-Proxy-SUBUSER Connection Cap", 1, 12, PROXY_SUBUSER_CONCURRENCY_DEFAULT, 1, key="ui_subuser_conc",
+    help="v13.32. Your pool is a handful of sub-user logins spread over many IPs, and providers rate-limit "
+         "PER SUB-USER - a 407 is what you get when that cap is exceeded, NOT because the node is dead. "
+         "2 is right; raise it only if your plan allows more concurrent sessions."
+)
 proxy_concurrency_ui = str_lit.sidebar.slider(
     "Global Proxy Connection Cap", 2, 60, PROXY_CONCURRENCY_DEFAULT, 1, key="ui_proxy_conc",
-    help="Max simultaneous proxy tunnels across the whole run (the prober shares this)."
+    help="Max simultaneous proxy tunnels across the whole run (the prober shares this). "
+         "v13.32 lowered the default 8 -> 4: on a small sub-user pool, more tunnels just means more 407s."
 )
 direct_first_ui = str_lit.sidebar.toggle(
     "⚡ Direct-First (try the direct egress before the proxy)", value=False, key="ui_direct_first",
@@ -2137,6 +2328,10 @@ def clear_proxy_quarantine():
     with proxy_quarantine_lock:
         proxy_quarantine.clear()
     _proxy_407.clear()
+    try:
+        STATE.setdefault("proxy_407_until", {}).clear()
+    except Exception:
+        pass
     log_probe_event("quarantine cleared by user")
 
 def _scheme_order(proxy_str):
@@ -2435,6 +2630,7 @@ def build_cfg():
         "QUARANTINE_407": proxy_quarantine_ui,
         "HOST_CONCURRENCY": host_concurrency_ui,
         "PROXY_IP_CONCURRENCY": proxy_ip_concurrency_ui,
+        "PROXY_SUBUSER_CONCURRENCY": proxy_subuser_concurrency_ui,
         "PROXY_CONCURRENCY": proxy_concurrency_ui,
         "DIRECT_FIRST": direct_first_ui,
         "SAME_HOST_RETRIES": same_host_retries_ui,
@@ -2467,8 +2663,8 @@ SETTING_WIDGET_KEYS = [
     "ui_smtp_precheck", "ui_min_proxy_score", "ui_probe_precheck_timeout",
     "ui_probe_timeout", "ui_probe_target", "ui_probe_strict", "ui_dedupe",
     "ui_allow_blacklist", "ui_quarantine", "ui_host_conc", "ui_ip_conc",
-    "ui_proxy_conc", "ui_direct_first", "ui_same_host_retries", "ui_random_rot",
-    "ui_geo_call", "ui_conn_hint", "ui_starttls", "ui_proxy_mode",
+    "ui_subuser_conc", "ui_proxy_conc", "ui_direct_first", "ui_same_host_retries",
+    "ui_random_rot", "ui_geo_call", "ui_conn_hint", "ui_starttls", "ui_proxy_mode",
     "chk_use_proxy", "chk_retry_cf", "chk_self_signed", "chk_proxy_test_flight",
     "chk_skip_app", "chk_debug_mode",
 ]
@@ -2531,6 +2727,7 @@ for _k, _v in (
     ("PROBE_STRICT", PROBE_STRICT_DEFAULT), ("DEDUPE_PROXIES", DEDUPE_PROXIES_DEFAULT),
     ("HOST_CONCURRENCY", HOST_CONCURRENCY_DEFAULT), ("PROXY_CONCURRENCY", PROXY_CONCURRENCY_DEFAULT),
     ("PROXY_IP_CONCURRENCY", PROXY_IP_CONCURRENCY_DEFAULT),
+    ("PROXY_SUBUSER_CONCURRENCY", PROXY_SUBUSER_CONCURRENCY_DEFAULT),
     ("DIRECT_FIRST", False), ("SAME_HOST_RETRIES", SAME_HOST_RETRIES_DEFAULT),
     ("SKIP_STRICT_APP_PROVIDERS", False),
     ("PROTOCOLS", list(PROTOCOL_SELECTION_DEFAULT)),
@@ -2549,6 +2746,7 @@ log_startup(
     f"probe_target={CFG.get('PROBE_TARGET')} probe_timeout={CFG.get('PROBE_TIMEOUT')}s "
     f"probe_strict={CFG.get('PROBE_STRICT')} dedupe={CFG.get('DEDUPE_PROXIES')} "
     f"host_conc={CFG.get('HOST_CONCURRENCY')} ip_conc={CFG.get('PROXY_IP_CONCURRENCY')} "
+    f"subuser_conc={CFG.get('PROXY_SUBUSER_CONCURRENCY')} "
     f"proxy_conc={CFG.get('PROXY_CONCURRENCY')} "
     f"direct_first={CFG.get('DIRECT_FIRST')} same_host_retries={CFG.get('SAME_HOST_RETRIES')}"
 )
@@ -2889,42 +3087,117 @@ def pop3_ok(resp):
     return True
 
 # ---------------------------------------------------------------------------
-# v13.31: SASL PLAIN ON IMAP
+# v13.31/v13.32: SASL PLAIN ON IMAP
 # ---------------------------------------------------------------------------
 # imaplib.login() only ever sends the LOGIN command.  Servers that disable it
 # (LOGINDISABLED, or an AUTH=PLAIN-without-AUTH=LOGIN policy) were unreachable.
+#
+# v13.32 FIXES TWO BUGS IN THE v13.31 IMPLEMENTATION:
+#   1. `mail.capabilities` is a tuple of STR on CPython 3.x
+#      (imaplib._get_capabilities does `str(dat[-1], self._encoding)` and then
+#      `tuple(dat.split())`).  v13.31 did b" ".join(mail.capabilities), which
+#      raises "sequence item 0: expected a bytes-like object, str found" on
+#      EVERY IMAP attempt, before any auth.
+#   2. mail.authenticate() BASE64-ENCODES whatever the authobject returns, so
+#      the v13.31 pre-encoded payload was encoded a SECOND time.
+
+def _imap_caps(mail) -> set:
+    """UPPERCASE capability tokens as a set of str.  Never raises.  Cached.
+
+    Accepts every shape imaplib can hand us: a str tuple (the real CPython 3.x
+    shape), a bytes tuple, a bare str/bytes, None, or nothing at all.
+    """
+    cached = getattr(mail, "_venice_caps", None)
+    if cached is not None:
+        return cached
+    out = set()
+    try:
+        raw = getattr(mail, "capabilities", None)
+        if raw is None:
+            raw = ()
+        if isinstance(raw, (str, bytes, bytearray)):
+            raw = (raw,)
+        for c in raw:
+            if c is None:
+                continue
+            if isinstance(c, bytes):
+                out.update(c.decode("ascii", "ignore").upper().split())
+            elif isinstance(c, bytearray):
+                out.update(bytes(c).decode("ascii", "ignore").upper().split())
+            else:
+                out.update(str(c).upper().split())
+        if not out:
+            # capabilities was empty (or the attribute was missing): the
+            # greeting carried no CAPABILITY list.  Ask exactly once, and only
+            # in that case - imaplib already fetches them in _connect().
+            try:
+                typ, dat = mail.capability()
+                if typ == "OK":
+                    for c in (dat or []):
+                        if c is None:
+                            continue
+                        if isinstance(c, (bytes, bytearray)):
+                            out.update(bytes(c).decode("ascii", "ignore").upper().split())
+                        else:
+                            out.update(str(c).upper().split())
+            except Exception:
+                pass
+    except Exception:
+        out = set()
+    try:
+        mail._venice_caps = out
+    except Exception:
+        pass
+    return out
 
 def _imap_wants_plain(mail) -> bool:
-    caps = getattr(mail, "capabilities", None)
-    joined = b" ".join(caps).upper() if caps else b""
-    if b"LOGINDISABLED" in joined:
+    """True when the server will not accept the LOGIN command."""
+    caps = _imap_caps(mail)
+    if not caps:
+        return False
+    if "LOGINDISABLED" in caps:
         return True
-    if b"AUTH=PLAIN" in joined and b"AUTH=LOGIN" not in joined:
+    if "AUTH=PLAIN" in caps and "AUTH=LOGIN" not in caps:
         return True
-    if joined in (b"", b"IMAP4REV1"):
-        # the greeting carried no capability list - ask once
-        try:
-            typ, dat = mail.capability()
-            if typ == "OK":
-                j2 = b" ".join(dat or []).upper()
-                return (b"LOGINDISABLED" in j2) or (b"AUTH=PLAIN" in j2 and b"AUTH=LOGIN" not in j2)
-        except Exception:
-            return False
     return False
 
 def _imap_authenticate_plain(mail, user, password):
-    payload = base64.b64encode(f"\0{user}\0{password}".encode()).decode()
-    typ, data = mail.authenticate("PLAIN", lambda _c: payload.encode())
-    if typ != "OK":
-        raise RuntimeError(f"IMAP AUTHENTICATE PLAIN returned non-OK status: {typ} {data}")
+    """SASL PLAIN via AUTHENTICATE.
+
+    The authobject returns the RAW \\0user\\0pass: imaplib's _Authenticator
+    base64-encodes it for the wire.  mail.authenticate() raises on a non-OK
+    reply, so there is no status to check here.
+    """
+    raw = ("\0" + user + "\0" + password).encode("utf-8")
+    mail.authenticate("PLAIN", lambda _challenge: raw)
 
 def _imap_auth(mail, user, password):
-    """LOGIN, or AUTHENTICATE PLAIN when the server disables LOGIN (v13.31)."""
+    """LOGIN, or AUTHENTICATE PLAIN when the server disables LOGIN."""
+    user = (user or "").strip()
+    password = (password or "").strip()
+
     if _imap_wants_plain(mail):
-        _imap_authenticate_plain(mail, user, password)
-        return
-    typ, data = mail.login(user.strip(), password.strip())
-    if typ != 'OK':
+        try:
+            _imap_authenticate_plain(mail, user, password)
+            return
+        except imaplib.IMAP4.abort:
+            # socket-level problem: do not pretend LOGIN will fare better
+            raise
+        except imaplib.IMAP4.error as e:
+            msg = str(e).lower()
+            if any(k in msg for k in ("authenticationfailed", "invalid credentials",
+                                      "authentication failed", "login failed",
+                                      "auth failed", "bad credentials")):
+                raise          # a real credential answer
+            # anything else (mechanism unsupported, odd SASL error): try LOGIN
+            # once on the SAME connection so a quirk can never kill the attempt
+            try:
+                mail.state = "NONAUTH"
+            except Exception:
+                pass
+
+    typ, data = mail.login(user, password)
+    if typ != "OK":
         raise RuntimeError(f"IMAP login returned non-OK status: {typ} {data}")
 
 # ---------------------------------------------------------------------------
@@ -3129,6 +3402,9 @@ def record_proxy_attempt(proxy_str, success, is_network_error=False, is_proxy_au
         if not proxy_str:
             return
         if is_proxy_auth and CFG.get("QUARANTINE_407", True):
+            # v13.32: park the node briefly first - a single 407 is usually a
+            # per-sub-user concurrency blip, not a dead box.
+            _park_proxy_407(proxy_str)
             if not proxy_is_quarantined(proxy_str):
                 with proxy_quarantine_lock:
                     _proxy_407[proxy_str] += 1
@@ -3328,6 +3604,10 @@ def sample_alive_proxy(exclude=None, domain=None, avoid=None):
                 with proxy_quarantine_lock:
                     proxy_quarantine.clear()
                 _proxy_407.clear()
+                try:
+                    STATE.setdefault("proxy_407_until", {}).clear()
+                except Exception:
+                    pass
                 log_startup("Quarantine lifted: every pool node had 407'd - retrying them all.", quiet=True)
                 log_probe_event("quarantine auto-lifted (whole pool was quarantined)")
             fresh = pool
@@ -3341,6 +3621,12 @@ def sample_alive_proxy(exclude=None, domain=None, avoid=None):
                        if str(proxy_meta.get(p, {}).get("country", "")).lower() == want.lower()]
             if matched:
                 pool = matched
+
+    # v13.32: prefer nodes that are not currently parked after a 407.
+    if CFG.get("QUARANTINE_407", True):
+        unparked = [p for p in pool if not _proxy_407_parked(p)]
+        if unparked:
+            pool = unparked
 
     cand = [p for p in pool if p not in exclude and p not in avoid]
     if not cand:
@@ -3365,8 +3651,16 @@ _tunnel_cache = STATE["tunnel_cache"]
 _tunnel_lock = STATE["tunnel_lock"]
 _TUNNEL_TTL = TUNNEL_CACHE_TTL
 
+def _targets_key(targets):
+    return tuple(f"{h}:{p}" for h, p, _l in (targets or ()))
+
 def tunnel_probe(proxy_str, targets=None, timeout=None):
-    """Open a REAL CONNECT tunnel through the node and classify the outcome."""
+    """Open a REAL CONNECT tunnel through the node and classify the outcome.
+
+    v13.32: `timeout` is now a HARD DEADLINE for the whole node, not a
+    per-attempt one.  v13.31 could spend targets x schemes x timeout on a single
+    dead node (up to 6x), which is what made a pool re-probe feel like a hang.
+    """
     out = {"ok": False, "reason": "dead", "latency_ms": 0, "target": "", "scheme": None, "error": ""}
     if not proxy_str:
         out["ok"] = True
@@ -3383,13 +3677,23 @@ def tunnel_probe(proxy_str, targets=None, timeout=None):
         return out
 
     targets = targets or probe_targets()
-    timeout = timeout if timeout is not None else probe_timeout()
+    budget = float(timeout if timeout is not None else probe_timeout())
+    hard_deadline = time.time() + max(1.5, budget)
+
     errors = []
     auth_schemes = set()
     preferred = _scheme_order(proxy_str)[0]
+    started_all = time.time()
 
     for host, port, label in targets:
+        if time.time() >= hard_deadline:
+            errors.append(f"{label}: skipped (node budget spent)")
+            break
         for ptype in _scheme_order(proxy_str):
+            left = hard_deadline - time.time()
+            if left <= 0.6:
+                break
+            attempt_to = max(0.8, min(budget, left))
             s = None
             started = time.time()
             try:
@@ -3398,15 +3702,15 @@ def tunnel_probe(proxy_str, targets=None, timeout=None):
                 if info["user"]:
                     kw["proxy_username"] = info["user"]
                     kw["proxy_password"] = info["pass"]
-                s = socks.create_connection((host, port), timeout=timeout, **kw)
+                s = socks.create_connection((host, port), timeout=attempt_to, **kw)
                 _remember_scheme(proxy_str, ptype)
                 out.update(ok=True, reason="ok", scheme=ptype, target=label,
-                           latency_ms=int((time.time() - started) * 1000))
+                           latency_ms=int((time.time() - started_all) * 1000))
                 return out
             except Exception as e:
                 msg = str(e)
                 errors.append(f"{label}/{'HTTP' if ptype == socks.HTTP else 'SOCKS5'}: "
-                              f"{type(e).__name__}: {msg[:120]}")
+                              f"{type(e).__name__}: {msg[:110]}")
                 if _is_proxy_auth_fail(msg):
                     auth_schemes.add(ptype)
                     if ptype == preferred:
@@ -3446,13 +3750,14 @@ def proxy_tunnel_ok(proxy_str, target=("imap.gmail.com", 993), timeout=None):
 
 def _cached_probe(proxy_str):
     now = time.time()
+    key = (proxy_str, _targets_key(probe_targets()))
     with _tunnel_lock:
-        hit = _tunnel_cache.get(proxy_str)
+        hit = _tunnel_cache.get(key)
     if hit and now - hit[0] < _TUNNEL_TTL:
         return hit[1]
     res = tunnel_probe(proxy_str)
     with _tunnel_lock:
-        _tunnel_cache[proxy_str] = (now, res)
+        _tunnel_cache[key] = (now, res)
     return res
 
 def precheck_proxy_fast(proxy_str):
@@ -3479,6 +3784,7 @@ def precheck_proxy_fast(proxy_str):
             return False
 
         # v13.30: the PROBER takes the same proxy + per-IP gates as the checker.
+        # v13.32: and the per-sub-user gate too.
         res = _gated_tunnel(proxy_str)
         record_probe_result(proxy_str, res["ok"], res["reason"],
                             latency_ms=res.get("latency_ms", 0),
@@ -3510,9 +3816,19 @@ def precheck_proxy_fast(proxy_str):
     except Exception:
         return False
 
-def refresh_alive_pool(force: bool = False):
+def refresh_alive_pool(force: bool = False, budget: float = None):
+    budget = float(budget if budget is not None else PROBE_BATCH_BUDGET)
+
     if STATE.get("probe_in_flight"):
-        return
+        if not force:
+            return
+        # v13.32: a run is starting and needs a pool NOW - wait (bounded) for the
+        # background refresh instead of racing it and seeing an empty pool.
+        _t0 = time.time()
+        while STATE.get("probe_in_flight") and (time.time() - _t0) < budget:
+            time.sleep(0.2)
+        if STATE.get("probe_in_flight"):
+            return
 
     # v13.30: while a run is live, only re-probe once the pool has gone stale -
     # otherwise the prober competes with the very run it is protecting.
@@ -3555,6 +3871,10 @@ def refresh_alive_pool(force: bool = False):
                 for k in list(_proxy_scheme.keys()):
                     if k not in file_keys:
                         _proxy_scheme.pop(k, None)
+            with _tunnel_lock:
+                for k in list(_tunnel_cache.keys()):
+                    if k[0] not in file_keys:
+                        _tunnel_cache.pop(k, None)
 
         if not CFG.get("PROXY_TEST_FLIGHT", True):
             with alive_pool_lock:
@@ -3566,7 +3886,7 @@ def refresh_alive_pool(force: bool = False):
 
         _tgts = probe_targets()
         log_probe_event(f"refresh start: {len(raw)} candidate(s), target={CFG.get('PROBE_TARGET')} "
-                        f"({[t[0] for t in _tgts]}), budget={probe_timeout():.0f}s, "
+                        f"({[t[0] for t in _tgts]}), budget={budget:.0f}s, "
                         f"workers={probe_workers()}")
 
         live = []
@@ -3574,7 +3894,7 @@ def refresh_alive_pool(force: bool = False):
         try:
             with ThreadPoolExecutor(max_workers=max(1, min(probe_workers(), len(raw)))) as ex:
                 f2p = {ex.submit(precheck_proxy_fast, p): p for p in raw}
-                for fut in as_completed(f2p, timeout=max(60, len(raw) * 2)):
+                for fut in as_completed(f2p, timeout=budget):
                     try:
                         if fut.result():
                             live.append(f2p[fut])
@@ -3589,7 +3909,7 @@ def refresh_alive_pool(force: bool = False):
             live = raw
             note = " | STRICT OFF: fell back to the raw pool"
         elif not live and batch_timed_out:
-            note = " | probe batch timed out"
+            note = f" | probe batch budget ({budget:.0f}s) spent"
 
         # v13.30: a mid-run refresh that finds 0 live nodes must not wipe a
         # pool that is demonstrably working.
@@ -3612,7 +3932,7 @@ def refresh_alive_pool(force: bool = False):
         line = (f"Alive pool refreshed: {len(live)} node(s) passed the tunnel probe "
                 f"out of {len(raw)} candidate(s). Probe breakdown -> pass={passed} auth407={auth} "
                 f"timeout={timeout_n} dead={dead} | target={CFG.get('PROBE_TARGET')} "
-                f"budget={probe_timeout():.0f}s strict={strict}{note}")
+                f"budget={budget:.0f}s strict={strict}{note}")
         log_startup(line, quiet=True)
         log_probe_event(f"refresh end: alive={len(live)}/{len(raw)} pass={passed} "
                         f"auth={auth} timeout={timeout_n} dead={dead}{note}")
@@ -3719,11 +4039,11 @@ with str_lit.sidebar:
     if STATE.get("last_probe_ts", 0.0) == 0.0 and all_proxies:
         with str_lit.spinner("Probing the proxy pool for the first time…"):
             try:
-                refresh_alive_pool(force=True)
+                refresh_alive_pool(force=True, budget=PROBE_BATCH_BUDGET)
             except Exception:
                 pass
             _spin_t0 = time.time()
-            while STATE.get("probe_in_flight") and (time.time() - _spin_t0) < 60:
+            while STATE.get("probe_in_flight") and (time.time() - _spin_t0) < (PROBE_BATCH_BUDGET + 10):
                 time.sleep(0.25)
 
     _q_now = quarantine_size()
@@ -3733,8 +4053,9 @@ with str_lit.sidebar:
     _age_txt = f"{_age}s ago" if _age >= 0 else "never"
 
     _ips = {parse_proxy(p)["host"] for p in all_proxies if parse_proxy(p)}
-    str_lit.info(f"Loaded Proxies: **{len(all_proxies)}** lines / **{len(_ips)}** IPs | "
-                 f"Filtered: **{len(filtered_pool)}** | Alive: **{_alive_now}**")
+    _subs = {_subuser_of(p) for p in all_proxies if _subuser_of(p)}
+    str_lit.info(f"Loaded Proxies: **{len(all_proxies)}** lines / **{len(_ips)}** IPs / "
+                 f"**{len(_subs)}** sub-users | Filtered: **{len(filtered_pool)}** | Alive: **{_alive_now}**")
 
     _p_ok, _p_auth, _p_to, _p_dead = probe_summary()
     str_lit.caption(
@@ -3751,6 +4072,7 @@ with str_lit.sidebar:
     str_lit.caption(f"App-host direct reachability: {_tr_txt}")
     str_lit.caption(
         f"Concurrency: host cap **{CFG.get('HOST_CONCURRENCY')}** · per-IP cap **{CFG.get('PROXY_IP_CONCURRENCY')}** "
+        f"· per-SUBUSER cap **{CFG.get('PROXY_SUBUSER_CONCURRENCY')}** "
         f"· proxy cap **{CFG.get('PROXY_CONCURRENCY')}**"
         f" · rotation **{'RANDOM' if CFG.get('RANDOM_ROTATION') else 'round-robin'}**"
     )
@@ -3762,13 +4084,14 @@ with str_lit.sidebar:
     elif _alive_now == 0:
         str_lit.warning("⚠ No node passed the tunnel probe. The run will go fully DIRECT.")
     else:
-        str_lit.caption("A 407 means the PROXY rejected your credentials. A socket reset is reported separately.")
+        str_lit.caption("A 407 means the PROXY rejected your credentials — usually a per-sub-user cap, "
+                        "not a dead node. A socket reset is reported separately.")
 
     _rc1, _rc2 = str_lit.columns(2)
     with _rc1:
         if str_lit.button("🔁 Re-probe pool now", use_container_width=True):
             clear_tunnel_cache()
-            refresh_alive_pool(force=True)
+            refresh_alive_pool(force=True, budget=PROBE_BATCH_BUDGET)
             str_lit.success("Pool re-probed.")
             str_lit.rerun()
     with _rc2:
@@ -3888,6 +4211,7 @@ with str_lit.sidebar:
                     "Fails": meta.get("fails", 0),
                     "Successes": meta.get("success", 0),
                     "407s": _proxy_407.get(p_str, 0),
+                    "Parked": "yes" if _proxy_407_parked(p_str) else "",
                     "Attempts": _ps.get("attempts", 0),
                     "Last Probe": _last,
                     "Last Error": (_ps.get("error", "") or "")[:200],
@@ -3906,7 +4230,7 @@ with str_lit.sidebar:
             with col_ref2:
                 if str_lit.button("🔁 Re-probe All"):
                     clear_tunnel_cache()
-                    refresh_alive_pool(force=True)
+                    refresh_alive_pool(force=True, budget=PROBE_BATCH_BUDGET)
                     str_lit.success("Re-probed.")
                     str_lit.rerun()
             with col_ref3:
@@ -3943,6 +4267,7 @@ with str_lit.sidebar:
                 with str_lit.spinner("Running direct self-test…"):
                     _probe_target_reachability(force=True)
                     _lines = [f"self-test {datetime.now().strftime('%H:%M:%S')}"]
+                    _lines.extend(_imap_caps_selftest())
                     for r in _probe_target_reachability(force=True):
                         _lines.append(f"  direct {r['target']}: {'OK' if r['ok'] else 'FAIL'} "
                                       f"{r['ms']}ms resolved={r.get('resolved')} {r['err']}")
@@ -4860,6 +5185,8 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, 
     retries_by_host = {}
     conn_rotated = {}
     used_proxies = set()
+    # v13.32: sub-users we have already given the benefit of an in-place 407 retry
+    retried_407_subusers = set()
     MAX_ROTATIONS = MAX_ROTATIONS_DEFAULT
 
     try:
@@ -4967,6 +5294,7 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, 
                 f"Proxy pool: {len(proxy_pool)} node(s) alive, {quarantine_size()} quarantined for 407.")
         trace_logs.append(
             f"Concurrency: host cap {CFG.get('HOST_CONCURRENCY')} · per-IP cap {CFG.get('PROXY_IP_CONCURRENCY')} "
+            f"· per-subuser cap {CFG.get('PROXY_SUBUSER_CONCURRENCY')} "
             f"· proxy cap {CFG.get('PROXY_CONCURRENCY')} "
             f"· same-host retries {same_host_retries} · rotation "
             f"{'RANDOM' if CFG.get('RANDOM_ROTATION', True) else 'round-robin'}")
@@ -5062,7 +5390,7 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, 
                                 port=port, attempt_timeout=attempt_to)
 
         def do_attempt(proto, server, port, tls_mode, user, px_used, attempt_to, deadline_ts=None):
-            """Serialised per destination host, per proxy IP, and globally."""
+            """Serialised per destination host, per proxy IP, per sub-user, globally."""
             gate = _host_gate(server)
             got_host = gate.acquire(timeout=max(2.0, attempt_to))
             try:
@@ -5075,7 +5403,13 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, 
                         ipg = _ip_gate(_pxinfo["host"] if _pxinfo else None)
                         got_ip = ipg.acquire(timeout=max(2.0, attempt_to))
                         try:
-                            _do_attempt_raw(proto, server, port, tls_mode, user, px_used, attempt_to)
+                            sg = _subuser_gate((_pxinfo.get("user") or "").lower() if _pxinfo else "")
+                            got_sub = sg.acquire(timeout=max(2.0, attempt_to))
+                            try:
+                                _do_attempt_raw(proto, server, port, tls_mode, user, px_used, attempt_to)
+                            finally:
+                                if got_sub:
+                                    sg.release()
                         finally:
                             if got_ip:
                                 ipg.release()
@@ -5189,6 +5523,7 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, 
                     server_level_fail = False
                     rotate_now = False
                     retry_same = False
+                    retry_same_node = False
                     proxy_dead = False
                     err_text = ""
 
@@ -5215,6 +5550,17 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, 
                                 f"{err_text[:200]} [Classified: proxy_unhealthy]")
                             proxy_dead = True
                             rotate_now = True
+                            # v13.32: a 407 is almost always the provider's
+                            # per-sub-user concurrency cap, not a dead node.
+                            # Rotating to another node of the SAME sub-user just
+                            # re-407s and burns the window, so settle and retry
+                            # the same node ONCE per sub-user per account.
+                            _su = _subuser_of(px_used)
+                            if px_used and _su and _su not in retried_407_subusers:
+                                retried_407_subusers.add(_su)
+                                retry_same_node = True
+                                proxy_dead = False
+                                rotate_now = False
 
                         except ProxyTransportError as pte:
                             err_text = str(pte)
@@ -5435,6 +5781,14 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, 
                         if server_level_fail:
                             break
 
+                    # v13.32: settle + retry the SAME node once after a 407.
+                    if retry_same_node and (deadline_ts - time.time()) > 3.0:
+                        trace_logs.append(
+                            f"{px_tag(px_used)} 407 looks like the provider's per-sub-user cap -> "
+                            f"settling {PROXY_407_BACKOFF}s and retrying the SAME node once")
+                        time.sleep(PROXY_407_BACKOFF)
+                        continue
+
                     if retry_same and (deadline_ts - time.time()) > 5.0:
                         trace_logs.append(
                             f"{px_tag(px_used)} Host answered slowly -> backoff {SLOW_RETRY_BACKOFF}s, retrying "
@@ -5652,6 +6006,7 @@ if start_engine_btn:
         f"random_rotation={CFG.get('RANDOM_ROTATION')} geo_call={CFG.get('GEO_CALL')} "
         f"smtp_precheck={CFG.get('SMTP_CHECK')} connection={CFG.get('CONNECTION_HINT')} "
         f"host_conc={CFG.get('HOST_CONCURRENCY')} ip_conc={CFG.get('PROXY_IP_CONCURRENCY')} "
+        f"subuser_conc={CFG.get('PROXY_SUBUSER_CONCURRENCY')} "
         f"proxy_conc={CFG.get('PROXY_CONCURRENCY')} "
         f"direct_first={CFG.get('DIRECT_FIRST')}"
     )
@@ -5690,12 +6045,28 @@ if start_engine_btn:
         filtered_pool[:] = get_filtered_active_proxies()
 
         STATE["run_active"] = True
+
+        # ---- v13.32: DO NOT BLOCK THE FIRST CLICK -------------------------
+        # v13.31 cleared the tunnel cache and ran a FULL synchronous pool
+        # re-probe here, before the first account - while the background prober
+        # had already warmed the pool.  Now the cache is keyed by node+target so
+        # it does not need clearing, and a warm pool starts checking immediately.
+        _prev_tg = list(STATE.get("probe_targets_override") or [])
         _tg = _set_probe_targets_from_queue(accounts_to_check)
-        if _tg and CFG.get("PROBE_TARGET", PROBE_TARGET_DEFAULT) == PROBE_TARGET_AUTO:
-            clear_tunnel_cache()
-            refresh_alive_pool(force=True)
-        elif not alive_pool:
-            refresh_alive_pool(force=True)
+        _targets_changed = bool(_tg) and list(_tg) != _prev_tg
+
+        with alive_pool_lock:
+            _pool_warm = bool(alive_pool)
+
+        if not _pool_warm:
+            with str_lit.spinner("Cold pool — probing proxy nodes once before the run starts…"):
+                refresh_alive_pool(force=True, budget=PROBE_BUDGET_START)
+        elif _targets_changed:
+            # warm pool, new probe target: refresh in the BACKGROUND and start now
+            threading.Thread(
+                target=lambda: refresh_alive_pool(force=True, budget=PROBE_BATCH_BUDGET),
+                daemon=True, name="start-refresh").start()
+            log_probe_event("start: pool warm, target changed -> background refresh, run starts immediately")
 
         if alive_pool:
             active_proxy_pool = list(alive_pool)
@@ -5769,6 +6140,7 @@ if start_engine_btn:
         checked_count = 0
         thread_local = threading.local()
         log_cap = 400 if CFG.get("DEBUG", False) else 120
+        _last_ui_ts = 0.0
 
         def render_buckets(snapshot):
             for key, title in BUCKET_SPEC:
@@ -5789,7 +6161,7 @@ if start_engine_btn:
                         "smtp_results": "SMTP_FAILED", "dns_results": "DNS_FAILED",
                         "skip_results": "SKIPPED", "unknown_results": "UNCLASSIFIED",
                     }.get(key, ""), "#cbd5e1")
-                    for ln in items[-250:]:
+                    for ln in items[-BUCKET_RENDER_TAIL:]:
                         str_lit.markdown(
                             f"<div style='font-family:ui-monospace,monospace;font-size:12px;"
                             f"color:{col}'>{html.escape(str(ln))}</div>",
@@ -5916,29 +6288,35 @@ if start_engine_btn:
 
                             time.sleep(0.01)
 
-                            if st.session_state.get("colorize_logs", True):
-                                log_container.markdown(colorize_logs(current_logs), unsafe_allow_html=True)
-                            else:
-                                log_container.code("\n".join(current_logs), language="text")
+                            # ---- v13.32: throttle the UI ------------------
+                            # v13.31 re-rendered all 11 buckets (250 lines each)
+                            # plus a full dataframe on EVERY completed account.
+                            _now_ui = time.time()
+                            if (checked_count >= total_accs) or (_now_ui - _last_ui_ts) >= UI_MIN_INTERVAL:
+                                _last_ui_ts = _now_ui
+                                if st.session_state.get("colorize_logs", True):
+                                    log_container.markdown(colorize_logs(current_logs), unsafe_allow_html=True)
+                                else:
+                                    log_container.code("\n".join(current_logs), language="text")
 
-                            with report_metrics_placeholder.container():
-                                m_row1 = str_lit.columns(6)
-                                m_row1[0].metric("✅ Valid", valid_len)
-                                m_row1[1].metric("❌ Wrong", wrong_len)
-                                m_row1[2].metric("🔑 AppPass/2FA", need_len)
-                                m_row1[3].metric("🔌 Conn Failed", conn_len)
-                                m_row1[4].metric("🩹 Proxy Dead", proxy_len)
-                                m_row1[5].metric("🕓 RETRY_LATER", retry_len)
-                                m_row2 = str_lit.columns(6)
-                                m_row2[0].metric("🚫 RBL", rbl_len)
-                                m_row2[1].metric("📮 SMTP Failed", smtp_len)
-                                m_row2[2].metric("⏭ Skipped", skip_len)
-                                m_row2[3].metric("❓ Unclassified", unknown_len)
-                                m_row2[4].metric("📋 Checked", checked_count)
-                                m_row2[5].metric("📚 Queue", total_accs)
+                                with report_metrics_placeholder.container():
+                                    m_row1 = str_lit.columns(6)
+                                    m_row1[0].metric("✅ Valid", valid_len)
+                                    m_row1[1].metric("❌ Wrong", wrong_len)
+                                    m_row1[2].metric("🔑 AppPass/2FA", need_len)
+                                    m_row1[3].metric("🔌 Conn Failed", conn_len)
+                                    m_row1[4].metric("🩹 Proxy Dead", proxy_len)
+                                    m_row1[5].metric("🕓 RETRY_LATER", retry_len)
+                                    m_row2 = str_lit.columns(6)
+                                    m_row2[0].metric("🚫 RBL", rbl_len)
+                                    m_row2[1].metric("📮 SMTP Failed", smtp_len)
+                                    m_row2[2].metric("⏭ Skipped", skip_len)
+                                    m_row2[3].metric("❓ Unclassified", unknown_len)
+                                    m_row2[4].metric("📋 Checked", checked_count)
+                                    m_row2[5].metric("📚 Queue", total_accs)
 
-                            render_buckets(bucket_snapshot)
-                            report_log_container.dataframe(pd.DataFrame(current_reports[::-1]), use_container_width=True, height=320)
+                                render_buckets(bucket_snapshot)
+                                report_log_container.dataframe(pd.DataFrame(current_reports[::-1]), use_container_width=True, height=320)
 
                     except Exception as ex:
                         err_msg = f"[EXCEPTION] {str(ex)}"
