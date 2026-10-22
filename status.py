@@ -2,11 +2,45 @@
 status.py — single source of truth for engine statuses and error classification.
 
 Both naming conventions are exported (VALID + WRONG_PASSWORD, FAILED +
-CONNECTION_FAILED, RBL + RBL_BLOCKED, PROXY_UNHEALTHY, ...) so
+CONNECTION_FAILED, RBL + RBL_BLOCKED, PROXY_UNHEALTHY, LOGIN_DROPPED, ...) so
 `from status import (...)` can never break.
 
 Classification order is deliberate:
-    APP -> WRONG_STRONG -> BARE_AUTH -> RBL -> DNS -> CONN_STRONG -> RETRY -> CONN -> WRONG -> UNKNOWN
+    APP -> WRONG_STRONG -> BARE_AUTH -> RBL -> DNS
+        -> RETRY_HARD -> SERVER_DROP -> CONN_STRONG -> RETRY -> CONN -> WRONG -> UNKNOWN
+
+v13.32
+------
+* NEW STATUS — LOGIN_DROPPED (+ SERVER_DROPPED alias).
+  A mail server that ANSWERS, ACCEPTS the LOGIN command and then closes the
+  socket with an untagged "* BYE" was being classified UNKNOWN, dropped by
+  note_verdict() and reported as CONNECTION_FAILED — i.e. "we never reached the
+  server" when in fact the server spoke and read the credentials.
+
+  Real string from a live Windstream run:
+      command: LOGIN => IMAP server terminating connection
+  which is imaplib._command_complete wrapping an abort raised from
+  _get_tagged_response when the server sends an untagged * BYE during LOGIN.
+
+  This is a SERVER-side, credential-adjacent verdict, NOT a transport failure.
+  It is kept distinct from WRONG_PASSWORD because a * BYE is also what several
+  servers send for a per-IP/per-account connection cap or a policy refusal
+  (app-password required) — the caller can escalate to WRONG_PASSWORD when it
+  reproduces across independent egress IPs.
+
+* NEW TABLE _SERVER_DROP, TESTED BEFORE _CONN_STRONG.
+  _CONN_STRONG already owns "connection closed"/"connection aborted", so a BYE
+  had to be recognised before it.  Tokens: "terminating connection",
+  "server terminating", "* bye", "auth process broken", "connection is closed",
+  "server closed the connection".
+
+* NEW TABLE _RETRY_HARD, TESTED BEFORE _SERVER_DROP.
+  "* BYE Too many simultaneous connections" must stay RETRY_LATER, not become
+  LOGIN_DROPPED.  Tokens: too many / limit / quota / busy / throttle / rate limit.
+
+* PRIORITY RENUMBERED to seat LOGIN_DROPPED directly below WRONG_PASSWORD.
+  It outranks RETRY_LATER (a definite server answer beats "try again") and is
+  outranked by WRONG_PASSWORD (a definite answer beats an ambiguous one).
 
 v13.31
 ------
@@ -56,11 +90,14 @@ RBL = RBL_BLOCKED = "rbl_blocked"
 SMTP_FAILED = "smtp_failed"
 DNS_FAILED = "dns_failed"
 ERROR = "error"
+# v13.32: server answered, accepted LOGIN, then closed the socket (* BYE).
+LOGIN_DROPPED = SERVER_DROPPED = "login_dropped"
 
 ALL = [
     VALID,
     WRONG_PASSWORD,
     NEED_APP_PASSWORD,
+    LOGIN_DROPPED,          # v13.32
     RETRY_LATER,
     RBL_BLOCKED,
     SMTP_FAILED,
@@ -76,24 +113,27 @@ TERMINAL = {VALID, WRONG_PASSWORD, NEED_APP_PASSWORD}
 
 # Lower value = "better" answer. Used by merge() and by the engine when it has
 # to pick between two verdicts it collected on the same account.
+# v13.32: LOGIN_DROPPED seats directly below WRONG_PASSWORD.
 PRIORITY = {
     VALID: 0,
     NEED_APP_PASSWORD: 1,
     WRONG_PASSWORD: 2,
     RBL_BLOCKED: 3,
-    RETRY_LATER: 4,
-    SMTP_FAILED: 5,
-    DNS_FAILED: 6,
-    CONNECTION_FAILED: 7,
-    PROXY_UNHEALTHY: 8,
-    UNKNOWN: 9,
-    SKIPPED_COOLDOWN: 10,
+    LOGIN_DROPPED: 4,
+    RETRY_LATER: 5,
+    SMTP_FAILED: 6,
+    DNS_FAILED: 7,
+    CONNECTION_FAILED: 8,
+    PROXY_UNHEALTHY: 9,
+    UNKNOWN: 10,
+    SKIPPED_COOLDOWN: 11,
 }
 
 LABELS = {
     VALID: "VALID",
     WRONG_PASSWORD: "WRONG_PASSWORD",
     NEED_APP_PASSWORD: "NEED_APP_PASSWORD",
+    LOGIN_DROPPED: "LOGIN_DROPPED",
     RETRY_LATER: "RETRY_LATER",
     RBL_BLOCKED: "RBL_BLOCKED",
     SMTP_FAILED: "SMTP_FAILED",
@@ -107,6 +147,7 @@ LABELS = {
 COLORS = {
     VALID: "#22c55e",
     WRONG_PASSWORD: "#ef4444",
+    LOGIN_DROPPED: "#f43f5e",
     CONNECTION_FAILED: "#eab308",
     PROXY_UNHEALTHY: "#e879f9",
     NEED_APP_PASSWORD: "#3b82f6",
@@ -212,6 +253,41 @@ _RETRY = (
     "greylist",
     "greylisted",
     "unexpected extra arguments",
+)
+
+# v13.32: a RETRY condition that can ALSO arrive wrapped in a * BYE.
+# "* BYE Too many simultaneous connections" must stay RETRY_LATER, not become
+# LOGIN_DROPPED.  Tested BEFORE _SERVER_DROP.
+_RETRY_HARD = (
+    "too many",
+    "limit",
+    "quota",
+    "busy",
+    "throttle",
+    "rate limit",
+    "try again",
+    "temporarily unavailable",
+)
+
+# v13.32: THE SERVER ANSWERED, THEN HUNG UP.  Tested BEFORE _CONN_STRONG, which
+# already owns "connection closed" / "connection aborted".
+#
+# imaplib renders a server-side close during LOGIN as
+#   "command: LOGIN => IMAP server terminating connection"
+# (an abort from _get_tagged_response on an untagged * BYE).  Some servers send
+# "* BYE Connection is closed" or "* BYE Auth process broken" instead.
+_SERVER_DROP = (
+    "terminating connection",
+    "imap server terminating",
+    "server terminating",
+    "* bye",
+    " bye ",
+    "bye ",
+    "auth process broken",
+    "connection is closed",
+    "server closed the connection",
+    "server dropped the connection",
+    "closing connection",
 )
 
 # v13.30: UNAMBIGUOUS transport failures.  Tested BEFORE _RETRY.
@@ -396,11 +472,17 @@ def classify_error(raw, domain=""):
     """Map a raw server/socket error string to an engine status.
 
     Order:
-      APP -> WRONG_STRONG -> BARE_AUTH -> RBL -> DNS -> CONN_STRONG -> RETRY -> CONN -> WRONG -> UNKNOWN
+      APP -> WRONG_STRONG -> BARE_AUTH -> RBL -> DNS
+          -> RETRY_HARD -> SERVER_DROP -> CONN_STRONG -> RETRY -> CONN -> WRONG -> UNKNOWN
 
     CONN_STRONG runs BEFORE RETRY (v13.30) so a transport reset is never read as
     a soft "try again"; RETRY runs before CONN so a proxy "Socket error: 407" is
     never read as an auth failure by a generic token.
+
+    v13.32: SERVER_DROP runs BEFORE CONN_STRONG so an untagged "* BYE" is not
+    swallowed by the "connection closed"/"connection aborted" tokens, and
+    RETRY_HARD runs before SERVER_DROP so "* BYE Too many connections" stays
+    RETRY_LATER.
     """
     t = _norm(raw)
     if not t:
@@ -419,6 +501,14 @@ def classify_error(raw, domain=""):
         return RBL_BLOCKED
     if _match(t, _DNS):
         return DNS_FAILED
+
+    # v13.32: a * BYE that is really a rate/connection cap must stay RETRY.
+    if _match(t, _RETRY_HARD):
+        return RETRY_LATER
+    # v13.32: the server answered, read the LOGIN, then hung up.
+    if _match(t, _SERVER_DROP):
+        return LOGIN_DROPPED
+
     if _match(t, _CONN_STRONG):
         return CONNECTION_FAILED
     if _match(t, _RETRY):
@@ -457,7 +547,17 @@ def is_retry_signal(raw):
 def is_conn_signal(raw):
     """v13.30: True for an unambiguous transport failure."""
     t = _norm(raw)
+    if _match(t, _SERVER_DROP):
+        return False
     return _match(t, _CONN_STRONG) or _match(t, _CONN)
+
+
+def is_login_drop_signal(raw):
+    """v13.32: True when the server accepted LOGIN then closed the socket (* BYE)."""
+    t = _norm(raw)
+    if _match(t, _RETRY_HARD):
+        return False
+    return _match(t, _SERVER_DROP)
 
 
 def is_proxy_auth_fail(raw):
@@ -503,7 +603,8 @@ def is_terminal(status):
 
 
 def is_failure(status):
-    return status in (CONNECTION_FAILED, PROXY_UNHEALTHY, DNS_FAILED, SMTP_FAILED, UNKNOWN)
+    return status in (CONNECTION_FAILED, PROXY_UNHEALTHY, DNS_FAILED,
+                      SMTP_FAILED, LOGIN_DROPPED, UNKNOWN)
 
 
 def display(status):
