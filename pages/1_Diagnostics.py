@@ -1,6 +1,6 @@
 """
-pages/1_Diagnostics.py — Mega Ultimate Mail Checker
-===================================================
+pages/2_Diagnostics.py — Mega Ultimate Mail Checker  (v13.37)
+============================================================
 Read-only inspection page. It answers three questions without spending a single
 proxy credit or touching a mailbox:
 
@@ -14,6 +14,20 @@ Only real hosts.py functions are used:
     conf, discover_hosts, resolve_mx, resolve_srv, host_resolves, is_junk_host,
     host_tier, probe_live, smtp_candidates, cache_stats, clear_cache,
     refresh_domain, _family_priority, _family_priority_pop, DEAD_IMAP_HOSTS
+
+v13.37 fixes on this page
+-------------------------
+* Renamed 1_Diagnostics.py -> 2_Diagnostics.py (it collided with
+  1_Mailbox_Reader.py, so both rendered under the same page number).
+* st.stop() inside `with tab_plan:` aborted the WHOLE script, so tabs 2-6
+  (Live Port Probe, DNS, SMTP, Proxy Audit, Cache) never rendered at all for a
+  zero-access domain, or whenever conf() raised.  Tab 1 is now skipped via a
+  flag and every other tab still renders.
+* _build_plan() claimed to mirror app.py and did not: it ignored the configured
+  protocol set and always emitted both IMAP and POP rungs.  It now reads the
+  engine's real protocol flags out of st.session_state["applied_cfg"].
+* The POP warning was unconditional-ish.  Replaced with a real
+  pop_only-vs-all_pop test.
 """
 
 import os
@@ -198,14 +212,49 @@ def _detect_format(line):
     return f"UNRECOGNISED ({n} colon-parts)"
 
 
-def _build_plan(domain, max_hosts):
-    """Replicate app.py's check_account_sync() rung construction EXACTLY."""
+# --------------------------------------------------------------------------
+# v13.37: read the ENGINE's real protocol flags
+# --------------------------------------------------------------------------
+def _protocols_from_app():
+    """app.py publishes its applied config into st.session_state["applied_cfg"].
+    Reading that same key is what makes this page honest instead of decorative.
+    Returns {imap, pop, smtp, sieve} — defaults match app.py's defaults."""
+    flags = {"imap": True, "pop": True, "smtp": False, "sieve": False}
+    cfg = {}
+    try:
+        cfg = st.session_state.get("applied_cfg") or {}
+    except Exception:
+        cfg = {}
+    raw = cfg.get("ui_protocols") or cfg.get("protocols")
+    if raw:
+        wanted = [str(p).strip().upper() for p in raw]
+        flags["imap"] = any(p.startswith("IMAP") for p in wanted)
+        flags["pop"] = any(p.startswith("POP") for p in wanted)
+        flags["smtp"] = any(p.startswith("SMTP") for p in wanted)
+        flags["sieve"] = any(p.startswith("SIEVE") for p in wanted)
+    return flags
+
+
+def _build_plan(domain, max_hosts, flags=None):
+    """Replicate app.py's check_account_sync() rung construction EXACTLY.
+
+    v13.37: the rung set is now gated on the engine's real protocol flags, so
+    disabling IMAP in the sidebar is visible here.
+    """
+    if flags is None:
+        flags = {"imap": True, "pop": True, "smtp": False, "sieve": False}
+
     got = H.conf(domain) or {}
     if got.get("type") == "zero_access":
         return got, [], [], [], [], "zero_access"
 
     all_imap = [h for h in (got.get("imap") or []) if h]
     all_pop = [h for h in (got.get("pop") or got.get("pop3") or []) if h]
+
+    if not flags.get("imap"):
+        all_imap = []
+    if not flags.get("pop"):
+        all_pop = []
 
     cap = max(2, min(4, int(max_hosts)))
     imap_hosts = _dedupe_by_ip(all_imap, cap)
@@ -256,6 +305,10 @@ tab_plan, tab_probe, tab_dns, tab_smtp, tab_proxy, tab_cache = st.tabs(
     ["🧭 Host Plan", "🔌 Live Port Probe", "🛰 DNS / Discovery", "📮 SMTP", "🌐 Proxy Audit", "🧰 Cache"]
 )
 
+_PROTO_FLAGS = _protocols_from_app()
+st.caption("Engine protocol flags read from the applied config: "
+           + ", ".join(k.upper() for k, v in _PROTO_FLAGS.items() if v))
+
 # ==========================================================================
 # 1. HOST PLAN
 # ==========================================================================
@@ -269,87 +322,102 @@ with tab_plan:
             except Exception as e:
                 st.warning(f"discovery refresh failed: {e}")
 
+    # v13.37: defaults first, so later tabs and the footer always have values
+    got, all_imap, all_pop, primary, fallback, kind = {}, [], [], [], [], "ok"
+    plan_error = ""
     try:
         with st.spinner("Building host plan…"):
-            got, all_imap, all_pop, primary, fallback, kind = _build_plan(domain, max_hosts)
+            got, all_imap, all_pop, primary, fallback, kind = _build_plan(
+                domain, max_hosts, _PROTO_FLAGS)
     except Exception as e:
-        st.error(f"conf() failed: {e}")
-        st.stop()
+        plan_error = str(e)
 
-    if kind == "zero_access":
+    # v13.37: was st.stop() -> killed tabs 2-6 as well
+    if plan_error:
+        st.error(f"conf() failed: {plan_error}")
+    elif kind == "zero_access":
         st.info("This provider is Zero-Access / bridge-only (no IMAP or POP endpoint).")
-        st.stop()
+    else:
+        if not got:
+            st.warning("`hosts.conf()` returned nothing for this domain — the generic guesser found no route.")
 
-    if not got:
-        st.warning("`hosts.conf()` returned nothing for this domain — the generic guesser found no route.")
-
-    fam = []
-    fam_pop = []
-    try:
-        fam = H._family_priority(domain)
-    except Exception:
-        pass
-    if _HAVE["family_pop"]:
+        fam = []
+        fam_pop = []
         try:
-            fam_pop = H._family_priority_pop(domain)
+            fam = H._family_priority(domain)
         except Exception:
             pass
+        if _HAVE["family_pop"]:
+            try:
+                fam_pop = H._family_priority_pop(domain)
+            except Exception:
+                pass
 
-    c1, c2, c3 = st.columns(3)
-    c1.metric("IMAP candidates (raw)", len(all_imap))
-    c2.metric("POP candidates (raw)", len(all_pop))
-    c3.metric("Rungs that will be dialled", len(primary) + len(fallback))
+        c1, c2, c3 = st.columns(3)
+        c1.metric("IMAP candidates (raw)", len(all_imap))
+        c2.metric("POP candidates (raw)", len(all_pop))
+        c3.metric("Rungs that will be dialled", len(primary) + len(fallback))
 
-    st.markdown("**Family priority (IMAP bucket)**")
-    st.code(", ".join(fam) or "— none, generic guesser", language="text")
-    st.markdown("**Family priority (POP bucket)**")
-    st.code(", ".join(fam_pop) or "— none (POP bucket falls back to the IMAP family)", language="text")
+        st.markdown("**Family priority (IMAP bucket)**")
+        st.code(", ".join(fam) or "— none, generic guesser", language="text")
+        st.markdown("**Family priority (POP bucket)**")
+        st.code(", ".join(fam_pop) or "— none (POP bucket falls back to the IMAP family)", language="text")
 
-    st.markdown("**Resulting ladder — this is literally what the engine dials**")
-    st.code(
-        f"Host order -> IMAP {[h for h in all_imap if h][:8]} | POP {all_pop[:4]}\n"
-        f"primary_plan  ({len(primary)}): " + ", ".join(f"{p} {h}:{pt}" for p, h, pt, _m in primary) + "\n"
-        f"fallback_plan ({len(fallback)}): " + ", ".join(f"{p} {h}:{pt}" for p, h, pt, _m in fallback),
-        language="text",
-    )
-
-    if not fam_pop and all_pop:
-        st.warning(
-            "No POP family list is present, so the POP rung is dialling an IMAP hostname on 995 "
-            f"(`{all_pop[0]}:995`). Expected after the fix: `pop.{domain.split('.')[-2] + '.' + domain.split('.')[-1]}`."
+        st.markdown("**Resulting ladder — this is literally what the engine dials**")
+        st.code(
+            f"Host order -> IMAP {[h for h in all_imap if h][:8]} | POP {all_pop[:4]}\n"
+            f"primary_plan  ({len(primary)}): " + ", ".join(f"{p} {h}:{pt}" for p, h, pt, _m in primary) + "\n"
+            f"fallback_plan ({len(fallback)}): " + ", ".join(f"{p} {h}:{pt}" for p, h, pt, _m in fallback),
+            language="text",
         )
 
-    st.markdown("**Per-host detail**")
-    rows = []
-    seen = []
-    for h in list(dict.fromkeys(all_imap + all_pop)):
-        if h in seen:
-            continue
-        seen.append(h)
-        ip = _resolve(h)
-        rows.append({
-            "Host": h,
-            "Resolves": "yes" if ip else "NO",
-            "IP": ip or "—",
-            "Dead-IMAP demoted": "yes" if (_HAVE["dead_imap"] and h in H.DEAD_IMAP_HOSTS) else "",
-            "Tier": H.host_tier(h, domain) if hasattr(H, "host_tier") else "",
-            "Looks like a router": "yes" if H.is_junk_host(h, domain) else "",
-            "In primary plan": "yes" if any(h == r[1] for r in primary) else "",
-        })
-    if rows:
-        st.dataframe(rows, use_container_width=True, hide_index=True)
+        if not fam_pop and all_pop:
+            st.warning(
+                "No POP family list is present, so the POP rung is dialling an IMAP hostname on 995 "
+                f"(`{all_pop[0]}:995`). Expected after the fix: `pop.{domain.split('.')[-2] + '.' + domain.split('.')[-1]}`."
+            )
 
-    # shared-IP grouping — explains why two hostnames live or die together
-    ipmap = {}
-    for h in seen:
-        ip = _resolve(h)
-        if ip:
-            ipmap.setdefault(ip, []).append(h)
-    shared = {ip: hs for ip, hs in ipmap.items() if len(hs) > 1}
-    if shared:
-        st.markdown("**Hosts sharing an IP** (they succeed or fail together)")
-        for ip, hs in shared.items():
-            st.code(f"{ip}  <-  {', '.join(hs)}", language="text")
+        # v13.37: real test instead of an unconditional warning
+        pop_only = bool(all_pop) and not bool(all_imap)
+        all_pop_dup = bool(all_pop) and bool(all_imap)
+        if pop_only:
+            st.warning("POP-only provider: the ladder has NO IMAP rung. Enable IMAP in the sidebar or "
+                       "this domain can never authenticate.")
+        elif all_pop_dup:
+            st.caption("IMAP and POP both exist — the engine dials IMAP first and only falls back to POP "
+                       "when every IMAP rung fails.")
+
+        st.markdown("**Per-host detail**")
+        rows = []
+        seen = []
+        for h in list(dict.fromkeys(all_imap + all_pop)):
+            if h in seen:
+                continue
+            seen.append(h)
+            ip = _resolve(h)
+            rows.append({
+                "Host": h,
+                "Resolves": "yes" if ip else "NO",
+                "IP": ip or "—",
+                "Dead-IMAP demoted": "yes" if (_HAVE["dead_imap"] and h in H.DEAD_IMAP_HOSTS) else "",
+                "Tier": H.host_tier(h, domain) if hasattr(H, "host_tier") else "",
+                "Looks like a router": "yes" if H.is_junk_host(h, domain) else "",
+                "In primary plan": "yes" if any(h == r[1] for r in primary) else "",
+            })
+        if rows:
+            st.dataframe(rows, use_container_width=True, hide_index=True)
+
+        # shared-IP grouping — explains why two hostnames live or die together
+        ipmap = {}
+        for h in seen:
+            ip = _resolve(h)
+            if ip:
+                ipmap.setdefault(ip, []).append(h)
+        shared = {ip: hs for ip, hs in ipmap.items() if len(hs) > 1}
+        if shared:
+            st.markdown("**Hosts sharing an IP** (they succeed or fail together)")
+            for ip, hs in shared.items():
+                st.code(f"{ip}  <-  {', '.join(hs)}", language="text")
 
 # ==========================================================================
 # 2. LIVE PORT PROBE
@@ -590,6 +658,7 @@ if st.button("📋 Build copy/paste bundle"):
     L.append(f"max_hosts     : {max_hosts}")
     L.append(f"hosts.py      : {os.path.join(APP_DIR, 'hosts.py')}")
     L.append(f"family_pop    : {_HAVE['family_pop']}")
+    L.append(f"proto_flags   : {_PROTO_FLAGS}")
     L.append(f"cwd           : {os.getcwd()}")
     L.append("")
     L.append("-- family (imap) --")
