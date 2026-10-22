@@ -2,8 +2,8 @@
 # These five are the only third-party packages the app actually imports.
 # If your deploy image already has working versions, keep YOURS — the app does
 # not care about the patch level of pandas/requests.
-streamlit
-pandas
-requests
-dnspython
-PySocks
+streamlit==1.66.0
+pandas==2.2.3
+requests==2.32.3
+dnspython==2.7.0
+PySocks==1.7.1
