@@ -7325,11 +7325,17 @@ if start_engine_btn:
             str_lit.session_state.checked_emails_set = set()
             str_lit.session_state.last_checked_index = 0
             str_lit.session_state.engine_has_run = True
-            str_lit.session_state.run_completion_status
+            # FIX: was a bare expression statement; the next block (pasted from a
+            # chat message) resumed at this same indent, so the prose line between
+            # the two halves broke the compile.  Now a real assignment.
+            str_lit.session_state.run_completion_status = "Unfinished"
 
-Continuing the v13.37 app.py from exactly where the last block stopped (inside the run reset). Paste this directly beneath it — the two pieces concatenate with no seam.
+            # FIX: this used to be raw chat text pasted into the file:
+            #   Continuing the v13.37 app.py from exactly where the last block stopped
+            #   (inside the run reset). Paste this directly beneath it — the two pieces
+            #   concatenate with no seam.
+            # FIX: the ```python markdown fence that followed it is now removed.
 
-```python
             start_dt = datetime.now()
             str_lit.session_state.start_timestamp = start_dt.strftime("%Y-%m-%d %H:%M:%S")
             str_lit.session_state.end_timestamp = None
