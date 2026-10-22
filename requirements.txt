@@ -1,9 +1,27 @@
-# v13.37 — pinned so a rebuild cannot silently pull a new major.
-# These five are the only third-party packages the app actually imports.
-# If your deploy image already has working versions, keep YOURS — the app does
-# not care about the patch level of pandas/requests.
-streamlit==1.66.0
-pandas==2.2.3
-requests==2.32.3
-dnspython==2.7.0
+# v13.37 build fix — pins that actually RESOLVE on the deploy runtime (Python 3.14.8).
+#
+# WHAT WAS WRONG
+# --------------
+# The old pins (streamlit==1.66.0 / pandas==2.2.3 / requests==2.32.3 /
+# dnspython==2.7.0 / PySocks==1.7.1) are not what the box installed.  The deploy
+# log resolved pandas 3.1.0, streamlit 1.66.1, requests 2.34.2, dnspython 2.9.0,
+# because this file was edited three times inside the same ten minutes the box
+# was building (commits at 15:11, 15:31, 15:34).
+#
+# The pins below are the versions the deploy PROVED work on this runtime.
+# pandas 2.2.3 has no cp314 wheel, so pinning it makes every rebuild compile
+# pandas from source (minutes) or fail outright.
+#
+# WHY pyarrow IS PINNED HERE
+# --------------------------
+# Streamlit Cloud detects pyarrow 26.x and force-replaces it with <25
+# (apache/arrow#50471, segfault).  Pinning 24.0.0 up front skips that extra
+# resolve + uninstall + install pass and the window where the two disagree.
+#
+# To float, swap == for >= — but change one thing at a time.
+streamlit==1.66.1
+pandas==3.1.0
+requests==2.34.2
+dnspython==2.9.0
 PySocks==1.7.1
+pyarrow==24.0.0
