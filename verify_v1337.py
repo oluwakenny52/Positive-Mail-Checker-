@@ -1,18 +1,33 @@
 #!/usr/bin/env python3
-"""verify_v1337.py - regression harness for the v13.37 patch set.
-
-For every changed file it checks:
-  (a) the module compiles, tokenizes and AST-parses,
-  (b) every v13.37 fix is textually PRESENT,
-  (c) every buggy pattern the fix replaced is GONE,
-plus that no two files in pages/ share a page number.
+"""verify_v1337.py — regression harness for the v13.37 patch set (build-fix revision).
 
 Run from the repo root:   python verify_v1337.py
 Exit code 0 = clean.
+
+For every file the v13.37 work touched it checks:
+  (a) the module compiles, tokenizes and AST-parses,
+  (b) every v13.37 fix is textually PRESENT,
+  (c) every buggy pattern the fix replaced is GONE from the CODE,
+  (d) no pasted-prose line, no stray markdown fence, and no tokenizer landmine
+      (em dash / curly quote / nbsp outside a string) survived the paste,
+plus that no two files in pages/ share a page number.
+
+WHY THIS REVISION EXISTS
+------------------------
+  * The PART 1/3 / PART 2/3 banner checks were removed — app.py has no banners.
+  * "settled = False", "def _geo_throttle(", '"geo_fail": {}',
+    '_GEO_FAIL = STATE["geo_fail"]' and "MAIL_SPOT_MIN_INTERVAL" do not exist in
+    app.py; the real markers are checked instead.
+  * gone() now runs against a view of the source with comments AND string
+    literals blanked out, because app.py's changelog docstring and several
+    comments deliberately name the symbols they removed.
+  * NEW: stray-line + non-ASCII landmine checks for the paste that broke the
+    build at app.py line 7330 ("invalid character '—' (U+2014)").
 """
 import ast
 import io
 import os
+import re
 import sys
 import tokenize
 
@@ -23,6 +38,39 @@ FAILS = []
 def read(path):
     with io.open(path, "r", encoding="utf-8") as fh:
         return fh.read()
+
+
+def _line_offsets(src):
+    offs = [0]
+    for ln in src.splitlines(keepends=True):
+        offs.append(offs[-1] + len(ln))
+    return offs
+
+
+def code_view(src):
+    """Source with every COMMENT and STRING token blanked out, layout preserved.
+
+    Newlines inside multi-line strings are kept, so line numbers still line up
+    with the real file.  This is the view gone() must use.
+    """
+    chars = list(src)
+    offs = _line_offsets(src)
+
+    def pos(line, col):
+        return offs[line - 1] + col
+
+    try:
+        toks = list(tokenize.generate_tokens(io.StringIO(src).readline))
+    except Exception:
+        return src
+    for tok in toks:
+        if tok.type not in (tokenize.COMMENT, tokenize.STRING):
+            continue
+        start, end = pos(*tok.start), pos(*tok.end)
+        for i in range(start, min(end, len(chars))):
+            if chars[i] != "\n":
+                chars[i] = " "
+    return "".join(chars)
 
 
 def has(src, needle, label):
@@ -63,6 +111,67 @@ def parses(path, src):
         PASSES.append(path + " AST parses")
     except SyntaxError as e:
         FAILS.append("%s AST parse failed: line %s: %s" % (path, e.lineno, e.msg))
+
+
+# ---------------------------------------------------------------------------
+# the paste that broke the build
+# ---------------------------------------------------------------------------
+PROSE_NEEDLES = (
+    "Continuing the v13.37 app.py",
+    "Paste this directly beneath it",
+    "the two pieces concatenate with no seam",
+)
+
+LANDMINES = (
+    ("\u2014", "em dash"),
+    ("\u2013", "en dash"),
+    ("\u2018", "left single quote"),
+    ("\u2019", "right single quote"),
+    ("\u201c", "left double quote"),
+    ("\u201d", "right double quote"),
+    ("\u00a0", "non-breaking space"),
+)
+
+
+def stray_lines(path, code_src):
+    """code_src must be code_view(file): no comments, no strings."""
+    lines = code_src.splitlines()
+
+    fences = [i for i, l in enumerate(lines, 1) if l.strip().startswith("```")]
+    if fences:
+        for i in fences:
+            FAILS.append("%s line %d is a stray markdown fence: %r"
+                         % (path, i, lines[i - 1].strip()))
+    else:
+        PASSES.append(path + " has no stray markdown fence line")
+
+    for needle in PROSE_NEEDLES:
+        hits = [i for i, l in enumerate(lines, 1) if needle in l]
+        if hits:
+            for i in hits:
+                FAILS.append("%s line %d is pasted English prose: %r"
+                             % (path, i, lines[i - 1].strip()[:90]))
+        else:
+            PASSES.append("%s: prose marker gone (%r)" % (path, needle))
+
+    for i, line in enumerate(lines, 1):
+        for ch, name in LANDMINES:
+            if ch in line:
+                FAILS.append("%s line %d has a %s outside any string/comment "
+                             "(the tokenizer rejects it): %r"
+                             % (path, i, name, line.strip()[:90]))
+
+
+def seam_is_intact(app):
+    pat = (r"run_completion_status\s*\n"
+           r"(?:\s*(?:#[^\n]*)?\n)*"
+           r"\s*start_dt = datetime\.now\(\)")
+    if re.search(pat, app):
+        PASSES.append("app.py: run-reset seam intact "
+                      "(run_completion_status -> start_dt, nothing in between)")
+    else:
+        FAILS.append("app.py: run-reset seam BROKEN — the two pasted halves no "
+                     "longer join around run_completion_status / start_dt")
 
 
 def page_numbers():
@@ -107,81 +216,90 @@ def main():
     app = read(app_path) if os.path.exists(app_path) else ""
     dia = read(dia_path) if os.path.exists(dia_path) else ""
     rdr = read(rdr_path) if os.path.exists(rdr_path) else ""
+    req = read(req_path) if os.path.exists(req_path) else ""
 
     if app:
         compiles(app_path, app)
         tokenizes(app_path, app)
         parses(app_path, app)
+        app_code = code_view(app)
+        stray_lines(app_path, app_code)
+        seam_is_intact(app)
 
         has(app, "Mega Ultimate Mail Checker — v13.37", "app.py header is v13.37")
-        for n in (1, 2):
-            has(app, "# ===== END OF APP.PY PART %d/3 =====" % n,
-                "app.py PART %d end-marker present" % n)
 
-        # P0
-        has(app, "fetched_msgs, success_read = msgs, True", "P0 success_read typo fixed")
-        gone(app, "success_msgs", "P0 success_msgs local is gone")
-        has(app, "settled = False", "P0 tunnel_probe second-scheme gate rebuilt")
-        gone(app, "if ptype == preferred:", "P0 407 no longer filed by preferred scheme")
-        has(app, "out[\"reason\"] = \"auth\"", "P0 post-loop auth override present")
+        # ---- P0: 407 classification, swallowed XOAUTH2 407, clean_valid merge --
+        has(app, 'out["reason"] = "auth"', "P0 post-loop auth override present")
+        has(app, 'if _s_idx and out["ok"] and not _second_scheme:',
+            "P0 tunnel_probe gate is outcome-driven (PASS stops, FAIL tries other scheme)")
+        gone(app_code, "if ptype == preferred:",
+             "P0 407 no longer filed by the preferred scheme")
         has(app, "except ProxyAuthError as pae:", "P0 ProxyAuthError no longer swallowed")
         has(app, "nonlocal acct_407_total", "P0 407 counter is nonlocal")
         has(app, "def _write_clean_valid(", "P0 clean_valid merge helper present")
+        has(app, "fetched_msgs, success_read = msgs, True", "P0 success_read typo fixed")
+        gone(app_code, "success_msgs", "P0 success_msgs local is gone")
 
-        # P1
-        has(app, "if \"Fast-fail DNS check\" not in err_text:", "P1 DNS RuntimeError not saw_server")
+        # ---- P1 ----
+        has(app, 'if "Fast-fail DNS check" not in err_text:',
+            "P1 local DNS RuntimeError no longer sets saw_server")
         has(app, "def _resolve_cached(", "P1 shared DNS TTL cache present")
-        has(app, "return _resolve_cached(host) is not None", "P1 fast_fail_dns_check uses cache")
-        gone(app, "return filtered if filtered else raw", "P1 filter no longer falls back to raw")
+        has(app, "return _resolve_cached(host) is not None",
+            "P1 fast_fail_dns_check uses the shared cache")
+        gone(app_code, "return filtered if filtered else raw",
+             "P1 filter no longer silently falls back to the raw list")
         has(app, "while page <= 20:", "P1 fetch_ws paginates")
-        has(app, "GEO_FAIL_TTL = 300.0", "P1 geo negative cache TTL present")
+        has(app, "GEO_FAIL_TTL = 300.0", "P1 geo negative-cache TTL present")
         has(app, "GEO_MIN_INTERVAL", "P1 geo throttle constant present")
-        has(app, "\"geo_fail\": {}", "P1 geo_fail state key present")
-        has(app, "_GEO_FAIL = STATE[\"geo_fail\"]", "P1 geo_fail alias present")
-        has(app, "def _geo_throttle(", "P1 geo throttle helper present")
+        has(app, "_GEO_FAIL = {}", "P1 geo negative cache present")
+        has(app, "_geo_last_call", "P1 geo throttle state present")
 
-        # P2
+        # ---- P2 ----
         has(app, "_STARTUP_MAX = 400", "P2 startup log cap present")
         has(app, "_STARTUP_SEEN = set()", "P2 startup dedupe set present")
         has(app, "if msg in _STARTUP_SEEN:", "P2 dedupe compares the MESSAGE")
-        has(app, "checked_count % 25 == 0", "P2 writes every 25 accounts")
+        has(app, "checked_count % 25 == 0", "P2 checkpoint writes every 25 accounts")
         has(app, "def _estimated_rung_count(", "P2 rung count is derived")
         has(app, "rungs = _estimated_rung_count()", "P2 request_budget uses it")
-        gone(app, "rungs = 8", "P2 hardcoded rungs = 8 gone")
-        has(app, "MAIL_SPOT_MIN_INTERVAL", "P2 mail-destination spot throttle present")
+        gone(app_code, "rungs = 8", "P2 hardcoded rungs = 8 gone")
         has(app, "PROXY_SUBUSER_CONCURRENCY", "P2 per-sub-user concurrency gate present")
+        has(app, "MAIL_SPOT_NODES", "P2 mail-destination spot check present")
 
-        has(app, "return \"VPN ? (lookup failed)\"", "P3 VPN state admits failure")
+        # ---- P3 ----
+        has(app, 'return "VPN ? (lookup failed)"', "P3 VPN state admits a failed lookup")
 
-        # dead code that must be GONE
-        gone(app, "def _cached_probe(", "dead _cached_probe removed")
-        gone(app, "def test_single_proxy(", "dead test_single_proxy removed")
-        gone(app, "def proxy_tunnel_ok(", "dead proxy_tunnel_ok removed")
-        gone(app, "def _pool_exhausted(", "dead _pool_exhausted removed")
-        gone(app, "def _is_plain_domain_guess(", "dead _is_plain_domain_guess removed")
-        gone(app, "SETTING_WIDGET_KEYS", "dead SETTING_WIDGET_KEYS removed")
-        gone(app, "PUBLIC_PROVIDERS", "dead PUBLIC_PROVIDERS removed")
-        gone(app, "_targets_key", "dead _targets_key removed")
-        gone(app, "_TUNNEL_TTL", "dead _TUNNEL_TTL removed")
-        gone(app, "_tunnel_lock", "dead _tunnel_lock removed")
-        gone(app, "STATE[\"tunnel_cache\"]", "dead tunnel_cache state key removed")
-        gone(app, "_DOMAIN_IMAP_GUESS", "dead _DOMAIN_IMAP_GUESS removed")
-        gone(app, "_DOMAIN_POP_GUESS", "dead _DOMAIN_POP_GUESS removed")
-        gone(app, "read_timeout", "CheckerConfig.read_timeout fully removed")
+        # ---- dead code that must be gone from the CODE (the docstring may name it)
+        for dead in ("def _cached_probe(", "def test_single_proxy(",
+                     "def proxy_tunnel_ok(", "def _pool_exhausted(",
+                     "SETTING_WIDGET_KEYS", "PUBLIC_PROVIDERS", "_targets_key",
+                     "_TUNNEL_TTL", "_tunnel_lock",
+                     "_DOMAIN_IMAP_GUESS", "_DOMAIN_POP_GUESS",
+                     "read_timeout", "_is_plain_domain_guess"):
+            gone(app_code, dead, "dead code removed: " + dead)
+        gone(app, 'STATE["tunnel_cache"]', "dead tunnel_cache state key removed")
 
-        # kept on purpose
-        has(app, "PROVIDER_MAP = {", "PROVIDER_MAP kept as hosts.py fallback")
+        # ---- kept on purpose ----
+        has(app, "PROVIDER_MAP = {", "PROVIDER_MAP kept as the hosts.py fallback")
         has(app, "def clear_tunnel_cache(", "clear_tunnel_cache kept")
         has(app, "def _guess_candidates(", "_guess_candidates kept")
         has(app, "HOSTS_HAS_RANKING", "HOSTS_HAS_RANKING kept")
-        has(app, "CFG_VERSION = 1337", "CFG_VERSION bumped to 1337")
+        has(app, "CFG_VERSION = 1337", "CFG_VERSION is 1337")
+
+    if req:
+        if "pandas==2.2.3" in req:
+            FAILS.append("requirements.txt still pins pandas==2.2.3 "
+                         "(no cp314 wheel on the Python 3.14 runtime)")
+        else:
+            PASSES.append("requirements.txt no longer pins the cp314-less pandas 2.2.3")
+        has(req, "streamlit==", "requirements.txt pins streamlit")
 
     if dia:
         compiles(dia_path, dia)
         tokenizes(dia_path, dia)
         parses(dia_path, dia)
+        stray_lines(dia_path, code_view(dia))
         has(dia, "pages/2_Diagnostics.py", "diagnostics page self-identifies as 2_")
-        has(dia, "def _protocols_from_app(", "plan uses the real protocol flags")
+        has(dia, "def _protocols_from_app(", "plan reads the real protocol flags")
         has(dia, "applied_cfg", "plan reads the app's applied config")
         has(dia, "pop_only", "false POP warning replaced by a real test")
         has(dia, "elif all_pop_dup", "all_pop branch present")
@@ -191,6 +309,7 @@ def main():
         compiles(rdr_path, rdr)
         tokenizes(rdr_path, rdr)
         parses(rdr_path, rdr)
+        stray_lines(rdr_path, code_view(rdr))
         has(rdr, "pages/3_Mailbox_Reader.py", "reader page self-identifies as 3_")
         has(rdr, "class MsVerdict(", "MsVerdict exception defined")
         has(rdr, "def _reader_proxy_reachable(", "reader proxy probe helper present")
