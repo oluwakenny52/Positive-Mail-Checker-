@@ -1,9 +1,78 @@
 """
-Mega Ultimate Mail Checker — v13.35
+Mega Ultimate Mail Checker — v13.36
 ===================================
 Complete rewrite. SMTP reachability is an OPT-IN pre-check stage (never inside
 the validator), status classification actually works, and every direct-connection
 line carries the real egress IP / region / country / VPN state.
+
+v13.36 changes  (THE 407 THAT WAS FILED AS A TRANSPORT FAILURE)
+--------------------------------------------------------------
+THE BUG.  ~200 attempts across three exported traces contain not one
+`PROXY 407` line and not one `[Classified: proxy_unhealthy]`.  Every single one
+reads:
+
+    -> PROXY TRANSPORT IMAP imap.windstream.net:993: Proxy tunnel transport
+       failure ... Socket error: 407: Proxy Authentication Required
+       [Classified: connection_failed]
+
+The app wrote 407 into the message and then filed it under the TRANSPORT
+branch.  Because the 407 never took the ProxyAuthError path, the entire 407
+machinery was dead code for the whole run:
+
+  * flags["saw_407"] stayed False   -> the "every attempt died in the PROXY hop"
+                                       verdict was skipped, and the true cause was
+                                       reported as "all hosts unreachable".
+  * acct_407 stayed 0               -> the 407 storm breaker (acct_407 >= 5)
+                                       could NEVER fire, so the app never bailed
+                                       out to DIRECT early and dutifully ground
+                                       through all four sub-phases.
+  * a 407'd node was retried, not parked -> the run spent its window rotating.
+
+The trace shows the cost plainly - the window is consumed on three or four rungs
+and then truncated, over and over:
+
+    proxy  · pass 1: window reached; stopping this pass (5 rung(s) not attempted).
+    direct · pass 1: window reached; stopping this pass (6 rung(s) not attempted).
+
+TWO LINES PRODUCED IT.  tunnel_probe() ended with a speculative promotion:
+when HTTP answered 407 and SOCKS5 died with a plain socket error (an HTTP-only
+port), len(auth_schemes) == 1 and the node was pinned to SOCKS5 for the life of
+the process.  proxy_connect() then looked at order[0] (SOCKS5), found it absent
+from auth_schemes, and raised the 407 as ProxyTransportError.
+
+P1 fixes the classification itself: if ANY scheme answered 407, it IS a
+credential refusal.  P2 removes the speculative promotion so the scheme memory
+is driven by an actual SUCCESS only.
+
+P5/P6/P7 stop the run bleeding its window while the provider is 407ing:
+quarantine 2 -> 3 (two strikes per node emptied the pool mid-run), force-direct
+5 -> 3 (every 407ing proxy attempt is a request that cannot succeed), cooldown
+45s -> 90s (a threshold trip outlasts 45s), the breaker no longer requires
+can_rotate (with a provider-wide 407 there is always another node, so the old
+condition was unsatisfiable), and SAME_HOST_RETRIES 0 -> 1 (with the pool
+407ing, DIRECT is the only path that can carry a run, and one transient
+connect-timeout was discarding a host permanently - still never retries a 407).
+
+P3 stops the local-part retry throwing away the node that just reached the
+mail server - a local-part retry is a MAIL-SERVER question, not a proxy one.
+
+P8 makes the verdict honest, with two corrections over the original patch:
+  * acct_407 is a sweep() LOCAL, reset per rung.  The verdict block is outside
+    sweep() AND outside the big try, so reading it there was a NameError.
+    A hoisted acct_407_total (nonlocal in sweep) is what the verdict reads.
+  * saw_server set only in the local-part-retry branches is too narrow: with
+    try_alt_username off, or when the local part equals the address, those
+    branches never run - so a genuine "LOGIN => IMAP server terminating
+    connection" would still fall through to "hosts unreachable".  saw_server is
+    now set in every handler that proves the host actually spoke.
+
+NEW - MAIL-DESTINATION SPOT CHECK.  The pool probe defaults to api.ipify.org:443,
+a WEBSITE, so ALL probe traffic lands on the websites meter - which is blind to
+exactly the failure the run hits.  A Webshare-style "You exceeded threshold for
+email servers websites" flag 407s CONNECTs to mail destinations while everything
+else passes.  After every probe cycle, 3 nodes CONNECT to the first queued mail
+host and the result is surfaced as a loud sidebar banner: "pool OK for web /
+407 for mail".
 
 v13.35 changes  (THE "Importing a module script failed." PANIC, THE DEAD RESET
                  BUTTON, AND THE LAG)
@@ -640,7 +709,7 @@ str_lit.set_page_config(
 # ============================================================================
 
 # Bump this whenever a DEFAULT changes in a way users should inherit.
-CFG_VERSION = 1335
+CFG_VERSION = 1336
 
 # ---- timing / response ----
 PROBE_TIMEOUT_DEFAULT = 8.0
@@ -664,7 +733,10 @@ WORK_FLOOR_FACTOR = 1.5
 WORK_FLOOR_PAD = 15.0
 ROTATE_SETTLE = 0.4
 SLOW_RETRY_BACKOFF = 1.2
-SAME_HOST_RETRIES_DEFAULT = 0     # v13.34: was 1. Each retry is a fresh CONNECT.
+SAME_HOST_RETRIES_DEFAULT = 1     # v13.36: was 0.  With the pool 407ing, DIRECT is
+                                  # the only path that can carry a run, and a single
+                                  # transient connect-timeout was discarding a host
+                                  # permanently.  Still never retries a 407.
 FAILURE_COOLDOWN_DEFAULT = 45.0
 WORKER_FUTURE_PAD = 60
 TUNNEL_CACHE_TTL = 120
@@ -749,11 +821,24 @@ PROBE_BUDGET_START = 120.0
 UI_MIN_INTERVAL = 0.12           # min seconds between UI re-renders
 BUCKET_RENDER_TAIL = 40          # lines rendered per bucket per refresh
 
+# ---- v13.36: MAIL-DESTINATION SPOT CHECK ----------------------------------
+# The pool probe defaults to api.ipify.org:443, a WEBSITE.  A provider
+# "email servers" cap 407s CONNECTs to mail destinations while every website
+# passes, so the pool looks perfectly healthy right up until the run dies.  This
+# samples a few nodes against a real mail host after each cycle and says so.
+MAIL_SPOT_CHECK_DEFAULT = True
+MAIL_SPOT_NODES = 3
+MAIL_SPOT_TIMEOUT = 6.0
+MAIL_SPOT_FALLBACK = ("imap.gmail.com", 993)
+
 # ---- proxy-layer failure contract ----
-PROXY_407_QUARANTINE = 2
-PROXY_407_FORCE_DIRECT = 5
+PROXY_407_QUARANTINE = 3         # v13.36: was 2.  With a provider-wide 407, two
+                                 # strikes per node emptied the pool mid-run.
+PROXY_407_FORCE_DIRECT = 3       # v13.36: was 5.  Every proxy attempt that 407s
+                                 # is a request that cannot succeed - go DIRECT.
 PROXY_407_BACKOFF = 0.8          # v13.32: settle before a same-node 407 retry
-PROXY_407_COOLDOWN = 45.0        # v13.32: 407 parks a node instead of killing it
+PROXY_407_COOLDOWN = 90.0        # v13.36: was 45.  A threshold trip outlasts 45s;
+                                 # re-trying a parked node that early just re-407s.
 MAX_ROTATIONS_DEFAULT = 2        # v13.33: was 5. Each rotation is a request.
 CHECK_PASS2_DEFAULT = False      # v13.33: no automatic second pass
 DEDUPE_PROXIES_DEFAULT = True
@@ -810,6 +895,7 @@ SETTING_DEFAULTS = {
     "ui_probe_scheme2": PROBE_SECOND_SCHEME_DEFAULT,
     "ui_prober_idle": PROBER_IDLE_ENABLED_DEFAULT,
     "ui_probe_sample": 0,
+    "ui_mail_spot": MAIL_SPOT_CHECK_DEFAULT,
     "ui_dedupe": DEDUPE_PROXIES_DEFAULT,
     "ui_allow_blacklist": False,
     "ui_quarantine": True,
@@ -873,6 +959,7 @@ def default_cfg() -> dict:
         "PROBE_SECOND_SCHEME": PROBE_SECOND_SCHEME_DEFAULT,
         "PROBER_IDLE_ENABLED": PROBER_IDLE_ENABLED_DEFAULT,
         "PROBE_SAMPLE_MAX": 0,
+        "MAIL_SPOT_CHECK": MAIL_SPOT_CHECK_DEFAULT,
         "DEDUPE_PROXIES": DEDUPE_PROXIES_DEFAULT,
         "ALLOW_BLACKLIST_IPS": False,
         "QUARANTINE_407": True,
@@ -1082,6 +1169,9 @@ def _engine_state():
         "target_reach": {"ts": 0.0, "rows": []},
         "selftest": {"ts": 0.0, "text": ""},
         "helo_name": {"name": "", "ts": 0.0},
+        # v13.36: last mail-destination spot check result
+        "mail_spot": {"ts": 0.0, "host": "", "port": 0, "ok": 0, "auth": 0,
+                      "other": 0, "n": 0, "error": ""},
         # probe bookkeeping
         "probe_in_flight": False,
         "last_probe_ts": 0.0,
@@ -1234,6 +1324,8 @@ def request_budget():
         sample = 0
     probed = min(nodes, sample) if sample else nodes
     cycle = probed * per_node
+    if CFG.get("MAIL_SPOT_CHECK", MAIL_SPOT_CHECK_DEFAULT):
+        cycle += min(MAIL_SPOT_NODES, probed)
     if CFG.get("PROBER_IDLE_ENABLED", PROBER_IDLE_ENABLED_DEFAULT):
         idle_per_min = cycle / max(1.0, PROBER_IDLE_SLEEP) * 60.0
     else:
@@ -1443,7 +1535,7 @@ def build_diagnostics_text():
         L.append(str(s))
 
     A("=" * 78)
-    A("MEGA ULTIMATE MAIL CHECKER — v13.35 DIAGNOSTIC BUNDLE")
+    A("MEGA ULTIMATE MAIL CHECKER — v13.36 DIAGNOSTIC BUNDLE")
     A(f"generated {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     A("=" * 78)
 
@@ -1538,6 +1630,17 @@ def build_diagnostics_text():
     A(f"  probe targets (live): {[t[0] + ':' + str(t[1]) for t in probe_targets()]}")
     A(f"  probe workers       : {probe_workers()} idle/run, {probe_workers(bulk=True)} bulk "
       f"(batch budget {PROBE_BATCH_BUDGET:.0f}s)")
+    _ms = STATE.get("mail_spot") or {}
+    if _ms.get("n"):
+        A(f"  MAIL-DEST SPOT      : {_ms['host']}:{_ms['port']} -> pass={_ms['ok']} "
+          f"407={_ms['auth']} other={_ms['other']} of {_ms['n']} node(s), "
+          f"{int(time.time() - _ms.get('ts', 0))}s ago")
+        if _ms.get("auth") and not _ms.get("ok"):
+            A("  *** pool passes the WEB probe but the provider 407s MAIL destinations ***")
+        if _ms.get("error"):
+            A(f"  spot error          : {_ms['error'][:200]}")
+    else:
+        A("  MAIL-DEST SPOT      : not run yet")
     A(f"  HOST_CONCURRENCY    : {CFG.get('HOST_CONCURRENCY')}")
     A(f"  PROXY_CONCURRENCY   : {CFG.get('PROXY_CONCURRENCY')}")
     A(f"  PROXY_IP_CONCURRENCY: {CFG.get('PROXY_IP_CONCURRENCY')}")
@@ -1549,11 +1652,15 @@ def build_diagnostics_text():
     A(f"  PROBE_SECOND_SCHEME : {CFG.get('PROBE_SECOND_SCHEME')}")
     A(f"  PROBER_IDLE_ENABLED : {CFG.get('PROBER_IDLE_ENABLED')}")
     A(f"  PROBE_SAMPLE_MAX    : {CFG.get('PROBE_SAMPLE_MAX')}")
+    A(f"  MAIL_SPOT_CHECK     : {CFG.get('MAIL_SPOT_CHECK')}")
     A(f"  MAX_ROTATIONS       : {CFG.get('MAX_ROTATIONS')}")
     A(f"  CHECK_PASS2         : {CFG.get('CHECK_PASS2')}")
     A(f"  DIRECT_FIRST        : {CFG.get('DIRECT_FIRST')}")
     A(f"  RANDOM_ROTATION     : {CFG.get('RANDOM_ROTATION')}")
     A(f"  CONNECT_FLOOR/READ  : {CONNECT_FLOOR_DEFAULT} / {READ_FLOOR_DEFAULT}")
+    A(f"  407 CONTRACT        : quarantine={PROXY_407_QUARANTINE} "
+      f"force_direct={PROXY_407_FORCE_DIRECT} cooldown={PROXY_407_COOLDOWN:.0f}s "
+      f"same_host_retries={CFG.get('SAME_HOST_RETRIES')}")
     A(f"  HELO name           : {smtp_helo_name()}")
 
     A("")
@@ -1667,8 +1774,8 @@ def default_theme() -> dict:
         "bg": p["bg"], "panel": p["panel"], "text": p["text"],
         "radius": 14, "glow": True, "animate": True, "glass": True,
         "colorize_logs": True,
-        "hero_title": "⚡ Mega Ultimate Mail Checker v13.35",
-        "hero_sub": "Plug-and-play edition — click 📥 Fetch & Test All Proxies, then press Start. Frugal by default: idle prober OFF, 1 probe target, 1 scheme, 2 rotations, 443 probe target (off the email meter), per-sub-user + per-IP 407 gates on by default, pool validated and ARMED by the fetch. v13.35: Reset Defaults genuinely resets, the first-load probe runs in the background, and the pre-filter/DNS lookups are cached so the page stops lagging.",
+        "hero_title": "⚡ Mega Ultimate Mail Checker v13.36",
+        "hero_sub": "Plug-and-play edition — click 📥 Fetch & Test All Proxies, then press Start. v13.36 files a 407 as a 407 instead of a transport failure, so the run stops burning its window on the proxy hop and can bail to DIRECT after 3 of them. A new mail-destination spot check tells you when the pool passes the web probe but the provider refuses MAIL ports — the 'email servers' cap that used to look like 'all hosts unreachable'.",
     }
 
 def load_theme() -> dict:
@@ -1866,6 +1973,7 @@ def render_hero(th: dict):
                 <span class="bb-tag">Gated Per-IP Tunnel Cap</span>
                 <span class="bb-tag">Per-Sub-User 407 Gate</span>
                 <span class="bb-tag">Request Frugal</span>
+                <span class="bb-tag">Mail-Dest Spot Check</span>
                 <span class="bb-tag">Microsoft XOAUTH2</span>
                 <span class="bb-tag">Deep Diagnostics</span>
             </div>
@@ -2597,6 +2705,15 @@ prober_idle_ui = str_lit.sidebar.toggle(
          "click Start or Re-probe. ON = the old behaviour: re-probe the whole pool on a timer even "
          "when nothing is running."
 )
+mail_spot_ui = str_lit.sidebar.toggle(
+    "✉️ Spot-check the pool against a MAIL destination", value=MAIL_SPOT_CHECK_DEFAULT,
+    key="ui_mail_spot",
+    help="v13.36. After every probe cycle, CONNECT 3 random nodes to your first queued mail host "
+         "(fallback imap.gmail.com:993) and report it. The pool probe defaults to a WEBSITE "
+         "(api.ipify.org:443), so without this a provider 'email servers' cap looks exactly like a "
+         "perfectly healthy pool right up until the run 407s on every account. Costs 3 CONNECTs per "
+         "cycle, on the mail meter."
+)
 probe_sample_ui = str_lit.sidebar.slider(
     "Probe: max nodes per cycle (0 = all)", 0, 200, 0, 5, key="ui_probe_sample",
     help="v13.33. Randomly sample this many nodes per cycle instead of probing the whole file. "
@@ -2613,9 +2730,9 @@ allow_blacklist_ips = str_lit.sidebar.toggle(
 )
 proxy_quarantine_ui = str_lit.sidebar.toggle(
     "🩹 Quarantine nodes that return 407", value=True, key="ui_quarantine",
-    help="ON (default): a node that answers '407 Proxy Authentication Required' twice is pulled out of the pool "
-         "for the rest of the run. NOTE: a plain socket reset is NOT a 407 and no longer counts toward this. "
-         "v13.32 also parks a 407'd node for 45s before it is considered again."
+    help="ON (default): a node that answers '407 Proxy Authentication Required' THREE times (v13.36) is pulled "
+         "out of the pool for the rest of the run. NOTE: a plain socket reset is NOT a 407 and no longer counts "
+         "toward this. v13.36 also parks a 407'd node for 90s before it is considered again."
 )
 
 str_lit.sidebar.markdown("---")
@@ -2647,12 +2764,13 @@ proxy_concurrency_ui = str_lit.sidebar.slider(
 direct_first_ui = str_lit.sidebar.toggle(
     "⚡ Direct-First (try the direct egress before the proxy)", value=False, key="ui_direct_first",
     help="ON: run the DIRECT sweep first and only fall back to the proxy. Also auto-engages per account "
-         "when >50% of the pool is quarantined."
+         "when >50% of the pool is quarantined. v13.36: with the pool 407ing this is the mode that "
+         "actually produces verdicts - or just set Proxy mode = Off."
 )
 same_host_retries_ui = str_lit.sidebar.slider(
     "Same-Host Retries on a SLOW answer", 0, 4, SAME_HOST_RETRIES_DEFAULT, 1, key="ui_same_host_retries",
-    help="v13.34 default 0. Only applies to READ-level slowness. A CONNECT-level timeout rotates the node "
-         "once and advances; a socket reset rotates immediately. Every retry is a fresh CONNECT."
+    help="v13.36 default 1 (was 0). Only applies to READ-level slowness. A CONNECT-level timeout rotates the "
+         "node once and advances; a socket reset rotates immediately. Every retry is a fresh CONNECT."
 )
 max_rotations_ui = str_lit.sidebar.slider(
     "Max proxy rotations per rung", 0, 8, MAX_ROTATIONS_DEFAULT, 1, key="ui_max_rot",
@@ -3076,7 +3194,8 @@ resolved_proxy_mode = str_lit.sidebar.selectbox(
     "Proxy Mode Engine:", options=["aggressive", "fallback", "sticky", "off"], index=1,
     key="ui_proxy_mode",
     help="aggressive: proxy only. fallback: proxy then direct (default, universal). "
-         "sticky: one proxy per worker thread. off: never use proxies."
+         "sticky: one proxy per worker thread. off: never use proxies. "
+         "v13.36: with a provider-wide 407, 'off' is the only mode that can finish a run."
 )
 
 def build_cfg():
@@ -3108,6 +3227,7 @@ def build_cfg():
         "PROBE_SECOND_SCHEME": probe_second_scheme_ui,
         "PROBER_IDLE_ENABLED": prober_idle_ui,
         "PROBE_SAMPLE_MAX": probe_sample_ui,
+        "MAIL_SPOT_CHECK": mail_spot_ui,
         "DEDUPE_PROXIES": dedupe_proxies_ui,
         "ALLOW_BLACKLIST_IPS": allow_blacklist_ips,
         "QUARANTINE_407": proxy_quarantine_ui,
@@ -3205,6 +3325,7 @@ for _k, _v in (
     ("PROBE_SECOND_SCHEME", PROBE_SECOND_SCHEME_DEFAULT),
     ("PROBER_IDLE_ENABLED", PROBER_IDLE_ENABLED_DEFAULT),
     ("PROBE_SAMPLE_MAX", 0),
+    ("MAIL_SPOT_CHECK", MAIL_SPOT_CHECK_DEFAULT),
     ("MAX_ROTATIONS", MAX_ROTATIONS_DEFAULT),
     ("CHECK_PASS2", CHECK_PASS2_DEFAULT),
     ("HOST_CONCURRENCY", HOST_CONCURRENCY_DEFAULT), ("PROXY_CONCURRENCY", PROXY_CONCURRENCY_DEFAULT),
@@ -3230,7 +3351,7 @@ log_startup(
     f"probe_max_targets={CFG.get('PROBE_MAX_TARGETS')} "
     f"probe_scheme2={CFG.get('PROBE_SECOND_SCHEME')} "
     f"prober_idle={CFG.get('PROBER_IDLE_ENABLED')} "
-    f"probe_sample={CFG.get('PROBE_SAMPLE_MAX')} "
+    f"probe_sample={CFG.get('PROBE_SAMPLE_MAX')} mail_spot={CFG.get('MAIL_SPOT_CHECK')} "
     f"max_rotations={CFG.get('MAX_ROTATIONS')} check_pass2={CFG.get('CHECK_PASS2')} "
     f"host_conc={CFG.get('HOST_CONCURRENCY')} ip_conc={CFG.get('PROXY_IP_CONCURRENCY')} "
     f"subuser_conc={CFG.get('PROXY_SUBUSER_CONCURRENCY')} "
@@ -3470,8 +3591,12 @@ def proxy_connect(host, port, proxy_str, timeout=None, remote_dns=True):
             if _is_proxy_auth_fail(str(proxy_ex)):
                 auth_schemes.add(ptype)
 
-    # v13.28: only a rejection on the scheme we actually PREFER is a real 407.
-    if order and order[0] in auth_schemes:
+    # v13.36: if ANY scheme answered 407, this IS a credential refusal.  Gating it
+    # on the PREFERRED scheme alone meant that whenever the preferred scheme was
+    # the wrong one for a node, a genuine 407 was raised as a ProxyTransportError:
+    # saw_407 stayed False, acct_407 stayed 0, the 407 storm breaker could never
+    # fire, and the verdict fell through to 'all hosts unreachable'.
+    if auth_schemes:
         raise ProxyAuthError(f"Proxy authentication required for {host}:{port}: {last_err}")
 
     raise ProxyTransportError(f"Proxy tunnel transport failure for {host}:{port}: {last_err}")
@@ -4236,9 +4361,11 @@ def tunnel_probe(proxy_str, targets=None, timeout=None):
                     except Exception:
                         pass
 
-    if auth_schemes and preferred in auth_schemes and len(auth_schemes) == 1:
-        other = socks.SOCKS5 if preferred == socks.HTTP else socks.HTTP
-        _remember_scheme(proxy_str, other)
+    # v13.36: no speculative scheme promotion.  When HTTP answered 407 and
+    # SOCKS5 died with a plain socket error (an HTTP-only port), this used to
+    # pin the node to SOCKS5 forever - which made every later proxy_connect()
+    # burn a SOCKS5 CONNECT before the real one AND mis-raise the 407 (see P1).
+    # _remember_scheme() is now driven by an actual SUCCESS only.
 
     out["error"] = " ; ".join(errors)[:300]
     return out
@@ -4358,6 +4485,70 @@ def _run_batch(fn, items, workers, budget):
         ex.shutdown(wait=False)
     return [it for it in items if id(it) in done_ids], timed_out
 
+# ---------------------------------------------------------------------------
+# v13.36: MAIL-DESTINATION SPOT CHECK
+# ---------------------------------------------------------------------------
+def _mail_spot_target():
+    """The real mail destination to test the pool against.
+
+    Prefer the queue-derived override (set at Start); fall back to a well-known
+    mail host so the check still says something on a cold app.
+    """
+    try:
+        ov = STATE.get("probe_targets_override") or []
+        for h, p, _l in ov:
+            if h:
+                return (h, int(p))
+    except Exception:
+        pass
+    return MAIL_SPOT_FALLBACK
+
+def mail_dest_spot_check(force: bool = False):
+    """CONNECT a few nodes to a MAIL destination and report it.
+
+    This is the check the pool probe cannot do: the probe target is a website
+    (api.ipify.org:443) so ALL probe traffic lands on the websites meter.  A
+    provider "email servers" cap 407s mail destinations while every website
+    passes - which is exactly why the pool reads "89 alive, 0 quarantined" and
+    then 407s on essentially every runtime attempt.
+    """
+    if not force and not CFG.get("MAIL_SPOT_CHECK", MAIL_SPOT_CHECK_DEFAULT):
+        return
+    with alive_pool_lock:
+        pool = [p for p in alive_pool if p]
+    if not pool:
+        STATE["mail_spot"] = {"ts": time.time(), "host": "", "port": 0, "ok": 0,
+                              "auth": 0, "other": 0, "n": 0, "error": "empty pool"}
+        return
+    host, port = _mail_spot_target()
+    sample = random.sample(pool, min(MAIL_SPOT_NODES, len(pool)))
+    ok = auth = other = 0
+    err = ""
+    for p in sample:
+        try:
+            res = tunnel_probe(p, targets=[(host, port, "mailspot")], timeout=MAIL_SPOT_TIMEOUT)
+        except Exception as e:
+            other += 1
+            err = err or f"{type(e).__name__}: {str(e)[:120]}"
+            continue
+        if res.get("ok"):
+            ok += 1
+        elif res.get("reason") == "auth":
+            auth += 1
+            err = err or (res.get("error", "") or "")
+        else:
+            other += 1
+            err = err or (res.get("error", "") or "")
+    STATE["mail_spot"] = {"ts": time.time(), "host": host, "port": int(port), "ok": ok,
+                          "auth": auth, "other": other, "n": len(sample),
+                          "error": (err or "")[:300]}
+    line = (f"mail-dest spot check {host}:{port} -> pass={ok} 407={auth} "
+            f"other={other} of {len(sample)} node(s)")
+    log_probe_event(line)
+    if auth and not ok:
+        log_probe_event("*** pool passes the WEB probe but the provider 407s MAIL "
+                        "destinations - check the 'email servers' cap ***")
+
 def refresh_alive_pool(force: bool = False, budget: float = None):
     budget = float(budget if budget is not None else PROBE_BATCH_BUDGET)
 
@@ -4445,6 +4636,10 @@ def refresh_alive_pool(force: bool = False, budget: float = None):
             enrich_proxy_geo(raw)
             save_proxy_meta()
             log_startup(f"Test Flight OFF: pool set to all {len(raw)} candidate(s) without probing.", quiet=True)
+            try:
+                mail_dest_spot_check()
+            except Exception as _mse:
+                log_probe_event(f"mail-dest spot check failed: {_mse}")
             return
 
         _tgts = probe_targets()
@@ -4470,6 +4665,10 @@ def refresh_alive_pool(force: bool = False, budget: float = None):
             if still:
                 note += f" | kept the current {len(still)}-node pool (run in flight)"
                 log_probe_event(f"refresh kept pool ({len(still)} nodes) - 0 passed under load")
+                try:
+                    mail_dest_spot_check()
+                except Exception as _mse:
+                    log_probe_event(f"mail-dest spot check failed: {_mse}")
                 return
 
         with alive_pool_lock:
@@ -4478,6 +4677,12 @@ def refresh_alive_pool(force: bool = False, budget: float = None):
         save_proxy_meta()
         STATE["last_probe_ts"] = time.time()
         STATE["probe_runs"] = int(STATE.get("probe_runs", 0)) + 1
+
+        # v13.36: the probe only proved the WEB path.  Prove the MAIL path too.
+        try:
+            mail_dest_spot_check()
+        except Exception as _mse:
+            log_probe_event(f"mail-dest spot check failed: {_mse}")
 
         passed, auth, timeout_n, dead = probe_summary()
         line = (f"Alive pool refreshed: {len(live)} node(s) passed the tunnel probe "
@@ -4674,6 +4879,12 @@ def fetch_and_test_all_proxies(silent: bool = False):
     STATE["probe_runs"] = int(STATE.get("probe_runs", 0)) + 1
     STATE["bootstrap_done"] = True
 
+    # v13.36: tell the user NOW if the provider is refusing mail destinations.
+    try:
+        mail_dest_spot_check(force=True)
+    except Exception as _mse:
+        log_probe_event(f"mail-dest spot check failed: {_mse}")
+
     all_proxies = load_proxies()
     filtered_pool = get_filtered_active_proxies(quiet=True)
 
@@ -4764,6 +4975,22 @@ with str_lit.sidebar:
     str_lit.caption(f"Probe targets in use: {', '.join(t[0] + ':' + str(t[1]) for t in probe_targets())}")
     str_lit.caption(f"Protocols dialled: **{' + '.join(active_protocols())}**")
 
+    # ---- v13.36: THE PROBE THE POOL PROBE CANNOT DO -----------------------
+    _ms = STATE.get("mail_spot") or {}
+    if _ms.get("n"):
+        _ms_age = int(time.time() - _ms.get("ts", 0))
+        _ms_txt = (f"Mail-destination spot check ({_ms['host']}:{_ms['port']}): "
+                   f"pass **{_ms['ok']}** | 407 **{_ms['auth']}** | other **{_ms['other']}** "
+                   f"/ {_ms['n']} node(s), {_ms_age}s ago")
+        if _ms.get("auth") and not _ms.get("ok"):
+            str_lit.error(
+                "🚨 " + _ms_txt + " — the pool passes the WEB probe but the provider is refusing "
+                "MAIL destinations with 407. Set **Proxy Mode Engine = off** (DIRECT) or wait for "
+                "the 'email servers' cap to reset. Those passwords are still untested."
+            )
+        else:
+            str_lit.caption(_ms_txt)
+
     _tr = _probe_target_reachability()
     _tr_txt = "  ".join(f"{r['target']} {'OK' if r['ok'] else 'FAIL'}" for r in _tr)
     str_lit.caption(f"App-host direct reachability: {_tr_txt}")
@@ -4780,6 +5007,11 @@ with str_lit.sidebar:
         f"**{_rb['cycle']}** per full pool cycle"
         + ("" if CFG.get("PROBER_IDLE_ENABLED", PROBER_IDLE_ENABLED_DEFAULT)
            else "  ·  idle probing **OFF** (probes only on load / Start / Re-probe)")
+    )
+    str_lit.caption(
+        f"407 contract: quarantine after **{PROXY_407_QUARANTINE}** strikes · "
+        f"force DIRECT after **{PROXY_407_FORCE_DIRECT}** in a rung · park **{PROXY_407_COOLDOWN:.0f}s** · "
+        f"same-host retries **{CFG.get('SAME_HOST_RETRIES')}**"
     )
 
     if _q_now:
@@ -4831,11 +5063,18 @@ with str_lit.sidebar:
     if str_lit.button("📥 Fetch & Test All Proxies"):
         with str_lit.spinner("Fetching from Webshare & Oxylabs and validating every line…"):
             _n_alive, _n_total = fetch_and_test_all_proxies()
+        _msr = STATE.get("mail_spot") or {}
         if _n_alive:
             str_lit.success(
                 f"✅ READY — **{_n_alive}** working node(s) from **{_n_total}** line(s) validated, "
                 f"saved and armed. Press 🔥 Start Live Checking Engine."
             )
+            if _msr.get("auth") and not _msr.get("ok"):
+                str_lit.error(
+                    f"🚨 …but the MAIL-destination spot check 407'd on {_msr['auth']}/{_msr['n']} "
+                    f"sampled node(s) against {_msr['host']}:{_msr['port']}. The provider is capping "
+                    f"email-server destinations — set **Proxy Mode Engine = off** until it resets."
+                )
         else:
             str_lit.warning("No node passed validation. Check WEBSHARE_KEYS in secrets.")
         str_lit.rerun()
@@ -4876,7 +5115,8 @@ with str_lit.sidebar:
                 f"dedupe={CFG.get('DEDUPE_PROXIES', True)} · "
                 f"max_targets={CFG.get('PROBE_MAX_TARGETS')} · "
                 f"scheme2={CFG.get('PROBE_SECOND_SCHEME')} · "
-                f"idle_probe={CFG.get('PROBER_IDLE_ENABLED')}"
+                f"idle_probe={CFG.get('PROBER_IDLE_ENABLED')} · "
+                f"mail_spot={CFG.get('MAIL_SPOT_CHECK')}"
             )
             str_lit.dataframe(pd.DataFrame(rows), use_container_width=True)
             col_ref1, col_ref2, col_ref3, col_ref4 = str_lit.columns(4)
@@ -4932,6 +5172,11 @@ with str_lit.sidebar:
                         _res = tunnel_probe(_one)
                         _lines.append(f"  tunnel via {_one}: ok={_res['ok']} reason={_res['reason']} "
                                       f"lat={_res['latency_ms']}ms err={_res.get('error','')}")
+                        _mh, _mp = _mail_spot_target()
+                        _mres = tunnel_probe(_one, targets=[(_mh, _mp, "mailspot")],
+                                             timeout=MAIL_SPOT_TIMEOUT)
+                        _lines.append(f"  MAIL DESTINATION {_mh}:{_mp} via {_one}: ok={_mres['ok']} "
+                                      f"reason={_mres['reason']} err={_mres.get('error','')}")
                     else:
                         _lines.append("  tunnel: no alive node to test")
                     STATE["selftest"] = {"ts": time.time(), "text": "\n".join(_lines)}
@@ -5858,7 +6103,7 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, 
     dns_ok = True
 
     best_verdict = {"status": None, "detail": "", "host": ""}
-    flags = {"saw_407": False, "saw_nonproxy": False}
+    flags = {"saw_407": False, "saw_nonproxy": False, "saw_server": False}
     force_direct = {"flag": False}
     host_407 = {}
     net_failed_hosts = set()
@@ -5867,6 +6112,11 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, 
     used_proxies = set()
     # v13.32: sub-users we have already given the benefit of an in-place 407 retry
     retried_407_subusers = set()
+    # v13.36: TOTAL 407s for the whole account.  sweep()'s own acct_407 is reset
+    # per rung, and the verdict block below lives OUTSIDE sweep() (and outside
+    # the big try), so reading acct_407 there would be a NameError.  sweep()
+    # rebinds this one via nonlocal.
+    acct_407_total = 0
     # v13.33: rotations are now a SETTING - every rotation is another request.
     MAX_ROTATIONS = max(0, int(CFG.get("MAX_ROTATIONS", MAX_ROTATIONS_DEFAULT)))
 
@@ -6154,7 +6404,16 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, 
                 q = set(proxy_quarantine)
             return bool(pool) and q >= pool
 
-        def _rotate_to_fresh(px_used, seen_px, why):
+        def _rotate_to_fresh(px_used, seen_px, why, keep_node=False):
+            """v13.36: keep_node=True holds the node that just REACHED the mail server.
+
+            A local-part retry is a MAIL-SERVER question, not a proxy question.
+            Rotating for it discarded a demonstrably working node and re-entered
+            the 407 storm.
+            """
+            if keep_node:
+                trace_logs.append(f"Keeping proxy ({why}) -> {px_tag(px_used)}")
+                return px_used, False
             newpx = sample_alive_proxy(exclude=seen_px, avoid=seen_px, domain=domain)
             if newpx and newpx not in seen_px:
                 seen_px.add(newpx)
@@ -6163,7 +6422,7 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, 
             return px_used, False
 
         def sweep(px_used, rungs, deadline_ts, label, allow_rotate=True):
-            nonlocal err_text
+            nonlocal err_text, acct_407_total
             had_net = False
             saw_retry = False
             if not rungs:
@@ -6230,6 +6489,7 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, 
                                                  is_network_error=True, is_proxy_auth=True)
                             host_407[server] = host_407.get(server, 0) + 1
                             acct_407 += 1
+                            acct_407_total += 1
                             trace_logs.append(
                                 f"{px_tag(px_used)} -> PROXY 407 {proto} {server}:{port}: "
                                 f"{err_text[:200]} [Classified: proxy_unhealthy]")
@@ -6264,6 +6524,7 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, 
                         except (SmtpAuthError, SieveAuthError) as cnf:
                             err_text = str(cnf)
                             flags["saw_nonproxy"] = True
+                            flags["saw_server"] = True
                             record_proxy_attempt(px_used, success=False, is_network_error=False)
                             trace_logs.append(
                                 f"{px_tag(px_used)} -> CONFIRM {proto} {server}:{port}: "
@@ -6279,6 +6540,7 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, 
                         except (SmtpSoftError, SieveSoftError) as soft:
                             err_text = str(soft)
                             flags["saw_nonproxy"] = True
+                            flags["saw_server"] = True
                             record_proxy_attempt(px_used, success=False, is_network_error=False)
                             trace_logs.append(
                                 f"{px_tag(px_used)} -> INCONCLUSIVE {proto} {server}:{port}: "
@@ -6290,6 +6552,7 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, 
                             err_text = str(ssl_err)
                             st_val = classify_error(ssl_err, domain)
                             flags["saw_nonproxy"] = True
+                            flags["saw_server"] = True
                             if st_val == FAILED:
                                 had_net = True
                                 net_failed_hosts.add(server)
@@ -6342,6 +6605,8 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, 
                             err_text = str(proto_err)
                             st_val = classify_error(proto_err, domain)
                             flags["saw_nonproxy"] = True
+                            # v13.36: a protocol-level error means the host SPOKE.
+                            flags["saw_server"] = True
                             record_proxy_attempt(px_used, success=False, is_network_error=False)
                             trace_logs.append(f"{px_tag(px_used)} -> AUTH {proto} {server}:{port}: {err_text[:140]} [Classified: {st_val}]")
                             note_verdict(st_val, f"{proto} {server}:{port} -> {st_val}", server)
@@ -6351,7 +6616,8 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, 
                                 if xres:
                                     return xres, had_net, saw_retry
                                 if u_idx + 1 < len(users):
-                                    px_used, _ok = _rotate_to_fresh(px_used, seen_px, "local-part retry")
+                                    flags["saw_server"] = True
+                                    px_used, _ok = _rotate_to_fresh(px_used, seen_px, "local-part retry", keep_node=True)
                                     trace_logs.append(f"{px_tag(px_used)} App-password signal as '{user}' -> retrying same host as local-part '{users[u_idx + 1]}'")
                                     continue
                                 if server in domain_local_hosts or not (domain_local_hosts - tried_hosts):
@@ -6371,7 +6637,8 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, 
                                 trace_logs.append(f"{px_tag(px_used)} RBL block on {server}:{port} -> IP flagged by server, advancing")
                                 server_level_fail = True
                             elif u_idx + 1 < len(users) and st_val in (WRONG, UNKNOWN):
-                                px_used, _ok = _rotate_to_fresh(px_used, seen_px, "local-part retry")
+                                flags["saw_server"] = True
+                                px_used, _ok = _rotate_to_fresh(px_used, seen_px, "local-part retry", keep_node=True)
                                 trace_logs.append(f"{px_tag(px_used)} Rejected as '{user}' -> retrying same host as local-part '{users[u_idx + 1]}'")
                                 continue
                             elif st_val == WRONG:
@@ -6402,8 +6669,12 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, 
                                                      is_network_error=True, is_proxy_auth=True)
                                 host_407[server] = host_407.get(server, 0) + 1
                                 acct_407 += 1
+                                acct_407_total += 1
                             else:
                                 flags["saw_nonproxy"] = True
+                                # v13.36: not a proxy-level error => the host was
+                                # reached and answered something.
+                                flags["saw_server"] = True
                             if _is_timeout(e):
                                 had_net = True
                                 net_failed_hosts.add(server)
@@ -6419,7 +6690,8 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, 
                                 if xres:
                                     return xres, had_net, saw_retry
                                 if u_idx + 1 < len(users):
-                                    px_used, _ok = _rotate_to_fresh(px_used, seen_px, "local-part retry")
+                                    flags["saw_server"] = True
+                                    px_used, _ok = _rotate_to_fresh(px_used, seen_px, "local-part retry", keep_node=True)
                                     trace_logs.append(f"{px_tag(px_used)} App-password signal as '{user}' -> retrying same host as local-part '{users[u_idx + 1]}'")
                                     continue
                                 if server in domain_local_hosts or not (domain_local_hosts - tried_hosts):
@@ -6439,7 +6711,8 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, 
                                 trace_logs.append(f"{px_tag(px_used)} RBL block on {server}:{port} -> IP flagged by server, advancing")
                                 server_level_fail = True
                             elif u_idx + 1 < len(users) and st_val in (WRONG, UNKNOWN):
-                                px_used, _ok = _rotate_to_fresh(px_used, seen_px, "local-part retry")
+                                flags["saw_server"] = True
+                                px_used, _ok = _rotate_to_fresh(px_used, seen_px, "local-part retry", keep_node=True)
                                 trace_logs.append(f"{px_tag(px_used)} Rejected as '{user}' -> retrying same host as local-part '{users[u_idx + 1]}'")
                                 continue
                             elif st_val == WRONG:
@@ -6497,10 +6770,11 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, 
                                 f"(host kept, {'407' if proxy_dead else 'net'})")
                             continue
 
-                    if proxy_dead and acct_407 >= PROXY_407_FORCE_DIRECT and (
-                            not can_rotate or _pool_exhausted()):
+                    # v13.36: can_rotate no longer gates the breaker - with a
+                    # provider-wide 407 rotation never helps, it only burns window.
+                    if proxy_dead and acct_407 >= PROXY_407_FORCE_DIRECT:
                         trace_logs.append(
-                            f"407 storm breaker: {acct_407} proxy-auth failure(s) and no fresh node "
+                            f"407 storm breaker: {acct_407} proxy-auth failure(s) in this rung "
                             f"-> bypassing the remaining hosts and going DIRECT.")
                         force_direct["flag"] = True
                         return None, had_net, saw_retry
@@ -6624,18 +6898,35 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, 
         trace_logs.append(
             f"Ladder exhausted with no live answer -> returning retained verdict [{best_verdict['status']}].")
         return None, best_verdict["status"], detail, None, trace_logs
-    if flags["saw_407"] and not flags["saw_nonproxy"]:
+
+    # v13.36: PROXY_UNHEALTHY now requires that the mail host was genuinely
+    # never reached (saw_server False) AND that we actually collected 407s.
+    # The old form (saw_407 and not saw_nonproxy) was unreachable whenever a
+    # single transport blip happened anywhere in the run.
+    if flags["saw_407"] and not flags.get("saw_server") and acct_407_total >= PROXY_407_FORCE_DIRECT:
         trace_logs.append(
-            f"Every attempt died in the PROXY hop ({quarantine_size()} node(s) quarantined) "
-            f"-> the mailbox was never reached, so the password is still untested.")
+            f"Every attempt died in the PROXY hop ({acct_407_total} x 407, "
+            f"{quarantine_size()} node(s) quarantined) -> the mailbox was never "
+            f"reached, so the password is still untested.")
         return None, PROXY_UNHEALTHY, (
-            f"every attempt failed in the proxy hop (407) - "
-            f"{quarantine_size()} node(s) quarantined; fix/replace the proxy pool"
+            f"proxy refused the MAIL ports with 407 on {acct_407_total} attempt(s) - the mail "
+            f"host was never reached; the pool passes the web probe but cannot pass "
+            f"email-server destinations (provider 'email servers' cap)"
         ), None, trace_logs
     if retryable:
         return None, RETRY, "retryable (proxy / IP-block / rate-limit)", None, trace_logs
     if not dns_ok:
         return None, DNS_FAILED, "Fast-fail DNS check failed: no host resolves locally", None, trace_logs
+    # v13.36: the host answered and LOGIN was issued, but the server dropped it.
+    # That is a SERVER-side verdict, not "hosts unreachable".
+    if flags.get("saw_server"):
+        trace_logs.append(
+            "Hosts answered and LOGIN was issued, but every server dropped the "
+            "connection before a verdict -> password still untested.")
+        return None, FAILED, (
+            "mail host reached but the server dropped LOGIN (server-side) - try the "
+            "other protocol/host, or an app password"
+        ), None, trace_logs
     return None, FAILED, "all hosts unreachable (timeouts/refused) - password could not be tested", None, trace_logs
 
 # ============================================================================
@@ -6695,7 +6986,7 @@ if start_engine_btn:
         f"subuser_conc={CFG.get('PROXY_SUBUSER_CONCURRENCY')} "
         f"proxy_conc={CFG.get('PROXY_CONCURRENCY')} "
         f"max_rotations={CFG.get('MAX_ROTATIONS')} check_pass2={CFG.get('CHECK_PASS2')} "
-        f"direct_first={CFG.get('DIRECT_FIRST')}"
+        f"direct_first={CFG.get('DIRECT_FIRST')} mail_spot={CFG.get('MAIL_SPOT_CHECK')}"
     )
 
     resume_lines = []
@@ -6781,6 +7072,14 @@ if start_engine_btn:
             f"PROXY HEALTH BANNER -> loaded={len(all_proxies)} filtered={len(filtered_pool)} "
             f"alive={len(alive_pool)} quarantined={quarantine_size()}"
         )
+        _msr = STATE.get("mail_spot") or {}
+        if _msr.get("auth") and not _msr.get("ok") and _msr.get("n"):
+            str_lit.error(
+                f"🚨 **Mail-destination spot check says the pool cannot reach MAIL ports** — "
+                f"{_msr['auth']}/{_msr['n']} sampled node(s) returned 407 against "
+                f"{_msr['host']}:{_msr['port']}. The run will spend its window on the proxy hop. "
+                f"Set **Proxy Mode Engine = off** (DIRECT) or wait for the provider cap to reset."
+            )
         if all_proxies and not alive_pool:
             str_lit.warning(
                 "⚠ **Proxy health: 0 nodes passed the tunnel probe.** Every account will run DIRECT. "
@@ -7341,7 +7640,7 @@ else:
                         for srv in imap_hosts:
                             msgs = read_mailbox_messages(acc_email, acc_pass, srv, proxy_str=mailbox_proxy, limit=max_msgs)
                             if msgs and not any("Error reading mailbox" in m for m in msgs):
-                                fetched_msgs, success_read = msgs, True
+                                fetched_msgs, success_msgs = msgs, True
                                 break
                             elif msgs:
                                 fetched_msgs = msgs
