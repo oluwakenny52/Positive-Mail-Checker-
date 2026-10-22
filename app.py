@@ -9,7 +9,7 @@ v13.37 changes  (THE 407 THAT WAS STILL FILED AS A TRANSPORT FAILURE, AND THE
                  POOL THAT EMPTIED ITSELF)
 ---------------------------------------------------------------------------
 * tunnel_probe() CLASSIFIES A 407 AS A 407 AGAIN.  v13.36 removed the
-  speculative scheme promotion but KEPT `if ptype == preferred:` on the
+  speculative scheme promotion but KEPT if ptype == preferred: on the
   classification, so a 407 arriving on the NON-preferred scheme was filed as
   'dead'/'transport' - no strike, no park, no quarantine, no storm-breaker
   count, and the verdict fell through to 'all hosts unreachable'.  ANY scheme
@@ -17,14 +17,14 @@ v13.37 changes  (THE 407 THAT WAS STILL FILED AS A TRANSPORT FAILURE, AND THE
   scheme memory is still driven by an actual SUCCESS only.
 
 * tunnel_probe() TRIES THE ALTERNATE SCHEME AFTER ANY FAILURE.  The v13.33 gate
-  `if _s_idx and not _second_scheme and not auth_schemes: break` binned an
+  if _s_idx and not _second_scheme and not auth_schemes: break binned an
   HTTP-only node whenever its SOCKS5 port died first (and vice versa).  The gate
   is now driven by the OUTCOME: a PASS stops (one CONNECT per probe, as
   intended), a FAILURE always tries the other scheme.  PROBE_SECOND_SCHEME is
   now only an extra confirmation pass on an already-passing node.
 
 * try_ms_xoauth2 NO LONGER SWALLOWS THE 407.  It ended in a bare
-  `except Exception`, so a ProxyAuthError raised through
+  except Exception, so a ProxyAuthError raised through
   imap_xoauth2_once -> ProxyIMAP4SSL -> proxy_connect vanished: saw_407 stayed
   False, acct_407_total stayed 0, the 407 storm breaker could never fire, and a
   407'd Microsoft account was reported as 'hosts unreachable'.  It now has an
@@ -37,7 +37,7 @@ v13.37 changes  (THE 407 THAT WAS STILL FILED AS A TRANSPORT FAILURE, AND THE
   that never resolved was therefore reported as 'server dropped LOGIN'.
 
 * THE FILTER NO LONGER FALLS BACK TO THE RAW LIST.  get_filtered_active_proxies
-  ended with `return filtered if filtered else raw`, silently discarding
+  ended with return filtered if filtered else raw, silently discarding
   MIN_PROXY_SCORE, POOL_MODE, ALLOW_BLACKLIST_IPS and the circuit breaker.  It
   returns the (possibly empty) filtered list and says so loudly.
 
@@ -84,7 +84,7 @@ v13.37 changes  (THE 407 THAT WAS STILL FILED AS A TRANSPORT FAILURE, AND THE
 v13.36 changes  (THE 407 THAT WAS FILED AS A TRANSPORT FAILURE)
 --------------------------------------------------------------
 THE BUG.  ~200 attempts across three exported traces contain not one
-`PROXY 407` line and not one `[Classified: proxy_unhealthy]`.  Every single one
+PROXY 407 line and not one [Classified: proxy_unhealthy].  Every single one
 reads:
 
     -> PROXY TRANSPORT IMAP imap.windstream.net:993: Proxy tunnel transport
@@ -153,7 +153,7 @@ host and the result is surfaced as a loud sidebar banner: "pool OK for web /
 v13.35 changes  (THE "Importing a module script failed." PANIC, THE DEAD RESET
                  BUTTON, AND THE LAG)
 -----------------------------------------------------------------------------
-* `TypeError: Importing a module script failed.` IS NOT A PYTHON ERROR.
+* TypeError: Importing a module script failed. IS NOT A PYTHON ERROR.
   That exact string is what Safari / iOS WebView throws when a DYNAMICALLY
   IMPORTED JAVASCRIPT CHUNK fails to load.  Streamlit 1.66's frontend lazy-loads
   chunks whose filenames contain a content hash; a redeploy changes every hash,
@@ -189,11 +189,11 @@ v13.35 changes  (THE "Importing a module script failed." PANIC, THE DEAD RESET
 
 * THE UI NO LONGER FREEZES ON LOAD.  The first-load pool probe ran SYNCHRONOUSLY
   in the sidebar before the main body rendered, then sat in a
-  `while probe_in_flight: sleep(0.25)` loop for up to 130s.  Now it is a
+  while probe_in_flight: sleep(0.25) loop for up to 130s.  Now it is a
   background thread and the page renders immediately; Start waits for it
   properly instead of racing it.
 
-* PROBE BATCH BUDGET IS NOW A REAL CEILING.  `with ThreadPoolExecutor(...)`
+* PROBE BATCH BUDGET IS NOW A REAL CEILING.  with ThreadPoolExecutor(...)
   calls shutdown(wait=True) on exit, so a budget "timeout" did not actually
   return - it waited for every straggler.  New _run_batch() collects what
   finished inside the budget and leaves the rest to the daemon workers.
@@ -294,7 +294,7 @@ v13.32 changes  (THE IMAP CRASH, THE DOUBLE BASE64, THE 407 FLOOD, THE HANG)
 * FATAL BUG FIXED - EVERY IMAP ATTEMPT CRASHED IN v13.31.
   imaplib.IMAP4._get_capabilities() does
       dat = str(dat[-1], self._encoding); self.capabilities = tuple(dat.split())
-  so `mail.capabilities` is a tuple of **str**, not bytes.  v13.31 did
+  so mail.capabilities is a tuple of **str**, not bytes.  v13.31 did
   b" ".join(mail.capabilities), which raises
       TypeError: sequence item 0: expected a bytes-like object, str found
   on the FIRST line of _imap_wants_plain(), i.e. before any auth, on EVERY IMAP
@@ -313,7 +313,7 @@ v13.32 changes  (THE IMAP CRASH, THE DOUBLE BASE64, THE 407 FLOOD, THE HANG)
   (ms_oauth.py always did this correctly - which is why XOAUTH2 worked.)
 
 * NO MORE PER-ATTEMPT CAPABILITY ROUND TRIP.
-  The v13.31 guard was `if joined in (b"", b"IMAP4REV1")` - comparing a bytes
+  The v13.31 guard was if joined in (b"", b"IMAP4REV1") - comparing a bytes
   literal against str data - so it was ALWAYS false and always issued an extra
   mail.capability() network round trip through the proxy, on every attempt.
   _imap_caps() reads the already-populated attribute, so it is free.
@@ -1151,7 +1151,7 @@ class MsVerdict(Exception):
     verify_and_connect instead of being discarded and re-tested as basic auth.
 
     ms_oauth raises MsTokenRejected with verdict 'wrong_password' (AADSTS50126)
-    or 'need_app_password' (AADSTS50076/50079).  The old `except ...: pass` threw
+    or 'need_app_password' (AADSTS50076/50079).  The old except ...: pass threw
     that away, so a known-wrong Microsoft password fell through to IMAP basic
     auth and came back as NEED_APP_PASSWORD.
     """
@@ -1401,7 +1401,7 @@ def probe_workers(bulk: bool = False) -> int:
 def _estimated_rung_count():
     """v13.37: how many rungs a typical account will actually dial.
 
-    Replaces the hardcoded `rungs = 8`, which under-counted an all-protocol run
+    Replaces the hardcoded rungs = 8, which under-counted an all-protocol run
     and over-counted an IMAP-only one, so the sidebar budget readout lied.
     """
     try:
@@ -1502,7 +1502,7 @@ def _env_info():
 def _imap_caps_selftest():
     """v13.32 regression check: the exact v13.31 crash, on a fake connection.
 
-    imaplib gives `capabilities` as a tuple of STR (and `capability()` as a list
+    imaplib gives capabilities as a tuple of STR (and capability() as a list
     of BYTES).  Both shapes must survive, and neither may raise.
     """
     class _Fake:
