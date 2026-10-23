@@ -3018,7 +3018,10 @@ def build_cfg():
         "PROXY_MODE": resolved_proxy_mode if use_proxy else "off",
         "RETRY_CONNECTION_FAILED": 1 if retry_cf else 0,
         "ALLOW_SELF_SIGNED": self_signed,
-        "TLS_STRICT": False,
+                # v13.39: unticking "Allow Self-Signed" now means STRICT - no silent
+                # fallback to unverified.  Leave default_cfg()["TLS_STRICT"] = False so the
+                # reset target stays consistent with ALLOW_SELF_SIGNED = True.
+                "TLS_STRICT": not self_signed,
         "TRY_STARTTLS": try_starttls_ui,
         "TRY_ALT_USERNAME": try_alt_username_ui,
         "CONFIRM_WRONG_ACROSS_HOSTS": confirm_wrong_ui,
@@ -3118,7 +3121,7 @@ CFG = str_lit.session_state.applied_cfg
 for _k, _v in (
     ("ALLOW_SELF_SIGNED", True), ("TLS_STRICT", False), ("TRY_STARTTLS", True),
     ("TRY_ALT_USERNAME", True), ("CONFIRM_WRONG_ACROSS_HOSTS", True),
-    ("MAX_HOSTS_PER_DOMAIN", 3), ("TIMEOUT", ATTEMPT_TIMEOUT_NORMAL),
+        ("MAX_HOSTS_PER_DOMAIN", 3), ("TIMEOUT", ATTEMPT_TIMEOUT_NORMAL),
     ("ACCOUNT_DEADLINE", DEADLINE_NORMAL), ("PROXY_CONNECT_TIMEOUT", 8.0),
     ("FAILURE_COOLDOWN", FAILURE_COOLDOWN_DEFAULT),
     ("FAST_MODE", False), ("BLACKLIST_CF", BLACKLIST_CF_DEFAULT), ("DEBUG", False),
@@ -3466,15 +3469,31 @@ def _raw_socket(host, port, proxy_str=None, timeout=None):
     s.settimeout(read_to)
     return s
 
-def tls_connect(host, port, proxy_str=None, insecure=True, timeout=None):
-    if insecure or CFG.get("ALLOW_SELF_SIGNED", True):
-        return _tls_context(host, False).wrap_socket(_raw_socket(host, port, proxy_str, timeout), server_hostname=host)
-    raw = _raw_socket(host, port, proxy_str, timeout)
-    try:
-        return _tls_context(host, True).wrap_socket(raw, server_hostname=host)
-    except ssl.SSLError as e:
-        warnings.warn(f"Verified TLS failed for {host} ({e!r}); retrying unverified on a FRESH socket")
-        return _tls_context(host, False).wrap_socket(_raw_socket(host, port, proxy_str, timeout), server_hostname=host)
+def tls_connect(host, port, proxy_str=None, insecure=None, timeout=None):
+            """v13.39: ALLOW_SELF_SIGNED is now a REAL switch, and TLS_STRICT is read.
+        
+            Before: `insecure=True` (the default) short-circuited straight to an
+            unverified context, so verification was never attempted at all; and the
+            verified branch silently fell back to unverified on ANY SSLError, so the
+            switch could only ever cost a handshake - it could never reject a bad cert.
+            TLS_STRICT was hardcoded False and read by nobody.
+            """
+            if insecure is None:
+                insecure = bool(CFG.get("ALLOW_SELF_SIGNED", True))
+            if insecure:
+                return _tls_context(host, False).wrap_socket(
+                    _raw_socket(host, port, proxy_str, timeout), server_hostname=host)
+        
+            raw = _raw_socket(host, port, proxy_str, timeout)
+            try:
+                return _tls_context(host, True).wrap_socket(raw, server_hostname=host)
+            except ssl.SSLError as e:
+                if CFG.get("TLS_STRICT", False):
+                    warnings.warn(f"Verified TLS failed for {host} ({e!r}); TLS_STRICT is ON so NOT falling back")
+                    raise
+                warnings.warn(f"Verified TLS failed for {host} ({e!r}); retrying unverified on a FRESH socket")
+                return _tls_context(host, False).wrap_socket(
+                    _raw_socket(host, port, proxy_str, timeout), server_hostname=host)
 
 def px_tag(proxy_str):
     if not proxy_str or proxy_str == "direct":
@@ -3493,7 +3512,7 @@ def px_tag(proxy_str):
 # ============================================================================
 
 class ProxyIMAP4SSL(imaplib.IMAP4_SSL):
-    def __init__(self, host, port=993, timeout=None, proxy_str=None, insecure=True):
+        def __init__(self, host, port=993, timeout=None, proxy_str=None, insecure=None):
         self._proxy_str = proxy_str
         self._insecure = insecure
         super().__init__(host, port, timeout=timeout)
@@ -3510,7 +3529,7 @@ class ProxyIMAP4(imaplib.IMAP4):
         return _raw_socket(self.host, self.port, self._proxy_str, timeout)
 
 class ProxyPOP3SSL(poplib.POP3_SSL):
-    def __init__(self, host, port=995, timeout=None, proxy_str=None, insecure=True):
+        def __init__(self, host, port=995, timeout=None, proxy_str=None, insecure=None):
         self._proxy_str = proxy_str
         self._insecure = insecure
         super().__init__(host, port, timeout=timeout)
@@ -5915,8 +5934,9 @@ def verify_and_connect(target_email, target_pass, hosts, proxy_str=None):
         if MS_OAUTH_OK and h.lower() in ms_oauth.MS_IMAP_HOSTS:
             try:
                 mail, _exists, _claims = ms_oauth.imap_xoauth2_open(
-                    target_email, target_pass, h, ProxyIMAP4SSL,
-                    port=993, proxy_str=proxy_str, insecure=True, attempt_timeout=15)
+                                        target_email, target_pass, h, ProxyIMAP4SSL,
+                                        port=993, proxy_str=proxy_str,
+                                        insecure=bool(CFG.get("ALLOW_SELF_SIGNED", True)), attempt_timeout=15)
                 return True, mail, h
             except ms_oauth.MsTokenRejected as tr:
                 if tr.verdict in ("wrong_password", "need_app_password"):
@@ -5930,11 +5950,12 @@ def verify_and_connect(target_email, target_pass, hosts, proxy_str=None):
             for user in users:
                 mail = None
                 try:
-                    if mode == "ssl":
-                        mail = ProxyIMAP4SSL(h, port, timeout=10, proxy_str=proxy_str, insecure=True)
-                    elif mode == "starttls":
-                        mail = ProxyIMAP4(h, port, timeout=10, proxy_str=proxy_str)
-                        mail.starttls(ssl_context=_tls_context(h, False))
+                    _ins = bool(CFG.get("ALLOW_SELF_SIGNED", True))
+                                        if mode == "ssl":
+                                            mail = ProxyIMAP4SSL(h, port, timeout=10, proxy_str=proxy_str, insecure=_ins)
+                                        elif mode == "starttls":
+                                            mail = ProxyIMAP4(h, port, timeout=10, proxy_str=proxy_str)
+                                            mail.starttls(ssl_context=_tls_context(h, verify=not _ins))
                     else:
                         mail = ProxyIMAP4(h, port, timeout=10, proxy_str=proxy_str)
                     _imap_auth(mail, user, target_pass)
@@ -6061,23 +6082,23 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, 
         primary_user = users[0]
 
         def note_verdict(st_val, detail, host="", force=False):
-            # FIX v13.38: LOGIN_DROPPED is a real server answer, not noise.
-            # FIX v13.39: UNKNOWN is retained too, so the tail's FAILED / RETRY /
-            # DNS / PROXY_UNHEALTHY branches are reached only when NOTHING ever
-            # answered - which is what those branches actually mean.
-            if st_val not in (VALID, WRONG, APP, RBL, LOGIN_DROPPED, UNKNOWN):
-                return
-            cur = best_verdict["status"]
-            # v13.39: force=True is for a DEFINITIVE answer that must not be
-            # suppressed by an earlier, vaguer one.  Microsoft XOAUTH2 AADSTS50126
-            # is definitive; an IMAP "basic authentication is disabled" (APP,
-            # priority 1) must not outrank it (WRONG, priority 2) - which is how a
-            # known-wrong Microsoft password was reported as NEED_APP_PASSWORD.
-            if force or cur is None or ST_PRIORITY.get(st_val, 99) < ST_PRIORITY.get(cur, 99):
-                best_verdict["status"] = st_val
-                best_verdict["detail"] = detail
-                best_verdict["host"] = host or ""
-                trace_logs.append(f"Verdict retained for this account: [{st_val}] ({detail})")
+                            # FIX v13.38: LOGIN_DROPPED is a real server answer, not noise.
+                            # FIX v13.39: UNKNOWN is retained too, so the tail's FAILED / RETRY /
+                            # DNS / PROXY_UNHEALTHY branches are reached only when NOTHING ever
+                            # answered - which is what those branches actually mean.
+                            if st_val not in (VALID, WRONG, APP, RBL, LOGIN_DROPPED, UNKNOWN):
+                                return
+                            cur = best_verdict["status"]
+                            # v13.39: force=True is for a DEFINITIVE answer that must not be
+                            # suppressed by an earlier, vaguer one.  Microsoft XOAUTH2 AADSTS50126
+                            # is definitive; an IMAP "basic authentication is disabled" (APP,
+                            # priority 1) must not outrank it (WRONG, priority 2) - which is how a
+                            # known-wrong Microsoft password was reported as NEED_APP_PASSWORD.
+                            if force or cur is None or ST_PRIORITY.get(st_val, 99) < ST_PRIORITY.get(cur, 99):
+                                best_verdict["status"] = st_val
+                                best_verdict["detail"] = detail
+                                best_verdict["host"] = host or ""
+                                trace_logs.append(f"Verdict retained for this account: [{st_val}] ({detail})")
 
         px = None
         if proxy_pool and proxy_mode != "off":
@@ -6146,16 +6167,16 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, 
         domain_local_hosts = {h for h in (imap_hosts + pop_hosts + _smtp_hosts) if _is_local_host(h)}
 
         tried_hosts = set()
-        # v13.39: hosts that have already answered WRONG / NEED_APP_PASSWORD.  A
-        # verdict from ONE host is PROVISIONAL until a second independent host
-        # agrees (or nothing local is left to dial).  Sets are mutable, so sweep()
-        # can .add() to them without a nonlocal declaration.
-        wrong_hosts = set()
-        app_hosts = set()
-        # v13.39 GUARD: the sidebar switch, default ON.
-        confirm_wrong = bool(CFG.get("CONFIRM_WRONG_ACROSS_HOSTS", True))
-
-        trace_logs.append(
+                # v13.39: hosts that have already answered WRONG / NEED_APP_PASSWORD.  A
+                # verdict from ONE host is PROVISIONAL until a second independent host
+                # agrees (or nothing local is left to dial).  Sets are mutable, so sweep()
+                # can .add() to them without a nonlocal declaration.
+                wrong_hosts = set()
+                app_hosts = set()
+                # v13.39 GUARD: the sidebar switch, default ON.
+                confirm_wrong = bool(CFG.get("CONFIRM_WRONG_ACROSS_HOSTS", True))
+        
+                trace_logs.append(
             f"Protocols selected -> {' + '.join(active_protocols())} "
             f"(SMTP/ManageSieve are CONFIRM-ONLY: a failure never lowers a verdict).")
         trace_logs.append(f"Host order -> IMAP {imap_hosts} | POP {pop_hosts} | SMTP {_smtp_hosts}")
@@ -6350,13 +6371,13 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, 
                     f"{err_text[:200]} [Classified: proxy_unhealthy]")
                 return None
             except ms_oauth.MsTokenRejected as tr:
-                if tr.verdict == "wrong_password":
-                    # force=True: AADSTS50126 is definitive.  Without it the IMAP
-                    # rung's APP (priority 1) suppressed this WRONG (priority 2).
-                    note_verdict(WRONG, f"XOAUTH2 token {tr.code} -> wrong password", server, force=True)
-                    trace_logs.append(f"{px_tag(px_used)} XOAUTH2 token rejected [{tr.code}] -> wrong password (definitive)")
-                elif tr.verdict == "need_app_password":
-                    note_verdict(APP, f"XOAUTH2 token {tr.code} -> MFA, app password required", server, force=True)
+                                    if tr.verdict == "wrong_password":
+                                        # force=True: AADSTS50126 is definitive.  Without it the IMAP
+                                        # rung's APP (priority 1) suppressed this WRONG (priority 2).
+                                        note_verdict(WRONG, f"XOAUTH2 token {tr.code} -> wrong password", server, force=True)
+                                        trace_logs.append(f"{px_tag(px_used)} XOAUTH2 token rejected [{tr.code}] -> wrong password (definitive)")
+                                    elif tr.verdict == "need_app_password":
+                                        note_verdict(APP, f"XOAUTH2 token {tr.code} -> MFA, app password required", server, force=True)
                     trace_logs.append(f"{px_tag(px_used)} XOAUTH2 token rejected [{tr.code}] -> MFA, app password required")
                 else:
                     trace_logs.append(f"{px_tag(px_used)} XOAUTH2 token rejected [{tr.code}] -> no verdict change")
@@ -6598,21 +6619,21 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, 
                                     trace_logs.append(f"{px_tag(px_used)} App-password signal as '{user}' -> retrying same host as local-part '{users[u_idx + 1]}'")
                                     continue
                                 app_hosts.add(server)
-                                _untried_local = [h for h in domain_local_hosts if h not in tried_hosts]
-                                _confirmed = (len(app_hosts) >= 2) or (not _untried_local)
-                                if (not confirm_wrong) or _confirmed:
-                                    # A definitive XOAUTH2 WRONG outranks a basic-auth
-                                    # "app password" signal - return the stronger one.
-                                    if best_verdict["status"] == WRONG:
-                                        return (None, WRONG,
-                                                best_verdict["detail"] + _wrong_detail_note(domain, password),
-                                                px_used, trace_logs), had_net, saw_retry
-                                    return (None, APP, f"{px_tag(px_used)} {proto} {server} -> {st_val}", px_used, trace_logs), had_net, saw_retry
-                                trace_logs.append(
-                                    f"{px_tag(px_used)} APP on {server} -> PROVISIONAL "
-                                    f"({len(app_hosts)} host(s) agreed, {len(_untried_local)} local host(s) "
-                                    f"still untried) -> continuing")
-                                server_level_fail = True
+                                                                _untried_local = [h for h in domain_local_hosts if h not in tried_hosts]
+                                                                _confirmed = (len(app_hosts) >= 2) or (not _untried_local)
+                                                                if (not confirm_wrong) or _confirmed:
+                                                                    # A definitive XOAUTH2 WRONG outranks a basic-auth
+                                                                    # "app password" signal - return the stronger one.
+                                                                    if best_verdict["status"] == WRONG:
+                                                                        return (None, WRONG,
+                                                                                best_verdict["detail"] + _wrong_detail_note(domain, password),
+                                                                                px_used, trace_logs), had_net, saw_retry
+                                                                    return (None, APP, f"{px_tag(px_used)} {proto} {server} -> {st_val}", px_used, trace_logs), had_net, saw_retry
+                                                                trace_logs.append(
+                                                                    f"{px_tag(px_used)} APP on {server} -> PROVISIONAL "
+                                                                    f"({len(app_hosts)} host(s) agreed, {len(_untried_local)} local host(s) "
+                                                                    f"still untried) -> continuing")
+                                                                server_level_fail = True
                             elif st_val == RETRY:
                                 saw_retry = True
                                 server_level_fail = True
@@ -6632,29 +6653,29 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, 
                                 trace_logs.append(f"{px_tag(px_used)} Rejected as '{user}' -> retrying same host as local-part '{users[u_idx + 1]}'")
                                 continue
                             elif st_val == WRONG:
-                                # v13.39 PROVISIONAL VERDICT.
-                                # The old guard read best_verdict AFTER note_verdict had
-                                # already written WRONG into it, so `better` was 2 < 2 =
-                                # False for ever, and `server in domain_local_hosts` is
-                                # true on rung 1 for essentially every domain.  One
-                                # AUTHENTICATIONFAILED therefore ended the whole ladder:
-                                # POP3, the sibling hosts, 143/110 and the DIRECT phase
-                                # were never dialled and a good combo was reported wrong.
-                                wrong_hosts.add(server)
-                                _untried_local = [h for h in domain_local_hosts if h not in tried_hosts]
-                                _confirmed = (len(wrong_hosts) >= 2) or (not _untried_local)
-
-                                if (not confirm_wrong) or _confirmed:
-                                    return (None, WRONG,
-                                            f"{px_tag(px_used)} {proto} {server} -> {st_val}" + _wrong_detail_note(domain, password),
-                                            px_used, trace_logs), had_net, saw_retry
-
-                                trace_logs.append(
-                                    f"{px_tag(px_used)} WRONG on {server} -> PROVISIONAL "
-                                    f"({len(wrong_hosts)} host(s) agreed, {len(_untried_local)} local host(s) "
-                                    f"still untried) -> continuing the ladder")
-                                server_level_fail = True
-                                rotate_now = False      # a WRONG is a mail answer, not a proxy one
+                                                                # v13.39 PROVISIONAL VERDICT.
+                                                                # The old guard read best_verdict AFTER note_verdict had
+                                                                # already written WRONG into it, so `better` was 2 < 2 =
+                                                                # False for ever, and `server in domain_local_hosts` is
+                                                                # true on rung 1 for essentially every domain.  One
+                                                                # AUTHENTICATIONFAILED therefore ended the whole ladder:
+                                                                # POP3, the sibling hosts, 143/110 and the DIRECT phase
+                                                                # were never dialled and a good combo was reported wrong.
+                                                                wrong_hosts.add(server)
+                                                                _untried_local = [h for h in domain_local_hosts if h not in tried_hosts]
+                                                                _confirmed = (len(wrong_hosts) >= 2) or (not _untried_local)
+                                
+                                                                if (not confirm_wrong) or _confirmed:
+                                                                    return (None, WRONG,
+                                                                            f"{px_tag(px_used)} {proto} {server} -> {st_val}" + _wrong_detail_note(domain, password),
+                                                                            px_used, trace_logs), had_net, saw_retry
+                                
+                                                                trace_logs.append(
+                                                                    f"{px_tag(px_used)} WRONG on {server} -> PROVISIONAL "
+                                                                    f"({len(wrong_hosts)} host(s) agreed, {len(_untried_local)} local host(s) "
+                                                                    f"still untried) -> continuing the ladder")
+                                                                server_level_fail = True
+                                                                rotate_now = False      # a WRONG is a mail answer, not a proxy one
                             # FIX v13.38: do NOT return early on a * BYE - POP3,
                             # the other hosts and the fallback rungs still get
                             # their turn.  A clean NO elsewhere outranks it.
@@ -6721,22 +6742,22 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, 
                                     px_used, _ok = _rotate_to_fresh(px_used, seen_px, "local-part retry", keep_node=True)
                                     trace_logs.append(f"{px_tag(px_used)} App-password signal as '{user}' -> retrying same host as local-part '{users[u_idx + 1]}'")
                                     continue
-                                app_hosts.add(server)
-                                _untried_local = [h for h in domain_local_hosts if h not in tried_hosts]
-                                _confirmed = (len(app_hosts) >= 2) or (not _untried_local)
-                                if (not confirm_wrong) or _confirmed:
-                                    # A definitive XOAUTH2 WRONG outranks a basic-auth
-                                    # "app password" signal - return the stronger one.
-                                    if best_verdict["status"] == WRONG:
-                                        return (None, WRONG,
-                                                best_verdict["detail"] + _wrong_detail_note(domain, password),
-                                                px_used, trace_logs), had_net, saw_retry
-                                    return (None, APP, f"{px_tag(px_used)} {proto} {server} -> {st_val}", px_used, trace_logs), had_net, saw_retry
-                                trace_logs.append(
-                                    f"{px_tag(px_used)} APP on {server} -> PROVISIONAL "
-                                    f"({len(app_hosts)} host(s) agreed, {len(_untried_local)} local host(s) "
-                                    f"still untried) -> continuing")
-                                server_level_fail = True
+                                ifapp_hosts.add(server)
+                                                                _untried_local = [h for h in domain_local_hosts if h not in tried_hosts]
+                                                                _confirmed = (len(app_hosts) >= 2) or (not _untried_local)
+                                                                if (not confirm_wrong) or _confirmed:
+                                                                    # A definitive XOAUTH2 WRONG outranks a basic-auth
+                                                                    # "app password" signal - return the stronger one.
+                                                                    if best_verdict["status"] == WRONG:
+                                                                        return (None, WRONG,
+                                                                                best_verdict["detail"] + _wrong_detail_note(domain, password),
+                                                                                px_used, trace_logs), had_net, saw_retry
+                                                                    return (None, APP, f"{px_tag(px_used)} {proto} {server} -> {st_val}", px_used, trace_logs), had_net, saw_retry
+                                                                trace_logs.append(
+                                                                    f"{px_tag(px_used)} APP on {server} -> PROVISIONAL "
+                                                                    f"({len(app_hosts)} host(s) agreed, {len(_untried_local)} local host(s) "
+                                                                    f"still untried) -> continuing")
+                                                                server_level_fail = True
                             elif st_val == RETRY:
                                 saw_retry = True
                                 server_level_fail = True
@@ -6755,29 +6776,29 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, 
                                 trace_logs.append(f"{px_tag(px_used)} Rejected as '{user}' -> retrying same host as local-part '{users[u_idx + 1]}'")
                                 continue
                             elif st_val == WRONG:
-                                # v13.39 PROVISIONAL VERDICT.
-                                # The old guard read best_verdict AFTER note_verdict had
-                                # already written WRONG into it, so `better` was 2 < 2 =
-                                # False for ever, and `server in domain_local_hosts` is
-                                # true on rung 1 for essentially every domain.  One
-                                # AUTHENTICATIONFAILED therefore ended the whole ladder:
-                                # POP3, the sibling hosts, 143/110 and the DIRECT phase
-                                # were never dialled and a good combo was reported wrong.
-                                wrong_hosts.add(server)
-                                _untried_local = [h for h in domain_local_hosts if h not in tried_hosts]
-                                _confirmed = (len(wrong_hosts) >= 2) or (not _untried_local)
-
-                                if (not confirm_wrong) or _confirmed:
-                                    return (None, WRONG,
-                                            f"{px_tag(px_used)} {proto} {server} -> {st_val}" + _wrong_detail_note(domain, password),
-                                            px_used, trace_logs), had_net, saw_retry
-
-                                trace_logs.append(
-                                    f"{px_tag(px_used)} WRONG on {server} -> PROVISIONAL "
-                                    f"({len(wrong_hosts)} host(s) agreed, {len(_untried_local)} local host(s) "
-                                    f"still untried) -> continuing the ladder")
-                                server_level_fail = True
-                                rotate_now = False      # a WRONG is a mail answer, not a proxy one
+                                                                # v13.39 PROVISIONAL VERDICT.
+                                                                # The old guard read best_verdict AFTER note_verdict had
+                                                                # already written WRONG into it, so `better` was 2 < 2 =
+                                                                # False for ever, and `server in domain_local_hosts` is
+                                                                # true on rung 1 for essentially every domain.  One
+                                                                # AUTHENTICATIONFAILED therefore ended the whole ladder:
+                                                                # POP3, the sibling hosts, 143/110 and the DIRECT phase
+                                                                # were never dialled and a good combo was reported wrong.
+                                                                wrong_hosts.add(server)
+                                                                _untried_local = [h for h in domain_local_hosts if h not in tried_hosts]
+                                                                _confirmed = (len(wrong_hosts) >= 2) or (not _untried_local)
+                                
+                                                                if (not confirm_wrong) or _confirmed:
+                                                                    return (None, WRONG,
+                                                                            f"{px_tag(px_used)} {proto} {server} -> {st_val}" + _wrong_detail_note(domain, password),
+                                                                            px_used, trace_logs), had_net, saw_retry
+                                
+                                                                trace_logs.append(
+                                                                    f"{px_tag(px_used)} WRONG on {server} -> PROVISIONAL "
+                                                                    f"({len(wrong_hosts)} host(s) agreed, {len(_untried_local)} local host(s) "
+                                                                    f"still untried) -> continuing the ladder")
+                                                                server_level_fail = True
+                                                                rotate_now = False      # a WRONG is a mail answer, not a proxy one
                             # FIX v13.38
                             elif st_val == LOGIN_DROPPED:
                                 server_level_fail = True
