@@ -163,7 +163,7 @@ def stray_lines(path, code_src):
 
 
 def seam_is_intact(app):
-    pat = (r"run_completion_status\s*\n"
+    pat = (r"run_completion_status[^\n]*\n"
            r"(?:\s*(?:#[^\n]*)?\n)*"
            r"\s*start_dt = datetime\.now\(\)")
     if re.search(pat, app):
