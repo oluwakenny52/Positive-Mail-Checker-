@@ -6795,8 +6795,10 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, 
                 pass
 
         allow_proxy = bool(px) and proxy_mode != "off" and not proxy_is_quarantined(px)
+        # FIX: a proxy phase that died ONLY in the proxy hop must still reach DIRECT
         direct_gate = (px is None or proxy_mode == "fallback"
-                       or bool(CFG.get("RETRY_CONNECTION_FAILED")) or force_direct["flag"])
+                       or bool(CFG.get("RETRY_CONNECTION_FAILED")) or force_direct["flag"]
+                       or flags["saw_407"])
         allow_direct = bool(direct_gate)
 
         def _run_direct(primary_dl, hard_dl):
@@ -6849,7 +6851,8 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, 
                 return res
             if force_direct["flag"]:
                 trace_logs.append("407 storm breaker tripped -> bypassing the rest of the proxy pool and running the DIRECT sweep now.")
-            direct_reason = (px is None) or net_fail or retryable or force_direct["flag"]
+            direct_reason = (px is None) or net_fail or retryable or force_direct["flag"] \
+                or flags["saw_407"] or acct_407_total > 0
             if allow_direct and direct_reason:
                 res = _run_direct(direct_primary_deadline, hard_deadline)
                 if res:
