@@ -1,5 +1,18 @@
 """
+Mega Ultimate Mail Checker — v13.38
+===================================
+Full version history lives in CHANGELOG.md — it was extracted out of this
+docstring in v13.38 so the top of app.py is readable at a glance.
 
+v13.38 headline: a mail server that ANSWERS, ACCEPTS the LOGIN command and
+then closes the socket (* BYE) is now its own status (LOGIN_DROPPED), with
+its own bucket, instead of being classified UNKNOWN and reported as
+CONNECTION_FAILED — i.e. "we never reached the server" when it spoke.
+
+Also: real phase deadlines, a shorter leash on 143/110, POP3 on by default.
+
+NO hardcoded proxy IPs and NO faked geo table. Everything is derived from
+proxies.txt / Streamlit secrets / live DNS / live ip-api.
 """
 
 import streamlit as str_lit
