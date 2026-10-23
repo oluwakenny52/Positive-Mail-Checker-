@@ -226,7 +226,7 @@ def main():
         stray_lines(app_path, app_code)
         seam_is_intact(app)
 
-        has(app, "Mega Ultimate Mail Checker — v13.37", "app.py header is v13.37")
+        has(app, "Mega Ultimate Mail Checker — v13.38", "app.py header is v13.38")
 
         # ---- P0: 407 classification, swallowed XOAUTH2 407, clean_valid merge --
         has(app, 'out["reason"] = "auth"', "P0 post-loop auth override present")
@@ -283,7 +283,7 @@ def main():
         has(app, "def clear_tunnel_cache(", "clear_tunnel_cache kept")
         has(app, "def _guess_candidates(", "_guess_candidates kept")
         has(app, "HOSTS_HAS_RANKING", "HOSTS_HAS_RANKING kept")
-        has(app, "CFG_VERSION = 1337", "CFG_VERSION is 1337")
+        has(app, "CFG_VERSION = 1338", "CFG_VERSION is 1338")
 
     if req:
         if "pandas==2.2.3" in req:
