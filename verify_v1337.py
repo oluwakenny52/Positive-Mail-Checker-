@@ -242,6 +242,16 @@ def main():
 
         # ---- P1 ----
         has(app, 'if "Fast-fail DNS check" not in err_text:',
+            # ---- P0-v13.39: a WRONG must be confirmed before it ends the ladder ----
+        has(app, "wrong_hosts.add(server)", "P0 provisional WRONG tracking present")
+        has(app, "if (not confirm_wrong) or _confirmed:",
+            "P0 WRONG early-return is gated on confirmation")
+        has(app, "app_hosts.add(server)", "P0 provisional APP tracking present")
+        has(app, "CONFIRM_WRONG_ACROSS_HOSTS", "P0 guard flag wired")
+        has(app, "note_verdict(st_val, detail, host=\"\", force=False)",
+            "P0 note_verdict has a force path")
+        has(app, "if st_val not in (VALID, WRONG, APP, RBL, LOGIN_DROPPED, UNKNOWN):",
+            "P0 UNKNOWN is retained")
             "P1 local DNS RuntimeError no longer sets saw_server")
         has(app, "def _resolve_cached(", "P1 shared DNS TTL cache present")
         has(app, "return _resolve_cached(host) is not None",
