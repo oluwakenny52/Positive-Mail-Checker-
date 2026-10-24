@@ -6268,7 +6268,7 @@ def _check_account_core(email, password, conf, domain, proxy_pool, thread_state,
                     trace_logs.append(f"{px_tag(px_used)} App-password signal as '{user}' -> retrying same host as local-part '{users[u_idx + 1]}'")
                     return None, had_net, saw_retry, "retry_user"
                 app_hosts.add(server)
-                _untried_local = [h for h in _dialable_local if h not in tried_hosts]
+                _untried_local = [h for h in domain_local_hosts if h not in tried_hosts]
                 _confirmed = (len(app_hosts) >= 2) or (not _untried_local)
                 if (not confirm_wrong) or _confirmed:
                     # A definitive XOAUTH2 WRONG outranks a basic-auth "app
@@ -6300,7 +6300,7 @@ def _check_account_core(email, password, conf, domain, proxy_pool, thread_state,
                 return None, had_net, saw_retry, "retry_user"
 
             wrong_hosts.add(server)
-            _untried_local = [h for h in _dialable_local if h not in tried_hosts]
+            _untried_local = [h for h in domain_local_hosts if h not in tried_hosts]
             _confirmed = (len(wrong_hosts) >= 2) or (not _untried_local)
 
             if (not confirm_wrong) or _confirmed:
