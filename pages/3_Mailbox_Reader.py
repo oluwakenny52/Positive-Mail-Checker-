@@ -1,8 +1,28 @@
 """
-pages/3_Mailbox_Reader.py — Bobito Mailbox Reader & Portal Hub  (v13.37)
+pages/3_Mailbox_Reader.py — Bobito Mailbox Reader & Portal Hub  (v13.39)
 =======================================================================
 Interactive inbox inspection: bot intelligence, OTP / debit-card / credential
 scanning, multi-field search, Telegram + blacklist filtering.
+
+v13.39 fixes on this page
+-------------------------
+* LOGIN_DROPPED exists here now.  The engine learned in v13.38 that a server
+  which ACCEPTS the LOGIN command and then closes the socket with an untagged
+  "* BYE" has spoken — but this page had no idea, so it filed the drop as a
+  plain FAILED.  _looks_like_login_drop() is tested BEFORE the FAILED
+  fall-through and the row is reported as LOGIN_DROPPED ("password still
+  untested"), with the rate-limit wording (* BYE Too many ...) excluded so a
+  connection cap stays FAILED.
+* ALLOW_SELF_SIGNED IS READ.  app_config["allow_self_signed"] existed and was
+  never used: both the implicit and the STARTTLS rung hardcoded verify=False,
+  so a self-signed toggle in this page did nothing.
+* THE PROXY PROBE TRIES HTTP AS WELL AS SOCKS5.  _reader_proxy_reachable() was
+  SOCKS5-only while _raw_socket() right below it happily speaks HTTP, so every
+  HTTP-only node was binned before it was ever tried.
+* THE PROBE IS CHEAPER: 5 nodes at 3s instead of 8 nodes at 5s (up to 40s of
+  stall before the reader even connected).
+* THE PHONE LAYOUT IS FIXED: Streamlit's 6rem/10rem .block-container padding is
+  overridden, there are @media queries, and the sidebar starts collapsed.
 
 v13.37 fixes on this page
 -------------------------
@@ -50,7 +70,8 @@ st.set_page_config(
     page_title="Bobito Mailbox Reader & Portal Hub",
     page_icon="📥",
     layout="wide",
-    initial_sidebar_state="expanded"
+    # v13.39: "expanded" covers the whole viewport on a phone.
+    initial_sidebar_state="collapsed"
 )
 
 try:
@@ -394,6 +415,52 @@ def theme_css(th: dict) -> str:
     ::-webkit-scrollbar-track {{ background: {bg}; }}
     ::-webkit-scrollbar-thumb {{ background: {g1}88; border-radius: 8px; }}
     ::-webkit-scrollbar-thumb:hover {{ background: {ac}; }}
+
+    /* ---- v13.39 MOBILE FIT ---- */
+    .block-container, [data-testid="stMainBlockContainer"] {{
+        padding-top: 1.2rem !important;
+        padding-bottom: 2rem !important;
+    }}
+    @media (max-width: 820px) {{
+        .block-container, [data-testid="stMainBlockContainer"] {{
+            padding: 0.55rem 0.7rem calc(1.3rem + env(safe-area-inset-bottom)) 0.7rem !important;
+            max-width: 100% !important;
+        }}
+        [data-testid="stHeader"] {{ height: 2.1rem; }}
+        [data-testid="stToolbar"] {{ right: 0.3rem; }}
+        [data-testid="stSidebar"] {{ width: 88vw !important; min-width: 88vw !important; }}
+        .bb-hero {{ padding: 14px 16px; border-radius: 12px; margin-bottom: 10px; }}
+        .bb-hero h1 {{ font-size: 1.18rem; line-height: 1.25; }}
+        .bb-hero p {{ font-size: .76rem; line-height: 1.35; }}
+        .bb-tag {{ font-size: .61rem; padding: 2px 8px; margin: 0 4px 4px 0; }}
+        .bb-section {{ margin: 14px 0 8px 0; padding: 8px 12px; gap: 8px; }}
+        .bb-section .bb-t {{ font-size: .9rem; }}
+        .bb-section .bb-s {{ display: block; margin: 2px 0 0 0; font-size: .67rem; }}
+        /* the reader's .bb-logbox is a fixed 360px box - vh keeps it on-screen */
+        .bb-logbox {{ font-size: .67rem; padding: 8px; max-height: 42vh; }}
+        .help-box {{ font-size: .7rem; }}
+        [data-testid="stMetric"] {{ padding: 8px 10px; }}
+        [data-testid="stMetricValue"] {{ font-size: 1.15rem !important; }}
+        [data-testid="stMetricLabel"] {{ font-size: .65rem !important; }}
+        .stTabs [data-baseweb="tab"] {{ padding: 6px 10px; font-size: .78rem; }}
+        .stTabs [data-baseweb="tab-list"] {{ gap: 2px; }}
+        h1 {{ font-size: 1.3rem !important; }}
+        h2 {{ font-size: 1.12rem !important; }}
+        h3 {{ font-size: 1rem !important; }}
+        .stButton > button, .stDownloadButton > button {{ padding: .35rem .5rem; font-size: .8rem; }}
+        [data-testid="stDataFrame"] {{ font-size: .72rem; }}
+        pre, code, .stCode {{ font-size: .68rem !important; }}
+        textarea, input {{ font-size: .8rem !important; }}
+    }}
+    @media (max-width: 420px) {{
+        .block-container {{ padding-left: 0.5rem !important; padding-right: 0.5rem !important; }}
+        .bb-hero h1 {{ font-size: 1.05rem; }}
+        [data-testid="stMetricValue"] {{ font-size: 1rem !important; }}
+        [data-testid="stMetricLabel"] {{ font-size: .6rem !important; }}
+    }}
+    @media (hover: none) {{
+        [data-testid="stSidebarCollapsedControl"] {{ top: .3rem; }}
+    }}
     {anim_css}
 </style>
 """
@@ -727,6 +794,18 @@ def otp_log(msg):
 #     property 'file' of '_ProxyIMAP4' object has no setter
 # ============================================================================
 
+def _cfg_verify() -> bool:
+    """v13.39: the page's ALLOW_SELF_SIGNED setting, finally read.
+
+    app_config["allow_self_signed"] existed in DEFAULT_APP_CONFIG and was used by
+    NOTHING - both TLS rungs hardcoded verify=False.  Unticked now means a real
+    verification, so an expired / mismatched certificate is actually rejected.
+    """
+    try:
+        return not bool(st.session_state.app_config.get("allow_self_signed", True))
+    except Exception:
+        return False
+
 def _mail_tls_context(verify=False):
     """verify=False tolerates self-signed / expired / hostname-mismatched certs."""
     if verify:
@@ -795,17 +874,21 @@ def _reader_proxy_reachable(proxy_str, host, port=993, timeout=5.0) -> bool:
         import socks
     except ImportError:
         return False
-    try:
-        s = socks.socksocket()
-        s.set_proxy(socks.SOCKS5, info["host"], info["port"],
-                    username=info.get("user"), password=info.get("pass"),
-                    rdns=True)
-        s.settimeout(timeout)
-        s.connect((host, int(port)))
-        s.close()
-        return True
-    except Exception:
-        return False
+    # v13.39: SOCKS5-only here binned every HTTP-only node while _raw_socket()
+    # right below happily speaks HTTP.  Try both, like _raw_socket does.
+    for _ptype in (socks.SOCKS5, socks.HTTP):
+        try:
+            s = socks.socksocket()
+            s.set_proxy(_ptype, info["host"], info["port"],
+                        username=info.get("user"), password=info.get("pass"),
+                        rdns=True)
+            s.settimeout(timeout)
+            s.connect((host, int(port)))
+            s.close()
+            return True
+        except Exception:
+            continue
+    return False
 
 def _reader_proxy_str(host: str = ""):
     """Optional proxy for manual reader connections (sidebar toggle).
@@ -824,11 +907,13 @@ def _reader_proxy_str(host: str = ""):
             st.session_state["_reader_proxy_path"] = "direct (no pool)"
             return None
         target = host or "imap.gmail.com"
-        for item in pool[:8]:
+        # v13.39: 8 nodes x 5s was up to 40s of stall before the reader even
+        # connected.  5 x 3s is enough to find a live node.
+        for item in pool[:5]:
             px = item.get("proxy")
             if not px:
                 continue
-            if _reader_proxy_reachable(px, target, 993):
+            if _reader_proxy_reachable(px, target, 993, timeout=3.0):
                 st.session_state["_reader_proxy_path"] = f"via {px} ({item.get('country')})"
                 return px
         st.session_state["_reader_proxy_path"] = "direct (every probed node failed)"
@@ -949,9 +1034,13 @@ def open_imap(host, port, timeout, proxy_str=None, try_starttls=None):
     a port-143 account dialled implicit TLS on 143 and then gave up entirely.
     The plaintext rung still matters: legacy / Zimbra servers answer
     'TLS not supported by server' on 143 but accept a cleartext LOGIN.
+
+    v13.39: the certificate policy comes from app_config["allow_self_signed"]
+    instead of being hardcoded to verify=False in both rungs.
     """
     if try_starttls is None:
         try_starttls = bool(st.session_state.app_config.get("try_starttls", True))
+    _verify = _cfg_verify()
 
     port = int(port or 993)
     if port == 143:
@@ -963,11 +1052,11 @@ def open_imap(host, port, timeout, proxy_str=None, try_starttls=None):
     for mode, p in ladder:
         try:
             if mode == "implicit":
-                m = _ProxyIMAP4SSL(host, p, timeout=timeout, proxy_str=proxy_str, verify=False)
+                m = _ProxyIMAP4SSL(host, p, timeout=timeout, proxy_str=proxy_str, verify=_verify)
             else:
                 m = _ProxyIMAP4(host, p, timeout=timeout, proxy_str=proxy_str)
                 if mode == "starttls" and try_starttls:
-                    m.starttls(ssl_context=_mail_tls_context(False))
+                    m.starttls(ssl_context=_mail_tls_context(_verify))
                 elif mode == "starttls" and not try_starttls:
                     continue
             _ensure_file(m)
@@ -984,6 +1073,18 @@ def _looks_like_auth_error(err_text: str) -> bool:
         "invalid login", "invalid password", "invalid user", "login failed",
         "auth failed", "[auth]", "username and password not accepted",
         "logon failure", "bad username", "authenticate failed",
+    ))
+
+def _looks_like_login_drop(err_text: str) -> bool:
+    """v13.39: the reader had no idea about the * BYE the engine learned in
+    v13.38, so a server that answered then hung up was filed as plain FAILED."""
+    s = (err_text or "").lower()
+    if any(k in s for k in ("too many", "limit", "quota", "busy", "throttle")):
+        return False                       # that is a rate cap, not a drop
+    return any(k in s for k in (
+        "terminating connection", "imap server terminating", "server terminating",
+        "* bye", " bye ", "auth process broken", "connection is closed",
+        "server closed the connection", "server dropped the connection",
     ))
 
 def _looks_like_app_password_error(err_text: str) -> bool:
@@ -1420,7 +1521,8 @@ def connect_and_login(host, port, timeout, proxy_str, users, password, email_add
         try:
             mail, _exists, _claims = _ms_oauth.imap_xoauth2_open(
                 email_addr, password, host, _XOAUTH2IMAP4SSL,
-                port=port, proxy_str=proxy_str, insecure=True, attempt_timeout=timeout)
+                port=port, proxy_str=proxy_str,
+                insecure=not _cfg_verify(), attempt_timeout=timeout)
             return mail
         except _ms_oauth.MsTokenTransport:
             pass                              # network blip -> fall through to basic auth
@@ -2043,6 +2145,14 @@ with st.sidebar.expander("⚙️ App Configuration Settings", expanded=False):
     new_fallback = st.checkbox("Enable Auto-Fallback Host Probing (Spectrum/Charter/TWC)", value=cfg.get("auto_fallback_probing", True))
     new_starttls = st.checkbox("Try STARTTLS / plaintext on port 143 if 993 fails", value=cfg.get("try_starttls", True))
     new_altuser = st.checkbox("Try local-part username on auth failure", value=cfg.get("try_alt_username", True))
+    # v13.39: allow_self_signed existed in app_config.json and was read by nothing.
+    new_selfsigned = st.checkbox(
+        "Allow self-signed / expired certificates",
+        value=cfg.get("allow_self_signed", True),
+        help="Untick to require a valid, hostname-matching certificate. This setting was in the "
+             "config file but the page hardcoded verify=False in both the implicit and STARTTLS rung, "
+             "so it could never take effect."
+    )
 
     if st.button("💾 Save App Settings", type="secondary", use_container_width=True):
         st.session_state.app_config["connection_timeout"] = new_timeout
@@ -2050,6 +2160,7 @@ with st.sidebar.expander("⚙️ App Configuration Settings", expanded=False):
         st.session_state.app_config["auto_fallback_probing"] = new_fallback
         st.session_state.app_config["try_starttls"] = new_starttls
         st.session_state.app_config["try_alt_username"] = new_altuser
+        st.session_state.app_config["allow_self_signed"] = new_selfsigned
         save_app_config(st.session_state.app_config)
         st.success("App configuration updated and saved globally!")
 
@@ -2079,6 +2190,7 @@ if st.sidebar.button("🚀 Validate & Import Batch Accounts", type="primary", us
         valid_count = 0
         wrong_count = 0
         appass_count = 0
+        login_drop_count = 0                       # v13.39
         failed_count = 0
 
         progress_bar = st.sidebar.progress(0)
@@ -2209,6 +2321,13 @@ if st.sidebar.button("🚀 Validate & Import Batch Accounts", type="primary", us
                     wrong_count += 1
                     status_type = "WRONG"
                     batch_logs.append(f"❌ [{row_time}] [WRONG] {email_val} — {classify_src}")
+                elif _looks_like_login_drop(classify_src):        # v13.39
+                    login_drop_count += 1
+                    failed_count += 1
+                    status_type = "LOGIN_DROPPED"
+                    batch_logs.append(
+                        f"🚪 [{row_time}] [LOGIN_DROPPED] {email_val} — server answered then closed "
+                        f"the socket (* BYE); the password is still UNTESTED — {classify_src}")
                 else:
                     failed_count += 1
                     status_type = "FAILED"
@@ -2240,6 +2359,7 @@ if st.sidebar.button("🚀 Validate & Import Batch Accounts", type="primary", us
             "valid": valid_count,
             "wrong": wrong_count,
             "appass": appass_count,
+            "login_dropped": login_drop_count,          # v13.39
             "failed": failed_count
         }
         st.session_state.batch_results_table = table_rows
@@ -2270,15 +2390,25 @@ with tab_analytics:
         st.success(f"🎉 Check Complete! Started: {meta['started']} | Ended: {meta['ended']} | Duration: {meta['duration']}")
 
     stats = st.session_state.batch_stats
-    a_col1, a_col2, a_col3, a_col4 = st.columns(4)
+    a_col1, a_col2, a_col3, a_col4, a_col5 = st.columns(5)
     with a_col1:
-        st.metric("✅ Valid", stats["valid"])
+        st.metric("✅ Valid", stats.get("valid", 0))
     with a_col2:
-        st.metric("❌ Wrong", stats["wrong"])
+        st.metric("❌ Wrong", stats.get("wrong", 0))
     with a_col3:
-        st.metric("🔑 AppPass", stats["appass"])
+        st.metric("🔑 AppPass", stats.get("appass", 0))
     with a_col4:
-        st.metric("⚠️ Failed", stats["failed"])
+        st.metric("🚪 Dropped", stats.get("login_dropped", 0))      # v13.39
+    with a_col5:
+        st.metric("⚠️ Failed", stats.get("failed", 0))
+
+    if stats.get("login_dropped"):
+        st.warning(
+            f"🚪 **{stats['login_dropped']} account(s) hit a LOGIN DROP** — the server answered, "
+            f"accepted the LOGIN command and then closed the socket (* BYE). Those passwords are "
+            f"still UNTESTED. Retry them from a different IP, or with an app password, before "
+            f"discarding them."
+        )
 
     st.markdown("#### Detailed Execution Log Table")
     if st.session_state.batch_results_table:
