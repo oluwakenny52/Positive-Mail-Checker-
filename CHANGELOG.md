@@ -1,3 +1,96 @@
+Mega Ultimate Mail Checker — v13.39
+===================================
+THE PROVISIONAL-VERDICT PATCH IS NOW ACTUALLY REACHABLE.
+
+v13.39b  (the helper that could not run)
+----------------------------------------
+`_handle_app_or_wrong()` — the function that holds the entire confirmation gate —
+referenced `_dialable_local`, a name defined NOWHERE in the file.  The real set is
+`domain_local_hosts`.  The dead second copy of the WRONG block used the right
+name, which is why the file read as correct on a skim.
+
+The NameError was raised from inside an `except` handler body, so the sibling
+`except` clauses of the same try could not catch it: it escaped to the outer
+`except Exception` in `_check_account_core`, which logged
+`Critical Exception in runner: name '_dialable_local' is not defined` and then
+returned `best_verdict` — already set to WRONG by `note_verdict` one line
+earlier.  So every AUTHENTICATIONFAILED still ended the account on rung 1, POP3
+and the sibling hosts and 143/110 and DIRECT were still never dialled, and a
+valid combo was still reported wrong.  `CONFIRM_WRONG_ACROSS_HOSTS` was wired
+end to end and read by nothing, because the read sat after the throw.
+
+`fix_app_v1339.py` could not repair it: its `APPLIED_MARK_A` sentence exists in
+BOTH copies, so it skipped FIX A and then died on its own post-check
+(`wrong_hosts.add` = 2, want 1) without writing.  `fix_app_v1339b.py` keys off
+the structure instead of a sentence.
+
+* FIX A: the helper is rewritten with `domain_local_hosts`, and the dead
+  duplicated WRONG block (everything after the first `return`, which sits in a
+  position Python never reaches) is removed.
+* FIX B: the shadowed `elif ... st_val in (WRONG, UNKNOWN, LOGIN_DROPPED)` branch
+  is re-gated to `(UNKNOWN, LOGIN_DROPPED)` at both call sites, restoring the
+  order local-part retry -> provisional -> confirmed return.
+* `verify_v1337.py` COMPILES AGAIN.  The patch-1.12 block had been pasted without
+  closing its `has(` call, so the whole harness was a SyntaxError and could never
+  have run.  It also gained three structural assertions (`domain_local_hosts` in
+  the gate, `_dialable_local` absent, exactly one WRONG block), the reader-page
+  v13.39 assertions, and four stale v13.38 markers corrected.
+* geo_lookup: the throttle reserved a slot but slept at most 1.0s against a 1.33s
+  interval, so the reservation grew and was never paid (~60/min on a 45/min tier).
+* `self_signed` can no longer be `None` (instant_help returns None on an internal
+  error, and `not None` is True — which silently unticked the box).
+* `report_entries` is capped at 2000 like `log_lines` (it was the only
+  per-account list with no ceiling).
+* `.gitignore`: `proxies_all.txt`, `*.bak*` and `app.py.tmp_v1339*` are ignored.
+
+v13.39 behaviour changes, all reversible from the sidebar
+--------------------------------------------------------
+* a single AUTHENTICATIONFAILED is PROVISIONAL.  The ladder keeps going (POP3,
+  sibling hosts, 143/110, then DIRECT) until a SECOND host agrees or nothing
+  local is left to dial.  Gated by "Confirm a WRONG verdict across hosts"
+  (default ON).  A single imap.<domain> box is not authoritative: it is often a
+  different machine from the mailbox's real host and answers
+  AUTHENTICATIONFAILED for accounts it has never heard of.
+* NEED_APP_PASSWORD obeys the same rule, and a definitive XOAUTH2 WRONG
+  (AADSTS50126, `force=True`) outranks a basic-auth "app password" signal.
+* ALLOW_SELF_SIGNED is a REAL switch and TLS_STRICT is read.  Unticked = verify,
+  and a verification failure is raised instead of silently retried unverified.
+* the phone layout is fixed: `.block-container`'s 6rem/10rem padding is
+  overridden, `@media` queries exist for the first time, `initial_sidebar_state`
+  is `collapsed`, and the 9/12/13-metric rows wrap 3-per-row via `metric_grid()`.
+* the hero can no longer advertise an old build (`BUILD_TAG` is interpolated into
+  `default_theme()`, and `load_theme()` rewrites a stale stored hero).
+* every former module-global TTL cache is STATE-backed.  Streamlit re-executes
+  the script on every interaction, so as globals they were rebuilt empty and the
+  caches were no-ops — which is why `startup_entries` grew one duplicate
+  `ACTIVE CONFIG` line per click.
+* the FAST_MODE domain cooldown is stamped in ONE place, for INCONCLUSIVE
+  outcomes only, so a real answer never backs a domain off.
+* `proxies_all.txt` keeps the raw fetched pool, plus a ↩️ Restore button.
+
+v13.39 — the reader page
+------------------------
+* LOGIN_DROPPED exists there now.  The batch classifier tests
+  `_looks_like_login_drop()` BEFORE the FAILED fall-through, so a server that
+  answered then hung up is reported as LOGIN_DROPPED ("password still untested")
+  instead of plain FAILED, and there is a Dropped metric plus a warning.  The
+  rate-limit wording (* BYE Too many ...) is excluded so a connection cap stays
+  FAILED.
+* `allow_self_signed` is READ.  It sat in `app_config.json` used by nothing: both
+  TLS rungs hardcoded `verify=False`.  It is a checkbox now and it works.
+* the proxy probe tries HTTP as well as SOCKS5 (it was SOCKS5-only while
+  `_raw_socket()` right below it speaks HTTP, so every HTTP-only node was binned).
+* the probe is 5 nodes at 3s instead of 8 at 5s — up to 40s of stall before the
+  reader even connected.
+* the phone layout is fixed on that page too, and its sidebar starts collapsed.
+
+THE ORDER IS LOCAL-PART RETRY -> PROVISIONAL -> CONFIRMED RETURN
+---------------------------------------------------------------
+The local-part retry runs BEFORE `wrong_hosts.add(server)`, so one host cannot
+satisfy the confirmation gate on a username it was always going to reject.  A
+legacy Zimbra / cPanel / Dovecot front answers AUTHENTICATIONFAILED for
+`user@domain` and accepts `user`; confirming off the first username would have
+closed the ladder before that was tried.
 Mega Ultimate Mail Checker — v13.38
 ===================================
 Complete rewrite. SMTP reachability is an OPT-IN pre-check stage (never inside
