@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""verify_v1337.py — regression harness for the v13.37 patch set (build-fix revision).
+"""verify_v1337.py — regression harness for the v13.37 patch set (v13.39b revision).
 
 Run from the repo root:   python verify_v1337.py
 Exit code 0 = clean.
@@ -12,8 +12,22 @@ For every file the v13.37 work touched it checks:
       (em dash / curly quote / nbsp outside a string) survived the paste,
 plus that no two files in pages/ share a page number.
 
-WHY THIS REVISION EXISTS
-------------------------
+WHY THIS REVISION EXISTS (v13.39b)
+----------------------------------
+  * THE P1 BLOCK DID NOT COMPILE.  It had been pasted without closing its
+    has(...) call, so the whole harness was a SyntaxError and could never have
+    run.  It is repaired, and the P0-v13.39 assertions are now real.
+  * NEW STRUCTURAL CHECKS for the v13.39b regression: _handle_app_or_wrong
+    referenced _dialable_local, a name defined NOWHERE, so every WRONG/APP
+    verdict raised NameError inside an except handler and fell straight through
+    to the outer handler - the ladder never advanced.  The helper must use
+    domain_local_hosts and must contain exactly ONE WRONG block (the duplicate
+    copy was dead code sitting after a return).
+  * Four stale v13.38 markers corrected for v13.39 (header, CFG_VERSION,
+    _GEO_FAIL, _STARTUP_SEEN - the last two are STATE-backed now).
+
+WHY THE EARLIER REVISION EXISTED
+--------------------------------
   * The PART 1/3 / PART 2/3 banner checks were removed — app.py has no banners.
   * "settled = False", "def _geo_throttle(", '"geo_fail": {}',
     '_GEO_FAIL = STATE["geo_fail"]' and "MAIL_SPOT_MIN_INTERVAL" do not exist in
@@ -226,7 +240,7 @@ def main():
         stray_lines(app_path, app_code)
         seam_is_intact(app)
 
-        has(app, "Mega Ultimate Mail Checker — v13.38", "app.py header is v13.38")
+        has(app, "Mega Ultimate Mail Checker — v13.39", "app.py header is v13.39")
 
         # ---- P0: 407 classification, swallowed XOAUTH2 407, clean_valid merge --
         has(app, 'out["reason"] = "auth"', "P0 post-loop auth override present")
@@ -254,17 +268,42 @@ def main():
             "P0 note_verdict has a force path")
         has(app, "if st_val not in (VALID, WRONG, APP, RBL, LOGIN_DROPPED, UNKNOWN):",
             "P0 UNKNOWN is retained")
-        # v13.39b: the helper must not name anything undefined, and must hold
-        # exactly ONE WRONG block (the duplicated copy was dead code).
+
+        # ---- P0-v13.39b: the helper must be reachable and single ----
         has(app, "[h for h in domain_local_hosts if h not in tried_hosts]",
             "P0 the confirmation gate uses domain_local_hosts")
-        gone(app_code, "_dialable_local", "_dialable_local is not referenced anywhere")
+        gone(app_code, "_dialable_local",
+             "P0 _dialable_local is not referenced anywhere")
         _nw = app.count("wrong_hosts.add(server)")
         if _nw != 1:
             FAILS.append("P0 the WRONG block is duplicated inside "
                          "_handle_app_or_wrong (wrong_hosts.add appears %d x, want 1)" % _nw)
         else:
             PASSES.append("P0 exactly one WRONG block in the helper")
+        gone(app_code, "st_val in (WRONG, UNKNOWN, LOGIN_DROPPED)",
+             "P0 the shadowed WRONG/UNKNOWN branch is re-gated")
+
+        # ---- P0-v13.39: TLS switch, STATE caches, mobile, hero guard ----
+        has(app, "def tls_connect(host, port, proxy_str=None, insecure=None, timeout=None):",
+            "P0 tls_connect resolves insecure from CFG")
+        has(app, "TLS_STRICT is ON so NOT falling back", "P0 TLS_STRICT is honoured")
+        has(app, '"TLS_STRICT": not self_signed', "P0 TLS_STRICT follows the checkbox")
+        has(app, '_STARTUP_SEEN = STATE.setdefault("startup_seen", set())',
+            "P0 startup dedupe set is STATE-backed")
+        has(app, '_DNS_CACHE = STATE.setdefault("dns_cache", {})',
+            "P0 DNS cache is STATE-backed")
+        has(app, '_PERSISTENT_VALID_CACHE = STATE.setdefault("persistent_valid_cache"',
+            "P0 valid cache is STATE-backed")
+        has(app, '_geo_last_call = STATE.setdefault("geo_last_call"',
+            "P0 geo throttle state is STATE-backed")
+        has(app, "def metric_grid(pairs, per_row: int = 3):", "P0 metrics wrap per row")
+        has(app, "initial_sidebar_state=\"collapsed\"", "P0 sidebar starts collapsed")
+        has(app, "if BUILD_TAG not in str(base.get(\"hero_title\", \"\")):",
+            "P0 load_theme cannot advertise an old build")
+        has(app, "def _MOBILE_CSS", "P0 mobile stylesheet present")
+        has(app, "if _status in (FAILED, PROXY_UNHEALTHY, RETRY, DNS_FAILED, UNKNOWN, SMTP_FAILED):",
+            "P0 FAST_MODE cooldown only arms on inconclusive results")
+
         has(app, "def _resolve_cached(", "P1 shared DNS TTL cache present")
         has(app, "return _resolve_cached(host) is not None",
             "P1 fast_fail_dns_check uses the shared cache")
@@ -273,12 +312,12 @@ def main():
         has(app, "while page <= 20:", "P1 fetch_ws paginates")
         has(app, "GEO_FAIL_TTL = 300.0", "P1 geo negative-cache TTL present")
         has(app, "GEO_MIN_INTERVAL", "P1 geo throttle constant present")
-        has(app, "_GEO_FAIL = {}", "P1 geo negative cache present")
+        has(app, '_GEO_FAIL = STATE.setdefault("geo_fail", {})',
+            "P1 geo negative cache is STATE-backed")
         has(app, "_geo_last_call", "P1 geo throttle state present")
 
         # ---- P2 ----
         has(app, "_STARTUP_MAX = 400", "P2 startup log cap present")
-        has(app, "_STARTUP_SEEN = set()", "P2 startup dedupe set present")
         has(app, "if msg in _STARTUP_SEEN:", "P2 dedupe compares the MESSAGE")
         has(app, "checked_count % 25 == 0", "P2 checkpoint writes every 25 accounts")
         has(app, "def _estimated_rung_count(", "P2 rung count is derived")
@@ -305,7 +344,8 @@ def main():
         has(app, "def clear_tunnel_cache(", "clear_tunnel_cache kept")
         has(app, "def _guess_candidates(", "_guess_candidates kept")
         has(app, "HOSTS_HAS_RANKING", "HOSTS_HAS_RANKING kept")
-        has(app, "CFG_VERSION = 1338", "CFG_VERSION is 1338")
+        has(app, "CFG_VERSION = 1339", "CFG_VERSION is 1339")
+        has(app, "BUILD_TAG = \"v13.39\"", "BUILD_TAG is the single build string")
 
     if req:
         if "pandas==2.2.3" in req:
@@ -339,6 +379,21 @@ def main():
         has(rdr, "def merge_into_clean_valid(", "reader merges clean_valid")
         has(rdr, "def _valid_fingerprint(", "valid-list mtime cache present")
         has(rdr, "MsVerdict(", "MsVerdict is actually raised")
+        # ---- v13.39 reader fixes ----
+        has(rdr, "def _looks_like_login_drop(", "reader knows about a * BYE drop")
+        has(rdr, "elif _looks_like_login_drop(classify_src):",
+            "reader reports LOGIN_DROPPED instead of FAILED")
+        has(rdr, "status_type = \"LOGIN_DROPPED\"", "reader has a LOGIN_DROPPED status")
+        has(rdr, "for _ptype in (socks.SOCKS5, socks.HTTP):",
+            "reader proxy probe tries HTTP as well as SOCKS5")
+        has(rdr, "def _cfg_verify()", "reader reads allow_self_signed")
+        has(rdr, "verify=_verify", "reader implicit rung honours the switch")
+        has(rdr, "_mail_tls_context(_verify)", "reader STARTTLS rung honours the switch")
+        has(rdr, 'st.session_state.app_config["allow_self_signed"] = new_selfsigned',
+            "reader saves the self-signed checkbox")
+        has(rdr, "for item in pool[:5]:", "reader probes 5 nodes, not 8")
+        has(rdr, "initial_sidebar_state=\"collapsed\"", "reader sidebar starts collapsed")
+        has(rdr, "/* ---- v13.39 MOBILE FIT ---- */", "reader has the mobile stylesheet")
 
     page_numbers()
 
