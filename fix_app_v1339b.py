@@ -1,20 +1,14 @@
 #!/usr/bin/env python3
-"""
-fix_app_v1339.py - applies the two remaining app.py regressions.
+"""fix_app_v1339b.py - repairs what fix_app_v1339.py false-negatives.
 
-WHY A SCRIPT: app.py is 340 KB / ~6.8k lines. Retyping it is where indentation
-faults come from. This edits the two sites in place with byte-exact anchors,
-asserts every anchor count, py_compile's the result, and only then replaces the
-file. Idempotent: running it twice is a no-op, not a double-edit.
+fix_app_v1339.py skips FIX A because its APPLIED_MARK_A ("it was always going to
+reject") is present in BOTH copies of the duplicated WRONG block, then dies on
+its own post-check (wrong_hosts.add == 2, want 1).  This script keys off the
+structure instead of a sentence: it takes the whole helper window and rewrites
+it, so it cannot be fooled by a marker.
 
-    python fix_app_v1339.py
-    python -m py_compile app.py
-
-FIX A : restore the WRONG local-part retry inside _handle_app_or_wrong, and move
-        it BEFORE wrong_hosts.add() so a host that rejects 'user@domain' but
-        accepts 'user' is not counted as an agreeing host on a username it was
-        always going to reject.
-FIX B : the now-shadowed branch handles only UNKNOWN / LOGIN_DROPPED.
+    python fix_app_v1339b.py
+    python -m py_compile app.py && python verify_v1337.py
 """
 import os
 import sys
@@ -28,10 +22,6 @@ START_A = ("        def _handle_app_or_wrong(st_val, proto, server, port, user, 
            "px_used, seen_px,\n")
 END_A = ("        # small mutable holder so _handle_app_or_wrong can read the current "
          "per-attempt timeout")
-APPLIED_MARK_A = "it was always going to reject"
-
-OLD_B = "elif u_idx + 1 < len(users) and st_val in (WRONG, UNKNOWN, LOGIN_DROPPED):"
-NEW_B = "elif u_idx + 1 < len(users) and st_val in (UNKNOWN, LOGIN_DROPPED):"
 
 NEW_FN = '''        def _handle_app_or_wrong(st_val, proto, server, port, user, u_idx, px_used, seen_px,
                                  had_net, saw_retry):
@@ -101,7 +91,12 @@ NEW_FN = '''        def _handle_app_or_wrong(st_val, proto, server, port, user, 
                 f"{px_tag(px_used)} WRONG on {server} -> PROVISIONAL "
                 f"({len(wrong_hosts)} host(s) agreed, {len(_untried_local)} local host(s) "
                 f"still untried) -> continuing the ladder")
-            return None, had_net, saw_retry, True'''
+            return None, had_net, saw_retry, True
+
+'''
+
+OLD_B = "elif u_idx + 1 < len(users) and st_val in (WRONG, UNKNOWN, LOGIN_DROPPED):"
+NEW_B = "elif u_idx + 1 < len(users) and st_val in (UNKNOWN, LOGIN_DROPPED):"
 
 
 def die(msg):
@@ -115,44 +110,46 @@ def main():
 
     with open(TARGET, encoding="utf-8") as f:
         src = f.read()
-
     before_lines = src.count("\n")
 
-    # ---------- sanity: this really is the v13.39 file ----------
+    # ---------- sanity ----------
     for probe, want, why in (
-        ("CONFIRM_WRONG_ACROSS_HOSTS", 4, "guard flag wiring"),
         ("def _handle_app_or_wrong", 1, "helper"),
         ("def _check_account_core", 1, "core"),
+        ("CONFIRM_WRONG_ACROSS_HOSTS", 4, "guard flag wiring"),
+        ("domain_local_hosts = {h for h in", 1, "local-host set"),
     ):
         got = src.count(probe)
         if got < want:
-            die(f"expected >= {want} x '{probe}' ({why}), found {got} - wrong file or "
-                f"already mangled. Nothing written.")
+            die(f"expected >= {want} x '{probe}' ({why}), found {got} - wrong file. Nothing written.")
 
-    # ---------- FIX A ----------
-    if APPLIED_MARK_A in src:
-        print("FIX A: already applied, skipped.")
+    # ---------- FIX A: replace the whole helper window ----------
+    if src.count(START_A) != 1:
+        die(f"FIX A start anchor found {src.count(START_A)}x (want 1).")
+    if src.count(END_A) != 1:
+        die(f"FIX A end anchor found {src.count(END_A)}x (want 1).")
+    i = src.index(START_A)
+    j = src.index(END_A)
+    if j <= i:
+        die("FIX A end anchor sits BEFORE the start anchor.")
+
+    window = src[i:j]
+    n_wrong = window.count("wrong_hosts.add(server)")
+    already = ("_dialable_local" not in window) and n_wrong == 1
+    if already:
+        print("FIX A: window already correct (1 WRONG block, no _dialable_local), skipped.")
     else:
-        if src.count(START_A) != 1:
-            die(f"FIX A start anchor found {src.count(START_A)}x (want 1).")
-        if src.count(END_A) != 1:
-            die(f"FIX A end anchor found {src.count(END_A)}x (want 1).")
-        i = src.index(START_A)
-        j = src.index(END_A)
-        if j <= i:
-            die("FIX A end anchor sits BEFORE the start anchor.")
-        old_fn = src[i:j]
-        if "wrong_hosts.add(server)" not in old_fn:
+        if n_wrong < 1:
             die("FIX A window does not contain wrong_hosts.add(server) - anchor drift.")
-        if len(old_fn.splitlines()) < 25:
-            die(f"FIX A window is only {len(old_fn.splitlines())} lines - suspiciously short.")
-        src = src[:i] + NEW_FN + "\n\n" + src[j:]
-        print(f"FIX A: helper replaced ({len(old_fn.splitlines())} -> "
-              f"{len(NEW_FN.splitlines())} lines).")
+        if "def _handle_app_or_wrong" not in window:
+            die("FIX A window does not start at the helper - anchor drift.")
+        src = src[:i] + NEW_FN + src[j:]
+        print(f"FIX A: helper rewritten ({len(window.splitlines())} -> "
+              f"{len(NEW_FN.splitlines())} lines; had {n_wrong} WRONG block(s), "
+              f"{window.count('_dialable_local')} x _dialable_local).")
 
-    # ---------- FIX B ----------
-    n_old = src.count(OLD_B)
-    n_new = src.count(NEW_B)
+    # ---------- FIX B: the shadowed branch handles only UNKNOWN / LOGIN_DROPPED ----------
+    n_old, n_new = src.count(OLD_B), src.count(NEW_B)
     if n_old == 2 and n_new == 0:
         src = src.replace(OLD_B, NEW_B)
         print("FIX B: 2 call sites re-gated.")
@@ -162,22 +159,22 @@ def main():
         die(f"FIX B anchor mismatch: old={n_old} new={n_new} (want 2/0 or 0/2).")
 
     # ---------- post-conditions ----------
-    checks = [
+    for probe, want in (
+        ("_dialable_local", 0),
+        ("wrong_hosts.add(server)", 1),
+        ("app_hosts.add(server)", 1),
+        ("if (not confirm_wrong) or _confirmed:", 2),
+        ("retrying same host as local-part", 2),
         ("st_val in (WRONG, UNKNOWN, LOGIN_DROPPED)", 0),
         ("st_val in (UNKNOWN, LOGIN_DROPPED)", 2),
-        ("retrying same host as local-part", 4),
-        ("wrong_hosts.add(server)", 1),
+        ("ifapp_hosts", 0),
         ("def _handle_app_or_wrong", 1),
         ("def _check_account_core", 1),
-        ("ifapp_hosts", 0),
-        ("if (not confirm_wrong) or _confirmed:", 2),
-    ]
-    for probe, want in checks:
+    ):
         got = src.count(probe)
         if got != want:
             die(f"post-check failed: '{probe}' = {got}, want {want}. Nothing written.")
 
-    # FIX A must precede wrong_hosts.add inside the helper
     fn_start = src.index("        def _handle_app_or_wrong(")
     fn_end = src.index(END_A, fn_start)
     body = src[fn_start:fn_end]
@@ -185,7 +182,7 @@ def main():
         die("ordering: the WRONG retry sits AFTER wrong_hosts.add().")
 
     # ---------- compile, then swap in ----------
-    tmp = TARGET + ".tmp_v1339"
+    tmp = TARGET + ".tmp_v1339b"
     with open(tmp, "w", encoding="utf-8") as f:
         f.write(src)
     try:
@@ -195,11 +192,8 @@ def main():
         die(f"result does not compile:\n{e}")
 
     bak = f"app.py.bak.{STAMP}"
-    with open(TARGET, encoding="utf-8") as f:
-        original = f.read()
     with open(bak, "w", encoding="utf-8") as f:
-        f.write(original)
-
+        f.write(src[:0] + open(TARGET, encoding="utf-8").read())
     os.replace(tmp, TARGET)
 
     print(f"\nOK. app.py rewritten ({before_lines} -> {src.count(chr(10))} lines).")
