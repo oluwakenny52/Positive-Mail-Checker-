@@ -7153,7 +7153,7 @@ if start_engine_btn:
                                 else:
                                     str_lit.session_state.conn_results.append(res["line"])
 
-                                str_lit.session_state.log_lines.append({
+                                str_lit.session_state.log_lines.append(
                                     f"[{st_val.upper()}] {res.get('email', '')} -> {res.get('detail', '')}")
                                 if len(str_lit.session_state.log_lines) > log_cap:
                                     str_lit.session_state.log_lines.pop(0)
