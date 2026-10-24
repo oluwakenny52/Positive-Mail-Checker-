@@ -748,7 +748,6 @@ class MsVerdict(Exception):
     def __init__(self, verdict, detail=""):
         super().__init__(detail or verdict)
         self.verdict = verdict
-
 def _is_proxy_auth_fail(msg) -> bool:
     """True when the PROXY ITSELF rejected us, as opposed to a transport failure."""
     m = (msg or "").lower()
@@ -864,6 +863,7 @@ def _engine_state():
         # a no-op.  They live in STATE now (setdefault below keeps the names).
         "startup_seen": set(),
         "startup_buffer": [],
+        "startup_buffer_lock": threading.Lock(),
         "dns_cache": {},
         "persistent_valid_cache": {"ts": 0.0, "data": []},
         "prev_valid_cache": {"ts": 0.0, "data": set()},
@@ -1546,6 +1546,10 @@ def is_light(th: dict) -> bool:
 # is exactly the "top and bottom is not my phone screen size" report.  These
 # rules are phone-only, so the desktop layout is untouched.
 _MOBILE_CSS = """
+    .block-container, [data-testid="stMainBlockContainer"] {
+        padding-top: 1.2rem !important;
+        padding-bottom: 2rem !important;
+    }
     @media (max-width: 820px) {
         .block-container, [data-testid="stMainBlockContainer"] {
             padding-top: 0.55rem !important;
@@ -5756,7 +5760,7 @@ def pop_plain_once(email, password, server, proxy_str=None, port=110, attempt_ti
             except Exception:
                 pass
 
-def verify_and_connect(target_email, target_pass, hosts, proxy_str=None):
+         def verify_and_connect(target_email, target_pass, hosts, proxy_str=None):
     """Used by the in-app Mailbox Reader.
 
     v13.39: the insecure flag is read from ALLOW_SELF_SIGNED (it used to be
@@ -6232,8 +6236,15 @@ def _check_account_core(email, password, conf, domain, proxy_pool, thread_state,
                                  had_net, saw_retry):
             """Shared body for the APP / WRONG verdict handling.
 
-            Returns (result_tuple_or_None, had_net, saw_retry, advance).  A
-            non-None result means RETURN it; advance=True means keep going.
+            Returns (result_tuple_or_None, had_net, saw_retry, advance).
+              * result is not None      -> RETURN it
+              * advance is True         -> keep going (PROVISIONAL)
+              * advance is "retry_user" -> retry this host as the LOCAL PART
+
+            NOTE: px_used is a parameter, not a nonlocal - the helper is a sibling
+            of sweep(), not nested inside it, so it cannot rebind sweep's locals.
+            That is harmless because the only call it makes here is
+            _rotate_to_fresh(..., keep_node=True), which returns the SAME node.
             """
             if st_val == APP:
                 xres = try_ms_xoauth2(server, px_used, attempt_to_ref[0], err_text)
@@ -6248,6 +6259,8 @@ def _check_account_core(email, password, conf, domain, proxy_pool, thread_state,
                 _untried_local = [h for h in domain_local_hosts if h not in tried_hosts]
                 _confirmed = (len(app_hosts) >= 2) or (not _untried_local)
                 if (not confirm_wrong) or _confirmed:
+                    # A definitive XOAUTH2 WRONG outranks a basic-auth "app
+                    # password" signal - return the stronger one.
                     if best_verdict["status"] == WRONG:
                         return (None, WRONG,
                                 best_verdict["detail"] + _wrong_detail_note(domain, password),
@@ -6260,14 +6273,29 @@ def _check_account_core(email, password, conf, domain, proxy_pool, thread_state,
                     f"still untried) -> continuing")
                 return None, had_net, saw_retry, True
 
-            # WRONG
+            # ---- WRONG -------------------------------------------------------
+            # v13.39: the local-part retry runs FIRST, exactly as it did before the
+            # dedup - a legacy Zimbra/cPanel/Dovecot front answers
+            # AUTHENTICATIONFAILED for 'user@domain' and accepts 'user'.  It must
+            # also run BEFORE wrong_hosts.add(), because the host has not been
+            # authoritatively tested until every username candidate is exhausted -
+            # otherwise one host can satisfy the confirmation gate on a username
+            # it was always going to reject.
+            if u_idx + 1 < len(users):
+                flags["saw_server"] = True
+                px_used, _ok = _rotate_to_fresh(px_used, seen_px, "local-part retry", keep_node=True)
+                trace_logs.append(f"{px_tag(px_used)} Rejected as '{user}' -> retrying same host as local-part '{users[u_idx + 1]}'")
+                return None, had_net, saw_retry, "retry_user"
+
             wrong_hosts.add(server)
             _untried_local = [h for h in domain_local_hosts if h not in tried_hosts]
             _confirmed = (len(wrong_hosts) >= 2) or (not _untried_local)
+
             if (not confirm_wrong) or _confirmed:
                 return (None, WRONG,
                         f"{px_tag(px_used)} {proto} {server} -> {st_val}" + _wrong_detail_note(domain, password),
                         px_used, trace_logs), had_net, saw_retry, False
+
             trace_logs.append(
                 f"{px_tag(px_used)} WRONG on {server} -> PROVISIONAL "
                 f"({len(wrong_hosts)} host(s) agreed, {len(_untried_local)} local host(s) "
@@ -6489,7 +6517,7 @@ def _check_account_core(email, password, conf, domain, proxy_pool, thread_state,
                             elif st_val == RBL:
                                 trace_logs.append(f"{px_tag(px_used)} RBL block on {server}:{port} -> IP flagged by server, advancing")
                                 server_level_fail = True
-                            elif u_idx + 1 < len(users) and st_val in (WRONG, UNKNOWN, LOGIN_DROPPED):
+                            elif u_idx + 1 < len(users) and st_val in (UNKNOWN, LOGIN_DROPPED):
                                 flags["saw_server"] = True
                                 px_used, _ok = _rotate_to_fresh(px_used, seen_px, "local-part retry", keep_node=True)
                                 trace_logs.append(f"{px_tag(px_used)} Rejected as '{user}' -> retrying same host as local-part '{users[u_idx + 1]}'")
@@ -6562,7 +6590,7 @@ def _check_account_core(email, password, conf, domain, proxy_pool, thread_state,
                             elif st_val == RBL:
                                 trace_logs.append(f"{px_tag(px_used)} RBL block on {server}:{port} -> IP flagged by server, advancing")
                                 server_level_fail = True
-                            elif u_idx + 1 < len(users) and st_val in (WRONG, UNKNOWN, LOGIN_DROPPED):
+                            elif u_idx + 1 < len(users) and st_val in (UNKNOWN, LOGIN_DROPPED):
                                 flags["saw_server"] = True
                                 px_used, _ok = _rotate_to_fresh(px_used, seen_px, "local-part retry", keep_node=True)
                                 trace_logs.append(f"{px_tag(px_used)} Rejected as '{user}' -> retrying same host as local-part '{users[u_idx + 1]}'")
