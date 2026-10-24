@@ -1,619 +1,723 @@
+# @@BLOCK 000 FILE_HEADER deps=none
 """
-status.py — single source of truth for engine statuses and error classification.
+status.py - status vocabulary, classifier and label/colour metadata for the
+Mega Ultimate Mail Checker.
 
-Both naming conventions are exported (VALID + WRONG_PASSWORD, FAILED +
-CONNECTION_FAILED, RBL + RBL_BLOCKED, PROXY_UNHEALTHY, LOGIN_DROPPED, ...) so
-`from status import (...)` can never break.
+SINGLE SOURCE OF TRUTH for turning a raw server/proxy string into a verdict.
+app.py imports this module; if the import fails it falls back to the inline
+classifier in app.py block 004 (STATUS_IMPORT_FALLBACK).
 
-Classification order is deliberate:
-    APP -> WRONG_STRONG -> BARE_AUTH -> RBL -> DNS
-        -> RETRY_HARD -> SERVER_DROP -> CONN_STRONG -> RETRY -> CONN -> WRONG -> UNKNOWN
+P0-3 ORDERING CONTRACT - DO NOT REORDER _ORDER:
+    WRONG_STRONG  is evaluated BEFORE APP_PASSWORD and BEFORE RETRY_HARD.
+    backend / upstream / downstream live in RETRY_HARD, NOT in RETRY.
+    So 'NO [AUTHENTICATIONFAILED] ... OAUTH' resolves WRONG, not
+    NEED_APP_PASSWORD, and auth rejections no longer resolve RETRY_LATER.
 
-v13.32
-------
-* NEW STATUS — LOGIN_DROPPED (+ SERVER_DROPPED alias).
-  A mail server that ANSWERS, ACCEPTS the LOGIN command and then closes the
-  socket with an untagged "* BYE" was being classified UNKNOWN, dropped by
-  note_verdict() and reported as CONNECTION_FAILED — i.e. "we never reached the
-  server" when in fact the server spoke and read the credentials.
-
-  Real string from a live Windstream run:
-      command: LOGIN => IMAP server terminating connection
-  which is imaplib._command_complete wrapping an abort raised from
-  _get_tagged_response when the server sends an untagged * BYE during LOGIN.
-
-  This is a SERVER-side, credential-adjacent verdict, NOT a transport failure.
-  It is kept distinct from WRONG_PASSWORD because a * BYE is also what several
-  servers send for a per-IP/per-account connection cap or a policy refusal
-  (app-password required) — the caller can escalate to WRONG_PASSWORD when it
-  reproduces across independent egress IPs.
-
-* NEW TABLE _SERVER_DROP, TESTED BEFORE _CONN_STRONG.
-  _CONN_STRONG already owns "connection closed"/"connection aborted", so a BYE
-  had to be recognised before it.  Tokens: "terminating connection",
-  "server terminating", "* bye", "auth process broken", "connection is closed",
-  "server closed the connection".
-
-* NEW TABLE _RETRY_HARD, TESTED BEFORE _SERVER_DROP.
-  "* BYE Too many simultaneous connections" must stay RETRY_LATER, not become
-  LOGIN_DROPPED.  Tokens: too many / limit / quota / busy / throttle / rate limit.
-
-* PRIORITY RENUMBERED to seat LOGIN_DROPPED directly below WRONG_PASSWORD.
-  It outranks RETRY_LATER (a definite server answer beats "try again") and is
-  outranked by WRONG_PASSWORD (a definite answer beats an ambiguous one).
-
-v13.31
-------
-* "535" ADDED TO _WRONG.  SMTP submission answers a rejected credential with
-  "535 5.7.8 Username and Password not accepted".  app.py handles SmtpAuthError
-  with its own handler, but this is the safety net if one ever escapes.
-* No behavioural change for IMAP / POP3.
-
-v13.30
-------
-* CONN_STRONG IS TESTED BEFORE RETRY.  "connection reset by peer" sat in BOTH
-  the _RETRY and _CONN tables, and _RETRY was tested first - so a plain socket
-  reset was reported as RETRY_LATER ("rate-limited, try again") instead of
-  CONNECTION_FAILED, and RETRY_LATER outranks CONNECTION_FAILED in PRIORITY.
-* _RETRY NO LONGER CONTAINS "connection reset by peer".
-* is_conn_signal() helper.
-
-v13.19
-------
-* NEW STATUS — PROXY_UNHEALTHY.  Returned when every attempt for an account
-  failed in the PROXY hop (407 Proxy Authentication Required).
-* is_proxy_auth_fail() helper.
-* classify_proxy_error() — proxy-aware wrapper around classify_error().
-
-v13.18
-------
-* RBL / RBL_BLOCKED ARE NOW DEFINED.
-* Microsoft AADSTS codes added:
-    AADSTS50126 / AADSTS50034           -> WRONG_PASSWORD
-    AADSTS50076 / AADSTS50079 / 50074   -> NEED_APP_PASSWORD (MFA on)
-* ms_token_status() helper for the XOAUTH2 path.
-* RBL is checked before CONN and before WRONG.
+Every table is a tuple of lowercase substrings matched against normalise().
 """
 
-# ---------------------------------------------------------------------------
-# CANONICAL STATUSES  (every alias points at the same string)
-# ---------------------------------------------------------------------------
-VALID = "valid"
-WRONG = WRONG_PASSWORD = "wrong_password"
-APP = NEED_APP_PASSWORD = "need_app_password"
-FAILED = CONNECTION_FAILED = "connection_failed"
-PROXY_UNHEALTHY = "proxy_unhealthy"
-SKIP = SKIPPED_COOLDOWN = "skipped_cooldown"
-UNKNOWN = "unknown"
-RETRY = RETRY_LATER = "retry_later"
-RBL = RBL_BLOCKED = "rbl_blocked"
-SMTP_FAILED = "smtp_failed"
-DNS_FAILED = "dns_failed"
-ERROR = "error"
-# v13.32: server answered, accepted LOGIN, then closed the socket (* BYE).
-LOGIN_DROPPED = SERVER_DROPPED = "login_dropped"
+from __future__ import annotations
 
-ALL = [
-    VALID,
-    WRONG_PASSWORD,
-    NEED_APP_PASSWORD,
-    LOGIN_DROPPED,          # v13.32
-    RETRY_LATER,
-    RBL_BLOCKED,
-    SMTP_FAILED,
-    DNS_FAILED,
-    CONNECTION_FAILED,
-    PROXY_UNHEALTHY,
-    UNKNOWN,
-    SKIPPED_COOLDOWN,
-]
-ALL_STATUSES = ALL
+import re
 
-TERMINAL = {VALID, WRONG_PASSWORD, NEED_APP_PASSWORD}
+STATUS_VERSION = "v13.40"
+STATUS_BUILD = 1340
+# @@END 000
 
-# Lower value = "better" answer. Used by merge() and by the engine when it has
-# to pick between two verdicts it collected on the same account.
-# v13.32: LOGIN_DROPPED seats directly below WRONG_PASSWORD.
-PRIORITY = {
-    VALID: 0,
-    NEED_APP_PASSWORD: 1,
-    WRONG_PASSWORD: 2,
-    RBL_BLOCKED: 3,
-    LOGIN_DROPPED: 4,
-    RETRY_LATER: 5,
-    SMTP_FAILED: 6,
-    DNS_FAILED: 7,
-    CONNECTION_FAILED: 8,
-    PROXY_UNHEALTHY: 9,
-    UNKNOWN: 10,
-    SKIPPED_COOLDOWN: 11,
+
+# @@BLOCK 001 STATUSES deps=000
+STATUS_VALID = "VALID"
+STATUS_WRONG = "WRONG"
+STATUS_NEED_APP_PASSWORD = "NEED_APP_PASSWORD"
+STATUS_RETRY_LATER = "RETRY_LATER"
+STATUS_TIMEOUT = "TIMEOUT"
+STATUS_SERVER_DROP = "SERVER_DROP"
+STATUS_LOGIN_DROPPED = "LOGIN_DROPPED"
+STATUS_PROXY_UNHEALTHY = "PROXY_UNHEALTHY"
+STATUS_PROXY_BLOCKED = "PROXY_BLOCKED"
+STATUS_CONNECTION_FAILED = "CONNECTION_FAILED"
+STATUS_DNS_FAIL = "DNS_FAIL"
+STATUS_RBL_BLOCKED = "RBL_BLOCKED"
+STATUS_DISABLED = "DISABLED"
+STATUS_LOCKED = "LOCKED"
+STATUS_EXPIRED = "EXPIRED"
+STATUS_ERROR = "ERROR"
+STATUS_UNKNOWN = "UNKNOWN"
+
+STATUSES = (
+    STATUS_VALID,
+    STATUS_WRONG,
+    STATUS_NEED_APP_PASSWORD,
+    STATUS_DISABLED,
+    STATUS_LOCKED,
+    STATUS_EXPIRED,
+    STATUS_RETRY_LATER,
+    STATUS_TIMEOUT,
+    STATUS_LOGIN_DROPPED,
+    STATUS_SERVER_DROP,
+    STATUS_PROXY_UNHEALTHY,
+    STATUS_PROXY_BLOCKED,
+    STATUS_CONNECTION_FAILED,
+    STATUS_DNS_FAIL,
+    STATUS_RBL_BLOCKED,
+    STATUS_ERROR,
+    STATUS_UNKNOWN,
+)
+
+BUCKET_VALID = "valid"
+BUCKET_WRONG = "wrong"
+BUCKET_RETRY = "retry"
+BUCKET_DROPPED = "dropped"
+BUCKET_BLOCKED = "blocked"
+BUCKET_DEAD = "dead"
+BUCKET_UNKNOWN = "unknown"
+
+BUCKETS = (
+    BUCKET_VALID,
+    BUCKET_WRONG,
+    BUCKET_RETRY,
+    BUCKET_DROPPED,
+    BUCKET_BLOCKED,
+    BUCKET_DEAD,
+    BUCKET_UNKNOWN,
+)
+
+STATUS_BUCKET = {
+    STATUS_VALID: BUCKET_VALID,
+    STATUS_WRONG: BUCKET_WRONG,
+    STATUS_NEED_APP_PASSWORD: BUCKET_WRONG,
+    STATUS_DISABLED: BUCKET_WRONG,
+    STATUS_LOCKED: BUCKET_WRONG,
+    STATUS_EXPIRED: BUCKET_WRONG,
+    STATUS_RETRY_LATER: BUCKET_RETRY,
+    STATUS_TIMEOUT: BUCKET_RETRY,
+    STATUS_LOGIN_DROPPED: BUCKET_DROPPED,
+    STATUS_SERVER_DROP: BUCKET_DROPPED,
+    STATUS_PROXY_UNHEALTHY: BUCKET_BLOCKED,
+    STATUS_PROXY_BLOCKED: BUCKET_BLOCKED,
+    STATUS_RBL_BLOCKED: BUCKET_BLOCKED,
+    STATUS_CONNECTION_FAILED: BUCKET_DEAD,
+    STATUS_DNS_FAIL: BUCKET_DEAD,
+    STATUS_ERROR: BUCKET_UNKNOWN,
+    STATUS_UNKNOWN: BUCKET_UNKNOWN,
 }
+
+
+def bucket_of(status):
+    """Map any status token to its display bucket. Never raises."""
+    return STATUS_BUCKET.get(status, BUCKET_UNKNOWN)
+# @@END 001
+
+
+# @@BLOCK 002 PRIORITY_LABELS_COLORS deps=001
+PRIORITY_ORDER = (
+    STATUS_VALID,
+    STATUS_WRONG,
+    STATUS_DISABLED,
+    STATUS_LOCKED,
+    STATUS_EXPIRED,
+    STATUS_NEED_APP_PASSWORD,
+    STATUS_RETRY_LATER,
+    STATUS_TIMEOUT,
+    STATUS_LOGIN_DROPPED,
+    STATUS_SERVER_DROP,
+    STATUS_PROXY_UNHEALTHY,
+    STATUS_PROXY_BLOCKED,
+    STATUS_RBL_BLOCKED,
+    STATUS_CONNECTION_FAILED,
+    STATUS_DNS_FAIL,
+    STATUS_ERROR,
+    STATUS_UNKNOWN,
+)
+PRIORITY = {s: i for i, s in enumerate(PRIORITY_ORDER)}
 
 LABELS = {
-    VALID: "VALID",
-    WRONG_PASSWORD: "WRONG_PASSWORD",
-    NEED_APP_PASSWORD: "NEED_APP_PASSWORD",
-    LOGIN_DROPPED: "LOGIN_DROPPED",
-    RETRY_LATER: "RETRY_LATER",
-    RBL_BLOCKED: "RBL_BLOCKED",
-    SMTP_FAILED: "SMTP_FAILED",
-    DNS_FAILED: "DNS_FAILED",
-    CONNECTION_FAILED: "CONNECTION_FAILED",
-    PROXY_UNHEALTHY: "PROXY_UNHEALTHY",
-    UNKNOWN: "UNKNOWN",
-    SKIPPED_COOLDOWN: "SKIPPED_COOLDOWN",
+    STATUS_VALID: "Valid",
+    STATUS_WRONG: "Wrong password",
+    STATUS_NEED_APP_PASSWORD: "Needs app password",
+    STATUS_RETRY_LATER: "Retry later",
+    STATUS_TIMEOUT: "Timeout",
+    STATUS_SERVER_DROP: "Server dropped",
+    STATUS_LOGIN_DROPPED: "Login dropped",
+    STATUS_PROXY_UNHEALTHY: "Proxy unhealthy",
+    STATUS_PROXY_BLOCKED: "Proxy blocked (407)",
+    STATUS_CONNECTION_FAILED: "Connection failed",
+    STATUS_DNS_FAIL: "DNS failure",
+    STATUS_RBL_BLOCKED: "RBL blocked",
+    STATUS_DISABLED: "Disabled",
+    STATUS_LOCKED: "Locked",
+    STATUS_EXPIRED: "Expired",
+    STATUS_ERROR: "Error",
+    STATUS_UNKNOWN: "Unknown",
 }
+DEFAULT_LABEL = "Unknown"
 
 COLORS = {
-    VALID: "#22c55e",
-    WRONG_PASSWORD: "#ef4444",
-    LOGIN_DROPPED: "#f43f5e",
-    CONNECTION_FAILED: "#eab308",
-    PROXY_UNHEALTHY: "#e879f9",
-    NEED_APP_PASSWORD: "#3b82f6",
-    RETRY_LATER: "#ffffff",
-    RBL_BLOCKED: "#facc15",
-    SMTP_FAILED: "#a855f7",
-    DNS_FAILED: "#f97316",
-    UNKNOWN: "#94a3b8",
-    SKIPPED_COOLDOWN: "#a78bfa",
+    STATUS_VALID: "#22c55e",
+    STATUS_WRONG: "#ef4444",
+    STATUS_NEED_APP_PASSWORD: "#f59e0b",
+    STATUS_RETRY_LATER: "#38bdf8",
+    STATUS_TIMEOUT: "#0ea5e9",
+    STATUS_SERVER_DROP: "#a855f7",
+    STATUS_LOGIN_DROPPED: "#c084fc",
+    STATUS_PROXY_UNHEALTHY: "#fb923c",
+    STATUS_PROXY_BLOCKED: "#f97316",
+    STATUS_CONNECTION_FAILED: "#64748b",
+    STATUS_DNS_FAIL: "#94a3b8",
+    STATUS_RBL_BLOCKED: "#eab308",
+    STATUS_DISABLED: "#dc2626",
+    STATUS_LOCKED: "#b91c1c",
+    STATUS_EXPIRED: "#ea580c",
+    STATUS_ERROR: "#6b7280",
+    STATUS_UNKNOWN: "#8b93a7",
 }
+DEFAULT_COLOR = "#8b93a7"
 
-# ---------------------------------------------------------------------------
-# MATCH TABLES
-# ---------------------------------------------------------------------------
+# Bucket display metadata, kept here so pages never hardcode colours.
+BUCKET_LABELS = {
+    BUCKET_VALID: "Valid",
+    BUCKET_WRONG: "Wrong",
+    BUCKET_RETRY: "Retry",
+    BUCKET_DROPPED: "Dropped",
+    BUCKET_BLOCKED: "Blocked",
+    BUCKET_DEAD: "Dead",
+    BUCKET_UNKNOWN: "Unknown",
+}
+BUCKET_COLORS = {
+    BUCKET_VALID: "#22c55e",
+    BUCKET_WRONG: "#ef4444",
+    BUCKET_RETRY: "#38bdf8",
+    BUCKET_DROPPED: "#a855f7",
+    BUCKET_BLOCKED: "#fb923c",
+    BUCKET_DEAD: "#64748b",
+    BUCKET_UNKNOWN: "#8b93a7",
+}
+# @@END 002
+
+
+# @@BLOCK 003 MATCH_TABLES_APP_DNS deps=001
+# Greedy app-password / modern-auth table. NOW EVALUATED AFTER WRONG_STRONG.
 _APP_PASSWORD = (
-    "basic authentication is disabled",
-    "basic auth is disabled",
-    "basicauthenticationdisabled",
-    "app password",
-    "application specific password",
     "application-specific password",
+    "application specific password",
     "app-specific password",
     "app specific password",
-    "two-factor",
-    "two factor",
-    "2fa",
-    "2-step",
-    "2 step",
-    "mfa",
-    "multi-factor",
-    "multi factor",
-    "less secure app",
-    "less secure apps",
-    "lesssecureapp",
+    "app password",
+    "application password",
     "oauth",
     "oauth2",
-    "token required",
-    "an app password is required",
-    "use an app password",
-    "enable imap",
-    "imap access is disabled",
-    "imap is disabled",
-    "pop access is disabled",
-    "enable pop",
-    "web login required",
-    "via your web browser",
-    "sign in with",
-    "modern authentication",
-    "authenticate with",
-    "log in with your browser",
-    "consent",
+    "xoauth2",
+    "sasl",
     "tenant",
-    # Microsoft OAuth token refusals that mean "MFA is on"
-    "aadsts50076",
-    "aadsts50079",
-    "aadsts50074",
-    "strongauth",
+    "consent",
+    "admin approval",
+    "mfa",
+    "2fa",
+    "two-factor",
+    "two factor",
+    "multi-factor",
+    "multi factor",
+    "modern authentication",
+    "basic authentication is disabled",
+    "basic auth is disabled",
+    "less secure",
+    "less-secure",
+    "enable imap",
+    "imap access",
+    "web login required",
+    "log in via your web browser",
+    "unsupported authentication",
+    "no supported authentication",
+    "authmechanism",
 )
 
 _DNS = (
-    "does not resolve",
-    "failed to resolve",
     "name or service not known",
     "nodename nor servname",
-    "getaddrinfo",
-    "gaierror",
-    "no address associated",
+    "getaddrinfo failed",
     "temporary failure in name resolution",
-    "dns",
+    "no address associated with hostname",
+    "name resolution",
+    "socket.gaierror",
+    "gaierror",
     "nxdomain",
     "servfail",
+    "no such host",
+    "dns lookup",
+    "dns resolution",
+    "dns error",
 )
+# @@END 003
 
-# SOFT, retryable conditions.  Kept NARROW on purpose.
-_RETRY = (
-    "lookup failed",
-    "user could not be routed",
-    "could not route",
-    "retry",
-    "retry later",
-    "try again",
-    "temporarily unavailable",
-    "temporary failure",
-    "try again later",
-    "service unavailable",
-    "server busy",
-    "too many",
-    "rate limit",
-    "rate-limit",
-    "ratelimit",
-    "throttle",
-    "throttled",
-    "over quota",
-    "quota exceeded",
-    "mailbox full",
-    "system busy",
-    "try later",
-    "unavailable",
-    "authentication services unavailable",
+
+# @@BLOCK 004 MATCH_TABLES_RETRY_SERVERDROP deps=001
+# RETRY_HARD owns backend / upstream / downstream. These were pulled OUT of
+# RETRY in v13.40 because they were swallowing real auth rejections.
+_RETRY_HARD = (
     "backend",
     "upstream",
     "downstream",
-    "greylist",
-    "greylisted",
-    "unexpected extra arguments",
-)
-
-# v13.32: a RETRY condition that can ALSO arrive wrapped in a * BYE.
-# "* BYE Too many simultaneous connections" must stay RETRY_LATER, not become
-# LOGIN_DROPPED.  Tested BEFORE _SERVER_DROP.
-_RETRY_HARD = (
+    "try again later",
+    "please try again",
+    "temporarily",
+    "temporary failure",
+    "unavailable",
+    "server busy",
+    "server is busy",
     "too many",
-    "limit",
-    "quota",
-    "busy",
-    "throttle",
     "rate limit",
+    "ratelimit",
+    "throttl",
+    "overload",
+    "congestion",
+    "system error",
+    "internal error",
+    "service error",
+    "maintenance",
+)
+
+# Soft / transport-level retry. Deliberately does NOT contain
+# backend, upstream or downstream.
+_RETRY = (
+    "timeout",
+    "timed out",
+    "time out",
+    "deadline exceeded",
+    "deadline",
+    "retry",
     "try again",
-    "temporarily unavailable",
-)
-
-# v13.32: THE SERVER ANSWERED, THEN HUNG UP.  Tested BEFORE _CONN_STRONG, which
-# already owns "connection closed" / "connection aborted".
-#
-# imaplib renders a server-side close during LOGIN as
-#   "command: LOGIN => IMAP server terminating connection"
-# (an abort from _get_tagged_response on an untagged * BYE).  Some servers send
-# "* BYE Connection is closed" or "* BYE Auth process broken" instead.
-_SERVER_DROP = (
-    "terminating connection",
-    "imap server terminating",
-    "server terminating",
-    "* bye",
-    " bye ",
-    "bye ",
-    "auth process broken",
-    "connection is closed",
-    "server closed the connection",
-    "server dropped the connection",
-    "closing connection",
-)
-
-# v13.30: UNAMBIGUOUS transport failures.  Tested BEFORE _RETRY.
-_CONN_STRONG = (
-    "connection reset by peer",
     "connection reset",
     "reset by peer",
-    "connection refused",
-    "connection aborted",
-    "connection closed",
-    "connection dropped",
-    "connection lost",
-    "connection failure",
     "broken pipe",
-    "unexpected eof",
-    "eof occurred",
-    "socket error",
-    "socket closed",
-    "socket timeout",
-    "bad file descriptor",
-    "network is unreachable",
-    "no route to host",
-    "host is down",
-    "timed out",
-    "timeout",
-    "timedout",
-    "ssl",
-    "tls",
-    "wrong version number",
+    "connection aborted",
+    "premature",
+    "incomplete",
+    "bad greeting",
+    "no greeting",
+    "greeting",
     "handshake",
-    "certificate",
-    "cert verify",
-    "cannot connect",
-    "unable to connect",
-    "failed to connect",
-    "connect failed",
-    "connection negotiation failure",
-    "negotiation failure",
-    "not supported by server",
-    "stls not supported",
-    "starttls not supported",
-    "tls not supported",
-    "imap4rev1",
+    "tls",
+    "ssl",
 )
 
+# A post-LOGIN '* BYE' is the Windstream / mediacombb.net signature.
+_SERVER_DROP = (
+    "* bye",
+    "bye",
+    "server dropped",
+    "dropped connection",
+    "connection dropped",
+    "server closed",
+)
+
+_SERVER_DROP_HARD = (
+    "eof while reading",
+    "eof occurred",
+    "socket error: eof",
+    "unexpected eof",
+    "connection closed by remote",
+    "remote host closed",
+    "peer closed",
+)
+# @@END 004
+
+
+# @@BLOCK 005 MATCH_TABLES_CONN_RBL_WRONG deps=001
 _CONN = (
-    "407",
-    "proxy authentication",
-    "proxy auth",
-    "proxyconnect",
-    "proxy connect",
-    "proxy route",
-    "bad proxy format",
-    "proxy",
-    "socks",
+    "connection refused",
+    "connect refused",
+    "no route to host",
+    "network is unreachable",
+    "connect failed",
+    "cannot connect",
+    "failed to connect",
+    "connection error",
+    "unreachable",
+    "host is down",
+    "connection attempt failed",
+    "oserror",
+    "errno 111",
+    "errno 113",
+    "errno 101",
+    "errno 110",
 )
 
-# IP-reputation / greylist refusals.  Checked BEFORE _CONN and BEFORE _WRONG.
 _RBL = (
-    "rbl restriction",
-    "rbl",
-    "abusix",
-    "dnsbl",
-    "spamhaus",
-    "spam cop",
-    "spamcop",
     "blacklist",
     "blacklisted",
-    "blacklisted ip",
-    "ip blocked",
-    "ip is blocked",
-    "blocked ip",
+    "blocklist",
+    "block list",
+    "dnsbl",
+    "rbl",
+    "spamhaus",
+    "spamcop",
+    "barracuda",
+    "sorbs",
+    "spamrl",
+    "listed at",
+    "blocked by",
     "your ip",
+    "ip blocked",
 )
 
-_WRONG = (
+# Lower-confidence WRONG. Evaluated right after WRONG_STRONG so that
+# 'mailbox unavailable' does not fall through to RETRY_HARD.
+_WRONG_SOFT = (
+    "no such user",
+    "user unknown",
+    "unknown user",
+    "unknown username",
+    "account not found",
+    "mailbox not found",
+    "mailbox unavailable",
+    "user not found",
+    "does not exist",
+)
+
+# THE definitive auth-rejection table. MUST be first in _ORDER.
+_WRONG_STRONG = (
+    "aadsts50126",
+    "aadsts7000218",
+    "aadsts50034",
+    "aadsts50076",
     "authenticationfailed",
     "authentication failed",
-    "authenticate error",
-    "authenticate failed",
-    "authentication error",
-    "auth failed",
-    "auth failure",
+    "authenticationfailure",
     "invalid credentials",
     "invalid credential",
     "invalid login",
     "invalid password",
-    "invalid user",
-    "invalid username",
-    "invalid user name",
-    "invalid account",
+    "invalid username or password",
+    "username and password not accepted",
+    "logon failure",
+    "logon failed",
     "login incorrect",
     "login failed",
-    "login failure",
-    "login returned non-ok",
-    "login non-ok",
-    "login error",
-    "password incorrect",
-    "password invalid",
-    "wrong password",
-    "incorrect password",
-    "realmless login not allowed",
-    "realmless",
-    "auth error",
-    "[auth]",
-    "authentication",
-    "not authenticated",
     "bad credentials",
-    "bad username",
-    "bad password",
-    "logon failure",
-    "username and password not accepted",
-    "user rejected",
-    "password rejected",
-    "invalid token",
-    "expired token",
-    "internal server error",
-    # v13.31: SMTP submission credential rejection
-    "535",
-)
-
-# Strong, unambiguous auth phrases checked before the CONN and RBL tables.
-_WRONG_STRONG = (
-    "realmless login not allowed",
-    "authenticationfailed",
-    "authentication failed",
-    "invalid credentials",
-    "invalid user name or password",
-    "login incorrect",
     "wrong password",
-    "authenticate error",
-    "invalid login or password",
-    # Microsoft OAuth token refusals that mean "wrong password"
-    "aadsts50126",
-    "aadsts50034",
-    "invalid_grant",
+    "password incorrect",
+    "auth failed",
+    "authorization failed",
+    "not authenticated",
+    "account is disabled",
+    "account disabled",
+    "user is locked",
+    "account is locked",
+    "account locked",
+    "password expired",
+    "5.7.8",
+    "5.7.1",
+    "535 ",
+    "535-",
+    "590 ",
 )
+# @@END 005
 
-# BARE / TERSE auth replies.
-_BARE_AUTH = (
-    "login",
-    "logon",
-    "auth",
-    "authenticate",
-    "authentication",
-    "sign in",
-    "signin",
-    "sign-in",
-    "credentials",
-    "invalid",
-)
 
+# @@BLOCK 006 MATCH_TABLES_BARE_PROXYLEVEL deps=001
 _PROXY_LEVEL = (
     "407",
-    "proxy authentication required",
     "proxy authentication",
     "proxy auth",
-    "proxyconnect",
-    "proxy connect",
-    "proxy route",
-    "bad proxy format",
-    "socks",
+    "proxyerror",
+    "proxy error",
+    "tunnel connection failed",
+    "connect tunnel",
+    "cannot connect to proxy",
+    "bad gateway",
+    "502",
+    "503",
+    "504",
+    "gateway timeout",
+    "quota",
+    "bandwidth",
+    "subuser",
+    "sub-user",
+    "no available",
+    "all nodes busy",
 )
 
-
-def _norm(text):
-    return (text or "").strip().lower()
-
-
-def _match(text, needles):
-    return any(n in text for n in needles)
-
-
-def _is_bare_auth(text):
-    return text.strip().rstrip(".:!,;").strip() in _BARE_AUTH
-
+_BARE = (
+    "error",
+    "failed",
+    "failure",
+    "denied",
+    "invalid",
+    "bad",
+    "closed",
+    "aborted",
+    "dropped",
+)
 
 # ---------------------------------------------------------------------------
-# CLASSIFIER
+# EVALUATION ORDER. Index 0 wins. WRONG_STRONG is deliberately first.
 # ---------------------------------------------------------------------------
-def classify_error(raw, domain=""):
-    """Map a raw server/socket error string to an engine status.
+_ORDER = (
+    ("WRONG_STRONG", _WRONG_STRONG, STATUS_WRONG),
+    ("WRONG_SOFT", _WRONG_SOFT, STATUS_WRONG),
+    ("SERVER_DROP", _SERVER_DROP, STATUS_LOGIN_DROPPED),
+    ("SERVER_DROP_HARD", _SERVER_DROP_HARD, STATUS_SERVER_DROP),
+    ("APP_PASSWORD", _APP_PASSWORD, STATUS_NEED_APP_PASSWORD),
+    ("DNS", _DNS, STATUS_DNS_FAIL),
+    ("RBL", _RBL, STATUS_RBL_BLOCKED),
+    ("CONN", _CONN, STATUS_CONNECTION_FAILED),
+    ("PROXY_LEVEL", _PROXY_LEVEL, STATUS_PROXY_UNHEALTHY),
+    ("RETRY_HARD", _RETRY_HARD, STATUS_RETRY_LATER),
+    ("RETRY", _RETRY, STATUS_RETRY_LATER),
+    ("BARE", _BARE, STATUS_ERROR),
+)
 
-    Order:
-      APP -> WRONG_STRONG -> BARE_AUTH -> RBL -> DNS
-          -> RETRY_HARD -> SERVER_DROP -> CONN_STRONG -> RETRY -> CONN -> WRONG -> UNKNOWN
-
-    CONN_STRONG runs BEFORE RETRY (v13.30) so a transport reset is never read as
-    a soft "try again"; RETRY runs before CONN so a proxy "Socket error: 407" is
-    never read as an auth failure by a generic token.
-
-    v13.32: SERVER_DROP runs BEFORE CONN_STRONG so an untagged "* BYE" is not
-    swallowed by the "connection closed"/"connection aborted" tokens, and
-    RETRY_HARD runs before SERVER_DROP so "* BYE Too many connections" stays
-    RETRY_LATER.
-    """
-    t = _norm(raw)
-    if not t:
-        return UNKNOWN
-
-    if _match(t, _APP_PASSWORD):
-        return NEED_APP_PASSWORD
-
-    if _match(t, _WRONG_STRONG):
-        return WRONG_PASSWORD
-
-    if _is_bare_auth(t):
-        return WRONG_PASSWORD
-
-    if _match(t, _RBL):
-        return RBL_BLOCKED
-    if _match(t, _DNS):
-        return DNS_FAILED
-
-    # v13.32: a * BYE that is really a rate/connection cap must stay RETRY.
-    if _match(t, _RETRY_HARD):
-        return RETRY_LATER
-    # v13.32: the server answered, read the LOGIN, then hung up.
-    if _match(t, _SERVER_DROP):
-        return LOGIN_DROPPED
-
-    if _match(t, _CONN_STRONG):
-        return CONNECTION_FAILED
-    if _match(t, _RETRY):
-        return RETRY_LATER
-    if _match(t, _CONN):
-        return CONNECTION_FAILED
-    if _match(t, _WRONG):
-        return WRONG_PASSWORD
-    return UNKNOWN
+TABLES = {name: (table, status) for name, table, status in _ORDER}
+TABLE_NAMES = tuple(name for name, _t, _s in _ORDER)
+# @@END 006
 
 
-def classify_proxy_error(raw, domain=""):
-    """Proxy-aware wrapper: a 407 / proxy-auth failure is PROXY_UNHEALTHY."""
-    if is_proxy_auth_fail(raw):
-        return PROXY_UNHEALTHY
-    return classify_error(raw, domain)
+# @@BLOCK 007 NORMALISE_HELPERS deps=006
+_WS_RE = re.compile(r"\s+")
 
 
-def ms_token_status(code):
-    """Map a Microsoft AADSTS code to an engine status."""
-    c = (code or "").upper()
-    if c in ("AADSTS50126", "AADSTS50034"):
-        return WRONG_PASSWORD
-    if c in ("AADSTS50076", "AADSTS50079", "AADSTS50074"):
-        return NEED_APP_PASSWORD
+def normalise(text):
+    """Lowercase, collapse whitespace, decode bytes. Never raises."""
+    if text is None:
+        return ""
+    if isinstance(text, (bytes, bytearray)):
+        try:
+            text = bytes(text).decode("utf-8", "replace")
+        except Exception:
+            text = repr(text)
+    try:
+        s = str(text)
+    except Exception:
+        return ""
+    s = s.replace("\r", " ").replace("\n", " ").replace("\t", " ")
+    s = _WS_RE.sub(" ", s)
+    return s.strip().lower()
+
+
+def first_match(haystack, table):
+    """First needle from table present in haystack, else None."""
+    for needle in table:
+        if needle in haystack:
+            return needle
     return None
 
 
-def is_retry_signal(raw):
-    t = _norm(raw)
-    if _match(t, _CONN_STRONG):
-        return False
-    return _match(t, _RETRY)
+def hits(haystack, table):
+    """Every needle from table present in haystack, in table order."""
+    return [n for n in table if n in haystack]
+# @@END 007
 
 
-def is_conn_signal(raw):
-    """v13.30: True for an unambiguous transport failure."""
-    t = _norm(raw)
-    if _match(t, _SERVER_DROP):
-        return False
-    return _match(t, _CONN_STRONG) or _match(t, _CONN)
+# @@BLOCK 008 CLASSIFIER deps=007
+def classify_detail(text, default=STATUS_UNKNOWN):
+    """Return (status, table_name, needle) for the first matching table."""
+    s = normalise(text)
+    if not s:
+        return default, "EMPTY", None
+    for name, table, status in _ORDER:
+        needle = first_match(s, table)
+        if needle is not None:
+            return status, name, needle
+    return default, "DEFAULT", None
 
 
-def is_login_drop_signal(raw):
-    """v13.32: True when the server accepted LOGIN then closed the socket (* BYE)."""
-    t = _norm(raw)
-    if _match(t, _RETRY_HARD):
-        return False
-    return _match(t, _SERVER_DROP)
+def classify_error(text, default=STATUS_UNKNOWN):
+    """Map a raw server/proxy/exception string to a status token."""
+    return classify_detail(text, default)[0]
 
 
-def is_proxy_auth_fail(raw):
-    """True when the PROXY itself rejected us (407). Not a mail-host problem."""
-    t = _norm(raw)
-    return ("407" in t) or ("proxy authentication required" in t)
+def explain(text, default=STATUS_UNKNOWN):
+    """Human string describing why text classified the way it did."""
+    status, table, needle = classify_detail(text, default)
+    if needle is None:
+        return "%s (no table matched, default)" % status
+    return "%s (table=%s, needle=%r)" % (status, table, needle)
+# @@END 008
 
 
-def is_proxy_level_error(raw):
-    """True when the failure happened in the PROXY hop, not the mail server."""
-    return _match(_norm(raw), _PROXY_LEVEL)
+# @@BLOCK 009 SIGNAL_HELPERS deps=008
+def is_valid(status):
+    return status == STATUS_VALID
 
 
-def is_app_password_signal(raw):
-    return _match(_norm(raw), _APP_PASSWORD)
+def is_wrong(status):
+    return bucket_of(status) == BUCKET_WRONG
 
 
-def is_dns_signal(raw):
-    return _match(_norm(raw), _DNS)
+def is_retry(status):
+    return bucket_of(status) in (BUCKET_RETRY, BUCKET_DROPPED)
 
 
-def is_rbl_signal(raw):
-    return _match(_norm(raw), _RBL)
+def is_drop(status):
+    return bucket_of(status) == BUCKET_DROPPED
 
 
-def is_wrong_password_signal(raw):
-    t = _norm(raw)
-    return _is_bare_auth(t) or _match(t, _WRONG_STRONG) or _match(t, _WRONG)
+def is_blocked(status):
+    return bucket_of(status) == BUCKET_BLOCKED
 
 
-# ---------------------------------------------------------------------------
-# SMALL HELPERS
-# ---------------------------------------------------------------------------
-def merge(*statuses):
-    cand = [s for s in statuses if s]
-    if not cand:
-        return UNKNOWN
-    return sorted(cand, key=lambda s: PRIORITY.get(s, 99))[0]
+def is_dead(status):
+    return bucket_of(status) == BUCKET_DEAD
 
 
-def is_terminal(status):
-    return status in TERMINAL
+def is_definitive(status):
+    """True when no amount of retrying should change the verdict."""
+    return status in (
+        STATUS_VALID,
+        STATUS_WRONG,
+        STATUS_DISABLED,
+        STATUS_LOCKED,
+        STATUS_EXPIRED,
+    )
 
 
-def is_failure(status):
-    return status in (CONNECTION_FAILED, PROXY_UNHEALTHY, DNS_FAILED,
-                      SMTP_FAILED, LOGIN_DROPPED, UNKNOWN)
+def worst_of(statuses):
+    """Lowest-priority-number status wins. Empty input -> UNKNOWN."""
+    best = None
+    best_rank = None
+    for s in statuses:
+        rank = PRIORITY.get(s)
+        if rank is None:
+            continue
+        if best_rank is None or rank < best_rank:
+            best, best_rank = s, rank
+    return best or STATUS_UNKNOWN
 
 
-def display(status):
-    return LABELS.get(status, status)
+def summarise(statuses):
+    """Counter dict of status -> count, plus a 'total' key."""
+    out = {}
+    for s in statuses:
+        out[s] = out.get(s, 0) + 1
+    out["total"] = len(list(statuses))
+    return out
 
 
-def color(status):
-    return COLORS.get(status, "#cbd5e1")
+def completion_status(statuses, ran=True):
+    """Coarse run outcome used by the app footer."""
+    seq = list(statuses)
+    if not ran:
+        return "not_run"
+    if not seq:
+        return "no_accounts"
+    if any(is_valid(s) for s in seq):
+        return "completed"
+    if all(is_definitive(s) or is_dead(s) for s in seq):
+        return "completed_no_valid"
+    return "partial"
+# @@END 009
 
 
-def upper(status):
-    return str(status or "").upper()
+# @@BLOCK 010 SMALL_HELPERS deps=002
+def label_for(status):
+    return LABELS.get(status, DEFAULT_LABEL)
+
+
+def color_for(status):
+    return COLORS.get(status, DEFAULT_COLOR)
+
+
+def priority_for(status):
+    return PRIORITY.get(status, len(PRIORITY_ORDER))
+
+
+def bucket_label(bucket):
+    return BUCKET_LABELS.get(bucket, str(bucket).title())
+
+
+def bucket_color(bucket):
+    return BUCKET_COLORS.get(bucket, DEFAULT_COLOR)
+
+
+def badge(status):
+    """Tiny HTML pill for a status token."""
+    return (
+        '<span style="display:inline-block;padding:1px 7px;border-radius:999px;'
+        'font-size:11px;font-weight:600;color:#0b0f19;background:%s;">%s</span>'
+        % (color_for(status), label_for(status))
+    )
+# @@END 010
+
+
+# @@BLOCK 011 FOOTER deps=010
+def selftest():
+    """Ordering assertions. Returns list of (name, ok, detail)."""
+    cases = (
+        ("auth_plus_oauth_is_wrong",
+         "NO [AUTHENTICATIONFAILED] Invalid credentials (Failure) OAUTH",
+         STATUS_WRONG),
+        ("aadsts_is_wrong",
+         "AADSTS50126: Error validating credentials",
+         STATUS_WRONG),
+        ("backend_is_not_retry_for_auth",
+         "NO [AUTHENTICATIONFAILED] backend said no",
+         STATUS_WRONG),
+        ("app_password_still_works",
+         "Application-specific password required",
+         STATUS_NEED_APP_PASSWORD),
+        ("upstream_alone_is_retry",
+         "upstream temporarily unavailable",
+         STATUS_RETRY_LATER),
+        ("bye_is_login_dropped",
+         "* BYE Windstream closing connection",
+         STATUS_LOGIN_DROPPED),
+        ("eof_is_server_drop",
+         "socket error: EOF while reading",
+         STATUS_SERVER_DROP),
+        ("dns_is_dns",
+         "getaddrinfo failed for imap.example.net",
+         STATUS_DNS_FAIL),
+        ("407_is_proxy",
+         "CONNECT tunnel failed: 407 Proxy Authentication Required",
+         STATUS_PROXY_UNHEALTHY),
+        ("rbl_is_rbl",
+         "Your IP is blacklisted by Spamhaus",
+         STATUS_RBL_BLOCKED),
+        ("empty_is_default",
+         "",
+         STATUS_UNKNOWN),
+    )
+    out = []
+    for name, text, want in cases:
+        got = classify_error(text)
+        out.append((name, got == want, "want=%s got=%s" % (want, got)))
+    return out
+
+
+__all__ = (
+    "STATUS_VERSION",
+    "STATUS_BUILD",
+    "STATUSES",
+    "BUCKETS",
+    "STATUS_BUCKET",
+    "PRIORITY",
+    "LABELS",
+    "COLORS",
+    "BUCKET_LABELS",
+    "BUCKET_COLORS",
+    "TABLES",
+    "TABLE_NAMES",
+    "normalise",
+    "classify_error",
+    "classify_detail",
+    "explain",
+    "bucket_of",
+    "is_valid",
+    "is_wrong",
+    "is_retry",
+    "is_drop",
+    "is_blocked",
+    "is_dead",
+    "is_definitive",
+    "worst_of",
+    "summarise",
+    "completion_status",
+    "label_for",
+    "color_for",
+    "priority_for",
+    "bucket_label",
+    "bucket_color",
+    "badge",
+    "selftest",
+)
+# @@END 011
