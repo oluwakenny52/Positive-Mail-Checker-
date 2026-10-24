@@ -242,7 +242,9 @@ def main():
 
         # ---- P1 ----
         has(app, 'if "Fast-fail DNS check" not in err_text:',
-            # ---- P0-v13.39: a WRONG must be confirmed before it ends the ladder ----
+            "P1 local DNS RuntimeError no longer sets saw_server")
+
+        # ---- P0-v13.39: a WRONG must be confirmed before it ends the ladder ----
         has(app, "wrong_hosts.add(server)", "P0 provisional WRONG tracking present")
         has(app, "if (not confirm_wrong) or _confirmed:",
             "P0 WRONG early-return is gated on confirmation")
@@ -252,7 +254,17 @@ def main():
             "P0 note_verdict has a force path")
         has(app, "if st_val not in (VALID, WRONG, APP, RBL, LOGIN_DROPPED, UNKNOWN):",
             "P0 UNKNOWN is retained")
-            "P1 local DNS RuntimeError no longer sets saw_server")
+        # v13.39b: the helper must not name anything undefined, and must hold
+        # exactly ONE WRONG block (the duplicated copy was dead code).
+        has(app, "[h for h in domain_local_hosts if h not in tried_hosts]",
+            "P0 the confirmation gate uses domain_local_hosts")
+        gone(app_code, "_dialable_local", "_dialable_local is not referenced anywhere")
+        _nw = app.count("wrong_hosts.add(server)")
+        if _nw != 1:
+            FAILS.append("P0 the WRONG block is duplicated inside "
+                         "_handle_app_or_wrong (wrong_hosts.add appears %d x, want 1)" % _nw)
+        else:
+            PASSES.append("P0 exactly one WRONG block in the helper")
         has(app, "def _resolve_cached(", "P1 shared DNS TTL cache present")
         has(app, "return _resolve_cached(host) is not None",
             "P1 fast_fail_dns_check uses the shared cache")
