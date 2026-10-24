@@ -1,3 +1,5 @@
+# @@FILE pages/4_Downloads.py blocks=16 version=v13.40
+# @@BLOCK 000 FILE_HEADER deps=-
 """
 pages/4_Downloads.py — Bobito Export Studio  (v13.40)
 =====================================================
@@ -17,17 +19,26 @@ import zipfile
 from datetime import datetime
 
 import streamlit as st
+# @@END 000
 
+
+# @@BLOCK 001 PAGE_CONFIG deps=000
 st.set_page_config(
     page_title="Export Studio · Downloads",
     page_icon="📦",
     layout="wide",
     initial_sidebar_state="collapsed",
 )
+# @@END 001
 
+
+# @@BLOCK 002 APP_PATHS deps=000
 APP_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 PRESET_FILE = os.path.join(APP_DIR, "download_presets.json")
+# @@END 002
 
+
+# @@BLOCK 003 THEME deps=002
 # --------------------------------------------------------------------------
 # theme mirror
 # --------------------------------------------------------------------------
@@ -49,7 +60,10 @@ def _load_theme():
 
 
 _TH = _load_theme()
+# @@END 003
 
+
+# @@BLOCK 004 CSS deps=003
 st.markdown(
     f"""
 <style>
@@ -87,14 +101,20 @@ st.markdown(
 """,
     unsafe_allow_html=True,
 )
+# @@END 004
 
+
+# @@BLOCK 005 HERO deps=004
 st.markdown(
     '<div class="ex-hero"><h1>📦 Export Studio</h1>'
     '<p>Choose what to download, choose the exact format, preview it, take it. '
     'No mailbox connection, no proxy credit spent.</p></div>',
     unsafe_allow_html=True,
 )
+# @@END 005
 
+
+# @@BLOCK 006 SOURCE_TABLES deps=002
 # --------------------------------------------------------------------------
 # sources
 # --------------------------------------------------------------------------
@@ -176,8 +196,10 @@ FORMAT_PRESETS = {
     "full annotated": "{n} | {email}:{password} | {status} | {host}:{port} | {detail}",
     "CUSTOM": "",
 }
+# @@END 006
 
 
+# @@BLOCK 007 PARSERS deps=006
 def _parse(line, source, status_hint):
     raw = line.rstrip("\n")
     if not raw.strip() or raw.startswith("#"):
@@ -232,8 +254,10 @@ def _load(selection):
             except Exception as ex:
                 st.warning(f"{label}: {ex}")
     return rows
+# @@END 007
 
 
+# @@BLOCK 008 FORMATTERS deps=007
 def _fmt(rows, template, delim, crlf, header, prefix, suffix,
          sort_key, dedupe, lower, regex_inc, regex_exc, host_filter):
     sel = rows
@@ -311,8 +335,10 @@ def _json_of(rows, lines=True):
     return json.dumps([{k: r[k] for k in
                         ("email", "password", "domain", "status", "host", "port", "detail")}
                        for r in rows], indent=2)
+# @@END 008
 
 
+# @@BLOCK 009 PRESETS_IO deps=002
 def _presets():
     try:
         if os.path.exists(PRESET_FILE):
@@ -329,8 +355,10 @@ def _save_presets(d):
             json.dump(d, f, indent=2)
     except Exception:
         pass
+# @@END 009
 
 
+# @@BLOCK 010 SIDEBAR deps=006
 # --------------------------------------------------------------------------
 # sidebar — source + format
 # --------------------------------------------------------------------------
@@ -403,7 +431,10 @@ with st.sidebar:
             if p_use != "--" and st.button("Apply", use_container_width=True):
                 st.session_state["_ex_apply"] = p_use
                 st.rerun()
+# @@END 010
 
+
+# @@BLOCK 011 PRESET_APPLY deps=010
 if st.session_state.get("_ex_apply"):
     _p = _presets().get(st.session_state.pop("_ex_apply"))
     if _p:
@@ -416,7 +447,10 @@ if st.session_state.get("_ex_apply"):
         dedupe, lower = _p.get("dedupe", True), _p.get("lower", True)
         name_pat = _p.get("name_pat", "export_{status}_{count}_{stamp}")
         picked = [s for s in _p.get("sources", picked) if s in labels] or picked
+# @@END 011
 
+
+# @@BLOCK 012 BUILD deps=011
 # --------------------------------------------------------------------------
 # build
 # --------------------------------------------------------------------------
@@ -457,7 +491,10 @@ st.download_button(
     type="primary",
     use_container_width=True,
 )
+# @@END 012
 
+
+# @@BLOCK 013 TABS deps=012
 tab_txt, tab_csv, tab_json, tab_zip, tab_break = st.tabs(
     ["Text / template", "CSV", "JSON", "ZIP (all formats)", "Per-status split"]
 )
@@ -512,9 +549,18 @@ with tab_break:
                                file_name=f"{tag}_{len(by[tag])}.txt",
                                mime="text/plain", key=f"dl_{tag}")
             st.code(body, language="text")
+# @@END 013
 
+
+# @@BLOCK 014 FOOTER deps=013
 st.markdown("---")
 try:
     st.page_link("app.py", label="← Back to the Mail Checker")
 except Exception:
     st.caption("The main checker lives at app.py")
+# @@END 014
+
+
+# @@BLOCK 015 TRAILING deps=014
+# (reserved tail - keeps the file closed after the last block)
+# @@END 015
