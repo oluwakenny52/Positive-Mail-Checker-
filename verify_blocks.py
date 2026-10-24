@@ -48,6 +48,7 @@ import tokenize
 BLOCKED_FILES = (
     "app.py",
     "status.py",
+    "engine.py",
     "pages/2_Diagnostics.py",
     "pages/3_Mailbox_Reader.py",
     "pages/4_Downloads.py",
