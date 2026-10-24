@@ -218,27 +218,35 @@ def page_numbers():
 
 
 def main():
-    app_path = "app.py"
+    app_path = "engine.py"
+    ui_path = "app.py"
     dia_path = "pages/2_Diagnostics.py"
     rdr_path = "pages/3_Mailbox_Reader.py"
     req_path = "requirements.txt"
 
-    for p in (app_path, dia_path, rdr_path, req_path):
+    for p in (app_path, ui_path, dia_path, rdr_path, req_path):
         if not os.path.exists(p):
             FAILS.append(p + " is MISSING")
 
-    app = read(app_path) if os.path.exists(app_path) else ""
+    app = ""
+    if os.path.exists(app_path):
+        app += read(app_path)
+    if os.path.exists(ui_path):
+        app += "\n\n" + read(ui_path)
+    ui_src = read(ui_path) if os.path.exists(ui_path) else ""
     dia = read(dia_path) if os.path.exists(dia_path) else ""
     rdr = read(rdr_path) if os.path.exists(rdr_path) else ""
     req = read(req_path) if os.path.exists(req_path) else ""
 
     if app:
-        compiles(app_path, app)
-        tokenizes(app_path, app)
-        parses(app_path, app)
+        for _p in (app_path, ui_path):
+            _s = read(_p)
+            compiles(_p, _s)
+            tokenizes(_p, _s)
+            parses(_p, _s)
+            stray_lines(_p, code_view(_s))
         app_code = code_view(app)
-        stray_lines(app_path, app_code)
-        seam_is_intact(app)
+        seam_is_intact(ui_src)
 
         has(app, "Mega Ultimate Mail Checker - v13.40", "app.py header is v13.40")
 
