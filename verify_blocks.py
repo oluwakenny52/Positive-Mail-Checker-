@@ -108,7 +108,7 @@ def code_view(src):
     except Exception:
         return src
     for tok in toks:
-        if tok.type not in (tokenize.COMMENT, tokenize.STRING):
+        if tok.type not in BLANK_TOKENS:
             continue
         start, end = pos(*tok.start), pos(*tok.end)
         for i in range(start, min(end, len(chars))):
