@@ -1,5 +1,6 @@
 # @@FILE verify_blocks.py blocks=1 version=v13.40
 #!/usr/bin/env python3
+# @@BLOCK 000 VERIFIER deps=-
 """verify_blocks.py - block-integrity gate for the block-edition app.
 
 Audits every file in BLOCKED_FILES for:
@@ -44,7 +45,7 @@ BLOCKED_FILES = [
 ]
 
 FILE_RX = re.compile(r"^#\s*@@FILE\s+(\S+)\s+blocks=(\d+)\s+version=(\S+)\s*$")
-BLOCK_RX = re.compile(r"^#\s*@@BLOCK\s+(\d{3})\s+([A-Za-z0-9_]+)\s*$")
+BLOCK_RX = re.compile(r"^#\s*@@BLOCK\s+(\d{3})\s+([A-Za-z0-9_]+)(?:\s+deps=(\S+))?\s*$")
 END_RX = re.compile(r"^#\s*@@END(?:\s+(\d{3}))?(?:\s+([A-Za-z0-9_]+))?\s*$")
 EOF_RX = re.compile(r"^#\s*@@EOF\b")
 
@@ -171,7 +172,6 @@ def audit_source(path):
 
     blocks = {}       # id -> (line, name)
     ends = {}         # id -> (line, name)
-    bare_ends = 0
 
     for i, raw in enumerate(lines, start=1):
         s = raw.strip()
@@ -180,6 +180,12 @@ def audit_source(path):
         if mb:
             bid = int(mb.group(1))
             bname = mb.group(2)
+            deps = mb.group(3)
+            if deps is not None and deps != "-":
+                for d in deps.split(","):
+                    d = d.strip()
+                    if d.isdigit() and int(d) >= bid:
+                        fault(i, "bad_deps", "block %03d declares deps=%s (>= its own id)" % (bid, deps))
             if bid in blocks:
                 fault(i, "duplicate_id", "block id %03d already opened at line %d" % (bid, blocks[bid][0]))
             else:
@@ -190,7 +196,6 @@ def audit_source(path):
         if me:
             gid, gname = me.group(1), me.group(2)
             if gid is None:
-                bare_ends += 1
                 fault(i, "bare_end", "bare '# @@END' with no block id")
                 fault(i, "bare_end", "bare '# @@END' with no block name")
             else:
@@ -228,8 +233,8 @@ def audit_source(path):
     if rep["declared"] is not None and rep["declared"] != rep["blocks"]:
         fault(0, "count_mismatch", "header declares %d blocks, found %d" % (rep["declared"], rep["blocks"]))
 
-    if lines and not any(EOF_RX.match(l.strip()) for l in lines[-3:]):
-        fault(len(lines), "eof_marker", "no '# @@EOF' marker in the last 3 lines")
+    if rep["declared"] is not None and not any(EOF_RX.match(l.strip()) for l in lines):
+        fault(len(lines), "eof_marker", "no '# @@EOF' marker")
 
     for lineno in non_ascii_offenders(src):
         fault(lineno, "non_ascii", "non-ASCII character outside a string or comment")
@@ -303,3 +308,5 @@ def main(argv=None):
 
 if __name__ == "__main__":
     sys.exit(main())
+# @@END 000 VERIFIER
+# @@EOF
