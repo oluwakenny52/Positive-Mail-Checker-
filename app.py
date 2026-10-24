@@ -6256,7 +6256,7 @@ def _check_account_core(email, password, conf, domain, proxy_pool, thread_state,
                     trace_logs.append(f"{px_tag(px_used)} App-password signal as '{user}' -> retrying same host as local-part '{users[u_idx + 1]}'")
                     return None, had_net, saw_retry, "retry_user"
                 app_hosts.add(server)
-                _untried_local = [h for h in domain_local_hosts if h not in tried_hosts]
+                _untried_local = [h for h in _dialable_local if h not in tried_hosts]
                 _confirmed = (len(app_hosts) >= 2) or (not _untried_local)
                 if (not confirm_wrong) or _confirmed:
                     # A definitive XOAUTH2 WRONG outranks a basic-auth "app
@@ -6272,6 +6272,35 @@ def _check_account_core(email, password, conf, domain, proxy_pool, thread_state,
                     f"({len(app_hosts)} host(s) agreed, {len(_untried_local)} local host(s) "
                     f"still untried) -> continuing")
                 return None, had_net, saw_retry, True
+
+            # ---- WRONG -------------------------------------------------------
+            # v13.39: the local-part retry runs FIRST, exactly as it did before the
+            # dedup - a legacy Zimbra/cPanel/Dovecot front answers
+            # AUTHENTICATIONFAILED for 'user@domain' and accepts 'user'.  It must
+            # also run BEFORE wrong_hosts.add(), because the host has not been
+            # authoritatively tested until every username candidate is exhausted -
+            # otherwise one host can satisfy the confirmation gate on a username
+            # it was always going to reject.
+            if u_idx + 1 < len(users):
+                flags["saw_server"] = True
+                px_used, _ok = _rotate_to_fresh(px_used, seen_px, "local-part retry", keep_node=True)
+                trace_logs.append(f"{px_tag(px_used)} Rejected as '{user}' -> retrying same host as local-part '{users[u_idx + 1]}'")
+                return None, had_net, saw_retry, "retry_user"
+
+            wrong_hosts.add(server)
+            _untried_local = [h for h in _dialable_local if h not in tried_hosts]
+            _confirmed = (len(wrong_hosts) >= 2) or (not _untried_local)
+
+            if (not confirm_wrong) or _confirmed:
+                return (None, WRONG,
+                        f"{px_tag(px_used)} {proto} {server} -> {st_val}" + _wrong_detail_note(domain, password),
+                        px_used, trace_logs), had_net, saw_retry, False
+
+            trace_logs.append(
+                f"{px_tag(px_used)} WRONG on {server} -> PROVISIONAL "
+                f"({len(wrong_hosts)} host(s) agreed, {len(_untried_local)} local host(s) "
+                f"still untried) -> continuing the ladder")
+            return None, had_net, saw_retry, True
 
             # ---- WRONG -------------------------------------------------------
             # v13.39: the local-part retry runs FIRST, exactly as it did before the
