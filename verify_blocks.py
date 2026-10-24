@@ -43,6 +43,7 @@ import io
 import os
 import re
 import sys
+import token
 import tokenize
 
 BLOCKED_FILES = (
@@ -72,6 +73,26 @@ def _line_offsets(src):
     for ln in src.splitlines(keepends=True):
         offs.append(offs[-1] + len(ln))
     return offs
+
+
+def _blank_types():
+    """Token types blanked out before the landmine scan.
+
+    Python 3.12+ splits an f-string into FSTRING_START / FSTRING_MIDDLE /
+    FSTRING_END instead of one STRING token.  Without this, every emoji inside
+    an f-string was falsely reported as non-ASCII outside a comment/string.
+    """
+    types = {tokenize.COMMENT, tokenize.STRING}
+    for name in ("FSTRING_START", "FSTRING_MIDDLE", "FSTRING_END"):
+        val = getattr(tokenize, name, None)
+        if val is None:
+            val = getattr(token, name, None)
+        if val is not None:
+            types.add(val)
+    return frozenset(types)
+
+
+BLANK_TOKENS = _blank_types()
 
 
 def code_view(src):
