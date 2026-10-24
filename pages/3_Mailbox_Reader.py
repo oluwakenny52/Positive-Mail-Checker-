@@ -1,3 +1,4 @@
+# @@FILE pages/3_Mailbox_Reader.py blocks=44 version=v13.40
 # @@BLOCK 000 FILE_HEADER deps=-
 """
 pages/3_Mailbox_Reader.py — Bobito Mailbox Reader & Portal Hub  (v13.39)
