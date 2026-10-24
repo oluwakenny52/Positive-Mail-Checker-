@@ -1,3 +1,5 @@
+# @@FILE pages/2_Diagnostics.py blocks=20 version=v13.40
+# @@BLOCK 000 FILE_HEADER deps=-
 """
 pages/2_Diagnostics.py — Mega Ultimate Mail Checker  (v13.37)
 ============================================================
@@ -38,9 +40,15 @@ import socket
 from datetime import datetime
 
 import streamlit as st
+# @@END 000
 
+
+# @@BLOCK 001 PAGE_CONFIG deps=000
 st.set_page_config(page_title="Diagnostics · Mail Checker", page_icon="🔍", layout="wide")
+# @@END 001
 
+
+# @@BLOCK 002 SYSPATH deps=000
 # --------------------------------------------------------------------------
 # make the repo root importable (the page runs from pages/)
 # --------------------------------------------------------------------------
@@ -48,7 +56,10 @@ THIS_DIR = os.path.dirname(os.path.abspath(__file__))
 APP_DIR = os.path.dirname(THIS_DIR)
 if APP_DIR not in sys.path:
     sys.path.insert(0, APP_DIR)
+# @@END 002
 
+
+# @@BLOCK 003 THEME deps=002
 # --------------------------------------------------------------------------
 # theme — read-only mirror of theme.json so this page matches the app
 # --------------------------------------------------------------------------
@@ -69,7 +80,10 @@ def _load_theme():
 
 
 _TH = _load_theme()
+# @@END 003
 
+
+# @@BLOCK 004 CSS deps=003
 st.markdown(
     f"""
 <style>
@@ -94,13 +108,19 @@ st.markdown(
 """,
     unsafe_allow_html=True,
 )
+# @@END 004
 
+
+# @@BLOCK 005 HERO deps=004
 st.markdown(
     '<div class="dg-hero"><h1>🔍 Diagnostics</h1>'
     '<p>Host plan · live port probe · DNS &amp; discovery · SMTP candidates · proxy audit · cache tools</p></div>',
     unsafe_allow_html=True,
 )
+# @@END 005
 
+
+# @@BLOCK 006 IMPORT_HOSTS deps=002
 # --------------------------------------------------------------------------
 # hosts.py must import, or nothing here means anything
 # --------------------------------------------------------------------------
@@ -123,7 +143,10 @@ if not _HAVE["family_pop"]:
         "This `hosts.py` has **no `_family_priority_pop()`** — the POP bucket is still being led by "
         "the IMAP family, so the POP rung will dial `<imap-host>:995`. Apply the v13.26 `hosts.py` patch."
     )
+# @@END 006
 
+
+# @@BLOCK 007 HELPERS_NET deps=006
 # --------------------------------------------------------------------------
 # small helpers
 # --------------------------------------------------------------------------
@@ -170,8 +193,10 @@ def _port_probe(host, port, timeout=8.0):
                 s.close()
             except Exception:
                 pass
+# @@END 007
 
 
+# @@BLOCK 008 HELPERS_PROXY deps=006
 def _parse_proxy(line):
     p = (line or "").strip()
     if not p:
@@ -210,8 +235,10 @@ def _detect_format(line):
     if n == 2:
         return "host:port (NO CREDS)"
     return f"UNRECOGNISED ({n} colon-parts)"
+# @@END 008
 
 
+# @@BLOCK 009 PROTOCOLS_PLAN deps=007
 # --------------------------------------------------------------------------
 # v13.37: read the ENGINE's real protocol flags
 # --------------------------------------------------------------------------
@@ -284,8 +311,10 @@ def _build_plan(domain, max_hosts, flags=None):
         fallback.append(("POP", h, 110, "plain"))
 
     return got, all_imap, all_pop, primary, fallback, "ok"
+# @@END 009
 
 
+# @@BLOCK 010 SIDEBAR deps=009
 # --------------------------------------------------------------------------
 # sidebar controls
 # --------------------------------------------------------------------------
@@ -295,7 +324,10 @@ with st.sidebar:
     max_hosts = st.slider("Max Hosts Per Domain (as in the app)", 1, 8, 3, 1)
     force = st.toggle("Force refresh discovery (bypass 24h host cache)", value=False)
     st.caption("Nothing here connects to a mailbox — only DNS and raw TCP.")
+# @@END 010
 
+
+# @@BLOCK 011 TABS_HEADER deps=010
 if not domain:
     st.info("Enter a domain.")
     st.stop()
@@ -308,7 +340,10 @@ tab_plan, tab_probe, tab_dns, tab_smtp, tab_proxy, tab_cache = st.tabs(
 _PROTO_FLAGS = _protocols_from_app()
 st.caption("Engine protocol flags read from the applied config: "
            + ", ".join(k.upper() for k, v in _PROTO_FLAGS.items() if v))
+# @@END 011
 
+
+# @@BLOCK 012 TAB_HOST_PLAN deps=011
 # ==========================================================================
 # 1. HOST PLAN
 # ==========================================================================
@@ -418,7 +453,10 @@ with tab_plan:
             st.markdown("**Hosts sharing an IP** (they succeed or fail together)")
             for ip, hs in shared.items():
                 st.code(f"{ip}  <-  {', '.join(hs)}", language="text")
+# @@END 012
 
+
+# @@BLOCK 013 TAB_PROBE deps=011
 # ==========================================================================
 # 2. LIVE PORT PROBE
 # ==========================================================================
@@ -465,7 +503,10 @@ with tab_probe:
                 )
             elif any(r["TCP"] == "OK" for r in results):
                 st.success("At least one listener answered — the ladder has something to talk to.")
+# @@END 013
 
+
+# @@BLOCK 014 TAB_DNS deps=011
 # ==========================================================================
 # 3. DNS / DISCOVERY
 # ==========================================================================
@@ -510,7 +551,10 @@ with tab_dns:
         "The bare apex is appended as a last-resort rung only if it resolves. "
         "It is demoted to the very end because it has no IMAP listener on most providers."
     )
+# @@END 014
 
+
+# @@BLOCK 015 TAB_SMTP deps=011
 # ==========================================================================
 # 4. SMTP
 # ==========================================================================
@@ -534,7 +578,10 @@ with tab_smtp:
                     out.append({"Host": h, "Port": port, "TLS": "implicit" if tls else "plain",
                                 "TCP": "OK" if ok else "FAIL", "ms": ms, "Error": err})
             st.dataframe(out, use_container_width=True, hide_index=True)
+# @@END 015
 
+
+# @@BLOCK 016 TAB_PROXY deps=011
 # ==========================================================================
 # 5. PROXY AUDIT
 # ==========================================================================
@@ -598,7 +645,10 @@ with tab_proxy:
 
         with st.expander("First 10 raw lines"):
             st.code("\n".join(lines[:10]) or "— empty —", language="text")
+# @@END 016
 
+
+# @@BLOCK 017 TAB_CACHE deps=011
 # ==========================================================================
 # 6. CACHE
 # ==========================================================================
@@ -644,7 +694,10 @@ with tab_cache:
                 )
         except Exception as e:
             st.caption(f"no readable cache: {e}")
+# @@END 017
 
+
+# @@BLOCK 018 FOOTER_BUNDLE deps=012
 # ==========================================================================
 # footer bundle
 # ==========================================================================
@@ -684,3 +737,9 @@ if st.button("📋 Build copy/paste bundle"):
         ok, ms, err = _port_probe(h, pt, timeout=6)
         L.append(f"{h}:{pt} tcp={'OK' if ok else 'FAIL'} {ms}ms {err}")
     st.code("\n".join(L), language="text")
+# @@END 018
+
+
+# @@BLOCK 019 TRAILING deps=018
+# (reserved tail - keeps the file closed after the last block)
+# @@END 019
