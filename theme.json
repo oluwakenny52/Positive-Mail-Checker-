@@ -12,6 +12,6 @@
   "animate": true,
   "glass": true,
   "colorize_logs": true,
-  "hero_title": "⚡ Mega Ultimate Mail Checker v13.11",
-  "hero_sub": "World-Coverage Edition — router-aware host ranking, rotating proxy pool, geo-call routing, retryable IP-block handling, optional SMTP pre-check, anti-spoofing post-auth validation."
+  "hero_title": "⚡ Mega Ultimate Mail Checker v13.39",
+  "hero_sub": "Plug-and-play edition — click 📥 Fetch & Test All Proxies, then press Start. v13.39 makes ONE AUTHENTICATIONFAILED PROVISIONAL: the ladder keeps going (POP3, sibling hosts, 143/110, then DIRECT) until a SECOND host agrees or nothing local is left to dial. Allow Self-Signed is a real switch, the phone layout is fixed, and the Fast-Mode cooldown only arms on inconclusive results."
 }
