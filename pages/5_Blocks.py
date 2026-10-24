@@ -1,3 +1,5 @@
+# @@FILE pages/5_Blocks.py blocks=9 version=v13.40
+# @@BLOCK 000 FILE_HEADER deps=-
 """
 pages/5_Blocks.py - Block Inspector  (v13.40)
 =============================================
@@ -12,10 +14,16 @@ import sys
 from datetime import datetime
 
 import streamlit as st
+# @@END 000
 
+
+# @@BLOCK 001 PAGE_CONFIG deps=000
 st.set_page_config(page_title="Blocks - Mail Checker", page_icon="🧱",
                    layout="wide", initial_sidebar_state="collapsed")
+# @@END 001
 
+
+# @@BLOCK 002 IMPORT_VERIFY_BLOCKS deps=000
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
@@ -26,7 +34,10 @@ except Exception as _e:
     st.error(f"verify_blocks.py could not be imported from {ROOT}: {_e}")
     st.caption("It must sit in the repo ROOT, next to app.py - not inside pages/.")
     st.stop()
+# @@END 002
 
+
+# @@BLOCK 003 CSS deps=000
 st.markdown(
     """
 <style>
@@ -47,15 +58,24 @@ st.markdown(
 """,
     unsafe_allow_html=True,
 )
+# @@END 003
 
+
+# @@BLOCK 004 HERO deps=003
 st.markdown(
     '<div class="bl-hero"><h1>🧱 Block Inspector</h1>'
     '<p>Frame integrity for every block file, plus paste validation before you commit.</p></div>',
     unsafe_allow_html=True,
 )
+# @@END 004
 
+
+# @@BLOCK 005 TABS deps=004
 tab_scan, tab_paste, tab_how = st.tabs(["📋 Scan the repo", "🧪 Validate a paste", "📖 How to replace a block"])
+# @@END 005
 
+
+# @@BLOCK 006 TAB_SCAN deps=005
 with tab_scan:
     if st.button("🔁 Re-scan now", type="primary"):
         st.rerun()
@@ -91,7 +111,10 @@ with tab_scan:
             if res["table"]:
                 st.markdown("**Manifest**")
                 st.dataframe(res["table"], use_container_width=True, hide_index=True)
+# @@END 006
 
+
+# @@BLOCK 007 TAB_PASTE deps=005
 with tab_paste:
     st.caption(
         "Paste a WHOLE file here and check it before committing. This is the same "
@@ -130,7 +153,10 @@ with tab_paste:
                             + ", ".join("%03d" % x for x in extra))
                 if not missing and not extra and res["ok"]:
                     st.success("Paste matches the on-disk block set exactly.")
+# @@END 007
 
+
+# @@BLOCK 008 TAB_HOW deps=005
 with tab_how:
     st.markdown(
         """
@@ -152,3 +178,6 @@ with tab_how:
   check the `deps=` line.
 
 **Gate before every commit**
+"""
+    )
+# @@END 008
