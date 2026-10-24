@@ -7166,6 +7166,12 @@ if start_engine_btn:
                                     "Status": st_val.upper(),
                                     "Under-The-Hood Background Trace": f"Result: {res.get('detail','')}\nSteps Executed:\n  ↳ {trace_text}",
                                 })
+                                # v13.39b: report_entries was the ONLY per-account list with
+                                # no ceiling - log_lines is capped at log_cap.  A 5000-combo
+                                # run held all 5000 tracebacks in memory and in the dataframe.
+                                if len(str_lit.session_state.report_entries) > 2000:
+                                    del str_lit.session_state.report_entries[:-2000]
+                                })
 
                                 valid_len = len(str_lit.session_state.valid_results)
                                 wrong_len = len(str_lit.session_state.wrong_results)
