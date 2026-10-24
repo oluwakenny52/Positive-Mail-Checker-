@@ -7171,7 +7171,6 @@ if start_engine_btn:
                                 # run held all 5000 tracebacks in memory and in the dataframe.
                                 if len(str_lit.session_state.report_entries) > 2000:
                                     del str_lit.session_state.report_entries[:-2000]
-                                })
 
                                 valid_len = len(str_lit.session_state.valid_results)
                                 wrong_len = len(str_lit.session_state.wrong_results)
