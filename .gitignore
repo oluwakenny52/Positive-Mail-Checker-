@@ -1,5 +1,7 @@
 .streamlit/secrets.toml
 proxies.txt
+# v13.39: proxies_all.txt is the raw fetched pool and holds proxy credentials.
+proxies_all.txt
 proxy_meta.json
 domain_cache.json
 hosts_cache.json
@@ -15,3 +17,7 @@ mail_results/
 __pycache__/
 *.py[cod]
 .DS_Store
+# v13.39: the patch scripts leave these behind.
+*.bak
+*.bak.*
+app.py.tmp_v1339*
