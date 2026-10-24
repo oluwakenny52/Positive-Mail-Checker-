@@ -2728,10 +2728,15 @@ def _remember_scheme(proxy_str, ptype):
 def geo_lookup(ip):
     """Country/region for an IP.
 
-    v13.39: the throttle now RESERVES its slot under the lock and then sleeps
-    OUTSIDE it.  Holding _GEO_LOCK across time.sleep() serialised every geo
-    lookup in the process, so enrich_proxy_geo(max_workers=8) behaved like one
-    worker at ~1.33s per node.
+    v13.39: the throttle RESERVES its slot under the lock and sleeps OUTSIDE it.
+    Holding _GEO_LOCK across time.sleep() serialised every geo lookup in the
+    process, so enrich_proxy_geo(max_workers=8) behaved like one worker at ~1.33s
+    per node.
+
+    v13.39b: the reservation is now PAID.  The sleep was capped at 1.0s while
+    GEO_MIN_INTERVAL is 1.33s, so the stamp advanced 1.33s per call while only
+    1.0s of wall clock elapsed - the reservation grew without bound and was never
+    honoured, giving ~60 requests/min against ip-api's 45/min tier.
     """
     if not ip or ip == "Unknown":
         return ("Unknown", "Unknown")
@@ -2743,10 +2748,12 @@ def geo_lookup(ip):
         failed = _GEO_FAIL.get(ip)
         if failed and (now - failed) < GEO_FAIL_TTL:
             return ("Unknown", "Unknown")
-        wait = GEO_MIN_INTERVAL - (now - _geo_last_call["ts"])
-        _geo_last_call["ts"] = max(now, _geo_last_call["ts"] + GEO_MIN_INTERVAL)
+        # Reserve the NEXT slot: the new stamp is the old stamp plus one interval,
+        # and the caller sleeps exactly that gap - outside the lock.
+        wait = max(0.0, _geo_last_call["ts"] + GEO_MIN_INTERVAL - now)
+        _geo_last_call["ts"] = now + wait
     if wait > 0:
-        time.sleep(min(wait, 1.0))
+        time.sleep(min(wait, 3.0))
 
     country, region, ok = "Unknown", "Unknown", False
     try:
@@ -2941,6 +2948,11 @@ self_signed = instant_help("self_signed", "v13.39: this is a REAL switch now. TI
 proxy_test_flight = instant_help("proxy_test_flight", "Probe every proxy for liveness before it enters the live pool. KEEP THIS ON - it is what makes Fetch & Test produce a pool that actually works.", "Test Flight", widget_type="checkbox", value=True)
 skip_app = instant_help("skip_app", "Filter out accounts requiring explicit app passwords or token generation upfront. OFF by default so Gmail/O365 combos are actually CHECKED rather than bucketed away.", "Skip Strict App-Only Providers", widget_type="checkbox", value=False)
 debug_mode = instant_help("debug_mode", "Stream verbose logs and error tracing directly into the UI interface.", "Enable Debug Mode", widget_type="checkbox", value=True)
+
+# v13.39b: instant_help() returns None when its internal try/except fires, and
+# `not None` is True - which silently flips ALLOW_SELF_SIGNED to False and turns
+# verification ON behind your back, in build_cfg()'s "TLS_STRICT": not self_signed.
+self_signed = True if self_signed is None else self_signed
 
 try_starttls_ui = str_lit.sidebar.toggle(
     "Enable STARTTLS + plaintext fallback (143 / 110)", value=True, key="ui_starttls",
