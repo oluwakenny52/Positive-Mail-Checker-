@@ -165,7 +165,7 @@ def main():
     checks = [
         ("st_val in (WRONG, UNKNOWN, LOGIN_DROPPED)", 0),
         ("st_val in (UNKNOWN, LOGIN_DROPPED)", 2),
-        ("retrying same host as local-part", 2),
+        ("retrying same host as local-part", 4),
         ("wrong_hosts.add(server)", 1),
         ("def _handle_app_or_wrong", 1),
         ("def _check_account_core", 1),
