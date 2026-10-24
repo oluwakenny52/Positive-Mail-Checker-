@@ -241,6 +241,10 @@ def _detect_format(line):
 # @@BLOCK 009 PROTOCOLS_PLAN deps=007
 # --------------------------------------------------------------------------
 # v13.37: read the ENGINE's real protocol flags
+# v13.40: build_cfg() publishes the key "PROTOCOLS" - "ui_protocols" is only
+#         the widget key, so the old lookup always missed and the page fell
+#         through to the IMAP+POP default, defeating this whole block.
+#         Also split string values: iterating "IMAP,POP" yields characters.
 # --------------------------------------------------------------------------
 def _protocols_from_app():
     """app.py publishes its applied config into st.session_state["applied_cfg"].
@@ -252,13 +256,41 @@ def _protocols_from_app():
         cfg = st.session_state.get("applied_cfg") or {}
     except Exception:
         cfg = {}
-    raw = cfg.get("ui_protocols") or cfg.get("protocols")
-    if raw:
-        wanted = [str(p).strip().upper() for p in raw]
-        flags["imap"] = any(p.startswith("IMAP") for p in wanted)
-        flags["pop"] = any(p.startswith("POP") for p in wanted)
-        flags["smtp"] = any(p.startswith("SMTP") for p in wanted)
-        flags["sieve"] = any(p.startswith("SIEVE") for p in wanted)
+    if not isinstance(cfg, dict):
+        cfg = {}
+
+    raw = cfg.get("PROTOCOLS") or cfg.get("protocols")
+    if not raw:
+        try:
+            raw = st.session_state.get("ui_protocols")
+        except Exception:
+            raw = None
+    if not raw:
+        return flags
+
+    if isinstance(raw, str):
+        wanted = []
+        buf = ""
+        for ch in raw:
+            if ch in ",/|; \t\r\n":
+                if buf:
+                    wanted.append(buf)
+                    buf = ""
+            else:
+                buf += ch
+        if buf:
+            wanted.append(buf)
+        wanted = [p.strip().upper() for p in wanted if p.strip()]
+    else:
+        wanted = [str(p).strip().upper() for p in raw if str(p).strip()]
+
+    if not wanted:
+        return flags
+
+    flags["imap"] = any(p.startswith("IMAP") for p in wanted)
+    flags["pop"] = any(p.startswith("POP") for p in wanted)
+    flags["smtp"] = any(p.startswith("SMTP") for p in wanted)
+    flags["sieve"] = any(p.startswith("SIEVE") for p in wanted)
     return flags
 
 
@@ -360,6 +392,11 @@ with tab_plan:
     # v13.37: defaults first, so later tabs and the footer always have values
     got, all_imap, all_pop, primary, fallback, kind = {}, [], [], [], [], "ok"
     plan_error = ""
+    # v13.40: fam/fam_pop belong up here too. They used to be bound only inside
+    # the success branch, so on plan_error / zero_access the bundle button in
+    # block 018 raised NameError: name 'fam' is not defined.
+    fam = []
+    fam_pop = []
     try:
         with st.spinner("Building host plan…"):
             got, all_imap, all_pop, primary, fallback, kind = _build_plan(
@@ -376,8 +413,6 @@ with tab_plan:
         if not got:
             st.warning("`hosts.conf()` returned nothing for this domain — the generic guesser found no route.")
 
-        fam = []
-        fam_pop = []
         try:
             fam = H._family_priority(domain)
         except Exception:
