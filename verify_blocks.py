@@ -1,917 +1,305 @@
-# @@FILE status.py blocks=13 version=v13.40
-# @@BLOCK 000 FILE_HEADER deps=-
-"""
-status.py - status vocabulary, classifier and label/colour metadata for the
-Mega Ultimate Mail Checker.
+# @@FILE verify_blocks.py blocks=1 version=v13.40
+#!/usr/bin/env python3
+"""verify_blocks.py - block-integrity gate for the block-edition app.
 
-SINGLE SOURCE OF TRUTH for turning a raw server/proxy string into a verdict.
-app.py imports this module; if the import fails it falls back to the inline
-classifier in app.py block 004 (STATUS_IMPORT_FALLBACK).
+Audits every file in BLOCKED_FILES for:
+  * a valid `# @@FILE <name> blocks=<n> version=<v>` header, count matching
+  * contiguous, zero-padded block ids starting at 000
+  * every block closed by a *named* `# @@END <id> <NAME>` matching its block
+  * no duplicate ids, no unmatched END
+  * no non-ASCII characters outside strings/comments (f-string aware, so
+    f-string bodies do NOT produce false positives)
 
-P0-3 ORDERING CONTRACT - DO NOT REORDER _ORDER:
-    WRONG_STRONG  is evaluated BEFORE APP_PASSWORD and BEFORE RETRY_HARD.
-    backend / upstream / downstream live in RETRY_HARD, NOT in RETRY.
-    So 'NO [AUTHENTICATIONFAILED] ... OAUTH' resolves WRONG, not
-    NEED_APP_PASSWORD, and auth rejections no longer resolve RETRY_LATER.
+A bare `# @@END` with no id costs 2 faults: one for the missing id and one for
+the unnamed end. Exit status is 1 when any fault is found.
 
-Every table is a tuple of lowercase substrings matched against normalise().
+API used elsewhere:
+  BLOCKED_FILES            list of audited paths
+  audit_source(path)       -> Report
+  audit_all(paths=None)    -> {path: Report}
+  block_ids(path)          -> [int, ...]
+  totals(reports=None)     -> (files, blocks, faults)
+  main(argv)               -> exit code
 """
 
 from __future__ import annotations
 
+import argparse
+import io
+import json
+import os
 import re
+import sys
+import tokenize
 
-STATUS_VERSION = "v13.40"
-STATUS_BUILD = 1340
-# @@END 000 FILE_HEADER
+__version__ = "v13.40"
 
+BLOCKED_FILES = [
+    "app.py",
+    "status.py",
+    "pages/2_Diagnostics.py",
+    "pages/3_Mailbox_Reader.py",
+    "pages/4_Downloads.py",
+    "pages/5_Blocks.py",
+]
 
-# @@BLOCK 001 STATUSES deps=000
-STATUS_VALID = "VALID"
-STATUS_WRONG = "WRONG"
-STATUS_NEED_APP_PASSWORD = "NEED_APP_PASSWORD"
-STATUS_RETRY_LATER = "RETRY_LATER"
-STATUS_TIMEOUT = "TIMEOUT"
-STATUS_SERVER_DROP = "SERVER_DROP"
-STATUS_LOGIN_DROPPED = "LOGIN_DROPPED"
-STATUS_PROXY_UNHEALTHY = "PROXY_UNHEALTHY"
-STATUS_PROXY_BLOCKED = "PROXY_BLOCKED"
-STATUS_CONNECTION_FAILED = "CONNECTION_FAILED"
-STATUS_DNS_FAIL = "DNS_FAIL"
-STATUS_RBL_BLOCKED = "RBL_BLOCKED"
-STATUS_DISABLED = "DISABLED"
-STATUS_LOCKED = "LOCKED"
-STATUS_EXPIRED = "EXPIRED"
-STATUS_ERROR = "ERROR"
-STATUS_UNKNOWN = "UNKNOWN"
+FILE_RX = re.compile(r"^#\s*@@FILE\s+(\S+)\s+blocks=(\d+)\s+version=(\S+)\s*$")
+BLOCK_RX = re.compile(r"^#\s*@@BLOCK\s+(\d{3})\s+([A-Za-z0-9_]+)\s*$")
+END_RX = re.compile(r"^#\s*@@END(?:\s+(\d{3}))?(?:\s+([A-Za-z0-9_]+))?\s*$")
+EOF_RX = re.compile(r"^#\s*@@EOF\b")
 
-STATUSES = (
-    STATUS_VALID,
-    STATUS_WRONG,
-    STATUS_NEED_APP_PASSWORD,
-    STATUS_DISABLED,
-    STATUS_LOCKED,
-    STATUS_EXPIRED,
-    STATUS_RETRY_LATER,
-    STATUS_TIMEOUT,
-    STATUS_LOGIN_DROPPED,
-    STATUS_SERVER_DROP,
-    STATUS_PROXY_UNHEALTHY,
-    STATUS_PROXY_BLOCKED,
-    STATUS_CONNECTION_FAILED,
-    STATUS_DNS_FAIL,
-    STATUS_RBL_BLOCKED,
-    STATUS_ERROR,
-    STATUS_UNKNOWN,
+_ALLOWED_TOKENS = frozenset(
+    {
+        "STRING",
+        "COMMENT",
+        "FSTRING_START",
+        "FSTRING_MIDDLE",
+        "FSTRING_END",
+        "NL",
+        "NEWLINE",
+        "INDENT",
+        "DEDENT",
+    }
 )
 
-BUCKET_VALID = "valid"
-BUCKET_WRONG = "wrong"
-BUCKET_RETRY = "retry"
-BUCKET_DROPPED = "dropped"
-BUCKET_BLOCKED = "blocked"
-BUCKET_DEAD = "dead"
-BUCKET_UNKNOWN = "unknown"
 
-BUCKETS = (
-    BUCKET_VALID,
-    BUCKET_WRONG,
-    BUCKET_RETRY,
-    BUCKET_DROPPED,
-    BUCKET_BLOCKED,
-    BUCKET_DEAD,
-    BUCKET_UNKNOWN,
-)
+class Report(dict):
+    """dict that also allows attribute access, so both `r['faults']` and
+    `r.faults` work for callers."""
 
-STATUS_BUCKET = {
-    STATUS_VALID: BUCKET_VALID,
-    STATUS_WRONG: BUCKET_WRONG,
-    STATUS_NEED_APP_PASSWORD: BUCKET_WRONG,
-    STATUS_DISABLED: BUCKET_WRONG,
-    STATUS_LOCKED: BUCKET_WRONG,
-    STATUS_EXPIRED: BUCKET_WRONG,
-    STATUS_RETRY_LATER: BUCKET_RETRY,
-    STATUS_TIMEOUT: BUCKET_RETRY,
-    STATUS_LOGIN_DROPPED: BUCKET_DROPPED,
-    STATUS_SERVER_DROP: BUCKET_DROPPED,
-    STATUS_PROXY_UNHEALTHY: BUCKET_BLOCKED,
-    STATUS_PROXY_BLOCKED: BUCKET_BLOCKED,
-    STATUS_RBL_BLOCKED: BUCKET_BLOCKED,
-    STATUS_CONNECTION_FAILED: BUCKET_DEAD,
-    STATUS_DNS_FAIL: BUCKET_DEAD,
-    STATUS_ERROR: BUCKET_UNKNOWN,
-    STATUS_UNKNOWN: BUCKET_UNKNOWN,
-}
-
-
-def bucket_of(status):
-    """Map any status token to its display bucket. Never raises."""
-    return STATUS_BUCKET.get(status, BUCKET_UNKNOWN)
-# @@END 001 STATUSES
-
-
-# @@BLOCK 002 PRIORITY_LABELS_COLORS deps=001
-PRIORITY_ORDER = (
-    STATUS_VALID,
-    STATUS_WRONG,
-    STATUS_DISABLED,
-    STATUS_LOCKED,
-    STATUS_EXPIRED,
-    STATUS_NEED_APP_PASSWORD,
-    STATUS_RETRY_LATER,
-    STATUS_TIMEOUT,
-    STATUS_LOGIN_DROPPED,
-    STATUS_SERVER_DROP,
-    STATUS_PROXY_UNHEALTHY,
-    STATUS_PROXY_BLOCKED,
-    STATUS_RBL_BLOCKED,
-    STATUS_CONNECTION_FAILED,
-    STATUS_DNS_FAIL,
-    STATUS_ERROR,
-    STATUS_UNKNOWN,
-)
-PRIORITY = {s: i for i, s in enumerate(PRIORITY_ORDER)}
-
-LABELS = {
-    STATUS_VALID: "Valid",
-    STATUS_WRONG: "Wrong password",
-    STATUS_NEED_APP_PASSWORD: "Needs app password",
-    STATUS_RETRY_LATER: "Retry later",
-    STATUS_TIMEOUT: "Timeout",
-    STATUS_SERVER_DROP: "Server dropped",
-    STATUS_LOGIN_DROPPED: "Login dropped",
-    STATUS_PROXY_UNHEALTHY: "Proxy unhealthy",
-    STATUS_PROXY_BLOCKED: "Proxy blocked (407)",
-    STATUS_CONNECTION_FAILED: "Connection failed",
-    STATUS_DNS_FAIL: "DNS failure",
-    STATUS_RBL_BLOCKED: "RBL blocked",
-    STATUS_DISABLED: "Disabled",
-    STATUS_LOCKED: "Locked",
-    STATUS_EXPIRED: "Expired",
-    STATUS_ERROR: "Error",
-    STATUS_UNKNOWN: "Unknown",
-}
-DEFAULT_LABEL = "Unknown"
-
-COLORS = {
-    STATUS_VALID: "#22c55e",
-    STATUS_WRONG: "#ef4444",
-    STATUS_NEED_APP_PASSWORD: "#f59e0b",
-    STATUS_RETRY_LATER: "#38bdf8",
-    STATUS_TIMEOUT: "#0ea5e9",
-    STATUS_SERVER_DROP: "#a855f7",
-    STATUS_LOGIN_DROPPED: "#c084fc",
-    STATUS_PROXY_UNHEALTHY: "#fb923c",
-    STATUS_PROXY_BLOCKED: "#f97316",
-    STATUS_CONNECTION_FAILED: "#64748b",
-    STATUS_DNS_FAIL: "#94a3b8",
-    STATUS_RBL_BLOCKED: "#eab308",
-    STATUS_DISABLED: "#dc2626",
-    STATUS_LOCKED: "#b91c1c",
-    STATUS_EXPIRED: "#ea580c",
-    STATUS_ERROR: "#6b7280",
-    STATUS_UNKNOWN: "#8b93a7",
-}
-DEFAULT_COLOR = "#8b93a7"
-
-# Bucket display metadata, kept here so pages never hardcode colours.
-BUCKET_LABELS = {
-    BUCKET_VALID: "Valid",
-    BUCKET_WRONG: "Wrong",
-    BUCKET_RETRY: "Retry",
-    BUCKET_DROPPED: "Dropped",
-    BUCKET_BLOCKED: "Blocked",
-    BUCKET_DEAD: "Dead",
-    BUCKET_UNKNOWN: "Unknown",
-}
-BUCKET_COLORS = {
-    BUCKET_VALID: "#22c55e",
-    BUCKET_WRONG: "#ef4444",
-    BUCKET_RETRY: "#38bdf8",
-    BUCKET_DROPPED: "#a855f7",
-    BUCKET_BLOCKED: "#fb923c",
-    BUCKET_DEAD: "#64748b",
-    BUCKET_UNKNOWN: "#8b93a7",
-}
-# @@END 002 PRIORITY_LABELS_COLORS
-
-
-# @@BLOCK 003 MATCH_TABLES_APP_DNS deps=001
-# Greedy app-password / modern-auth table. NOW EVALUATED AFTER WRONG_STRONG.
-_APP_PASSWORD = (
-    "application-specific password",
-    "application specific password",
-    "app-specific password",
-    "app specific password",
-    "app password",
-    "application password",
-    "oauth",
-    "oauth2",
-    "xoauth2",
-    "sasl",
-    "tenant",
-    "consent",
-    "admin approval",
-    "mfa",
-    "2fa",
-    "two-factor",
-    "two factor",
-    "multi-factor",
-    "multi factor",
-    "modern authentication",
-    "basic authentication is disabled",
-    "basic auth is disabled",
-    "less secure",
-    "less-secure",
-    "enable imap",
-    "imap access",
-    "web login required",
-    "log in via your web browser",
-    "unsupported authentication",
-    "no supported authentication",
-    "authmechanism",
-)
-
-_DNS = (
-    "name or service not known",
-    "nodename nor servname",
-    "getaddrinfo failed",
-    "temporary failure in name resolution",
-    "no address associated with hostname",
-    "name resolution",
-    "socket.gaierror",
-    "gaierror",
-    "nxdomain",
-    "servfail",
-    "no such host",
-    "dns lookup",
-    "dns resolution",
-    "dns error",
-)
-# @@END 003 MATCH_TABLES_APP_DNS
-
-
-# @@BLOCK 004 MATCH_TABLES_RETRY_SERVERDROP deps=001
-# RETRY_HARD owns backend / upstream / downstream. These were pulled OUT of
-# RETRY in v13.40 because they were swallowing real auth rejections.
-_RETRY_HARD = (
-    "backend",
-    "upstream",
-    "downstream",
-    "try again later",
-    "please try again",
-    "temporarily",
-    "temporary failure",
-    "unavailable",
-    "server busy",
-    "server is busy",
-    "too many",
-    "rate limit",
-    "ratelimit",
-    "throttl",
-    "overload",
-    "congestion",
-    "system error",
-    "internal error",
-    "service error",
-    "maintenance",
-)
-
-# Soft / transport-level retry. Deliberately does NOT contain
-# backend, upstream or downstream.
-_RETRY = (
-    "timeout",
-    "timed out",
-    "time out",
-    "deadline exceeded",
-    "deadline",
-    "retry",
-    "try again",
-    "connection reset",
-    "reset by peer",
-    "broken pipe",
-    "connection aborted",
-    "premature",
-    "incomplete",
-    "bad greeting",
-    "no greeting",
-    "greeting",
-    "handshake",
-    "tls",
-    "ssl",
-)
-
-# A post-LOGIN '* BYE' is the Windstream / mediacombb.net signature.
-_SERVER_DROP = (
-    "* bye",
-    "bye",
-    "server dropped",
-    "dropped connection",
-    "connection dropped",
-    "server closed",
-)
-
-_SERVER_DROP_HARD = (
-    "eof while reading",
-    "eof occurred",
-    "socket error: eof",
-    "unexpected eof",
-    "connection closed by remote",
-    "remote host closed",
-    "peer closed",
-)
-# @@END 004 MATCH_TABLES_RETRY_SERVERDROP
-
-
-# @@BLOCK 005 MATCH_TABLES_CONN_RBL_WRONG deps=001
-_CONN = (
-    "connection refused",
-    "connect refused",
-    "no route to host",
-    "network is unreachable",
-    "connect failed",
-    "cannot connect",
-    "failed to connect",
-    "connection error",
-    "unreachable",
-    "host is down",
-    "connection attempt failed",
-    "oserror",
-    "errno 111",
-    "errno 113",
-    "errno 101",
-    "errno 110",
-)
-
-_RBL = (
-    "blacklist",
-    "blacklisted",
-    "blocklist",
-    "block list",
-    "dnsbl",
-    "rbl",
-    "spamhaus",
-    "spamcop",
-    "barracuda",
-    "sorbs",
-    "spamrl",
-    "listed at",
-    "blocked by",
-    "your ip",
-    "ip blocked",
-)
-
-# Lower-confidence WRONG. Evaluated right after WRONG_STRONG so that
-# 'mailbox unavailable' does not fall through to RETRY_HARD.
-_WRONG_SOFT = (
-    "no such user",
-    "user unknown",
-    "unknown user",
-    "unknown username",
-    "account not found",
-    "mailbox not found",
-    "mailbox unavailable",
-    "user not found",
-    "does not exist",
-)
-
-# THE definitive auth-rejection table. MUST be first in _ORDER.
-_WRONG_STRONG = (
-    "aadsts50126",
-    "aadsts7000218",
-    "aadsts50034",
-    "aadsts50076",
-    "authenticationfailed",
-    "authentication failed",
-    "authenticationfailure",
-    "invalid credentials",
-    "invalid credential",
-    "invalid login",
-    "invalid password",
-    "invalid username or password",
-    "username and password not accepted",
-    "logon failure",
-    "logon failed",
-    "login incorrect",
-    "login failed",
-    "bad credentials",
-    "wrong password",
-    "password incorrect",
-    "auth failed",
-    "authorization failed",
-    "not authenticated",
-    "account is disabled",
-    "account disabled",
-    "user is locked",
-    "account is locked",
-    "account locked",
-    "password expired",
-    "5.7.8",
-    "5.7.1",
-    "535 ",
-    "535-",
-    "590 ",
-)
-# @@END 005 MATCH_TABLES_CONN_RBL_WRONG
-
-
-# @@BLOCK 006 MATCH_TABLES_BARE_PROXYLEVEL deps=001
-_PROXY_LEVEL = (
-    "407",
-    "proxy authentication",
-    "proxy auth",
-    "proxyerror",
-    "proxy error",
-    "tunnel connection failed",
-    "connect tunnel",
-    "cannot connect to proxy",
-    "bad gateway",
-    "502",
-    "503",
-    "504",
-    "gateway timeout",
-    "quota",
-    "bandwidth",
-    "subuser",
-    "sub-user",
-    "no available",
-    "all nodes busy",
-)
-
-_BARE = (
-    "error",
-    "failed",
-    "failure",
-    "denied",
-    "invalid",
-    "bad",
-    "closed",
-    "aborted",
-    "dropped",
-)
-
-# ---------------------------------------------------------------------------
-# EVALUATION ORDER. Index 0 wins. WRONG_STRONG is deliberately first.
-# ---------------------------------------------------------------------------
-_ORDER = (
-    ("WRONG_STRONG", _WRONG_STRONG, STATUS_WRONG),
-    ("WRONG_SOFT", _WRONG_SOFT, STATUS_WRONG),
-    ("SERVER_DROP", _SERVER_DROP, STATUS_LOGIN_DROPPED),
-    ("SERVER_DROP_HARD", _SERVER_DROP_HARD, STATUS_SERVER_DROP),
-    ("APP_PASSWORD", _APP_PASSWORD, STATUS_NEED_APP_PASSWORD),
-    ("DNS", _DNS, STATUS_DNS_FAIL),
-    ("RBL", _RBL, STATUS_RBL_BLOCKED),
-    ("CONN", _CONN, STATUS_CONNECTION_FAILED),
-    ("PROXY_LEVEL", _PROXY_LEVEL, STATUS_PROXY_UNHEALTHY),
-    ("RETRY_HARD", _RETRY_HARD, STATUS_RETRY_LATER),
-    ("RETRY", _RETRY, STATUS_RETRY_LATER),
-    ("BARE", _BARE, STATUS_ERROR),
-)
-
-TABLES = {name: (table, status) for name, table, status in _ORDER}
-TABLE_NAMES = tuple(name for name, _t, _s in _ORDER)
-# @@END 006 MATCH_TABLES_BARE_PROXYLEVEL
-
-
-# @@BLOCK 007 NORMALISE_HELPERS deps=006
-_WS_RE = re.compile(r"\s+")
-
-
-def normalise(text):
-    """Lowercase, collapse whitespace, decode bytes. Never raises."""
-    if text is None:
-        return ""
-    if isinstance(text, (bytes, bytearray)):
+    def __getattr__(self, name):
         try:
-            text = bytes(text).decode("utf-8", "replace")
-        except Exception:
-            text = repr(text)
-    try:
-        s = str(text)
-    except Exception:
-        return ""
-    s = s.replace("\r", " ").replace("\n", " ").replace("\t", " ")
-    s = _WS_RE.sub(" ", s)
-    return s.strip().lower()
-
-
-def first_match(haystack, table):
-    """First needle from table present in haystack, else None."""
-    for needle in table:
-        if needle in haystack:
-            return needle
-    return None
-
-
-def hits(haystack, table):
-    """Every needle from table present in haystack, in table order."""
-    return [n for n in table if n in haystack]
-# @@END 007 NORMALISE_HELPERS
-
-
-# @@BLOCK 008 CLASSIFIER deps=007
-def classify_detail(text, default=STATUS_UNKNOWN):
-    """Return (status, table_name, needle) for the first matching table."""
-    s = normalise(text)
-    if not s:
-        return default, "EMPTY", None
-    for name, table, status in _ORDER:
-        needle = first_match(s, table)
-        if needle is not None:
-            return status, name, needle
-    return default, "DEFAULT", None
-
-
-def classify_error(text, default=STATUS_UNKNOWN):
-    """Map a raw server/proxy/exception string to a status token."""
-    return classify_detail(text, default)[0]
-
-
-def explain(text, default=STATUS_UNKNOWN):
-    """Human string describing why text classified the way it did."""
-    status, table, needle = classify_detail(text, default)
-    if needle is None:
-        return "%s (no table matched, default)" % status
-    return "%s (table=%s, needle=%r)" % (status, table, needle)
-# @@END 008 CLASSIFIER
-
-
-# @@BLOCK 009 SIGNAL_HELPERS deps=008
-def is_valid(status):
-    return status == STATUS_VALID
-
-
-def is_wrong(status):
-    return bucket_of(status) == BUCKET_WRONG
-
-
-def is_retry(status):
-    return bucket_of(status) in (BUCKET_RETRY, BUCKET_DROPPED)
-
-
-def is_drop(status):
-    return bucket_of(status) == BUCKET_DROPPED
-
-
-def is_blocked(status):
-    return bucket_of(status) == BUCKET_BLOCKED
-
-
-def is_dead(status):
-    return bucket_of(status) == BUCKET_DEAD
-
-
-def is_definitive(status):
-    """True when no amount of retrying should change the verdict."""
-    return status in (
-        STATUS_VALID,
-        STATUS_WRONG,
-        STATUS_DISABLED,
-        STATUS_LOCKED,
-        STATUS_EXPIRED,
-    )
-
-
-def worst_of(statuses):
-    """Lowest-priority-number status wins. Empty input -> UNKNOWN."""
-    best = None
-    best_rank = None
-    for s in statuses:
-        rank = PRIORITY.get(s)
-        if rank is None:
-            continue
-        if best_rank is None or rank < best_rank:
-            best, best_rank = s, rank
-    return best or STATUS_UNKNOWN
-
-
-def summarise(statuses):
-    """Counter dict of status -> count, plus a 'total' key."""
-    out = {}
-    for s in statuses:
-        out[s] = out.get(s, 0) + 1
-    out["total"] = len(list(statuses))
-    return out
-
-
-def completion_status(statuses, ran=True):
-    """Coarse run outcome used by the app footer."""
-    seq = list(statuses)
-    if not ran:
-        return "not_run"
-    if not seq:
-        return "no_accounts"
-    if any(is_valid(s) for s in seq):
-        return "completed"
-    if all(is_definitive(s) or is_dead(s) for s in seq):
-        return "completed_no_valid"
-    return "partial"
-# @@END 009 SIGNAL_HELPERS
-
-
-# @@BLOCK 010 SMALL_HELPERS deps=002
-def label_for(status):
-    return LABELS.get(status, DEFAULT_LABEL)
-
-
-def color_for(status):
-    return COLORS.get(status, DEFAULT_COLOR)
-
-
-def priority_for(status):
-    return PRIORITY.get(status, len(PRIORITY_ORDER))
-
-
-def bucket_label(bucket):
-    return BUCKET_LABELS.get(bucket, str(bucket).title())
-
-
-def bucket_color(bucket):
-    return BUCKET_COLORS.get(bucket, DEFAULT_COLOR)
-
-
-def badge(status):
-    """Tiny HTML pill for a status token."""
-    return (
-        '<span style="display:inline-block;padding:1px 7px;border-radius:999px;'
-        'font-size:11px;font-weight:600;color:#0b0f19;background:%s;">%s</span>'
-        % (color_for(status), label_for(status))
-    )
-# @@END 010 SMALL_HELPERS
-
-
-# @@BLOCK 011 FOOTER deps=010
-def selftest():
-    """Ordering assertions. Returns list of (name, ok, detail)."""
-    cases = (
-        ("auth_plus_oauth_is_wrong",
-         "NO [AUTHENTICATIONFAILED] Invalid credentials (Failure) OAUTH",
-         STATUS_WRONG),
-        ("aadsts_is_wrong",
-         "AADSTS50126: Error validating credentials",
-         STATUS_WRONG),
-        ("backend_is_not_retry_for_auth",
-         "NO [AUTHENTICATIONFAILED] backend said no",
-         STATUS_WRONG),
-        ("app_password_still_works",
-         "Application-specific password required",
-         STATUS_NEED_APP_PASSWORD),
-        ("upstream_alone_is_retry",
-         "upstream temporarily unavailable",
-         STATUS_RETRY_LATER),
-        ("bye_is_login_dropped",
-         "* BYE Windstream closing connection",
-         STATUS_LOGIN_DROPPED),
-        ("eof_is_server_drop",
-         "socket error: EOF while reading",
-         STATUS_SERVER_DROP),
-        ("dns_is_dns",
-         "getaddrinfo failed for imap.example.net",
-         STATUS_DNS_FAIL),
-        ("407_is_proxy",
-         "CONNECT tunnel failed: 407 Proxy Authentication Required",
-         STATUS_PROXY_UNHEALTHY),
-        ("rbl_is_rbl",
-         "Your IP is blacklisted by Spamhaus",
-         STATUS_RBL_BLOCKED),
-        ("empty_is_default",
-         "",
-         STATUS_UNKNOWN),
-    )
-    out = []
-    for name, text, want in cases:
-        got = classify_error(text)
-        out.append((name, got == want, "want=%s got=%s" % (want, got)))
-    return out
-
-
-__all__ = (
-    "STATUS_VERSION",
-    "STATUS_BUILD",
-    "STATUSES",
-    "BUCKETS",
-    "STATUS_BUCKET",
-    "PRIORITY",
-    "LABELS",
-    "COLORS",
-    "BUCKET_LABELS",
-    "BUCKET_COLORS",
-    "TABLES",
-    "TABLE_NAMES",
-    "normalise",
-    "classify_error",
-    "classify_detail",
-    "explain",
-    "bucket_of",
-    "is_valid",
-    "is_wrong",
-    "is_retry",
-    "is_drop",
-    "is_blocked",
-    "is_dead",
-    "is_definitive",
-    "worst_of",
-    "summarise",
-    "completion_status",
-    "label_for",
-    "color_for",
-    "priority_for",
-    "bucket_label",
-    "bucket_color",
-    "badge",
-    "selftest",
-)
-# @@END 011 FOOTER
-
-
-# @@BLOCK 012 APP_COMPAT deps=001,002,004,006,007,008,010,011
-# ============================================================================
-# APP COMPATIBILITY SURFACE - the names app.py block 004 imports.
-#
-# WHY THIS BLOCK EXISTS
-# ---------------------
-# app.py block 004 does
-#
-#     from status import (VALID, WRONG, WRONG_PASSWORD, APP, NEED_APP_PASSWORD,
-#                         FAILED, ..., ALL_STATUSES, is_proxy_level_error,
-#                         display, color)
-#
-# but this module published ONLY the STATUS_* spellings.  The import therefore
-# raised, on the very first name,
-#
-#     ImportError: cannot import name 'VALID' from 'status'
-#
-# app.py's `except Exception` swallowed it, set STATUS_OK = False and ran its
-# own inline fallback classifier in block 004 for the whole process.  So every
-# block in THIS file was dead code, the startup panel said
-# "status.py import failed", the diag bundle said status_ok: False, and the
-# P0-3 ordering contract documented at the top of this file was unenforceable
-# from here - it only LOOKED fixed because the fallback carries the same order.
-#
-# It also re-publishes classify_error() with app.py's CALLING CONVENTION:
-# app.py calls st_classify(err_str, domain) while this module's signature is
-# classify_error(text, default=...), so the DOMAIN was binding to `default` and
-# an unmatched string came back as e.g. "embaleme.com.br" - a token outside
-# app.py's note_verdict() allow-list, so the verdict was silently dropped.
-#
-# deps= is deliberately wide: this block is a re-export surface, so it reads
-# every table and helper it republishes.
-# ============================================================================
-
-# ---- status token aliases (app.py spelling -> this module's spelling) -------
-VALID = STATUS_VALID
-WRONG = WRONG_PASSWORD = STATUS_WRONG
-APP = NEED_APP_PASSWORD = STATUS_NEED_APP_PASSWORD
-FAILED = CONNECTION_FAILED = STATUS_CONNECTION_FAILED
-PROXY_UNHEALTHY = STATUS_PROXY_UNHEALTHY
-UNKNOWN = STATUS_UNKNOWN
-RETRY = RETRY_LATER = STATUS_RETRY_LATER
-RBL = RBL_BLOCKED = STATUS_RBL_BLOCKED
-DNS_FAILED = STATUS_DNS_FAIL
-LOGIN_DROPPED = STATUS_LOGIN_DROPPED
-
-# Two app-only bucket tokens have no STATUS_* equivalent:
-#   SMTP_FAILED      submission AUTH failure - CONFIRM-ONLY, never lowers a verdict
-#   SKIPPED_COOLDOWN the Fast-Mode domain-cooldown sentinel
-SMTP_FAILED = "SMTP_FAILED"
-SKIP = SKIPPED_COOLDOWN = "SKIPPED_COOLDOWN"
-
-# ---- widen the published tables so the two new tokens are first-class -------
-ALL_STATUSES = tuple(STATUSES) + (SMTP_FAILED, SKIPPED_COOLDOWN)
-
-_NEW_RANK = len(PRIORITY)
-PRIORITY = dict(PRIORITY)
-PRIORITY.setdefault(SMTP_FAILED, _NEW_RANK)
-PRIORITY.setdefault(SKIPPED_COOLDOWN, _NEW_RANK + 1)
-
-LABELS = dict(LABELS)
-LABELS.setdefault(SMTP_FAILED, "SMTP failed")
-LABELS.setdefault(SKIPPED_COOLDOWN, "Skipped (cooldown)")
-
-COLORS = dict(COLORS)
-COLORS.setdefault(SMTP_FAILED, "#a855f7")
-COLORS.setdefault(SKIPPED_COOLDOWN, "#a78bfa")
-
-STATUS_BUCKET = dict(STATUS_BUCKET)
-STATUS_BUCKET.setdefault(SMTP_FAILED, BUCKET_UNKNOWN)
-STATUS_BUCKET.setdefault(SKIPPED_COOLDOWN, BUCKET_UNKNOWN)
-
-
-# ---- RATE-LIMIT GUARD ------------------------------------------------------
-# _ORDER evaluates the * BYE / SERVER_DROP family BEFORE RETRY_HARD, so
-#
-#     "* BYE Too many simultaneous connections"
-#
-# resolved LOGIN_DROPPED.  A * BYE carrying a RATE-LIMIT wording is not a login
-# drop: the password was never presented, the CONNECTION CAP was.  The right
-# answer is RETRY_LATER, because a cap is PER IP and the engine must therefore
-# ROTATE the proxy (LOGIN_DROPPED sets rotate_now = False and stalls instead).
-# app.py's inline fallback and the reader's _looks_like_login_drop() both
-# already do exactly this; this module did not.
-_RATE_LIMIT_TOKENS = (
-    "too many", "limit", "quota", "busy", "throttle", "ratelimit",
-    "rate limit", "overload", "congestion", "maintenance",
-)
-
-
-def classify_detail(text, default=STATUS_UNKNOWN):
-    """Guarded classifier - see _RATE_LIMIT_TOKENS above.
-
-    When a rate-limit wording is present the SERVER_DROP family is skipped and
-    RETRY_HARD gets its turn.  Everything else keeps _ORDER's precedence
-    byte-for-byte, so WRONG_STRONG still wins on an auth rejection that merely
-    mentions a limit.
-    """
-    s = normalise(text)
-    if not s:
-        return default, "EMPTY", None
-    skip_drop = any(k in s for k in _RATE_LIMIT_TOKENS)
-    for name, table, status in _ORDER:
-        if skip_drop and name in ("SERVER_DROP", "SERVER_DROP_HARD"):
-            continue
-        needle = first_match(s, table)
-        if needle is not None:
-            return status, name, needle
-    return default, "DEFAULT", None
-
-
-def classify_error(text, domain="", default=STATUS_UNKNOWN):
-    """app.py-compatible classifier: (text, domain) -> status token.
-
-    The SECOND POSITIONAL is the DOMAIN and is accepted purely for signature
-    compatibility with app.py's `st_classify(err_str, domain)`; it does not
-    influence the verdict.  Pass the no-match fallback as a KEYWORD:
-    classify_error(text, default=STATUS_WRONG).
-
-    Always returns a member of ALL_STATUSES, never the domain - app.py's
-    note_verdict() silently drops anything outside its allow-list.
-    """
-    return classify_detail(text, default)[0]
-
-
-def is_proxy_level_error(text) -> bool:
-    """True when the failure is a PROXY CREDENTIAL rejection, not a reset."""
-    return any(k in normalise(text) for k in _PROXY_LEVEL)
-
-
-def display(status):
-    """Alias of label_for(), for app.py's st_display()."""
-    return label_for(status)
-
-
-def color(status):
-    """Alias of color_for(), for app.py's st_color()."""
-    return color_for(status)
-
-
-_APP_FACING_NAMES = (
-    "VALID", "WRONG", "WRONG_PASSWORD", "APP", "NEED_APP_PASSWORD",
-    "FAILED", "CONNECTION_FAILED", "PROXY_UNHEALTHY",
-    "SKIP", "SKIPPED_COOLDOWN", "UNKNOWN",
-    "RETRY", "RETRY_LATER", "RBL", "RBL_BLOCKED",
-    "SMTP_FAILED", "DNS_FAILED", "LOGIN_DROPPED",
-    "ALL_STATUSES", "is_proxy_level_error", "display", "color",
-)
-
-__all__ = tuple(__all__) + _APP_FACING_NAMES + ("alias_selftest",)
-
-
-def alias_selftest():
-    """Prove the app.py import contract resolves, for real.
-
-    Returns [(name, ok, detail)].  This is the check that would have caught the
-    original ImportError before it silently disabled this whole module.
-    """
-    out = []
-    for name in _APP_FACING_NAMES:
-        if name in globals():
-            out.append((name, True, repr(globals()[name])[:44]))
+            return self[name]
+        except KeyError as exc:
+            raise AttributeError(name) from exc
+
+    @property
+    def ok(self):
+        return not self.get("faults")
+
+
+def _mask(lines, tok):
+    sr, sc = tok.start
+    er, ec = tok.end
+    if sr == er:
+        row = lines[sr - 1]
+        lines[sr - 1] = row[:sc] + " " * max(0, ec - sc) + row[ec:]
+        return
+    for r in range(sr, er + 1):
+        idx = r - 1
+        if idx >= len(lines):
+            break
+        row = lines[idx]
+        if r == sr:
+            lines[idx] = row[:sc] + " " * max(0, len(row) - sc)
+        elif r == er:
+            lines[idx] = " " * ec + row[ec:]
         else:
-            out.append((name, False, "MISSING"))
+            lines[idx] = " " * len(row)
+
+
+def non_ascii_offenders(src):
+    """Line numbers carrying non-ASCII outside strings/comments."""
+    lines = src.splitlines()
+    masked = list(lines)
     try:
-        got = classify_error("NO [AUTHENTICATIONFAILED] Invalid credentials",
-                             "example.com")
-        out.append(("classify_error(text, domain) -> WRONG",
-                    got == STATUS_WRONG, got))
-    except Exception as exc:                                  # noqa: BLE001
-        out.append(("classify_error(text, domain) -> WRONG", False, repr(exc)))
-    try:
-        got = classify_error("zzz nothing in any table zzz", "example.com")
-        out.append(("no-match returns a STATUS, not the domain",
-                    got == STATUS_UNKNOWN, got))
-    except Exception as exc:                                  # noqa: BLE001
-        out.append(("no-match returns a STATUS, not the domain", False, repr(exc)))
-    try:
-        got = classify_error("* BYE Too many simultaneous connections")
-        out.append(("rate-limited * BYE -> RETRY_LATER, not LOGIN_DROPPED",
-                    got == STATUS_RETRY_LATER, got))
-    except Exception as exc:                                  # noqa: BLE001
-        out.append(("rate-limited * BYE -> RETRY_LATER, not LOGIN_DROPPED",
-                    False, repr(exc)))
-    try:
-        got = is_proxy_level_error("407 Proxy Authentication Required")
-        out.append(("is_proxy_level_error detects 407", bool(got), got))
-    except Exception as exc:                                  # noqa: BLE001
-        out.append(("is_proxy_level_error detects 407", False, repr(exc)))
+        toks = list(tokenize.generate_tokens(io.StringIO(src).readline))
+    except Exception:
+        toks = []
+    if not toks:
+        return []
+    for tok in toks:
+        if tokenize.tok_name.get(tok.type) in _ALLOWED_TOKENS:
+            try:
+                _mask(masked, tok)
+            except Exception:
+                pass
+    out = []
+    for i, row in enumerate(masked, start=1):
+        if any(ord(ch) > 127 for ch in row):
+            out.append(i)
     return out
-# @@END 012 APP_COMPAT
+
+
+def _scan(path):
+    with open(path, "r", encoding="utf-8") as fh:
+        return fh.read()
+
+
+def audit_source(path):
+    """Audit one file. Never raises; problems come back as faults."""
+    rep = Report(
+        path=path,
+        exists=False,
+        declared=None,
+        version=None,
+        blocks=0,
+        faults=0,
+        details=[],
+    )
+
+    if not os.path.isfile(path):
+        rep["faults"] = 1
+        rep["details"].append({"line": 0, "kind": "missing_file", "text": "%s is MISSING" % path})
+        return rep
+
+    try:
+        src = _scan(path)
+    except Exception as exc:
+        rep["exists"] = True
+        rep["faults"] = 1
+        rep["details"].append({"line": 0, "kind": "unreadable", "text": str(exc)})
+        return rep
+
+    rep["exists"] = True
+    lines = src.splitlines()
+
+    def fault(line, kind, text):
+        rep["details"].append({"line": line, "kind": kind, "text": text})
+        rep["faults"] += 1
+
+    # header
+    if lines:
+        m = FILE_RX.match(lines[0].strip())
+        if m:
+            rep["declared"] = int(m.group(2))
+            rep["version"] = m.group(3)
+            if os.path.basename(path) != m.group(1):
+                fault(1, "header_name", "header says '%s', file is '%s'" % (m.group(1), path))
+        else:
+            fault(1, "header", "first line is not a valid '# @@FILE name blocks=N version=V' header")
+
+    blocks = {}       # id -> (line, name)
+    ends = {}         # id -> (line, name)
+    bare_ends = 0
+
+    for i, raw in enumerate(lines, start=1):
+        s = raw.strip()
+
+        mb = BLOCK_RX.match(s)
+        if mb:
+            bid = int(mb.group(1))
+            bname = mb.group(2)
+            if bid in blocks:
+                fault(i, "duplicate_id", "block id %03d already opened at line %d" % (bid, blocks[bid][0]))
+            else:
+                blocks[bid] = (i, bname)
+            continue
+
+        me = END_RX.match(s)
+        if me:
+            gid, gname = me.group(1), me.group(2)
+            if gid is None:
+                bare_ends += 1
+                fault(i, "bare_end", "bare '# @@END' with no block id")
+                fault(i, "bare_end", "bare '# @@END' with no block name")
+            else:
+                bid = int(gid)
+                if bid in ends:
+                    fault(i, "duplicate_end", "END %03d already closed at line %d" % (bid, ends[bid][0]))
+                ends[bid] = (i, gname or "")
+            continue
+
+    rep["blocks"] = len(blocks)
+
+    # every open block needs a matching named end
+    for bid in sorted(blocks):
+        if bid not in ends:
+            fault(blocks[bid][0], "unclosed", "block %03d %s has no matching '# @@END'" % (bid, blocks[bid][1]))
+            continue
+        eline, ename = ends[bid]
+        bname = blocks[bid][1]
+        if not ename:
+            fault(eline, "unnamed_end", "END %03d carries no block name" % bid)
+        elif ename != bname:
+            fault(eline, "end_name_mismatch", "END %03d name '%s' != block name '%s'" % (bid, ename, bname))
+
+    for bid in sorted(ends):
+        if bid not in blocks:
+            fault(ends[bid][0], "orphan_end", "END %03d has no matching block" % bid)
+
+    if blocks:
+        expected = list(range(len(blocks)))
+        actual = sorted(blocks)
+        if actual != expected:
+            missing = [i for i in expected if i not in blocks]
+            fault(0, "noncontiguous", "block ids are not 000..%03d (missing %s)" % (len(blocks) - 1, missing or "none"))
+
+    if rep["declared"] is not None and rep["declared"] != rep["blocks"]:
+        fault(0, "count_mismatch", "header declares %d blocks, found %d" % (rep["declared"], rep["blocks"]))
+
+    if lines and not any(EOF_RX.match(l.strip()) for l in lines[-3:]):
+        fault(len(lines), "eof_marker", "no '# @@EOF' marker in the last 3 lines")
+
+    for lineno in non_ascii_offenders(src):
+        fault(lineno, "non_ascii", "non-ASCII character outside a string or comment")
+
+    rep["faults"] = len(rep["details"])
+    return rep
+
+
+audit_file = audit_source
+
+
+def block_ids(path):
+    if not os.path.isfile(path):
+        return []
+    ids = []
+    for raw in _scan(path).splitlines():
+        m = BLOCK_RX.match(raw.strip())
+        if m:
+            ids.append(int(m.group(1)))
+    return ids
+
+
+def audit_all(paths=None):
+    targets = list(paths) if paths else list(BLOCKED_FILES)
+    return {p: audit_source(p) for p in targets}
+
+
+def totals(reports=None):
+    reps = reports if reports is not None else audit_all()
+    if isinstance(reps, dict):
+        reps = list(reps.values())
+    files = len(reps)
+    blocks = sum(r.get("blocks", 0) for r in reps)
+    faults = sum(r.get("faults", 0) for r in reps)
+    return files, blocks, faults
+
+
+audit = audit_source
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(description="block-integrity gate")
+    ap.add_argument("--json", action="store_true", help="emit JSON")
+    ap.add_argument("--quiet", action="store_true", help="summary only")
+    ap.add_argument("paths", nargs="*", help="override BLOCKED_FILES")
+    args = ap.parse_args(argv)
+
+    reports = audit_all(args.paths or None)
+    files, blocks, faults = totals(reports)
+
+    if args.json:
+        print(json.dumps({"files": files, "blocks": blocks, "faults": faults,
+                          "reports": reports}, indent=2, default=str))
+    else:
+        for path, rep in reports.items():
+            if rep.get("faults"):
+                status = "FAULT %d" % rep["faults"]
+            elif not rep.get("exists"):
+                status = "MISSING"
+            else:
+                status = "OK"
+            print("%-34s blocks=%-4d %s" % (path, rep.get("blocks", 0), status))
+            if not args.quiet:
+                for d in rep.get("details", []):
+                    print("    L%-5d %-20s %s" % (d["line"], d["kind"], d["text"]))
+        print("-" * 62)
+        print("files=%d blocks=%d faults=%d" % (files, blocks, faults))
+
+    return 1 if faults else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
