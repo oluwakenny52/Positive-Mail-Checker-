@@ -1,4 +1,5 @@
-# @@BLOCK 000 FILE_HEADER deps=none
+# @@FILE status.py blocks=12 version=v13.40
+# @@BLOCK 000 FILE_HEADER deps=-
 """
 status.py - status vocabulary, classifier and label/colour metadata for the
 Mega Ultimate Mail Checker.
