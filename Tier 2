@@ -1,0 +1,371 @@
+#!/usr/bin/env python3
+"""tier2_split.py - split app.py into engine.py (logic) + app.py (render).
+
+WHY
+---
+app.py is already 111 @@BLOCK-delimited blocks, so the split is a MOVE of whole
+blocks - no body is edited.  That is the whole point of the block frame.
+
+THE ONE TRAP THIS RESPECTS
+--------------------------
+A block moved to engine.py executes ONCE per server process (module import is
+cached).  A block left in app.py executes on EVERY Streamlit rerun.  So:
+
+    pure definitions (def/class/import/pure-literal Assign) -> engine.py
+    anything with a top-level side effect               -> app.py
+
+Everything with a side effect therefore keeps its exact current cadence.
+
+CROSS-FILE NAMES
+----------------
+engine.install(globals()) at the top of app.py  -> engine names reach app.py
+engine.bind(globals()) first line of every app block -> app names reach engine
+
+Run once from the repo root:   python tier2_split.py
+Writes: engine.py, app.py (backup -> app_pre_tier2.py.bak), TIER2_MANIFEST.txt
+"""
+import ast
+import io
+import os
+import re
+import sys
+import time
+
+SRC = "app.py"
+ENGINE = "engine.py"
+BACKUP = "app_pre_tier2.py.bak"
+MANIFEST = "TIER2_MANIFEST.txt"
+
+RE_FILE = re.compile(r"^#\s*@@FILE\s+(\S+)\s+blocks=(\d+)\s+version=(\S+)\s*$")
+RE_BLOCK = re.compile(r"^#\s*@@BLOCK\s+(\d{3})\s+([A-Z0-9_]+)\s+deps=([\d,\-]+)\s*$")
+RE_END = re.compile(r"^#\s*@@END\s+(\d{3})\s+([A-Z0-9_]+)\s*$")
+
+DEF_TYPES = (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef,
+             ast.Import, ast.ImportFrom)
+
+
+def read(p):
+    with io.open(p, "r", encoding="utf-8") as fh:
+        return fh.read()
+
+
+def write(p, text):
+    with io.open(p, "w", encoding="utf-8", newline="\n") as fh:
+        fh.write(text)
+
+
+def parse_blocks(src):
+    lines = src.splitlines()
+    out = []
+    cur = None
+    for i, ln in enumerate(lines, 1):
+        m = RE_BLOCK.match(ln)
+        if m:
+            cur = {"id": int(m.group(1)), "name": m.group(2),
+                   "deps": [int(d) for d in m.group(3).split(",") if d.isdigit()],
+                   "start": i, "body": []}
+            continue
+        m = RE_END.match(ln)
+        if m and cur is not None:
+            out.append(cur)
+            cur = None
+            continue
+        if cur is not None:
+            cur["body"].append(ln)
+    return out
+
+
+def _safe(body):
+    """True only if every top-level statement is a pure definition."""
+    try:
+        tree = ast.parse("\n".join(body))
+    except SyntaxError:
+        return False
+    for node in tree.body:
+        if isinstance(node, DEF_TYPES):
+            continue
+        if isinstance(node, (ast.Assign, ast.AnnAssign)):
+            val = getattr(node, "value", None)
+            if val is None:
+                continue
+            if any(isinstance(n, ast.Call) for n in ast.walk(val)):
+                return False
+            continue
+        if isinstance(node, ast.Expr) and isinstance(node.value, ast.Constant):
+            continue
+        return False
+    return True
+
+
+def _defs(tree, into):
+    for node in tree.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            into.add(node.name)
+        elif isinstance(node, (ast.Assign, ast.AnnAssign)):
+            tgts = node.targets if isinstance(node, ast.Assign) else [node.target]
+            for t in tgts:
+                for n in ast.walk(t):
+                    if isinstance(n, ast.Name):
+                        into.add(n.id)
+        elif isinstance(node, (ast.Import, ast.ImportFrom)):
+            for a in node.names:
+                into.add(a.asname or a.name.split(".")[0])
+        elif isinstance(node, (ast.Try, ast.If, ast.With)):
+            for sub in node.body:
+                _defs(ast.Module(body=[sub], type_ignores=[]), into)
+
+
+def _uses(tree):
+    return {n.id for n in ast.walk(tree)
+            if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Load)}
+
+
+def _import_lines(src):
+    """Every top-level import statement in the file, deduped, order preserved."""
+    seen, out = set(), []
+    for node in ast.parse(src).body:
+        if isinstance(node, (ast.Import, ast.ImportFrom)):
+            txt = ast.unparse(node)
+            if txt not in seen:
+                seen.add(txt)
+                out.append(txt)
+    # imports hidden inside a try/except guard
+    for node in ast.parse(src).body:
+        if isinstance(node, ast.Try):
+            for sub in node.body:
+                if isinstance(sub, (ast.Import, ast.ImportFrom)):
+                    txt = ast.unparse(sub)
+                    if txt not in seen:
+                        seen.add(txt)
+                        out.append(txt)
+    return out
+
+
+def emit(fname, version, entries):
+    """entries: [(old_id_or_None, name, deps_list, body_lines)]"""
+    n = len(entries)
+    idmap = {}
+    for new_id, (old, _n, _d, _b) in enumerate(entries):
+        if old is not None:
+            idmap[old] = new_id
+    L = ["# @@FILE %s blocks=%d version=%s" % (fname, n, version), ""]
+    for new_id, (old, name, deps, body) in enumerate(entries):
+        mapped = sorted({idmap[d] for d in deps
+                         if d in idmap and idmap[d] < new_id})
+        dep_str = ",".join("%03d" % d for d in mapped) or "-"
+        L.append("# @@BLOCK %03d %s deps=%s" % (new_id, name, dep_str))
+        L.extend(body)
+        L.append("# @@END %03d %s" % (new_id, name))
+        L.append("")
+    return "\n".join(L)
+
+
+ENGINE_HEADER = '''"""
+engine.py - Mega Ultimate Mail Checker engine (TIER 2).
+
+Every PURE DEFINITION block of the old app.py lives here: functions, classes,
+tables, imports.  Module body runs ONCE per server process, so nothing in this
+file may have a per-rerun side effect.
+
+app.py imports this module and calls install()/bind() - see the contract below.
+"""'''
+
+APP_HEADER = '''"""
+Mega Ultimate Mail Checker - app.py  (TIER 2 UI SHELL)
+
+The engine lives in engine.py.  This file renders.
+
+TIER 2 CONTRACT
+  * engine.py holds pure definitions and runs once per server process.
+  * app.py holds every block with a top-level side effect, so it still runs on
+    EVERY rerun - sidebar, session init, gates, run loop, all unchanged.
+  * engine.install(globals()) below pulls the whole engine namespace in.
+  * engine.bind(globals()) is the first line of every block below, so an engine
+    function can always see anything that is still defined in this file.
+  * Mutable shared state (STATE, CFG, pools) is mutated IN PLACE, never rebound
+    wholesale, so both modules keep looking at the same object.
+"""'''
+
+SHIM = '''import sys as _sys
+import streamlit as str_lit
+import engine
+
+engine.install(globals())
+_SYS_ENGINE = engine'''
+
+LINK = '''_ENGINE_OWN = frozenset(k for k in globals() if not k.startswith("__"))
+
+
+def install(ns):
+    """Copy the whole engine namespace into a caller's globals()."""
+    for k, v in globals().items():
+        if not k.startswith("__"):
+            ns[k] = v
+    return ns
+
+
+def bind(ns):
+    """Refresh engine globals from a caller's namespace.
+
+    Only adds names the engine does not own, so the engine's own definitions
+    always win.  Called before every app block, which is what keeps a name left
+    behind in app.py visible to an engine function.
+    """
+    g = globals()
+    for k, v in ns.items():
+        if not k.startswith("__") and k not in _ENGINE_OWN:
+            g[k] = v
+    return g'''
+
+BIND_LINE = "engine.bind(globals())"
+
+
+def main():
+    if not os.path.exists(SRC):
+        print("app.py not found in %s" % os.getcwd())
+        return 1
+    src = read(SRC)
+    version = "v13.40"
+    first = src.splitlines()[0] if src.splitlines() else ""
+    m = RE_FILE.match(first)
+    if m:
+        version = m.group(3)
+
+    blocks = parse_blocks(src)
+    if not blocks:
+        print("no @@BLOCK lines found in app.py - run verify_blocks.py first")
+        return 1
+
+    # ---- classify ---------------------------------------------------------
+    engine_blocks, app_blocks = [], []
+    for b in blocks:
+        body_src = "\n".join(b["body"])
+        if "set_page_config" in body_src:
+            app_blocks.append(b)
+        elif b["id"] == 0:
+            engine_blocks.append(b)
+        elif _safe(b["body"]):
+            engine_blocks.append(b)
+        else:
+            app_blocks.append(b)
+
+    # ---- cross-reference report ------------------------------------------
+    def_names, use_names = {}, {}
+    for b in blocks:
+        try:
+            tree = ast.parse("\n".join(b["body"]))
+        except SyntaxError:
+            continue
+        d = set()
+        _defs(tree, d)
+        def_names[b["id"]] = d
+        use_names[b["id"]] = _uses(tree)
+
+    app_defined = {}
+    for b in app_blocks:
+        for n in def_names.get(b["id"], ()):
+            app_defined.setdefault(n, b["name"])
+    engine_defined = set()
+    for b in engine_blocks:
+        engine_defined |= def_names.get(b["id"], ())
+
+    borrowed = set()
+    for b in engine_blocks:
+        for n in use_names.get(b["id"], ()):
+            if n in app_defined and n not in engine_defined:
+                borrowed.add((n, app_defined[n]))
+
+    shadowed = sorted(n for n in (engine_defined & set(app_defined))
+                      if n in engine_defined)
+
+    # ---- build ------------------------------------------------------------
+    eng_entries = [(None, "FILE_HEADER", [], ENGINE_HEADER.splitlines()),
+                   (None, "IMPORTS_SHARED", [], _import_lines(src))]
+    for b in engine_blocks:
+        eng_entries.append((b["id"], b["name"], b["deps"], b["body"]))
+    eng_entries.append((None, "ENGINE_LINK", [], LINK.splitlines()))
+
+    app_entries = [(None, "FILE_HEADER", [], APP_HEADER.splitlines()),
+                   (None, "SHIM", [], SHIM.splitlines())]
+    for b in app_blocks:
+        body = list(b["body"])
+        app_entries.append((b["id"], b["name"], b["deps"],
+                            [BIND_LINE, ""] + body))
+
+    engine_src = emit(ENGINE, version, eng_entries)
+    app_src = emit("app.py", version, app_entries)
+
+    # ---- validate ---------------------------------------------------------
+    try:
+        import verify_blocks as VB
+    except Exception as exc:                       # noqa: BLE001
+        print("could not import verify_blocks.py: %r" % (exc,))
+        return 1
+
+    fails = []
+    for label, text in ((ENGINE, engine_src), ("app.py (new)", app_src)):
+        res = VB.audit_source(text, label)
+        fails.extend(res["fails"])
+        try:
+            compile(text, label, "exec")
+        except SyntaxError as e:
+            fails.append("%s DOES NOT COMPILE: line %s: %s" % (label, e.lineno, e.msg))
+        if not res["table"]:
+            fails.append("%s produced no blocks" % label)
+
+    print("=" * 74)
+    print("TIER 2 SPLIT - %s" % time.strftime("%Y-%m-%d %H:%M:%S"))
+    print("=" * 74)
+    print("engine.py : %d block(s)  (pure definitions)" % len(eng_entries))
+    print("app.py    : %d block(s)  (side-effecting / render)" % len(app_entries))
+    print("")
+    print("-- MOVED TO engine.py --")
+    for b in engine_blocks:
+        print("   %03d  %-32s %d line(s)" % (b["id"], b["name"], len(b["body"])))
+    print("")
+    print("-- KEPT IN app.py --")
+    for b in app_blocks:
+        print("   %03d  %-32s %d line(s)" % (b["id"], b["name"], len(b["body"])))
+    print("")
+    if borrowed:
+        print("-- engine references a name that stays in app.py (bind() covers it) --")
+        for n, where in sorted(borrowed):
+            print("   %-34s defined in app block %s" % (n, where))
+    if shadowed:
+        print("-- defined in BOTH files (engine's wins; mutate in place, never rebind) --")
+        for n in shadowed[:40]:
+            print("   %s" % n)
+    print("")
+
+    if fails:
+        print("VALIDATION FAILED - app.py left untouched")
+        for f in fails[:60]:
+            print("  - " + f)
+        return 1
+
+    # ---- write ------------------------------------------------------------
+    if os.path.exists(BACKUP):
+        os.replace(BACKUP, BACKUP + "." + time.strftime("%H%M%S"))
+    os.replace(SRC, BACKUP)
+    write(ENGINE, engine_src)
+    write(SRC, app_src)
+
+    with io.open(MANIFEST, "w", encoding="utf-8", newline="\n") as fh:
+        fh.write("TIER 2 MANIFEST  %s\n" % time.strftime("%Y-%m-%d %H:%M:%S"))
+        fh.write("engine.py: %d blocks\n" % len(eng_entries))
+        for i, (_o, n, _d, b) in enumerate(eng_entries):
+            fh.write("  %03d %s (%d lines)\n" % (i, n, len(b)))
+        fh.write("app.py: %d blocks\n" % len(app_entries))
+        for i, (_o, n, _d, b) in enumerate(app_entries):
+            fh.write("  %03d %s (%d lines)\n" % (i, n, len(b)))
+
+    print("OK - wrote engine.py and app.py")
+    print("     old app.py backed up to %s" % BACKUP)
+    print("     manifest -> %s" % MANIFEST)
+    print("")
+    print("next:  python verify_blocks.py && python verify_v1337.py")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
