@@ -5760,7 +5760,7 @@ def pop_plain_once(email, password, server, proxy_str=None, port=110, attempt_ti
             except Exception:
                 pass
 
-         def verify_and_connect(target_email, target_pass, hosts, proxy_str=None):
+def verify_and_connect(target_email, target_pass, hosts, proxy_str=None):
     """Used by the in-app Mailbox Reader.
 
     v13.39: the insecure flag is read from ALLOW_SELF_SIGNED (it used to be
