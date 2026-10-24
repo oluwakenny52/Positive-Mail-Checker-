@@ -1,686 +1,370 @@
+# @@BLOCK 000 FILE_HEADER deps=none
 """
-pages/2_Diagnostics.py — Mega Ultimate Mail Checker  (v13.37)
-============================================================
-Read-only inspection page. It answers three questions without spending a single
-proxy credit or touching a mailbox:
+pages/2_Diagnostics.py - engine / proxy / DNS diagnostics surface.
 
-  1. What EXACTLY will the engine dial for this domain?  (the real rung order,
-     built with the same cap / apex / POP-selection logic app.py uses)
-  2. Does the network actually answer?  (live TCP probes on 993/143/995/110)
-  3. Is the resolution layer sane?  (family priority, dead-imap demotion,
-     SRV / autoconfig / MX discovery sources, SMTP candidates, host cache)
+Read-only: every control here reads, probes or clears a cache. Nothing here
+mutates a bucket.
 
-Only real hosts.py functions are used:
-    conf, discover_hosts, resolve_mx, resolve_srv, host_resolves, is_junk_host,
-    host_tier, probe_live, smtp_candidates, cache_stats, clear_cache,
-    refresh_domain, _family_priority, _family_priority_pop, DEAD_IMAP_HOSTS
-
-v13.37 fixes on this page
--------------------------
-* Renamed 1_Diagnostics.py -> 2_Diagnostics.py (it collided with
-  1_Mailbox_Reader.py, so both rendered under the same page number).
-* st.stop() inside `with tab_plan:` aborted the WHOLE script, so tabs 2-6
-  (Live Port Probe, DNS, SMTP, Proxy Audit, Cache) never rendered at all for a
-  zero-access domain, or whenever conf() raised.  Tab 1 is now skipped via a
-  flag and every other tab still renders.
-* _build_plan() claimed to mirror app.py and did not: it ignored the configured
-  protocol set and always emitted both IMAP and POP rungs.  It now reads the
-  engine's real protocol flags out of st.session_state["applied_cfg"].
-* The POP warning was unconditional-ish.  Replaced with a real
-  pop_only-vs-all_pop test.
+NOTE: this page deliberately does NOT call set_page_config(). Importing app.py
+runs its own call and Streamlit permits only one per script run.
 """
 
-import os
-import sys
+from __future__ import annotations
+
+import importlib
 import json
-import time
+import os
 import socket
-from datetime import datetime
+import sys
+import time
+import html as _html
 
-import streamlit as st
+import streamlit as str_lit
 
-st.set_page_config(page_title="Diagnostics · Mail Checker", page_icon="🔍", layout="wide")
-
-# --------------------------------------------------------------------------
-# make the repo root importable (the page runs from pages/)
-# --------------------------------------------------------------------------
-THIS_DIR = os.path.dirname(os.path.abspath(__file__))
-APP_DIR = os.path.dirname(THIS_DIR)
-if APP_DIR not in sys.path:
-    sys.path.insert(0, APP_DIR)
-
-# --------------------------------------------------------------------------
-# theme — read-only mirror of theme.json so this page matches the app
-# --------------------------------------------------------------------------
-def _load_theme():
-    base = {"bg": "#0b1020", "panel": "#141b30", "text": "#e6ebff",
-            "accent": "#8b5cf6", "accent2": "#22d3ee", "g1": "#667eea", "g2": "#764ba2"}
-    for cand in (os.path.join(APP_DIR, "theme.json"), "theme.json"):
-        try:
-            if os.path.exists(cand):
-                with open(cand, encoding="utf-8") as f:
-                    data = json.load(f)
-                if isinstance(data, dict):
-                    base.update({k: v for k, v in data.items() if k in base and isinstance(v, str)})
-                break
-        except Exception:
-            continue
-    return base
+PAGE_NAME = "Diagnostics"
+PAGE_VERSION = "v13.40"
+DIAG_TTL = 30.0
+# @@END 000
 
 
-_TH = _load_theme()
-
-st.markdown(
-    f"""
-<style>
-    .stApp {{ background: {_TH['bg']}; color: {_TH['text']}; }}
-    h1, h2, h3, h4 {{ color: {_TH['text']} !important; }}
-    .dg-hero {{
-        background: linear-gradient(135deg, {_TH['g1']} 0%, {_TH['g2']} 100%);
-        padding: 18px 24px; border-radius: 14px; margin-bottom: 14px;
-        border: 1px solid rgba(255,255,255,.12);
-    }}
-    .dg-hero h1 {{ color: #fff !important; margin: 0; font-size: 1.5rem; font-weight: 800; }}
-    .dg-hero p {{ color: rgba(255,255,255,.92) !important; margin: 6px 0 0 0; font-size: .85rem; }}
-    code, pre, [data-testid="stCodeBlock"] {{
-        background: {_TH['bg']} !important; color: {_TH['accent2']} !important;
-        border: 1px solid rgba(255,255,255,.10) !important; border-radius: 10px !important;
-    }}
-    [data-testid="stMetric"] {{
-        background: {_TH['panel']}; border: 1px solid rgba(255,255,255,.10);
-        border-left: 4px solid {_TH['accent']}; border-radius: 12px; padding: 12px 14px;
-    }}
-</style>
-""",
-    unsafe_allow_html=True,
-)
-
-st.markdown(
-    '<div class="dg-hero"><h1>🔍 Diagnostics</h1>'
-    '<p>Host plan · live port probe · DNS &amp; discovery · SMTP candidates · proxy audit · cache tools</p></div>',
-    unsafe_allow_html=True,
-)
-
-# --------------------------------------------------------------------------
-# hosts.py must import, or nothing here means anything
-# --------------------------------------------------------------------------
-try:
-    import hosts as H
-except Exception as _err:
-    st.error(f"`hosts.py` could not be imported: {_err}")
-    st.caption(f"Looked in: {APP_DIR}  ·  cwd: {os.getcwd()}")
-    st.stop()
-
-_HAVE = {
-    "family_pop": hasattr(H, "_family_priority_pop"),
-    "dead_imap": hasattr(H, "DEAD_IMAP_HOSTS"),
-    "conf": hasattr(H, "conf"),
-    "discover": hasattr(H, "discover_hosts"),
-}
-
-if not _HAVE["family_pop"]:
-    st.warning(
-        "This `hosts.py` has **no `_family_priority_pop()`** — the POP bucket is still being led by "
-        "the IMAP family, so the POP rung will dial `<imap-host>:995`. Apply the v13.26 `hosts.py` patch."
-    )
-
-# --------------------------------------------------------------------------
-# small helpers
-# --------------------------------------------------------------------------
-def _resolve(host):
+# @@BLOCK 001 ENGINE_ACCESS deps=000
+@str_lit.cache_resource(show_spinner=False)
+def _engine():
+    """Import app.py once per server process. Returns the module or the
+    exception object so the page can degrade instead of crashing."""
+    mod = sys.modules.get("app")
+    if mod is not None:
+        return mod
     try:
-        return socket.gethostbyname(host)
+        return importlib.import_module("app")
+    except Exception as exc:  # noqa: BLE001
+        return exc
+
+
+def _ok():
+    return not isinstance(_engine(), BaseException)
+
+
+def _eng(name, default=None):
+    if not _ok():
+        return default
+    return getattr(_engine(), name, default)
+
+
+def _state():
+    mod = _engine()
+    if isinstance(mod, BaseException):
+        return {}
+    s = getattr(mod, "STATE", None)
+    if isinstance(s, dict):
+        return s
+    fn = getattr(mod, "_engine_state", None)
+    if callable(fn):
+        try:
+            got = fn()
+            if isinstance(got, dict):
+                return got
+        except Exception:
+            pass
+    return {}
+# @@END 001
+
+
+# @@BLOCK 002 PROTOCOLS_FROM_APP deps=001
+def _protocols_from_app():
+    """FIX v13.40.
+
+    The old page read `ui_protocols` / `protocols`, which are raw WIDGET
+    VALUES: they can be empty or stale before the first run. app.py actually
+    publishes the ACTIVE list as CFG['PROTOCOLS']. Read that, then fall back.
+    """
+    candidates = []
+    cfg = _eng("CFG", None)
+    if isinstance(cfg, dict):
+        candidates.append(cfg)
+    st = _eng("STATE", None)
+    if isinstance(st, dict):
+        candidates.append(st)
+    for src in candidates:
+        for key in ("PROTOCOLS", "protocols"):
+            val = src.get(key)
+            if val:
+                return tuple(val)
+    direct = _eng("PROTOCOLS", None)
+    if direct:
+        return tuple(direct)
+    return ("IMAP",)
+
+
+def _protocols_source():
+    cfg = _eng("CFG", None)
+    if isinstance(cfg, dict) and cfg.get("PROTOCOLS"):
+        return "CFG['PROTOCOLS']"
+    if _eng("PROTOCOLS", None):
+        return "module PROTOCOLS"
+    return "fallback (IMAP only)"
+# @@END 002
+
+
+# @@BLOCK 003 SMALL_HELPERS deps=001
+def _bucket_rows():
+    """(bucket, row) for every *_results list in session_state."""
+    out = []
+    try:
+        items = list(str_lit.session_state.items())
     except Exception:
-        return None
-
-
-def _dedupe_by_ip(hosts, cap):
-    """Same collapse app.py performs: one host per resolved IP, capped."""
-    out, seen_ips = [], set()
-    for h in hosts:
-        if not h or h in out:
+        return out
+    for key, val in items:
+        if not isinstance(key, str) or not key.endswith("_results"):
             continue
-        ip = _resolve(h) or ("?" + h)
-        if ip in seen_ips:
+        if not isinstance(val, list):
             continue
-        seen_ips.add(ip)
-        out.append(h)
-        if len(out) >= cap:
-            break
-    if len(out) < cap:
-        for h in hosts:
-            if len(out) >= cap:
-                break
-            if h and h not in out:
-                out.append(h)
+        bucket = key[: -len("_results")]
+        for row in val:
+            if isinstance(row, dict):
+                out.append((bucket, row))
     return out
 
 
-def _port_probe(host, port, timeout=8.0):
-    t0 = time.time()
-    s = None
-    try:
-        s = socket.create_connection((host, int(port)), timeout=timeout)
-        return True, int((time.time() - t0) * 1000), ""
-    except Exception as e:
-        return False, int((time.time() - t0) * 1000), f"{type(e).__name__}: {str(e)[:110]}"
-    finally:
-        if s:
-            try:
-                s.close()
-            except Exception:
-                pass
+def _count(bucket):
+    return sum(1 for b, _r in _bucket_rows() if b == bucket)
 
 
-def _parse_proxy(line):
-    p = (line or "").strip()
-    if not p:
-        return None
-    try:
-        if "://" in p:
-            from urllib.parse import urlparse
-            u = urlparse(p)
-            return {"host": u.hostname, "port": u.port or 80, "user": u.username}
-        if "@" in p:
-            cred, hostpart = p.rsplit("@", 1)
-            user = cred.split(":", 1)[0]
-            host, port = hostpart.split(":", 1)
-            return {"host": host, "port": int(port), "user": user}
-        parts = p.split(":")
-        if len(parts) == 4:
-            return {"host": parts[0], "port": int(parts[1]), "user": parts[2]}
-        if len(parts) == 2:
-            return {"host": parts[0], "port": int(parts[1]), "user": None}
-    except Exception:
-        return None
-    return None
-
-
-def _detect_format(line):
-    p = (line or "").strip()
-    if not p:
-        return "empty"
-    if "://" in p:
-        return "scheme:// (url form)"
-    if "@" in p:
-        return "user:pass@host:port"
-    n = len(p.split(":"))
-    if n == 4:
-        return "host:port:user:pass"
-    if n == 2:
-        return "host:port (NO CREDS)"
-    return f"UNRECOGNISED ({n} colon-parts)"
-
-
-# --------------------------------------------------------------------------
-# v13.37: read the ENGINE's real protocol flags
-# --------------------------------------------------------------------------
-def _protocols_from_app():
-    """app.py publishes its applied config into st.session_state["applied_cfg"].
-    Reading that same key is what makes this page honest instead of decorative.
-    Returns {imap, pop, smtp, sieve} — defaults match app.py's defaults."""
-    flags = {"imap": True, "pop": True, "smtp": False, "sieve": False}
-    cfg = {}
-    try:
-        cfg = st.session_state.get("applied_cfg") or {}
-    except Exception:
-        cfg = {}
-    raw = cfg.get("ui_protocols") or cfg.get("protocols")
-    if raw:
-        wanted = [str(p).strip().upper() for p in raw]
-        flags["imap"] = any(p.startswith("IMAP") for p in wanted)
-        flags["pop"] = any(p.startswith("POP") for p in wanted)
-        flags["smtp"] = any(p.startswith("SMTP") for p in wanted)
-        flags["sieve"] = any(p.startswith("SIEVE") for p in wanted)
-    return flags
-
-
-def _build_plan(domain, max_hosts, flags=None):
-    """Replicate app.py's check_account_sync() rung construction EXACTLY.
-
-    v13.37: the rung set is now gated on the engine's real protocol flags, so
-    disabling IMAP in the sidebar is visible here.
-    """
-    if flags is None:
-        flags = {"imap": True, "pop": True, "smtp": False, "sieve": False}
-
-    got = H.conf(domain) or {}
-    if got.get("type") == "zero_access":
-        return got, [], [], [], [], "zero_access"
-
-    all_imap = [h for h in (got.get("imap") or []) if h]
-    all_pop = [h for h in (got.get("pop") or got.get("pop3") or []) if h]
-
-    if not flags.get("imap"):
-        all_imap = []
-    if not flags.get("pop"):
-        all_pop = []
-
-    cap = max(2, min(4, int(max_hosts)))
-    imap_hosts = _dedupe_by_ip(all_imap, cap)
-
-    if domain and domain not in imap_hosts and len(imap_hosts) < 4 and _resolve(domain):
-        imap_hosts = imap_hosts + [domain]
-    if domain in imap_hosts:
-        imap_hosts = [h for h in imap_hosts if h != domain] + [domain]
-
-    pop_only_pref = [h for h in all_pop if h not in imap_hosts]
-    pop_hosts = (pop_only_pref or all_pop)[:1]
-
-    imap_set = set(imap_hosts)
-    pop_only = [h for h in pop_hosts if h not in imap_set]
-    pop_dup = [h for h in pop_hosts if h in imap_set]
-
-    primary = [("IMAP", h, 993, "ssl") for h in imap_hosts]
-    primary += [("POP", h, 995, "ssl") for h in pop_only]
-
-    fallback = [("POP", h, 995, "ssl") for h in pop_dup]
-    for h in imap_hosts:
-        fallback.append(("IMAP", h, 143, "starttls"))
-    for h in imap_hosts[:2]:
-        fallback.append(("IMAP", h, 143, "plain"))
-    for h in pop_hosts:
-        fallback.append(("POP", h, 110, "starttls"))
-        fallback.append(("POP", h, 110, "plain"))
-
-    return got, all_imap, all_pop, primary, fallback, "ok"
-
-
-# --------------------------------------------------------------------------
-# sidebar controls
-# --------------------------------------------------------------------------
-with st.sidebar:
-    st.markdown("### 🔍 Diagnostics controls")
-    domain = st.text_input("Domain", value="windstream.net").strip().lower()
-    max_hosts = st.slider("Max Hosts Per Domain (as in the app)", 1, 8, 3, 1)
-    force = st.toggle("Force refresh discovery (bypass 24h host cache)", value=False)
-    st.caption("Nothing here connects to a mailbox — only DNS and raw TCP.")
-
-if not domain:
-    st.info("Enter a domain.")
-    st.stop()
-
-# --------------------------------------------------------------------------
-tab_plan, tab_probe, tab_dns, tab_smtp, tab_proxy, tab_cache = st.tabs(
-    ["🧭 Host Plan", "🔌 Live Port Probe", "🛰 DNS / Discovery", "📮 SMTP", "🌐 Proxy Audit", "🧰 Cache"]
-)
-
-_PROTO_FLAGS = _protocols_from_app()
-st.caption("Engine protocol flags read from the applied config: "
-           + ", ".join(k.upper() for k, v in _PROTO_FLAGS.items() if v))
-
-# ==========================================================================
-# 1. HOST PLAN
-# ==========================================================================
-with tab_plan:
-    st.markdown(f"#### Exact rung order for `@{domain}`")
-
-    if force:
-        with st.spinner("Re-running discovery (SRV / autoconfig / autodiscover / MX)…"):
-            try:
-                H.refresh_domain(domain)
-            except Exception as e:
-                st.warning(f"discovery refresh failed: {e}")
-
-    # v13.37: defaults first, so later tabs and the footer always have values
-    got, all_imap, all_pop, primary, fallback, kind = {}, [], [], [], [], "ok"
-    plan_error = ""
-    try:
-        with st.spinner("Building host plan…"):
-            got, all_imap, all_pop, primary, fallback, kind = _build_plan(
-                domain, max_hosts, _PROTO_FLAGS)
-    except Exception as e:
-        plan_error = str(e)
-
-    # v13.37: was st.stop() -> killed tabs 2-6 as well
-    if plan_error:
-        st.error(f"conf() failed: {plan_error}")
-    elif kind == "zero_access":
-        st.info("This provider is Zero-Access / bridge-only (no IMAP or POP endpoint).")
-    else:
-        if not got:
-            st.warning("`hosts.conf()` returned nothing for this domain — the generic guesser found no route.")
-
-        fam = []
-        fam_pop = []
-        try:
-            fam = H._family_priority(domain)
-        except Exception:
-            pass
-        if _HAVE["family_pop"]:
-            try:
-                fam_pop = H._family_priority_pop(domain)
-            except Exception:
-                pass
-
-        c1, c2, c3 = st.columns(3)
-        c1.metric("IMAP candidates (raw)", len(all_imap))
-        c2.metric("POP candidates (raw)", len(all_pop))
-        c3.metric("Rungs that will be dialled", len(primary) + len(fallback))
-
-        st.markdown("**Family priority (IMAP bucket)**")
-        st.code(", ".join(fam) or "— none, generic guesser", language="text")
-        st.markdown("**Family priority (POP bucket)**")
-        st.code(", ".join(fam_pop) or "— none (POP bucket falls back to the IMAP family)", language="text")
-
-        st.markdown("**Resulting ladder — this is literally what the engine dials**")
-        st.code(
-            f"Host order -> IMAP {[h for h in all_imap if h][:8]} | POP {all_pop[:4]}\n"
-            f"primary_plan  ({len(primary)}): " + ", ".join(f"{p} {h}:{pt}" for p, h, pt, _m in primary) + "\n"
-            f"fallback_plan ({len(fallback)}): " + ", ".join(f"{p} {h}:{pt}" for p, h, pt, _m in fallback),
-            language="text",
-        )
-
-        if not fam_pop and all_pop:
-            st.warning(
-                "No POP family list is present, so the POP rung is dialling an IMAP hostname on 995 "
-                f"(`{all_pop[0]}:995`). Expected after the fix: `pop.{domain.split('.')[-2] + '.' + domain.split('.')[-1]}`."
-            )
-
-        # v13.37: real test instead of an unconditional warning
-        pop_only = bool(all_pop) and not bool(all_imap)
-        all_pop_dup = bool(all_pop) and bool(all_imap)
-        if pop_only:
-            st.warning("POP-only provider: the ladder has NO IMAP rung. Enable IMAP in the sidebar or "
-                       "this domain can never authenticate.")
-        elif all_pop_dup:
-            st.caption("IMAP and POP both exist — the engine dials IMAP first and only falls back to POP "
-                       "when every IMAP rung fails.")
-
-        st.markdown("**Per-host detail**")
-        rows = []
-        seen = []
-        for h in list(dict.fromkeys(all_imap + all_pop)):
-            if h in seen:
-                continue
-            seen.append(h)
-            ip = _resolve(h)
-            rows.append({
-                "Host": h,
-                "Resolves": "yes" if ip else "NO",
-                "IP": ip or "—",
-                "Dead-IMAP demoted": "yes" if (_HAVE["dead_imap"] and h in H.DEAD_IMAP_HOSTS) else "",
-                "Tier": H.host_tier(h, domain) if hasattr(H, "host_tier") else "",
-                "Looks like a router": "yes" if H.is_junk_host(h, domain) else "",
-                "In primary plan": "yes" if any(h == r[1] for r in primary) else "",
-            })
-        if rows:
-            st.dataframe(rows, use_container_width=True, hide_index=True)
-
-        # shared-IP grouping — explains why two hostnames live or die together
-        ipmap = {}
-        for h in seen:
-            ip = _resolve(h)
-            if ip:
-                ipmap.setdefault(ip, []).append(h)
-        shared = {ip: hs for ip, hs in ipmap.items() if len(hs) > 1}
-        if shared:
-            st.markdown("**Hosts sharing an IP** (they succeed or fail together)")
-            for ip, hs in shared.items():
-                st.code(f"{ip}  <-  {', '.join(hs)}", language="text")
-
-# ==========================================================================
-# 2. LIVE PORT PROBE
-# ==========================================================================
-with tab_probe:
-    st.markdown("#### Live TCP probe from this app host")
-    st.caption("A TCP connect proves a listener exists. It does NOT prove a mailbox exists.")
-
-    default_targets = []
-    for _p, h, pt, _m in (primary or []):
-        default_targets.append(f"{h}:{pt}")
-    if not default_targets:
-        default_targets = [f"imap.{domain}:993", f"pop.{domain}:995"]
-
-    targets_text = st.text_area(
-        "Targets (one host:port per line)", value="\n".join(dict.fromkeys(default_targets)), height=120
+def _kv_table(pairs, headers=("Key", "Value")):
+    if not pairs:
+        str_lit.caption("Nothing to show.")
+        return
+    head = "".join("<th style='text-align:left;padding:4px 10px;'>%s</th>" % _html.escape(h) for h in headers)
+    body = "".join(
+        "<tr><td style='padding:4px 10px;'>%s</td><td style='padding:4px 10px;'>%s</td></tr>"
+        % (_html.escape(str(a)), _html.escape(str(b)))
+        for a, b in pairs
     )
-    probe_to = st.slider("Timeout (s)", 2, 20, 8, 1)
+    str_lit.markdown(
+        "<table style='width:100%%;border-collapse:collapse;font-size:13px;'>"
+        "<thead><tr>%s</tr></thead><tbody>%s</tbody></table>" % (head, body),
+        unsafe_allow_html=True,
+    )
 
-    if st.button("▶ Probe all targets", type="primary"):
-        pairs = []
-        for line in targets_text.splitlines():
-            line = line.strip()
-            if not line or ":" not in line:
-                continue
-            h, p = line.rsplit(":", 1)
-            if p.strip().isdigit():
-                pairs.append((h.strip(), int(p.strip())))
-        if not pairs:
-            st.warning("No valid host:port targets.")
+
+def _fmt_bytes(n):
+    try:
+        n = float(n)
+    except Exception:
+        return str(n)
+    for unit in ("B", "KB", "MB", "GB"):
+        if n < 1024 or unit == "GB":
+            return "%.1f %s" % (n, unit)
+        n /= 1024.0
+    return "%.1f GB" % n
+# @@END 003
+
+
+# @@BLOCK 004 CSS deps=000
+def _css():
+    str_lit.markdown(
+        """
+        <style>
+        .dx-hero{background:linear-gradient(135deg,#0f172a,#1e293b);
+                 border:1px solid #334155;border-radius:14px;
+                 padding:16px 20px;margin-bottom:12px;}
+        .dx-hero h1{margin:0;font-size:22px;color:#e2e8f0;}
+        .dx-hero p{margin:4px 0 0;font-size:13px;color:#94a3b8;}
+        .dx-card{background:#0f172a;border:1px solid #1e293b;border-radius:12px;
+                 padding:12px 14px;margin-bottom:10px;}
+        .dx-card h3{margin:0 0 6px;font-size:14px;color:#cbd5e1;}
+        .dx-note{font-size:12px;color:#94a3b8;}
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+# @@END 004
+
+
+# @@BLOCK 005 HERO deps=004
+def _hero():
+    if not _ok():
+        str_lit.error("Engine import failed: %r" % (_engine(),))
+        return
+    _css()
+    str_lit.markdown(
+        "<div class='dx-hero'><h1>Diagnostics</h1>"
+        "<p>Engine surface, proxy pool, DNS cache and the classifier self-test. "
+        "Read-only.</p></div>",
+        unsafe_allow_html=True,
+    )
+# @@END 005
+
+
+# @@BLOCK 006 SUMMARY_METRICS deps=003
+def _summary():
+    st = _state()
+    rows = _bucket_rows()
+    cols = str_lit.columns(5)
+    cols[0].metric("Accounts in session", len(rows))
+    cols[1].metric("Valid", _count("valid"))
+    cols[2].metric("Wrong", _count("wrong"))
+    cols[3].metric("Blocked", _count("blocked"))
+    cols[4].metric("State keys", len(st))
+    str_lit.caption(
+        "Protocols source: %s | protocols=%s"
+        % (_protocols_source(), ", ".join(_protocols_from_app()))
+    )
+# @@END 006
+
+
+# @@BLOCK 007 DIAG_TEXT deps=001
+def _diag_text(force=False):
+    st = _state()
+    cache = st.get("diag_cache")
+    now = time.time()
+    if (
+        not force
+        and isinstance(cache, dict)
+        and cache.get("text")
+        and (now - float(cache.get("ts", 0.0))) < DIAG_TTL
+    ):
+        return cache["text"], float(cache.get("ts", 0.0)), True
+
+    builder = _eng("build_diagnostics_text", None)
+    if callable(builder):
+        try:
+            text = builder()
+        except Exception as exc:  # noqa: BLE001
+            text = "build_diagnostics_text() raised: %r" % (exc,)
+    else:
+        text = "build_diagnostics_text() not found on engine."
+
+    try:
+        st["diag_cache"] = {"text": text, "ts": now}
+    except Exception:
+        pass
+    return text, now, False
+# @@END 007
+
+
+# @@BLOCK 008 DIAG_EXPANDER deps=007
+def _diag_panel():
+    c1, c2, c3 = str_lit.columns([1, 1, 3])
+    force = c1.button("Rebuild", key="dx_rebuild")
+    selftest = c2.button("Self-test", key="dx_selftest")
+    text, ts, cached = _diag_text(force=force)
+    c3.caption(
+        "cached %.0fs ago (TTL %.0fs)" % (time.time() - ts, DIAG_TTL)
+        if cached
+        else "fresh"
+    )
+    with str_lit.expander("Engine diagnostics bundle", expanded=False):
+        str_lit.code(text or "(empty)", language="text")
+
+    if selftest:
+        mod = sys.modules.get("status")
+        if mod is None:
+            try:
+                mod = importlib.import_module("status")
+            except Exception as exc:  # noqa: BLE001
+                str_lit.error("status.py import failed: %r" % (exc,))
+                return
+        fn = getattr(mod, "selftest", None)
+        if not callable(fn):
+            str_lit.warning("status.selftest() missing.")
+            return
+        results = fn()
+        bad = [r for r in results if not r[1]]
+        if bad:
+            for name, _okay, detail in bad:
+                str_lit.error("%s -> %s" % (name, detail))
         else:
-            results = []
-            bar = st.progress(0.0)
-            for i, (h, p) in enumerate(pairs, 1):
-                ok, ms, err = _port_probe(h, p, timeout=probe_to)
-                results.append({"Target": f"{h}:{p}", "TCP": "OK" if ok else "FAIL",
-                                "ms": ms, "Error": err})
-                bar.progress(i / len(pairs), text=f"{i}/{len(pairs)}")
-            st.dataframe(results, use_container_width=True, hide_index=True)
+            str_lit.success("status.selftest(): %d/%d passed." % (len(results), len(results)))
+# @@END 008
 
-            if all(r["TCP"] == "FAIL" for r in results):
-                st.error(
-                    "Every target refused. That is a **host or path** problem, not a password problem — "
-                    "no proxy and no retry setting can change it."
-                )
-            elif any(r["TCP"] == "OK" for r in results):
-                st.success("At least one listener answered — the ladder has something to talk to.")
 
-# ==========================================================================
-# 3. DNS / DISCOVERY
-# ==========================================================================
-with tab_dns:
-    st.markdown("#### Resolution layer")
+# @@BLOCK 009 PROXY_TABLE deps=003
+def _proxy_table():
+    st = _state()
+    meta = st.get("proxy_meta")
+    if not isinstance(meta, dict):
+        meta = _eng("proxy_meta", None) or {}
+    if not meta:
+        str_lit.info("No proxy_meta in session yet - start a run first.")
+        return
+    pairs = []
+    for node, info in sorted(meta.items()):
+        if isinstance(info, dict):
+            summary = ", ".join(
+                "%s=%s" % (k, info.get(k))
+                for k in ("status", "fails", "407s", "cooldown_until", "last_used")
+                if k in info
+            )
+            pairs.append((node, summary or json.dumps(info, default=str)[:160]))
+        else:
+            pairs.append((node, info))
+    str_lit.markdown("<div class='dx-card'><h3>Proxy nodes (%d)</h3></div>" % len(pairs), unsafe_allow_html=True)
+    _kv_table(pairs, ("Node", "State"))
+# @@END 009
 
-    mx = []
-    srv = []
-    found = {}
-    try:
-        mx = H.resolve_mx(domain)
-    except Exception as e:
-        st.warning(f"MX lookup failed: {e}")
-    try:
-        srv = H.resolve_srv(f"_imaps._tcp.{domain}")
-    except Exception as e:
-        st.warning(f"SRV lookup failed: {e}")
 
-    st.markdown("**MX records**")
-    st.code("\n".join(mx) or "— none", language="text")
-    st.markdown("**SRV `_imaps._tcp`**")
-    st.code("\n".join(str(s) for s in srv) or "— none", language="text")
-
-    if st.button("Run full discovery (SRV → autoconfig → autodiscover → MX → prefixes)"):
-        with st.spinner("Discovering…"):
-            try:
-                found = H.discover_hosts(domain, force_refresh=True)
-            except Exception as e:
-                st.error(f"discover_hosts failed: {e}")
-        if found:
-            st.markdown(f"**Sources that produced data:** `{found.get('sources') or 'none'}`")
-            st.markdown("**Discovered IMAP**")
-            st.code("\n".join(found.get("imap") or []) or "— none", language="text")
-            st.markdown("**Discovered POP**")
-            st.code("\n".join(found.get("pop") or []) or "— none", language="text")
-
-    st.divider()
-    st.markdown("**Apex check**")
-    apex_ip = _resolve(domain)
-    st.code(f"{domain} -> {apex_ip or 'DOES NOT RESOLVE'}", language="text")
-    st.caption(
-        "The bare apex is appended as a last-resort rung only if it resolves. "
-        "It is demoted to the very end because it has no IMAP listener on most providers."
-    )
-
-# ==========================================================================
-# 4. SMTP
-# ==========================================================================
-with tab_smtp:
-    st.markdown("#### SMTP pre-check candidates")
-    st.caption("Only used when `📮 Enable SMTP pre-check` is ON in the app sidebar. Ports tried: 587 → 465 → 25.")
-    try:
-        cands = H.smtp_candidates(domain) or []
-    except Exception as e:
-        cands = []
-        st.warning(f"smtp_candidates failed: {e}")
-    if not cands:
-        st.info("No SMTP candidates (Zero-Access provider, or nothing derivable).")
-    else:
-        st.code("\n".join(cands), language="text")
-        if st.button("Probe SMTP candidates"):
-            out = []
-            for h in cands:
-                for port, tls in ((587, False), (465, True), (25, False)):
-                    ok, ms, err = _port_probe(h, port, timeout=6)
-                    out.append({"Host": h, "Port": port, "TLS": "implicit" if tls else "plain",
-                                "TCP": "OK" if ok else "FAIL", "ms": ms, "Error": err})
-            st.dataframe(out, use_container_width=True, hide_index=True)
-
-# ==========================================================================
-# 5. PROXY AUDIT
-# ==========================================================================
-with tab_proxy:
-    st.markdown("#### proxies.txt audit (read-only)")
-    st.caption("Nothing is probed here — use the app sidebar's 🔁 Re-probe for a real tunnel test.")
-
-    pfile = None
-    for cand in (os.path.join(APP_DIR, "proxies.txt"), "proxies.txt"):
-        if os.path.exists(cand):
-            pfile = cand
-            break
-
-    if not pfile:
-        st.info("No proxies.txt found next to app.py.")
-    else:
-        try:
-            with open(pfile, encoding="utf-8", errors="ignore") as f:
-                raw = [l.rstrip("\n") for l in f]
-        except Exception as e:
-            st.error(f"Could not read {pfile}: {e}")
-            raw = []
-
-        lines = [l.strip() for l in raw if l.strip() and not l.startswith("#")]
-        uniq = list(dict.fromkeys(lines))
-        formats = {}
-        unparsable = 0
-        with_creds = 0
-        for l in lines:
-            formats[_detect_format(l)] = formats.get(_detect_format(l), 0) + 1
-            if "@" in l:
-                with_creds += 1
-            if not _parse_proxy(l):
-                unparsable += 1
-
-        c1, c2, c3, c4 = st.columns(4)
-        c1.metric("Lines", len(lines))
-        c2.metric("Unique", len(uniq))
-        c3.metric("With credentials", with_creds)
-        c4.metric("Unparsable", unparsable)
-
-        st.markdown("**Detected line formats**")
-        st.code(json.dumps(formats, indent=2), language="json")
-
-        if lines and with_creds == 0:
-            st.warning("No line contains `@` → **no credentials at all**. A 407 is guaranteed if the proxy needs auth.")
-        if unparsable:
-            st.warning(f"{unparsable} line(s) do not parse into host:port — check for spaces or stray characters.")
-
-        dupes = {}
-        for l in lines:
-            info = _parse_proxy(l)
-            if info:
-                k = f"{info['host']}:{info['port']}"
-                dupes[k] = dupes.get(k, 0) + 1
-        heavy = {k: v for k, v in dupes.items() if v > 1}
-        if heavy:
-            st.markdown("**Repeated endpoints** (dedupe collapses these)")
-            st.code("\n".join(f"{k}  x{v}" for k, v in sorted(heavy.items(), key=lambda kv: -kv[1])[:30]),
-                    language="text")
-
-        with st.expander("First 10 raw lines"):
-            st.code("\n".join(lines[:10]) or "— empty —", language="text")
-
-# ==========================================================================
-# 6. CACHE
-# ==========================================================================
-with tab_cache:
-    st.markdown("#### Host cache tools")
-
-    try:
-        stats = H.cache_stats()
-    except Exception as e:
-        stats = {"error": str(e)}
-    st.json(stats)
-
-    c1, c2 = st.columns(2)
+# @@BLOCK 010 POOL_DNS_VIEW deps=003
+def _pool_view():
+    st = _state()
+    alive = st.get("alive_pool") or _eng("alive_pool", None) or []
+    dns = st.get("dns_cache") or _eng("dns_cache", None) or {}
+    c1, c2 = str_lit.columns(2)
     with c1:
-        if st.button("🧹 Clear hosts_cache.json", use_container_width=True):
-            try:
-                H.clear_cache()
-                st.success("Cache cleared. Reload this page to rebuild it.")
-            except Exception as e:
-                st.error(f"clear_cache failed: {e}")
+        str_lit.markdown("**Alive pool**")
+        str_lit.caption("%d node(s) currently marked alive." % len(list(alive)))
+        if alive:
+            str_lit.code("\n".join(str(x) for x in list(alive)[:40]), language="text")
     with c2:
-        if st.button("♻️ Refresh this domain", use_container_width=True):
+        str_lit.markdown("**DNS cache**")
+        str_lit.caption("%d host(s) cached." % len(dns))
+        if isinstance(dns, dict) and dns:
+            _kv_table(list(dns.items())[:40], ("Host", "Resolved"))
+# @@END 010
+
+
+# @@BLOCK 011 SELF_TEST deps=002
+def _connectivity():
+    with str_lit.expander("Egress + DNS probe", expanded=False):
+        host = str_lit.text_input("Host to probe", value="imap.gmail.com", key="dx_probe_host")
+        port = str_lit.number_input("Port", value=993, min_value=1, max_value=65535, key="dx_probe_port")
+        if str_lit.button("Probe", key="dx_probe_go"):
+            t0 = time.time()
             try:
-                H.refresh_domain(domain)
-                st.success(f"Discovery refreshed for {domain}.")
-            except Exception as e:
-                st.error(f"refresh_domain failed: {e}")
+                ip = socket.gethostbyname(host)
+                dns_ms = (time.time() - t0) * 1000.0
+                str_lit.success("DNS %s -> %s (%.0f ms)" % (host, ip, dns_ms))
+            except Exception as exc:  # noqa: BLE001
+                str_lit.error("DNS failed for %s: %r" % (host, exc))
+                return
+            t1 = time.time()
+            try:
+                with socket.create_connection((host, int(port)), timeout=8):
+                    str_lit.success("TCP %s:%d open (%.0f ms)" % (host, port, (time.time() - t1) * 1000.0))
+            except Exception as exc:  # noqa: BLE001
+                str_lit.warning("TCP %s:%d failed: %r" % (host, port, exc))
+        str_lit.caption(
+            "Egress IP hint: %s" % (_eng("EGRESS_IP", "unknown"))
+        )
+# @@END 011
 
-    st.caption(
-        "Clear the cache after any hosts.py change, otherwise the old family entry keeps being served "
-        "for up to 24h."
-    )
 
-    with st.expander("Cached entries (domain -> counts)"):
-        try:
-            with open(os.path.join(APP_DIR, "hosts_cache.json"), encoding="utf-8") as f:
-                data = json.load(f)
-            if isinstance(data, dict):
-                st.code(
-                    "\n".join(f"{k}: imap={len(v.get('imap') or [])} pop={len(v.get('pop') or [])} "
-                              f"sources={v.get('sources')}" for k, v in list(data.items())[:60]),
-                    language="text",
-                )
-        except Exception as e:
-            st.caption(f"no readable cache: {e}")
+# @@BLOCK 012 FOOTER deps=005
+def main():
+    _hero()
+    if not _ok():
+        return
+    _summary()
+    str_lit.divider()
+    _diag_panel()
+    str_lit.divider()
+    _proxy_table()
+    str_lit.divider()
+    _pool_view()
+    str_lit.divider()
+    _connectivity()
+    str_lit.caption("Diagnostics %s" % PAGE_VERSION)
 
-# ==========================================================================
-# footer bundle
-# ==========================================================================
-st.divider()
-if st.button("📋 Build copy/paste bundle"):
-    L = []
-    L.append("=" * 70)
-    L.append(f"DIAGNOSTICS BUNDLE — {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-    L.append("=" * 70)
-    L.append(f"domain        : {domain}")
-    L.append(f"max_hosts     : {max_hosts}")
-    L.append(f"hosts.py      : {os.path.join(APP_DIR, 'hosts.py')}")
-    L.append(f"family_pop    : {_HAVE['family_pop']}")
-    L.append(f"proto_flags   : {_PROTO_FLAGS}")
-    L.append(f"cwd           : {os.getcwd()}")
-    L.append("")
-    L.append("-- family (imap) --")
-    L.append(", ".join(fam) or "none")
-    L.append("-- family (pop) --")
-    L.append(", ".join(fam_pop) or "none")
-    L.append("")
-    L.append("-- raw conf --")
-    L.append(json.dumps(got, indent=2)[:4000])
-    L.append("")
-    L.append("-- rungs --")
-    for p, h, pt, m in primary:
-        L.append(f"PRIMARY  {p} {h}:{pt} {m}")
-    for p, h, pt, m in fallback:
-        L.append(f"FALLBACK {p} {h}:{pt} {m}")
-    L.append("")
-    L.append("-- resolution --")
-    for h in list(dict.fromkeys(all_imap + all_pop)):
-        L.append(f"{h} -> {_resolve(h) or 'UNRESOLVED'}")
-    L.append("")
-    L.append("-- live probe --")
-    for p, h, pt, m in (primary or [])[:6]:
-        ok, ms, err = _port_probe(h, pt, timeout=6)
-        L.append(f"{h}:{pt} tcp={'OK' if ok else 'FAIL'} {ms}ms {err}")
-    st.code("\n".join(L), language="text")
+
+main()
+# @@END 012
