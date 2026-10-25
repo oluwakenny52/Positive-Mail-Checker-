@@ -352,8 +352,9 @@ def main():
         has(app, 'BUILD_TAG = "v13.40"', "BUILD_TAG is the single build string")
 
     if req:
-        if "pandas==2.2.3" in req:
-            FAILS.append("requirements.txt still pins pandas==2.2.3 "
+        req_code = "\n".join(l.split("#", 1)[0] for l in req.splitlines())
+        if "pandas==2.2.3" in req_code:
+            FAILS.append("requirements.txt still pins pandas==2.2.3 on an active line "
                          "(no cp314 wheel on the Python 3.14 runtime)")
         else:
             PASSES.append("requirements.txt no longer pins the cp314-less pandas 2.2.3")
