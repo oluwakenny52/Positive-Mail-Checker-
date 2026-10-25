@@ -851,6 +851,21 @@ class MsVerdict(Exception):
 # @@END 022 EXCEPTION_TYPES
 
 # @@BLOCK 023 SMALL_PREDICATES deps=-
+# Decisiveness for note_verdict(), HIGH WINS - and it must be identical under
+# status.py AND under the inline fallback, because status.PRIORITY is high-wins
+# while the fallback's ST_PRIORITY is low-wins.  note_verdict() compared with
+# `<`, so under status.py a later WRONG could never overwrite an earlier
+# LOGIN_DROPPED, and a bare UNKNOWN always won.
+_VERDICT_RANK = {
+    WRONG: 90,
+    VALID: 80,
+    APP: 70,
+    RBL: 60,
+    LOGIN_DROPPED: 50,
+    UNKNOWN: 10,
+}
+
+
 def _is_proxy_auth_fail(msg) -> bool:
     """True when the PROXY ITSELF rejected us, as opposed to a transport failure."""
     m = (msg or "").lower()
@@ -6461,7 +6476,7 @@ def _check_account_core(email, password, conf, domain, proxy_pool, thread_state,
             if st_val not in (VALID, WRONG, APP, RBL, LOGIN_DROPPED, UNKNOWN):
                 return
             cur = best_verdict["status"]
-            if force or cur is None or ST_PRIORITY.get(st_val, 99) < ST_PRIORITY.get(cur, 99):
+            if force or cur is None or _VERDICT_RANK.get(st_val, 0) > _VERDICT_RANK.get(cur, 0):
                 best_verdict["status"] = st_val
                 best_verdict["detail"] = detail
                 best_verdict["host"] = host or ""
