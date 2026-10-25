@@ -37,6 +37,7 @@ __version__ = "v13.40"
 
 BLOCKED_FILES = [
     "app.py",
+    "engine.py",
     "status.py",
     "pages/2_Diagnostics.py",
     "pages/3_Mailbox_Reader.py",
