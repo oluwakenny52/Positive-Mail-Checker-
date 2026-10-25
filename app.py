@@ -4550,7 +4550,7 @@ def precheck_proxy_fast(proxy_str):
         return False
 # @@END 071 PRECHECK_FAST
 
-# @@BLOCK 072 RUN_BATCH deps=072
+# @@BLOCK 072 RUN_BATCH deps=-
 def _run_batch(fn, items, workers, budget):
     """Run fn(item) over items with a HARD wall-clock budget."""
     done_ids = set()
