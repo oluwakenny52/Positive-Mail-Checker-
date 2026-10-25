@@ -25,7 +25,7 @@ NAMED, NUMBERED, REPLACEABLE block.
 
 `.github/workflows/gates.yml` runs all five on every push and writes a PASS/FAIL
 table to the run summary, so the gates are checkable from a phone with no
-terminal. `pages/5_Blocks.py` runs the same verifier in the browser and can
+terminal. The Summary step exits non-zero when a gate fails, so the run itself goes red. `pages/5_Blocks.py` runs the same verifier in the browser and can
 canonicalise a bare `@@END` for you (download the fixed file, upload it back).
 
 Always invoke `verify_blocks.py` as `python verify_blocks.py` - its `# @@FILE`
