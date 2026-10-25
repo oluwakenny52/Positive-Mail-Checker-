@@ -1744,7 +1744,8 @@ def _reset_theme():
 #   * "[data-testid=stSidebar] * { color }" clobbered the sidebar's own icons.
 # Streamlit's own .block-container padding (6rem top / 10rem bottom) is never
 # overridden by this app, which is half of the "does not fit my phone" report.
-_MOBILE_CSS = """
+def _MOBILE_CSS():
+    return """
     .block-container, [data-testid="stMainBlockContainer"] {
         padding-top: 1.2rem !important;
         padding-bottom: 2rem !important;
@@ -1954,7 +1955,7 @@ def theme_css(th: dict) -> str:
     ::-webkit-scrollbar-thumb {{ background: {g1}88; border-radius: 8px; }}
     ::-webkit-scrollbar-thumb:hover {{ background: {ac}; }}
     {anim_css}
-    {_MOBILE_CSS}
+    {_MOBILE_CSS()}
 </style>
 """
 # @@END 033 THEME_CSS
@@ -6724,7 +6725,7 @@ def _check_account_core(email, password, conf, domain, proxy_pool, thread_state,
 
 # @@BLOCK 101 CORE_VERDICT_HELPERS deps=022,023,067,100
         def try_ms_xoauth2(server, px_used, attempt_to, err_snapshot=""):
-            nonlocal err_text, acct_407_total
+            nonlocal acct_407_total, err_text
             if not MS_OAUTH_OK:
                 return None
             if server.lower() not in ms_oauth.MS_IMAP_HOSTS:
@@ -6875,7 +6876,7 @@ def _check_account_core(email, password, conf, domain, proxy_pool, thread_state,
 
 # @@BLOCK 102 CORE_SWEEP deps=016,100,101
         def sweep(px_used, rungs, deadline_ts, label, allow_rotate=True):
-            nonlocal err_text, acct_407_total
+            nonlocal acct_407_total, err_text
             had_net = False
             saw_retry = False
             if not rungs:
