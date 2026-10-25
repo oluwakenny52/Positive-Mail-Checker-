@@ -204,8 +204,13 @@ def _parse(line, source, status_hint):
     raw = line.rstrip("\n")
     if not raw.strip() or raw.startswith("#"):
         return None
-    combo, _, rest = raw.partition("|")
-    combo = combo.strip().strip('"\'').replace(" ", "")
+    if " | " in raw:
+        combo, _, rest = raw.partition(" | ")
+    elif "|" in raw:
+        combo, _, rest = raw.partition("|")
+    else:
+        combo, rest = raw, ""
+    combo = combo.strip().strip('"\'')
     if ":" not in combo:
         return None
     email, _, pw = combo.partition(":")
