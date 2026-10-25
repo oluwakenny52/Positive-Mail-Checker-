@@ -8221,3 +8221,4 @@ str_lit.caption(
     f"Every section is a replaceable @@BLOCK - run verify_blocks.py after every paste."
 )
 # @@END 110 FOOTER
+# @@EOF
