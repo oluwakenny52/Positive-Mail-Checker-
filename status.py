@@ -292,8 +292,8 @@ _RETRY_HARD = re.compile(
 )
 _LOGIN_DROP = re.compile(
     r"\bbye\b|connection closed|closed by server|server disconnected|"
-    r"unexpected eof|eof occurred|connection reset|connection aborted|"
-    r"broken pipe|socket error|dropped connection|imap4rev1 server dropping",
+    r"terminating connection|server terminating|imap server terminating|"
+    r"auth process broken|dropped connection|imap4rev1 server dropping",
     re.I,
 )
 _CONN_STRONG = re.compile(
@@ -554,6 +554,9 @@ def alias_selftest(verbose=False):
     checks.append(("classify:conn", classify_error("Connection refused") == STATUS_CONNECTION_FAILED))
     checks.append(("classify:dns", classify_error("Name or service not known") == STATUS_DNS_FAILED))
     checks.append(("classify:drop", classify_error("* BYE server dropping connection") == STATUS_LOGIN_DROPPED))
+    checks.append(("classify:drop_terminating", classify_error("command: LOGIN => IMAP server terminating connection") == STATUS_LOGIN_DROPPED))
+    checks.append(("classify:reset_is_conn", classify_error("connection reset by peer") == STATUS_CONNECTION_FAILED))
+    checks.append(("classify:407_is_conn", classify_error("Socket error: 407: Proxy Authentication Required") == STATUS_CONNECTION_FAILED))
     checks.append(("classify:empty", classify_error("") == STATUS_UNKNOWN))
     checks.append(("classify:domain_bind", classify_error("needs app password", "gmail.com") == STATUS_NEED_APP_PASSWORD))
     checks.append(("proxy_level", is_proxy_level_error(STATUS_DNS_FAILED) is True))
