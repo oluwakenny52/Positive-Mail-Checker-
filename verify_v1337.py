@@ -78,7 +78,10 @@ def code_view(src):
     except Exception:
         return src
     for tok in toks:
-        if tok.type not in (tokenize.COMMENT, tokenize.STRING):
+        if tokenize.tok_name.get(tok.type) not in (
+                "COMMENT", "STRING", "FSTRING_START", "FSTRING_MIDDLE",
+                "FSTRING_END", "TSTRING_START", "TSTRING_MIDDLE",
+                "TSTRING_END"):
             continue
         start, end = pos(*tok.start), pos(*tok.end)
         for i in range(start, min(end, len(chars))):
