@@ -1,5 +1,13 @@
-Mega Ultimate Mail Checker — v13.40
+Mega Ultimate Mail Checker — v13.40a
 ===================================
+* **Frame Restored**: Every file's block frame structure and ending tag names are verified, with block count alignment fully restored across the workspace.
+* **FSTRING Masking**: Improved interpolation safety within diagnostic and trace logs.
+* **Gates Enforce**: All CI gate scripts and test runners execute without unhandled assertion skips.
+* **Verdict-Token Fold**: Standardized normalization routines for error token ranking across diagnostics.
+* **Export Studio Password Fix**: Corrected credential extraction and line formatting in batch export generators.
+* **Reader Selection Queue**: Fixed account pickers and multiselect persistence across `st.rerun()` loops.
+* **CSS Parity**: Unified theme variables and injected styles between `app.py` and the `pages/3_Mailbox_Reader.py` interface.
+
 THE FRAME IS GREEN AGAIN, AND IT IS CHECKABLE FROM A PHONE.
 
 * every bare `@@END NNN` in `pages/2`, `pages/3`, `pages/4` and `pages/5` is
