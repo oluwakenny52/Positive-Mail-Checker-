@@ -19,7 +19,7 @@ import zipfile
 from datetime import datetime
 
 import streamlit as st
-# @@END 000
+# @@END 000 FILE_HEADER
 
 
 # @@BLOCK 001 PAGE_CONFIG deps=000
@@ -29,13 +29,13 @@ st.set_page_config(
     layout="wide",
     initial_sidebar_state="collapsed",
 )
-# @@END 001
+# @@END 001 PAGE_CONFIG
 
 
 # @@BLOCK 002 APP_PATHS deps=000
 APP_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 PRESET_FILE = os.path.join(APP_DIR, "download_presets.json")
-# @@END 002
+# @@END 002 APP_PATHS
 
 
 # @@BLOCK 003 THEME deps=002
@@ -60,7 +60,7 @@ def _load_theme():
 
 
 _TH = _load_theme()
-# @@END 003
+# @@END 003 THEME
 
 
 # @@BLOCK 004 CSS deps=003
@@ -101,7 +101,7 @@ st.markdown(
 """,
     unsafe_allow_html=True,
 )
-# @@END 004
+# @@END 004 CSS
 
 
 # @@BLOCK 005 HERO deps=004
@@ -111,7 +111,7 @@ st.markdown(
     'No mailbox connection, no proxy credit spent.</p></div>',
     unsafe_allow_html=True,
 )
-# @@END 005
+# @@END 005 HERO
 
 
 # @@BLOCK 006 SOURCE_TABLES deps=002
@@ -196,7 +196,7 @@ FORMAT_PRESETS = {
     "full annotated": "{n} | {email}:{password} | {status} | {host}:{port} | {detail}",
     "CUSTOM": "",
 }
-# @@END 006
+# @@END 006 SOURCE_TABLES
 
 
 # @@BLOCK 007 PARSERS deps=006
@@ -254,7 +254,7 @@ def _load(selection):
             except Exception as ex:
                 st.warning(f"{label}: {ex}")
     return rows
-# @@END 007
+# @@END 007 PARSERS
 
 
 # @@BLOCK 008 FORMATTERS deps=007
@@ -335,7 +335,7 @@ def _json_of(rows, lines=True):
     return json.dumps([{k: r[k] for k in
                         ("email", "password", "domain", "status", "host", "port", "detail")}
                        for r in rows], indent=2)
-# @@END 008
+# @@END 008 FORMATTERS
 
 
 # @@BLOCK 009 PRESETS_IO deps=002
@@ -355,7 +355,7 @@ def _save_presets(d):
             json.dump(d, f, indent=2)
     except Exception:
         pass
-# @@END 009
+# @@END 009 PRESETS_IO
 
 
 # @@BLOCK 010 SIDEBAR deps=006
@@ -364,6 +364,26 @@ def _save_presets(d):
 # --------------------------------------------------------------------------
 srcs = _sources()
 sess = _session_sources()
+
+# v13.40: consume a pending preset HERE, before a single widget exists.
+# SessionState.__setitem__ raises StreamlitWidgetAlreadyInstantiatedError if you
+# write a widget key AFTER that widget was created in the same run - which is
+# exactly what block 011 used to do, so Apply threw and the boxes never updated.
+_pending_preset = st.session_state.pop("_ex_apply", None)
+if _pending_preset:
+    _pp = _presets().get(_pending_preset) or {}
+    if _pp:
+        st.session_state["ex_tpl"] = _pp.get("template", "{email}:{password}")
+        st.session_state["ex_delim"] = _pp.get("delim", "none")
+        st.session_state["ex_eol"] = _pp.get("eol", "LF (unix)")
+        st.session_state["ex_header"] = _pp.get("header", "")
+        st.session_state["ex_prefix"] = _pp.get("prefix", "")
+        st.session_state["ex_suffix"] = _pp.get("suffix", "")
+        st.session_state["ex_sort"] = _pp.get("sort", "none")
+        st.session_state["ex_dedupe"] = bool(_pp.get("dedupe", True))
+        st.session_state["ex_lower"] = bool(_pp.get("lower", True))
+        st.session_state["ex_name"] = _pp.get("name_pat", "export_{status}_{count}_{stamp}")
+        st.session_state["_ex_active"] = _pending_preset
 
 with st.sidebar:
     st.markdown("### 1. What to download")
@@ -386,22 +406,23 @@ with st.sidebar:
         template = "{email}:{password}"
 
     delim = st.selectbox("Separator inside a line", ["none", "tab", "comma", "semicolon", "pipe"],
-                         index=0, help="'none' keeps the template exactly as written.")
+                         index=0, key="ex_delim",
+                         help="'none' keeps the template exactly as written.")
     _delim_map = {"none": " ", "tab": "\t", "comma": ",", "semicolon": ";", "pipe": "|"}
     delim_ch = _delim_map[delim]
 
-    eol = st.radio("Line ending", ["LF (unix)", "CRLF (windows)"], horizontal=True)
+    eol = st.radio("Line ending", ["LF (unix)", "CRLF (windows)"], horizontal=True, key="ex_eol")
     crlf = eol.startswith("CRLF")
 
-    header = st.text_input("Header line (optional)", value="")
-    prefix = st.text_input("Prefix line (optional)", value="")
-    suffix = st.text_input("Suffix line (optional)", value="")
+    header = st.text_input("Header line (optional)", value="", key="ex_header")
+    prefix = st.text_input("Prefix line (optional)", value="", key="ex_prefix")
+    suffix = st.text_input("Suffix line (optional)", value="", key="ex_suffix")
 
     st.markdown("---")
     st.markdown("### 3. Filter and order")
-    sort_key = st.selectbox("Sort by", ["none", "email", "domain", "status"], index=0)
-    dedupe = st.toggle("Dedupe by email (first wins)", value=True)
-    lower = st.toggle("Lowercase email", value=True)
+    sort_key = st.selectbox("Sort by", ["none", "email", "domain", "status"], index=0, key="ex_sort")
+    dedupe = st.toggle("Dedupe by email (first wins)", value=True, key="ex_dedupe")
+    lower = st.toggle("Lowercase email", value=True, key="ex_lower")
     regex_inc = st.text_input("Include regex", value="")
     regex_exc = st.text_input("Exclude regex", value="")
     host_filter = st.text_input("Only these hosts (comma)", value="")
@@ -410,6 +431,7 @@ with st.sidebar:
     st.markdown("### 4. File name")
     name_pat = st.text_input("Name pattern",
                              value="export_{status}_{count}_{stamp}",
+                             key="ex_name",
                              help="{status} {count} {stamp} {sources} are substituted.")
 
     st.markdown("---")
@@ -431,23 +453,30 @@ with st.sidebar:
             if p_use != "--" and st.button("Apply", use_container_width=True):
                 st.session_state["_ex_apply"] = p_use
                 st.rerun()
-# @@END 010
+# @@END 010 SIDEBAR
 
 
 # @@BLOCK 011 PRESET_APPLY deps=010
-if st.session_state.get("_ex_apply"):
-    _p = _presets().get(st.session_state.pop("_ex_apply"))
-    if _p:
-        st.session_state["ex_tpl"] = _p.get("template", "{email}:{password}")
-        template = st.session_state["ex_tpl"]
-        delim = _p.get("delim", "none")
-        crlf = str(_p.get("eol", "LF")).startswith("CRLF")
-        header, prefix, suffix = _p.get("header", ""), _p.get("prefix", ""), _p.get("suffix", "")
-        sort_key = _p.get("sort", "none")
-        dedupe, lower = _p.get("dedupe", True), _p.get("lower", True)
-        name_pat = _p.get("name_pat", "export_{status}_{count}_{stamp}")
-        picked = [s for s in _p.get("sources", picked) if s in labels] or picked
-# @@END 011
+# Block 010 already seeded every preset-backed widget key BEFORE those widgets
+# were created - the only point where writing a widget key is legal.  So the
+# values read out of the widgets above already carry the preset; this block just
+# mirrors the preset into the locals block 012 consumes, and consumes the
+# one-shot marker so a later rerun does not clobber your manual edits.
+_p = _presets().get(st.session_state.pop("_ex_active", None) or "") or {}
+if _p:
+    template = _p.get("template", template)
+    delim = _p.get("delim", delim)
+    delim_ch = _delim_map[delim]
+    crlf = str(_p.get("eol", eol)).startswith("CRLF")
+    header = _p.get("header", header)
+    prefix = _p.get("prefix", prefix)
+    suffix = _p.get("suffix", suffix)
+    sort_key = _p.get("sort", sort_key)
+    dedupe = _p.get("dedupe", dedupe)
+    lower = _p.get("lower", lower)
+    name_pat = _p.get("name_pat", name_pat)
+    picked = [s for s in _p.get("sources", picked) if s in labels] or picked
+# @@END 011 PRESET_APPLY
 
 
 # @@BLOCK 012 BUILD deps=011
@@ -491,7 +520,7 @@ st.download_button(
     type="primary",
     use_container_width=True,
 )
-# @@END 012
+# @@END 012 BUILD
 
 
 # @@BLOCK 013 TABS deps=012
@@ -549,7 +578,7 @@ with tab_break:
                                file_name=f"{tag}_{len(by[tag])}.txt",
                                mime="text/plain", key=f"dl_{tag}")
             st.code(body, language="text")
-# @@END 013
+# @@END 013 TABS
 
 
 # @@BLOCK 014 FOOTER deps=013
@@ -558,10 +587,10 @@ try:
     st.page_link("app.py", label="← Back to the Mail Checker")
 except Exception:
     st.caption("The main checker lives at app.py")
-# @@END 014
+# @@END 014 FOOTER
 
 
 # @@BLOCK 015 TRAILING deps=014
 # (reserved tail - keeps the file closed after the last block)
-# @@END 015
+# @@END 015 TRAILING
 # @@EOF
