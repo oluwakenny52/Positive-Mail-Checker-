@@ -2436,6 +2436,10 @@ else:
     if last_acc in valid_dropdown_options:
         default_index = valid_dropdown_options.index(last_acc)
 
+_pending_sel = st.session_state.pop("_pending_selected_account", None)
+if _pending_sel and _pending_sel in valid_dropdown_options:
+    st.session_state["selected_account"] = _pending_sel
+
 if st.session_state.get("selected_account") not in valid_dropdown_options:
     st.session_state["selected_account"] = (
         valid_dropdown_options[default_index] if valid_dropdown_options else "none"
@@ -2958,10 +2962,10 @@ if st.sidebar.button("🔑 Login & Save Account", type="primary", use_container_
             st.session_state.forced_account = combo
             st.session_state.mb_host = connected_host
             st.session_state.mb_folders = discovered_folders
-            # Push the selection into the dropdown key too, otherwise the
-            # selectbox keeps whatever it already had.
-            if combo in valid_dropdown_options:
-                st.session_state["selected_account"] = combo
+            # The selectbox with key "selected_account" was already created in
+            # block 029 this run, so writing that key here is too late.  Queue
+            # it instead and let block 029 consume it BEFORE the widget exists.
+            st.session_state["_pending_selected_account"] = combo
             save_session_cache()
             flash(f"Connected: {connected_host} ({len(discovered_folders)} folders)")
             st.rerun()
