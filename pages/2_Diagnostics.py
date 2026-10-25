@@ -1,7 +1,7 @@
 # @@FILE pages/2_Diagnostics.py blocks=20 version=v13.40
 # @@BLOCK 000 FILE_HEADER deps=-
 """
-pages/2_Diagnostics.py — Mega Ultimate Mail Checker  (v13.37)
+pages/2_Diagnostics.py — Mega Ultimate Mail Checker  (v13.40)
 ============================================================
 Read-only inspection page. It answers three questions without spending a single
 proxy credit or touching a mailbox:
@@ -40,12 +40,13 @@ import socket
 from datetime import datetime
 
 import streamlit as st
-# @@END 000
+# @@END 000 FILE_HEADER
 
 
 # @@BLOCK 001 PAGE_CONFIG deps=000
-st.set_page_config(page_title="Diagnostics · Mail Checker", page_icon="🔍", layout="wide")
-# @@END 001
+st.set_page_config(page_title="Diagnostics · Mail Checker", page_icon="🔍", layout="wide",
+                   initial_sidebar_state="collapsed")
+# @@END 001 PAGE_CONFIG
 
 
 # @@BLOCK 002 SYSPATH deps=000
@@ -56,7 +57,7 @@ THIS_DIR = os.path.dirname(os.path.abspath(__file__))
 APP_DIR = os.path.dirname(THIS_DIR)
 if APP_DIR not in sys.path:
     sys.path.insert(0, APP_DIR)
-# @@END 002
+# @@END 002 SYSPATH
 
 
 # @@BLOCK 003 THEME deps=002
@@ -80,7 +81,7 @@ def _load_theme():
 
 
 _TH = _load_theme()
-# @@END 003
+# @@END 003 THEME
 
 
 # @@BLOCK 004 CSS deps=003
@@ -108,7 +109,7 @@ st.markdown(
 """,
     unsafe_allow_html=True,
 )
-# @@END 004
+# @@END 004 CSS
 
 
 # @@BLOCK 005 HERO deps=004
@@ -117,7 +118,7 @@ st.markdown(
     '<p>Host plan · live port probe · DNS &amp; discovery · SMTP candidates · proxy audit · cache tools</p></div>',
     unsafe_allow_html=True,
 )
-# @@END 005
+# @@END 005 HERO
 
 
 # @@BLOCK 006 IMPORT_HOSTS deps=002
@@ -143,7 +144,7 @@ if not _HAVE["family_pop"]:
         "This `hosts.py` has **no `_family_priority_pop()`** — the POP bucket is still being led by "
         "the IMAP family, so the POP rung will dial `<imap-host>:995`. Apply the v13.26 `hosts.py` patch."
     )
-# @@END 006
+# @@END 006 IMPORT_HOSTS
 
 
 # @@BLOCK 007 HELPERS_NET deps=006
@@ -193,7 +194,7 @@ def _port_probe(host, port, timeout=8.0):
                 s.close()
             except Exception:
                 pass
-# @@END 007
+# @@END 007 HELPERS_NET
 
 
 # @@BLOCK 008 HELPERS_PROXY deps=006
@@ -235,7 +236,7 @@ def _detect_format(line):
     if n == 2:
         return "host:port (NO CREDS)"
     return f"UNRECOGNISED ({n} colon-parts)"
-# @@END 008
+# @@END 008 HELPERS_PROXY
 
 
 # @@BLOCK 009 PROTOCOLS_PLAN deps=007
@@ -343,7 +344,7 @@ def _build_plan(domain, max_hosts, flags=None):
         fallback.append(("POP", h, 110, "plain"))
 
     return got, all_imap, all_pop, primary, fallback, "ok"
-# @@END 009
+# @@END 009 PROTOCOLS_PLAN
 
 
 # @@BLOCK 010 SIDEBAR deps=009
@@ -356,7 +357,7 @@ with st.sidebar:
     max_hosts = st.slider("Max Hosts Per Domain (as in the app)", 1, 8, 3, 1)
     force = st.toggle("Force refresh discovery (bypass 24h host cache)", value=False)
     st.caption("Nothing here connects to a mailbox — only DNS and raw TCP.")
-# @@END 010
+# @@END 010 SIDEBAR
 
 
 # @@BLOCK 011 TABS_HEADER deps=010
@@ -372,7 +373,7 @@ tab_plan, tab_probe, tab_dns, tab_smtp, tab_proxy, tab_cache = st.tabs(
 _PROTO_FLAGS = _protocols_from_app()
 st.caption("Engine protocol flags read from the applied config: "
            + ", ".join(k.upper() for k, v in _PROTO_FLAGS.items() if v))
-# @@END 011
+# @@END 011 TABS_HEADER
 
 
 # @@BLOCK 012 TAB_HOST_PLAN deps=011
@@ -488,7 +489,7 @@ with tab_plan:
             st.markdown("**Hosts sharing an IP** (they succeed or fail together)")
             for ip, hs in shared.items():
                 st.code(f"{ip}  <-  {', '.join(hs)}", language="text")
-# @@END 012
+# @@END 012 TAB_HOST_PLAN
 
 
 # @@BLOCK 013 TAB_PROBE deps=011
@@ -538,7 +539,7 @@ with tab_probe:
                 )
             elif any(r["TCP"] == "OK" for r in results):
                 st.success("At least one listener answered — the ladder has something to talk to.")
-# @@END 013
+# @@END 013 TAB_PROBE
 
 
 # @@BLOCK 014 TAB_DNS deps=011
@@ -586,7 +587,7 @@ with tab_dns:
         "The bare apex is appended as a last-resort rung only if it resolves. "
         "It is demoted to the very end because it has no IMAP listener on most providers."
     )
-# @@END 014
+# @@END 014 TAB_DNS
 
 
 # @@BLOCK 015 TAB_SMTP deps=011
@@ -613,7 +614,7 @@ with tab_smtp:
                     out.append({"Host": h, "Port": port, "TLS": "implicit" if tls else "plain",
                                 "TCP": "OK" if ok else "FAIL", "ms": ms, "Error": err})
             st.dataframe(out, use_container_width=True, hide_index=True)
-# @@END 015
+# @@END 015 TAB_SMTP
 
 
 # @@BLOCK 016 TAB_PROXY deps=011
@@ -680,7 +681,7 @@ with tab_proxy:
 
         with st.expander("First 10 raw lines"):
             st.code("\n".join(lines[:10]) or "— empty —", language="text")
-# @@END 016
+# @@END 016 TAB_PROXY
 
 
 # @@BLOCK 017 TAB_CACHE deps=011
@@ -729,7 +730,7 @@ with tab_cache:
                 )
         except Exception as e:
             st.caption(f"no readable cache: {e}")
-# @@END 017
+# @@END 017 TAB_CACHE
 
 
 # @@BLOCK 018 FOOTER_BUNDLE deps=012
@@ -772,10 +773,10 @@ if st.button("📋 Build copy/paste bundle"):
         ok, ms, err = _port_probe(h, pt, timeout=6)
         L.append(f"{h}:{pt} tcp={'OK' if ok else 'FAIL'} {ms}ms {err}")
     st.code("\n".join(L), language="text")
-# @@END 018
+# @@END 018 FOOTER_BUNDLE
 
 
 # @@BLOCK 019 TRAILING deps=018
 # (reserved tail - keeps the file closed after the last block)
-# @@END 019
+# @@END 019 TRAILING
 # @@EOF
