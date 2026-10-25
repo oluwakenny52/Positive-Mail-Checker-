@@ -129,7 +129,7 @@ def _scan(path):
 
 def _finalise(rep):
     """Derive faults/fails/table/ok from details+blocks. Called before EVERY return."""
-    rep["faults"] = len(rep["details"])
+    rep["faults"] = len(rep["details"]); rep["ok"] = not rep["faults"]
     rep["fails"] = ["L%d %s: %s" % (d["line"], d["kind"], d["text"])
                     for d in rep["details"]]
     rep["table"] = [{"id": b[0], "name": b[1], "line": b[2]} for b in rep["blocks"]]
