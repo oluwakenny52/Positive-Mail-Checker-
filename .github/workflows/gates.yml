@@ -1,0 +1,48 @@
+name: frame-gates
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  gates:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: 1. fix_end_names --check
+        run: python fix_end_names.py --check
+        continue-on-error: true
+
+      - name: 2. verify_blocks
+        run: python verify_blocks.py
+        continue-on-error: true
+
+      - name: 3. audit_frame
+        run: python audit_frame.py
+        continue-on-error: true
+
+      - name: 4. verify_v1337
+        run: python verify_v1337.py
+        continue-on-error: true
+
+      - name: 5. test_verdicts
+        run: python test_verdicts.py
+        continue-on-error: true
+
+      - name: Summary
+        run: |
+          {
+            echo "## Frame gates"
+            echo ""
+            echo "| gate | result |"
+            echo "| --- | --- |"
+            for g in "fix_end_names.py --check" "verify_blocks.py" "audit_frame.py" "verify_v1337.py" "test_verdicts.py"; do
+              if python $g > /dev/null 2>&1; then r="PASS"; else r="FAIL"; fi
+              echo "| \`$g\` | $r |"
+            done
+          } >> "$GITHUB_STEP_SUMMARY"
