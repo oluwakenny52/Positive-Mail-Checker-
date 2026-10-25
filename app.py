@@ -4141,12 +4141,27 @@ def sieve_auth_once(email, password, server, proxy_str=None, insecure=None,
 # @@END 066 SIEVE_AUTH
 
 # @@BLOCK 067 ERROR_CLASSIFY deps=016,017,022,023,039
+# status.py emits the SPECIFIC tokens (WRONG_PASSWORD, NEED_APP_PASSWORD,
+# RBL_BLOCKED, RETRY_LATER) while every ladder in this file compares the
+# COLLAPSED names (WRONG, APP, RBL, RETRY).  note_verdict()'s whitelist holds
+# only the collapsed names, so an AUTHENTICATIONFAILED was filed as Connection
+# Failed and silently dropped.  Fold once, at the boundary.
+_CANON_STATUS = {
+    WRONG_PASSWORD: WRONG,
+    NEED_APP_PASSWORD: APP,
+    RBL_BLOCKED: RBL,
+    RETRY_LATER: RETRY,
+    FAILED: CONNECTION_FAILED,
+}
+
+
 def classify_error(err, domain=""):
     try:
         err_str = str(err)
         if domain in ZERO_ACCESS_PROVIDERS:
             return APP
-        return st_classify(err_str, domain)
+        st_val = st_classify(err_str, domain)
+        return _CANON_STATUS.get(st_val, st_val)
     except Exception:
         return UNKNOWN
 
