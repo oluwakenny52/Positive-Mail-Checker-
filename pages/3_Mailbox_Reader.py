@@ -1,12 +1,12 @@
-# @@FILE pages/3_Mailbox_Reader.py blocks=44 version=v13.41
+# @@FILE pages/3_Mailbox_Reader.py blocks=44 version=v13.42
 # @@BLOCK 000 FILE_HEADER deps=-
 """
-pages/3_Mailbox_Reader.py — Bobito Mailbox Reader & Portal Hub  (v13.41)
+pages/3_Mailbox_Reader.py — Bobito Mailbox Reader & Portal Hub  (v13.42)
 =======================================================================
 Interactive inbox inspection: bot intelligence, OTP / debit-card / credential
 scanning, multi-field search, Telegram + blacklist filtering.
 
-v13.41 fixes on this page
+v13.42 fixes on this page
 -------------------------
 * URLPARSE IMPORT DROPPED: removed unused import.
 * KEEPALIVE FIXED: used `streamlit.components.v1.html()` so the 30s health ping actually executes.
@@ -28,6 +28,7 @@ v13.41 fixes on this page
 * BATCH RUN RESULTS PERSISTED: batch failures and wrong/appass verdicts are written to individual text files and CSV.
 * PAGER MATCH COUNTERS RESTORED: global search and OTP pagers count true matches instead of page slices (v13.41).
 * PHASE-2 SELECT VALIDATION: message fetch loops verify IMAP folder selection status per hop (v13.41).
+* SIDEBAR & HEADER CSS REFINED: updated sidebar text inheritance and removed conflicting mobile header height override (v13.42).
 """
 
 import streamlit as st
@@ -316,7 +317,9 @@ def theme_css(th: dict) -> str:
         background: linear-gradient(180deg, {panel} 0%, {bg} 100%) !important;
         border-right: 1px solid {border};
     }}
-    [data-testid="stSidebar"] * {{ color: {text}; }}
+    [data-testid="stSidebar"] p,
+    [data-testid="stSidebar"] label,
+    [data-testid="stSidebar"] .stMarkdown span {{ color: inherit; }}
     h1, h2, h3, h4, h5, h6 {{ color: {text} !important; letter-spacing: .2px; }}
     p, span, label, li, small, strong {{ color: {text}; }}
     hr {{ border-color: {border} !important; }}
