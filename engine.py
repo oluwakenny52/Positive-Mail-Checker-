@@ -3,9 +3,9 @@
 # engine.py - headless verification engine: rung planning, pooled execution,
 # verdict aggregation and backoff. No Streamlit, no side effects on import.
 #
-# Aggregation mirrors app.py block 101 exactly: wrong_hosts / wrong_rungs /
-# app_rungs / domain_local_hosts, local-part retry BEFORE the host is
-# condemned, one wrong_hosts.add(server) per failing host.
+# Aggregation mirrors app.py blocks 100-104 (the WRONG block lives in 101):
+# wrong_hosts / wrong_rungs / app_rungs / domain_local_hosts, local-part retry
+# BEFORE the host is condemned, one wrong_hosts.add(server) per failing host.
 #
 #   python engine.py --selftest
 # ===========================================================================
@@ -165,7 +165,10 @@ def _hosts_of(domain):
             except Exception:
                 continue
             if out:
-                return [str(h) for h in out]
+                if isinstance(out, dict):
+                    out = out.get("imap") or []
+                if out:
+                    return [str(h) for h in out]
     return []
 
 
@@ -176,7 +179,7 @@ def _rank(domain, hosts):
     if not callable(fn):
         return list(hosts)
     try:
-        return list(fn(domain, list(hosts)))
+        return list(fn(list(hosts), domain, False))
     except Exception:
         try:
             return list(fn(list(hosts)))
@@ -215,7 +218,16 @@ def plan_rungs(domain, local="", *, include_pop=False, limit=DEFAULT_RUNG_LIMIT)
             rungs.append(Rung(order=len(rungs), host=h, port=995, proto="pop", tls=True, source="pop"))
             rungs.append(Rung(order=len(rungs), host=h, port=110, proto="pop", tls=False, source="pop-plain"))
 
-    return rungs[:limit] if limit else rungs
+    if limit and len(rungs) > limit:
+        head = rungs[:limit]
+        # POP must survive the cap: the IMAP rungs alone filled the ladder and
+        # include_pop=True produced no POP rung at all.
+        if include_pop and not any(r.proto == "pop" for r in head):
+            pop_tail = [r for r in rungs if r.proto == "pop"][:2]
+            if pop_tail:
+                head = head[: max(0, limit - len(pop_tail))] + pop_tail
+        rungs = head
+    return rungs
 # @@END 005 PLAN
 
 
@@ -531,4 +543,3 @@ if __name__ == "__main__":
     sys.exit(main())
 # @@END 011 SELFTEST_MAIN
 # @@EOF
-
