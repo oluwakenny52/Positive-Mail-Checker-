@@ -245,12 +245,15 @@ with st.expander("🛠 Canonicalise @@END names (no terminal needed)", expanded=
         except Exception as _cn_e:
             st.session_state["cn_msg"] = f"canonicalise failed: {_cn_e}"
             st.session_state["cn_out"] = ""
-    if st.session_state.get("cn_out"):
-        st.success(st.session_state.get("cn_msg", ""))
-        st.download_button("⬇️ Download the fixed file",
-                           data=st.session_state["cn_out"].encode("utf-8"),
-                           file_name=st.session_state.get("cn_name", "fixed.py"),
-                           mime="text/plain")
-        st.code(st.session_state["cn_out"], language="python")
+    if st.session_state.get("cn_msg"):
+        if not st.session_state.get("cn_out"):
+            st.error(st.session_state["cn_msg"])
+        else:
+            st.success(st.session_state["cn_msg"])
+            st.download_button("⬇️ Download the fixed file",
+                               data=st.session_state["cn_out"].encode("utf-8"),
+                               file_name=st.session_state.get("cn_name", "fixed.py"),
+                               mime="text/plain")
+            st.code(st.session_state["cn_out"], language="python")
 # @@END 009 CANON_END
 # @@EOF
