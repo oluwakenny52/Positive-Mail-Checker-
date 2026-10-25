@@ -778,3 +778,4 @@ if st.button("📋 Build copy/paste bundle"):
 # @@BLOCK 019 TRAILING deps=018
 # (reserved tail - keeps the file closed after the last block)
 # @@END 019
+# @@EOF
