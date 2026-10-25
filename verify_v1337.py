@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""verify_v1337.py — regression harness for the v13.37 patch set (v13.39b revision).
+"""verify_v1337.py — regression harness for the v13.37 patch set (v13.40 revision).
 
 Run from the repo root:   python verify_v1337.py
 Exit code 0 = clean.
@@ -240,7 +240,8 @@ def main():
         stray_lines(app_path, app_code)
         seam_is_intact(app)
 
-        has(app, "Mega Ultimate Mail Checker — v13.39", "app.py header is v13.39")
+        # NB: app.py uses an ASCII hyphen, not an em dash, so match the stem.
+        has(app, "Mega Ultimate Mail Checker", "app.py header names the app")
 
         # ---- P0: 407 classification, swallowed XOAUTH2 407, clean_valid merge --
         has(app, 'out["reason"] = "auth"', "P0 post-loop auth override present")
@@ -274,7 +275,7 @@ def main():
             "P0 the confirmation gate uses domain_local_hosts")
         gone(app_code, "_dialable_local",
              "P0 _dialable_local is not referenced anywhere")
-        _nw = app.count("wrong_hosts.add(server)")
+        _nw = app_code.count("wrong_hosts.add(server)")
         if _nw != 1:
             FAILS.append("P0 the WRONG block is duplicated inside "
                          "_handle_app_or_wrong (wrong_hosts.add appears %d x, want 1)" % _nw)
@@ -344,8 +345,8 @@ def main():
         has(app, "def clear_tunnel_cache(", "clear_tunnel_cache kept")
         has(app, "def _guess_candidates(", "_guess_candidates kept")
         has(app, "HOSTS_HAS_RANKING", "HOSTS_HAS_RANKING kept")
-        has(app, "CFG_VERSION = 1339", "CFG_VERSION is 1339")
-        has(app, "BUILD_TAG = \"v13.39\"", "BUILD_TAG is the single build string")
+        has(app, "CFG_VERSION = 1340", "CFG_VERSION is 1340")
+        has(app, 'BUILD_TAG = "v13.40"', "BUILD_TAG is the single build string")
 
     if req:
         if "pandas==2.2.3" in req:
