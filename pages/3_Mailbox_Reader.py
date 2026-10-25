@@ -50,7 +50,7 @@ from datetime import datetime
 from typing import List, Tuple
 from email.header import decode_header
 from email import message_from_bytes
-# @@END 000
+# @@END 000 FILE_HEADER
 
 
 # @@BLOCK 001 PAGE_CONFIG deps=000
@@ -62,7 +62,7 @@ st.set_page_config(
     # v13.39: "expanded" covers the whole viewport on a phone.
     initial_sidebar_state="collapsed"
 )
-# @@END 001
+# @@END 001 PAGE_CONFIG
 
 
 # @@BLOCK 002 HOSTS_IMPORT deps=001
@@ -72,7 +72,7 @@ except ImportError:
     def host_list(email: str) -> List[str]:
         domain = email.split("@")[-1].lower() if "@" in email else ""
         return [f"imap.{domain}"] if domain else ["imap.gmail.com"]
-# @@END 002
+# @@END 002 HOSTS_IMPORT
 
 
 # @@BLOCK 003 MS_OAUTH_IMPORT deps=001
@@ -85,7 +85,7 @@ except Exception:
     _ms_oauth = None
     _MS_OAUTH_OK = False
     _MS_IMAP_HOSTS = {"outlook.office365.com", "imap-mail.outlook.com"}
-# @@END 003
+# @@END 003 MS_OAUTH_IMPORT
 
 
 # @@BLOCK 004 MSVERDICT_CLASS deps=000
@@ -103,7 +103,7 @@ class MsVerdict(Exception):
         super().__init__(detail or verdict)
         self.verdict = verdict
         self.detail = detail or verdict
-# @@END 004
+# @@END 004 MSVERDICT_CLASS
 
 
 # @@BLOCK 005 PROVIDER_KNOWLEDGE deps=000
@@ -193,7 +193,7 @@ def username_candidates(email_addr: str) -> List[str]:
         if local and local.lower() != email_addr.lower():
             out.append(local)
     return list(dict.fromkeys(out))
-# @@END 005
+# @@END 005 PROVIDER_KNOWLEDGE
 
 
 # @@BLOCK 006 THEME_DATA deps=000
@@ -281,7 +281,7 @@ def save_theme(th: dict) -> None:
 
 def is_light(th: dict) -> bool:
     return _lum(th.get("bg", "#000000")) > 0.6
-# @@END 006
+# @@END 006 THEME_DATA
 
 
 # @@BLOCK 007 THEME_CSS deps=006
@@ -478,7 +478,7 @@ def theme_css(th: dict) -> str:
     {anim_css}
 </style>
 """
-# @@END 007
+# @@END 007 THEME_CSS
 
 
 # @@BLOCK 008 UI_HELPERS deps=006
@@ -497,7 +497,7 @@ def section(icon: str, title: str, subtitle: str = "") -> None:
         f'<span class="bb-t">{html.escape(title)}</span>{sub}</div>',
         unsafe_allow_html=True,
     )
-# @@END 008
+# @@END 008 UI_HELPERS
 
 
 # @@BLOCK 009 PROXY_LOADER deps=000
@@ -548,7 +548,7 @@ def load_app_proxies() -> List[dict]:
                 return dynamic_pool
 
     return dynamic_pool
-# @@END 009
+# @@END 009 PROXY_LOADER
 
 
 # @@BLOCK 010 KEEPALIVE_AND_THEME_APPLY deps=007
@@ -567,7 +567,7 @@ components.html(
 # --- Load shared theme and inject it (must happen before anything renders) ---
 THEME = load_theme()
 st.markdown(theme_css(THEME), unsafe_allow_html=True)
-# @@END 010
+# @@END 010 KEEPALIVE_AND_THEME_APPLY
 
 
 # @@BLOCK 011 SIDEBAR_THEME deps=010
@@ -618,7 +618,7 @@ with st.sidebar.expander("🎨 Theme (synced with checker)", expanded=False):
         st.rerun()
 
     st.caption("Saved to theme.json — the main checker picks it up automatically.")
-# @@END 011
+# @@END 011 SIDEBAR_THEME
 
 
 # @@BLOCK 012 FILES_AND_CONFIG deps=000
@@ -735,7 +735,7 @@ def load_session_cache():
                         st.session_state[k] = v
         except Exception:
             pass
-# @@END 012
+# @@END 012 FILES_AND_CONFIG
 
 
 # @@BLOCK 013 SESSION_INIT deps=012
@@ -806,7 +806,7 @@ if "reader_use_proxy" not in st.session_state:
     st.session_state.reader_use_proxy = False
 if "stream_page_size" not in st.session_state:
     st.session_state.stream_page_size = 15
-# @@END 013
+# @@END 013 SESSION_INIT
 
 
 # @@BLOCK 014 LOGGERS deps=013
@@ -864,7 +864,7 @@ def msg_label(msg, idx: int) -> str:
 def render_flash() -> None:
     for kind, msg in st.session_state.pop("_flash", []):
         {"success": st.success, "warning": st.warning, "error": st.error}.get(kind, st.info)(msg)
-# @@END 014
+# @@END 014 LOGGERS
 
 
 # @@BLOCK 015 TLS_AND_PROXY_PARSE deps=013
@@ -944,7 +944,7 @@ def _parse_proxy_str(proxy_str):
         return {"host": host, "port": port, "user": user or None, "pass": pw or None, "scheme": scheme}
     except Exception:
         return None
-# @@END 015
+# @@END 015 TLS_AND_PROXY_PARSE
 
 
 # @@BLOCK 016 PROXY_PROBE deps=015
@@ -1019,7 +1019,7 @@ def _conn_path() -> str:
         return st.session_state.get("_reader_proxy_path", "unknown")
     except Exception:
         return "unknown"
-# @@END 016
+# @@END 016 PROXY_PROBE
 
 
 # @@BLOCK 017 SOCKET_AND_IMAP deps=016
@@ -1182,7 +1182,7 @@ def open_imap(host, port, timeout, proxy_str=None, try_starttls=None):
                         pass
 
     raise last or RuntimeError(f"open_imap failed for {host}:{port}")
-# @@END 017
+# @@END 017 SOCKET_AND_IMAP
 
 
 # @@BLOCK 018 ERROR_SNIFFERS deps=017
@@ -1230,7 +1230,7 @@ def _looks_like_network_error(err_text: str) -> bool:
         "too many simultaneous", "rate limit", "ratelimit", "throttl", "no setter",
         "name resolution", "getaddrinfo", "temporary failure in name resolution",
     ))
-# @@END 018
+# @@END 018 ERROR_SNIFFERS
 
 
 # @@BLOCK 019 VALID_STORAGE deps=018
@@ -1429,7 +1429,7 @@ def clear_all_valid_accounts_storage():
         except Exception:
             pass
     _VALID_CACHE["fp"] = None
-# @@END 019
+# @@END 019 VALID_STORAGE
 
 
 # @@BLOCK 020 ZIP_CACHE deps=019
@@ -1509,7 +1509,7 @@ def generate_all_mail_zip():
     _ZIP_CACHE["fp"] = fp
     _ZIP_CACHE["blob"] = blob
     return blob
-# @@END 020
+# @@END 020 ZIP_CACHE
 
 
 # @@BLOCK 021 MIME_AND_PORTAL deps=019
@@ -1543,7 +1543,7 @@ def get_webmail_portal(email_addr):
         "montevideo.com.uy": "https://webmail.montevideo.com.uy",
     }
     return portals.get(domain, f"https://www.{domain}")
-# @@END 021
+# @@END 021 MIME_AND_PORTAL
 
 
 # @@BLOCK 022 IMAP_UTF7 deps=021
@@ -1641,7 +1641,7 @@ def parse_imap_list_line(s: str) -> Tuple[str, str, str]:
 def get_imap_path(selected_ui_folder: str) -> str:
     folder_map = st.session_state.get("folder_map", {})
     return folder_map.get(selected_ui_folder, selected_ui_folder)
-# @@END 022
+# @@END 022 IMAP_UTF7
 
 
 # @@BLOCK 023 FOLDERS deps=022
@@ -1703,7 +1703,7 @@ def list_folders(mail, email_addr: str = "", host_val: str = ""):
     st.session_state.folder_map = folder_map
     save_session_cache()
     return display_folders
-# @@END 023
+# @@END 023 FOLDERS
 
 
 # @@BLOCK 024 LOGIN deps=023
@@ -1836,7 +1836,7 @@ def move_message(mail, src_folder_label, mid, dst_folder_label):
 
     mail.store(mid, '+FLAGS', '\\Deleted')
     mail.expunge()
-# @@END 024
+# @@END 024 LOGIN
 
 
 # @@BLOCK 025 CLASSIFY_CONTENT deps=024
@@ -1998,7 +1998,7 @@ def should_blacklist_message(msg, blacklist_input) -> bool:
         return False
     combined_text = f"{msg.get('subject', '')} {msg.get('body', '')} {msg.get('from', '')}".lower()
     return _has_word(combined_text, blackwords)
-# @@END 025
+# @@END 025 CLASSIFY_CONTENT
 
 
 # @@BLOCK 026 SEARCH_AND_FETCH deps=025
@@ -2344,7 +2344,7 @@ st.caption(
 )
 
 valid = load_valid()
-# @@END 027
+# @@END 027 HERO_AND_VALID
 
 
 # @@BLOCK 028 DELETION_MANAGER deps=027
@@ -2401,7 +2401,7 @@ with st.expander("🗑️ Account Deletion Manager", expanded=False):
                     st.rerun()
     else:
         st.caption("No valid accounts currently available for deletion.")
-# @@END 028
+# @@END 028 DELETION_MANAGER
 
 
 # @@BLOCK 029 ACCOUNT_PICKER deps=028
@@ -2454,7 +2454,7 @@ if pick and pick != "none":
 if actual_pick and actual_pick != "none" and ":" in actual_pick:
     save_last_account(actual_pick)
     save_session_cache()
-# @@END 029
+# @@END 029 ACCOUNT_PICKER
 
 
 # @@BLOCK 030 SIDEBAR_HUB deps=029
@@ -2486,7 +2486,7 @@ if clean_download_lines:
         mime="application/zip",
         use_container_width=True
     )
-# @@END 030
+# @@END 030 SIDEBAR_HUB
 
 
 # @@BLOCK 031 SIDEBAR_CONFIG deps=029
@@ -2523,7 +2523,7 @@ with st.sidebar.expander("⚙️ App Configuration Settings", expanded=False):
         st.session_state.app_config["allow_self_signed"] = new_selfsigned
         save_app_config(st.session_state.app_config)
         st.success("App configuration updated and saved globally!")
-# @@END 031
+# @@END 031 SIDEBAR_CONFIG
 
 
 # @@BLOCK 032 SIDEBAR_BATCH deps=031
@@ -2812,7 +2812,7 @@ if st.sidebar.button("🚀 Validate & Import Batch Accounts", type="primary", us
         save_session_cache()
         flash(f"Batch validation complete. Valid: {valid_count}, Wrong: {wrong_count}, AppPass: {appass_count}, Dropped: {login_drop_count}, Failed: {failed_count}")
         st.rerun()
-# @@END 032
+# @@END 032 SIDEBAR_BATCH
 
 
 # @@BLOCK 033 STREAM_TABS deps=032
@@ -2876,7 +2876,7 @@ with tab_analytics:
         )
     else:
         st.caption("No table results available yet.")
-# @@END 033
+# @@END 033 STREAM_TABS
 
 
 # @@BLOCK 034 SIDEBAR_OVERRIDES_LOGIN deps=033
@@ -2967,7 +2967,7 @@ if st.sidebar.button("🔑 Login & Save Account", type="primary", use_container_
             st.rerun()
         else:
             st.sidebar.error(f"❌ Login failed: {last_err}")
-# @@END 034
+# @@END 034 SIDEBAR_OVERRIDES_LOGIN
 
 
 # @@BLOCK 035 REFRESH_AND_PORTAL deps=034
@@ -3005,7 +3005,7 @@ if active_email and active_password:
     portal_url = get_webmail_portal(active_email)
     st.sidebar.markdown(f"[Open Webmail Portal]({portal_url})", unsafe_allow_html=True)
     st.sidebar.text_input("Copy Credentials", value=f"{active_email}:{active_password}")
-# @@END 035
+# @@END 035 REFRESH_AND_PORTAL
 
 
 # @@BLOCK 036 CONNECT_DISCOVER deps=035
@@ -3063,7 +3063,7 @@ if st.button("Connect & Discover Folders", type="primary", use_container_width=T
                 st.error(f"{last} — this provider has no standard IMAP endpoint (needs an app password / bridge).")
             else:
                 st.error(last)
-# @@END 036
+# @@END 036 CONNECT_DISCOVER
 
 
 # @@BLOCK 037 FOLDER_LOGS_AND_CONTROLS deps=036
@@ -3101,7 +3101,7 @@ if st.button("📂 Load Folder Messages", type="primary", use_container_width=Tr
                 st.rerun()
         except Exception as e:
             st.error(str(e))
-# @@END 037
+# @@END 037 FOLDER_LOGS_AND_CONTROLS
 
 
 # @@BLOCK 038 MAIN_STREAM deps=037
@@ -3245,7 +3245,7 @@ if len(active_msgs) > 0:
                 )
                 save_session_cache()
                 st.rerun()
-# @@END 038
+# @@END 038 MAIN_STREAM
 
 
 # @@BLOCK 039 OTP_SCANNER deps=038
@@ -3465,7 +3465,7 @@ with st.expander("🔑 Standalone OTP, Debit/Credit Cards & Sensitive Data Scann
             st.code("\n".join(st.session_state.otp_diag_logs), language="text")
         else:
             st.caption("OTP scanner traces and raw server logs will appear here during execution.")
-# @@END 039
+# @@END 039 OTP_SCANNER
 
 
 # @@BLOCK 040 DEEP_SEARCH deps=039
@@ -3637,7 +3637,7 @@ with st.expander("🔍 Deep Keyword Search & Scope Filters", expanded=False):
             st.code("\n".join(st.session_state.search_diag_logs), language="text")
         else:
             st.caption("Search engine logs will be recorded here after executing a keyword search.")
-# @@END 040
+# @@END 040 DEEP_SEARCH
 
 
 # @@BLOCK 041 BOT_PURGE deps=040
@@ -3781,7 +3781,7 @@ with st.expander("🤖 Mass Bot Purge & Intelligence Hub", expanded=False):
         st.code("\n".join(st.session_state.bot_diag_logs), language="text")
     else:
         st.caption("Bot engine traces will be printed here during purge operations.")
-# @@END 041
+# @@END 041 BOT_PURGE
 
 
 # @@BLOCK 042 BACK_TO_CHECKER deps=041
@@ -3791,10 +3791,10 @@ try:
     st.page_link("app.py", label="← Back to the Mail Checker")
 except Exception:
     st.caption("The main checker lives at app.py")
-# @@END 042
+# @@END 042 BACK_TO_CHECKER
 
 
 # @@BLOCK 043 TRAILING deps=042
 # (reserved tail - keeps the file closed after the last block)
-# @@END 043
+# @@END 043 TRAILING
 # @@EOF
