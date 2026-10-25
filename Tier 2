@@ -157,6 +157,7 @@ def emit(fname, version, entries):
         L.extend(body)
         L.append("# @@END %03d %s" % (new_id, name))
         L.append("")
+    L.append("# @@EOF")
     return "\n".join(L)
 
 
@@ -303,7 +304,7 @@ def main():
         return 1
 
     fails = []
-    for label, text in ((ENGINE, engine_src), ("app.py (new)", app_src)):
+    for label, text in ((ENGINE, engine_src), ("app.py", app_src)):
         res = VB.audit_source(text, label)
         fails.extend(res["fails"])
         try:
