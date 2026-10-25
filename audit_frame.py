@@ -12,7 +12,7 @@ import io, os, re, sys, tokenize
 
 GATED = ["app.py", "engine.py", "status.py", "pages/2_Diagnostics.py",
          "pages/3_Mailbox_Reader.py", "pages/4_Downloads.py", "pages/5_Blocks.py"]
-EXPECT_FILES, EXPECT_BLOCKS = 7, 225
+EXPECT_FILES, EXPECT_BLOCKS = 7, 226
 
 FILE_RX  = re.compile(r"^#\s*@@FILE\s+(\S+)\s+blocks=(\d+)\s+version=(\S+)\s*$")
 BLOCK_RX = re.compile(r"^#\s*@@BLOCK\s+(\d{3})\s+([A-Za-z0-9_]+)(?:\s+deps=(\S+))?\s*$")
@@ -179,7 +179,7 @@ def api_conformance():
         for x in res_all.values():
             _ = x["table"]; _ = bool(x["fails"]); _ = x["ok"]
             _ = {b[0] for b in x["blocks"]}
-        _ = VB.block_ids("app.py") - {1}
+        _ = set(VB.block_ids("app.py")) - {1}
     except Exception as e:
         bad.append("pages/5_Blocks.py expression -> %r" % (e,))
 
@@ -259,7 +259,14 @@ def main():
     for t in todo:
         print("  " + t)
 
-    ok = (faults == 0) and (not bad)
+    _files = sum(1 for r in gated if r["exists"])
+    _blocks = sum(r["blocks"] for r in gated)
+    drift = (_files != EXPECT_FILES) or (_blocks != EXPECT_BLOCKS)
+    if drift:
+        print("TARGET DRIFT: expected %d file(s) / %d block(s), found %d / %d"
+              % (EXPECT_FILES, EXPECT_BLOCKS, _files, _blocks))
+
+    ok = (faults == 0) and (not bad) and (not drift)
     print()
     print("RESULT: %s" % ("GREEN" if ok else "NOT GREEN"))
     return 0 if ok else 1
