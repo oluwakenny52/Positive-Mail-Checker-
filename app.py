@@ -2029,6 +2029,11 @@ def metric_grid(pairs, per_row: int = 3):
 # @@BLOCK 036 LOG_COLOR deps=-
 TAG_COLORS = {
     "VALID": "#22c55e",
+    "WRONG": "#ef4444",
+    "APP": "#eab308",
+    "RBL": "#a855f7",
+    "FAILED": "#ef4444",
+    "RETRY": "#38bdf8",
     "WRONG_PASSWORD": "#ef4444",
     "LOGIN_DROPPED": "#f43f5e",
     "CONNECTION_FAILED": "#eab308",
@@ -2049,7 +2054,8 @@ TAG_COLORS = {
 
 def _line_color(line: str) -> str:
     up = str(line).upper()
-    for tag in ("SKIPPED_COOLDOWN", "SKIPPED", "NEED_APP_PASSWORD", "RBL_BLOCKED",
+    for tag in ("SKIPPED_COOLDOWN", "SKIPPED", "WRONG", "APP", "RBL", "FAILED", "RETRY",
+                "NEED_APP_PASSWORD", "RBL_BLOCKED",
                 "WRONG_PASSWORD", "PROXY_UNHEALTHY", "CONNECTION_FAILED", "RETRY_LATER",
                 "SMTP_FAILED", "DNS_FAILED", "UNCLASSIFIED", "LOGIN_DROPPED", "VALID",
                 "UNKNOWN", "EXCEPTION", "ERROR"):
