@@ -530,3 +530,5 @@ def main(argv=None):
 if __name__ == "__main__":
     sys.exit(main())
 # @@END 011 SELFTEST_MAIN
+# @@EOF
+
