@@ -50,6 +50,8 @@ validates a paste before you commit.
 | `pages/4_Downloads.py` | export studio |
 | `pages/5_Blocks.py` | frame inspector |
 
+tier2_split.py is staged but NOT applied — engine.py is currently a separate hand-written engine that app.py does not import.
+
 ## Deploy
 
 Streamlit secrets: `WEBSHARE_KEYS`, `OXYLABS_BASE` (see
