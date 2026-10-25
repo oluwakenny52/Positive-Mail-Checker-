@@ -333,6 +333,18 @@ def _build_plan(domain, max_hosts, flags=None):
 
     primary = [("IMAP", h, 993, "ssl") for h in imap_hosts]
     primary += [("POP", h, 995, "ssl") for h in pop_only]
+    # v13.40a: app.py also dials SMTP submission and ManageSieve when those
+    # protocols are selected, so the page was missing up to 4 rungs.
+    if flags.get("smtp"):
+        try:
+            _smtp = [h for h in (H.smtp_candidates(domain) or []) if h][:1]
+        except Exception:
+            _smtp = []
+        for _sh in _smtp:
+            for _sp, _sm in ((587, "starttls"), (465, "ssl"), (25, "plain")):
+                primary.append(("SMTP", _sh, _sp, _sm))
+    if flags.get("sieve") and imap_hosts:
+        primary.append(("SIEVE", imap_hosts[0], 4190, "starttls"))
 
     fallback = [("POP", h, 995, "ssl") for h in pop_dup]
     for h in imap_hosts:
