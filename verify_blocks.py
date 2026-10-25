@@ -128,11 +128,16 @@ def _scan(path):
 
 
 def _finalise(rep):
-    """Derive faults/fails/table from details+blocks. Called before EVERY return."""
+    """Derive faults/fails/table/ok from details+blocks. Called before EVERY return."""
     rep["faults"] = len(rep["details"])
     rep["fails"] = ["L%d %s: %s" % (d["line"], d["kind"], d["text"])
                     for d in rep["details"]]
     rep["table"] = [{"id": b[0], "name": b[1], "line": b[2]} for b in rep["blocks"]]
+    # `ok` must be a REAL KEY as well as the property: pages/5_Blocks.py does
+    # res["ok"] (subscript) and audit_frame.api_conformance does
+    # r.get("ok") is True.  A property alone satisfies NEITHER - r["ok"] raises
+    # KeyError('ok') and r.get("ok") returns None.
+    rep["ok"] = not rep["faults"]
     return rep
 
 
