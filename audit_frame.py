@@ -195,7 +195,7 @@ def api_conformance():
     except Exception as e:
         bad.append("fix_end_names._regate() -> %r" % (e,))
 
-    t2 = "Tier 2"
+    t2 = "tier2_split.py"
     if os.path.exists(t2):
         t = io.open(t2, encoding="utf-8").read()
         if '"app.py (new)"' in t:
