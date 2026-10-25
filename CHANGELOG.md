@@ -1,3 +1,32 @@
+Mega Ultimate Mail Checker — v13.40
+===================================
+THE FRAME IS GREEN AGAIN, AND IT IS CHECKABLE FROM A PHONE.
+
+* every bare `@@END NNN` in `pages/2`, `pages/3`, `pages/4` and `pages/5` is
+  named. `verify_blocks.py`, `fix_end_names.py --check` and `audit_frame.py`
+  all pass.
+* `pages/5_Blocks.py` gained a Canonicalise block: it rewrites bare `@@END`
+  markers in the browser and offers the fixed file as a download, so the frame
+  is repairable with no terminal.
+* `pages/5_Blocks.py` block 007 computed `missing` as `list - set`. `block_ids()`
+  returns a list and `list` has no `__sub__`, so CPython answered with the
+  reflected set subtraction and `missing` came out identical to `extra`.
+* `audit_frame.py` had the same `list - set` bug in its API-conformance probe,
+  and `EXPECT_FILES`/`EXPECT_BLOCKS` were printed but never asserted. Both fixed;
+  target is now 7 files / 226 blocks.
+* `pages/4_Downloads.py` block 011 assigned `st.session_state["ex_tpl"]` AFTER
+  the widget with that key had been created in the same run, which raises
+  `StreamlitWidgetAlreadyInstantiatedError` - the same rule the v13.35 reset
+  button was rebuilt around. The pending preset is now consumed at the top of
+  block 010, before any widget exists, and every preset-backed widget carries a
+  key.
+* `verify_v1337.py` still asserted v13.39 / CFG_VERSION 1339 and an em dash in
+  the app header, so it could never print FAILED 0 on a v13.40 tree.
+* `test_verdicts.py` required a `_norm_verdict()` helper that was never written;
+  the needles now target `_VERDICT_RANK`, which is what actually normalises.
+* `pages/2_Diagnostics.py` sidebar starts collapsed like every other page.
+* `.github/workflows/gates.yml` runs the five gates on every push.
+
 Mega Ultimate Mail Checker — v13.39
 ===================================
 THE PROVISIONAL-VERDICT PATCH IS NOW ACTUALLY REACHABLE.
