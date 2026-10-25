@@ -62,8 +62,8 @@ for p in ("engine.py", "app.py"):
         src += io.open(p, encoding="utf-8").read() + "\n"
 
 NEEDLES = (
-    "def _norm_verdict(st_val):",
-    "return _norm_verdict(st_classify(err_str, domain))",
+    "def note_verdict(st_val, detail, host=\"\", force=False):",
+    "if st_val not in (VALID, WRONG, APP, RBL, LOGIN_DROPPED, UNKNOWN):",
     "_VERDICT_RANK.get(st_val, 0) > _VERDICT_RANK.get(cur, 0)",
 )
 for n in NEEDLES:
