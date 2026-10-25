@@ -10,9 +10,9 @@ Exit 0 = frame clean AND verifier contract satisfied.
 from __future__ import annotations
 import io, os, re, sys, tokenize
 
-GATED = ["app.py", "status.py", "pages/2_Diagnostics.py",
+GATED = ["app.py", "engine.py", "status.py", "pages/2_Diagnostics.py",
          "pages/3_Mailbox_Reader.py", "pages/4_Downloads.py", "pages/5_Blocks.py"]
-EXPECT_FILES, EXPECT_BLOCKS = 6, 213
+EXPECT_FILES, EXPECT_BLOCKS = 7, 225
 
 FILE_RX  = re.compile(r"^#\s*@@FILE\s+(\S+)\s+blocks=(\d+)\s+version=(\S+)\s*$")
 BLOCK_RX = re.compile(r"^#\s*@@BLOCK\s+(\d{3})\s+([A-Za-z0-9_]+)(?:\s+deps=(\S+))?\s*$")
