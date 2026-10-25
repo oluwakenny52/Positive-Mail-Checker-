@@ -77,6 +77,44 @@ if "ST_PRIORITY.get(st_val, 99) < ST_PRIORITY.get(cur, 99)" not in src:
 else:
     FAILS.append("note_verdict still compares priorities with <")
 
+# ---------------------------------------- the verdict-token fold (v13.41)
+# status.py emits the SPECIFIC tokens; every ladder in app.py compares the
+# COLLAPSED names and note_verdict()'s whitelist holds only the collapsed ones.
+# The old harness asserted the buggy tuple verbatim and never noticed, because
+# it only ever exercised status.py.
+FOLD = (
+    ("WRONG_PASSWORD: WRONG", "an auth failure must land on WRONG"),
+    ("NEED_APP_PASSWORD: APP", "an app-password demand must land on APP"),
+    ("RBL_BLOCKED: RBL", "an RBL block must land on RBL"),
+    ("RETRY_LATER: RETRY", "a soft retry must land on RETRY"),
+    ("FAILED: CONNECTION_FAILED", "FAILED must collapse onto CONNECTION_FAILED"),
+)
+if "_CANON_STATUS" not in src:
+    FAILS.append("MISSING: app.py has no _CANON_STATUS fold - status.py's "
+                 "specific tokens fall through every ladder and note_verdict()")
+else:
+    ok("app.py has the _CANON_STATUS fold")
+for needle, why in FOLD:
+    if needle in src:
+        ok("fold %s (%s)" % (needle, why))
+    else:
+        FAILS.append("MISSING: fold %s - %s" % (needle, why))
+
+for needle in ("st_val = st_classify(err_str, domain)",
+               "_CANON_STATUS.get(st_val, st_val)"):
+    if needle in src:
+        ok("present: %s" % needle)
+    else:
+        FAILS.append("MISSING: %s" % needle)
+
+# and prove the fold is NEEDED: none of these may already be whitelisted
+for v in (S.STATUS_WRONG_PASSWORD, S.STATUS_NEED_APP_PASSWORD,
+          S.STATUS_RBL_BLOCKED, S.STATUS_RETRY_LATER):
+    if v in (S.VALID, S.WRONG, S.APP, S.RBL, S.LOGIN_DROPPED, S.UNKNOWN):
+        ok("%s already survives note_verdict" % v)
+    else:
+        ok("%s would be dropped by note_verdict without the fold" % v)
+
 # ----------------------------------------------------------------- hosts.py
 try:
     import hosts as H
