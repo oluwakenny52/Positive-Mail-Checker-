@@ -1,12 +1,12 @@
-# @@FILE pages/3_Mailbox_Reader.py blocks=44 version=v13.42
+# @@FILE pages/3_Mailbox_Reader.py blocks=44 version=v13.40
 # @@BLOCK 000 FILE_HEADER deps=-
 """
-pages/3_Mailbox_Reader.py — Bobito Mailbox Reader & Portal Hub  (v13.42)
+pages/3_Mailbox_Reader.py — Bobito Mailbox Reader & Portal Hub  (v13.40)
 =======================================================================
 Interactive inbox inspection: bot intelligence, OTP / debit-card / credential
 scanning, multi-field search, Telegram + blacklist filtering.
 
-v13.42 fixes on this page
+v13.40 fixes on this page
 -------------------------
 * URLPARSE IMPORT DROPPED: removed unused import.
 * KEEPALIVE FIXED: used `streamlit.components.v1.html()` so the 30s health ping actually executes.
@@ -26,9 +26,8 @@ v13.42 fixes on this page
 * GLOBAL PAGINATION: folder search results are collected globally before slicing to fix overlapping page ranges.
 * FLASH MESSAGES PRESERVED: added persistent flash state so action toasts survive `st.rerun()`.
 * BATCH RUN RESULTS PERSISTED: batch failures and wrong/appass verdicts are written to individual text files and CSV.
-* PAGER MATCH COUNTERS RESTORED: global search and OTP pagers count true matches instead of page slices (v13.41).
-* PHASE-2 SELECT VALIDATION: message fetch loops verify IMAP folder selection status per hop (v13.41).
-* SIDEBAR & HEADER CSS REFINED: updated sidebar text inheritance and removed conflicting mobile header height override (v13.42).
+* PAGER MATCH COUNTERS RESTORED: global search and OTP pagers count true matches instead of page slices.
+* PHASE-2 SELECT VALIDATION: message fetch loops verify IMAP folder selection status per hop.
 """
 
 import streamlit as st
@@ -435,7 +434,7 @@ def theme_css(th: dict) -> str:
             padding: 0.55rem 0.7rem calc(1.3rem + env(safe-area-inset-bottom)) 0.7rem !important;
             max-width: 100% !important;
         }}
-        [data-testid="stHeader"] {{ height: 2.1rem; }}
+        /* v13.40a: app.py removed this - it fought Streamlit's own header */
         [data-testid="stToolbar"] {{ right: 0.3rem; }}
         [data-testid="stSidebar"] {{ width: 88vw !important; min-width: 88vw !important; }}
         .bb-hero {{ padding: 14px 16px; border-radius: 12px; margin-bottom: 10px; }}
