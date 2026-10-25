@@ -1,4 +1,4 @@
-# @@FILE pages/5_Blocks.py blocks=9 version=v13.40
+# @@FILE pages/5_Blocks.py blocks=10 version=v13.40
 # @@BLOCK 000 FILE_HEADER deps=-
 """
 pages/5_Blocks.py - Block Inspector  (v13.40)
@@ -14,13 +14,13 @@ import sys
 from datetime import datetime
 
 import streamlit as st
-# @@END 000
+# @@END 000 FILE_HEADER
 
 
 # @@BLOCK 001 PAGE_CONFIG deps=000
 st.set_page_config(page_title="Blocks - Mail Checker", page_icon="🧱",
                    layout="wide", initial_sidebar_state="collapsed")
-# @@END 001
+# @@END 001 PAGE_CONFIG
 
 
 # @@BLOCK 002 IMPORT_VERIFY_BLOCKS deps=000
@@ -34,7 +34,7 @@ except Exception as _e:
     st.error(f"verify_blocks.py could not be imported from {ROOT}: {_e}")
     st.caption("It must sit in the repo ROOT, next to app.py - not inside pages/.")
     st.stop()
-# @@END 002
+# @@END 002 IMPORT_VERIFY_BLOCKS
 
 
 # @@BLOCK 003 CSS deps=000
@@ -58,7 +58,7 @@ st.markdown(
 """,
     unsafe_allow_html=True,
 )
-# @@END 003
+# @@END 003 CSS
 
 
 # @@BLOCK 004 HERO deps=003
@@ -67,12 +67,12 @@ st.markdown(
     '<p>Frame integrity for every block file, plus paste validation before you commit.</p></div>',
     unsafe_allow_html=True,
 )
-# @@END 004
+# @@END 004 HERO
 
 
 # @@BLOCK 005 TABS deps=004
 tab_scan, tab_paste, tab_how = st.tabs(["📋 Scan the repo", "🧪 Validate a paste", "📖 How to replace a block"])
-# @@END 005
+# @@END 005 TABS
 
 
 # @@BLOCK 006 TAB_SCAN deps=005
@@ -111,7 +111,7 @@ with tab_scan:
             if res["table"]:
                 st.markdown("**Manifest**")
                 st.dataframe(res["table"], use_container_width=True, hide_index=True)
-# @@END 006
+# @@END 006 TAB_SCAN
 
 
 # @@BLOCK 007 TAB_PASTE deps=005
@@ -141,7 +141,11 @@ with tab_paste:
                 st.dataframe(res["table"], use_container_width=True, hide_index=True)
 
             if target in VB.BLOCKED_FILES and os.path.exists(os.path.join(ROOT, target)):
-                disk = VB.block_ids(os.path.join(ROOT, target))
+                # v13.40: block_ids() returns a LIST. `list - set` has no
+                # list.__sub__, so CPython answers with the reflected set
+                # subtraction and computes pasted - disk - i.e. `missing` came
+                # out identical to `extra`. set() both sides.
+                disk = set(VB.block_ids(os.path.join(ROOT, target)))
                 pasted = {b[0] for b in res["blocks"]}
                 missing = sorted(disk - pasted)
                 extra = sorted(pasted - disk)
@@ -153,7 +157,7 @@ with tab_paste:
                             + ", ".join("%03d" % x for x in extra))
                 if not missing and not extra and res["ok"]:
                     st.success("Paste matches the on-disk block set exactly.")
-# @@END 007
+# @@END 007 TAB_PASTE
 
 
 # @@BLOCK 008 TAB_HOW deps=005
@@ -180,5 +184,73 @@ with tab_how:
 **Gate before every commit**
 """
     )
-# @@END 008
+# @@END 008 TAB_HOW
+
+
+# @@BLOCK 009 CANON_END deps=002
+# In-browser stand-in for `python fix_end_names.py --apply`, so the frame can be
+# repaired from a phone with no terminal.  Rewrites MARKER LINES ONLY.
+def canon_end_names(src):
+    """Return (fixed_text, changed_count).  Names every bare @@END from its @@BLOCK."""
+    names, out, open_id, changed = {}, [], None, 0
+    for ln in src.splitlines():
+        mb = VB.BLOCK_RX.match(ln)
+        if mb:
+            if open_id is not None and names.get(open_id):
+                out.append("# @@END %03d %s" % (open_id, names[open_id]))
+                changed += 1
+            out.append(ln)
+            open_id = int(mb.group(1))
+            names[open_id] = mb.group(2)
+            continue
+        me = VB.END_RX.match(ln)
+        if me and me.group(1):
+            bid = int(me.group(1))
+            if bid == open_id:
+                open_id = None
+            if names.get(bid):
+                want = "# @@END %03d %s" % (bid, names[bid])
+                if ln != want:
+                    changed += 1
+                out.append(want)
+            else:
+                out.append(ln)
+            continue
+        out.append(ln)
+    if open_id is not None and names.get(open_id):
+        out.append("# @@END %03d %s" % (open_id, names[open_id]))
+        changed += 1
+    return "\n".join(out) + "\n", changed
+
+
+st.divider()
+with st.expander("🛠 Canonicalise @@END names (no terminal needed)", expanded=False):
+    st.caption("Names every bare '# @@END NNN' from its matching '# @@BLOCK NNN NAME'. "
+               "Download the result, then replace the file in GitHub with it.")
+    _cn_file = st.selectbox("File to canonicalise", list(VB.BLOCKED_FILES), key="cn_file")
+    if st.button("🛠 Canonicalise", type="primary", key="cn_go"):
+        try:
+            _cn_src = open(os.path.join(ROOT, _cn_file), encoding="utf-8").read()
+            _cn_out, _cn_n = canon_end_names(_cn_src)
+            _cn_res = VB.audit_source(_cn_out, _cn_file)
+            if _cn_res["faults"]:
+                st.session_state["cn_msg"] = (
+                    f"WARNING: {_cn_res['faults']} fault(s) still present - check the Scan tab.")
+            else:
+                st.session_state["cn_msg"] = (
+                    f"Frame OK. {_cn_n} marker line(s) rewritten, "
+                    f"{len(_cn_res['blocks'])} block(s) intact.")
+            st.session_state["cn_out"] = _cn_out
+            st.session_state["cn_name"] = os.path.basename(_cn_file)
+        except Exception as _cn_e:
+            st.session_state["cn_msg"] = f"canonicalise failed: {_cn_e}"
+            st.session_state["cn_out"] = ""
+    if st.session_state.get("cn_out"):
+        st.success(st.session_state.get("cn_msg", ""))
+        st.download_button("⬇️ Download the fixed file",
+                           data=st.session_state["cn_out"].encode("utf-8"),
+                           file_name=st.session_state.get("cn_name", "fixed.py"),
+                           mime="text/plain")
+        st.code(st.session_state["cn_out"], language="python")
+# @@END 009 CANON_END
 # @@EOF
