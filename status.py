@@ -650,3 +650,4 @@ ALIASES = {
 assert len(ALIASES) == len(STATUS_ALL_STATUSES), "alias/constant count mismatch"
 assert all(ALIASES[k] == v for k, v in zip(ALIASES, STATUS_ALL_STATUSES)), "alias drift"
 # @@END 012 APP_COMPAT
+# @@EOF
