@@ -564,3 +564,4 @@ except Exception:
 # @@BLOCK 015 TRAILING deps=014
 # (reserved tail - keeps the file closed after the last block)
 # @@END 015
+# @@EOF
