@@ -16,7 +16,7 @@ the unnamed end. Exit status is 1 when any fault is found.
 
 API used elsewhere:
   BLOCKED_FILES            list of audited paths
-  audit_source(path)       -> Report
+  audit_source(target, name=None) -> Report     (path, or source text + label)
   audit_all(paths=None)    -> {path: Report}
   block_ids(path)          -> [int, ...]
   totals(reports=None)     -> (files, blocks, faults)
@@ -127,30 +127,46 @@ def _scan(path):
         return fh.read()
 
 
-def audit_source(path):
-    """Audit one file. Never raises; problems come back as faults."""
+def _finalise(rep):
+    """Derive faults/fails/table from details+blocks. Called before EVERY return."""
+    rep["faults"] = len(rep["details"])
+    rep["fails"] = ["L%d %s: %s" % (d["line"], d["kind"], d["text"])
+                    for d in rep["details"]]
+    rep["table"] = [{"id": b[0], "name": b[1], "line": b[2]} for b in rep["blocks"]]
+    return rep
+
+
+def audit_source(target, name=None):
+    """Audit one file, or a pasted block of source.
+
+    target = a filesystem path, OR the full source text when `name` is given.
+    Never raises; problems come back as faults.
+    """
+    is_text = name is not None
+    path = name if is_text else target
+
     rep = Report(
         path=path,
         exists=False,
         declared=None,
         version=None,
-        blocks=0,
+        blocks=[],
         faults=0,
         details=[],
+        fails=[],
+        table=[],
     )
 
-    if not os.path.isfile(path):
-        rep["faults"] = 1
+    if not is_text and not os.path.isfile(path):
         rep["details"].append({"line": 0, "kind": "missing_file", "text": "%s is MISSING" % path})
-        return rep
+        return _finalise(rep)
 
     try:
-        src = _scan(path)
+        src = target if is_text else _scan(path)
     except Exception as exc:
         rep["exists"] = True
-        rep["faults"] = 1
         rep["details"].append({"line": 0, "kind": "unreadable", "text": str(exc)})
-        return rep
+        return _finalise(rep)
 
     rep["exists"] = True
     lines = src.splitlines()
@@ -165,7 +181,7 @@ def audit_source(path):
         if m:
             rep["declared"] = int(m.group(2))
             rep["version"] = m.group(3)
-            if os.path.basename(path) != m.group(1):
+            if path.replace("\\", "/") != m.group(1).replace("\\", "/"):
                 fault(1, "header_name", "header says '%s', file is '%s'" % (m.group(1), path))
         else:
             fault(1, "header", "first line is not a valid '# @@FILE name blocks=N version=V' header")
@@ -174,7 +190,7 @@ def audit_source(path):
     ends = {}         # id -> (line, name)
 
     for i, raw in enumerate(lines, start=1):
-        s = raw.strip()
+        s = raw.rstrip()
 
         mb = BLOCK_RX.match(s)
         if mb:
@@ -205,33 +221,32 @@ def audit_source(path):
                 ends[bid] = (i, gname or "")
             continue
 
-    rep["blocks"] = len(blocks)
+    rep["blocks"] = [(bid, blocks[bid][1], blocks[bid][0]) for bid in sorted(blocks)]
 
     # every open block needs a matching named end
-    for bid in sorted(blocks):
+    for bid, bname, bline in rep["blocks"]:
         if bid not in ends:
-            fault(blocks[bid][0], "unclosed", "block %03d %s has no matching '# @@END'" % (bid, blocks[bid][1]))
+            fault(bline, "unclosed", "block %03d %s has no matching '# @@END'" % (bid, bname))
             continue
         eline, ename = ends[bid]
-        bname = blocks[bid][1]
         if not ename:
             fault(eline, "unnamed_end", "END %03d carries no block name" % bid)
         elif ename != bname:
             fault(eline, "end_name_mismatch", "END %03d name '%s' != block name '%s'" % (bid, ename, bname))
 
     for bid in sorted(ends):
-        if bid not in blocks:
+        if not any(b[0] == bid for b in rep["blocks"]):
             fault(ends[bid][0], "orphan_end", "END %03d has no matching block" % bid)
 
-    if blocks:
-        expected = list(range(len(blocks)))
-        actual = sorted(blocks)
+    if rep["blocks"]:
+        expected = list(range(len(rep["blocks"])))
+        actual = sorted(b[0] for b in rep["blocks"])
         if actual != expected:
-            missing = [i for i in expected if i not in blocks]
-            fault(0, "noncontiguous", "block ids are not 000..%03d (missing %s)" % (len(blocks) - 1, missing or "none"))
+            missing = [i for i in expected if i not in actual]
+            fault(0, "noncontiguous", "block ids are not 000..%03d (missing %s)" % (len(rep["blocks"]) - 1, missing or "none"))
 
-    if rep["declared"] is not None and rep["declared"] != rep["blocks"]:
-        fault(0, "count_mismatch", "header declares %d blocks, found %d" % (rep["declared"], rep["blocks"]))
+    if rep["declared"] is not None and rep["declared"] != len(rep["blocks"]):
+        fault(0, "count_mismatch", "header declares %d blocks, found %d" % (rep["declared"], len(rep["blocks"])))
 
     if rep["declared"] is not None and not any(EOF_RX.match(l.strip()) for l in lines):
         fault(len(lines), "eof_marker", "no '# @@EOF' marker")
@@ -239,8 +254,7 @@ def audit_source(path):
     for lineno in non_ascii_offenders(src):
         fault(lineno, "non_ascii", "non-ASCII character outside a string or comment")
 
-    rep["faults"] = len(rep["details"])
-    return rep
+    return _finalise(rep)
 
 
 audit_file = audit_source
@@ -251,7 +265,7 @@ def block_ids(path):
         return []
     ids = []
     for raw in _scan(path).splitlines():
-        m = BLOCK_RX.match(raw.strip())
+        m = BLOCK_RX.match(raw.rstrip())
         if m:
             ids.append(int(m.group(1)))
     return ids
@@ -267,8 +281,8 @@ def totals(reports=None):
     if isinstance(reps, dict):
         reps = list(reps.values())
     files = len(reps)
-    blocks = sum(r.get("blocks", 0) for r in reps)
-    faults = sum(r.get("faults", 0) for r in reps)
+    blocks = sum(len(r.get("blocks") or []) for r in reps)
+    faults = sum(len(r.get("fails") or []) for r in reps)
     return files, blocks, faults
 
 
@@ -296,7 +310,7 @@ def main(argv=None):
                 status = "MISSING"
             else:
                 status = "OK"
-            print("%-34s blocks=%-4d %s" % (path, rep.get("blocks", 0), status))
+            print("%-34s blocks=%-4d %s" % (path, len(rep.get("blocks") or []), status))
             if not args.quiet:
                 for d in rep.get("details", []):
                     print("    L%-5d %-20s %s" % (d["line"], d["kind"], d["text"]))
