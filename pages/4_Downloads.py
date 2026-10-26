@@ -148,8 +148,8 @@ def _sources():
             if b in IGNORE or any(t in b.lower() for t in IGNORE_TOKENS):
                 continue
             try:
-                n = sum(1 for l in open(p, encoding="utf-8", errors="ignore")
-                        if l.strip() and not l.startswith("#"))
+                with open(p, encoding="utf-8", errors="ignore") as _fh:
+                    n = sum(1 for l in _fh if l.strip() and not l.startswith("#"))
             except Exception:
                 n = 0
             if n:
@@ -308,7 +308,7 @@ def _fmt(rows, template, delim, crlf, header, prefix, suffix,
         except KeyError as ke:
             line = r["line"]
             st.session_state["_fmt_bad"] = str(ke)
-        if delim != " ":
+        if delim != " " and " " not in template:
             line = line.replace(" ", delim)
         out.append(line)
 
