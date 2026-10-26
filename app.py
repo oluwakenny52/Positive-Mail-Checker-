@@ -1,4 +1,5 @@
 # @@FILE app.py blocks=111 version=v13.40
+# @@FILE app.py blocks=111 version=v13.40
 # @@BLOCK 000 FILE_HEADER deps=-
 """
 Mega Ultimate Mail Checker - v13.40  (BLOCK EDITION)
@@ -33,7 +34,7 @@ P0-2  allow_direct was latched BEFORE the proxy phase, so in Proxy Mode =
       fall through to DIRECT.                              [103]
 P0-3  status.py tested the greedy _APP_PASSWORD tokens (oauth / tenant /
       consent / mfa / 2fa) BEFORE _WRONG_STRONG, and _RETRY owned
-      backend / upstream / downstream / unavailable.       [status.py 003, 008]
+      backend / upstream / downstream / unavailable.       [status.py 006, 007]
 P0-4  the duplicate WRONG block after the first return in
       _handle_app_or_wrong was unreachable dead code and broke
       verify_v1337.py.                                     [101]
@@ -6852,7 +6853,8 @@ def _check_account_core(email, password, conf, domain, proxy_pool, thread_state,
                 trace_logs.append(
                     f"{px_tag(px_used)} APP on {server} -> PROVISIONAL "
                     f"({len(app_hosts)} host(s) agreed, {len(_conf_pool)} candidate(s) "
-                    f"still untried, {len(app_rungs)} rung(s) dialled) -> continuing")
+                    f"still untried, {len(_untried_local)} local, "
+                    f"{len(app_rungs)} rung(s) dialled) -> continuing")
                 return None, had_net, saw_retry, True
 
             # ---- WRONG (single copy - the duplicate after the first return is gone) ----
@@ -6885,7 +6887,8 @@ def _check_account_core(email, password, conf, domain, proxy_pool, thread_state,
             trace_logs.append(
                 f"{px_tag(px_used)} WRONG on {server} -> PROVISIONAL "
                 f"({len(wrong_hosts)} host(s) agreed, {len(_conf_pool)} candidate(s) "
-                f"still untried, {len(wrong_rungs)} rung(s) dialled) -> continuing the ladder")
+                f"still untried, {len(_untried_local)} local, "
+                f"{len(wrong_rungs)} rung(s) dialled) -> continuing the ladder")
             return None, had_net, saw_retry, True
 # @@END 101 CORE_VERDICT_HELPERS
 
