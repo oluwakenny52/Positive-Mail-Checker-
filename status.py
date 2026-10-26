@@ -564,6 +564,12 @@ def alias_selftest(verbose=False):
     checks.append(("classify:wrong_user", classify_error("550 5.1.1 User unknown") == STATUS_WRONG))
     checks.append(("classify:ratelimit", classify_error("* BYE Too many simultaneous connections") == STATUS_RETRY_LATER))
     checks.append(("classify:transient", classify_error("upstream temporarily unavailable") == STATUS_RETRY_LATER))
+    checks.append(("classify:backend", classify_error("backend error") == STATUS_RETRY_LATER))
+    checks.append(("classify:upstream", classify_error("upstream error") == STATUS_RETRY_LATER))
+    checks.append(("classify:proxy_blocked",
+                   classify_error("Connection blocked by proxy") == STATUS_CONNECTION_FAILED))
+    checks.append(("classify:spamhaus_still_rbl",
+                   classify_error("blocked by Spamhaus") == STATUS_RBL))
     checks.append(("classify:conn", classify_error("Connection refused") == STATUS_CONNECTION_FAILED))
     checks.append(("classify:dns", classify_error("Name or service not known") == STATUS_DNS_FAILED))
     checks.append(("classify:drop", classify_error("* BYE server dropping connection") == STATUS_LOGIN_DROPPED))
@@ -574,12 +580,6 @@ def alias_selftest(verbose=False):
     checks.append(("classify:domain_bind", classify_error("needs app password", "gmail.com") == STATUS_NEED_APP_PASSWORD))
     checks.append(("proxy_level", is_proxy_level_error(STATUS_DNS_FAILED) is True))
     checks.append(("priority_order", PRIORITY[STATUS_WRONG] > PRIORITY[STATUS_VALID] > PRIORITY[STATUS_RETRY_LATER]))
-    checks.append(("classify:backend", classify_error("backend error") == STATUS_RETRY_LATER))
-    checks.append(("classify:upstream", classify_error("upstream error") == STATUS_RETRY_LATER))
-    checks.append(("classify:proxy_blocked",
-                   classify_error("Connection blocked by proxy") == STATUS_CONNECTION_FAILED))
-    checks.append(("classify:spamhaus_still_rbl",
-                   classify_error("blocked by Spamhaus") == STATUS_RBL))
     checks.append(("worse_of:skip", worse_of(STATUS_SKIP) == STATUS_SKIP))
     checks.append(("worse_of", worse_of(STATUS_VALID, STATUS_WRONG) == STATUS_WRONG))
     checks.append(("tally", tally([STATUS_VALID, STATUS_WRONG])["total"] == 2))
