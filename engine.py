@@ -440,6 +440,8 @@ def run_engine(targets, probe, *, workers=DEFAULT_WORKERS, limit=DEFAULT_RUNG_LI
                                     attempts=attempts, sleep=sleep))
             if results[-1].status == VALID:
                 break
+            if results[-1].status in RETRY_SET:
+                state.cooldown_host(rung.host, 30.0)
         return target, results
 
     with ThreadPoolExecutor(max_workers=workers) as pool:
