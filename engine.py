@@ -250,6 +250,12 @@ def _prio(code):
     return 10
 
 
+def _local_to(domain, host):
+    d = (domain or "").lower().strip()
+    h = (host or "").lower().strip()
+    return bool(d) and bool(h) and (h == d or h.endswith("." + d))
+
+
 def pick_verdict(results):
     """Aggregate rung results into one verdict + forensic detail.
 
@@ -280,7 +286,10 @@ def pick_verdict(results):
         if host:
             domain_local_hosts.add(host)
 
-    if wrong_rungs:
+    wrong_local = [r for r in wrong_rungs if _local_to(r.target.domain, r.host)]
+    if wrong_local:
+        verdict = WRONG if any(r.status == WRONG for r in wrong_local) else WRONG_PASSWORD
+    elif wrong_rungs:
         verdict = WRONG if any(r.status == WRONG for r in wrong_rungs) else WRONG_PASSWORD
     elif valid_rungs:
         verdict = VALID
