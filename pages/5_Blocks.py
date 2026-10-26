@@ -1,7 +1,7 @@
-# @@FILE pages/5_Blocks.py blocks=10 version=v13.41
+# @@FILE pages/5_Blocks.py blocks=11 version=v13.42
 # @@BLOCK 000 FILE_HEADER deps=-
 """
-pages/5_Blocks.py - Block Inspector  (v13.41)
+pages/5_Blocks.py - Block Inspector  (v13.42)
 =============================================
 Validates the @@BLOCK frame of every big file IN THE BROWSER, so you never
 need a terminal, and lets you VALIDATE A PASTE before you commit it.
@@ -289,4 +289,74 @@ with st.expander("🛠 Canonicalise @@END names (no terminal needed)", expanded=
                                mime="text/plain")
             st.code(st.session_state["cn_out"], language="python")
 # @@END 009 CANON_END
+
+
+# @@BLOCK 010 FIX_CHECK deps=002
+# Behavioural companion to the frame scan. verify_blocks proves the @@BLOCK
+# frame; it cannot see whether a FIX is still in the code. These are the exact
+# strings the fix plan introduced, with the count each must appear at.
+_FIX_CHECKS = (
+    ("status.py", "_PROXY_BLOCKED", 2, "proxy-blocked classifies as CONNECTION_FAILED"),
+    ("status.py", "best = None", 1, "worse_of no longer seeds with UNKNOWN"),
+    ("status.py", "backend|upstream|downstream", 1, "_RETRY owns the transient words"),
+    ("app.py", "{len(_untried_local)} local", 2, "_untried_local is reported"),
+    ("app.py", "# A 407 is a proxy answer", 1, "a 407 breaks the username loop"),
+    ("app.py", "[status.py 006, 007]", 1, "P0-3 ledger pointer"),
+    ("pages/3_Mailbox_Reader.py", "login_drop_count += 1", 1, "drop not double counted"),
+    ("pages/4_Downloads.py", "_frag.format(**d)", 1, "delimiter honours spaced templates"),
+    ("pages/4_Downloads.py", '_cut = raw.find("|", _colon + 1)', 1, "no pipe truncation"),
+    ("pages/5_Blocks.py", "out.insert(len(out) - 1, _end)", 1, "@@EOF stays last"),
+    ("engine.py", '_conf = getattr(_hosts, "conf", None)', 1, "engine reads hosts.conf"),
+    ("engine.py", "state.cooldown_host(rung.host, 30.0)", 1, "cooldown table is armed"),
+    ("engine.py", "def _local_to(domain, host):", 1, "pick_verdict checks locality"),
+    ("fix_end_names.py", "(\\d{3})", 2, "marker id width matches verify_blocks (RE_BLOCK & RE_END)"),
+    ("fix_end_names.py", "gate_faults", 3, "re-gate drives the exit code"),
+    ("audit_frame.py", "EXPECT_BLOCKS drift trap", 1, "drift trap documented"),
+)
+
+# order matters in the verdict tail: a server answer must outrank retryable
+_ORDER_CHECKS = (
+    ("app.py", 'if flags.get("saw_login_drop"):',
+     '    if retryable:\n        return None, RETRY', "LOGIN_DROPPED before retryable"),
+)
+
+st.divider()
+with st.expander("🧪 Fix self-check (are the behavioural fixes still in?)", expanded=False):
+    st.caption("Textual, like the gates: it proves the fix is still THERE, not that it "
+               "behaves. A FAIL means the fix was lost in an edit or a repair.")
+    if st.button("🧪 Run fix self-check", type="primary", key="fx_go"):
+        _rows, _bad = [], 0
+        for _f, _needle, _want, _why in _FIX_CHECKS:
+            try:
+                with open(os.path.join(ROOT, _f), encoding="utf-8") as _fh:
+                    _n = _fh.read().count(_needle)
+            except Exception as _e:
+                _rows.append("ERROR %-26s %r  (%s)" % (_f, _needle, _e))
+                _bad += 1
+                continue
+            _ok = (_n == _want)
+            _bad += 0 if _ok else 1
+            _rows.append("%s %-26s got %d want %d  %s  [%s]"
+                         % ("OK  " if _ok else "FAIL", _f, _n, _want, _needle, _why))
+        for _f, _a, _b, _why in _ORDER_CHECKS:
+            try:
+                with open(os.path.join(ROOT, _f), encoding="utf-8") as _fh:
+                    _s = _fh.read()
+                _ok = (_a in _s) and (_b in _s) and (_s.rindex(_a) < _s.index(_b))
+            except Exception as _e:
+                _rows.append("ERROR %-26s order check (%s)" % (_f, _e))
+                _bad += 1
+                continue
+            _bad += 0 if _ok else 1
+            _rows.append("%s %-26s order  [%s]"
+                         % ("OK  " if _ok else "FAIL", _f, _why))
+        st.session_state["fx_out"] = "\n".join(_rows)
+        st.session_state["fx_bad"] = _bad
+    if st.session_state.get("fx_out"):
+        if st.session_state.get("fx_bad"):
+            st.error("%d check(s) FAILED - a fix is missing." % st.session_state["fx_bad"])
+        else:
+            st.success("All checks OK.")
+        st.code(st.session_state["fx_out"], language="text")
+# @@END 010 FIX_CHECK
 # @@EOF
