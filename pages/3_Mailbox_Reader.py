@@ -2756,7 +2756,6 @@ if st.sidebar.button("🚀 Validate & Import Batch Accounts", type="primary", us
                     batch_logs.append(f"❌ [{row_time}] [WRONG] {email_val} — {classify_src}")
                 elif _looks_like_login_drop(classify_src):
                     login_drop_count += 1
-                    failed_count += 1
                     status_type = "LOGIN_DROPPED"
                     append_result("login_dropped_retry", f"{email_val}:{pass_val} | {classify_src}")
                     batch_logs.append(
