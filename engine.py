@@ -155,6 +155,15 @@ class RungResult:
 def _hosts_of(domain):
     if _hosts is None:
         return []
+    _conf = getattr(_hosts, "conf", None)
+    if callable(_conf):
+        try:
+            _got = _conf(domain) or {}
+            _out = [str(h) for h in (_got.get("imap") or []) if h]
+            if _out:
+                return _out
+        except Exception:
+            pass
     for fname in ("host_list", "discover_hosts", "smtp_candidates"):
         fn = getattr(_hosts, fname, None)
         if not callable(fn):
