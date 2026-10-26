@@ -247,6 +247,12 @@ def _detect_format(line):
 #         through to the IMAP+POP default, defeating this whole block.
 #         Also split string values: iterating "IMAP,POP" yields characters.
 # --------------------------------------------------------------------------
+_WEB_ONLY = {
+    "secure.windstream.net", "webmail.windstream.net",
+    "secure.suddenlink.net", "webmail.suddenlink.net", "secure.optimum.net",
+}
+
+
 def _protocols_from_app():
     """app.py publishes its applied config into st.session_state["applied_cfg"].
     Reading that same key is what makes this page honest instead of decorative.
@@ -324,6 +330,16 @@ def _build_plan(domain, max_hosts, flags=None):
     if domain in imap_hosts:
         imap_hosts = [h for h in imap_hosts if h != domain] + [domain]
 
+    _drop = {domain}
+    if domain.endswith("windstream.net") or domain.endswith("kinetic.net"):
+        _drop |= {"secure.windstream.net", "webmail.windstream.net"}
+    _kept = [h for h in imap_hosts if h.lower() not in _drop]
+    if _kept:
+        imap_hosts = _kept
+    _web = [h for h in imap_hosts if h.lower() in _WEB_ONLY]
+    if _web and len(_web) < len(imap_hosts):
+        imap_hosts = [h for h in imap_hosts if h.lower() not in _WEB_ONLY] + _web
+
     pop_only_pref = [h for h in all_pop if h not in imap_hosts]
     pop_hosts = (pop_only_pref or all_pop)[:1]
 
@@ -331,8 +347,11 @@ def _build_plan(domain, max_hosts, flags=None):
     pop_only = [h for h in pop_hosts if h not in imap_set]
     pop_dup = [h for h in pop_hosts if h in imap_set]
 
-    primary = [("IMAP", h, 993, "ssl") for h in imap_hosts]
+    primary = []
+    if imap_hosts:
+        primary.append(("IMAP", imap_hosts[0], 993, "ssl"))
     primary += [("POP", h, 995, "ssl") for h in pop_only]
+    primary += [("IMAP", h, 993, "ssl") for h in imap_hosts[1:]]
     # v13.40a: app.py also dials SMTP submission and ManageSieve when those
     # protocols are selected, so the page was missing up to 4 rungs.
     if flags.get("smtp"):
