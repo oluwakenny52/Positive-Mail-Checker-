@@ -1,4 +1,3 @@
-@@ -1,414 +0,0 @@
 #!/usr/bin/env python3
 """verify_v1337.py — regression harness for the v13.37 patch set (v13.40 revision).
 
