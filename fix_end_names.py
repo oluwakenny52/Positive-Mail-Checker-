@@ -53,7 +53,7 @@ FILES = (
 )
 
 RE_ANY_MARKER = re.compile(r"@@(?:BLOCK|END)\b")
-RE_BLOCK = re.compile(r"^#\s*@@BLOCK\s+(\d{1,3})\s+([A-Za-z0-9_]+)"
+RE_BLOCK = re.compile(r"^#\s*@@BLOCK\s+(\d{3})\s+([A-Za-z0-9_]+)"
                       r"\s*(?:deps\s*=\s*([0-9,\-\s]*))?\s*$")
 RE_END = re.compile(r"^#\s*@@END\s+(\d{1,3})(?:\s+([A-Za-z0-9_]+))?\s*$")
 
@@ -294,9 +294,10 @@ def main(argv=None):
         print("Already canonical - nothing to write.")
     print("")
 
+    gate_faults = 0
     if not args.no_gate:
-        _regate()
-    return 1 if hard else 0
+        gate_faults = _regate()
+    return 1 if (hard or gate_faults) else 0
 
 
 if __name__ == "__main__":
