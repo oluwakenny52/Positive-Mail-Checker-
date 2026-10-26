@@ -6976,6 +6976,10 @@ def _check_account_core(email, password, conf, domain, proxy_pool, thread_state,
                                 f"{err_text[:200]} [Classified: proxy_unhealthy]")
                             proxy_dead = True
                             rotate_now = True
+                            # A 407 is a proxy answer, not a username answer: break
+                            # the username loop so the retry below is not preceded
+                            # by a second dial through the same dead node.
+                            server_level_fail = True
                             _su = _subuser_of(px_used)
                             if px_used and _su and _su not in retried_407_subusers:
                                 retried_407_subusers.add(_su)
