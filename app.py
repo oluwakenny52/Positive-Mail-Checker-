@@ -7424,8 +7424,6 @@ def _check_account_core(email, password, conf, domain, proxy_pool, thread_state,
             f"host was never reached; the pool passes the web probe but cannot pass "
             f"email-server destinations (provider 'email servers' cap)"
         ), None, trace_logs
-    if retryable:
-        return None, RETRY, "retryable (proxy / IP-block / rate-limit)", None, trace_logs
     if not dns_ok:
         return None, DNS_FAILED, "Fast-fail DNS check failed: no host resolves locally", None, trace_logs
     if flags.get("saw_login_drop"):
@@ -7433,6 +7431,8 @@ def _check_account_core(email, password, conf, domain, proxy_pool, thread_state,
             "Mail host answered, accepted the LOGIN command, then closed the socket "
             "(* BYE) before returning a verdict - server-side drop, not a network fault.")
         return None, LOGIN_DROPPED, _login_dropped_detail(), None, trace_logs
+    if retryable:
+        return None, RETRY, "retryable (proxy / IP-block / rate-limit)", None, trace_logs
     if flags.get("saw_server"):
         trace_logs.append(
             "Hosts answered and LOGIN was issued, but every server dropped the "
