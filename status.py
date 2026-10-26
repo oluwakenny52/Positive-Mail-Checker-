@@ -302,16 +302,23 @@ _CONN_STRONG = re.compile(
     r"wrong version number|hostname mismatch",
     re.I,
 )
-# Transient-server words only. backend/upstream/downstream are excluded here
-# on purpose so they land on RETRY_LATER.
+# Transient-server words. backend/upstream/downstream are INCLUDED: with them
+# excluded, a bare "backend error" matched nothing and fell through to UNKNOWN.
 _RETRY = re.compile(
     r"unavailable|server error|internal error|greeting|busy|try again|"
-    r"not ready|come back later",
+    r"not ready|come back later|backend|upstream|downstream",
     re.I,
 )
 _CONN = re.compile(
     r"connect|socket|network|reset|eof|pipe|timeout|refused|unreachable|"
     r"proxy",
+    re.I,
+)
+
+# "blocked by" is claimed by _RBL, so a proxy refusal was filed as RBL. This
+# runs before _RBL and owns only the proxy spelling.
+_PROXY_BLOCKED = re.compile(
+    r"blocked by (?:the )?proxy|proxy (?:is )?blocked|proxy denied",
     re.I,
 )
 
@@ -361,6 +368,8 @@ def classify_error(text, domain="", default=STATUS_UNKNOWN):
         if d in _APP_HINT_DOMAINS or "app" in low:
             return STATUS_NEED_APP_PASSWORD
         return STATUS_APP
+    if _PROXY_BLOCKED.search(low):
+        return STATUS_CONNECTION_FAILED
     if _RBL.search(low):
         if "blocked" in low:
             return STATUS_RBL_BLOCKED
@@ -455,15 +464,19 @@ def priority_of(code):
 
 
 def worse_of(*codes):
-    """Return the most decisive status among `codes`."""
-    best = STATUS_UNKNOWN
+    """Return the most decisive status among `codes`.
+
+    Starts from None, not UNKNOWN: SKIP ranks 5 and UNKNOWN 10, so seeding with
+    UNKNOWN made worse_of([SKIP]) answer UNKNOWN.
+    """
+    best = None
     for c in codes:
         if c is None:
             continue
         n = normalise(c)
-        if PRIORITY.get(n, 0) > PRIORITY.get(best, 0):
+        if best is None or PRIORITY.get(n, 0) > PRIORITY.get(best, 0):
             best = n
-    return best
+    return best if best is not None else STATUS_UNKNOWN
 
 
 def better_of(*codes):
@@ -561,6 +574,13 @@ def alias_selftest(verbose=False):
     checks.append(("classify:domain_bind", classify_error("needs app password", "gmail.com") == STATUS_NEED_APP_PASSWORD))
     checks.append(("proxy_level", is_proxy_level_error(STATUS_DNS_FAILED) is True))
     checks.append(("priority_order", PRIORITY[STATUS_WRONG] > PRIORITY[STATUS_VALID] > PRIORITY[STATUS_RETRY_LATER]))
+    checks.append(("classify:backend", classify_error("backend error") == STATUS_RETRY_LATER))
+    checks.append(("classify:upstream", classify_error("upstream error") == STATUS_RETRY_LATER))
+    checks.append(("classify:proxy_blocked",
+                   classify_error("Connection blocked by proxy") == STATUS_CONNECTION_FAILED))
+    checks.append(("classify:spamhaus_still_rbl",
+                   classify_error("blocked by Spamhaus") == STATUS_RBL))
+    checks.append(("worse_of:skip", worse_of(STATUS_SKIP) == STATUS_SKIP))
     checks.append(("worse_of", worse_of(STATUS_VALID, STATUS_WRONG) == STATUS_WRONG))
     checks.append(("tally", tally([STATUS_VALID, STATUS_WRONG])["total"] == 2))
 
