@@ -1,7 +1,7 @@
-# @@FILE pages/5_Blocks.py blocks=10 version=v13.40
+# @@FILE pages/5_Blocks.py blocks=10 version=v13.41
 # @@BLOCK 000 FILE_HEADER deps=-
 """
-pages/5_Blocks.py - Block Inspector  (v13.40)
+pages/5_Blocks.py - Block Inspector  (v13.41)
 =============================================
 Validates the @@BLOCK frame of every big file IN THE BROWSER, so you never
 need a terminal, and lets you VALIDATE A PASTE before you commit it.
@@ -96,18 +96,42 @@ with tab_scan:
 
     st.caption(f"Scanned at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
 
+    # v13.41: a phone cannot multi-select inside st.code(), so the fault list is
+    # JOINED into one box per file (one copy icon) instead of one box per fault.
+    # Nothing is truncated now - the old [:40] slice also hid the tail.
+    def _file_report(path, res):
+        L = [f"FILE: {path}",
+             f"exists={res.get('exists')} blocks={len(res['blocks'])} "
+             f"faults={len(res['fails'])}"]
+        if res["fails"]:
+            L.append("-- faults --")
+            L.extend(res["fails"])
+        if res["table"]:
+            L.append("-- blocks --")
+            L.extend("%03d %s (line %d)" % (b["id"], b["name"], b["line"])
+                     for b in res["table"])
+        return "\n".join(L)
+
+    _everything = "\n\n".join(_file_report(p, r) for p, r in results.items())
+
+    with st.expander(f"📋 Copy the WHOLE scan ({total_fails} fault(s))",
+                     expanded=bool(total_fails)):
+        st.caption("Tap the copy icon at the top-right of the box, then paste it back.")
+        st.code(_everything, language="text")
+        st.download_button("⬇️ Download the scan as .txt",
+                           data=_everything.encode("utf-8"),
+                           file_name="blocks_scan_%s.txt"
+                                     % datetime.now().strftime("%Y%m%d_%H%M%S"),
+                           mime="text/plain",
+                           use_container_width=True)
+
     for path, res in results.items():
         label = f"{path}  -  {len(res['blocks'])} block(s), {len(res['fails'])} fault(s)"
         with st.expander(label, expanded=bool(res["fails"])):
-            if not res["blocks"] and not res["fails"]:
+            if not res.get("exists"):
                 st.caption("File absent - skipped.")
                 continue
-            if res["fails"]:
-                st.markdown("**Faults**")
-                for f in res["fails"][:40]:
-                    st.code(f, language="text")
-                if len(res["fails"]) > 40:
-                    st.caption(f"... and {len(res['fails']) - 40} more")
+            st.code(_file_report(path, res), language="text")
             if res["table"]:
                 st.markdown("**Manifest**")
                 st.dataframe(res["table"], use_container_width=True, hide_index=True)
@@ -197,7 +221,11 @@ def canon_end_names(src):
         mb = VB.BLOCK_RX.match(ln)
         if mb:
             if open_id is not None and names.get(open_id):
-                out.append("# @@END %03d %s" % (open_id, names[open_id]))
+                _end = "# @@END %03d %s" % (open_id, names[open_id])
+                if out and out[-1].strip().startswith("# @@EOF"):
+                    out.insert(len(out) - 1, _end)
+                else:
+                    out.append(_end)
                 changed += 1
             out.append(ln)
             open_id = int(mb.group(1))
@@ -218,7 +246,11 @@ def canon_end_names(src):
             continue
         out.append(ln)
     if open_id is not None and names.get(open_id):
-        out.append("# @@END %03d %s" % (open_id, names[open_id]))
+        _end = "# @@END %03d %s" % (open_id, names[open_id])
+        if out and out[-1].strip().startswith("# @@EOF"):
+            out.insert(len(out) - 1, _end)
+        else:
+            out.append(_end)
         changed += 1
     return "\n".join(out) + "\n", changed
 
@@ -230,7 +262,8 @@ with st.expander("🛠 Canonicalise @@END names (no terminal needed)", expanded=
     _cn_file = st.selectbox("File to canonicalise", list(VB.BLOCKED_FILES), key="cn_file")
     if st.button("🛠 Canonicalise", type="primary", key="cn_go"):
         try:
-            _cn_src = open(os.path.join(ROOT, _cn_file), encoding="utf-8").read()
+            with open(os.path.join(ROOT, _cn_file), encoding="utf-8") as _cn_fh:
+                _cn_src = _cn_fh.read()
             _cn_out, _cn_n = canon_end_names(_cn_src)
             _cn_res = VB.audit_source(_cn_out, _cn_file)
             if _cn_res["faults"]:
