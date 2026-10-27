@@ -470,7 +470,7 @@ line; providers meter per sub-user, which is what produces most 407s.
 direct. **Quarantine** - a node pulled out for the run after three 407s.
 **Spot check** - three nodes CONNECTed to a real mail host, so a web-only-healthy
 pool is caught. **Provisional** - a verdict held until a second host or rung
-agrees. **Confirm-only** rungs are never allowed to create a `WRONG` on their own.
+agrees. Confirm-only rungs never create a WRONG from a single host on their own, but a definitive SMTP/Sieve auth error does raise WRONG directly.
 
 Build **{BUILD_TAG}** - a frame-audited block edition. Every section is a named,
 numbered, replaceable `@@BLOCK`.
