@@ -53,6 +53,7 @@ validates a paste before you commit.
 | `pages/3_Mailbox_Reader.py` | inbox reader, OTP/card scanner |
 | `pages/4_Downloads.py` | export studio |
 | `pages/5_Blocks.py` | frame inspector |
+| `pages/6_User_Guide.py` | end-user manual: every control, button, verdict and page |
 
 tier2_split.py is staged but NOT applied — engine.py is currently a separate hand-written engine that app.py does not import.
 
