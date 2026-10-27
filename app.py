@@ -8282,7 +8282,7 @@ else:
 # @@BLOCK 110 FOOTER deps=008,034
 section_title("🧭", "Navigation", f"{BUILD_TAG} - block edition")
 
-_n1, _n2, _n3 = str_lit.columns(3)
+_n1, _n2, _n3, _n4 = str_lit.columns(4)
 with _n1:
     try:
         str_lit.page_link("pages/3_Mailbox_Reader.py", label="📥 Mailbox Reader",
@@ -8301,6 +8301,12 @@ with _n3:
                           use_container_width=True)
     except Exception:
         str_lit.caption("Export Studio lives at pages/4_Downloads.py")
+with _n4:
+    try:
+        str_lit.page_link("pages/6_User_Guide.py", label="📖 User Guide",
+                          use_container_width=True)
+    except Exception:
+        str_lit.caption("User Guide lives at pages/6_User_Guide.py")
 
 str_lit.caption(
     f"Build {BUILD_TAG} · CFG {CFG_VERSION} · block edition. "
