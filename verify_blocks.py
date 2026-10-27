@@ -44,6 +44,7 @@ BLOCKED_FILES = [
     "pages/3_Mailbox_Reader.py",
     "pages/4_Downloads.py",
     "pages/5_Blocks.py",
+    "pages/6_User_Guide.py",
 ]
 
 FILE_RX = re.compile(r"^#\s*@@FILE\s+(\S+)\s+blocks=(\d+)\s+version=(\S+)\s*$")
