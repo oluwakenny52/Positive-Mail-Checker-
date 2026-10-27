@@ -3306,6 +3306,14 @@ debug_mode = instant_help(
 # True - which silently flips ALLOW_SELF_SIGNED to False and turns verification ON
 # behind your back, in build_cfg()'s "TLS_STRICT": not self_signed.
 self_signed = True if self_signed is None else self_signed
+# v13.42: the same hazard applies to every other instant_help() widget and they
+# were left unguarded.  A None here silently turns the proxy OFF, the direct
+# retry OFF, the test flight OFF, the app-skip OFF and debug OFF in build_cfg().
+use_proxy = True if use_proxy is None else use_proxy
+retry_cf = True if retry_cf is None else retry_cf
+proxy_test_flight = True if proxy_test_flight is None else proxy_test_flight
+skip_app = False if skip_app is None else skip_app
+debug_mode = True if debug_mode is None else debug_mode
 
 try_starttls_ui = str_lit.sidebar.toggle(
     "Enable STARTTLS + plaintext fallback (143 / 110)", value=True, key="ui_starttls",
