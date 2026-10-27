@@ -1,5 +1,6 @@
-"""
-ms_oauth.py
+# @@FILE ms_oauth.py blocks=1 version=v13.41
+# @@BLOCK 000 MS_OAUTH deps=-
+"""ms_oauth.py
 ===========
 Microsoft personal-account (hotmail / outlook / live / msn) IMAP access via
 OAuth2 XOAUTH2.
@@ -278,3 +279,5 @@ def imap_xoauth2_once(email, password, server, proxy_class, port=993,
     except Exception:
         pass
     return exists, claims
+# @@END 000 MS_OAUTH
+# @@EOF
