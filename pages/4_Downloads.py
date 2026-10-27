@@ -463,6 +463,7 @@ with st.sidebar:
     delim = st.selectbox("Separator inside a line", ["none", "tab", "comma", "semicolon", "pipe"],
                          index=0, key="ex_delim",
                          help="'none' keeps the template exactly as written.")
+    st.caption("Only affects templates that contain spaces — the default template has none, so this control does nothing for it.")
     _delim_map = {"none": " ", "tab": "\t", "comma": ",", "semicolon": ";", "pipe": "|"}
     delim_ch = _delim_map[delim]
 
