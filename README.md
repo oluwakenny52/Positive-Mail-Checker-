@@ -15,17 +15,21 @@ NAMED, NUMBERED, REPLACEABLE block.
 * Every `@@END` MUST carry its block name. A bare `# @@END 016` is a fault.
 * The last line of every block file is `# @@EOF`.
 
-## Gates - all five must be green before every commit
+## Gates - all seven must be green before every commit
 
     python fix_end_names.py --check      # exit 0 = no bare @@END pending
     python verify_blocks.py              # exit 0 = frame intact
     python audit_frame.py                # must print RESULT: GREEN
     python verify_v1337.py               # must print FAILED 0
     python test_verdicts.py              # must print FAILED 0
+    python engine.py --selftest          # exit 0 = headless engine sanity
+    python status.py --selftest          # exit 0 = status classifier sanity
 
-`.github/workflows/gates.yml` runs all five on every push and writes a PASS/FAIL
+`.github/workflows/gates.yml` runs all seven on every push and writes a PASS/FAIL
 table to the run summary, so the gates are checkable from a phone with no
-terminal. The Summary step exits non-zero when a gate fails, so the run itself goes red. `pages/5_Blocks.py` runs the same verifier in the browser and can
+terminal. The Summary step exits non-zero when a gate fails, so the run itself goes red. 
+
+`pages/5_Blocks.py` runs the same verifier in the browser and can
 canonicalise a bare `@@END` for you (download the fixed file, upload it back).
 
 Always invoke `verify_blocks.py` as `python verify_blocks.py` - its `# @@FILE`
