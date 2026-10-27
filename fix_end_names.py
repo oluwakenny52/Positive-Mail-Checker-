@@ -55,7 +55,7 @@ FILES = (
 RE_ANY_MARKER = re.compile(r"@@(?:BLOCK|END)\b")
 RE_BLOCK = re.compile(r"^#\s*@@BLOCK\s+(\d{3})\s+([A-Za-z0-9_]+)"
                       r"\s*(?:deps\s*=\s*([0-9,\-\s]*))?\s*$")
-RE_END = re.compile(r"^#\s*@@END\s+(\d{1,3})(?:\s+([A-Za-z0-9_]+))?\s*$")
+RE_END = re.compile(r"^#\s*@@END\s+(\d{3})(?:\s+([A-Za-z0-9_]+))?\s*$")
 
 
 def read(path):
