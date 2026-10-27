@@ -42,16 +42,14 @@ import os
 import re
 import sys
 
-FILES = (
-    "app.py",
-    "engine.py",
-    "status.py",
-    "pages/2_Diagnostics.py",
-    "pages/3_Mailbox_Reader.py",
-    "pages/4_Downloads.py",
-    "pages/5_Blocks.py",
-    "pages/6_User_Guide.py",
-)
+# One source of truth: verify_blocks owns the gated file list.  Local copy only
+# if the import fails (e.g. run from a directory without verify_blocks.py).
+try:
+    from verify_blocks import BLOCKED_FILES as FILES
+except Exception:
+    FILES = ("app.py", "engine.py", "status.py", "pages/2_Diagnostics.py",
+             "pages/3_Mailbox_Reader.py", "pages/4_Downloads.py",
+             "pages/5_Blocks.py", "pages/6_User_Guide.py")
 
 RE_ANY_MARKER = re.compile(r"@@(?:BLOCK|END)\b")
 RE_BLOCK = re.compile(r"^#\s*@@BLOCK\s+(\d{3})\s+([A-Za-z0-9_]+)"
