@@ -10,9 +10,15 @@ Exit 0 = frame clean AND verifier contract satisfied.
 from __future__ import annotations
 import io, os, re, sys, tokenize
 
-GATED = ["app.py", "engine.py", "status.py", "pages/2_Diagnostics.py",
-         "pages/3_Mailbox_Reader.py", "pages/4_Downloads.py", "pages/5_Blocks.py",
-         "pages/6_User_Guide.py"]
+# One source of truth: verify_blocks owns the gated file list, so adding a file
+# there propagates to every gate.  Local copy only if the import fails (e.g. the
+# script is run from a directory where verify_blocks.py is not importable).
+try:
+    from verify_blocks import BLOCKED_FILES as GATED
+except Exception:
+    GATED = ["app.py", "engine.py", "status.py", "pages/2_Diagnostics.py",
+             "pages/3_Mailbox_Reader.py", "pages/4_Downloads.py",
+             "pages/5_Blocks.py", "pages/6_User_Guide.py"]
 # NOTE: these are the CURRENT counts. tier2_split.py rewrites app.py+engine.py
 # into a different shape, so re-derive both numbers after running it or this
 # gate goes red on drift and looks like a regression.  EXPECT_BLOCKS drift trap.
