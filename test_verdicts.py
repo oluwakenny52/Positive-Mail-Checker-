@@ -113,7 +113,7 @@ for v in (S.STATUS_WRONG_PASSWORD, S.STATUS_NEED_APP_PASSWORD,
     if v in (S.VALID, S.WRONG, S.APP, S.RBL, S.LOGIN_DROPPED, S.UNKNOWN):
         ok("%s already survives note_verdict" % v)
     else:
-        ok("%s would be dropped by note_verdict without the fold" % v)
+        FAILS.append("expected status whitelisted: " + repr(v))
 
 # ----------------------------------------------------------------- hosts.py
 try:
