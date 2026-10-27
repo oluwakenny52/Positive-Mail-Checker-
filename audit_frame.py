@@ -15,7 +15,7 @@ GATED = ["app.py", "engine.py", "status.py", "pages/2_Diagnostics.py",
 # NOTE: these are the CURRENT counts. tier2_split.py rewrites app.py+engine.py
 # into a different shape, so re-derive both numbers after running it or this
 # gate goes red on drift and looks like a regression.
-EXPECT_FILES, EXPECT_BLOCKS = 7, 226
+EXPECT_FILES, EXPECT_BLOCKS = 7, 227
 
 FILE_RX  = re.compile(r"^#\s*@@FILE\s+(\S+)\s+blocks=(\d+)\s+version=(\S+)\s*$")
 BLOCK_RX = re.compile(r"^#\s*@@BLOCK\s+(\d{3})\s+([A-Za-z0-9_]+)(?:\s+deps=(\S+))?\s*$")
