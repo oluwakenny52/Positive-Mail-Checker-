@@ -301,8 +301,6 @@ try:
         SKIP, SKIPPED_COOLDOWN, UNKNOWN,
         RETRY, RETRY_LATER, RBL, RBL_BLOCKED, SMTP_FAILED, DNS_FAILED,
         LOGIN_DROPPED,
-        ALL_STATUSES as ST_ALL, LABELS as ST_LABELS, COLORS as ST_COLORS,
-        PRIORITY as ST_PRIORITY,
         classify_error as st_classify, is_proxy_level_error as st_proxy_level,
         display as st_display, color as st_color,
     )
