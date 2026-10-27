@@ -64,7 +64,15 @@ def read(path):
 
 
 def _is_marker_line(ln):
-    return ln[:1] == "#" and RE_ANY_MARKER.search(ln) is not None
+    """True only for a real `# @@BLOCK ...` / `# @@END ...` line at column 0.
+
+    v13.42: the @@ token must be the FIRST thing after the '#'.  A prose comment
+    that merely MENTIONS @@BLOCK (pages/5_Blocks.py block 010 has one) used to be
+    read as a MALFORMED marker, which made --check exit 1.
+    """
+    if ln[:1] != "#":
+        return False
+    return RE_ANY_MARKER.match(ln[1:].strip()) is not None
 
 
 def _analyse(lines):
