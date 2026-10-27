@@ -6860,7 +6860,12 @@ def _check_account_core(email, password, conf, domain, proxy_pool, thread_state,
                 app_rungs.add((server, proto, port))
                 _untried_local = [h for h in domain_local_hosts if h not in tried_hosts]
                 _conf_pool = [h for h in (imap_hosts + pop_hosts) if h not in tried_hosts]
-                _confirmed = (len(app_hosts) >= 2) or (len(app_rungs) >= 2) or (not _conf_pool)
+                _rungs_left_here = [r for r in (fallback_plan or ())
+                                    if r[1] == server
+                                    and (r[1], r[0], r[2]) not in wrong_rungs
+                                    and (r[1], r[0], r[2]) not in app_rungs]
+                _confirmed = ((len(app_hosts) >= 2) or (len(app_rungs) >= 2)
+                              or (not _conf_pool and not _rungs_left_here))
                 if (not confirm_wrong) or _confirmed:
                     # A definitive XOAUTH2 WRONG outranks a basic-auth "app
                     # password" signal - return the stronger one.
@@ -6896,7 +6901,15 @@ def _check_account_core(email, password, conf, domain, proxy_pool, thread_state,
             wrong_rungs.add((server, proto, port))
             _untried_local = [h for h in domain_local_hosts if h not in tried_hosts]
             _conf_pool = [h for h in (imap_hosts + pop_hosts) if h not in tried_hosts]
-            _confirmed = (len(wrong_hosts) >= 2) or (len(wrong_rungs) >= 2) or (not _conf_pool)
+            # FIX P0-1b: this host's still-undialled 143/110 rungs count as
+            # "something left to dial". Without this, a single-IMAP-host domain
+            # confirmed on rung 1 and skipped the whole fallback plan + direct sweep.
+            _rungs_left_here = [r for r in (fallback_plan or ())
+                                if r[1] == server
+                                and (r[1], r[0], r[2]) not in wrong_rungs
+                                and (r[1], r[0], r[2]) not in app_rungs]
+            _confirmed = ((len(wrong_hosts) >= 2) or (len(wrong_rungs) >= 2)
+                          or (not _conf_pool and not _rungs_left_here))
 
             if (not confirm_wrong) or _confirmed:
                 return (None, WRONG,
