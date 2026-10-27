@@ -323,7 +323,7 @@ def main():
         # ---- P2 ----
         has(app, "_STARTUP_MAX = 400", "P2 startup log cap present")
         has(app, "if msg in _STARTUP_SEEN:", "P2 dedupe compares the MESSAGE")
-        has(app, "checked_count % 25 == 0", "P2 checkpoint writes every 25 accounts")
+        has(app, "checked_count % 100 == 0", "P2 checkpoint writes every 100 accounts")
         has(app, "def _estimated_rung_count(", "P2 rung count is derived")
         has(app, "rungs = _estimated_rung_count()", "P2 request_budget uses it")
         gone(app_code, "rungs = 8", "P2 hardcoded rungs = 8 gone")
