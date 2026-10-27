@@ -7751,6 +7751,10 @@ if start_engine_btn:
                         if res:
                             st_val = res["status"]
                             em_val = res.get('email', '').strip().lower()
+                            # FIX LAG-1: decide the UI tick BEFORE doing any list copies.
+                            _now_ui = time.time()
+                            _tick = (checked_count >= total_accs) or \
+                                    ((_now_ui - _last_ui_ts) >= UI_MIN_INTERVAL)
 
                             with session_state_lock:
                                 if em_val:
@@ -7816,9 +7820,11 @@ if start_engine_btn:
                                 smtp_len = len(str_lit.session_state.smtp_results)
                                 skip_len = len(str_lit.session_state.skip_results)
                                 unknown_len = len(str_lit.session_state.unknown_results)
-                                current_logs = list(str_lit.session_state.log_lines)
-                                current_reports = list(str_lit.session_state.report_entries)
-                                bucket_snapshot = {
+                                current_logs = (list(str_lit.session_state.log_lines)
+                                                if _tick else [])
+                                current_reports = (list(str_lit.session_state.report_entries)
+                                                   if _tick else [])
+                                bucket_snapshot = ({
                                     "valid_results": list(str_lit.session_state.valid_results),
                                     "wrong_results": list(str_lit.session_state.wrong_results),
                                     "conn_results": list(str_lit.session_state.conn_results),
@@ -7831,19 +7837,15 @@ if start_engine_btn:
                                     "dns_results": list(str_lit.session_state.dns_results),
                                     "skip_results": list(str_lit.session_state.skip_results),
                                     "unknown_results": list(str_lit.session_state.unknown_results),
-                                }
+                                } if _tick else {})
 
-                            time.sleep(0.01)
-
-                            _now_ui = time.time()
-                            if (checked_count >= total_accs) \
-                                    or (_now_ui - _last_ui_ts) >= UI_MIN_INTERVAL:
+                            if _tick:
                                 _last_ui_ts = _now_ui
                                 if str_lit.session_state.get("colorize_logs", True):
-                                    log_container.markdown(colorize_logs(current_logs),
+                                    log_container.markdown(colorize_logs(current_logs[-120:]),
                                                            unsafe_allow_html=True)
                                 else:
-                                    log_container.code("\n".join(current_logs), language="text")
+                                    log_container.code("\n".join(current_logs[-120:]), language="text")
 
                                 with report_metrics_placeholder.container():
                                     _m_pairs = [
@@ -7881,12 +7883,12 @@ if start_engine_btn:
                             str_lit.session_state.log_lines.append(err_msg)
                             current_logs = list(str_lit.session_state.log_lines)
                         if str_lit.session_state.get("colorize_logs", True):
-                            log_container.markdown(colorize_logs(current_logs),
+                            log_container.markdown(colorize_logs(current_logs[-120:]),
                                                    unsafe_allow_html=True)
                         else:
-                            log_container.code("\n".join(current_logs), language="text")
+                            log_container.code("\n".join(current_logs[-120:]), language="text")
 
-                    if checked_count % 25 == 0 or checked_count == total_accs:
+                    if checked_count % 100 == 0 or checked_count == total_accs:
                         with session_state_lock:
                             done = set(str_lit.session_state.checked_emails_set)
                             valids = list(str_lit.session_state.valid_results)
