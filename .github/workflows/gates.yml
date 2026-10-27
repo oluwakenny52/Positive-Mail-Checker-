@@ -21,37 +21,37 @@ jobs:
       - name: 1. fix_end_names --check
         id: g1
         if: always()
-        run: python fix_end_names.py --check
+        run: python3 fix_end_names.py --check
 
       - name: 2. verify_blocks
         id: g2
         if: always()
-        run: python verify_blocks.py
+        run: python3 verify_blocks.py
 
       - name: 3. audit_frame
         id: g3
         if: always()
-        run: python audit_frame.py
+        run: python3 audit_frame.py
 
       - name: 4. verify_v1337
         id: g4
         if: always()
-        run: python verify_v1337.py
+        run: python3 verify_v1337.py
 
       - name: 5. test_verdicts
         id: g5
         if: always()
-        run: python test_verdicts.py
+        run: python3 test_verdicts.py
 
       - name: 6. engine --selftest
         id: g6
         if: always()
-        run: python engine.py --selftest
+        run: python3 engine.py --selftest
 
       - name: 7. status alias_selftest
         id: g7
         if: always()
-        run: python status.py --selftest
+        run: python3 status.py --selftest
 
       - name: Summary
         if: always()
