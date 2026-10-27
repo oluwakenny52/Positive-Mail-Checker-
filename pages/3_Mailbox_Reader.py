@@ -1,7 +1,7 @@
-# @@FILE pages/3_Mailbox_Reader.py blocks=44 version=v13.40
+# @@FILE pages/3_Mailbox_Reader.py blocks=44 version=v13.41
 # @@BLOCK 000 FILE_HEADER deps=-
 """
-pages/3_Mailbox_Reader.py — Bobito Mailbox Reader & Portal Hub  (v13.40)
+pages/3_Mailbox_Reader.py — Bobito Mailbox Reader & Portal Hub  (v13.41)
 =======================================================================
 Interactive inbox inspection: bot intelligence, OTP / debit-card / credential
 scanning, multi-field search, Telegram + blacklist filtering.
