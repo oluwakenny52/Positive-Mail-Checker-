@@ -151,11 +151,26 @@ if not _HAVE["family_pop"]:
 # --------------------------------------------------------------------------
 # small helpers
 # --------------------------------------------------------------------------
-def _resolve(host):
+@st.cache_data(ttl=300, show_spinner=False)
+def _resolve_uncached(host):
     try:
         return socket.gethostbyname(host)
     except Exception:
         return None
+
+
+_RESOLVE_MEMO = {}
+
+
+def _resolve(host):
+    h = (host or "").strip().lower()
+    if not h:
+        return None
+    if h in _RESOLVE_MEMO:
+        return _RESOLVE_MEMO[h]
+    val = _resolve_uncached(h)
+    _RESOLVE_MEMO[h] = val
+    return val
 
 
 def _dedupe_by_ip(hosts, cap):
