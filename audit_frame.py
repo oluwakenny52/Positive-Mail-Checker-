@@ -18,7 +18,9 @@ try:
 except Exception:
     GATED = ["app.py", "engine.py", "status.py", "pages/2_Diagnostics.py",
              "pages/3_Mailbox_Reader.py", "pages/4_Downloads.py",
-             "pages/5_Blocks.py", "pages/6_User_Guide.py"]
+             "pages/5_Blocks.py", "pages/6_User_Guide.py", "ms_oauth.py"]
+...
+EXPECT_FILES, EXPECT_BLOCKS = 9, 245
 # NOTE: these are the CURRENT counts. tier2_split.py rewrites app.py+engine.py
 # into a different shape, so re-derive both numbers after running it or this
 # gate goes red on drift and looks like a regression.  EXPECT_BLOCKS drift trap.
