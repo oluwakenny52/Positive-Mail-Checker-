@@ -26,6 +26,7 @@ API used elsewhere:
 from __future__ import annotations
 
 import argparse
+import ast
 import io
 import json
 import os
@@ -180,6 +181,35 @@ def audit_source(target, name=None):
     def fault(line, kind, text):
         rep["details"].append({"line": line, "kind": kind, "text": text})
         rep["faults"] += 1
+
+    # v13.42: the file must actually COMPILE.  app.py block 000 and
+    # pages/5_Blocks both advertise this and nothing ever did it - only
+    # tokenize() ran, and its exceptions were swallowed.  engine.py, pages/4
+    # and pages/5 were compiled by NO gate at all.
+    try:
+        compile(src, path, "exec")
+    except SyntaxError as exc:
+        fault(exc.lineno or 0, "syntax", "does not compile: %s" % exc.msg)
+    else:
+        try:
+            ast.parse(src, filename=path)
+        except SyntaxError as exc:
+            fault(exc.lineno or 0, "syntax", "AST parse failed: %s" % exc.msg)
+
+    # v13.42: the README's "nothing but blanks and comments between an @@END and
+    # the next @@BLOCK" rule was never implemented either.
+    for _ei, _raw in enumerate(lines):
+        if not END_RX.match(_raw.rstrip()):
+            continue
+        _nxt = next((_bi for _bi in range(_ei + 1, len(lines))
+                     if BLOCK_RX.match(lines[_bi].rstrip())), None)
+        if _nxt is None:
+            continue
+        for _j in range(_ei + 1, _nxt):
+            _s = lines[_j]
+            if _s.strip() and not _s.lstrip().startswith("#"):
+                fault(_j + 1, "text_between",
+                      "text between @@END and the next @@BLOCK: %r" % _s.strip()[:60])
 
     # header
     if lines:
