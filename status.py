@@ -569,7 +569,7 @@ def alias_selftest(verbose=False):
     checks.append(("classify:proxy_blocked",
                    classify_error("Connection blocked by proxy") == STATUS_CONNECTION_FAILED))
     checks.append(("classify:spamhaus_still_rbl",
-                   classify_error("blocked by Spamhaus") == STATUS_RBL))
+                   classify_error("blocked by Spamhaus") == STATUS_RBL_BLOCKED))
     checks.append(("classify:conn", classify_error("Connection refused") == STATUS_CONNECTION_FAILED))
     checks.append(("classify:dns", classify_error("Name or service not known") == STATUS_DNS_FAILED))
     checks.append(("classify:drop", classify_error("* BYE server dropping connection") == STATUS_LOGIN_DROPPED))
