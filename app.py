@@ -8178,6 +8178,12 @@ if str_lit.session_state.engine_has_run or load_persistent_valid_results():
             if not items:
                 str_lit.caption("nothing here yet")
                 continue
+            _safe = "".join(ch if ch.isalnum() else "_" for ch in title).strip("_")
+            str_lit.download_button(
+                f"Download these {len(items)} line(s)",
+                data="\n".join(str(i) for i in items).encode("utf-8"),
+                file_name=f"{_safe}_{len(items)}.txt",
+                mime="text/plain", key=f"sumdl_{_safe}")
             for it in items:
                 str_lit.code(it, language="text")
 
