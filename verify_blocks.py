@@ -45,6 +45,7 @@ BLOCKED_FILES = [
     "pages/4_Downloads.py",
     "pages/5_Blocks.py",
     "pages/6_User_Guide.py",
+    "ms_oauth.py",
 ]
 
 FILE_RX = re.compile(r"^#\s*@@FILE\s+(\S+)\s+blocks=(\d+)\s+version=(\S+)\s*$")
