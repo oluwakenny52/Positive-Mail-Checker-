@@ -3258,12 +3258,13 @@ else:
     choice = str_lit.session_state.pool_pick
     if choice in ("country", "mix"):
         available_countries = get_available_countries_with_scores() or ["US"]
+        _raw_for_scores = load_proxies() if choice == "mix" else []
         with str_lit.sidebar.form("pool_pick_form"):
             picked = []
             for c in available_countries:
                 label = c
                 if choice == "mix":
-                    scores = [proxy_meta.get(p, {}).get("score", 0) for p in load_proxies()
+                    scores = [proxy_meta.get(p, {}).get("score", 0) for p in _raw_for_scores
                               if str(proxy_meta.get(p, {}).get("country", "")).upper() == c]
                     label = f"{c}  score={max(scores) if scores else 0}"
                 if str_lit.checkbox(label, value=c in str_lit.session_state.picked_countries,
@@ -4173,6 +4174,8 @@ _CANON_STATUS = {
     RBL_BLOCKED: RBL,
     RETRY_LATER: RETRY,
     FAILED: CONNECTION_FAILED,
+    DNS_FAILED: CONNECTION_FAILED,
+    SMTP_FAILED: CONNECTION_FAILED,
 }
 
 
@@ -7440,7 +7443,9 @@ def _check_account_core(email, password, conf, domain, proxy_pool, thread_state,
             trace_logs.append(f"NOTE: the retained verdict came from {_bh}, which is not a "
                               f"local host for {domain}. It may belong to a different provider.")
         if best_verdict["status"] == WRONG:
-            detail = detail + _wrong_detail_note(domain, password)
+            _wn = _wrong_detail_note(domain, password)
+            if _wn and _wn not in detail:
+                detail = detail + _wn
         if best_verdict["status"] == LOGIN_DROPPED:
             detail = f"{detail} | " + _login_dropped_detail()
         trace_logs.append("Ladder exhausted with no live answer -> returning retained "
@@ -7452,13 +7457,13 @@ def _check_account_core(email, password, conf, domain, proxy_pool, thread_state,
         trace_logs.append(
             f"Every attempt died in the PROXY hop ({acct_407_total} x 407, "
             f"{quarantine_size()} node(s) quarantined) -> the mailbox was never "
-            f"reached, so the password is still untested.")
+            f"reached, so the password is still untested. Per-host 407 map: {host_407}")
         return None, PROXY_UNHEALTHY, (
             f"proxy refused the MAIL ports with 407 on {acct_407_total} attempt(s) - the mail "
             f"host was never reached; the pool passes the web probe but cannot pass "
             f"email-server destinations (provider 'email servers' cap)"
         ), None, trace_logs
-    if not dns_ok:
+    if not dns_ok and not flags.get("saw_server") and not flags.get("saw_login_drop"):
         return None, DNS_FAILED, "Fast-fail DNS check failed: no host resolves locally", None, trace_logs
     if flags.get("saw_login_drop"):
         trace_logs.append(
@@ -7939,15 +7944,15 @@ if start_engine_btn:
             run_interrupted = True
             detected_stop_reason = "Resource Exhaustion: RAM full / Out of Memory"
             str_lit.error(f"⚠ Engine Stopped: RAM Full: {me}")
+        except (socket.timeout, ConnectionError, ssl.SSLError) as net_err:
+            run_interrupted = True
+            detected_stop_reason = f"Network Connection Failure: {net_err}"
+            str_lit.error(f"⚠ Engine Stopped: {detected_stop_reason}")
         except (OSError, IOError) as oe:
             run_interrupted = True
             detected_stop_reason = ("Resource Exhaustion: Disk Space / ROM full"
                                     if getattr(oe, 'errno', 0) == 28
                                     else f"Filesystem / I/O Error: {oe}")
-            str_lit.error(f"⚠ Engine Stopped: {detected_stop_reason}")
-        except (socket.timeout, ConnectionError, ssl.SSLError) as net_err:
-            run_interrupted = True
-            detected_stop_reason = f"Network Connection Failure: {net_err}"
             str_lit.error(f"⚠ Engine Stopped: {detected_stop_reason}")
         except BaseException as be:
             if isinstance(be, (SystemExit, KeyboardInterrupt)):
