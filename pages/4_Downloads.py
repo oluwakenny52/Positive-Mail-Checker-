@@ -207,7 +207,11 @@ def _parse(line, source, status_hint):
     if " | " in raw:
         combo, _, rest = raw.partition(" | ")
     elif "|" in raw:
-        combo, _, rest = raw.partition("|")
+        # v13.42: anchor the cut to the FIRST colon, so a '|' before the colon
+        # cannot eat the email and the split is deterministic.
+        _colon = raw.find(":")
+        _cut = raw.find("|", _colon + 1) if _colon != -1 else -1
+        combo, rest = (raw[:_cut], raw[_cut + 1:]) if _cut != -1 else (raw, "")
     else:
         combo, rest = raw, ""
     combo = combo.strip().strip('"\'')
