@@ -7078,17 +7078,17 @@ def _check_account_core(email, password, conf, domain, proxy_pool, thread_state,
                             st_val = classify_error(ssl_err, domain)
                             flags["saw_nonproxy"] = True
                             flags["saw_server"] = True
-                            if st_val == FAILED:
+                            if st_val == CONNECTION_FAILED:
                                 had_net = True
                                 net_failed_hosts.add(server)
                             record_proxy_attempt(px_used, success=False,
-                                                 is_network_error=(st_val == FAILED))
+                                                 is_network_error=(st_val == CONNECTION_FAILED))
                             trace_logs.append(f"{px_tag(px_used)} -> TLS FAILED {proto} "
                                               f"{server}:{port}: {err_text[:140]} "
                                               f"[Classified: {st_val}]")
                             note_verdict(st_val, f"{proto} {server}:{port} -> {st_val}", server)
                             server_level_fail = True
-                            rotate_now = _is_proxy_level_error(err_text) or st_val == FAILED
+                            rotate_now = _is_proxy_level_error(err_text) or st_val == CONNECTION_FAILED
 
                         except (socket.timeout, TimeoutError) as to_err:
                             err_text = str(to_err)
@@ -7191,7 +7191,7 @@ def _check_account_core(email, password, conf, domain, proxy_pool, thread_state,
                                     f"advancing the ladder (POP3 / other hosts still get a turn)")
                             else:
                                 server_level_fail = True
-                                if (st_val == FAILED
+                                if (st_val == CONNECTION_FAILED
                                         and retries_by_host.get(server, 0) < same_host_retries
                                         and (deadline_ts - time.time()) > 7.0):
                                     retries_by_host[server] = retries_by_host.get(server, 0) + 1
@@ -7215,11 +7215,11 @@ def _check_account_core(email, password, conf, domain, proxy_pool, thread_state,
                             if _is_timeout(e):
                                 had_net = True
                                 net_failed_hosts.add(server)
-                            if st_val == FAILED:
+                            if st_val == CONNECTION_FAILED:
                                 had_net = True
                                 net_failed_hosts.add(server)
                             record_proxy_attempt(px_used, success=False,
-                                                 is_network_error=(st_val == FAILED))
+                                                 is_network_error=(st_val == CONNECTION_FAILED))
                             trace_logs.append(f"{px_tag(px_used)} -> FAILED {proto} "
                                               f"{server}:{port}: {err_text[:140]} "
                                               f"[Classified: {st_val}]")
