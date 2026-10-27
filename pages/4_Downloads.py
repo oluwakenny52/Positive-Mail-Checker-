@@ -406,6 +406,14 @@ with st.sidebar:
     st.markdown("### 2. How to write it")
     fmt_name = st.selectbox("Format", list(FORMAT_PRESETS.keys()), index=0)
     default_tpl = FORMAT_PRESETS[fmt_name]
+    # v13.42: value= only applies on the FIRST render, so picking a different
+    # format did nothing.  Re-seed the key when the format changes - legal here,
+    # the text_input below does not exist yet this run.  A preset applied this
+    # run wins (its marker is still in session_state).
+    if st.session_state.get("_ex_fmt_seen") != fmt_name:
+        st.session_state["_ex_fmt_seen"] = fmt_name
+        if default_tpl and not st.session_state.get("_ex_active"):
+            st.session_state["ex_tpl"] = default_tpl
     template = st.text_input(
         "Template ({email} {password} {domain} {local} {status} {host} {port} {detail} {n})",
         value=default_tpl or "{email}:{password}",
