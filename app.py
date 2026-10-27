@@ -2434,7 +2434,7 @@ def _park_proxy_407(proxy_str):
         pass
 
 
-def _gated_tunnel(proxy_str, timeout=None):
+def _gated_tunnel(proxy_str, timeout=None, targets=None):
     """Run tunnel_probe() behind the proxy gate, the per-IP gate and the
     per-SUB-USER gate."""
     info = parse_proxy(proxy_str)
@@ -2457,7 +2457,7 @@ def _gated_tunnel(proxy_str, timeout=None):
             got_sub = sg.acquire(timeout=wait)
         except Exception:
             got_sub = False
-        return tunnel_probe(proxy_str, timeout=timeout)
+        return tunnel_probe(proxy_str, targets=targets, timeout=timeout)
     finally:
         if got_sub:
             try:
@@ -4655,7 +4655,8 @@ def mail_dest_spot_check(force: bool = False):
     err = ""
     for p in sample:
         try:
-            res = tunnel_probe(p, targets=[(host, port, "mailspot")], timeout=MAIL_SPOT_TIMEOUT)
+            res = _gated_tunnel(p, timeout=MAIL_SPOT_TIMEOUT,
+                                targets=[(host, port, "mailspot")])
         except Exception as e:
             other += 1
             err = err or f"{type(e).__name__}: {str(e)[:120]}"
