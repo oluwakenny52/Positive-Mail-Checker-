@@ -672,5 +672,13 @@ ALIASES = {
 
 assert len(ALIASES) == len(STATUS_ALL_STATUSES), "alias/constant count mismatch"
 assert all(ALIASES[k] == v for k, v in zip(ALIASES, STATUS_ALL_STATUSES)), "alias drift"
+
+
+if __name__ == "__main__":
+    import sys as _sys
+
+    if "--selftest" in _sys.argv:
+        alias_selftest(verbose=True)
+    _sys.exit(0)
 # @@END 012 APP_COMPAT
 # @@EOF
