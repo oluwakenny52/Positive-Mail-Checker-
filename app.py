@@ -2621,6 +2621,18 @@ checker_mode = str_lit.sidebar.selectbox(
          "rapid ports. Deep: maximum depth, multiple fallbacks, strict validation."
 )
 
+# v13.42: ui_workers / ui_deadline / ui_timeout are the SAME widget keys in all
+# three branches, but each branch declares DIFFERENT ranges, so a mode switch
+# could leave a stored value outside the new slider's range.  Clamp to the mode
+# we are about to render - legal here, the widgets do not exist yet this run.
+_bounds = {"Fast Mode": ((1, 100), (10, 300), (3, 40)),
+           "Deep / Aggressive Mode": ((1, 50), (15, 400), (5, 60))}.get(
+    checker_mode, ((1, 100), (10, 300), (3, 40)))
+for _k, (_lo, _hi) in zip(("ui_workers", "ui_deadline", "ui_timeout"), _bounds):
+    _v = str_lit.session_state.get(_k)
+    if isinstance(_v, int) and not (_lo <= _v <= _hi):
+        str_lit.session_state[_k] = max(_lo, min(_hi, _v))
+
 if checker_mode == "Fast Mode":
     engine_config = CheckerConfig(mode_name="Fast", fast_mode=True, max_concurrent_checks=100,
                                   connect_timeout=5.0, max_retries=1, failure_cooldown=60.0)
