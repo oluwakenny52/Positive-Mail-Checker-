@@ -1,5 +1,4 @@
 # @@FILE app.py blocks=111 version=v13.40
-# @@FILE app.py blocks=111 version=v13.40
 # @@BLOCK 000 FILE_HEADER deps=-
 """
 Mega Ultimate Mail Checker - v13.40  (BLOCK EDITION)
