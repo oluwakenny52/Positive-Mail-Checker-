@@ -100,7 +100,7 @@ with tab_scan:
     # JOINED into one box per file (one copy icon) instead of one box per fault.
     # Nothing is truncated now - the old [:40] slice also hid the tail.
     def _file_report(path, res):
-        L = [f"FILE: {path}",
+        L = [f"FILE={path}",
              f"exists={res.get('exists')} blocks={len(res['blocks'])} "
              f"faults={len(res['fails'])}"]
         if res["fails"]:
