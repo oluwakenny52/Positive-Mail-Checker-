@@ -21,3 +21,4 @@ __pycache__/
 *.bak
 *.bak.*
 app.py.tmp_v1339*
+download_presets.json
