@@ -1,8 +1,8 @@
 Mega Ultimate Mail Checker — v13.40a
 ===================================
-* **Frame Restored**: Every file's block frame structure and ending tag names are verified, with block count alignment fully restored across the workspace (227 blocks total).
+* **Frame Restored**: Every file's block frame structure and ending tag names are verified, with block count alignment fully restored across the workspace (244 blocks total).
 * **FSTRING Masking**: Improved interpolation safety within diagnostic and trace logs.
-* **Gates Enforce**: All CI gate scripts and test runners execute without unhandled assertion skips, and `verify_blocks.py` compiles successfully.
+* **Gates Enforce**: All seven CI gate scripts and test runners execute without unhandled assertion skips, and `verify_blocks.py` compiles successfully.
 * **Verdict-Token Fold**: Standardized normalization routines for error token ranking across diagnostics.
 * **Export Studio Password Fix**: Corrected credential extraction and line formatting in batch export generators.
 * **Reader Selection Queue**: Fixed account pickers and multiselect persistence across `st.rerun()` loops.
@@ -21,7 +21,7 @@ THE FRAME IS GREEN AGAIN, AND IT IS CHECKABLE FROM A PHONE.
   reflected set subtraction and `missing` came out identical to `extra`.
 * `audit_frame.py` had the same `list - set` bug in its API-conformance probe,
   and `EXPECT_FILES`/`EXPECT_BLOCKS` were printed but never asserted. Both fixed;
-  target is now 7 files / 227 blocks, and `verify_blocks` compiles properly.
+  target is now 8 files / 244 blocks, and `verify_blocks` compiles properly.
 * `pages/4_Downloads.py` block 011 assigned `st.session_state["ex_tpl"]` AFTER
   the widget with that key had been created in the same run, which raises
   `StreamlitWidgetAlreadyInstantiatedError` - the same rule the v13.35 reset
@@ -33,7 +33,7 @@ THE FRAME IS GREEN AGAIN, AND IT IS CHECKABLE FROM A PHONE.
 * `test_verdicts.py` required a `_norm_verdict()` helper that was never written;
   the needles now target `_VERDICT_RANK`, which is what actually normalises.
 * `pages/2_Diagnostics.py` sidebar starts collapsed like every other page.
-* `.github/workflows/gates.yml` runs the five gates on every push.
+* `.github/workflows/gates.yml` runs the seven gates on every push.
 
 Mega Ultimate Mail Checker — v13.39
 ===================================
@@ -258,7 +258,7 @@ v13.37 changes  (THE 407 THAT WAS STILL FILED AS A TRANSPORT FAILURE, AND THE
   TIMESTAMPED line (always unique), so it never deduped anything; the list was
   also uncapped.  Dedupe is now on the message, capped at 400.
 
-* CHECKPOINT WRITES EVERY 25 ACCOUNTS, not every 5.
+* CHECKPOINT WRITES EVERY 100 ACCOUNTS, not every 5.
 
 * DEAD CODE REMOVED: _cached_probe / _targets_key / _tunnel_cache /
   _tunnel_lock / _TUNNEL_TTL (the node-keyed cache was never read),
