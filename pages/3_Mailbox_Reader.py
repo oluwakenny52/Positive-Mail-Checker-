@@ -1481,10 +1481,10 @@ def generate_all_mail_zip():
 
                 if "valid" in filename_lower or "clean" in filename_lower:
                     cat_name = f"Clean_Valid_{count}.txt"
-                elif "wrong" in filename_lower or "pass" in filename_lower:
-                    cat_name = f"Wrong_Password_{count}.txt"
                 elif "app" in filename_lower or "2fa" in filename_lower or "otp" in filename_lower:
                     cat_name = f"App_Password_2FA_{count}.txt"
+                elif "wrong" in filename_lower or "pass" in filename_lower:
+                    cat_name = f"Wrong_Password_{count}.txt"
                 elif "fail" in filename_lower or "conn" in filename_lower:
                     cat_name = f"Connection_Failed_{count}.txt"
                 else:
