@@ -2495,6 +2495,9 @@ def _secret_to_env(k, v):
         os.environ[str(k)] = "\n".join(str(x) for x in v if x is not None)
         return
     if isinstance(v, dict):
+        # FIX SEC-1: nested [sections] in secrets.toml used to be dropped entirely.
+        for _sk, _sv in v.items():
+            _secret_to_env(_sk, _sv)
         return
     os.environ[str(k)] = str(v)
 
