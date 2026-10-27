@@ -110,7 +110,7 @@ for needle in ("st_val = st_classify(err_str, domain)",
 # and prove the fold is NEEDED: none of these may already be whitelisted
 for v in (S.STATUS_WRONG_PASSWORD, S.STATUS_NEED_APP_PASSWORD,
           S.STATUS_RBL_BLOCKED, S.STATUS_RETRY_LATER):
-    if v in (S.VALID, S.WRONG, S.APP, S.RBL, S.LOGIN_DROPPED, S.UNKNOWN):
+    if v not in (S.VALID, S.WRONG, S.APP, S.RBL, S.LOGIN_DROPPED, S.UNKNOWN):
         ok("%s already survives note_verdict" % v)
     else:
         FAILS.append("expected status whitelisted: " + repr(v))
