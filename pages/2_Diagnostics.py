@@ -330,9 +330,12 @@ def _build_plan(domain, max_hosts, flags=None):
     if domain in imap_hosts:
         imap_hosts = [h for h in imap_hosts if h != domain] + [domain]
 
-    _drop = {domain}
+    # v13.42: app.py drops the apex ONLY for Windstream/Kinetic.  Dropping it for
+    # every domain made this page's "exactly what the engine dials" ladder one
+    # rung short - the apex is appended above and then removed right here.
+    _drop = set()
     if domain.endswith("windstream.net") or domain.endswith("kinetic.net"):
-        _drop |= {"secure.windstream.net", "webmail.windstream.net"}
+        _drop |= {domain, "secure.windstream.net", "webmail.windstream.net"}
     _kept = [h for h in imap_hosts if h.lower() not in _drop]
     if _kept:
         imap_hosts = _kept
