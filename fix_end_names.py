@@ -50,6 +50,7 @@ FILES = (
     "pages/3_Mailbox_Reader.py",
     "pages/4_Downloads.py",
     "pages/5_Blocks.py",
+    "pages/6_User_Guide.py",
 )
 
 RE_ANY_MARKER = re.compile(r"@@(?:BLOCK|END)\b")
