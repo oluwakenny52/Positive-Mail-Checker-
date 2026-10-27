@@ -39,6 +39,16 @@ jobs:
         run: python test_verdicts.py
         continue-on-error: true
 
+      - name: 6. engine --selftest
+        id: g6
+        run: python engine.py --selftest
+        continue-on-error: true
+
+      - name: 7. status alias_selftest
+        id: g7
+        run: python -c "import status; status.alias_selftest(verbose=True)"
+        continue-on-error: true
+
       - name: Summary
         if: always()
         env:
@@ -47,6 +57,8 @@ jobs:
           R3: ${{ steps.g3.outcome }}
           R4: ${{ steps.g4.outcome }}
           R5: ${{ steps.g5.outcome }}
+          R6: ${{ steps.g6.outcome }}
+          R7: ${{ steps.g7.outcome }}
         run: |
           fail=0
           {
@@ -54,11 +66,11 @@ jobs:
             echo ""
             echo "| gate | result |"
             echo "| --- | --- |"
-            for pair in "fix_end_names.py --check:$R1" "verify_blocks.py:$R2" "audit_frame.py:$R3" "verify_v1337.py:$R4" "test_verdicts.py:$R5"; do
+            for pair in "fix_end_names.py --check:$R1" "verify_blocks.py:$R2" "audit_frame.py:$R3" "verify_v1337.py:$R4" "test_verdicts.py:$R5" "engine.py --selftest:$R6" "status.alias_selftest:$R7"; do
               g="${pair%%:*}"; r="${pair##*:}"
               if [ "$r" = "success" ]; then echo "| \`$g\` | PASS |"; else echo "| \`$g\` | FAIL |"; fail=1; fi
             done
             echo ""
-            if [ "$fail" -eq 0 ]; then echo "**All five gates green.**"; else echo "**A gate is RED - do not ship.**"; fi
+            if [ "$fail" -eq 0 ]; then echo "**All seven gates green.**"; else echo "**A gate is RED - do not ship.**"; fi
           } >> "$GITHUB_STEP_SUMMARY"
           exit $fail
