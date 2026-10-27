@@ -169,18 +169,26 @@ def ms_access_token(email, password, timeout=10, force_refresh=False):
     except Exception as exc:
         raise MsTokenTransport(f"token endpoint unreachable: {exc}")
 
-    if resp.status_code != 200:
-        raise MsTokenTransport(f"token endpoint HTTP {resp.status_code}: {resp.text[:140]}")
-
+    # v13.41: a ROPC rejection is HTTP 400 with an AADSTS body, NOT 200. The old
+    # code raised MsTokenTransport for every non-200, so MsTokenRejected was
+    # unreachable and every wrong Microsoft password became APPASS.
     try:
         data = resp.json()
     except Exception:
-        raise MsTokenTransport(f"token endpoint non-JSON body: {resp.text[:140]}")
+        data = {}
+        if resp.status_code == 200:
+            raise MsTokenTransport(f"token endpoint non-JSON body: {resp.text[:140]}")
+
+    description = data.get("error_description") or data.get("error") or resp.text[:200]
+    code = _classify_token_error(description)
+
+    if resp.status_code != 200:
+        if code:
+            raise MsTokenRejected(code, description)
+        raise MsTokenTransport(f"token endpoint HTTP {resp.status_code}: {resp.text[:140]}")
 
     token = data.get("access_token")
     if not isinstance(token, str) or token.count(".") != 2 or not data.get("expires_in"):
-        description = data.get("error_description") or data.get("error") or ""
-        code = _classify_token_error(description)
         if code:
             raise MsTokenRejected(code, description)
         raise MsTokenTransport(f"malformed token response: {str(data)[:140]}")
