@@ -1068,6 +1068,14 @@ def clear_tunnel_cache():
 # @@END 025 PROBE_TELEMETRY
 
 # @@BLOCK 026 RUNTIME_HELPERS deps=024
+def live_cfg():
+    """The CURRENT run's config, readable from the long-lived daemon thread."""
+    c = STATE.get("cfg")
+    if c:
+        return c
+    return globals().get("CFG") or {}
+
+
 def probe_timeout() -> float:
     try:
         return float(CFG.get("PROBE_TIMEOUT", PROBE_TIMEOUT_DEFAULT))
@@ -3482,6 +3490,8 @@ for _k, _v in (
 ):
     CFG.setdefault(_k, _v)
 
+STATE["cfg"] = CFG
+
 log_startup(
     f"ACTIVE CONFIG -> protocols={CFG.get('PROTOCOLS')} mode={CFG.get('MODE_NAME')} "
     f"workers={CFG.get('MAX_WORKERS_START')} "
@@ -3587,7 +3597,7 @@ def save_domain_cache():
     try:
         with file_write_lock:
             with cache_lock:
-                with open(CFG["CACHE_FILE"], "w", encoding="utf-8") as f:
+                with open(live_cfg()["CACHE_FILE"], "w", encoding="utf-8") as f:
                     json.dump(domain_cache, f, indent=2)
     except Exception as e:
         warnings.warn(f"Failed to save domain cache: {e}")
@@ -3597,7 +3607,7 @@ def save_proxy_meta():
     try:
         with file_write_lock:
             with proxy_lock:
-                with open(CFG["PROXY_META_FILE"], "w", encoding="utf-8") as f:
+                with open(live_cfg()["PROXY_META_FILE"], "w", encoding="utf-8") as f:
                     json.dump(proxy_meta, f, indent=2)
     except Exception as e:
         warnings.warn(f"Failed to save proxy meta: {e}")
@@ -3606,7 +3616,7 @@ def save_proxy_meta():
 def proxy_is_blocked(proxy_str):
     if not proxy_str:
         return False
-    if CFG.get("ALLOW_BLACKLIST_IPS", False):
+    if live_cfg().get("ALLOW_BLACKLIST_IPS", False):
         return False
     try:
         if proxy_str in circuit_breaker_until and time.time() < circuit_breaker_until[proxy_str]:
@@ -3623,16 +3633,16 @@ def get_filtered_active_proxies(quiet: bool = False):
         if not raw:
             return []
         try:
-            dedupe = bool(CFG.get("DEDUPE_PROXIES", DEDUPE_PROXIES_DEFAULT))
+            dedupe = bool(live_cfg().get("DEDUPE_PROXIES", DEDUPE_PROXIES_DEFAULT))
         except Exception:
             dedupe = DEDUPE_PROXIES_DEFAULT
         if dedupe:
             raw = list(dict.fromkeys(raw))
         filtered = []
-        min_score = CFG.get("MIN_PROXY_SCORE", MIN_PROXY_SCORE_DEFAULT)
-        mode = CFG.get("POOL_MODE", "all")
-        chosen_countries = CFG.get("SELECTED_COUNTRIES", [])
-        chosen_mix = CFG.get("SELECTED_MIX_COUNTRIES", [])
+        min_score = live_cfg().get("MIN_PROXY_SCORE", MIN_PROXY_SCORE_DEFAULT)
+        mode = live_cfg().get("POOL_MODE", "all")
+        chosen_countries = live_cfg().get("SELECTED_COUNTRIES", [])
+        chosen_mix = live_cfg().get("SELECTED_MIX_COUNTRIES", [])
 
         with proxy_lock:
             meta_snapshot = dict(proxy_meta)
@@ -3727,7 +3737,7 @@ def _dedupe_hosts_by_ip(hosts, cap=3):
 # @@BLOCK 060 PROXY_CONNECT deps=022,023,059
 def proxy_connect(host, port, proxy_str, timeout=None, remote_dns=True):
     """Open a tunnel.  This is ALWAYS a proxy hop."""
-    base_timeout = timeout or CFG["PROXY_CONNECT_TIMEOUT"]
+    base_timeout = timeout or live_cfg()["PROXY_CONNECT_TIMEOUT"]
     try:
         with proxy_lock:
             fails = proxy_meta.get(proxy_str, {}).get("fails", 0)
@@ -3791,7 +3801,7 @@ def _tls_context(host: str, verify: bool):
 
 
 def _raw_socket(host, port, proxy_str=None, timeout=None):
-    t = timeout or CFG["TIMEOUT"]
+    t = timeout or live_cfg()["TIMEOUT"]
     read_to = max(READ_FLOOR_DEFAULT, t * 0.9)
     if proxy_str and proxy_str != "direct":
         s = proxy_connect(host, port, proxy_str, timeout=t)
@@ -3811,7 +3821,7 @@ def tls_connect(host, port, proxy_str=None, insecure=None, timeout=None):
     including the Mailbox Reader - honours the checkbox.
     """
     if insecure is None:
-        insecure = bool(CFG.get("ALLOW_SELF_SIGNED", True))
+        insecure = bool(live_cfg().get("ALLOW_SELF_SIGNED", True))
     if insecure:
         return _tls_context(host, False).wrap_socket(
             _raw_socket(host, port, proxy_str, timeout), server_hostname=host)
@@ -3820,7 +3830,7 @@ def tls_connect(host, port, proxy_str=None, insecure=None, timeout=None):
     try:
         return _tls_context(host, True).wrap_socket(raw, server_hostname=host)
     except ssl.SSLError as e:
-        if CFG.get("TLS_STRICT", False):
+        if live_cfg().get("TLS_STRICT", False):
             warnings.warn(f"Verified TLS failed for {host} ({e!r}); "
                           f"TLS_STRICT is ON so NOT falling back")
             raise
@@ -4054,8 +4064,8 @@ def smtp_auth_once(email, password, server, proxy_str=None, insecure=None, port=
                    attempt_timeout=None, user=None):
     """Confirm-only SMTP submission AUTH.  Raises SmtpAuthError ONLY on a clean 535."""
     if insecure is None:
-        insecure = bool(CFG.get("ALLOW_SELF_SIGNED", True))
-    to = attempt_timeout or CFG["TIMEOUT"]
+        insecure = bool(live_cfg().get("ALLOW_SELF_SIGNED", True))
+    to = attempt_timeout or live_cfg()["TIMEOUT"]
     s = None
     try:
         s = _raw_socket(server, port, proxy_str, timeout=to)
@@ -4120,8 +4130,8 @@ def sieve_auth_once(email, password, server, proxy_str=None, insecure=None,
                     port=SIEVE_PORT, attempt_timeout=None, user=None):
     """Confirm-only ManageSieve (RFC 5804) AUTH.  Same credentials, port 4190."""
     if insecure is None:
-        insecure = bool(CFG.get("ALLOW_SELF_SIGNED", True))
-    to = attempt_timeout or CFG["TIMEOUT"]
+        insecure = bool(live_cfg().get("ALLOW_SELF_SIGNED", True))
+    to = attempt_timeout or live_cfg()["TIMEOUT"]
     s = None
     try:
         s = _raw_socket(server, port, proxy_str, timeout=to)
@@ -4203,7 +4213,7 @@ def record_proxy_attempt(proxy_str, success, is_network_error=False, is_proxy_au
     try:
         if not proxy_str:
             return
-        if is_proxy_auth and CFG.get("QUARANTINE_407", True):
+        if is_proxy_auth and live_cfg().get("QUARANTINE_407", True):
             _park_proxy_407(proxy_str)
             if not proxy_is_quarantined(proxy_str):
                 with proxy_quarantine_lock:
@@ -4211,7 +4221,7 @@ def record_proxy_attempt(proxy_str, success, is_network_error=False, is_proxy_au
                     strikes = _proxy_407[proxy_str]
                 if strikes >= PROXY_407_QUARANTINE:
                     quarantine_proxy(proxy_str, f"{strikes}x 407")
-        threshold = int(CFG.get("BLACKLIST_CF", BLACKLIST_CF_DEFAULT))
+        threshold = int(live_cfg().get("BLACKLIST_CF", BLACKLIST_CF_DEFAULT))
         with proxy_lock:
             if proxy_str not in proxy_meta:
                 proxy_meta[proxy_str] = {"fails": 0, "success": 0, "country": "Unknown",
@@ -4273,7 +4283,7 @@ def smtp_domain_probe(domain, timeout=3.5):
 
     with alive_pool_lock:
         have_pool = bool(alive_pool)
-    if have_pool and CFG.get("PROXY_MODE", "fallback") != "off":
+    if have_pool and live_cfg().get("PROXY_MODE", "fallback") != "off":
         if _smtp_banner_ok(live, sample_alive_proxy(domain=domain), timeout):
             return True
     return False
@@ -4346,10 +4356,10 @@ def smtp_failed_check(domain, px, trace_logs):
             s = None
             try:
                 s = _raw_socket(h, port, px, timeout=min(6.0, max(3.0, float(
-                    CFG.get("TIMEOUT", ATTEMPT_TIMEOUT_NORMAL)))))
+                    live_cfg().get("TIMEOUT", ATTEMPT_TIMEOUT_NORMAL)))))
                 if use_tls:
                     s = _tls_context(h, False).wrap_socket(s, server_hostname=h)
-                s.settimeout(min(6.0, max(3.0, float(CFG.get("TIMEOUT", ATTEMPT_TIMEOUT_NORMAL)))))
+                s.settimeout(min(6.0, max(3.0, float(live_cfg().get("TIMEOUT", ATTEMPT_TIMEOUT_NORMAL)))))
                 banner = s.recv(200)
                 if banner[:3] == b"220":
                     trace_logs.append(f"SMTP failed check -> {px_tag(px)} {h}:{port} OK")
@@ -4397,7 +4407,7 @@ def sample_alive_proxy(exclude=None, domain=None, avoid=None):
     if not pool:
         return None
 
-    if CFG.get("QUARANTINE_407", True):
+    if live_cfg().get("QUARANTINE_407", True):
         with proxy_quarantine_lock:
             q = set(proxy_quarantine)
         fresh = [p for p in pool if p not in q]
@@ -4419,7 +4429,7 @@ def sample_alive_proxy(exclude=None, domain=None, avoid=None):
         if fresh:
             pool = fresh
 
-    if CFG.get("GEO_CALL", False) and domain:
+    if live_cfg().get("GEO_CALL", False) and domain:
         want = tld_country(domain)
         if want:
             matched = [p for p in pool
@@ -4427,7 +4437,7 @@ def sample_alive_proxy(exclude=None, domain=None, avoid=None):
             if matched:
                 pool = matched
 
-    if CFG.get("QUARANTINE_407", True):
+    if live_cfg().get("QUARANTINE_407", True):
         unparked = [p for p in pool if not _proxy_407_parked(p)]
         if unparked:
             pool = unparked
@@ -4438,7 +4448,7 @@ def sample_alive_proxy(exclude=None, domain=None, avoid=None):
     if not cand:
         cand = pool
 
-    if not CFG.get("RANDOM_ROTATION", True):
+    if not live_cfg().get("RANDOM_ROTATION", True):
         with STATE["rr_lock"]:
             STATE["rr_index"] = (STATE["rr_index"] + 1) % len(pool)
             return pool[STATE["rr_index"]]
@@ -4478,12 +4488,12 @@ def tunnel_probe(proxy_str, targets=None, timeout=None):
 
     targets = targets or probe_targets()
     try:
-        _max_t = max(1, int(CFG.get("PROBE_MAX_TARGETS", PROBE_MAX_TARGETS_DEFAULT)))
+        _max_t = max(1, int(live_cfg().get("PROBE_MAX_TARGETS", PROBE_MAX_TARGETS_DEFAULT)))
     except Exception:
         _max_t = PROBE_MAX_TARGETS_DEFAULT
     targets = list(targets)[:_max_t]
     try:
-        _second_scheme = bool(CFG.get("PROBE_SECOND_SCHEME", PROBE_SECOND_SCHEME_DEFAULT))
+        _second_scheme = bool(live_cfg().get("PROBE_SECOND_SCHEME", PROBE_SECOND_SCHEME_DEFAULT))
     except Exception:
         _second_scheme = PROBE_SECOND_SCHEME_DEFAULT
 
@@ -4570,8 +4580,8 @@ def precheck_proxy_fast(proxy_str):
             record_probe_result(proxy_str, False, "nosocks", error="PySocks missing")
             return False
         if not is_proxy_alive(info["host"], info["port"],
-                              timeout=float(CFG.get("PROXY_PRECHECK_TIMEOUT",
-                                                    PROXY_PRECHECK_TIMEOUT_DEFAULT))):
+                              timeout=float(live_cfg().get("PROXY_PRECHECK_TIMEOUT",
+                                                           PROXY_PRECHECK_TIMEOUT_DEFAULT))):
             record_proxy_attempt(proxy_str, success=False, is_network_error=True)
             record_probe_result(proxy_str, False, "tcp",
                                 error=f"direct TCP to {info['host']}:{info['port']} failed")
@@ -4657,7 +4667,7 @@ def _mail_spot_target():
 
 def mail_dest_spot_check(force: bool = False):
     """CONNECT a few nodes to a MAIL destination and report it."""
-    if not force and not CFG.get("MAIL_SPOT_CHECK", MAIL_SPOT_CHECK_DEFAULT):
+    if not force and not live_cfg().get("MAIL_SPOT_CHECK", MAIL_SPOT_CHECK_DEFAULT):
         return
     with alive_pool_lock:
         pool = [p for p in alive_pool if p]
@@ -4701,7 +4711,7 @@ def refresh_alive_pool(force: bool = False, budget: float = None):
     budget = float(budget if budget is not None else PROBE_BATCH_BUDGET)
 
     if (not force) and (not STATE.get("run_active")) \
-            and not CFG.get("PROBER_IDLE_ENABLED", PROBER_IDLE_ENABLED_DEFAULT):
+            and not live_cfg().get("PROBER_IDLE_ENABLED", PROBER_IDLE_ENABLED_DEFAULT):
         return
 
     if not _PROBE_OWNER_LOCK.acquire(blocking=False):
@@ -4735,7 +4745,7 @@ def refresh_alive_pool(force: bool = False, budget: float = None):
             return
 
         try:
-            _sample = max(0, int(CFG.get("PROBE_SAMPLE_MAX", 0)))
+            _sample = max(0, int(live_cfg().get("PROBE_SAMPLE_MAX", 0)))
         except Exception:
             _sample = 0
         if _sample and len(raw) > _sample:
@@ -4765,7 +4775,7 @@ def refresh_alive_pool(force: bool = False, budget: float = None):
                     if k not in file_keys:
                         _proxy_scheme.pop(k, None)
 
-        if not CFG.get("PROXY_TEST_FLIGHT", True):
+        if not live_cfg().get("PROXY_TEST_FLIGHT", True):
             with alive_pool_lock:
                 alive_pool[:] = raw
             enrich_proxy_geo(raw)
@@ -4779,13 +4789,13 @@ def refresh_alive_pool(force: bool = False, budget: float = None):
             return
 
         _tgts = probe_targets()
-        log_probe_event(f"refresh start: {len(raw)} candidate(s), target={CFG.get('PROBE_TARGET')} "
+        log_probe_event(f"refresh start: {len(raw)} candidate(s), target={live_cfg().get('PROBE_TARGET')} "
                         f"({[t[0] for t in _tgts]}), budget={budget:.0f}s, "
                         f"workers={probe_workers()}")
 
         live, batch_timed_out = _run_batch(precheck_proxy_fast, raw, probe_workers(), budget)
 
-        strict = bool(CFG.get("PROBE_STRICT", PROBE_STRICT_DEFAULT))
+        strict = bool(live_cfg().get("PROBE_STRICT", PROBE_STRICT_DEFAULT))
         note = ""
         if not live and not strict:
             live = raw
@@ -4821,7 +4831,7 @@ def refresh_alive_pool(force: bool = False, budget: float = None):
         line = (f"Alive pool refreshed: {len(live)} node(s) passed the tunnel probe "
                 f"out of {len(raw)} candidate(s). Probe breakdown -> pass={passed} "
                 f"auth407={auth} timeout={timeout_n} dead={dead} | "
-                f"target={CFG.get('PROBE_TARGET')} budget={budget:.0f}s strict={strict}{note}")
+                f"target={live_cfg().get('PROBE_TARGET')} budget={budget:.0f}s strict={strict}{note}")
         log_startup(line, quiet=True)
         log_probe_event(f"refresh end: alive={len(live)}/{len(raw)} pass={passed} "
                         f"auth={auth} timeout={timeout_n} dead={dead}{note}")
