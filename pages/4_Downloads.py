@@ -122,19 +122,23 @@ IGNORE = {
     "last_account.txt", "proxies.txt", "proxies_all.txt", "disposable_domains.txt",
     "clean_proxies.txt", "proxy_pool.txt", "download_presets.json",
 }
-IGNORE_TOKENS = ("resume", "unfinished", "remaining", "input", "proxies", "proxy", "config")
+# FIX DL-1: "proxy" used to be an IGNORE_TOKEN, so proxy_unhealthy_<stamp>.txt was
+# silently dropped from Sources. Match the real infrastructure filenames instead.
+IGNORE_TOKENS = ("resume", "unfinished", "remaining", "input", "proxies", "config")
 
 
 def _status_of(path):
     n = os.path.basename(path).lower()
     if "clean_valid" in n or "manual_valid" in n or "valid_accounts" in n:
         return "VALID"
-    for tag, word in (("VALID", "valid"), ("WRONG_PASSWORD", "wrong"),
-                      ("NEED_APP_PASSWORD", "need_app"), ("LOGIN_DROPPED", "login_dropped"),
-                      ("CONNECTION_FAILED", "failed"), ("PROXY_UNHEALTHY", "proxy_unhealthy"),
-                      ("RETRY_LATER", "retry_later"), ("RBL_BLOCKED", "rbl_blocked"),
-                      ("SMTP_FAILED", "smtp_failed"), ("DNS_FAILED", "dns_failed"),
-                      ("SKIPPED", "skipped"), ("UNKNOWN", "unclassified")):
+    # FIX DL-3: most-specific token first. "failed" used to swallow smtp_failed_* and
+    # dns_failed_* and file both as CONNECTION_FAILED.
+    for tag, word in (("LOGIN_DROPPED", "login_dropped"), ("NEED_APP_PASSWORD", "need_app"),
+                      ("PROXY_UNHEALTHY", "proxy_unhealthy"), ("RETRY_LATER", "retry_later"),
+                      ("RBL_BLOCKED", "rbl_blocked"), ("SMTP_FAILED", "smtp_failed"),
+                      ("DNS_FAILED", "dns_failed"), ("SKIPPED", "skipped"),
+                      ("UNKNOWN", "unclassified"), ("CONNECTION_FAILED", "failed"),
+                      ("WRONG_PASSWORD", "wrong"), ("VALID", "valid")):
         if word in n:
             return tag
     return "MIXED"
@@ -177,6 +181,34 @@ def _session_sources():
         items = st.session_state.get(key) or []
         if items:
             out[f"{label}  ({len(items)})"] = key
+    return out
+
+
+# FIX DL-2: one-click per-status download. tag -> newest file in mail_results/.
+STATUS_FILE_TAGS = (
+    ("valid", "Valid"),
+    ("wrong", "Wrong password"),
+    ("need_app", "App password / 2FA"),
+    ("login_dropped", "Login dropped (* BYE)"),
+    ("retry_later", "RETRY_LATER"),
+    ("rbl_blocked", "RBL blocked"),
+    ("failed", "Connection failed"),
+    ("proxy_unhealthy", "Proxy unhealthy"),
+    ("dns_failed", "DNS failed"),
+    ("smtp_failed", "SMTP failed"),
+    ("skipped", "Skipped / filtered"),
+    ("unclassified", "Unclassified"),
+)
+
+
+def _latest_per_tag():
+    """{tag: newest path} for every status that has a file on disk."""
+    out = {}
+    for tag, _lbl in STATUS_FILE_TAGS:
+        hits = sorted(glob.glob(os.path.join(APP_DIR, "mail_results", f"{tag}_*.txt")),
+                      reverse=True)
+        if hits:
+            out[tag] = hits[0]
     return out
 
 
@@ -400,7 +432,13 @@ with st.sidebar:
     if not labels:
         st.info("No result files yet. Run the checker, or validate a batch in the Reader.")
         st.stop()
-    picked = st.multiselect("Sources", labels, default=labels[:1])
+    # FIX DL-4: default to ALL sources. default=labels[:1] preselected only
+    # "Session . valid_results", which is why the page looked valid-only.
+    picked = st.multiselect(
+        "Sources", labels, default=labels,
+        help="Multi-select. Add ANY session bucket or any mail_results file - "
+             "nothing is filtered out.")
+    st.caption(f"{len(labels)} source(s) available, all selected. Deselect to narrow.")
 
     st.markdown("---")
     st.markdown("### 2. How to write it")
