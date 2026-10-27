@@ -7730,6 +7730,7 @@ if start_engine_btn:
 # @@BLOCK 106 RUN_LOOP deps=014,083,105
         detected_stop_reason = "Interrupted / Stopped before completion"
         run_interrupted = False
+        _bucket_seen = {}
         try:
             current_workers = CFG["MAX_WORKERS_START"]
             if CFG.get("DYNAMIC_WORKER_SCALING", False):
@@ -7845,7 +7846,7 @@ if start_engine_btn:
                                     log_container.markdown(colorize_logs(current_logs[-120:]),
                                                            unsafe_allow_html=True)
                                 else:
-                                    log_container.code("\n".join(current_logs[-120:]), language="text")
+                                    log_container.code("\n".join(current_logs), language="text")
 
                                 with report_metrics_placeholder.container():
                                     _m_pairs = [
@@ -7883,10 +7884,10 @@ if start_engine_btn:
                             str_lit.session_state.log_lines.append(err_msg)
                             current_logs = list(str_lit.session_state.log_lines)
                         if str_lit.session_state.get("colorize_logs", True):
-                            log_container.markdown(colorize_logs(current_logs[-120:]),
+                            log_container.markdown(colorize_logs(current_logs),
                                                    unsafe_allow_html=True)
                         else:
-                            log_container.code("\n".join(current_logs[-120:]), language="text")
+                            log_container.code("\n".join(current_logs), language="text")
 
                     if checked_count % 100 == 0 or checked_count == total_accs:
                         with session_state_lock:
