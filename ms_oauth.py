@@ -94,7 +94,7 @@ class MsTokenRejected(Exception):
 
     @property
     def verdict(self):
-        if self.code in ("AADSTS50126", "AADSTS50034"):
+        if self.code == "AADSTS50126":
             return "wrong_password"
         if self.code in ("AADSTS50076", "AADSTS50079", "AADSTS50074"):
             return "need_app_password"
@@ -270,11 +270,11 @@ def imap_xoauth2_open(email, password, server, proxy_class, port=993,
 def imap_xoauth2_once(email, password, server, proxy_class, port=993,
                       proxy_str=None, insecure=True, attempt_timeout=10):
     """Same as imap_xoauth2_open but closes the connection.  Returns (exists, claims)."""
-    mail, exists, claims = imap_xoauth2_open(
+    let_mail, exists, claims = imap_xoauth2_open(
         email, password, server, proxy_class, port=port, proxy_str=proxy_str,
         insecure=insecure, attempt_timeout=attempt_timeout)
     try:
-        mail.logout()
+        let_mail.logout()
     except Exception:
         pass
     return exists, claims
