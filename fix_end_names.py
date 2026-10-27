@@ -49,7 +49,7 @@ try:
 except Exception:
     FILES = ("app.py", "engine.py", "status.py", "pages/2_Diagnostics.py",
              "pages/3_Mailbox_Reader.py", "pages/4_Downloads.py",
-             "pages/5_Blocks.py", "pages/6_User_Guide.py")
+             "pages/5_Blocks.py", "pages/6_User_Guide.py", "ms_oauth.py")
 
 RE_ANY_MARKER = re.compile(r"@@(?:BLOCK|END)\b")
 RE_BLOCK = re.compile(r"^#\s*@@BLOCK\s+(\d{3})\s+([A-Za-z0-9_]+)"
