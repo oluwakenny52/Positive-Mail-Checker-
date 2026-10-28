@@ -1,4 +1,4 @@
-# @@FILE pages/5_Blocks.py blocks=11 version=v13.42
+# @@FILE pages/5_Blocks.py blocks=12 version=v13.42
 # @@BLOCK 000 FILE_HEADER deps=-
 """
 pages/5_Blocks.py - Block Inspector  (v13.42)
@@ -7,13 +7,68 @@ Validates the @@BLOCK frame of every big file IN THE BROWSER, so you never
 need a terminal, and lets you VALIDATE A PASTE before you commit it.
 
 Uses verify_blocks.py from the repo root as the single source of truth.
+
+Headless mode for CI (gate 8) - no Streamlit server and no streamlit import:
+
+    python3 pages/5_Blocks.py --fix-check
 """
 
 import os
 import sys
 from datetime import datetime
 
-import streamlit as st
+_CLI_FIX_CHECK = "--fix-check" in sys.argv
+
+
+class _BareNoop:
+    """Absorbs any st.* call made outside a Streamlit runtime."""
+
+    def __call__(self, *a, **k):
+        if len(a) == 1 and not k and callable(a[0]):
+            return a[0]                      # used as a bare decorator
+        return self
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def __getattr__(self, name):
+        return _BareNoop()
+
+
+class _BareSt:
+    """Minimal st.* surface, so blocks 001-010 run unchanged under plain python3."""
+
+    session_state = {}
+
+    def __getattr__(self, name):
+        return _BareNoop()
+
+    def tabs(self, labels):
+        return [_BareNoop() for _ in labels]
+
+    def columns(self, spec):
+        return [_BareNoop() for _ in range(spec)]
+
+    def button(self, *a, **k):
+        return False
+
+    def selectbox(self, label, options, **k):
+        return list(options)[0]
+
+    def text_area(self, *a, **k):
+        return ""
+
+    def stop(self):
+        raise SystemExit(2)
+
+
+if _CLI_FIX_CHECK:
+    st = _BareSt()          # bare mode: nothing here needs a real runtime
+else:
+    import streamlit as st
 # @@END 000 FILE_HEADER
 
 
@@ -31,6 +86,10 @@ if ROOT not in sys.path:
 try:
     import verify_blocks as VB
 except Exception as _e:
+    if _CLI_FIX_CHECK:
+        sys.stderr.write("FIX-CHECK: verify_blocks.py not importable from %s: %s\n"
+                         % (ROOT, _e))
+        raise SystemExit(2)
     st.error(f"verify_blocks.py could not be imported from {ROOT}: {_e}")
     st.caption("It must sit in the repo ROOT, next to app.py - not inside pages/.")
     st.stop()
@@ -306,6 +365,8 @@ _FIX_CHECKS = (
     ("pages/4_Downloads.py", "template.format(**d)", 1, "delimiter honours spaced templates"),
     ("pages/4_Downloads.py", '_cut = raw.find("|", _colon + 1)', 1, "no pipe truncation"),
     ("pages/5_Blocks.py", "out.insert(len(out) - 1, _end)", 2, "@@EOF stays last"),
+    ("pages/5_Blocks.py", "def run_fix_check():", 1, "one implementation, button and CLI"),
+    ("pages/5_Blocks.py", "if _CLI_FIX_CHECK:", 3, "CLI dispatch stays wired (000, 002, 011)"),
     ("engine.py", '_conf = getattr(_hosts, "conf", None)', 1, "engine reads hosts.conf"),
     ("engine.py", "state.cooldown_host(rung.host, 30.0)", 1, "cooldown table is armed"),
     ("engine.py", "def _local_to(domain, host):", 1, "pick_verdict checks locality"),
@@ -320,36 +381,44 @@ _ORDER_CHECKS = (
      '    if retryable:\n        return None, RETRY', "LOGIN_DROPPED before retryable"),
 )
 
+
+def run_fix_check():
+    """Run every fix check. Returns (rows, bad_count). No Streamlit calls, so the
+    button and the CLI share one implementation."""
+    _rows, _bad = [], 0
+    for _f, _needle, _want, _why in _FIX_CHECKS:
+        try:
+            with open(os.path.join(ROOT, _f), encoding="utf-8") as _fh:
+                _n = _fh.read().count(_needle)
+        except Exception as _e:
+            _rows.append("ERROR %-26s %r  (%s)" % (_f, _needle, _e))
+            _bad += 1
+            continue
+        _ok = (_n == _want)
+        _bad += 0 if _ok else 1
+        _rows.append("%s %-26s got %d want %d  %s  [%s]"
+                     % ("OK  " if _ok else "FAIL", _f, _n, _want, _needle, _why))
+    for _f, _a, _b, _why in _ORDER_CHECKS:
+        try:
+            with open(os.path.join(ROOT, _f), encoding="utf-8") as _fh:
+                _s = _fh.read()
+            _ok = (_a in _s) and (_b in _s) and (_s.rindex(_a) < _s.index(_b))
+        except Exception as _e:
+            _rows.append("ERROR %-26s order check (%s)" % (_f, _e))
+            _bad += 1
+            continue
+        _bad += 0 if _ok else 1
+        _rows.append("%s %-26s order  [%s]"
+                     % ("OK  " if _ok else "FAIL", _f, _why))
+    return _rows, _bad
+
+
 st.divider()
 with st.expander("🧪 Fix self-check (are the behavioural fixes still in?)", expanded=False):
     st.caption("Textual, like the gates: it proves the fix is still THERE, not that it "
                "behaves. A FAIL means the fix was lost in an edit or a repair.")
     if st.button("🧪 Run fix self-check", type="primary", key="fx_go"):
-        _rows, _bad = [], 0
-        for _f, _needle, _want, _why in _FIX_CHECKS:
-            try:
-                with open(os.path.join(ROOT, _f), encoding="utf-8") as _fh:
-                    _n = _fh.read().count(_needle)
-            except Exception as _e:
-                _rows.append("ERROR %-26s %r  (%s)" % (_f, _needle, _e))
-                _bad += 1
-                continue
-            _ok = (_n == _want)
-            _bad += 0 if _ok else 1
-            _rows.append("%s %-26s got %d want %d  %s  [%s]"
-                         % ("OK  " if _ok else "FAIL", _f, _n, _want, _needle, _why))
-        for _f, _a, _b, _why in _ORDER_CHECKS:
-            try:
-                with open(os.path.join(ROOT, _f), encoding="utf-8") as _fh:
-                    _s = _fh.read()
-                _ok = (_a in _s) and (_b in _s) and (_s.rindex(_a) < _s.index(_b))
-            except Exception as _e:
-                _rows.append("ERROR %-26s order check (%s)" % (_f, _e))
-                _bad += 1
-                continue
-            _bad += 0 if _ok else 1
-            _rows.append("%s %-26s order  [%s]"
-                         % ("OK  " if _ok else "FAIL", _f, _why))
+        _rows, _bad = run_fix_check()
         st.session_state["fx_out"] = "\n".join(_rows)
         st.session_state["fx_bad"] = _bad
     if st.session_state.get("fx_out"):
@@ -359,4 +428,24 @@ with st.expander("🧪 Fix self-check (are the behavioural fixes still in?)", ex
             st.success("All checks OK.")
         st.code(st.session_state["fx_out"], language="text")
 # @@END 010 FIX_CHECK
+
+
+# @@BLOCK 011 CLI_FIX_CHECK deps=000,010
+# Headless entry so CI can exercise the self-check with no Streamlit server:
+#
+#     python3 pages/5_Blocks.py --fix-check
+#
+# Calls the same run_fix_check() the button calls.
+# Exit 0 = every check OK, 1 = at least one check FAILED, 2 = could not run.
+if _CLI_FIX_CHECK:
+    _rows, _bad = run_fix_check()
+    print("FIX-CHECK  pages/5_Blocks.py  (%d check(s))" % len(_rows))
+    for _r in _rows:
+        print("  " + _r)
+    if _bad:
+        print("FIX-CHECK: %d check(s) FAILED" % _bad)
+        raise SystemExit(1)
+    print("FIX-CHECK: OK")
+    raise SystemExit(0)
+# @@END 011 CLI_FIX_CHECK
 # @@EOF
