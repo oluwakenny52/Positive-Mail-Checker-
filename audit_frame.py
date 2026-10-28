@@ -16,7 +16,9 @@ import io, os, re, sys, tokenize
 try:
     from verify_blocks import BLOCKED_FILES as GATED
 except Exception:
-    GATED = ["app.py", "engine.py", "hosts.py", "status.py",
+    # Mirror of verify_blocks.BLOCKED_FILES: post-Tier-2 the app.py/engine.py
+    # pair collapses to app.py, so 9 files, not 10.
+    GATED = ["app.py", "hosts.py", "status.py",
              "pages/2_Diagnostics.py", "pages/3_Mailbox_Reader.py",
              "pages/4_Downloads.py", "pages/5_Blocks.py",
              "pages/6_User_Guide.py", "ms_oauth.py"]
@@ -24,7 +26,7 @@ except Exception:
 # NOTE: these are the CURRENT counts. tier2_split.py rewrites app.py+engine.py
 # into a different shape, so re-derive both numbers after running it or this
 # gate goes red on drift and looks like a regression.  EXPECT_BLOCKS drift trap.
-EXPECT_FILES, EXPECT_BLOCKS = 10, 263
+EXPECT_FILES, EXPECT_BLOCKS = 9, 246
 
 FILE_RX  = re.compile(r"^#\s*@@FILE\s+(\S+)\s+blocks=(\d+)\s+version=(\S+)\s*$")
 BLOCK_RX = re.compile(r"^#\s*@@BLOCK\s+(\d{3})\s+([A-Za-z0-9_]+)(?:\s+deps=(\S+))?\s*$")
