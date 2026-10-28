@@ -4178,14 +4178,18 @@ def sieve_auth_once(email, password, server, proxy_str=None, insecure=None,
 # COLLAPSED names (WRONG, APP, RBL, RETRY).  note_verdict()'s whitelist holds
 # only the collapsed names, so an AUTHENTICATIONFAILED was filed as Connection
 # Failed and silently dropped.  Fold once, at the boundary.
+# DNS_FAILED / SMTP_FAILED are already SPECIFIC, are reported as their own
+# buckets (dns_results / smtp_results) and arm the Fast-Mode cooldown, so they
+# map to THEMSELVES - flattening them onto CONNECTION_FAILED made a DNS problem
+# indistinguishable from a refused socket.
 _CANON_STATUS = {
     WRONG_PASSWORD: WRONG,
     NEED_APP_PASSWORD: APP,
     RBL_BLOCKED: RBL,
     RETRY_LATER: RETRY,
     FAILED: CONNECTION_FAILED,
-    DNS_FAILED: CONNECTION_FAILED,
-    SMTP_FAILED: CONNECTION_FAILED,
+    DNS_FAILED: DNS_FAILED,
+    SMTP_FAILED: SMTP_FAILED,
 }
 
 
