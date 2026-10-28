@@ -3675,14 +3675,14 @@ def get_filtered_active_proxies(quiet: bool = False):
                         "circuit breaker). Returning an EMPTY pool - the raw list is NOT "
                         "used as a silent fallback.", quiet=quiet)
             log_probe_event("proxy filter emptied the pool -> 0 candidates (no raw fallback)")
-        return filtered
+                return filtered
     except Exception as e:
         log_startup(f"WARNING: Error filtering active proxies: {e}", quiet=quiet)
         return load_proxies(quiet=quiet)
 
 
 all_proxies = load_proxies()
-filtered_pool = get_filtered_active_proxies()
+filtered_pool = []  # never snapshotted at import; refreshed by callers before use
 # @@END 058 FILE_IO
 
 # @@BLOCK 059 DNS_CACHE deps=024
