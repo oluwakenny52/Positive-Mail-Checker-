@@ -17,6 +17,7 @@ jobs:
       - uses: actions/setup-python@v6
         with:
           python-version: "3.14"
+          cache: pip
 
       - name: 1. fix_end_names --check
         id: g1
@@ -58,6 +59,11 @@ jobs:
         if: always()
         run: python3 -m compileall -q .
 
+      - name: 9. requirements resolve
+        id: g9
+        if: always()
+        run: python3 -m pip install -r requirements.txt
+
       - name: Summary
         if: always()
         env:
@@ -69,6 +75,7 @@ jobs:
           R6: ${{ steps.g6.outcome }}
           R7: ${{ steps.g7.outcome }}
           R8: ${{ steps.g8.outcome }}
+          R9: ${{ steps.g9.outcome }}
         run: |
           fail=0
           {
@@ -76,11 +83,11 @@ jobs:
             echo ""
             echo "| gate | result |"
             echo "| --- | --- |"
-            for pair in "fix_end_names.py --check:$R1" "verify_blocks.py:$R2" "audit_frame.py:$R3" "verify_v1337.py:$R4" "test_verdicts.py:$R5" "engine.py --selftest:$R6" "status.py --selftest:$R7" "compileall -q .:$R8"; do
+            for pair in "fix_end_names.py --check:$R1" "verify_blocks.py:$R2" "audit_frame.py:$R3" "verify_v1337.py:$R4" "test_verdicts.py:$R5" "engine.py --selftest:$R6" "status.py --selftest:$R7" "compileall -q .:$R8" "pip install -r requirements.txt:$R9"; do
               g="${pair%%:*}"; r="${pair##*:}"
               if [ "$r" = "success" ]; then echo "| \`$g\` | PASS |"; else echo "| \`$g\` | FAIL |"; fail=1; fi
             done
             echo ""
-            if [ "$fail" -eq 0 ]; then echo "**All eight gates green.**"; else echo "**A gate is RED - do not ship.**"; fi
+            if [ "$fail" -eq 0 ]; then echo "**All nine gates green.**"; else echo "**A gate is RED - do not ship.**"; fi
           } >> "$GITHUB_STEP_SUMMARY"
           exit $fail
