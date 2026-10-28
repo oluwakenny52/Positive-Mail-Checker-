@@ -16,14 +16,15 @@ import io, os, re, sys, tokenize
 try:
     from verify_blocks import BLOCKED_FILES as GATED
 except Exception:
-    GATED = ["app.py", "engine.py", "status.py", "pages/2_Diagnostics.py",
-             "pages/3_Mailbox_Reader.py", "pages/4_Downloads.py",
-             "pages/5_Blocks.py", "pages/6_User_Guide.py", "ms_oauth.py"]
+    GATED = ["app.py", "engine.py", "hosts.py", "status.py",
+             "pages/2_Diagnostics.py", "pages/3_Mailbox_Reader.py",
+             "pages/4_Downloads.py", "pages/5_Blocks.py",
+             "pages/6_User_Guide.py", "ms_oauth.py"]
 
 # NOTE: these are the CURRENT counts. tier2_split.py rewrites app.py+engine.py
 # into a different shape, so re-derive both numbers after running it or this
 # gate goes red on drift and looks like a regression.  EXPECT_BLOCKS drift trap.
-EXPECT_FILES, EXPECT_BLOCKS = 9, 245
+EXPECT_FILES, EXPECT_BLOCKS = 10, 263
 
 FILE_RX  = re.compile(r"^#\s*@@FILE\s+(\S+)\s+blocks=(\d+)\s+version=(\S+)\s*$")
 BLOCK_RX = re.compile(r"^#\s*@@BLOCK\s+(\d{3})\s+([A-Za-z0-9_]+)(?:\s+deps=(\S+))?\s*$")
@@ -31,6 +32,7 @@ END_RX   = re.compile(r"^#\s*@@END(?:\s+(\d{3}))?(?:\s+([A-Za-z0-9_]+))?\s*$")
 EOF_RX   = re.compile(r"^#\s*@@EOF\b")
 ALLOWED  = frozenset({"STRING", "COMMENT", "FSTRING_START", "FSTRING_MIDDLE",
                       "FSTRING_END", "NL", "NEWLINE", "INDENT", "DEDENT"})
+
 
 def non_ascii(src):
     lines = src.splitlines()
@@ -61,6 +63,7 @@ def non_ascii(src):
         except Exception:
             pass
     return [i for i, l in enumerate(masked, 1) if any(ord(c) > 127 for c in l)]
+
 
 def scan(path):
     out = {"path": path, "faults": [], "blocks": 0, "named": 0, "bare": 0,
@@ -133,6 +136,7 @@ def scan(path):
     for n in non_ascii(src):
         out["faults"].append("L%d non_ascii outside string/comment" % n)
     return out
+
 
 def api_conformance():
     """Prove verify_blocks.py satisfies its three callers. Returns [problems]."""
@@ -212,6 +216,7 @@ def api_conformance():
             bad.append("Tier 2: emit() does not write @@EOF")
     return bad
 
+
 def main():
     reps = [scan(p) for p in GATED] + [scan("verify_blocks.py")]
     faults = sum(len(r["faults"]) for r in reps)
@@ -277,6 +282,7 @@ def main():
     print()
     print("RESULT: %s" % ("GREEN" if ok else "NOT GREEN"))
     return 0 if ok else 1
+
 
 if __name__ == "__main__":
     sys.exit(main())
