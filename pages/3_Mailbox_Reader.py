@@ -3671,12 +3671,13 @@ with st.expander("🤖 Mass Bot Purge & Intelligence Hub", expanded=False):
 
     bot_page_size = st.slider("Bot Stream Results Page Size", 5, 200, 15, key="bot_page_size_slider")
 
-    # v13.37: say what the purge really is
-    st.caption("⚠️ The purge below is a per-term SERVER search (`telegram`, `otp`, `verification`, "
-               "`passcode`, `bot`) followed by \\Deleted + EXPUNGE on every hit in the selected folders. "
-               "It removes MORE than the rows previewed here.")
+    # v13.41: purge now deletes only the already-detected bot messages in the loaded stream.
+    # No SEARCH TEXT. Only the IDs the user has already seen as bots.
+    st.caption("⚠️ The purge below deletes only the bot messages currently shown in the loaded stream. "
+               "It uses their stored IDs. It does not run a new server search.")
 
     b_act1, b_act2 = st.columns(2)
+
     with b_act1:
         if st.button("🔍 Scan Folder For Bot/OTP/Telegram Messages", use_container_width=True):
             host = resolve_active_host(active_email)
@@ -3716,35 +3717,40 @@ with st.expander("🤖 Mass Bot Purge & Intelligence Hub", expanded=False):
                     mail = get_active_mail(active_email, active_password, host)
                     deleted_count = 0
 
-                    folders = sorted({bm["folder"] for bm in all_loaded_bot_msgs}) or [folder]
-                    terms = ["telegram", "otp", "verification", "passcode", "bot"]
+                    # Group already-detected bot message IDs by folder.
+                    # No SEARCH TEXT. Only the messages the user has already seen as bots.
+                    by_folder = {}
+                    for bm in all_loaded_bot_msgs:
+                        by_folder.setdefault(bm.get("folder") or folder, []).append(bm.get("id"))
+
+                    folders = sorted(by_folder.keys()) or [folder]
                     skipped_folders = []
                     for r_folder in folders:
                         r_encoded = encode_imap_utf7(get_imap_path(r_folder))
                         sel_typ, sel_data = mail.select(f'"{r_encoded}"', readonly=False)
                         if sel_typ != "OK":
-                            # v13.40: the return was ignored, so a folder that
-                            # failed to open got purged from the WRONG mailbox.
                             bot_log(f"⚠️ Skipped '{r_folder}': select failed ({sel_typ} {sel_data})")
                             skipped_folders.append(r_folder)
                             continue
                         bot_log(f"📂 Selected '{r_folder}' for purge.")
-                        found = set()
-                        for term in terms:
-                            typ, data = mail.search(None, "TEXT", term)
-                            if typ == "OK" and data and data[0]:
-                                found.update((data[0] or b"").split())
-                        bot_log(f"  └─ {len(found)} candidate IDs in '{r_folder}'.")
-                        if found:
-                            # v13.40: one comma-joined store instead of N round-trips.
-                            id_csv = b",".join(sorted(found, key=lambda x: int(x)))
-                            mail.store(id_csv, "+FLAGS", "\\Deleted")
-                        deleted_count += len(found)
+
+                        ids = [i for i in by_folder.get(r_folder, []) if i]
+                        if not ids:
+                            bot_log(f"  └─ no bot IDs in '{r_folder}'.")
+                            continue
+
+                        # IMAP IDs are numeric strings; store in one call.
+                        id_csv = b",".join(sorted(ids, key=lambda x: int(x)))
+                        mail.store(id_csv, "+FLAGS", "\\Deleted")
+                        deleted_count += len(ids)
+                        bot_log(f"  └─ marked {len(ids)} bot message(s) deleted in '{r_folder}'.")
                         mail.expunge()
+
                     if skipped_folders:
                         bot_log(f"🏁 Skipped folders: {skipped_folders}")
 
                     bot_log(f"🏁 [MASS DELETE COMPLETE] Purged {deleted_count} messages across {len(folders) - len(skipped_folders)} folder(s).")
+
                     st.session_state.current_messages = [m for m in st.session_state.current_messages if not m["is_bot"]]
                     st.session_state.bot_filter_mode = False
                     save_session_cache()
