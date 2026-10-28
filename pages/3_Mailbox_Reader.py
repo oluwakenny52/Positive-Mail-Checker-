@@ -65,6 +65,31 @@ st.set_page_config(
 # @@END 001 PAGE_CONFIG
 
 
+# @@BLOCK 001B USER_KEY_GATE deps=001
+import hashlib
+
+def _user_key_hash():
+    return st.session_state.get("user_key_hash", "")
+
+def user_file(name: str) -> str:
+    h = _user_key_hash()
+    return f"{h}_{name}" if h else name
+
+if not _user_key_hash():
+    st.markdown("## Enter your unique key")
+    st.caption("This key isolates your session on this device. Other users will not see your accounts, cache, or results.")
+    phrase = st.text_input("Unique key or phrase", type="password", key="user_key_input", placeholder="type anything only you know")
+    if st.button("Enter", type="primary"):
+        if phrase and phrase.strip():
+            h = hashlib.sha256(phrase.strip().encode("utf-8")).hexdigest()[:16]
+            st.session_state["user_key_hash"] = h
+            st.rerun()
+        else:
+            st.error("Key cannot be empty.")
+    st.stop()
+# @@END 001B USER_KEY_GATE
+
+
 # @@BLOCK 002 HOSTS_IMPORT deps=001
 try:
     from hosts import host_list
