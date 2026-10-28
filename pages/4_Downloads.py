@@ -118,6 +118,11 @@ st.markdown(
 # --------------------------------------------------------------------------
 # sources
 # --------------------------------------------------------------------------
+def _results_dir():
+    h = st.session_state.get("user_key_hash", "")
+    return f"{h}_mail_results" if h else "mail_results"
+    
+    
 IGNORE = {
     "last_account.txt", "proxies.txt", "proxies_all.txt", "disposable_domains.txt",
     "clean_proxies.txt", "proxy_pool.txt", "download_presets.json",
