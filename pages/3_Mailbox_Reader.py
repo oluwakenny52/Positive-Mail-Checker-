@@ -108,46 +108,21 @@ class MsVerdict(Exception):
 
 # @@BLOCK 005 PROVIDER_KNOWLEDGE deps=000
 # ============================================================================
-# PROVIDER KNOWLEDGE  (legacy ISP domains whose MX != their IMAP host)
+# PROVIDER KNOWLEDGE
 # ============================================================================
+# Host order is owned by hosts.py. This page no longer overrides it.
+# candidate_hosts() calls host_list() first, then appends generic guesses last.
+# ZERO_ACCESS_PROVIDERS still marks domains that have no IMAP at all.
 
-PROVIDER_FALLBACK_HOSTS = {
-    "charter.net":     ["mobile.charter.net", "imap.charter.net", "mail.twc.com", "imap.twc.com"],
-    "spectrum.net":    ["imap.spectrum.net", "mail.spectrum.net"],
-    "twc.com":         ["mail.twc.com", "imap.twc.com"],
-    "rr.com":          ["mail.twc.com", "imap.rr.com"],
-    "roadrunner.com":  ["mail.twc.com", "imap.rr.com"],
-    "brighthouse.com": ["mail.twc.com"],
-    "verizon.net":     ["imap.aol.com", "imap.verizon.net"],
-    "att.net":         ["imap.mail.att.net", "imap.att.net"],
-    "sbcglobal.net":   ["imap.mail.att.net", "imap.att.net"],
-    "bellsouth.net":   ["imap.mail.att.net", "imap.att.net"],
-    "ameritech.net":   ["imap.mail.att.net", "imap.att.net"],
-    "comcast.net":     ["imap.comcast.net"],
-    "cox.net":         ["imap.cox.net"],
-    "earthlink.net":   ["imap.earthlink.net"],
-    "windstream.net":  ["imap.windstream.net"],
-    "frontier.com":    ["imap.frontier.com"],
-    "frontiernet.net": ["imap.frontier.com"],
-    "centurylink.net": ["imap.centurylink.net"],
-    "q.com":           ["imap.centurylink.net"],
-    "embarqmail.com":  ["imap.centurylink.net"],
-    # Latin-America / Spanish-language ISPs (MX is a Zimbra MTA router, so the
-    # real endpoint must be supplied here - 'imap.<domain>' does not exist).
-    "montevideo.com.uy": ["mail.montevideo.com.uy", "webmail.montevideo.com.uy", "pop3-mvd.montevideo.com.uy"],
-    "adinet.com.uy":     ["mail.adinet.com.uy"],
-    "antel.com.uy":      ["mail.antel.com.uy"],
-    "uy.com":            ["mail.uy.com"],
-}
-
-# These have NO standard IMAP endpoint at all (need Bridge / no IMAP).
 ZERO_ACCESS_PROVIDERS = {
     "proton.me", "protonmail.com", "pm.me",
     "tuta.com", "tutanota.com", "tuta.io",
 }
 
 def candidate_hosts(email_addr: str, override_host: str = "") -> List[str]:
-    """Ordered, de-duplicated host candidates. Never returns an empty list."""
+    """Ordered, de-duplicated host candidates. Never returns an empty list.
+    Uses hosts.py host_list() as the single source of truth.
+    """
     email_addr = (email_addr or "").strip()
     domain = email_addr.split("@")[-1].lower() if "@" in email_addr else ""
 
@@ -159,9 +134,6 @@ def candidate_hosts(email_addr: str, override_host: str = "") -> List[str]:
 
     if override_host and override_host.strip():
         push(override_host.strip())
-
-    for h in PROVIDER_FALLBACK_HOSTS.get(domain, []):
-        push(h)
 
     try:
         for h in (host_list(email_addr) or []):
