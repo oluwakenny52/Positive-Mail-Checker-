@@ -618,10 +618,10 @@ with st.sidebar.expander("🎨 Theme (synced with checker)", expanded=False):
 
 # @@BLOCK 012 FILES_AND_CONFIG deps=000
 # Persistent Last Account Management & Session Cache
-LAST_ACCOUNT_FILE = "last_account.txt"
-APP_CONFIG_FILE = "app_config.json"
-MANUAL_VALID_FILE = "manual_valid_accounts.txt"
-SESSION_CACHE_FILE = "session_cache.json"
+LAST_ACCOUNT_FILE = user_file("last_account.txt")
+APP_CONFIG_FILE = user_file("app_config.json")
+MANUAL_VALID_FILE = user_file("manual_valid_accounts.txt")
+SESSION_CACHE_FILE = user_file("session_cache.json")
 
 DEFAULT_APP_CONFIG = {
     "connection_timeout": 15,
