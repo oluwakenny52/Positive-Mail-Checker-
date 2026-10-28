@@ -664,19 +664,22 @@ def save_session_cache():
             "otp_total_matched_count": st.session_state.get("otp_total_matched_count", 0),
         }
 
-        # v13.40: every message was base64'd into the cache, several times per
-        # interaction. Cap the count and the raw size.
+        # Never persist raw bodies or full body text. Metadata only.
+        # Full content is re-fetched on demand when a message is opened.
         MAX_CACHED = 60
-        MAX_RAW = 32 * 1024
-        for k_name, key_in_state in [("current_messages", "current_messages"), ("otp_messages", "otp_messages"), ("search_messages", "search_messages")]:
+        KEEP_KEYS = {
+            "id", "folder", "from", "to", "subject", "date",
+            "is_read", "is_bot", "categories", "flags", "size_bytes",
+            "pins", "links", "cards", "creds",
+        }
+        for k_name, key_in_state in [
+            ("current_messages", "current_messages"),
+            ("otp_messages", "otp_messages"),
+            ("search_messages", "search_messages"),
+        ]:
             serialized_list = []
             for m in st.session_state.get(key_in_state, [])[:MAX_CACHED]:
-                m_copy = {k: v for k, v in m.items() if k != "raw"}
-                raw_bytes = m.get("raw")
-                if isinstance(raw_bytes, bytes) and raw_bytes:
-                    m_copy["raw"] = base64.b64encode(raw_bytes[:MAX_RAW]).decode("ascii")
-                else:
-                    m_copy["raw"] = ""
+                m_copy = {k: v for k, v in m.items() if k in KEEP_KEYS}
                 serialized_list.append(m_copy)
             cache_data[k_name] = serialized_list
 
