@@ -484,9 +484,7 @@ str_lit.set_page_config(
     layout="wide",
     initial_sidebar_state="collapsed",
 )
-# @@END 007 PAGE_CONFIG
 
-# @@BLOCK 007B USER_KEY_GATE deps=007
 import hashlib
 
 def _user_key_hash():
@@ -508,7 +506,7 @@ if not _user_key_hash():
         else:
             str_lit.error("Key cannot be empty.")
     str_lit.stop()
-# @@END 007B USER_KEY_GATE
+# @@END 007 PAGE_CONFIG
 
 # @@BLOCK 008 BUILD_IDENTITY deps=-
 # Bump CFG_VERSION whenever a DEFAULT changes in a way users should inherit.
