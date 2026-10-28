@@ -1,7 +1,12 @@
+# @@FILE hosts.py blocks=17 version=v13.30
+# @@BLOCK 000 FILE_HEADER deps=-
 """
 hosts.py
 ========
 One host table. Primary first, backup second, with SRV/autoconfig/MX discovery.
+
+Framed with @@BLOCK markers, one per section - replace a whole block, never edit
+inside one.
 
 v13.30 changes
 --------------
@@ -54,11 +59,10 @@ try:
     _REQ = True
 except ImportError:
     _REQ = False
+# @@END 000 FILE_HEADER
 
-# ============================================================================
-# STATIC PROVIDER TABLES
-# ============================================================================
 
+# @@BLOCK 001 GLOBAL_SETS deps=000
 YAHOO_IMAP = ["imap.mail.yahoo.com"]
 YAHOO_POP = ["pop.mail.yahoo.com"]
 MS_IMAP = ["outlook.office365.com", "imap-mail.outlook.com"]
@@ -80,7 +84,10 @@ GMAIL_DOMAINS = {"gmail.com", "googlemail.com"}
 STRICT_APP = GMAIL_DOMAINS | {"outlook.com", "hotmail.com", "live.com", "windowslive.com"}
 ZERO_ACCESS = {"proton.me", "protonmail.com", "pm.me", "tuta.io", "tutanota.com", "tutamail.com", "tuta.com"}
 PARENT = {"memoad.jp": "biglobe.ne.jp"}
+# @@END 001 GLOBAL_SETS
 
+
+# @@BLOCK 002 US_ISP_FAMILIES deps=000
 ATT_FAMILY = {
     "att.net", "sbcglobal.net", "bellsouth.net", "pacbell.net", "swbell.net",
     "ameritech.net", "currently.com", "prodigy.net", "snet.net", "flash.net",
@@ -119,7 +126,10 @@ VERIZON_POP = ["pop.aol.com", "pop.verizon.net"]
 WINDSTREAM = {"windstream.net", "kinetic.net"}
 WINDSTREAM_IMAP = ["imap.windstream.net", "mail.windstream.net"]
 WINDSTREAM_POP = ["pop.windstream.net"]
+# @@END 002 US_ISP_FAMILIES
 
+
+# @@BLOCK 003 COUNTRY_IMAP deps=000
 COUNTRY = {
     "bluewin.ch": ["imaps.bluewin.ch"],
     "interia.pl": ["poczta.interia.pl"],
@@ -169,7 +179,10 @@ COUNTRY = {
     "cogeco.ca": ["imap.cogeco.ca"],
     "sympatico.ca": ["imap.sympatico.ca"],
 }
+# @@END 003 COUNTRY_IMAP
 
+
+# @@BLOCK 004 COUNTRY_POP deps=003
 # ---------------------------------------------------------------------------
 # v13.30 - POP ENDPOINTS FOR COUNTRY ENTRIES
 # ---------------------------------------------------------------------------
@@ -201,11 +214,10 @@ COUNTRY_POP = {
     "onet.pl": ["pop3.onet.pl"],
     "o2.pl": ["poczta.o2.pl"],
 }
+# @@END 004 COUNTRY_POP
 
-# ============================================================================
-# v13.18 - FAMILY PRIORITY + DEAD ENDPOINT DEMOTION
-# ============================================================================
 
+# @@BLOCK 005 DEAD_ENDPOINTS deps=000
 # Hosts that resolve but have NO IMAP listener.
 DEAD_IMAP_HOSTS = {
     "mail.yahoo.com", "email.yahoo.com", "yahoo.com",
@@ -236,7 +248,10 @@ DEAD_POP_HOSTS = {
     "imap.suddenlink.net", "imap.optimum.net",
     "imap.mediacombb.net",
 }
+# @@END 005 DEAD_ENDPOINTS
 
+
+# @@BLOCK 006 FAMILY_PRIORITY deps=001,002,003,005
 # domain -> hosts that MUST lead the ladder for that domain.
 FAMILY_PRIORITY = {}
 
@@ -335,8 +350,10 @@ def _order_provider_hosts(hosts, domain, pop=False):
         seen.add(h)
         (dead if h in dead_set else alive).append(h)
     return alive + dead
+# @@END 006 FAMILY_PRIORITY
 
 
+# @@BLOCK 007 POP_DERIVE deps=004,005
 # v13.30: derive a POP list from an IMAP list when no curated POP list exists.
 # A COUNTRY entry used to be handed to BOTH buckets verbatim, so the POP rung
 # dialled an IMAP-only hostname on 995 and the real POP host was never reached.
@@ -387,8 +404,10 @@ def _pop_for(domain, imap_hosts):
         if h and h not in out:
             out.append(h)
     return out
+# @@END 007 POP_DERIVE
 
 
+# @@BLOCK 008 SMTP_DIRECT deps=000
 # Explicit SMTP endpoints for the providers whose SMTP host is NOT derived from
 # their IMAP host. Checked before every guess.
 SMTP_DIRECT = {
@@ -424,7 +443,10 @@ SMTP_DIRECT = {
     "naver.com": ["smtp.naver.com"],
     "qq.com": ["smtp.qq.com"],
 }
+# @@END 008 SMTP_DIRECT
 
+
+# @@BLOCK 009 DISPOSABLE_AND_MX deps=000
 DISPOSABLE_PARTS = (
     "tempmail", "temp-mail", "guerrillamail", "10minutemail", "mailinator",
     "yopmail", "trashmail", "throwaway", "fakeinbox", "sharklasers",
@@ -490,11 +512,10 @@ MX_PROVIDER_MAP = (
       "liquidweb", "inmotion", "greengeeks", "a2hosting", "hostpapa",
       "netsol", "network solutions", "webhostingpad", "stablehost", "hawkhost"), (None, None, None)),
 )
+# @@END 009 DISPOSABLE_AND_MX
 
-# ============================================================================
-# ROUTER / RELAY DETECTION + CANDIDATE RANKING
-# ============================================================================
 
+# @@BLOCK 010 ROUTER_DETECTION deps=000
 _ROUTER_LABEL_EXACT = re.compile(
     r"^(?:"
     r"mx|mx\d+|mta|mtas|mta\d+|smtp|smtps|smtpout|smtp-in|smtp-out|"
@@ -569,8 +590,10 @@ def host_tier(host, domain):
     if is_junk_host(h, d):
         return 3
     return 2
+# @@END 010 ROUTER_DETECTION
 
 
+# @@BLOCK 011 PROBE_RANK deps=010,013
 _probe_lock = threading.Lock()
 _probe_cache = {}
 _PROBE_TTL = 600
@@ -642,12 +665,10 @@ def rank_hosts(hosts, domain, probe=True):
         t[0],
     ))
     return [h for _i, h in indexed]
+# @@END 011 PROBE_RANK
 
 
-# ============================================================================
-# CACHES  (atomic writes)
-# ============================================================================
-
+# @@BLOCK 012 CACHE_ATOMIC deps=000
 _CACHE_FILE = "hosts_cache.json"
 _CACHE_TTL = 86400
 _CACHE_MAX_AGE = 7 * 86400
@@ -782,12 +803,10 @@ def _dedupe(seq):
         if x and x not in out:
             out.append(x)
     return out
+# @@END 012 CACHE_ATOMIC
 
 
-# ============================================================================
-# DNS HELPERS
-# ============================================================================
-
+# @@BLOCK 013 DNS_HELPERS deps=012
 def _dns_resolve(name, rdtype):
     if not _DNS:
         return []
@@ -875,12 +894,10 @@ def host_resolves(host):
     with _resolve_lock:
         _resolve_cache[host] = ok
     return ok
+# @@END 013 DNS_HELPERS
 
 
-# ============================================================================
-# DOMAIN-LOCAL + ALIAS-ROOT SERVICE-NAME MERGE
-# ============================================================================
-
+# @@BLOCK 014 LOCAL_MERGE deps=005,006,013
 _LOCAL_PRIORITY_IMAP = ("imap.", "mail.", "email.", "")
 _LOCAL_PRIORITY_POP = ("pop.", "pop3.", "")
 
@@ -985,12 +1002,10 @@ def merge_domain_guesses(servers, domain):
         dead = [h for h in merged if h in dead_set]
         out[key] = alive + dead
     return out
+# @@END 014 LOCAL_MERGE
 
 
-# ============================================================================
-# DISCOVERY: SRV / AUTOCONFIG / AUTODISCOVER / MX
-# ============================================================================
-
+# @@BLOCK 015 DISCOVERY deps=009,011,013,014
 def _thunderbird_autoconfig(domain):
     if not _REQ:
         return [], []
@@ -1194,12 +1209,10 @@ def discover_hosts(domain, email=None, use_cache=True, force_refresh=False):
     _save_cache()
 
     return {"imap": imap, "pop": pop, "smtp": smtp, "sources": sources}
+# @@END 015 DISCOVERY
 
 
-# ============================================================================
-# PUBLIC API
-# ============================================================================
-
+# @@BLOCK 016 PUBLIC_API deps=004,006,007,013,015
 def domain_of(email_addr):
     return (email_addr or "").split("@")[-1].lower().strip()
 
@@ -1383,3 +1396,5 @@ def refresh_domain(domain):
 def is_disposable(email_addr):
     domain = domain_of(email_addr)
     return any(part in domain for part in DISPOSABLE_PARTS)
+# @@END 016 PUBLIC_API
+# @@EOF
