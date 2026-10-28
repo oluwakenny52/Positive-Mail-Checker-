@@ -768,7 +768,7 @@ def default_cfg() -> dict:
         "CUSTOM_WHITELIST": [],
         "CUSTOM_BLACKLIST": [],
         "PROXY_FILE": "proxies.txt",
-        "RESULTS_DIR": "mail_results",
+        "RESULTS_DIR": user_file("mail_results"),
         "CACHE_FILE": "domain_cache.json",
         "PROXY_META_FILE": "proxy_meta.json",
         "MAX_PROXY_TRIES": 2,
@@ -3431,7 +3431,7 @@ def build_cfg():
         "CUSTOM_WHITELIST": [d.strip().lower() for d in custom_whitelist_input.split(",") if d.strip()],
         "CUSTOM_BLACKLIST": [d.strip().lower() for d in custom_blacklist_input.split(",") if d.strip()],
         "PROXY_FILE": "proxies.txt",
-        "RESULTS_DIR": "mail_results",
+        "RESULTS_DIR": user_file("mail_results"),
         "CACHE_FILE": "domain_cache.json",
         "PROXY_META_FILE": "proxy_meta.json",
         "MAX_PROXY_TRIES": engine_config.max_retries,
@@ -5077,7 +5077,7 @@ def fetch_and_test_all_proxies(silent: bool = False):
 # @@END 077 FETCH_AND_TEST
 
 # @@BLOCK 078 CLEAN_VALID_IO deps=039
-CLEAN_VALID_FILE = "clean_valid_accounts.txt"
+CLEAN_VALID_FILE = user_file("clean_valid_accounts.txt")
 
 
 def _read_clean_valid():
