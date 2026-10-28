@@ -54,18 +54,14 @@ from email import message_from_bytes
 
 
 # @@BLOCK 001 PAGE_CONFIG deps=000
-# --- Page Config (MUST be the first Streamlit call) ---   # v13.37: hoisted
+# --- Page Config (MUST be the first Streamlit call) ---
 st.set_page_config(
     page_title="Bobito Mailbox Reader & Portal Hub",
     page_icon="📥",
     layout="wide",
-    # v13.39: "expanded" covers the whole viewport on a phone.
     initial_sidebar_state="collapsed"
 )
-# @@END 001 PAGE_CONFIG
 
-
-# @@BLOCK 001B USER_KEY_GATE deps=001
 import hashlib
 
 def _user_key_hash():
@@ -87,7 +83,7 @@ if not _user_key_hash():
         else:
             st.error("Key cannot be empty.")
     st.stop()
-# @@END 001B USER_KEY_GATE
+# @@END 001 PAGE_CONFIG
 
 
 # @@BLOCK 002 HOSTS_IMPORT deps=001
