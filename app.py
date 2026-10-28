@@ -3674,8 +3674,8 @@ def get_filtered_active_proxies(quiet: bool = False):
             log_startup("WARNING: every candidate was filtered out (min score / pool mode / "
                         "circuit breaker). Returning an EMPTY pool - the raw list is NOT "
                         "used as a silent fallback.", quiet=quiet)
-            log_probe_event("proxy filter emptied the pool -> 0 candidates (no raw fallback)")
-                return filtered
+                        log_probe_event("proxy filter emptied the pool -> 0 candidates (no raw fallback)")
+        return filtered
     except Exception as e:
         log_startup(f"WARNING: Error filtering active proxies: {e}", quiet=quiet)
         return load_proxies(quiet=quiet)
