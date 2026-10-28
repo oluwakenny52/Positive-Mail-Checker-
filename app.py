@@ -486,6 +486,30 @@ str_lit.set_page_config(
 )
 # @@END 007 PAGE_CONFIG
 
+# @@BLOCK 007B USER_KEY_GATE deps=007
+import hashlib
+
+def _user_key_hash():
+    return str_lit.session_state.get("user_key_hash", "")
+
+def user_file(name: str) -> str:
+    h = _user_key_hash()
+    return f"{h}_{name}" if h else name
+
+if not _user_key_hash():
+    str_lit.markdown("## Enter your unique key")
+    str_lit.caption("This key isolates your session on this device. Other users will not see your accounts, cache, or results.")
+    phrase = str_lit.text_input("Unique key or phrase", type="password", key="user_key_input", placeholder="type anything only you know")
+    if str_lit.button("Enter", type="primary"):
+        if phrase and phrase.strip():
+            h = hashlib.sha256(phrase.strip().encode("utf-8")).hexdigest()[:16]
+            str_lit.session_state["user_key_hash"] = h
+            str_lit.rerun()
+        else:
+            str_lit.error("Key cannot be empty.")
+    str_lit.stop()
+# @@END 007B USER_KEY_GATE
+
 # @@BLOCK 008 BUILD_IDENTITY deps=-
 # Bump CFG_VERSION whenever a DEFAULT changes in a way users should inherit.
 CFG_VERSION = 1340
@@ -1828,12 +1852,18 @@ def theme_css(th: dict) -> str:
     @keyframes bbShift {{ 0%{{background-position:0% 50%}} 50%{{background-position:100% 50%}} 100%{{background-position:0% 50%}} }}
     """
 
+    # Display fit from sidebar sliders (defaults if gate not yet passed)
+    _font = int(str_lit.session_state.get("ui_font_size", 16))
+    _scale = int(str_lit.session_state.get("ui_content_scale", 100)) / 100.0
+
     return f"""
 <style>
     :root {{
         --bb-g1: {g1}; --bb-g2: {g2}; --bb-ac: {ac}; --bb-ac2: {ac2};
         --bb-bg: {bg}; --bb-panel: {panel}; --bb-text: {text}; --bb-r: {r}px;
     }}
+    html {{ font-size: {_font}px !important; }}
+    .stApp {{ zoom: {_scale}; }}
     .stApp, [data-testid="stAppViewContainer"], [data-testid="stMain"] {{
         background: {bg} !important; color: {text} !important;
     }}
@@ -1931,7 +1961,6 @@ def theme_css(th: dict) -> str:
     .bb-section .bb-ico {{ font-size: 1.25rem; }}
     .bb-section .bb-t {{ font-weight: 800; font-size: 1.03rem; color: {text}; }}
     .bb-section .bb-s {{ font-size: .76rem; color: {dim}; margin-left: 8px; }}
-
     .bb-card {{
         background: {panel}; border: 1px solid {border}; border-radius: {r}px;
         padding: 14px 18px; {glass_css}
@@ -1941,21 +1970,18 @@ def theme_css(th: dict) -> str:
         font-size: .72rem; font-weight: 800; margin-right: 6px;
         background: {ac}33; color: {ac2}; border: 1px solid {ac}55;
     }}
-
     .bb-logbox {{
         background: {bg}; border: 1px solid {border}; border-radius: {r}px;
         padding: 10px 12px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
         font-size: .78rem; max-height: 420px; overflow-y: auto;
     }}
     .bb-log {{ padding: 1px 8px; white-space: pre-wrap; word-break: break-word; }}
-
     .help-box {{
         background: {panel}; border-left: 3px solid {ac};
         padding: 6px 10px; margin: 2px 0 8px 0;
         font-size: .78rem; color: {text}; opacity: .9;
         border-radius: 4px; line-height: 1.35;
     }}
-
     ::-webkit-scrollbar {{ width: 10px; height: 10px; }}
     ::-webkit-scrollbar-track {{ background: {bg}; }}
     ::-webkit-scrollbar-thumb {{ background: {g1}88; border-radius: 8px; }}
@@ -2621,6 +2647,12 @@ str_lit.sidebar.caption(
     "(Ctrl/Cmd+Shift+R). It is not an app error."
 )
 
+str_lit.sidebar.markdown("---")
+str_lit.sidebar.subheader("Display Fit")
+ui_font = str_lit.sidebar.slider("Font size", 12, 22, 16, key="ui_font_size")
+ui_scale = str_lit.sidebar.slider("Content scale %", 80, 140, 100, key="ui_content_scale")
+str_lit.sidebar.markdown("---")
+
 checker_mode = str_lit.sidebar.selectbox(
     "⚡ Select Engine Mode:",
     options=["Normal Mode", "Fast Mode", "Deep / Aggressive Mode"],
@@ -2629,7 +2661,6 @@ checker_mode = str_lit.sidebar.selectbox(
     help="Normal: balanced and safe for legacy ISP IMAP. Fast: syntax + MX pre-filter, "
          "rapid ports. Deep: maximum depth, multiple fallbacks, strict validation."
 )
-
 # v13.42: ui_workers / ui_deadline / ui_timeout are the SAME widget keys in all
 # three branches, but each branch declares DIFFERENT ranges, so a mode switch
 # could leave a stored value outside the new slider's range.  Clamp to the mode
@@ -2641,7 +2672,6 @@ for _k, (_lo, _hi) in zip(("ui_workers", "ui_deadline", "ui_timeout"), _bounds):
     _v = str_lit.session_state.get(_k)
     if isinstance(_v, int) and not (_lo <= _v <= _hi):
         str_lit.session_state[_k] = max(_lo, min(_hi, _v))
-
 if checker_mode == "Fast Mode":
     engine_config = CheckerConfig(mode_name="Fast", fast_mode=True, max_concurrent_checks=100,
                                   connect_timeout=5.0, max_retries=1, failure_cooldown=60.0)
@@ -2667,7 +2697,6 @@ else:
                                       key="ui_deadline")
     timeout = str_lit.sidebar.slider("Timeout", 3, 40, ATTEMPT_TIMEOUT_NORMAL, 1, key="ui_timeout")
     default_hosts = 3
-
 max_acc = str_lit.sidebar.slider("Max Accounts", 0, 5000, 5000, 100, key="ui_max_acc")
 blacklist_cf = str_lit.sidebar.slider(
     "Blacklist CF (consecutive proxy fails)", 3, 100, BLACKLIST_CF_DEFAULT, 1,
