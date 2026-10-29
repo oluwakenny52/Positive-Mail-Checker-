@@ -10,8 +10,9 @@ For every file the v13.37 work touched it checks:
   (c) every buggy pattern the fix replaced is GONE from the CODE,
   (d) no pasted-prose line, no stray markdown fence, and no tokenizer landmine
       (em dash / curly quote / nbsp outside a string) survived the paste,
-plus that no two files in pages/ share a page number, and that the build
-identity in app.py, its @@FILE header and pages/6_User_Guide.py all agree.
+plus that no two files in pages/ share a page number, that the build identity in
+app.py, its @@FILE header and pages/6_User_Guide.py all agree, and that every
+auth.<name> a page CALLS is actually defined in auth.py.
 
 WHY THIS REVISION EXISTS (v13.47)
 ---------------------------------
@@ -25,6 +26,11 @@ WHY THIS REVISION EXISTS (v13.47)
     catches an override (a second assignment silently wins by rebinding).
   * pages/6_User_Guide.py is gated too: it mirrors block 008 by design and now
     cannot drift from it.
+  * auth_api() compares every auth.<name> a page CALLS against the names auth.py
+    actually defines.  The fit_panel AttributeError shipped because nothing ever
+    compared the two: the callers were updated, the module was not, and every
+    gate stayed green.  The match is anchored on the call paren so that the
+    prose "auth.py" does not read as a call to a function named py.
   * A NOTE (not a failure) is printed for any block file whose own header
     version trails the app, so the drift stays visible without breaking CI.
 
@@ -248,6 +254,45 @@ def build_identity(app, app_code, gui, gui_code):
                 "pages/6_User_Guide.py assigns CFG_VERSION once")
         exactly(gui_code, "BUILD_TAG =", 1,
                 "pages/6_User_Guide.py assigns BUILD_TAG once")
+
+
+AUTH_CALLERS = ("app.py", "pages/3_Mailbox_Reader.py", "pages/4_Downloads.py",
+                "pages/5_Blocks.py", "pages/6_User_Guide.py")
+
+# anchored on the call paren: bare `auth.py` in prose must not read as auth.py()
+AUTH_CALL = re.compile(r"\bauth\.([A-Za-z_]\w*)\s*\(")
+
+AUTH_REQUIRED = ("fit", "fit_panel", "require", "user_file")
+
+
+def auth_api():
+    """Every auth.<name> a page CALLS must exist in auth.py.
+
+    The AttributeError for fit_panel shipped because nothing compared the two:
+    the callers were updated, the module was not, and every gate was green.
+    """
+    if not os.path.exists("auth.py"):
+        FAILS.append("auth.py is MISSING")
+        return
+    mod = read("auth.py")
+    defined = set(re.findall(r"^def\s+([A-Za-z_]\w*)\s*\(", mod, re.M))
+    for c in AUTH_CALLERS:
+        if not os.path.exists(c):
+            continue
+        called = sorted(set(AUTH_CALL.findall(read(c))))
+        if not called:
+            NOTES.append("%s calls no auth.<name> - nothing to compare" % c)
+        for name in called:
+            if name in defined:
+                PASSES.append("%s: auth.%s exists" % (c, name))
+            else:
+                FAILS.append("%s calls auth.%s, which auth.py does not define"
+                             % (c, name))
+    for need in AUTH_REQUIRED:
+        if need in defined:
+            PASSES.append("auth.py defines %s" % need)
+        else:
+            FAILS.append("auth.py does not define %s" % need)
 
 
 def version_drift(paths):
@@ -499,6 +544,7 @@ def main():
         exactly(code_view(gui), "def ug_h(", 1, "ug_h() defined once")
         gone(code_view(gui), "import auth\nimport auth", "auth not imported twice")
 
+    auth_api()
     page_numbers()
     version_drift(["engine.py", "status.py", "verify_blocks.py", "ms_oauth.py"])
 
