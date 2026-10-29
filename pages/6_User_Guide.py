@@ -131,6 +131,12 @@ st.markdown(_CSS, unsafe_allow_html=True)
 
 # @@BLOCK 004 AUTH deps=001
 import auth
+
+try:                                   # a module cached from before a redeploy
+    auth.fit_panel                     # still has the pre-split, one-function shape
+except AttributeError:
+    import importlib
+    auth = importlib.reload(auth)
 from auth import user_file
 
 # require() first, fit() second - the order every page uses. fit() is CSS-only
