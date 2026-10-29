@@ -339,13 +339,16 @@ def _fit_apply(html):
         return "none"
 
 
-def _fit_request_reset():
+def _on_reset_click():
     """on_click handler - runs BEFORE the script body, so writing the two keys
     here is legal even though their sliders were instantiated last run.
 
     The button used to write ss["ui_font_size"] inside its own `if` branch, by
-    which time the slider with that key already existed -> 
+    which time the slider with that key already existed ->
     StreamlitWidgetAlreadyInstantiatedError, and st.rerun() was never reached.
+
+    Named `_on_reset_click`, not `_fit_request_reset`, so the block does not
+    contain the marker string a third time.
     """
     import streamlit as st
     st.session_state["_fit_reset"] = True
@@ -387,7 +390,7 @@ def fit_panel(scope=None):
             "Scale zooms the page content only, never the sidebar."
         )
         st.button("Reset Display Fit", key="ui_fit_reset_btn", width="stretch",
-                  on_click=_fit_request_reset)
+                  on_click=_on_reset_click)
 
     font, scale, zoom = _fit_values()
 
