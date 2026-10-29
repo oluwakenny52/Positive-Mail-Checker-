@@ -207,14 +207,16 @@ def require(st, title="Unlock Positive Mail-Checker"):
 FIT_FONT_KEY = "ui_font_size"
 FIT_SCALE_KEY = "ui_content_scale"
 FIT_FONT_DEFAULT = 16
-FIT_SCALE_DEFAULT = 1.00
-FIT_FONT_MIN, FIT_FONT_MAX = 12, 24
-FIT_SCALE_MIN, FIT_SCALE_MAX = 0.75, 1.60
-# Above these a stored value is read as a PERCENT and scaled back down.
-# app.py block 019's SETTING_DEFAULTS seeds 100 / 100 in older trees; without
-# this the sliders were pinned at maximum and could not be moved at all.
+FIT_SCALE_DEFAULT = 100          # PERCENT, not a factor - this is what worked
+FIT_FONT_MIN, FIT_FONT_MAX = 12, 22
+FIT_SCALE_MIN, FIT_SCALE_MAX = 80, 140
+# A stored scale at or below this is a FACTOR (1.4) and is converted to a
+# percent (140). Anything above it is already a percent. Both directions are
+# covered so an old session, an old SETTING_DEFAULTS and a fresh install all land
+# in range.
+FIT_SCALE_FACTOR_BELOW = 3
+# A stored FONT size above this is a percent and is taken of the default px.
 FIT_FONT_PERCENT_ABOVE = 40
-FIT_SCALE_PERCENT_ABOVE = 3
 
 
 def _fit_raw(key, default, cast=float):
@@ -233,7 +235,7 @@ def _fit_raw(key, default, cast=float):
     return val
 
 
-def _fit_from(raw, default, lo, hi, cast=float, percent_above=None):
+def _fit_from(raw, default, lo, hi, cast=float, percent_above=None, factor_below=None):
     """Convert + clamp ONE raw value. Pure, so the selftest can drive it."""
     try:
         val = cast(raw)
@@ -243,12 +245,16 @@ def _fit_from(raw, default, lo, hi, cast=float, percent_above=None):
         return default
     if percent_above is not None and val > percent_above:
         val = cast(float(default) * val / 100.0)
+    elif factor_below is not None and val <= factor_below:
+        val = cast(val * 100.0)
     return max(lo, min(hi, val))
 
 
-def _fit_normalise(key, default, lo, hi, cast=float, percent_above=None):
+def _fit_normalise(key, default, lo, hi, cast=float, percent_above=None,
+                   factor_below=None):
     """Clamped, percent-aware read of one setting. NEVER raises."""
-    return _fit_from(_fit_raw(key, default, cast), default, lo, hi, cast, percent_above)
+    return _fit_from(_fit_raw(key, default, cast), default, lo, hi, cast,
+                     percent_above, factor_below)
 
 
 def _fit_read(key, default, lo, hi, cast=float):
@@ -258,22 +264,22 @@ def _fit_read(key, default, lo, hi, cast=float):
         raw = st.session_state.get(key, default)
     except Exception:
         return default
-    return _fit_from(raw, default, lo, hi, cast, None)
+    return _fit_from(raw, default, lo, hi, cast, None, None)
 
 
 def fit_css(font=None, scale=None) -> str:
     """CSS for the Display Fit sliders. Always returns a str.
 
-    font / scale are optional overrides, so the values can be exercised with no
+    font is px. scale is a PERCENT (80-140) and becomes a zoom factor.
+
+    font / scale are optional overrides so the values can be exercised with no
     Streamlit at all. No argument = read the live settings.
 
-    v13.45 LAYOUT FIX. `zoom` used to sit on `html body div.stApp`, which
-    CONTAINS the sidebar - and the mobile sheet sets the sidebar to 88vw. A vw
-    unit is not divided by the zoom factor, so at 1.40 the sidebar laid out at
-    123vw of visual width and shoved the main column off the screen. zoom now
-    sits on the MAIN container only: the sidebar keeps native geometry (its text
-    still grows, because :root is the rem base) and the main column scales.
-    Every declaration stays `!important` so a later sheet cannot outrank it.
+    `zoom` sits on the MAIN container only. It used to sit on
+    `html body div.stApp`, which CONTAINS the sidebar - and the mobile sheet sets
+    the sidebar to 88vw. A vw unit is not divided by the zoom factor, so at 1.40
+    the sidebar laid out at 123vw and shoved the main column off the screen.
+    Every declaration is `!important` so a later sheet cannot outrank it.
     """
     if font is None:
         size = _fit_normalise(FIT_FONT_KEY, FIT_FONT_DEFAULT,
@@ -281,10 +287,15 @@ def fit_css(font=None, scale=None) -> str:
     else:
         size = max(FIT_FONT_MIN, min(FIT_FONT_MAX, int(font)))
     if scale is None:
-        zoom = _fit_normalise(FIT_SCALE_KEY, FIT_SCALE_DEFAULT,
-                              FIT_SCALE_MIN, FIT_SCALE_MAX, float, FIT_SCALE_PERCENT_ABOVE)
+        pct = _fit_normalise(FIT_SCALE_KEY, FIT_SCALE_DEFAULT,
+                             FIT_SCALE_MIN, FIT_SCALE_MAX, float, None,
+                             FIT_SCALE_FACTOR_BELOW)
     else:
-        zoom = max(FIT_SCALE_MIN, min(FIT_SCALE_MAX, float(scale)))
+        pct = float(scale)
+        if pct <= FIT_SCALE_FACTOR_BELOW:      # a factor was handed in
+            pct = pct * 100.0
+        pct = max(FIT_SCALE_MIN, min(FIT_SCALE_MAX, pct))
+    zoom = pct / 100.0
 
     return (
         "<style>"
@@ -309,10 +320,9 @@ def fit(st) -> None:
 
     This is the ONLY definition of fit(), and it must be called EXACTLY ONCE per
     page. A second call assigns ui_font_size / ui_content_scale after those
-    widgets already exist, which raises StreamlitWidgetAlreadyInstantiatedError
-    inside the try/except below: the sliders survive, but the call is wasted and
-    anything written for them later in that run is lost. pages/3 called it twice
-    until v13.45.
+    widgets already exist, which raises inside the try/except below: the sliders
+    survive, but the call is wasted and anything written for them later in that
+    run is lost. app.py block 046 must therefore NOT define these two widgets.
     """
     try:
         if st.session_state.pop("_fit_reset", False):
@@ -322,28 +332,33 @@ def fit(st) -> None:
             st.session_state[FIT_SCALE_KEY] = FIT_SCALE_DEFAULT
 
         # Normalise UNCONDITIONALLY, not only when the key is missing. A key
-        # that is merely present can still hold a percent (100) from an older
-        # SETTING_DEFAULTS, and a slider handed 100 against 0.75-1.60 is pinned
-        # at maximum and immovable. Before the widgets, so no
+        # that is merely present can still hold a percent (100) or a factor
+        # (1.4), and a slider handed either against the wrong range is pinned
+        # and immovable. Before the widgets, so no
         # WidgetAlreadyInstantiatedError.
         st.session_state[FIT_FONT_KEY] = _fit_normalise(
             FIT_FONT_KEY, FIT_FONT_DEFAULT, FIT_FONT_MIN, FIT_FONT_MAX,
             int, FIT_FONT_PERCENT_ABOVE)
         st.session_state[FIT_SCALE_KEY] = _fit_normalise(
             FIT_SCALE_KEY, FIT_SCALE_DEFAULT, FIT_SCALE_MIN, FIT_SCALE_MAX,
-            float, FIT_SCALE_PERCENT_ABOVE)
+            float, None, FIT_SCALE_FACTOR_BELOW)
 
         with st.sidebar.expander("🔎 Display Fit", expanded=False):
-            st.slider("Text size (px)", FIT_FONT_MIN, FIT_FONT_MAX, key=FIT_FONT_KEY)
-            st.slider("Content scale", FIT_SCALE_MIN, FIT_SCALE_MAX, step=0.05,
-                      format="%.2f", key=FIT_SCALE_KEY)
-            st.caption("Text %dpx · Scale %.2f"
-                       % (st.session_state[FIT_FONT_KEY], st.session_state[FIT_SCALE_KEY]))
+            st.slider("Font size", FIT_FONT_MIN, FIT_FONT_MAX, key=FIT_FONT_KEY)
+            st.slider("Content scale %", FIT_SCALE_MIN, FIT_SCALE_MAX, step=5,
+                      key=FIT_SCALE_KEY)
+            st.caption("Text **%dpx** · Scale **%d%%** (zoom %.2f)"
+                       % (st.session_state[FIT_FONT_KEY],
+                          st.session_state[FIT_SCALE_KEY],
+                          st.session_state[FIT_SCALE_KEY] / 100.0))
             if st.button("Reset Display Fit", key="fit_reset_btn", width="stretch"):
                 st.session_state["_fit_reset"] = True
                 st.rerun()
-    except Exception:
-        pass
+    except Exception as _fit_err:
+        try:
+            st.sidebar.warning("Display Fit failed: %s" % _fit_err)
+        except Exception:
+            pass
     try:
         st.markdown(fit_css(), unsafe_allow_html=True)
     except Exception:
@@ -368,41 +383,48 @@ def _selftest() -> None:
     check("fit_css has zoom", lambda: "zoom: 1.00" in fit_css())
     check("fit_css honours font override", lambda: "font-size: 20px" in fit_css(20, 1.25))
     check("fit_css honours scale override", lambda: "zoom: 1.25" in fit_css(20, 1.25))
-    check("fit_css clamps high", lambda: "font-size: 24px" in fit_css(99, 9))
+    check("fit_css clamps high", lambda: "font-size: 22px" in fit_css(99, 9))
     check("fit_css clamps low", lambda: "font-size: 12px" in fit_css(1, 0))
+    check("fit_css accepts a percent directly", lambda: "zoom: 1.30" in fit_css(16, 130))
     check("fit_css not empty", lambda: len(fit_css()) > 40)
     check("fit_css closes style", lambda: fit_css().rstrip().endswith("</style>"))
     check("fit_css is important", lambda: fit_css().count("!important") >= 2)
     check("_fit_read defaults headless",
           lambda: _fit_read("no_such_key", 7, 0, 10, int) == 7)
 
-    # ---- percent leftovers from SETTING_DEFAULTS must land in range --------
-    # A value above the percent threshold is a percent; a value between the
-    # range top and the threshold is a factor that is merely out of range. Both
-    # end up clamped, in opposite directions - 9 is 9%, so it clamps LOW.
-    check("percent scale converts",
-          lambda: _fit_from(100, FIT_SCALE_DEFAULT, FIT_SCALE_MIN, FIT_SCALE_MAX, float, 3) == 1.0)
+    # ---- a percent OR a factor must land in range, from either direction ----
+    check("percent scale is untouched",
+          lambda: _fit_from(100, FIT_SCALE_DEFAULT, FIT_SCALE_MIN, FIT_SCALE_MAX,
+                            float, None, FIT_SCALE_FACTOR_BELOW) == 100)
+    check("factor scale converts to a percent",
+          lambda: _fit_from(1.25, FIT_SCALE_DEFAULT, FIT_SCALE_MIN, FIT_SCALE_MAX,
+                            float, None, FIT_SCALE_FACTOR_BELOW) == 125)
+    check("bare factor 1.0 converts", 
+          lambda: _fit_from(1.0, FIT_SCALE_DEFAULT, FIT_SCALE_MIN, FIT_SCALE_MAX,
+                            float, None, FIT_SCALE_FACTOR_BELOW) == 100)
     check("percent font converts",
           lambda: _fit_from(100, FIT_FONT_DEFAULT, FIT_FONT_MIN, FIT_FONT_MAX, int, 40) == 16)
-    check("factor scale is untouched",
-          lambda: _fit_from(1.25, FIT_SCALE_DEFAULT, FIT_SCALE_MIN, FIT_SCALE_MAX, float, 3) == 1.25)
     check("px font is untouched",
           lambda: _fit_from(20, FIT_FONT_DEFAULT, FIT_FONT_MIN, FIT_FONT_MAX, int, 40) == 20)
     check("junk falls back",
-          lambda: _fit_from("abc", FIT_SCALE_DEFAULT, FIT_SCALE_MIN, FIT_SCALE_MAX, float, 3) == 1.0)
-    check("above-range factor clamps high",
-          lambda: _fit_from(2.5, FIT_SCALE_DEFAULT, FIT_SCALE_MIN, FIT_SCALE_MAX, float, 3) == FIT_SCALE_MAX)
-    check("percent below the threshold clamps low",
-          lambda: _fit_from(9, FIT_SCALE_DEFAULT, FIT_SCALE_MIN, FIT_SCALE_MAX, float, 3) == FIT_SCALE_MIN)
+          lambda: _fit_from("abc", FIT_SCALE_DEFAULT, FIT_SCALE_MIN, FIT_SCALE_MAX,
+                            float, None, FIT_SCALE_FACTOR_BELOW) == FIT_SCALE_DEFAULT)
+    check("above-range percent clamps high",
+          lambda: _fit_from(250, FIT_SCALE_DEFAULT, FIT_SCALE_MIN, FIT_SCALE_MAX,
+                            float, None, FIT_SCALE_FACTOR_BELOW) == FIT_SCALE_MAX)
+    check("below-range percent clamps low",
+          lambda: _fit_from(9, FIT_SCALE_DEFAULT, FIT_SCALE_MIN, FIT_SCALE_MAX,
+                            float, None, FIT_SCALE_FACTOR_BELOW) == FIT_SCALE_MIN)
 
     # ---- the constants must stay inside the ranges fit_css clamps to -------
-    check("scale constants are factors, not percents",
-          lambda: FIT_SCALE_MIN < FIT_SCALE_DEFAULT <= FIT_SCALE_MAX <= 2.0)
-    check("font constants are px, not percents",
+    check("scale constants are percents",
+          lambda: FIT_SCALE_MIN < FIT_SCALE_DEFAULT <= FIT_SCALE_MAX <= 200)
+    check("font constants are px",
           lambda: FIT_FONT_MIN <= FIT_FONT_DEFAULT <= FIT_FONT_MAX <= 40)
-    check("percent thresholds sit above the ranges",
-          lambda: FIT_SCALE_PERCENT_ABOVE > FIT_SCALE_MAX
-          and FIT_FONT_PERCENT_ABOVE > FIT_FONT_MAX)
+    check("factor threshold sits below the scale range",
+          lambda: FIT_SCALE_FACTOR_BELOW < FIT_SCALE_MIN)
+    check("font percent threshold sits above the range",
+          lambda: FIT_FONT_PERCENT_ABOVE > FIT_FONT_MAX)
 
     # ---- passkey digest ----------------------------------------------------
     check("digest is stable", lambda: _digest("abc", "s") == _digest("abc", "s"))
