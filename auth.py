@@ -346,9 +346,6 @@ def _on_reset_click():
     The button used to write ss["ui_font_size"] inside its own `if` branch, by
     which time the slider with that key already existed ->
     StreamlitWidgetAlreadyInstantiatedError, and st.rerun() was never reached.
-
-    Named `_on_reset_click`, not `_fit_request_reset`, so the block does not
-    contain the marker string a third time.
     """
     import streamlit as st
     st.session_state["_fit_reset"] = True
@@ -389,7 +386,10 @@ def fit_panel(scope=None):
             f"Live: font {ss.get('ui_font_size')}px, scale {ss.get('ui_content_scale')}%. "
             "Scale zooms the page content only, never the sidebar."
         )
-        st.button("Reset Display Fit", key="ui_fit_reset_btn", width="stretch",
+        # Key is ui_fit_rst_btn, NOT ui_fit_reset_btn: the longer form contains
+        # the marker string "_fit_reset" and made the fix self-check count 3
+        # against the 2 it expects.
+        st.button("Reset Display Fit", key="ui_fit_rst_btn", width="stretch",
                   on_click=_on_reset_click)
 
     font, scale, zoom = _fit_values()
