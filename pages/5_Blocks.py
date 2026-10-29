@@ -397,6 +397,8 @@ with st.expander("🛠 Canonicalise @@END names (no terminal needed)", expanded=
 # strings the fix plan introduced, with the count each must appear at.
 # NB: three needles below point at THIS file, so each also matches its own
 # literal in this table - their want counts include that +1 self-reference.
+# ("importlib.reload(auth)" is NOT one of them: it also appears in block 004,
+# but its target is app.py, and the count is taken inside the target file.)
 _FIX_CHECKS = (
     ("status.py", "_PROXY_BLOCKED", 2, "proxy-blocked classifies as CONNECTION_FAILED"),
     ("status.py", "best = None", 1, "worse_of no longer seeds with UNKNOWN"),
@@ -425,6 +427,11 @@ _FIX_CHECKS = (
     ("pages/3_Mailbox_Reader.py", "auth.fit(st)", 1, "fit() called exactly once per page"),
     ("pages/4_Downloads.py", "from auth import user_file", 1,
      "Export Studio resolves user paths"),
+    ("auth.py", "def fit_panel(", 1, "panel is its own function, not part of fit"),
+    ("auth.py", "def fit(", 1, "fit() is CSS-only and defined once"),
+    ("pages/3_Mailbox_Reader.py", "from auth import user_file", 1,
+     "reader resolves per-user paths"),
+    ("app.py", "importlib.reload(auth)", 1, "app survives a stale cached auth module"),
 )
 
 # order matters in the verdict tail: a server answer must outrank retryable
