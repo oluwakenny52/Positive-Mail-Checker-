@@ -1,4 +1,4 @@
-# @@FILE auth.py blocks=6 version=v13.46
+# @@FILE auth.py blocks=6 version=v13.47
 # @@BLOCK 000 HEADER deps=-
 """auth.py - per-user passkey gate and display-fit controls.
 
@@ -17,6 +17,12 @@ Every page calls, in this order:
 fit() and fit_panel() are deliberately separate. The CSS has to land as early as
 possible so the first paint is already scaled; the panel has to land after the
 title or it pushes the header down. One function cannot do both.
+
+v13.47: the deployed copy had drifted - the panel was back inside fit() and
+fit_panel() did not exist at all, so every caller of fit_panel() died with
+AttributeError and the Reset button still wrote the slider keys after the
+sliders were built. fit() is CSS-only again and the reset travels through an
+on_click handler, which Streamlit runs BEFORE the script body.
 
 The passphrase is salted-sha256 hashed into passkey.json. It is a LOCK, not
 encryption: per-user files are separated by the hash PREFIX, they are not
@@ -340,11 +346,11 @@ def _fit_apply(html):
 
 
 def _on_reset_click():
-    """on_click handler - runs BEFORE the script body, so writing the two keys
-    here is legal even though their sliders were instantiated last run.
+    """on_click handler - runs BEFORE the script body, so raising the flag here
+    is legal even though the sliders existed last run.
 
-    The button used to write ss["ui_font_size"] inside its own `if` branch, by
-    which time the slider with that key already existed ->
+    The button used to write the two keys inside its own `if` branch, by which
+    time the slider holding that key was already instantiated this run ->
     StreamlitWidgetAlreadyInstantiatedError, and st.rerun() was never reached.
     """
     import streamlit as st
