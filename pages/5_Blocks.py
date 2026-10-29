@@ -140,6 +140,12 @@ st.markdown(
 if not _CLI_FIX_CHECK:
     import auth
 
+try:                                   # a module cached from before a redeploy
+    auth.fit_panel                     # still has the pre-split, one-function shape
+except AttributeError:
+    import importlib
+    auth = importlib.reload(auth)
+
     auth.require(st, "Unlock Block Inspector")
     auth.fit(st)                    # CSS only, before the first widget
     auth.fit_panel(st)              # the controls; collapsed until tapped
