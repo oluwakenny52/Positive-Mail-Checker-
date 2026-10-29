@@ -1,4 +1,4 @@
-# @@FILE auth.py blocks=6 version=v13.43
+# @@FILE auth.py blocks=6 version=v13.44
 # @@BLOCK 000 HEADER deps=-
 """auth.py - per-user passkey gate and display-fit controls.
 
@@ -210,17 +210,16 @@ FIT_FONT_DEFAULT = 16
 FIT_SCALE_DEFAULT = 1.00
 FIT_FONT_MIN, FIT_FONT_MAX = 12, 24
 FIT_SCALE_MIN, FIT_SCALE_MAX = 0.75, 1.60
+# Above these a stored value is read as a PERCENT and scaled back down.
+# app.py block 019's SETTING_DEFAULTS seeds 100 / 100, which sits far outside
+# both ranges; without this the sliders were pinned at maximum and could not be
+# moved at all, because fit() only ever seeded a key that was ABSENT.
+FIT_FONT_PERCENT_ABOVE = 40
+FIT_SCALE_PERCENT_ABOVE = 3
 
 
-def _fit_read(key, default, lo, hi, cast=float):
-    """One Display Fit setting, clamped. NEVER raises.
-
-    v13.44: this was a bare st.session_state read inside fit_css, so the call
-    raised whenever it ran outside a Streamlit script run - which is exactly
-    what the CI selftest does - and raised ImportError wherever streamlit is
-    not installed. The narrow except did not cover either, so fit_css died
-    before emitting a byte and the gate went red.
-    """
+def _fit_raw(key, default, cast=float):
+    """One Display Fit setting as stored, unclamped. NEVER raises."""
     try:
         import streamlit as st
         raw = st.session_state.get(key, default)
@@ -232,7 +231,35 @@ def _fit_read(key, default, lo, hi, cast=float):
         return default
     if val != val:                       # NaN
         return default
+    return val
+
+
+def _fit_from(raw, default, lo, hi, cast=float, percent_above=None):
+    """Convert + clamp ONE raw value. Pure, so the selftest can drive it."""
+    try:
+        val = cast(raw)
+    except (TypeError, ValueError):
+        return default
+    if val != val:                       # NaN
+        return default
+    if percent_above is not None and val > percent_above:
+        val = cast(float(default) * val / 100.0)
     return max(lo, min(hi, val))
+
+
+def _fit_normalise(key, default, lo, hi, cast=float, percent_above=None):
+    """Clamped, percent-aware read of one setting. NEVER raises."""
+    return _fit_from(_fit_raw(key, default, cast), default, lo, hi, cast, percent_above)
+
+
+def _fit_read(key, default, lo, hi, cast=float):
+    """Clamped read with no percent conversion. Kept for callers and selftest."""
+    try:
+        import streamlit as st
+        raw = st.session_state.get(key, default)
+    except Exception:
+        return default
+    return _fit_from(raw, default, lo, hi, cast, None)
 
 
 def fit_css(font=None, scale=None) -> str:
@@ -242,26 +269,33 @@ def fit_css(font=None, scale=None) -> str:
     Streamlit at all. No argument = read the live settings. The fallback is a
     harmless 16px / 1.00.
 
-    The slider that writes ui_content_scale must use FIT_SCALE_MIN..FIT_SCALE_MAX
-    (a 0.75-1.60 FACTOR). It used to be 80-140 percent, and every value above
-    1.60 clamped, pinning the zoom at maximum.
+    Specificity is deliberately high (`:root`, `html body div.stApp`) and every
+    declaration is `!important`, so a later font-size or zoom rule in app.py
+    cannot outrank this one. `:root` beats a bare `html` rule, which is what
+    makes the font-size reach rem-based text at all.
     """
     if font is None:
-        size = int(_fit_read(FIT_FONT_KEY, FIT_FONT_DEFAULT, FIT_FONT_MIN, FIT_FONT_MAX, int))
+        size = _fit_normalise(FIT_FONT_KEY, FIT_FONT_DEFAULT,
+                              FIT_FONT_MIN, FIT_FONT_MAX, int, FIT_FONT_PERCENT_ABOVE)
     else:
         size = max(FIT_FONT_MIN, min(FIT_FONT_MAX, int(font)))
     if scale is None:
-        zoom = float(_fit_read(FIT_SCALE_KEY, FIT_SCALE_DEFAULT, FIT_SCALE_MIN, FIT_SCALE_MAX, float))
+        zoom = _fit_normalise(FIT_SCALE_KEY, FIT_SCALE_DEFAULT,
+                              FIT_SCALE_MIN, FIT_SCALE_MAX, float, FIT_SCALE_PERCENT_ABOVE)
     else:
         zoom = max(FIT_SCALE_MIN, min(FIT_SCALE_MAX, float(scale)))
 
     return (
         "<style>"
-        f"html, body, .stApp, .stApp p, .stApp li, .stApp label, .stApp input, "
-        f".stApp textarea, .stApp select {{ font-size: {size}px !important; }}"
-        f".stApp {{ zoom: {zoom:.2f}; }}"
-        ".block-container, [data-testid=\"stMainBlockContainer\"] { max-width: 100% !important; }"
-        "</style>"
+        ":root, html body, html body div.stApp, html body .stApp p,"
+        " html body .stApp li, html body .stApp label, html body .stApp input,"
+        " html body .stApp textarea, html body .stApp select"
+        " { font-size: %dpx !important; }"
+        "html body div.stApp, html body [data-testid=\"stAppViewContainer\"]"
+        " { zoom: %.2f !important; }"
+        ".block-container, [data-testid=\"stMainBlockContainer\"]"
+        " { max-width: 100%% !important; }"
+        "</style>" % (size, zoom)
     )
 # @@END 003 FIT_CSS
 
@@ -270,8 +304,7 @@ def fit_css(font=None, scale=None) -> str:
 def fit(st) -> None:
     """Sidebar sliders + the CSS they drive. Call LATE in the page. Never raises.
 
-    This is the ONLY definition of fit(). It used to be duplicated here and in
-    003, so this copy shadowed the one that owned the reset handling.
+    This is the ONLY definition of fit().
     """
     try:
         if st.session_state.pop("_fit_reset", False):
@@ -280,17 +313,24 @@ def fit(st) -> None:
             st.session_state[FIT_FONT_KEY] = FIT_FONT_DEFAULT
             st.session_state[FIT_SCALE_KEY] = FIT_SCALE_DEFAULT
 
-        if FIT_FONT_KEY not in st.session_state:
-            st.session_state[FIT_FONT_KEY] = int(
-                _fit_read(FIT_FONT_KEY, FIT_FONT_DEFAULT, FIT_FONT_MIN, FIT_FONT_MAX, int))
-        if FIT_SCALE_KEY not in st.session_state:
-            st.session_state[FIT_SCALE_KEY] = float(
-                _fit_read(FIT_SCALE_KEY, FIT_SCALE_DEFAULT, FIT_SCALE_MIN, FIT_SCALE_MAX, float))
+        # v13.44: normalise UNCONDITIONALLY, not only when the key is missing.
+        # A key that is merely present can still hold a percent (100) from
+        # SETTING_DEFAULTS, and a slider handed 100 against 0.75-1.60 is pinned
+        # at maximum and immovable. Before the widgets, so no
+        # WidgetAlreadyInstantiatedError.
+        st.session_state[FIT_FONT_KEY] = _fit_normalise(
+            FIT_FONT_KEY, FIT_FONT_DEFAULT, FIT_FONT_MIN, FIT_FONT_MAX,
+            int, FIT_FONT_PERCENT_ABOVE)
+        st.session_state[FIT_SCALE_KEY] = _fit_normalise(
+            FIT_SCALE_KEY, FIT_SCALE_DEFAULT, FIT_SCALE_MIN, FIT_SCALE_MAX,
+            float, FIT_SCALE_PERCENT_ABOVE)
 
         with st.sidebar.expander("🔎 Display Fit", expanded=False):
             st.slider("Text size (px)", FIT_FONT_MIN, FIT_FONT_MAX, key=FIT_FONT_KEY)
             st.slider("Content scale", FIT_SCALE_MIN, FIT_SCALE_MAX, step=0.05,
                       format="%.2f", key=FIT_SCALE_KEY)
+            st.caption("Text %dpx · Scale %.2f"
+                       % (st.session_state[FIT_FONT_KEY], st.session_state[FIT_SCALE_KEY]))
             if st.button("Reset Display Fit", key="fit_reset_btn", width="stretch"):
                 st.session_state["_fit_reset"] = True
                 st.rerun()
@@ -324,14 +364,32 @@ def _selftest() -> None:
     check("fit_css clamps low", lambda: "font-size: 12px" in fit_css(1, 0))
     check("fit_css not empty", lambda: len(fit_css()) > 40)
     check("fit_css closes style", lambda: fit_css().rstrip().endswith("</style>"))
+    check("fit_css is important", lambda: fit_css().count("!important") >= 2)
     check("_fit_read defaults headless",
           lambda: _fit_read("no_such_key", 7, 0, 10, int) == 7)
+
+    # ---- percent leftovers from SETTING_DEFAULTS must land in range --------
+    check("percent scale converts",
+          lambda: _fit_from(100, FIT_SCALE_DEFAULT, FIT_SCALE_MIN, FIT_SCALE_MAX, float, 3) == 1.0)
+    check("percent font converts",
+          lambda: _fit_from(100, FIT_FONT_DEFAULT, FIT_FONT_MIN, FIT_FONT_MAX, int, 40) == 16)
+    check("factor scale is untouched",
+          lambda: _fit_from(1.25, FIT_SCALE_DEFAULT, FIT_SCALE_MIN, FIT_SCALE_MAX, float, 3) == 1.25)
+    check("px font is untouched",
+          lambda: _fit_from(20, FIT_FONT_DEFAULT, FIT_FONT_MIN, FIT_FONT_MAX, int, 40) == 20)
+    check("junk falls back",
+          lambda: _fit_from("abc", FIT_SCALE_DEFAULT, FIT_SCALE_MIN, FIT_SCALE_MAX, float, 3) == 1.0)
+    check("out of range still clamps",
+          lambda: _fit_from(9, FIT_SCALE_DEFAULT, FIT_SCALE_MIN, FIT_SCALE_MAX, float, 3) == FIT_SCALE_MAX)
 
     # ---- the constants must stay inside the ranges fit_css clamps to -------
     check("scale constants are factors, not percents",
           lambda: FIT_SCALE_MIN < FIT_SCALE_DEFAULT <= FIT_SCALE_MAX <= 2.0)
     check("font constants are px, not percents",
           lambda: FIT_FONT_MIN <= FIT_FONT_DEFAULT <= FIT_FONT_MAX <= 40)
+    check("percent thresholds sit above the ranges",
+          lambda: FIT_SCALE_PERCENT_ABOVE > FIT_SCALE_MAX
+          and FIT_FONT_PERCENT_ABOVE > FIT_FONT_MAX)
 
     # ---- passkey digest ----------------------------------------------------
     check("digest is stable", lambda: _digest("abc", "s") == _digest("abc", "s"))
