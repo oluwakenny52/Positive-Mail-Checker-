@@ -369,6 +369,9 @@ def _selftest() -> None:
           lambda: _fit_read("no_such_key", 7, 0, 10, int) == 7)
 
     # ---- percent leftovers from SETTING_DEFAULTS must land in range --------
+    # A value above the percent threshold is a percent; a value between the
+    # range top and the threshold is a factor that is merely out of range. Both
+    # end up clamped, in opposite directions - 9 is 9%, so it clamps LOW.
     check("percent scale converts",
           lambda: _fit_from(100, FIT_SCALE_DEFAULT, FIT_SCALE_MIN, FIT_SCALE_MAX, float, 3) == 1.0)
     check("percent font converts",
@@ -379,8 +382,10 @@ def _selftest() -> None:
           lambda: _fit_from(20, FIT_FONT_DEFAULT, FIT_FONT_MIN, FIT_FONT_MAX, int, 40) == 20)
     check("junk falls back",
           lambda: _fit_from("abc", FIT_SCALE_DEFAULT, FIT_SCALE_MIN, FIT_SCALE_MAX, float, 3) == 1.0)
-    check("out of range still clamps",
-          lambda: _fit_from(9, FIT_SCALE_DEFAULT, FIT_SCALE_MIN, FIT_SCALE_MAX, float, 3) == FIT_SCALE_MAX)
+    check("above-range factor clamps high",
+          lambda: _fit_from(2.5, FIT_SCALE_DEFAULT, FIT_SCALE_MIN, FIT_SCALE_MAX, float, 3) == FIT_SCALE_MAX)
+    check("percent below the threshold clamps low",
+          lambda: _fit_from(9, FIT_SCALE_DEFAULT, FIT_SCALE_MIN, FIT_SCALE_MAX, float, 3) == FIT_SCALE_MIN)
 
     # ---- the constants must stay inside the ranges fit_css clamps to -------
     check("scale constants are factors, not percents",
