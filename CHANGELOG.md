@@ -15,6 +15,9 @@ Mega Ultimate Mail Checker — v13.43
 * Reader hardening: per-user batch result files, delimiter-less LIST lines parsed
   as names, proxy probe dials the real port, word-boundary batch matching,
   throttled cache writes, `st.iframe` keep-alive, purge checks the STORE reply.
+* `fit_css()` is headless-proof: `_fit_read()` never raises, `fit_css(font, scale)`
+  takes overrides, and the selftest asserts values instead of the environment.
+* `pages/4` presets resolve per user at call time.
 Mega Ultimate Mail Checker — v13.40a
 ===================================
 * **Frame Restored**: Every file's block frame structure and ending tag names are verified, with block count alignment fully restored across the workspace (246 blocks total).
