@@ -34,7 +34,12 @@ st.set_page_config(
 
 # @@BLOCK 002 APP_PATHS deps=000
 APP_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-PRESET_FILE = os.path.join(APP_DIR, "download_presets.json")
+def _preset_file():
+    """Per-user preset file. Resolved at CALL time - block 002 runs before the
+    gate, so the hash is not known yet."""
+    h = st.session_state.get("user_key_hash", "")
+    name = ("%s_download_presets.json" % h) if h else "download_presets.json"
+    return os.path.join(APP_DIR, name)
 # @@END 002 APP_PATHS
 
 
@@ -396,8 +401,8 @@ def _json_of(rows, lines=True):
 # @@BLOCK 009 PRESETS_IO deps=002
 def _presets():
     try:
-        if os.path.exists(PRESET_FILE):
-            with open(PRESET_FILE, encoding="utf-8") as f:
+        if os.path.exists(_preset_file()):
+            with open(_preset_file(), encoding="utf-8") as f:
                 return json.load(f) or {}
     except Exception:
         pass
@@ -406,7 +411,7 @@ def _presets():
 
 def _save_presets(d):
     try:
-        with open(PRESET_FILE, "w", encoding="utf-8") as f:
+        with open(_preset_file(), "w", encoding="utf-8") as f:
             json.dump(d, f, indent=2)
     except Exception:
         pass
