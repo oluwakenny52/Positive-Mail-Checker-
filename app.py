@@ -3624,6 +3624,10 @@ _theme = str_lit.session_state.theme
 str_lit.markdown(theme_css(_theme), unsafe_allow_html=True)
 render_hero(_theme)
 
+# Display Fit controls belong UNDER the header. fit() in block 007 injects the
+# CSS only; the panel is drawn here.
+auth.fit_panel(str_lit)
+
 try:
     os.makedirs(CFG["RESULTS_DIR"], exist_ok=True)
     log_startup(f"Verified/Created results directory at '{CFG['RESULTS_DIR']}'.")
