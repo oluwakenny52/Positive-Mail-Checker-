@@ -1,7 +1,7 @@
-# @@FILE pages/4_Downloads.py blocks=16 version=v13.44
+# @@FILE pages/4_Downloads.py blocks=16 version=v13.47
 # @@BLOCK 000 FILE_HEADER deps=-
 """
-pages/4_Downloads.py — Bobito Export Studio  (v13.44)
+pages/4_Downloads.py — Bobito Export Studio  (v13.47)
 =====================================================
 Pick WHAT to download, pick HOW it is written, preview it, take it.
 
@@ -14,6 +14,19 @@ v13.44 fix on this page
   It used to be built at import time in block 002, which runs BEFORE the gate,
   so the path never carried the unlocked hash and every user on the deployment
   shared one preset store.
+
+v13.47 fixes on this page
+-------------------------
+* DISPLAY FIT PANEL: auth.fit_panel() is called in block 005. auth.fit() injects
+  the CSS only, so without this call the Display Fit control was missing here.
+  The expander stays collapsed until it is tapped.
+* LAST-ACCOUNT FILE: "last_account" is an IGNORE_TOKEN now. The live file is
+  <hash>_last_account.txt, and the IGNORE set only matched the bare basename, so
+  the account bookkeeping file was offered as an export source.
+* EX_TPL DEFAULT: the text_input supplied both value= and a pre-seeded key, which
+  raised Streamlit's "created with a default value but also had its value set via
+  the Session State API" warning on every render. value= is gone; the key is
+  still seeded by the preset branch and the format-change guard above it.
 """
 
 import os
@@ -134,7 +147,8 @@ import auth
 from auth import user_file
 
 auth.require(st, "Unlock Export Studio")
-auth.fit(st)
+auth.fit(st)                        # CSS only, before the first widget
+auth.fit_panel(st)                  # the controls; collapsed until tapped
 # @@END 005 HERO
 
 
@@ -159,7 +173,10 @@ IGNORE = {
 }
 # FIX DL-1: "proxy" used to be an IGNORE_TOKEN, so proxy_unhealthy_<stamp>.txt was
 # silently dropped from Sources. Match the real infrastructure filenames instead.
-IGNORE_TOKENS = ("resume", "unfinished", "remaining", "input", "proxies", "config")
+# v13.47: "last_account" is a token - the live file is <hash>_last_account.txt, so
+# the bare basename in IGNORE never matched it and it showed up as a source.
+IGNORE_TOKENS = ("resume", "unfinished", "remaining", "input", "proxies", "config",
+                 "last_account")
 
 
 def _status_of(path):
@@ -483,13 +500,18 @@ with st.sidebar:
     # format did nothing.  Re-seed the key when the format changes - legal here,
     # the text_input below does not exist yet this run.  A preset applied this
     # run wins (its marker is still in session_state).
+    # v13.47: the widget below carries no value= any more. Passing both a default
+    # and a key that is already in session_state raised Streamlit's
+    # "created with a default value but also had its value set via the Session
+    # State API" warning on every render. The key is always seeded here first.
     if st.session_state.get("_ex_fmt_seen") != fmt_name:
         st.session_state["_ex_fmt_seen"] = fmt_name
         if default_tpl and not st.session_state.get("_ex_active"):
             st.session_state["ex_tpl"] = default_tpl
+    if "ex_tpl" not in st.session_state:
+        st.session_state["ex_tpl"] = default_tpl or "{email}:{password}"
     template = st.text_input(
         "Template ({email} {password} {domain} {local} {status} {host} {port} {detail} {n})",
-        value=default_tpl or "{email}:{password}",
         key="ex_tpl",
     )
     if fmt_name == "CUSTOM" and not template.strip():
