@@ -1,4 +1,5 @@
-## v13.43 - passphrase gate and full display fit
+Mega Ultimate Mail Checker — v13.43
+===================================
 
 * NEW `auth.py`: per-user passkey gate on all six entry points, salted-sha256,
   optional device remember, "start fresh as a different user".
@@ -11,6 +12,9 @@
 * Reader: restored messages keep `raw`/`body`; `LAST_ACCOUNT_FILE` compared by
   basename.
 * Gates: `hosts.py` and `auth.py` added to `BLOCKED_FILES`; 11 files / 269 blocks.
+* Reader hardening: per-user batch result files, delimiter-less LIST lines parsed
+  as names, proxy probe dials the real port, word-boundary batch matching,
+  throttled cache writes, `st.iframe` keep-alive, purge checks the STORE reply.
 Mega Ultimate Mail Checker — v13.40a
 ===================================
 * **Frame Restored**: Every file's block frame structure and ending tag names are verified, with block count alignment fully restored across the workspace (246 blocks total).
