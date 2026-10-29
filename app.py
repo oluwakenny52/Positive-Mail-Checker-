@@ -485,27 +485,15 @@ str_lit.set_page_config(
     initial_sidebar_state="collapsed",
 )
 
-import hashlib
+import auth
 
-def _user_key_hash():
-    return str_lit.session_state.get("user_key_hash", "")
+# The passkey gate lives in auth.py so every page shares ONE implementation.
+# user_file() is re-exported: default_cfg(), RESULTS_DIR, CLEAN_VALID_FILE and
+# every results glob prefix per-user names with the unlocked hash.
+user_file = auth.user_file
 
-def user_file(name: str) -> str:
-    h = _user_key_hash()
-    return f"{h}_{name}" if h else name
-
-if not _user_key_hash():
-    str_lit.markdown("## Enter your unique key")
-    str_lit.caption("This key isolates your session on this device. Other users will not see your accounts, cache, or results.")
-    phrase = str_lit.text_input("Unique key or phrase", type="password", key="user_key_input", placeholder="type anything only you know")
-    if str_lit.button("Enter", type="primary"):
-        if phrase and phrase.strip():
-            h = hashlib.sha256(phrase.strip().encode("utf-8")).hexdigest()[:16]
-            str_lit.session_state["user_key_hash"] = h
-            str_lit.rerun()
-        else:
-            str_lit.error("Key cannot be empty.")
-    str_lit.stop()
+str_lit.markdown(auth.fit_css(), unsafe_allow_html=True)
+auth.require(str_lit)
 # @@END 007 PAGE_CONFIG
 
 # @@BLOCK 008 BUILD_IDENTITY deps=-
