@@ -1,7 +1,7 @@
-# @@FILE pages/2_Diagnostics.py blocks=20 version=v13.40
+# @@FILE pages/2_Diagnostics.py blocks=20 version=v13.47
 # @@BLOCK 000 FILE_HEADER deps=-
 """
-pages/2_Diagnostics.py — Mega Ultimate Mail Checker  (v13.40)
+pages/2_Diagnostics.py — Mega Ultimate Mail Checker  (v13.47)
 ============================================================
 Read-only inspection page. It answers three questions without spending a single
 proxy credit or touching a mailbox:
@@ -30,6 +30,14 @@ v13.37 fixes on this page
   engine's real protocol flags out of st.session_state["applied_cfg"].
 * The POP warning was unconditional-ish.  Replaced with a real
   pop_only-vs-all_pop test.
+
+v13.47 fixes on this page
+-------------------------
+* DISPLAY FIT PANEL: auth.fit_panel() is called in block 005. auth.fit() injects
+  the CSS only, so without this call the whole Display Fit control was missing
+  from this page. The expander stays collapsed until it is tapped.
+* use_container_width -> width="stretch" on the three dataframes and the two
+  cache buttons. use_container_width is deprecated and warned on every render.
 """
 
 import os
@@ -122,7 +130,8 @@ st.markdown(
 import auth
 
 auth.require(st, "Unlock Diagnostics")
-auth.fit(st)
+auth.fit(st)                        # CSS only, before the first widget
+auth.fit_panel(st)                  # the controls; collapsed until tapped
 # @@END 005 HERO
 
 
@@ -530,7 +539,7 @@ with tab_plan:
                 "In primary plan": "yes" if any(h == r[1] for r in primary) else "",
             })
         if rows:
-            st.dataframe(rows, use_container_width=True, hide_index=True)
+            st.dataframe(rows, width="stretch", hide_index=True)
 
         # shared-IP grouping — explains why two hostnames live or die together
         ipmap = {}
@@ -584,7 +593,7 @@ with tab_probe:
                 results.append({"Target": f"{h}:{p}", "TCP": "OK" if ok else "FAIL",
                                 "ms": ms, "Error": err})
                 bar.progress(i / len(pairs), text=f"{i}/{len(pairs)}")
-            st.dataframe(results, use_container_width=True, hide_index=True)
+            st.dataframe(results, width="stretch", hide_index=True)
 
             if all(r["TCP"] == "FAIL" for r in results):
                 st.error(
@@ -667,7 +676,7 @@ with tab_smtp:
                     ok, ms, err = _port_probe(h, port, timeout=6)
                     out.append({"Host": h, "Port": port, "TLS": "implicit" if tls else "plain",
                                 "TCP": "OK" if ok else "FAIL", "ms": ms, "Error": err})
-            st.dataframe(out, use_container_width=True, hide_index=True)
+            st.dataframe(out, width="stretch", hide_index=True)
 # @@END 015 TAB_SMTP
 
 
@@ -753,14 +762,14 @@ with tab_cache:
 
     c1, c2 = st.columns(2)
     with c1:
-        if st.button("🧹 Clear hosts_cache.json", use_container_width=True):
+        if st.button("🧹 Clear hosts_cache.json", width="stretch"):
             try:
                 H.clear_cache()
                 st.success("Cache cleared. Reload this page to rebuild it.")
             except Exception as e:
                 st.error(f"clear_cache failed: {e}")
     with c2:
-        if st.button("♻️ Refresh this domain", use_container_width=True):
+        if st.button("♻️ Refresh this domain", width="stretch"):
             try:
                 H.refresh_domain(domain)
                 st.success(f"Discovery refreshed for {domain}.")
