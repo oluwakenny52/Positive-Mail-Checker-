@@ -118,6 +118,11 @@ st.markdown(
     '<p>Host plan · live port probe · DNS &amp; discovery · SMTP candidates · proxy audit · cache tools</p></div>',
     unsafe_allow_html=True,
 )
+
+import auth
+
+auth.require(st, "Unlock Diagnostics")
+auth.fit(st)
 # @@END 005 HERO
 
 
