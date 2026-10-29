@@ -89,13 +89,13 @@ if _ROOT not in _sys.path:
     _sys.path.insert(0, _ROOT)
 
 import auth
-from auth import user_file
 
 try:                                   # a module cached from before a redeploy
     auth.fit_panel                     # still has the pre-split, one-function shape
 except AttributeError:
     import importlib
     auth = importlib.reload(auth)
+
 from auth import user_file          # blocks 012, 019 and 032 resolve paths through it
 
 auth.require(st, "Unlock Mailbox Reader")
