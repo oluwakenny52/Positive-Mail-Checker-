@@ -1,7 +1,7 @@
-# @@FILE pages/3_Mailbox_Reader.py blocks=44 version=v13.41
+# @@FILE pages/3_Mailbox_Reader.py blocks=44 version=v13.43
 # @@BLOCK 000 FILE_HEADER deps=-
 """
-pages/3_Mailbox_Reader.py — Bobito Mailbox Reader & Portal Hub  (v13.41)
+pages/3_Mailbox_Reader.py — Bobito Mailbox Reader & Portal Hub  (v13.43)
 =======================================================================
 Interactive inbox inspection: bot intelligence, OTP / debit-card / credential
 scanning, multi-field search, Telegram + blacklist filtering.
@@ -28,6 +28,18 @@ v13.40 fixes on this page
 * BATCH RUN RESULTS PERSISTED: batch failures and wrong/appass verdicts are written to individual text files and CSV.
 * PAGER MATCH COUNTERS RESTORED: global search and OTP pagers count true matches instead of page slices.
 * PHASE-2 SELECT VALIDATION: message fetch loops verify IMAP folder selection status per hop.
+
+v13.43 fixes on this page
+-------------------------
+* PER-USER STORAGE: results dir, clean-valid, last account, config, session cache and
+  every batch result file resolve through user_file(); foreign <hash>_ files are skipped.
+* LIST PARSER: a LIST line carrying no delimiter no longer swallows the mailbox name.
+* PROXY PROBE PORT: the probe dials the port that is about to be dialled.
+* BATCH SEARCH MATCHING: word boundaries instead of raw substring, so 'pin' stops
+  matching 'shipping'.
+* CACHE WRITE THROTTLE: log() no longer rewrites the whole session cache per line.
+* KEEPALIVE: st.iframe data: URI with a components.html fallback.
+* PAGER CLAMPS: the bot page counter cannot reach 0; the purge checks the STORE reply.
 """
 
 import streamlit as st
@@ -48,6 +60,7 @@ import json
 import csv
 from datetime import datetime
 from typing import List, Tuple
+from urllib.parse import quote
 from email.header import decode_header
 from email import message_from_bytes
 # @@END 000 FILE_HEADER
@@ -531,17 +544,20 @@ def load_app_proxies() -> List[dict]:
 
 
 # @@BLOCK 010 KEEPALIVE_AND_THEME_APPLY deps=007
-# v13.40: st.markdown() strips <script>. components.html() actually executes it.
-components.html(
-    """
-    <script>
-    setInterval(function(){
-        try { fetch('/_stcore/health', {cache: 'no-store'}); } catch (e) {}
-    }, 30000);
-    </script>
-    """,
-    height=0,
+# v13.40: st.markdown() strips <script>, so a real embed is required to run it.
+# v13.43: st.iframe with a data: URI is the current API and components.v1.html is
+# deprecated. Both are guarded so the 30s health ping can never silently stop.
+_PING_HTML = (
+    "<script>setInterval(function(){try{fetch('/_stcore/health',{cache:'no-store'});}"
+    "catch(e){}},30000);</script>"
 )
+try:
+    st.iframe("data:text/html;charset=utf-8," + quote(_PING_HTML), height=0)
+except Exception:
+    try:
+        components.html(_PING_HTML, height=0)
+    except Exception:
+        pass
 
 # --- Load shared theme and inject it (must happen before anything renders) ---
 THEME = load_theme()
@@ -804,10 +820,19 @@ if "otp_page_rows" not in st.session_state:
 
 
 # @@BLOCK 014 LOGGERS deps=013
+# v13.43: log() rewrote the entire session cache - 60 messages with base64 raw
+# blobs - on every single line. Throttled to one write per 2s; the explicit
+# save_session_cache() at the end of each action still lands.
+_LAST_CACHE_WRITE = {"t": 0.0}
+
+
 def log(msg):
     st.session_state.mb_log.insert(0, msg)
     st.session_state.mb_log = st.session_state.mb_log[:50]
-    save_session_cache()
+    _now = time.time()
+    if _now - _LAST_CACHE_WRITE.get("t", 0.0) >= 2.0:
+        _LAST_CACHE_WRITE["t"] = _now
+        save_session_cache()
 
 # v13.40: diagnostic logs grew without limit for the whole session.
 _DIAG_CAP = 400
@@ -976,7 +1001,7 @@ def _reader_proxy_reachable(proxy_str, host, port=993, timeout=5.0) -> bool:
                     pass
     return False
 
-def _reader_proxy_str(host: str = ""):
+def _reader_proxy_str(host: str = "", port=None):
     """Optional proxy for manual reader connections (sidebar toggle).
 
     v13.37: tries each pool entry against the real target host and returns the
@@ -995,7 +1020,7 @@ def _reader_proxy_str(host: str = ""):
         target = host or "imap.gmail.com"
         # v13.40: the probe hardcoded 993, so a port-143 account probed the wrong
         # port, failed every node and silently went direct. Use the real port.
-        probe_port = int(st.session_state.app_config.get("imap_port", 993) or 993)
+        probe_port = int(port or st.session_state.app_config.get("imap_port", 993) or 993)
         for item in pool[:5]:
             px = item.get("proxy")
             if not px:
@@ -1635,17 +1660,27 @@ def clean_display_label(folder_name: str) -> str:
     return folder_name
 
 def parse_imap_list_line(s: str) -> Tuple[str, str, str]:
+    """flags, delimiter, raw mailbox name.
+
+    v13.43: the delimiter default was the two-character string '".' and a line
+    carrying only a name (no delimiter field) put that NAME into delim and left
+    raw_name empty, so the mailbox was dropped. One part means name, not delim.
+    """
     s = s.strip()
-    flags, delim, raw_name = "", '".', s
+    flags, delim, raw_name = "", "/", s
     if s.startswith("("):
         end_paren = s.find(")")
         if end_paren != -1:
             flags = s[1:end_paren].strip()
             remainder = s[end_paren + 1:].strip()
             parts = remainder.split(None, 1)
-            if len(parts) >= 1:
+            if len(parts) == 2:
                 delim = parts[0]
-            raw_name = parts[1].strip() if len(parts) == 2 else ""
+                raw_name = parts[1].strip()
+            elif len(parts) == 1:
+                raw_name = parts[0].strip()
+            else:
+                raw_name = ""
 
     if raw_name.startswith('"') and raw_name.endswith('"') and len(raw_name) >= 2:
         raw_name = raw_name[1:-1].replace('\\"', '"')
@@ -1772,15 +1807,20 @@ def connect_and_login(host, port, timeout, proxy_str, users, password, email_add
                 break                          # host-level failure: user is irrelevant
     raise last_err or RuntimeError(f"login failed for {email_addr}")
 
-def open_mail(email_addr, password_val, host_val, timeout=None, proxy_str=None):
+def open_mail(email_addr, password_val, host_val, timeout=None, proxy_str=None, port=None):
     """Connect + login.  Tries the full address first, then the bare local part,
     because legacy ISP servers authenticate on the local part only.  Microsoft
-    hosts are handled over XOAUTH2 inside connect_and_login()."""
+    hosts are handled over XOAUTH2 inside connect_and_login().
+
+    v13.43: `port` is a real parameter, so the proxy probe is handed the port
+    that is about to be dialled instead of re-reading the config and probing a
+    different one than the socket then uses.
+    """
     if timeout is None:
         timeout = st.session_state.app_config.get("connection_timeout", 15)
-    port_val = st.session_state.app_config.get("imap_port", 993)
+    port_val = int(port or st.session_state.app_config.get("imap_port", 993) or 993)
     if proxy_str is None:
-        proxy_str = _reader_proxy_str(host_val)
+        proxy_str = _reader_proxy_str(host_val, port_val)
 
     # v13.40: try_alt_username was honoured only in the batch path.
     if st.session_state.app_config.get("try_alt_username", True):
@@ -1815,7 +1855,7 @@ def get_active_mail(email_addr, password_val, host_val):
             st.session_state.active_mail = None
 
         try:
-            st.session_state.active_mail = open_mail(email_addr, password_val, host_val)
+            st.session_state.active_mail = open_mail(email_addr, password_val, host_val, port=_port)
             st.session_state.connected_account_combo = current_combo
             save_session_cache()
         except Exception as ex:
@@ -1826,7 +1866,7 @@ def get_active_mail(email_addr, password_val, host_val):
             st.session_state.active_mail.noop()
         except Exception:
             try:
-                st.session_state.active_mail = open_mail(email_addr, password_val, host_val)
+                st.session_state.active_mail = open_mail(email_addr, password_val, host_val, port=_port)
                 st.session_state.connected_account_combo = current_combo
                 save_session_cache()
             except Exception as ex:
@@ -2068,7 +2108,8 @@ def execute_imap_search_safely(mail, field_cmd: str, query_term: str, log_func):
                             if isinstance(item, tuple) and len(item) >= 2:
                                 header_str = item[0].decode("utf-8", errors="ignore")
                                 content_bytes = item[1].decode("utf-8", errors="ignore")
-                                if q_lower in content_bytes.lower():
+                                # v13.43: raw substring made 'pin' match 'shipping'.
+                                if _has_word(content_bytes.lower(), [q_lower]):
                                     mid_match = re.search(r'^(\d+)', header_str.strip())
                                     if mid_match:
                                         matched_ids.append(mid_match.group(1).encode('utf-8'))
@@ -2548,10 +2589,12 @@ with st.sidebar.expander("⚙️ App Configuration Settings", expanded=False):
 def append_result(kind: str, line: str) -> None:
     """Append one outcome to its results file. v13.40: only VALID was ever
     persisted; WRONG / APPASS / FAILED vanished on refresh."""
-    path = f"mail_results/{kind}.txt"
+    # v13.43: the results dir was shared, so every user's wrong/appass/failed
+    # rows leaked into the other users' valid list and into their ZIP.
+    path = user_file(f"mail_results/{kind}.txt")
     key = _combo_of(line).lower()
     try:
-        os.makedirs("mail_results", exist_ok=True)
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
         rows = []
         if os.path.exists(path):
             with open(path, encoding="utf-8", errors="ignore") as f:
@@ -3772,7 +3815,14 @@ with st.expander("🤖 Mass Bot Purge & Intelligence Hub", expanded=False):
 
                         # IMAP IDs are numeric strings; store in one call.
                         id_csv = b",".join(sorted(ids, key=lambda x: int(x)))
-                        mail.store(id_csv, "+FLAGS", "\\Deleted")
+                        st_typ, st_data = mail.store(id_csv, "+FLAGS", "\\Deleted")
+                        # v13.43: the STORE reply was never checked, so a refused
+                        # flag update still counted as a deletion and expunged
+                        # nothing, while the UI reported success.
+                        if st_typ != "OK":
+                            bot_log(f"  └─ ⚠️ STORE refused in '{r_folder}': {st_typ} {st_data}")
+                            skipped_folders.append(r_folder)
+                            continue
                         deleted_count += len(ids)
                         bot_log(f"  └─ marked {len(ids)} bot message(s) deleted in '{r_folder}'.")
                         mail.expunge()
@@ -3794,7 +3844,7 @@ with st.expander("🤖 Mass Bot Purge & Intelligence Hub", expanded=False):
     st.markdown("#### 📱 Detected Bot Message Preview Screen")
     if all_loaded_bot_msgs:
         bot_total_pages = max(1, math.ceil(len(all_loaded_bot_msgs) / bot_page_size))
-        bot_curr_p = min(st.session_state.bot_current_page, bot_total_pages)
+        bot_curr_p = max(1, min(int(st.session_state.bot_current_page or 1), bot_total_pages))
         st.session_state.bot_current_page = bot_curr_p
 
         start_idx = (bot_curr_p - 1) * bot_page_size
