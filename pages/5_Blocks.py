@@ -127,9 +127,12 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-import auth
-
+# auth is imported ONLY in browser mode.  Imported unconditionally it drags
+# Streamlit in through auth.py and breaks block 000's promise that
+# `--fix-check` needs no streamlit import at all.
 if not _CLI_FIX_CHECK:
+    import auth
+
     auth.require(st, "Unlock Block Inspector")
     auth.fit(st)
 # @@END 004 HERO
