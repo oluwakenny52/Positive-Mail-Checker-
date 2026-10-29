@@ -36,6 +36,16 @@ Always invoke `verify_blocks.py` as `python verify_blocks.py` - its `# @@FILE`
 header is line 1, so it has no usable shebang.
 
 ## In-browser
+## Passphrase and per-user isolation
+
+`auth.py` gates every page. First visit: choose a passphrase (optionally
+"Remember on this device", which writes a salted hash to `passkey.json`). Every
+per-user file - results directory, clean-valid list, last account, session
+cache - is prefixed with the unlocked hash, so two people on one deployment stay
+separate. It is a lock, not encryption.
+
+Display Fit (font size / content scale) is in every page's sidebar via
+`auth.fit(st)`.
 
 `pages/5_Blocks.py` (Block Inspector) runs the same engine in the browser and
 validates a paste before you commit.
