@@ -59,6 +59,7 @@ CONNECTION_FAILED = getattr(_status, "CONNECTION_FAILED", "CONNECTION_FAILED")
 UNKNOWN = getattr(_status, "UNKNOWN", "UNKNOWN")
 RETRY_LATER = getattr(_status, "RETRY_LATER", "RETRY_LATER")
 LOGIN_DROPPED = getattr(_status, "LOGIN_DROPPED", "LOGIN_DROPPED")
+SKIP = getattr(_status, "SKIP", "SKIP")
 
 WRONG_SET = frozenset({WRONG, WRONG_PASSWORD})
 APP_SET = frozenset({APP, NEED_APP_PASSWORD})
@@ -296,10 +297,15 @@ def pick_verdict(results):
     elif app_rungs:
         verdict = APP
     else:
-        verdict = UNKNOWN
+        # Seed with None, not UNKNOWN: SKIP ranks 5 and UNKNOWN ranks 10, so
+        # seeding with UNKNOWN made a SKIP-only result answer UNKNOWN - the same
+        # defect worse_of() was fixed for.
+        verdict = None
         for r in results or ():
-            if _prio(r.status) > _prio(verdict):
+            if verdict is None or _prio(r.status) > _prio(verdict):
                 verdict = r.status
+        if verdict is None:
+            verdict = UNKNOWN
 
     return {
         "status": verdict,
