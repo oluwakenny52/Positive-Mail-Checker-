@@ -203,212 +203,140 @@ def require(st, title="Unlock Positive Mail-Checker"):
 # @@END 002 GATE
 
 
-# @@BLOCK 003 FIT_CSS deps=001
-FIT_FONT_KEY = "ui_font_size"
-FIT_SCALE_KEY = "ui_content_scale"
+# @@BLOCK 003 FIT_CSS deps=002
 FIT_FONT_DEFAULT = 16
-FIT_SCALE_DEFAULT = 100          # PERCENT, not a factor - this is what worked
+FIT_SCALE_DEFAULT = 100
 FIT_FONT_MIN, FIT_FONT_MAX = 12, 22
 FIT_SCALE_MIN, FIT_SCALE_MAX = 80, 140
-# A stored scale at or below this is a FACTOR (1.4) and is converted to a
-# percent (140). Anything above it is already a percent.
 FIT_SCALE_FACTOR_BELOW = 3
-# A stored FONT size above this is a percent and is taken of the default px.
-FIT_FONT_PERCENT_ABOVE = 40
 
 
-def _fit_raw(key, default, cast=float):
-    """One Display Fit setting as stored, unclamped. NEVER raises."""
+def _fit_clamp_font(value):
     try:
-        import streamlit as st
-        raw = st.session_state.get(key, default)
-    except Exception:
-        return default
-    try:
-        val = cast(raw)
+        n = float(value)
     except (TypeError, ValueError):
-        return default
-    if val != val:                       # NaN
-        return default
-    return val
+        return FIT_FONT_DEFAULT
+    return int(max(FIT_FONT_MIN, min(FIT_FONT_MAX, round(n))))
 
 
-def _fit_from(raw, default, lo, hi, cast=float, percent_above=None, factor_below=None):
-    """Convert + clamp ONE raw value. Pure, so the selftest can drive it."""
+def _fit_clamp_scale(value):
     try:
-        val = cast(raw)
+        n = float(value)
     except (TypeError, ValueError):
-        return default
-    if val != val:                       # NaN
-        return default
-    if percent_above is not None and val > percent_above:
-        val = cast(float(default) * val / 100.0)
-    elif factor_below is not None and val <= factor_below:
-        val = cast(val * 100.0)
-    return max(lo, min(hi, val))
+        return FIT_SCALE_DEFAULT
+    if n <= FIT_SCALE_FACTOR_BELOW:
+        n *= 100.0
+    return int(max(FIT_SCALE_MIN, min(FIT_SCALE_MAX, round(n))))
 
 
-def _fit_normalise(key, default, lo, hi, cast=float, percent_above=None,
-                   factor_below=None):
-    """Clamped, percent-aware read of one setting. NEVER raises."""
-    return _fit_from(_fit_raw(key, default, cast), default, lo, hi, cast,
-                     percent_above, factor_below)
+def _fit_normalise(value):
+    return _fit_clamp_scale(value)
 
 
-def _fit_read(key, default, lo, hi, cast=float):
-    """Clamped read with no percent conversion. Kept for callers and selftest."""
-    try:
-        import streamlit as st
-        raw = st.session_state.get(key, default)
-    except Exception:
-        return default
-    return _fit_from(raw, default, lo, hi, cast, None, None)
+def _fit_from(font=None, scale=None):
+    f = _fit_clamp_font(font)
+    s = _fit_clamp_scale(scale)
+    return f, s, s / 100.0
+
+
+def _fit_raw():
+    ss = st.session_state
+    return ss.get("ui_font_size"), ss.get("ui_content_scale")
+
+
+def _fit_read():
+    return _fit_values()
 
 
 def _fit_values():
-    """(px, percent) resolved from live settings. One place, never raises."""
-    size = _fit_normalise(FIT_FONT_KEY, FIT_FONT_DEFAULT, FIT_FONT_MIN,
-                          FIT_FONT_MAX, int, FIT_FONT_PERCENT_ABOVE)
-    pct = _fit_normalise(FIT_SCALE_KEY, FIT_SCALE_DEFAULT, FIT_SCALE_MIN,
-                         FIT_SCALE_MAX, float, None, FIT_SCALE_FACTOR_BELOW)
-    return size, pct
+    font, scale = _fit_raw()
+    return _fit_from(font, scale)
 
 
-def fit_css(font=None, scale=None) -> str:
-    """CSS for the Display Fit sliders. Always returns a str.
-
-    font is px. scale is a PERCENT (80-140) and becomes a zoom factor.
-
-    Every selector is deliberately REDUNDANT. The sheet used to hang on
-    `html body .stApp p` and one `[data-testid="stMainBlockContainer"]`; if
-    either name differs in a Streamlit build the rule silently matches nothing
-    and the page never changes. Both are now backed by several candidates, the
-    markdown container is addressed directly, and `!important` is on every
-    declaration so no later sheet can outrank it.
-
-    zoom sits on the MAIN column only. It used to sit on `html body div.stApp`,
-    which CONTAINS the sidebar - and the mobile sheet sizes the sidebar to 88vw.
-    A vw unit is not divided by the zoom factor, so at 1.40 the sidebar laid out
-    at 123vw and pushed the main column off the screen.
-    """
-    if font is None or scale is None:
-        _size, _pct = _fit_values()
-        if font is None:
-            size = _size
-        else:
-            size = max(FIT_FONT_MIN, min(FIT_FONT_MAX, int(font)))
-        if scale is None:
-            pct = _pct
-        else:
-            pct = float(scale)
-            if pct <= FIT_SCALE_FACTOR_BELOW:
-                pct = pct * 100.0
-            pct = max(FIT_SCALE_MIN, min(FIT_SCALE_MAX, pct))
-    else:
-        size = max(FIT_FONT_MIN, min(FIT_FONT_MAX, int(font)))
-        pct = float(scale)
-        if pct <= FIT_SCALE_FACTOR_BELOW:
-            pct = pct * 100.0
-        pct = max(FIT_SCALE_MIN, min(FIT_SCALE_MAX, pct))
-    zoom = pct / 100.0
-
+def fit_css(font=None, scale=None):
+    f, s, z = _fit_from(font, scale)
     return (
-        "<style>"
-        ":root, html, html body"
-        " { font-size: %dpx !important; }"
-        "html body .stApp, html body [data-testid=\"stApp\"]"
-        " { font-size: %dpx !important; }"
-        "html body .stApp p, html body .stApp li, html body .stApp label,"
-        " html body .stApp span, html body .stApp td, html body .stApp th,"
-        " html body .stApp input, html body .stApp textarea,"
-        " html body .stApp select, html body .stApp button,"
-        " html body [data-testid=\"stMarkdownContainer\"],"
-        " html body [data-testid=\"stMarkdownContainer\"] p,"
-        " html body [data-testid=\"stMarkdownContainer\"] span,"
-        " html body [data-testid=\"stMarkdownContainer\"] li"
-        " { font-size: %dpx !important; }"
-        "html body .block-container,"
-        " html body [data-testid=\"stMainBlockContainer\"],"
-        " html body [data-testid=\"stMain\"],"
-        " html body section.main"
-        " { zoom: %.2f !important; max-width: 100%% !important; }"
-        "</style>" % (size, size, size, zoom)
+        "<style>\n"
+        "/* Display Fit. zoom sits on the main container only, never on stApp, */\n"
+        "/* because stApp also holds the sidebar and would scale it twice.      */\n"
+        '.block-container,\n[data-testid="stMainBlockContainer"] {\n'
+        f"  zoom: {z:.4f} !important;\n"
+        "  max-width: 100% !important;\n"
+        "}\n"
+        '[data-testid="stMarkdownContainer"] :is(p, li, td, th, h1, h2, h3, h4, h5, h6) {\n'
+        f"  font-size: {f}px !important;\n"
+        "}\n"
+        '[data-testid="stMarkdownContainer"] [data-testid="stCaptionContainer"] p {\n'
+        f"  font-size: {max(11, f - 3)}px !important;\n"
+        "}\n"
+        "</style>\n"
     )
-# @@END 003 FIT_CSS
+# @@END 003
 
 
 # @@BLOCK 004 FIT_UI deps=003
-def fit(st) -> None:
-    """Sidebar sliders + the CSS they drive. Never raises.
+def _fit_seed():
+    ss = st.session_state
+    if ss.get("_fit_seeded"):
+        return
+    if "ui_font_size" not in ss:
+        ss["ui_font_size"] = FIT_FONT_DEFAULT
+    if "ui_content_scale" not in ss:
+        ss["ui_content_scale"] = FIT_SCALE_DEFAULT
+    ss["_fit_seeded"] = True
 
-    The ONLY definition of fit(), and it must be called EXACTLY ONCE per page.
-    A second call assigns ui_font_size / ui_content_scale after those widgets
-    already exist, which raises inside the try/except below. app.py block 046
-    must therefore NOT define these two widgets.
-    """
+
+def _fit_apply(html):
     try:
-        if st.session_state.pop("_fit_reset", False):
-            # Assigned BEFORE either widget exists. Assigning after them raises
-            # the v13.35 StreamlitWidgetAlreadyInstantiatedError.
-            st.session_state[FIT_FONT_KEY] = FIT_FONT_DEFAULT
-            st.session_state[FIT_SCALE_KEY] = FIT_SCALE_DEFAULT
-
-        # Normalise UNCONDITIONALLY. A key that is merely present can still hold
-        # a percent (100) or a factor (1.4), and a slider handed either against
-        # the wrong range is pinned and immovable. Before the widgets, so no
-        # WidgetAlreadyInstantiatedError.
-        st.session_state[FIT_FONT_KEY] = _fit_normalise(
-            FIT_FONT_KEY, FIT_FONT_DEFAULT, FIT_FONT_MIN, FIT_FONT_MAX,
-            int, FIT_FONT_PERCENT_ABOVE)
-        st.session_state[FIT_SCALE_KEY] = _fit_normalise(
-            FIT_SCALE_KEY, FIT_SCALE_DEFAULT, FIT_SCALE_MIN, FIT_SCALE_MAX,
-            float, None, FIT_SCALE_FACTOR_BELOW)
-
-        # NOT in an expander any more: a collapsed sidebar expander is the one
-        # structural difference from the version that worked.
-        st.sidebar.subheader("🔎 Display Fit")
-        st.slider("Font size", FIT_FONT_MIN, FIT_FONT_MAX, key=FIT_FONT_KEY)
-        st.slider("Content scale %", FIT_SCALE_MIN, FIT_SCALE_MAX, step=5,
-                  key=FIT_SCALE_KEY)
-        _px, _pct = _fit_values()
-        st.caption("Text **%dpx** · Scale **%d%%** (zoom %.2f)" % (_px, _pct, _pct / 100.0))
-        if st.button("Reset Display Fit", key="fit_reset_btn", width="stretch"):
-            st.session_state["_fit_reset"] = True
-            st.rerun()
-        with st.sidebar.expander("🔧 Display Fit debug", expanded=False):
-            st.caption("If the numbers below do not change when you drag, the "
-                       "WIDGET is broken. If they change and the page does not, "
-                       "the CSS is not reaching the DOM.")
-            st.code("stored font  = %r\nstored scale = %r\nresolved     = %dpx / %d%%\n"
-                    "css length   = %d\ncss head     = %r"
-                    % (st.session_state.get(FIT_FONT_KEY),
-                       st.session_state.get(FIT_SCALE_KEY),
-                       _px, _pct, len(fit_css()), fit_css()[:70]),
-                    language="text")
-    except Exception as _fit_err:
-        try:
-            st.sidebar.error("Display Fit failed: %s: %s"
-                             % (type(_fit_err).__name__, _fit_err))
-        except Exception:
-            pass
-    _css = ""
-    try:
-        _css = fit_css()
+        st.html(html)
+        return "st.html"
     except Exception:
-        _css = ""
-    if _css:
-        injected = False
-        try:
-            st.html(_css)
-            injected = True
-        except Exception:
-            injected = False
-        if not injected:
-            try:
-                st.markdown(_css, unsafe_allow_html=True)
-            except Exception:
-                pass
-# @@END 004 FIT_UI
+        pass
+    try:
+        st.markdown(html, unsafe_allow_html=True)
+        return "st.markdown"
+    except Exception:
+        return "none"
+
+
+def fit(scope=None):
+    ss = st.session_state
+    if ss.pop("_fit_reset", False):
+        ss["ui_font_size"] = FIT_FONT_DEFAULT
+        ss["ui_content_scale"] = FIT_SCALE_DEFAULT
+    _fit_seed()
+
+    with st.expander("🔎 Display Fit", expanded=True):
+        st.slider("Font size (px)", FIT_FONT_MIN, FIT_FONT_MAX, key="ui_font_size")
+        st.slider("Content scale (%)", FIT_SCALE_MIN, FIT_SCALE_MAX, key="ui_content_scale")
+        st.caption(
+            f"Live: font {ss.get('ui_font_size')}px, scale {ss.get('ui_content_scale')}%. "
+            "Scale zooms the page content only, never the sidebar."
+        )
+        if st.button("Reset Display Fit", key="ui_fit_reset_btn", width="stretch"):
+            ss["ui_font_size"] = FIT_FONT_DEFAULT
+            ss["ui_content_scale"] = FIT_SCALE_DEFAULT
+            st.rerun()
+
+    font, scale, zoom = _fit_values()
+    html = fit_css(font, scale)
+    how = _fit_apply(html)
+
+    with st.expander("🔧 Display Fit debug", expanded=False):
+        st.write(
+            {
+                "font": font,
+                "scale": scale,
+                "zoom": round(zoom, 4),
+                "injected_via": how,
+                "session_state": {
+                    "ui_font_size": ss.get("ui_font_size"),
+                    "ui_content_scale": ss.get("ui_content_scale"),
+                },
+            }
+        )
+        st.code(html, language="html")
+# @@END 004
 
 
 # @@BLOCK 005 SELFTEST deps=001,003
