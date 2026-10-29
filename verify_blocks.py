@@ -16,6 +16,7 @@ the unnamed end. Exit status is 1 when any fault is found.
 
 API used elsewhere:
   BLOCKED_FILES            list of audited paths
+  TARGET_FILES/TARGET_BLOCKS  the frame size this list is expected to produce
   audit_source(target, name=None) -> Report     (path, or source text + label)
   audit_all(paths=None)    -> {path: Report}
   block_ids(path)          -> [int, ...]
@@ -49,6 +50,16 @@ BLOCKED_FILES = [
     "pages/5_Blocks.py",
     "pages/6_User_Guide.py",
 ]
+
+# The frame target lives HERE, beside the list it describes, so a frame move is
+# one edit in one file.  audit_frame.py imports these instead of keeping its own
+# copy, and its api_conformance() asserts both names exist.
+#
+# tier2_split.py REWRITES app.py and OVERWRITES engine.py - it deletes no file -
+# so TARGET_FILES stays 11 and only TARGET_BLOCKS moves.  The split prints the
+# new line for you and records it in TIER2_MANIFEST.txt; paste it here.
+TARGET_FILES = 11
+TARGET_BLOCKS = 269
 
 FILE_RX = re.compile(r"^#\s*@@FILE\s+(\S+)\s+blocks=(\d+)\s+version=(\S+)\s*$")
 BLOCK_RX = re.compile(r"^#\s*@@BLOCK\s+(\d{3})\s+([A-Za-z0-9_]+)(?:\s+deps=(\S+))?\s*$")
