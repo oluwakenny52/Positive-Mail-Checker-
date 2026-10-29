@@ -54,35 +54,19 @@ from email import message_from_bytes
 
 
 # @@BLOCK 001 PAGE_CONFIG deps=000
-# --- Page Config (MUST be the first Streamlit call) ---
-st.set_page_config(
-    page_title="Bobito Mailbox Reader & Portal Hub",
-    page_icon="📥",
-    layout="wide",
-    initial_sidebar_state="collapsed"
-)
+st.set_page_config(page_title="Mailbox Reader - Mail Checker", page_icon="📬",
+                   layout="wide", initial_sidebar_state="collapsed")
 
-import hashlib
+import sys as _sys
 
-def _user_key_hash():
-    return st.session_state.get("user_key_hash", "")
+_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _ROOT not in _sys.path:
+    _sys.path.insert(0, _ROOT)
 
-def user_file(name: str) -> str:
-    h = _user_key_hash()
-    return f"{h}_{name}" if h else name
+import auth
 
-if not _user_key_hash():
-    st.markdown("## Enter your unique key")
-    st.caption("This key isolates your session on this device. Other users will not see your accounts, cache, or results.")
-    phrase = st.text_input("Unique key or phrase", type="password", key="user_key_input", placeholder="type anything only you know")
-    if st.button("Enter", type="primary"):
-        if phrase and phrase.strip():
-            h = hashlib.sha256(phrase.strip().encode("utf-8")).hexdigest()[:16]
-            st.session_state["user_key_hash"] = h
-            st.rerun()
-        else:
-            st.error("Key cannot be empty.")
-    st.stop()
+auth.require(st, "Unlock Mailbox Reader")
+auth.fit(st)
 # @@END 001 PAGE_CONFIG
 
 
@@ -93,10 +77,6 @@ except ImportError:
     def host_list(email: str) -> List[str]:
         domain = email.split("@")[-1].lower() if "@" in email else ""
         return [f"imap.{domain}"] if domain else ["imap.gmail.com"]
-
-import auth
-
-auth.require(st, "Unlock Mailbox Reader")
 # @@END 002 HOSTS_IMPORT
 
 
