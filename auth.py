@@ -198,17 +198,25 @@ def require(st, title="Unlock Positive Mail-Checker"):
 
 # @@BLOCK 003 FIT_CSS deps=000
 def fit_css():
-    """CSS applying the two display-fit sliders."""
+    """CSS applying the two display-fit sliders.
+
+    `st` MUST be bound here: this module is import-clean, so there is no
+    module-level streamlit. The except clauses are narrow on purpose - a broad
+    `except Exception` hid a NameError on `st` and pinned every page to 16px /
+    1.00 forever, which looked exactly like "the sliders do nothing".
+    """
+    import streamlit as st
     try:
         font = int(st.session_state.get("ui_font_size", DEFAULT_FONT))
-    except Exception:
+    except (TypeError, ValueError):
         font = DEFAULT_FONT
     try:
         scale = int(st.session_state.get("ui_content_scale", DEFAULT_SCALE)) / 100.0
-    except Exception:
+    except (TypeError, ValueError):
         scale = 1.0
     return ("<style>html{font-size:%dpx !important;}"
-            ".stApp{zoom:%.2f;}</style>" % (font, scale))
+            "body{font-size:%dpx !important;}"
+            ".stApp{zoom:%.2f !important;}</style>" % (font, font, scale))
 # @@END 003 FIT_CSS
 
 
@@ -223,7 +231,7 @@ def fit(st):
 # @@END 004 FIT_UI
 
 
-# @@BLOCK 005 SELFTEST deps=001
+# @@BLOCK 005 SELFTEST deps=001,003
 def _selftest():
     checks = []
     h1 = _digest("abc", "s")
@@ -231,6 +239,14 @@ def _selftest():
     checks.append(("salt matters", h1 != _digest("abc", "t")))
     checks.append(("length", len(h1) == HASH_LEN))
     checks.append(("hex", all(c in "0123456789abcdef" for c in h1)))
+    # fit_css() must RUN, not fall back - this is the NameError tripwire.
+    try:
+        css = fit_css()
+        checks.append(("fit_css runs", "<style>" in css))
+        checks.append(("fit_css has zoom", "zoom:" in css))
+    except Exception:
+        checks.append(("fit_css runs", False))
+        checks.append(("fit_css has zoom", False))
     bad = [n for n, ok in checks if not ok]
     if bad:
         raise AssertionError("auth selftest failed: " + ", ".join(bad))
