@@ -483,6 +483,13 @@ def _selftest() -> None:
     check("require is callable", lambda: callable(require))
     check("user_file is callable", lambda: callable(user_file))
 
+    # ---- isolation: a path is never bare, even before unlock -------------
+    check("anon id is non-empty headless", lambda: bool(_anon_id()))
+    check("user_file prefixes headless", lambda: user_file("x.txt").endswith("_x.txt"))
+    check("user_file('') is not empty", lambda: bool(user_file("")))
+    check("user_file('') has no separator", lambda: "_" not in user_file(""))
+    check("user_dir is under data/", lambda: user_dir().startswith("data/"))
+
     # ---- Display Fit must work with no Streamlit and no script run ---------
     check("fit_css returns str", lambda: isinstance(fit_css(), str))
     check("fit_css has font-size", lambda: "font-size: 16px" in fit_css())
@@ -521,7 +528,6 @@ def _selftest() -> None:
     check("below-range percent clamps low",
           lambda: _fit_from(9, FIT_SCALE_DEFAULT, FIT_SCALE_MIN, FIT_SCALE_MAX,
                             float, None, FIT_SCALE_FACTOR_BELOW) == FIT_SCALE_MIN)
-    # The distinction that was missing: 99px clamps, 100% falls back.
     check("out-of-range px clamps instead of falling back",
           lambda: _fit_from(99, FIT_FONT_DEFAULT, FIT_FONT_MIN, FIT_FONT_MAX, int, 40)
           == FIT_FONT_MAX)
@@ -554,4 +560,5 @@ if __name__ == "__main__":
     _selftest()
     print("auth selftest OK")
 # @@END 005 SELFTEST
+# @@EOF
 # @@EOF
