@@ -19,12 +19,15 @@ try:
                                TARGET_BLOCKS as EXPECT_BLOCKS)
 except Exception:
     # Mirror for the import-failure path.  tier2_split.py REWRITES app.py and
-    # OVERWRITES engine.py; it deletes nothing, so EXPECT_FILES stays 11 and only
-    # EXPECT_BLOCKS moves.  The real values live in verify_blocks.py.
+    # OVERWRITES engine.py; it deletes nothing, so EXPECT_FILES stays 12 and only
+    # EXPECT_BLOCKS moves.  The real values live in verify_blocks.py - this copy
+    # had drifted to 11/269, which is why the fallback path disagreed with the
+    # gate whenever verify_blocks.py was unimportable.
     GATED = ["app.py", "auth.py", "engine.py", "hosts.py", "ms_oauth.py",
-             "status.py", "pages/2_Diagnostics.py", "pages/3_Mailbox_Reader.py",
-             "pages/4_Downloads.py", "pages/5_Blocks.py", "pages/6_User_Guide.py"]
-    EXPECT_FILES, EXPECT_BLOCKS = 11, 269
+             "status.py", "verify_blocks.py", "pages/2_Diagnostics.py",
+             "pages/3_Mailbox_Reader.py", "pages/4_Downloads.py",
+             "pages/5_Blocks.py", "pages/6_User_Guide.py"]
+    EXPECT_FILES, EXPECT_BLOCKS = 12, 270
 
 FILE_RX  = re.compile(r"^#\s*@@FILE\s+(\S+)\s+blocks=(\d+)\s+version=(\S+)\s*$")
 BLOCK_RX = re.compile(r"^#\s*@@BLOCK\s+(\d{3})\s+([A-Za-z0-9_]+)(?:\s+deps=(\S+))?\s*$")
