@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""verify_v1337.py — regression harness for the v13.37 patch set (v13.40 revision).
+"""verify_v1337.py - regression harness for the v13.37 patch set (v13.47 revision).
 
 Run from the repo root:   python verify_v1337.py
 Exit code 0 = clean.
@@ -10,10 +10,26 @@ For every file the v13.37 work touched it checks:
   (c) every buggy pattern the fix replaced is GONE from the CODE,
   (d) no pasted-prose line, no stray markdown fence, and no tokenizer landmine
       (em dash / curly quote / nbsp outside a string) survived the paste,
-plus that no two files in pages/ share a page number.
+plus that no two files in pages/ share a page number, and that the build
+identity in app.py, its @@FILE header and pages/6_User_Guide.py all agree.
 
-WHY THIS REVISION EXISTS (v13.39b)
-----------------------------------
+WHY THIS REVISION EXISTS (v13.47)
+---------------------------------
+  * BUILD IDENTITY IS DERIVED, NOT HARDCODED.  The harness used to assert the
+    literals "CFG_VERSION = 1340" and 'BUILD_TAG = "v13.40"'.  app.py moved to
+    1347 / v13.47 and the gate went red on every single bump until someone
+    hand-edited the needle - a gate that has to be re-written to stay true is
+    not a gate.  The version is now read out of app.py's own @@FILE header and
+    the two constants must match it, so the header, the constants and the guide
+    can only ever agree.  Each constant must also appear exactly once, which
+    catches an override (a second assignment silently wins by rebinding).
+  * pages/6_User_Guide.py is gated too: it mirrors block 008 by design and now
+    cannot drift from it.
+  * A NOTE (not a failure) is printed for any block file whose own header
+    version trails the app, so the drift stays visible without breaking CI.
+
+WHY THE EARLIER REVISION EXISTED (v13.39b)
+------------------------------------------
   * THE P1 BLOCK DID NOT COMPILE.  It had been pasted without closing its
     has(...) call, so the whole harness was a SyntaxError and could never have
     run.  It is repaired, and the P0-v13.39 assertions are now real.
@@ -23,20 +39,18 @@ WHY THIS REVISION EXISTS (v13.39b)
     to the outer handler - the ladder never advanced.  The helper must use
     domain_local_hosts and must contain exactly ONE WRONG block (the duplicate
     copy was dead code sitting after a return).
-  * Four stale v13.38 markers corrected for v13.39 (header, CFG_VERSION,
-    _GEO_FAIL, _STARTUP_SEEN - the last two are STATE-backed now).
 
 WHY THE EARLIER REVISION EXISTED
 --------------------------------
-  * The PART 1/3 / PART 2/3 banner checks were removed — app.py has no banners.
+  * The PART 1/3 / PART 2/3 banner checks were removed - app.py has no banners.
   * "settled = False", "def _geo_throttle(", '"geo_fail": {}',
     '_GEO_FAIL = STATE["geo_fail"]' and "MAIL_SPOT_MIN_INTERVAL" do not exist in
     app.py; the real markers are checked instead.
   * gone() now runs against a view of the source with comments AND string
     literals blanked out, because app.py's changelog docstring and several
     comments deliberately name the symbols they removed.
-  * NEW: stray-line + non-ASCII landmine checks for the paste that broke the
-    build at app.py line 7330 ("invalid character '—' (U+2014)").
+  * stray-line + non-ASCII landmine checks for the paste that broke the build
+    at app.py line 7330 ("invalid character '-' (U+2014)").
 """
 import ast
 import io
@@ -47,6 +61,7 @@ import tokenize
 
 PASSES = []
 FAILS = []
+NOTES = []
 
 
 def read(path):
@@ -104,6 +119,15 @@ def gone(src, needle, label):
         PASSES.append(label)
 
 
+def exactly(src_code, needle, want, label):
+    """`needle` must appear `want` times in the CODE view (duplicate/override)."""
+    n = src_code.count(needle)
+    if n == want:
+        PASSES.append(label)
+    else:
+        FAILS.append("%s: %r appears %d x, want %d" % (label, needle, n, want))
+
+
 def compiles(path, src):
     try:
         compile(src, path, "exec")
@@ -149,6 +173,10 @@ LANDMINES = (
     ("\u00a0", "non-breaking space"),
 )
 
+# name, blocks=N, version=vNN.NN  - the identity every block file carries
+FILE_HDR = re.compile(
+    r"^#\s*@@FILE\s+(\S+)\s+blocks=\d+\s+version=v(\d+)\.(\d+)\s*$", re.M)
+
 
 def stray_lines(path, code_src):
     """code_src must be code_view(file): no comments, no strings."""
@@ -187,8 +215,60 @@ def seam_is_intact(app):
         PASSES.append("app.py: run-reset seam intact "
                       "(run_completion_status -> start_dt, nothing in between)")
     else:
-        FAILS.append("app.py: run-reset seam BROKEN — the two pasted halves no "
+        FAILS.append("app.py: run-reset seam BROKEN - the two pasted halves no "
                      "longer join around run_completion_status / start_dt")
+
+
+def build_identity(app, app_code, gui, gui_code):
+    """CFG_VERSION / BUILD_TAG derive from app.py's @@FILE header.
+
+    The header is line 1 and the constants live in block 008.  All three must
+    agree, each constant exactly once, and pages/6 block 001 must mirror them.
+    """
+    m = FILE_HDR.search(app)
+    if not m or m.group(1) != "app.py":
+        FAILS.append("app.py line 1 has no parseable "
+                     "'# @@FILE app.py blocks=N version=vNN.NN' header")
+        return
+    major, minor = m.group(2), m.group(3)
+    tag = "v%s.%s" % (major, minor)
+    has(app, "CFG_VERSION = %s%s" % (major, minor),
+        "CFG_VERSION matches the header version (%s%s)" % (major, minor))
+    has(app, 'BUILD_TAG = "%s"' % tag,
+        "BUILD_TAG is the single build string (%s)" % tag)
+    exactly(app_code, "CFG_VERSION =", 1, "CFG_VERSION is assigned once")
+    exactly(app_code, "BUILD_TAG =", 1, "BUILD_TAG is assigned once")
+
+    if gui:
+        has(gui, "CFG_VERSION = %s%s" % (major, minor),
+            "pages/6_User_Guide.py CFG_VERSION mirrors app.py")
+        has(gui, 'BUILD_TAG = "%s"' % tag,
+            "pages/6_User_Guide.py BUILD_TAG mirrors app.py")
+        exactly(gui_code, "CFG_VERSION =", 1,
+                "pages/6_User_Guide.py assigns CFG_VERSION once")
+        exactly(gui_code, "BUILD_TAG =", 1,
+                "pages/6_User_Guide.py assigns BUILD_TAG once")
+
+
+def version_drift(paths):
+    """NOTE (not a failure) for a gated file whose header version trails app.py."""
+    app = read("app.py") if os.path.exists("app.py") else ""
+    m = FILE_HDR.search(app)
+    if not m:
+        return
+    want = (int(m.group(2)), int(m.group(3)))
+    for p in paths:
+        if not os.path.exists(p):
+            continue
+        pm = FILE_HDR.search(read(p))
+        if not pm:
+            NOTES.append("%s header has no version=vNN.NN" % p)
+            continue
+        got = (int(pm.group(2)), int(pm.group(3)))
+        if got < want:
+            NOTES.append("%s header is v%d.%d, app.py is v%d.%d - bump it with "
+                         "the app or it will name a build that no longer exists"
+                         % (p, got[0], got[1], want[0], want[1]))
 
 
 def page_numbers():
@@ -224,15 +304,17 @@ def main():
     app_path = "app.py"
     dia_path = "pages/2_Diagnostics.py"
     rdr_path = "pages/3_Mailbox_Reader.py"
+    gui_path = "pages/6_User_Guide.py"
     req_path = "requirements.txt"
 
-    for p in (app_path, dia_path, rdr_path, req_path):
+    for p in (app_path, dia_path, rdr_path, gui_path, req_path):
         if not os.path.exists(p):
             FAILS.append(p + " is MISSING")
 
     app = read(app_path) if os.path.exists(app_path) else ""
     dia = read(dia_path) if os.path.exists(dia_path) else ""
     rdr = read(rdr_path) if os.path.exists(rdr_path) else ""
+    gui = read(gui_path) if os.path.exists(gui_path) else ""
     req = read(req_path) if os.path.exists(req_path) else ""
 
     if app:
@@ -348,8 +430,9 @@ def main():
         has(app, "def clear_tunnel_cache(", "clear_tunnel_cache kept")
         has(app, "def _guess_candidates(", "_guess_candidates kept")
         has(app, "HOSTS_HAS_RANKING", "HOSTS_HAS_RANKING kept")
-        has(app, "CFG_VERSION = 1340", "CFG_VERSION is 1340")
-        has(app, 'BUILD_TAG = "v13.40"', "BUILD_TAG is the single build string")
+
+        # ---- build identity: derived from the header, never hardcoded ----
+        build_identity(app, app_code, gui, code_view(gui) if gui else "")
 
     if req:
         req_code = "\n".join(l.split("#", 1)[0] for l in req.splitlines())
@@ -400,12 +483,31 @@ def main():
         has(rdr, "initial_sidebar_state=\"collapsed\"", "reader sidebar starts collapsed")
         has(rdr, "/* ---- v13.39 MOBILE FIT ---- */", "reader has the mobile stylesheet")
 
+    if gui:
+        compiles(gui_path, gui)
+        tokenizes(gui_path, gui)
+        parses(gui_path, gui)
+        stray_lines(gui_path, code_view(gui))
+        has(gui, "pages/6_User_Guide.py", "guide self-identifies as 6_")
+        # exactly once each: a second fit() raises inside its own try/except and
+        # a second fit_panel() draws the sliders twice.
+        exactly(code_view(gui), "auth.fit(st)", 1, "guide calls auth.fit() exactly once")
+        exactly(code_view(gui), "auth.fit_panel(st)", 1,
+                "guide calls auth.fit_panel() exactly once")
+        exactly(code_view(gui), "auth.require(", 1, "guide calls auth.require() exactly once")
+        exactly(code_view(gui), "def ug_card(", 1, "ug_card() defined once")
+        exactly(code_view(gui), "def ug_h(", 1, "ug_h() defined once")
+        gone(code_view(gui), "import auth\nimport auth", "auth not imported twice")
+
     page_numbers()
+    version_drift(["engine.py", "status.py", "verify_blocks.py", "ms_oauth.py"])
 
     print("=" * 62)
     print("PASSED %d   FAILED %d" % (len(PASSES), len(FAILS)))
     for f in FAILS:
         print("  - " + f)
+    for n in NOTES:
+        print("  note: " + n)
     print("=" * 62)
     return 1 if FAILS else 0
 
