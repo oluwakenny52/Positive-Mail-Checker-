@@ -1,4 +1,4 @@
-# @@FILE status.py blocks=13 version=v13.40
+# @@FILE status.py blocks=13 version=v13.42
 # ===========================================================================
 # status.py - canonical mail-verdict taxonomy, classifier and presentation.
 #
@@ -14,8 +14,9 @@
 #     never LOGIN_DROPPED. _RETRY deliberately excludes
 #     backend/upstream/downstream so those transient-server words fall through
 #     to RETRY_LATER as well.
-#   * Short aliases (VALID, WRONG, ...) are published in block 012 APP_COMPAT
-#     for app.py block 004's `from status import (...)`.
+#   * Short aliases (VALID, WRONG, ...) live in block 011 ALIASES. Block 012
+#     APP_COMPAT adds the STATUS_* and function spellings app.py and the pages
+#     still reach for. Both exist for app.py block 004's `from status import`.
 # ===========================================================================
 
 
@@ -29,7 +30,7 @@ an inline copy of the same tables, so the two must stay in lockstep.
 
 import re
 
-STATUS_VERSION = "v13.40"
+STATUS_VERSION = "v13.42"
 STATUS_MODULE = "status"
 STATUS_BLOCKS = 13
 # @@END 000 HEADER
