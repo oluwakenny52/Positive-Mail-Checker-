@@ -1,4 +1,4 @@
-# @@FILE auth.py blocks=6 version=v13.44
+# @@FILE auth.py blocks=6 version=v13.45
 # @@BLOCK 000 HEADER deps=-
 """auth.py - per-user passkey gate and display-fit controls.
 
@@ -209,52 +209,68 @@ FIT_SCALE_DEFAULT = 100
 FIT_FONT_MIN, FIT_FONT_MAX = 12, 22
 FIT_SCALE_MIN, FIT_SCALE_MAX = 80, 140
 FIT_SCALE_FACTOR_BELOW = 3
+FIT_FONT_PERCENT_ABOVE = 40
+
+
+def _fit_from(value, default, lo, hi, cast, percent_above=None, factor_below=None):
+    """Clamp one raw setting into [lo, hi] and cast it. Never raises.
+
+    A value at or below `factor_below` is a 0.8-1.6 factor and is multiplied by
+    100. A value above `percent_above` is a percent where pixels were expected
+    and falls back to `default`. Junk also falls back to `default`.
+    """
+    try:
+        n = float(value)
+    except (TypeError, ValueError):
+        return cast(default)
+    if factor_below is not None and n <= factor_below:
+        n *= 100.0
+    if percent_above is not None and n > percent_above:
+        n = float(default)
+    return cast(max(lo, min(hi, round(n))))
 
 
 def _fit_clamp_font(value):
-    try:
-        n = float(value)
-    except (TypeError, ValueError):
-        return FIT_FONT_DEFAULT
-    return int(max(FIT_FONT_MIN, min(FIT_FONT_MAX, round(n))))
+    return _fit_from(value, FIT_FONT_DEFAULT, FIT_FONT_MIN, FIT_FONT_MAX,
+                     int, FIT_FONT_PERCENT_ABOVE)
 
 
 def _fit_clamp_scale(value):
-    try:
-        n = float(value)
-    except (TypeError, ValueError):
-        return FIT_SCALE_DEFAULT
-    if n <= FIT_SCALE_FACTOR_BELOW:
-        n *= 100.0
-    return int(max(FIT_SCALE_MIN, min(FIT_SCALE_MAX, round(n))))
+    return _fit_from(value, FIT_SCALE_DEFAULT, FIT_SCALE_MIN, FIT_SCALE_MAX,
+                     int, None, FIT_SCALE_FACTOR_BELOW)
 
 
 def _fit_normalise(value):
     return _fit_clamp_scale(value)
 
 
-def _fit_from(font=None, scale=None):
+def _fit_read(key, default, lo, hi, cast, percent_above=None, factor_below=None):
+    """Clamped session value for `key`. Safe with no script run (headless)."""
+    try:
+        import streamlit as st
+        raw = st.session_state.get(key, default)
+    except Exception:
+        raw = default
+    return _fit_from(raw, default, lo, hi, cast, percent_above, factor_below)
+
+
+def _fit_raw():
+    import streamlit as st
+    ss = st.session_state
+    return ss.get("ui_font_size"), ss.get("ui_content_scale")
+
+
+def _fit_values():
+    font, scale = _fit_raw()
     f = _fit_clamp_font(font)
     s = _fit_clamp_scale(scale)
     return f, s, s / 100.0
 
 
-def _fit_raw():
-    ss = st.session_state
-    return ss.get("ui_font_size"), ss.get("ui_content_scale")
-
-
-def _fit_read():
-    return _fit_values()
-
-
-def _fit_values():
-    font, scale = _fit_raw()
-    return _fit_from(font, scale)
-
-
 def fit_css(font=None, scale=None):
-    f, s, z = _fit_from(font, scale)
+    f = _fit_clamp_font(font)
+    s = _fit_clamp_scale(scale)
+    z = s / 100.0
     return (
         "<style>\n"
         "/* Display Fit. zoom sits on the main container only, never on stApp, */\n"
@@ -276,6 +292,7 @@ def fit_css(font=None, scale=None):
 
 # @@BLOCK 004 FIT_UI deps=003
 def _fit_seed():
+    import streamlit as st
     ss = st.session_state
     if ss.get("_fit_seeded"):
         return
@@ -287,6 +304,7 @@ def _fit_seed():
 
 
 def _fit_apply(html):
+    import streamlit as st
     try:
         st.html(html)
         return "st.html"
@@ -300,11 +318,21 @@ def _fit_apply(html):
 
 
 def fit(scope=None):
+    import streamlit as st
     ss = st.session_state
     if ss.pop("_fit_reset", False):
         ss["ui_font_size"] = FIT_FONT_DEFAULT
         ss["ui_content_scale"] = FIT_SCALE_DEFAULT
     _fit_seed()
+    # Normalise BEFORE the widgets exist this run. An old factor (1.00) or an
+    # old percent font (100) would otherwise sit outside the slider's range and
+    # Streamlit would refuse to draw it.
+    ss["ui_font_size"] = _fit_read("ui_font_size", FIT_FONT_DEFAULT,
+                                   FIT_FONT_MIN, FIT_FONT_MAX, int,
+                                   FIT_FONT_PERCENT_ABOVE)
+    ss["ui_content_scale"] = _fit_read("ui_content_scale", FIT_SCALE_DEFAULT,
+                                       FIT_SCALE_MIN, FIT_SCALE_MAX, int,
+                                       None, FIT_SCALE_FACTOR_BELOW)
 
     with st.expander("🔎 Display Fit", expanded=True):
         st.slider("Font size (px)", FIT_FONT_MIN, FIT_FONT_MAX, key="ui_font_size")
