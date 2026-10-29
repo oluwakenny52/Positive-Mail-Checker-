@@ -295,11 +295,24 @@ def is_light(th: dict) -> bool:
 # @@END 006 THEME_DATA
 
 
-# @@BLOCK 007 THEME_CSS deps=006
+# # @@BLOCK 007 THEME_CSS deps=006
+def _readable_text(th: dict) -> str:
+    """`text`, or white/black when `text` and `bg` are too close to read.
+
+    is_light() only looked at bg, so a dark bg with a dark text colour rendered
+    every character in near-black on black. Emoji survived (colour glyphs) and
+    the words vanished, which read as "the page hangs / only dark".
+    """
+    t, b = _lum(th.get("text", "#ffffff")), _lum(th.get("bg", "#000000"))
+    if abs(t - b) >= 0.35:
+        return th.get("text", "#ffffff")
+    return "#0f172a" if b > 0.6 else "#f4f6fb"
+
+
 def theme_css(th: dict) -> str:
     g1, g2 = th["g1"], th["g2"]
     ac, ac2 = th["accent"], th["accent2"]
-    bg, panel, text = th["bg"], th["panel"], th["text"]
+    bg, panel, text = th["bg"], th["panel"], _readable_text(th)
     r = int(th.get("radius", 14))
     light = is_light(th)
     border = "rgba(15,23,42,0.14)" if light else "rgba(255,255,255,0.10)"
@@ -434,6 +447,11 @@ def theme_css(th: dict) -> str:
     ::-webkit-scrollbar-track {{ background: {bg}; }}
     ::-webkit-scrollbar-thumb {{ background: {g1}88; border-radius: 8px; }}
     ::-webkit-scrollbar-thumb:hover {{ background: {ac}; }}
+
+    /* the health-ping frame must not occupy layout */
+    iframe[title="st.iframe"], iframe[height="1"], iframe[height="0"] {{
+        height: 0 !important; display: block; border: 0 !important;
+    }}
 
     /* ---- v13.39 MOBILE FIT ---- */
     .block-container, [data-testid="stMainBlockContainer"] {{
