@@ -188,7 +188,7 @@ with tab_scan:
                            file_name="blocks_scan_%s.txt"
                                      % datetime.now().strftime("%Y%m%d_%H%M%S"),
                            mime="text/plain",
-                           use_container_width=True)
+                           width="stretch")
 
     for path, res in results.items():
         label = f"{path}  -  {len(res['blocks'])} block(s), {len(res['fails'])} fault(s)"
@@ -199,7 +199,7 @@ with tab_scan:
             st.code(_file_report(path, res), language="text")
             if res["table"]:
                 st.markdown("**Manifest**")
-                st.dataframe(res["table"], use_container_width=True, hide_index=True)
+                st.dataframe(res["table"], width="stretch", hide_index=True)
 # @@END 006 TAB_SCAN
 
 
@@ -227,7 +227,7 @@ with tab_paste:
                     st.code(f, language="text")
             if res["table"]:
                 st.markdown("**Blocks found in the paste**")
-                st.dataframe(res["table"], use_container_width=True, hide_index=True)
+                st.dataframe(res["table"], width="stretch", hide_index=True)
 
             if target in VB.BLOCKED_FILES and os.path.exists(os.path.join(ROOT, target)):
                 # v13.40: block_ids() returns a LIST. `list - set` has no
