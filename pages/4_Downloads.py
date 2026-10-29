@@ -104,13 +104,22 @@ st.markdown(
 # @@END 004 CSS
 
 
-# @@BLOCK 005 HERO deps=004
+# @@BLOCK 005 HERO deps=002,004
 st.markdown(
     '<div class="ex-hero"><h1>📦 Export Studio</h1>'
     '<p>Choose what to download, choose the exact format, preview it, take it. '
     'No mailbox connection, no proxy credit spent.</p></div>',
     unsafe_allow_html=True,
 )
+
+import sys as _sys
+
+if APP_DIR not in _sys.path:
+    _sys.path.insert(0, APP_DIR)
+import auth
+
+auth.require(st, "Unlock Export Studio")
+auth.fit(st)
 # @@END 005 HERO
 
 
@@ -151,7 +160,7 @@ def _status_of(path):
 
 def _sources():
     out = {}
-    for pat in ("mail_results/*.txt", "*.txt"):
+    for pat in (os.path.join(_results_dir(), "*.txt"), "*.txt"):
         for p in glob.glob(os.path.join(APP_DIR, pat)):
             b = os.path.basename(p)
             if b in IGNORE or any(t in b.lower() for t in IGNORE_TOKENS):
@@ -210,7 +219,7 @@ def _latest_per_tag():
     """{tag: newest path} for every status that has a file on disk."""
     out = {}
     for tag, _lbl in STATUS_FILE_TAGS:
-        hits = sorted(glob.glob(os.path.join(APP_DIR, "mail_results", f"{tag}_*.txt")),
+        hits = sorted(glob.glob(os.path.join(APP_DIR, _results_dir(), f"{tag}_*.txt")),
                       reverse=True)
         if hits:
             out[tag] = hits[0]
