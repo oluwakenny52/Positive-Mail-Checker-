@@ -1,14 +1,14 @@
-# @@FILE pages/5_Blocks.py blocks=12 version=v13.42
+# @@FILE pages/5_Blocks.py blocks=12 version=v13.43
 # @@BLOCK 000 FILE_HEADER deps=-
 """
-pages/5_Blocks.py - Block Inspector  (v13.42)
+pages/5_Blocks.py - Block Inspector  (v13.43)
 =============================================
 Validates the @@BLOCK frame of every big file IN THE BROWSER, so you never
 need a terminal, and lets you VALIDATE A PASTE before you commit it.
 
 Uses verify_blocks.py from the repo root as the single source of truth.
 
-Headless mode for CI (gate 8) - no Streamlit server and no streamlit import:
+Headless mode for CI (gate 11) - no Streamlit server and no streamlit import:
 
     python3 pages/5_Blocks.py --fix-check
 """
@@ -41,7 +41,9 @@ class _BareNoop:
 class _BareSt:
     """Minimal st.* surface, so blocks 001-010 run unchanged under plain python3."""
 
-    session_state = {}
+    def __init__(self):
+        # per-instance, not a class attribute: two _BareSt()s must not share state
+        self.session_state = {}
 
     def __getattr__(self, name):
         return _BareNoop()
@@ -148,7 +150,10 @@ with tab_scan:
     if st.button("🔁 Re-scan now", type="primary"):
         st.rerun()
 
-    results = VB.audit_all()
+    # CLI mode does not need the scan: block 011 prints only run_fix_check() rows
+    # and everything here is a st.* noop under _BareSt.  Skipping it keeps the gate
+    # off a full parse+compile of all twelve files it would then throw away.
+    results = {} if _CLI_FIX_CHECK else VB.audit_all()
     total_blocks = sum(len(r["blocks"]) for r in results.values())
     total_fails = sum(len(r["fails"]) for r in results.values())
 
@@ -238,8 +243,10 @@ with tab_paste:
                 st.success(f"Frame OK - {len(res['blocks'])} block(s), ids contiguous, "
                            f"all closed, file compiles.")
             else:
+                # v13.43: no [:40] slice - the count above already states the total,
+                # so a slice only made the list and the number disagree.
                 st.error(f"{len(res['fails'])} fault(s) found:")
-                for f in res["fails"][:40]:
+                for f in res["fails"]:
                     st.code(f, language="text")
             if res["table"]:
                 st.markdown("**Blocks found in the paste**")
