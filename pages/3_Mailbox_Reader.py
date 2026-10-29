@@ -3895,7 +3895,10 @@ try:
 except Exception:
     st.caption("The main checker lives at app.py")
 
-auth.fit(st)
+# v13.45: auth.fit(st) already ran in block 001. Calling it again here assigned
+# the widget keys after the widgets existed, which raised inside fit()'s own
+# try/except - so it silently did nothing except emit the CSS a second time.
+# fit() must be called exactly once per page.
 # @@END 042 BACK_TO_CHECKER
 
 
