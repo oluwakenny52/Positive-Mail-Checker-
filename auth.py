@@ -26,10 +26,12 @@ import time
 
 PASSKEY_FILE = "passkey.json"
 SALT_BYTES = 16
+# Hex chars kept from the sha256 = 64 bits. Do NOT raise this casually:
+# match_key re-derives with the CURRENT value, so every stored hash orphans.
 HASH_LEN = 16
 DEFAULT_FONT = 16
 DEFAULT_SCALE = 100
-MIN_LEN = 4
+MIN_LEN = 8
 # @@END 000 HEADER
 
 
@@ -78,7 +80,7 @@ def match_key(phrase):
     if not phrase:
         return ""
     for k in reversed(_load().get("keys") or []):
-        if _digest(phrase, k.get("salt", "")) == k.get("hash"):
+        if secrets.compare_digest(_digest(phrase, k.get("salt", "")), k.get("hash", "")):
             return k.get("hash", "")
     return ""
 
@@ -160,13 +162,20 @@ def require(st, title="Unlock Positive Mail-Checker"):
                     st.session_state["user_key_hash"] = add_key(p2, lbl)
                     st.rerun()
         with st.expander("Forget a passkey"):
-            st.caption("Forget THIS passkey removes only the one you are signed "
-                       "in with. Every other user on this deployment keeps theirs.")
-            if st.button("Forget this passkey", key="au_forget_one"):
-                forget_current(st.session_state.get("user_key_hash", ""))
+            # Locked, so there is no session hash to "forget this one" with -
+            # pick the key explicitly instead of reading user_key_hash (which is
+            # always "" on this branch, making the old button a permanent no-op).
+            pick = {}
+            for k in (_load().get("keys") or []):
+                lab = (k.get("label") or "").strip() or "unlabelled"
+                pick["%s · %s" % (lab, str(k.get("hash", ""))[:8])] = k.get("hash", "")
+            st.caption("Removes ONE key. Every other user on this deployment keeps theirs.")
+            choice = st.selectbox("Which passkey", list(pick))
+            if st.button("Forget selected passkey", key="au_forget_one"):
+                forget_current(pick.get(choice, ""))
                 st.session_state.pop("user_key_hash", None)
                 st.rerun()
-            st.caption("Forget ALL passkeys removes every key, for everyone.")
+            st.caption("Or remove every key, for everyone.")
             if st.button("Forget all passkeys", key="au_forget_all"):
                 forget_all()
                 st.session_state.pop("user_key_hash", None)
@@ -234,6 +243,10 @@ def fit_css(font=None, scale=None) -> str:
     font / scale are optional overrides, so the values can be exercised with no
     Streamlit at all. No argument = read the live settings. The fallback is a
     harmless 16px / 1.00.
+
+    The slider that writes ui_content_scale must use FIT_SCALE_MIN..FIT_SCALE_MAX
+    (a 0.75-1.60 FACTOR). It used to be 80-140 percent, and every value above
+    1.60 clamped, pinning the zoom at maximum.
     """
     if font is None:
         size = int(_fit_read(FIT_FONT_KEY, FIT_FONT_DEFAULT, FIT_FONT_MIN, FIT_FONT_MAX, int))
@@ -252,10 +265,16 @@ def fit_css(font=None, scale=None) -> str:
         ".block-container, [data-testid=\"stMainBlockContainer\"] { max-width: 100% !important; }"
         "</style>"
     )
+# @@END 003 FIT_CSS
 
 
+# @@BLOCK 004 FIT_UI deps=003
 def fit(st) -> None:
-    """Render the Display Fit controls and inject their CSS. Never raises."""
+    """Sidebar sliders + the CSS they drive. Call LATE in the page. Never raises.
+
+    This is the ONLY definition of fit(). It used to be duplicated here and in
+    003, so this copy shadowed the one that owned the reset handling.
+    """
     try:
         if st.session_state.pop("_fit_reset", False):
             # Assigned BEFORE either widget exists. Assigning after them raises
@@ -272,7 +291,8 @@ def fit(st) -> None:
 
         with st.sidebar.expander("🔎 Display Fit", expanded=False):
             st.slider("Text size (px)", FIT_FONT_MIN, FIT_FONT_MAX, key=FIT_FONT_KEY)
-            st.slider("Content scale", FIT_SCALE_MIN, FIT_SCALE_MAX, step=0.05, key=FIT_SCALE_KEY)
+            st.slider("Content scale", FIT_SCALE_MIN, FIT_SCALE_MAX, step=0.05,
+                      format="%.2f", key=FIT_SCALE_KEY)
             if st.button("Reset Display Fit", key="fit_reset_btn", width="stretch"):
                 st.session_state["_fit_reset"] = True
                 st.rerun()
@@ -282,21 +302,10 @@ def fit(st) -> None:
         st.markdown(fit_css(), unsafe_allow_html=True)
     except Exception:
         pass
-# @@END 003 FIT_CSS
-
-
-# @@BLOCK 004 FIT_UI deps=003
-def fit(st):
-    """Sidebar sliders + the CSS they drive. Call LATE in the page."""
-    with st.sidebar:
-        st.markdown("### Display Fit")
-        st.slider("Font size", 12, 22, DEFAULT_FONT, key="ui_font_size")
-        st.slider("Content scale %", 80, 140, DEFAULT_SCALE, key="ui_content_scale")
-    st.markdown(fit_css(), unsafe_allow_html=True)
 # @@END 004 FIT_UI
 
 
-# @@BLOCK 005 SELFTEST deps=003
+# @@BLOCK 005 SELFTEST deps=001,003
 def _selftest() -> None:
     bad = []
 
@@ -320,10 +329,19 @@ def _selftest() -> None:
     check("_fit_read defaults headless",
           lambda: _fit_read("no_such_key", 7, 0, 10, int) == 7)
 
+    # ---- the constants must stay inside the ranges fit_css clamps to -------
+    check("scale constants are factors, not percents",
+          lambda: FIT_SCALE_MIN < FIT_SCALE_DEFAULT <= FIT_SCALE_MAX <= 2.0)
+    check("font constants are px, not percents",
+          lambda: FIT_FONT_MIN <= FIT_FONT_DEFAULT <= FIT_FONT_MAX <= 40)
+
     # ---- passkey digest ----------------------------------------------------
     check("digest is stable", lambda: _digest("abc", "s") == _digest("abc", "s"))
     check("digest is salted", lambda: _digest("abc", "s") != _digest("abc", "t"))
-    check("digest is sha256 hex", lambda: len(_digest("abc", "s")) == 64)
+    check("digest is hex of HASH_LEN",
+          lambda: len(_digest("abc", "s")) == HASH_LEN
+          and all(c in "0123456789abcdef" for c in _digest("abc", "s")))
+    check("HASH_LEN is sane", lambda: 8 <= HASH_LEN <= 64)
 
     if bad:
         raise AssertionError("auth selftest failed: " + ", ".join(bad))
