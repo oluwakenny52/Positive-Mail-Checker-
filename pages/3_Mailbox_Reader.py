@@ -948,7 +948,13 @@ def _mail_tls_context(verify=False):
     return ctx
 
 def _parse_proxy_str(proxy_str):
-    """Accepts host:port | host:port:user:pass | user:pass@host:port | scheme://..."""
+    """Accepts host:port | host:port:user:pass | user:pass@host:port | scheme://...
+
+    v13.47: the userinfo half used to be a local named `auth`, shadowing the
+    `auth` MODULE this page imports.  Inside this function `auth.require` was an
+    AttributeError, and verify_v1337.py reported `auth.split` as a call to a
+    function the module does not have.  It is `userinfo` now.
+    """
     if not proxy_str or proxy_str == "direct":
         return None
     try:
@@ -960,11 +966,11 @@ def _parse_proxy_str(proxy_str):
 
         user = pw = None
         if "@" in p:
-            auth, p = p.rsplit("@", 1)
-            if ":" in auth:
-                user, pw = auth.split(":", 1)
+            userinfo, p = p.rsplit("@", 1)
+            if ":" in userinfo:
+                user, pw = userinfo.split(":", 1)
             else:
-                user = auth
+                user = userinfo
 
         parts = p.split(":")
         host = None
