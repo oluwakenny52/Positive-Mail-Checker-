@@ -16,6 +16,13 @@ v13.47: block 004 calls auth.fit_panel() in browser mode only. auth.fit() inject
 the CSS, so without the panel call the Display Fit control was missing here. The
 call stays inside the `if not _CLI_FIX_CHECK:` branch so `--fix-check` still runs
 without importing Streamlit. The expander stays collapsed until it is tapped.
+
+The reload guard is INSIDE that branch too. Left at module level, `--fix-check`
+reached `auth.fit_panel` with `auth` never imported - a NameError, which
+`except AttributeError` does not catch - so gate 11 died with a traceback. The
+require/fit/fit_panel calls are also OUTSIDE the except: nested inside it, they
+only ran when the module was stale, so a healthy module rendered the page with
+no passkey gate and no Display Fit panel.
 """
 
 import os
@@ -137,18 +144,22 @@ st.markdown(
 # auth is imported ONLY in browser mode.  Imported unconditionally it drags
 # Streamlit in through auth.py and breaks block 000's promise that
 # `--fix-check` needs no streamlit import at all.
+#
+# The whole guard lives inside that branch for the same reason: at module level
+# `auth.fit_panel` is reached with `auth` never bound, and the resulting
+# NameError is not an AttributeError, so --fix-check died here.
 if not _CLI_FIX_CHECK:
     import auth
 
-try:                                   # a module cached from before a redeploy
-    auth.fit_panel                     # still has the pre-split, one-function shape
-except AttributeError:
-    import importlib
-    auth = importlib.reload(auth)
+    try:                                # a module cached from before a redeploy
+        auth.fit_panel                  # still has the pre-split, one-function shape
+    except AttributeError:
+        import importlib
+        auth = importlib.reload(auth)
 
     auth.require(st, "Unlock Block Inspector")
-    auth.fit(st)                    # CSS only, before the first widget
-    auth.fit_panel(st)              # the controls; collapsed until tapped
+    auth.fit(st)                        # CSS only, before the first widget
+    auth.fit_panel(st)                  # the controls; collapsed until tapped
 # @@END 004 HERO
 
 
