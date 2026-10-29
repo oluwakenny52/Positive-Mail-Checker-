@@ -1,14 +1,22 @@
-# @@FILE auth.py blocks=6 version=v13.45
+# @@FILE auth.py blocks=6 version=v13.46
 # @@BLOCK 000 HEADER deps=-
 """auth.py - per-user passkey gate and display-fit controls.
 
 Import-clean: stdlib only, no Streamlit at module level.
 
-Every page calls, in this order, in its FIRST block:
+Every page calls, in this order:
 
     import auth
     auth.require(st)      # unlock or stop
-    auth.fit(st)          # sliders + CSS
+    auth.fit(st)          # CSS ONLY - must be early, before the first widget
+
+...and then, AFTER the page header:
+
+    auth.fit_panel(st)    # the controls, where a display control belongs
+
+fit() and fit_panel() are deliberately separate. The CSS has to land as early as
+possible so the first paint is already scaled; the panel has to land after the
+title or it pushes the header down. One function cannot do both.
 
 The passphrase is salted-sha256 hashed into passkey.json. It is a LOCK, not
 encryption: per-user files are separated by the hash PREFIX, they are not
@@ -210,14 +218,26 @@ FIT_FONT_MIN, FIT_FONT_MAX = 12, 22
 FIT_SCALE_MIN, FIT_SCALE_MAX = 80, 140
 FIT_SCALE_FACTOR_BELOW = 3
 FIT_FONT_PERCENT_ABOVE = 40
+# A value at or above this is a percent where pixels were expected. It is not
+# `percent_above` itself: 99px is an out-of-range PIXEL and must clamp to the
+# maximum, while 100 is a PERCENT and must fall back to the default. Using
+# percent_above as the threshold made 99 fall back and the clamp never ran.
+FIT_PERCENT_THRESHOLD = 100
 
 
 def _fit_from(value, default, lo, hi, cast, percent_above=None, factor_below=None):
     """Clamp one raw setting into [lo, hi] and cast it. Never raises.
 
-    A value at or below `factor_below` is a 0.8-1.6 factor and is multiplied by
-    100. A value above `percent_above` is a percent where pixels were expected
-    and falls back to `default`. Junk also falls back to `default`.
+    Order matters and is the whole point of this helper:
+
+      1. unparseable -> `default`
+      2. at or below `factor_below` -> a 0.8-1.6 factor, multiplied by 100
+      3. at or above FIT_PERCENT_THRESHOLD -> a percent where pixels were
+         expected, so `default`
+      4. otherwise -> clamped into [lo, hi]
+
+    Steps 3 and 4 are distinct. A value in (hi, 100) is an out-of-range pixel
+    and clamps to hi; only a value that is genuinely a percent falls back.
     """
     try:
         n = float(value)
@@ -225,8 +245,10 @@ def _fit_from(value, default, lo, hi, cast, percent_above=None, factor_below=Non
         return cast(default)
     if factor_below is not None and n <= factor_below:
         n *= 100.0
-    if percent_above is not None and n > percent_above:
-        n = float(default)
+    if percent_above is not None:
+        floor = max(float(FIT_PERCENT_THRESHOLD), float(percent_above) + 1.0)
+        if n >= floor:
+            n = float(default)
     return cast(max(lo, min(hi, round(n))))
 
 
@@ -287,7 +309,7 @@ def fit_css(font=None, scale=None):
         "}\n"
         "</style>\n"
     )
-# @@END 003
+# @@END 003 FIT_CSS
 
 
 # @@BLOCK 004 FIT_UI deps=003
@@ -317,7 +339,20 @@ def _fit_apply(html):
         return "none"
 
 
+def _fit_request_reset():
+    """on_click handler - runs BEFORE the script body, so writing the two keys
+    here is legal even though their sliders were instantiated last run.
+
+    The button used to write ss["ui_font_size"] inside its own `if` branch, by
+    which time the slider with that key already existed -> 
+    StreamlitWidgetAlreadyInstantiatedError, and st.rerun() was never reached.
+    """
+    import streamlit as st
+    st.session_state["_fit_reset"] = True
+
+
 def fit(scope=None):
+    """Inject the Display Fit CSS. Call EARLY - before the first widget."""
     import streamlit as st
     ss = st.session_state
     if ss.pop("_fit_reset", False):
@@ -334,21 +369,27 @@ def fit(scope=None):
                                        FIT_SCALE_MIN, FIT_SCALE_MAX, int,
                                        None, FIT_SCALE_FACTOR_BELOW)
 
-    with st.expander("🔎 Display Fit", expanded=True):
+    font, scale, zoom = _fit_values()
+    ss["_fit_injected_via"] = _fit_apply(fit_css(font, scale))
+
+
+def fit_panel(scope=None):
+    """The Display Fit controls. Call LATE - after the page header."""
+    import streamlit as st
+    ss = st.session_state
+    _fit_seed()
+
+    with st.expander("🔎 Display Fit", expanded=False):
         st.slider("Font size (px)", FIT_FONT_MIN, FIT_FONT_MAX, key="ui_font_size")
         st.slider("Content scale (%)", FIT_SCALE_MIN, FIT_SCALE_MAX, key="ui_content_scale")
         st.caption(
             f"Live: font {ss.get('ui_font_size')}px, scale {ss.get('ui_content_scale')}%. "
             "Scale zooms the page content only, never the sidebar."
         )
-        if st.button("Reset Display Fit", key="ui_fit_reset_btn", width="stretch"):
-            ss["ui_font_size"] = FIT_FONT_DEFAULT
-            ss["ui_content_scale"] = FIT_SCALE_DEFAULT
-            st.rerun()
+        st.button("Reset Display Fit", key="ui_fit_reset_btn", width="stretch",
+                  on_click=_fit_request_reset)
 
     font, scale, zoom = _fit_values()
-    html = fit_css(font, scale)
-    how = _fit_apply(html)
 
     with st.expander("🔧 Display Fit debug", expanded=False):
         st.write(
@@ -356,15 +397,15 @@ def fit(scope=None):
                 "font": font,
                 "scale": scale,
                 "zoom": round(zoom, 4),
-                "injected_via": how,
+                "injected_via": ss.get("_fit_injected_via", "unknown"),
                 "session_state": {
                     "ui_font_size": ss.get("ui_font_size"),
                     "ui_content_scale": ss.get("ui_content_scale"),
                 },
             }
         )
-        st.code(html, language="html")
-# @@END 004
+        st.code(fit_css(font, scale), language="html")
+# @@END 004 FIT_UI
 
 
 # @@BLOCK 005 SELFTEST deps=001,003
@@ -400,7 +441,7 @@ def _selftest() -> None:
     check("factor scale converts to a percent",
           lambda: _fit_from(1.25, FIT_SCALE_DEFAULT, FIT_SCALE_MIN, FIT_SCALE_MAX,
                             float, None, FIT_SCALE_FACTOR_BELOW) == 125)
-    check("bare factor 1.0 converts", 
+    check("bare factor 1.0 converts",
           lambda: _fit_from(1.0, FIT_SCALE_DEFAULT, FIT_SCALE_MIN, FIT_SCALE_MAX,
                             float, None, FIT_SCALE_FACTOR_BELOW) == 100)
     check("percent font converts",
@@ -416,6 +457,10 @@ def _selftest() -> None:
     check("below-range percent clamps low",
           lambda: _fit_from(9, FIT_SCALE_DEFAULT, FIT_SCALE_MIN, FIT_SCALE_MAX,
                             float, None, FIT_SCALE_FACTOR_BELOW) == FIT_SCALE_MIN)
+    # The distinction that was missing: 99px clamps, 100% falls back.
+    check("out-of-range px clamps instead of falling back",
+          lambda: _fit_from(99, FIT_FONT_DEFAULT, FIT_FONT_MIN, FIT_FONT_MAX, int, 40)
+          == FIT_FONT_MAX)
 
     # ---- the constants must stay inside the ranges fit_css clamps to -------
     check("scale constants are percents",
@@ -426,6 +471,8 @@ def _selftest() -> None:
           lambda: FIT_SCALE_FACTOR_BELOW < FIT_SCALE_MIN)
     check("font percent threshold sits above the range",
           lambda: FIT_FONT_PERCENT_ABOVE > FIT_FONT_MAX)
+    check("percent threshold is a real percent",
+          lambda: FIT_PERCENT_THRESHOLD >= 100)
 
     # ---- passkey digest ----------------------------------------------------
     check("digest is stable", lambda: _digest("abc", "s") == _digest("abc", "s"))
