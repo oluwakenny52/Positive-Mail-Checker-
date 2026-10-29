@@ -1847,15 +1847,14 @@ def theme_css(th: dict) -> str:
     @keyframes bbShift {{ 0%{{background-position:0% 50%}} 50%{{background-position:100% 50%}} 100%{{background-position:0% 50%}} }}
     """
 
-    _fit = auth.fit_css().replace("<style>", "").replace("</style>", "")
-
     return f"""
 <style>
+    <!-- Display Fit CSS is emitted once, by auth.fit() in block 007. It used to
+         be re-embedded here as well, which fought the 88vw sidebar rule. -->
     :root {{
         --bb-g1: {g1}; --bb-g2: {g2}; --bb-ac: {ac}; --bb-ac2: {ac2};
         --bb-bg: {bg}; --bb-panel: {panel}; --bb-text: {text}; --bb-r: {r}px;
     }}
-    {_fit}
     .stApp, [data-testid="stAppViewContainer"], [data-testid="stMain"] {{
         background: {bg} !important; color: {text} !important;
     }}
@@ -2601,6 +2600,16 @@ def _apply_settings_reset(reason: str = "Reset Defaults"):
             str_lit.session_state[k] = list(v) if isinstance(v, list) else v
         except Exception:
             pass
+    # v13.45: ui_font_size / ui_content_scale are created by auth.fit() in block
+    # 007, which has ALREADY run by the time this executes - so assigning them in
+    # the loop above raises StreamlitWidgetAlreadyInstantiatedError and is
+    # swallowed. They were therefore the only two settings Reset Defaults could
+    # never restore. Hand the pair to auth.fit() through its own one-shot flag;
+    # fit() consumes it at the top of the next run, where assigning is legal.
+    try:
+        str_lit.session_state["_fit_reset"] = True
+    except Exception:
+        pass
     try:
         str_lit.session_state.pool_mode = "all"
         str_lit.session_state.pool_locked = True
@@ -2626,6 +2635,10 @@ _reset_all_settings = _apply_settings_reset
 
 if str_lit.session_state.pop("_bb_reset_pending", False):
     _apply_settings_reset("Reset Defaults button")
+    # The flag above is consumed by auth.fit() at block 007, which has already
+    # run. Rerun once so the widgets are rebuilt from the new values - both the
+    # ones assigned here and the Display Fit pair.
+    str_lit.rerun()
 # @@END 045 SETTINGS_RESET
 
 # @@BLOCK 046 SIDEBAR_MODE deps=009,042,043,044
