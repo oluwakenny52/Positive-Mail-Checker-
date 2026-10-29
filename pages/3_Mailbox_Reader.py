@@ -93,6 +93,10 @@ except ImportError:
     def host_list(email: str) -> List[str]:
         domain = email.split("@")[-1].lower() if "@" in email else ""
         return [f"imap.{domain}"] if domain else ["imap.gmail.com"]
+
+import auth
+
+auth.require(st, "Unlock Mailbox Reader")
 # @@END 002 HOSTS_IMPORT
 
 
@@ -685,13 +689,17 @@ def save_session_cache():
             "otp_total_matched_count": st.session_state.get("otp_total_matched_count", 0),
         }
 
-        # Never persist raw bodies or full body text. Metadata only.
-        # Full content is re-fetched on demand when a message is opened.
+        # v13.43: raw/body/body_raw are persisted now, so a restored page does
+        # not have to re-fetch a mailbox to show a message.  `raw` is bytes, so
+        # it is base64-encoded here - json.dump cannot take bytes, and the bare
+        # except below would swallow the TypeError and stop writing the cache
+        # entirely, with no visible error.
         MAX_CACHED = 60
         KEEP_KEYS = {
             "id", "folder", "from", "to", "subject", "date",
             "is_read", "is_bot", "categories", "flags", "size_bytes",
             "pins", "links", "cards", "creds",
+            "raw", "body", "body_raw",
         }
         for k_name, key_in_state in [
             ("current_messages", "current_messages"),
@@ -701,6 +709,8 @@ def save_session_cache():
             serialized_list = []
             for m in st.session_state.get(key_in_state, [])[:MAX_CACHED]:
                 m_copy = {k: v for k, v in m.items() if k in KEEP_KEYS}
+                if isinstance(m_copy.get("raw"), (bytes, bytearray)):
+                    m_copy["raw"] = base64.b64encode(bytes(m_copy["raw"])).decode("ascii")
                 serialized_list.append(m_copy)
             cache_data[k_name] = serialized_list
 
@@ -1280,7 +1290,7 @@ def _valid_files() -> List[str]:
         if not os.path.isfile(p):
             continue
         low = os.path.basename(p).lower()
-        if any(kw in low for kw in _VALID_IGNORE) or low == LAST_ACCOUNT_FILE:
+        if any(kw in low for kw in _VALID_IGNORE) or low == os.path.basename(LAST_ACCOUNT_FILE):
             continue
         out.append(p)
     return out
@@ -1387,7 +1397,7 @@ def delete_specific_account_from_storage(target_combo: str):
     search_files = glob.glob("mail_results/*.txt") + glob.glob("*.txt")
     for path in search_files:
         filename_lower = os.path.basename(path).lower()
-        if filename_lower == LAST_ACCOUNT_FILE or any(kw in filename_lower for kw in ["resume", "unfinished", "remaining", "input", "proxies", "proxy", "config", "blocklist"]):
+        if filename_lower == os.path.basename(LAST_ACCOUNT_FILE) or any(kw in filename_lower for kw in ["resume", "unfinished", "remaining", "input", "proxies", "proxy", "config", "blocklist"]):
             continue
         try:
             with open(path, "r", encoding="utf-8", errors="ignore") as f:
@@ -1463,7 +1473,7 @@ def generate_all_mail_zip():
         for path in search_paths:
             filename = os.path.basename(path)
             filename_lower = filename.lower()
-            if filename in added_files or filename == LAST_ACCOUNT_FILE or any(kw in filename_lower for kw in ["resume", "unfinished", "remaining"]):
+            if filename in added_files or filename == os.path.basename(LAST_ACCOUNT_FILE) or any(kw in filename_lower for kw in ["resume", "unfinished", "remaining"]):
                 continue
             try:
                 with open(path, "r", encoding="utf-8", errors="ignore") as f:
@@ -3834,6 +3844,8 @@ try:
     st.page_link("app.py", label="← Back to the Mail Checker")
 except Exception:
     st.caption("The main checker lives at app.py")
+
+auth.fit(st)
 # @@END 042 BACK_TO_CHECKER
 
 
