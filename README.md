@@ -14,8 +14,9 @@ NAMED, NUMBERED, REPLACEABLE block.
 * Nothing but blanks and comments between an `@@END` and the next `@@BLOCK`.
 * Every `@@END` MUST carry its block name. A bare `# @@END 016` is a fault.
 * The last line of every block file is `# @@EOF`.
+* The frame is 11 files / 269 blocks. A 9-file / 246-block scan is a stale deploy.
 
-## Gates - all seven must be green before every commit
+## Gates - all ten must be green before every commit
 
     python fix_end_names.py --check      # exit 0 = no bare @@END pending
     python verify_blocks.py              # exit 0 = frame intact
@@ -23,38 +24,47 @@ NAMED, NUMBERED, REPLACEABLE block.
     python verify_v1337.py               # must print FAILED 0
     python test_verdicts.py              # must print FAILED 0
     python engine.py --selftest          # exit 0 = headless engine sanity
-    python status.py --selftest          # exit 0 = status classifier sanity
+    python status.py --alias-selftest    # exit 0 = verdict alias sanity
+    python -m compileall -q .            # exit 0 = everything compiles
+    pip install -r requirements.txt      # exit 0 = pins still resolve
+    python auth.py --selftest            # exit 0 = gate + Display Fit sanity
 
-`.github/workflows/gates.yml` runs all seven on every push and writes a PASS/FAIL
+`.github/workflows/gates.yml` runs all ten on every push and writes a PASS/FAIL
 table to the run summary, so the gates are checkable from a phone with no
-terminal. The Summary step exits non-zero when a gate fails, so the run itself goes red. 
+terminal. The Summary step exits non-zero when a gate fails, so the run itself
+goes red. The step names in the workflow are the authority if a command above
+ever drifts from them.
 
-`pages/5_Blocks.py` runs the same verifier in the browser and can
-canonicalise a bare `@@END` for you (download the fixed file, upload it back).
+`pages/5_Blocks.py` runs the same verifier in the browser and can canonicalise a
+bare `@@END` for you (download the fixed file, upload it back). It also
+validates a paste before you commit.
 
 Always invoke `verify_blocks.py` as `python verify_blocks.py` - its `# @@FILE`
 header is line 1, so it has no usable shebang.
 
-## In-browser
 ## Passphrase and per-user isolation
 
 `auth.py` gates every page. First visit: choose a passphrase (optionally
 "Remember on this device", which writes a salted hash to `passkey.json`). Every
 per-user file - results directory, clean-valid list, last account, session
-cache - is prefixed with the unlocked hash, so two people on one deployment stay
-separate. It is a lock, not encryption.
+cache, export presets - is prefixed with the unlocked hash, so two people on one
+deployment stay separate. It is a lock, not encryption.
+
+"Remember on this device" is a convenience for a private phone. On a shared
+deployment, "Forget this passkey" removes only the key you are signed in with;
+"Forget all passkeys" deletes `passkey.json` and locks out everybody. `passkey.json`
+is per-deployment and resets on redeploy; `theme.json` and `proxies.txt` stay
+shared on purpose.
 
 Display Fit (font size / content scale) is in every page's sidebar via
 `auth.fit(st)`.
-
-`pages/5_Blocks.py` (Block Inspector) runs the same engine in the browser and
-validates a paste before you commit.
 
 ## Layout
 
 | File | Role |
 |---|---|
 | `app.py` | UI shell + run loop (111 blocks) |
+| `auth.py` | passphrase gate, per-user paths, Display Fit |
 | `engine.py` | headless verification engine (12 blocks) |
 | `status.py` | canonical verdict taxonomy + classifier (13 blocks) |
 | `hosts.py` | host discovery, family priority, ranking |
@@ -65,7 +75,8 @@ validates a paste before you commit.
 | `pages/5_Blocks.py` | frame inspector |
 | `pages/6_User_Guide.py` | end-user manual: every control, button, verdict and page |
 
-tier2_split.py is staged but NOT applied — engine.py is currently a separate hand-written engine that app.py does not import.
+`tier2_split.py` is staged but NOT applied - `engine.py` is currently a separate
+hand-written engine that `app.py` does not import.
 
 ## Deploy
 
