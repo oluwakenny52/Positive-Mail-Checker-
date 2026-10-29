@@ -2629,11 +2629,6 @@ if str_lit.session_state.pop("_bb_reset_pending", False):
 # @@END 045 SETTINGS_RESET
 
 # @@BLOCK 046 SIDEBAR_MODE deps=009,042,043,044
-str_lit.sidebar.markdown("---")
-str_lit.sidebar.subheader("Display Fit")
-ui_font = str_lit.sidebar.slider("Font size", 12, 22, 16, key="ui_font_size")
-ui_scale = str_lit.sidebar.slider("Content scale %", 80, 140, 100, key="ui_content_scale")
-str_lit.sidebar.markdown("---")
 str_lit.sidebar.header("⚙ Engine Control Panel")
 str_lit.sidebar.caption(
     "Universal defaults are pre-set for ANY mix of combos (Gmail / O365 / Yahoo / "
