@@ -1,4 +1,5 @@
-# @@FILE auth.py blocks=6 version=# @@BLOCK 000 HEADER deps=-
+# @@FILE auth.py blocks=6 version=v13.43
+# @@BLOCK 000 HEADER deps=-
 """auth.py - per-user passkey gate and display-fit controls.
 
 Import-clean: stdlib only, no Streamlit at module level.
