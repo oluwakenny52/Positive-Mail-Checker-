@@ -144,6 +144,12 @@ import sys as _sys
 if APP_DIR not in _sys.path:
     _sys.path.insert(0, APP_DIR)
 import auth
+
+try:                                   # a module cached from before a redeploy
+    auth.fit_panel                     # still has the pre-split, one-function shape
+except AttributeError:
+    import importlib
+    auth = importlib.reload(auth)
 from auth import user_file
 
 auth.require(st, "Unlock Export Studio")
