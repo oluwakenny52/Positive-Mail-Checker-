@@ -1,6 +1,41 @@
+Mega Ultimate Mail Checker — v13.45
+===================================
+Display Fit is usable again, and the two silent-failure paths behind it are closed.
+
+* DISPLAY FIT: `zoom` moved off `html body div.stApp` onto the MAIN container
+  only. The sidebar lives inside `.stApp` and the mobile sheet sizes it to
+  `88vw`; a vw unit is not divided by the zoom factor, so at 1.40 the sidebar
+  laid out at 123vw and pushed the main column off a phone screen. Font size
+  still reaches everything through `:root`, so sidebar text scales without the
+  geometry breaking.
+* RESET DEFAULTS REACHES DISPLAY FIT. `ui_font_size` / `ui_content_scale` are
+  created by `auth.fit()` in block 007, so block 045's assignment loop raised
+  StreamlitWidgetAlreadyInstantiatedError for exactly those two keys and the
+  per-key `except Exception: pass` hid it - they were the only two settings the
+  button could never restore. The reset now raises auth's `_fit_reset` flag and
+  reruns, so `fit()` applies the pair at the top of the next run where assigning
+  is legal.
+* `auth.fit(st)` IS CALLED ONCE PER PAGE. `pages/3_Mailbox_Reader.py` called it
+  in block 001 and again in block 042; the second call threw inside `fit()`'s own
+  try/except and did nothing but duplicate the CSS.
+* `fit_css()` IS EMITTED ONCE. `theme_css()` re-embedded it inside the theme
+  sheet, so every page carried two copies of the same rules.
+* EXPORT STUDIO PRESETS WORK. `pages/4` block 002 called `user_file()` but the
+  file only ever did `import auth`; `_presets()` and `_save_presets()` swallowed
+  the NameError, so Save preset and Apply preset had never worked. `user_file` is
+  imported in block 005 and `_results_dir()` uses it instead of re-implementing
+  the prefix.
+* GATE COVERAGE. `pages/5_Blocks.py` fix-checks now assert the `_fit_reset` flag
+  (auth + app), the single `auth.fit(st)` call, and the `user_file` import, so
+  none of the four can be lost silently again.
+* `audit_frame.py`'s import-failure mirror caught up: 11 files / 269 blocks ->
+  12 / 270, matching `verify_blocks.py`, and it lists `verify_blocks.py` itself.
+* README: the gate list now matches the workflow order and uses
+  `status.py --selftest` (the documented `--alias-selftest` was not a flag
+  `status.py` accepts).
+  
 Mega Ultimate Mail Checker — v13.43
 ===================================
-
 * NEW `auth.py`: per-user passkey gate on all six entry points, salted-sha256,
   optional device remember, "start fresh as a different user".
 * Per-user isolation completed: results dir, clean-valid, last account, session
@@ -18,6 +53,7 @@ Mega Ultimate Mail Checker — v13.43
 * `fit_css()` is headless-proof: `_fit_read()` never raises, `fit_css(font, scale)`
   takes overrides, and the selftest asserts values instead of the environment.
 * `pages/4` presets resolve per user at call time.
+
 Mega Ultimate Mail Checker — v13.40a
 ===================================
 * **Frame Restored**: Every file's block frame structure and ending tag names are verified, with block count alignment fully restored across the workspace (246 blocks total).
