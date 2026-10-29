@@ -373,6 +373,8 @@ with st.expander("🛠 Canonicalise @@END names (no terminal needed)", expanded=
 # Behavioural companion to the frame scan. verify_blocks proves the @@BLOCK
 # frame; it cannot see whether a FIX is still in the code. These are the exact
 # strings the fix plan introduced, with the count each must appear at.
+# NB: three needles below point at THIS file, so each also matches its own
+# literal in this table - their want counts include that +1 self-reference.
 _FIX_CHECKS = (
     ("status.py", "_PROXY_BLOCKED", 2, "proxy-blocked classifies as CONNECTION_FAILED"),
     ("status.py", "best = None", 1, "worse_of no longer seeds with UNKNOWN"),
@@ -383,9 +385,9 @@ _FIX_CHECKS = (
     ("pages/3_Mailbox_Reader.py", "login_drop_count += 1", 1, "drop not double counted"),
     ("pages/4_Downloads.py", "template.format(**d)", 1, "delimiter honours spaced templates"),
     ("pages/4_Downloads.py", '_cut = raw.find("|", _colon + 1)', 1, "no pipe truncation"),
-    ("pages/5_Blocks.py", "out.insert(len(out) - 1, _end)", 2, "@@EOF stays last"),
-    ("pages/5_Blocks.py", "def run_fix_check():", 1, "one implementation, button and CLI"),
-    ("pages/5_Blocks.py", "if _CLI_FIX_CHECK:", 3, "CLI dispatch stays wired (000, 002, 011)"),
+    ("pages/5_Blocks.py", "out.insert(len(out) - 1, _end)", 3, "@@EOF stays last"),
+    ("pages/5_Blocks.py", "def run_fix_check():", 2, "one implementation, button and CLI"),
+    ("pages/5_Blocks.py", "if _CLI_FIX_CHECK:", 4, "CLI dispatch stays wired (000, 002, 011)"),
     ("engine.py", '_conf = getattr(_hosts, "conf", None)', 1, "engine reads hosts.conf"),
     ("engine.py", "state.cooldown_host(rung.host, 30.0)", 1, "cooldown table is armed"),
     ("engine.py", "def _local_to(domain, host):", 1, "pick_verdict checks locality"),
