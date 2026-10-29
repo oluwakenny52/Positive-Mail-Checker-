@@ -19,7 +19,7 @@ NAMED, NUMBERED, REPLACEABLE block.
   prints target against found and warns on drift - so a stale number cannot hide
   in a doc. A frame move is one edit, in `verify_blocks.py`.
 
-## Gates - all ten must be green before every commit
+## Gates - all eleven must be green before every commit
 
     python fix_end_names.py --check      # exit 0 = no bare @@END pending
     python verify_blocks.py              # exit 0 = frame intact
@@ -31,8 +31,9 @@ NAMED, NUMBERED, REPLACEABLE block.
     python -m compileall -q .            # exit 0 = everything compiles
     pip install -r requirements.txt      # exit 0 = pins still resolve
     python auth.py --selftest            # exit 0 = gate + Display Fit sanity
+    python pages/5_Blocks.py --fix-check # exit 0 = the fixes are still in the code
 
-`.github/workflows/gates.yml` runs all ten on every push and writes a PASS/FAIL
+`.github/workflows/gates.yml` runs all eleven on every push and writes a PASS/FAIL
 table to the run summary, so the gates are checkable from a phone with no
 terminal. The Summary step exits non-zero when a gate fails, so the run itself
 goes red. The step names in the workflow are the authority if a command above
