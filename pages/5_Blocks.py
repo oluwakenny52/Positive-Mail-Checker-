@@ -149,15 +149,28 @@ with tab_scan:
     total_blocks = sum(len(r["blocks"]) for r in results.values())
     total_fails = sum(len(r["fails"]) for r in results.values())
 
+    # The frame size is READ, never quoted: verify_blocks.py owns the target and
+    # audit_frame.py imports the same two names. A stale number cannot hide in a
+    # doc or in this page.
+    _tgt_files = getattr(VB, "TARGET_FILES", 0)
+    _tgt_blocks = getattr(VB, "TARGET_BLOCKS", 0)
+
     c1, c2, c3 = st.columns(3)
-    c1.metric("Files checked", len(results))
-    c2.metric("Blocks found", total_blocks)
+    c1.metric("Files / target %d" % _tgt_files, len(results))
+    c2.metric("Blocks / target %d" % _tgt_blocks, total_blocks)
     c3.metric("Failures", total_fails)
 
     if total_fails == 0 and total_blocks:
         st.success("Frame is intact on every block file.")
     elif total_fails:
         st.error(f"{total_fails} structural fault(s) - details under each file below.")
+
+    if (len(results) != _tgt_files) or (total_blocks != _tgt_blocks):
+        st.warning(
+            "Frame size has DRIFTED: target %d file(s) / %d block(s), found %d / %d. "
+            "If the move is real, edit TARGET_FILES/TARGET_BLOCKS in verify_blocks.py "
+            "- that is the only place, and tier2_split.py prints the new line."
+            % (_tgt_files, _tgt_blocks, len(results), total_blocks))
 
     st.caption(f"Scanned at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
 
@@ -378,7 +391,7 @@ _FIX_CHECKS = (
     ("engine.py", "def _local_to(domain, host):", 1, "pick_verdict checks locality"),
     ("fix_end_names.py", "(\\d{3})", 2, "marker id width matches verify_blocks (RE_BLOCK & RE_END)"),
     ("fix_end_names.py", "gate_faults", 3, "re-gate drives the exit code"),
-    ("audit_frame.py", "EXPECT_BLOCKS drift trap", 1, "drift trap documented"),
+    ("audit_frame.py", "TARGET_FILES as EXPECT_FILES", 1, "frame target is imported, not duplicated"),
     ("auth.py", "def require(", 1, "passkey gate exists"),
     ("auth.py", "def fit_css(", 1, "display fit exists"),
     ("app.py", "DNS_FAILED, SMTP_FAILED):", 1, "DNS/SMTP verdicts retained"),
