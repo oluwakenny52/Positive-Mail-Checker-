@@ -98,6 +98,11 @@ st.markdown(
     'and which page does what. Nothing here connects anywhere.</p></div>',
     unsafe_allow_html=True,
 )
+
+import auth
+
+auth.require(st, "Unlock User Guide")
+auth.fit(st)
 # @@END 005 HERO
 
 
