@@ -14,7 +14,10 @@ NAMED, NUMBERED, REPLACEABLE block.
 * Nothing but blanks and comments between an `@@END` and the next `@@BLOCK`.
 * Every `@@END` MUST carry its block name. A bare `# @@END 016` is a fault.
 * The last line of every block file is `# @@EOF`.
-* The frame is 11 files / 269 blocks. A 9-file / 246-block scan is a stale deploy.
+* The frame size is deliberately NOT written down here. `verify_blocks.py` owns
+  `TARGET_FILES`/`TARGET_BLOCKS`, `audit_frame.py` imports them, and the Scan tab
+  prints target against found and warns on drift - so a stale number cannot hide
+  in a doc. A frame move is one edit, in `verify_blocks.py`.
 
 ## Gates - all ten must be green before every commit
 
@@ -63,9 +66,9 @@ Display Fit (font size / content scale) is in every page's sidebar via
 
 | File | Role |
 |---|---|
-| `app.py` | UI shell + run loop (111 blocks) |
+| `app.py` | UI shell + run loop |
 | `auth.py` | passphrase gate, per-user paths, Display Fit |
-| `engine.py` | headless verification engine (12 blocks) |
+| `engine.py` | headless verification engine |
 | `status.py` | canonical verdict taxonomy + classifier (13 blocks) |
 | `hosts.py` | host discovery, family priority, ranking |
 | `ms_oauth.py` | Microsoft XOAUTH2 (personal accounts) |
