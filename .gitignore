@@ -22,3 +22,6 @@ __pycache__/
 *.bak.*
 app.py.tmp_v1339*
 download_presets.json
+passkey.json
+passkey.json.tmp
+*_mail_results/
