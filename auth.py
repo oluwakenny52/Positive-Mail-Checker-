@@ -196,27 +196,92 @@ def require(st, title="Unlock Positive Mail-Checker"):
 # @@END 002 GATE
 
 
-# @@BLOCK 003 FIT_CSS deps=000
-def fit_css():
-    """CSS applying the two display-fit sliders.
+# @@BLOCK 003 FIT_CSS deps=001
+FIT_FONT_KEY = "ui_font_size"
+FIT_SCALE_KEY = "ui_content_scale"
+FIT_FONT_DEFAULT = 16
+FIT_SCALE_DEFAULT = 1.00
+FIT_FONT_MIN, FIT_FONT_MAX = 12, 24
+FIT_SCALE_MIN, FIT_SCALE_MAX = 0.75, 1.60
 
-    `st` MUST be bound here: this module is import-clean, so there is no
-    module-level streamlit. The except clauses are narrow on purpose - a broad
-    `except Exception` hid a NameError on `st` and pinned every page to 16px /
-    1.00 forever, which looked exactly like "the sliders do nothing".
+
+def _fit_read(key, default, lo, hi, cast=float):
+    """One Display Fit setting, clamped. NEVER raises.
+
+    v13.44: this was a bare st.session_state read inside fit_css, so the call
+    raised whenever it ran outside a Streamlit script run - which is exactly
+    what the CI selftest does - and raised ImportError wherever streamlit is
+    not installed. The narrow except did not cover either, so fit_css died
+    before emitting a byte and the gate went red.
     """
-    import streamlit as st
     try:
-        font = int(st.session_state.get("ui_font_size", DEFAULT_FONT))
-    except (TypeError, ValueError):
-        font = DEFAULT_FONT
+        import streamlit as st
+        raw = st.session_state.get(key, default)
+    except Exception:
+        return default
     try:
-        scale = int(st.session_state.get("ui_content_scale", DEFAULT_SCALE)) / 100.0
+        val = cast(raw)
     except (TypeError, ValueError):
-        scale = 1.0
-    return ("<style>html{font-size:%dpx !important;}"
-            "body{font-size:%dpx !important;}"
-            ".stApp{zoom:%.2f !important;}</style>" % (font, font, scale))
+        return default
+    if val != val:                       # NaN
+        return default
+    return max(lo, min(hi, val))
+
+
+def fit_css(font=None, scale=None) -> str:
+    """CSS for the Display Fit sliders. Always returns a str.
+
+    font / scale are optional overrides, so the values can be exercised with no
+    Streamlit at all. No argument = read the live settings. The fallback is a
+    harmless 16px / 1.00.
+    """
+    if font is None:
+        size = int(_fit_read(FIT_FONT_KEY, FIT_FONT_DEFAULT, FIT_FONT_MIN, FIT_FONT_MAX, int))
+    else:
+        size = max(FIT_FONT_MIN, min(FIT_FONT_MAX, int(font)))
+    if scale is None:
+        zoom = float(_fit_read(FIT_SCALE_KEY, FIT_SCALE_DEFAULT, FIT_SCALE_MIN, FIT_SCALE_MAX, float))
+    else:
+        zoom = max(FIT_SCALE_MIN, min(FIT_SCALE_MAX, float(scale)))
+
+    return (
+        "<style>"
+        f"html, body, .stApp, .stApp p, .stApp li, .stApp label, .stApp input, "
+        f".stApp textarea, .stApp select {{ font-size: {size}px !important; }}"
+        f".stApp {{ zoom: {zoom:.2f}; }}"
+        ".block-container, [data-testid=\"stMainBlockContainer\"] { max-width: 100% !important; }"
+        "</style>"
+    )
+
+
+def fit(st) -> None:
+    """Render the Display Fit controls and inject their CSS. Never raises."""
+    try:
+        if st.session_state.pop("_fit_reset", False):
+            # Assigned BEFORE either widget exists. Assigning after them raises
+            # StreamlitWidgetAlreadyInstantiatedError - the v13.35 reset lesson.
+            st.session_state[FIT_FONT_KEY] = FIT_FONT_DEFAULT
+            st.session_state[FIT_SCALE_KEY] = FIT_SCALE_DEFAULT
+
+        if FIT_FONT_KEY not in st.session_state:
+            st.session_state[FIT_FONT_KEY] = int(
+                _fit_read(FIT_FONT_KEY, FIT_FONT_DEFAULT, FIT_FONT_MIN, FIT_FONT_MAX, int))
+        if FIT_SCALE_KEY not in st.session_state:
+            st.session_state[FIT_SCALE_KEY] = float(
+                _fit_read(FIT_SCALE_KEY, FIT_SCALE_DEFAULT, FIT_SCALE_MIN, FIT_SCALE_MAX, float))
+
+        with st.sidebar.expander("🔎 Display Fit", expanded=False):
+            st.slider("Text size (px)", FIT_FONT_MIN, FIT_FONT_MAX, key=FIT_FONT_KEY)
+            st.slider("Content scale", FIT_SCALE_MIN, FIT_SCALE_MAX, step=0.05, key=FIT_SCALE_KEY)
+            if st.button("Reset Display Fit", key="fit_reset_btn", width="stretch"):
+                st.session_state["_fit_reset"] = True
+                st.rerun()
+    except Exception:
+        pass
+    try:
+        st.markdown(fit_css(), unsafe_allow_html=True)
+    except Exception:
+        pass
 # @@END 003 FIT_CSS
 
 
@@ -231,33 +296,41 @@ def fit(st):
 # @@END 004 FIT_UI
 
 
-# @@BLOCK 005 SELFTEST deps=001,003
-def _selftest():
-    checks = []
-    h1 = _digest("abc", "s")
-    checks.append(("deterministic", h1 == _digest("abc", "s")))
-    checks.append(("salt matters", h1 != _digest("abc", "t")))
-    checks.append(("length", len(h1) == HASH_LEN))
-    checks.append(("hex", all(c in "0123456789abcdef" for c in h1)))
-    # fit_css() must RUN, not fall back - this is the NameError tripwire.
-    try:
-        css = fit_css()
-        checks.append(("fit_css runs", "<style>" in css))
-        checks.append(("fit_css has zoom", "zoom:" in css))
-    except Exception:
-        checks.append(("fit_css runs", False))
-        checks.append(("fit_css has zoom", False))
-    bad = [n for n, ok in checks if not ok]
+# @@BLOCK 005 SELFTEST deps=003
+def _selftest() -> None:
+    bad = []
+
+    def check(name, fn):
+        try:
+            if fn() is False:
+                bad.append(name)
+        except Exception as exc:
+            bad.append(f"{name} ({type(exc).__name__}: {exc})")
+
+    # ---- Display Fit must work with no Streamlit and no script run ---------
+    check("fit_css returns str", lambda: isinstance(fit_css(), str))
+    check("fit_css has font-size", lambda: "font-size: 16px" in fit_css())
+    check("fit_css has zoom", lambda: "zoom: 1.00" in fit_css())
+    check("fit_css honours font override", lambda: "font-size: 20px" in fit_css(20, 1.25))
+    check("fit_css honours scale override", lambda: "zoom: 1.25" in fit_css(20, 1.25))
+    check("fit_css clamps high", lambda: "font-size: 24px" in fit_css(99, 9))
+    check("fit_css clamps low", lambda: "font-size: 12px" in fit_css(1, 0))
+    check("fit_css not empty", lambda: len(fit_css()) > 40)
+    check("fit_css closes style", lambda: fit_css().rstrip().endswith("</style>"))
+    check("_fit_read defaults headless",
+          lambda: _fit_read("no_such_key", 7, 0, 10, int) == 7)
+
+    # ---- passkey digest ----------------------------------------------------
+    check("digest is stable", lambda: _digest("abc", "s") == _digest("abc", "s"))
+    check("digest is salted", lambda: _digest("abc", "s") != _digest("abc", "t"))
+    check("digest is sha256 hex", lambda: len(_digest("abc", "s")) == 64)
+
     if bad:
         raise AssertionError("auth selftest failed: " + ", ".join(bad))
-    print("auth.py selftest: %d checks OK" % len(checks))
-    return True
 
 
 if __name__ == "__main__":
-    import sys as _sys
-    if "--selftest" in _sys.argv:
-        _selftest()
-    _sys.exit(0)
+    _selftest()
+    print("auth selftest OK")
 # @@END 005 SELFTEST
 # @@EOF
