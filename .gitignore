@@ -20,6 +20,8 @@ __pycache__/
 # v13.39: the patch scripts leave these behind.
 *.bak
 *.bak.*
+# tier2_split.py report - regenerated on every run
+TIER2_MANIFEST.txt
 app.py.tmp_v1339*
 download_presets.json
 passkey.json
