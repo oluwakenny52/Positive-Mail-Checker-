@@ -54,18 +54,18 @@ jobs:
         if: always()
         run: python3 status.py --selftest
 
-      - name: 10. auth --selftest
-        id: g10
+      - name: 8. auth --selftest
+        id: g8
         if: always()
         run: python3 auth.py --selftest
 
-      - name: 8. compileall
-        id: g8
+      - name: 9. compileall
+        id: g9
         if: always()
         run: python3 -m compileall -q .
 
-      - name: 9. requirements resolve
-        id: g9
+      - name: 10. requirements resolve
+        id: g10
         if: always()
         run: python3 -m pip install -r requirements.txt
 
@@ -89,7 +89,7 @@ jobs:
             echo ""
             echo "| gate | result |"
             echo "| --- | --- |"
-            for pair in "fix_end_names.py --check:$R1" "verify_blocks.py:$R2" "audit_frame.py:$R3" "verify_v1337.py:$R4" "test_verdicts.py:$R5" "engine.py --selftest:$R6" "status.py --selftest:$R7" "compileall -q .:$R8" "pip install -r requirements.txt:$R9" "auth.py --selftest:$R10"; do
+            for pair in "fix_end_names.py --check:$R1" "verify_blocks.py:$R2" "audit_frame.py:$R3" "verify_v1337.py:$R4" "test_verdicts.py:$R5" "engine.py --selftest:$R6" "status.py --selftest:$R7" "auth.py --selftest:$R8" "compileall -q .:$R9" "pip install -r requirements.txt:$R10"; do
               g="${pair%%:*}"; r="${pair##*:}"
               if [ "$r" = "success" ]; then echo "| \`$g\` | PASS |"; else echo "| \`$g\` | FAIL |"; fail=1; fi
             done
