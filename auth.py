@@ -132,9 +132,48 @@ def user_key_hash():
     return str(st.session_state.get("user_key_hash", ""))
 
 
+def _anon_id():
+    """Identity for a session that has not unlocked yet.
+
+    user_file() returned the BARE name when there was no hash, so every file
+    written before require() - and every path built at import time before the
+    key exists - landed unprefixed in the shared working directory.  Two users
+    on one deployment therefore shared one results dir, one clean-valid list and
+    one session cache, and each saw the other's runs.
+
+    A per-session anonymous id is used until the passphrase arrives, so a path
+    is never bare.  "anonlocal" covers the headless case (no Streamlit, e.g.
+    --selftest), where there is no session to collide with.
+    """
+    try:
+        import streamlit as st
+        ss = st.session_state
+    except Exception:
+        return "anonlocal"
+    h = ss.get("user_key_hash")
+    if h:
+        return h
+    if not ss.get("_anon_hash"):
+        ss["_anon_hash"] = "anon" + secrets.token_hex(8)
+    return ss["_anon_hash"]
+
+
 def user_file(name):
-    h = user_key_hash()
-    return "%s_%s" % (h, name) if h else name
+    """Per-user filename. NEVER bare - see _anon_id()."""
+    h = _anon_id()
+    return "%s_%s" % (h, name) if name else h
+
+
+def user_dir(name=""):
+    """Per-user directory under data/, created on demand."""
+    d = os.path.join("data", _anon_id())
+    if name:
+        d = os.path.join(d, name)
+    try:
+        os.makedirs(d, exist_ok=True)
+    except Exception:
+        pass
+    return d
 # @@END 001 KEYS
 
 
