@@ -1,12 +1,19 @@
-# @@FILE pages/4_Downloads.py blocks=16 version=v13.40
+# @@FILE pages/4_Downloads.py blocks=16 version=v13.44
 # @@BLOCK 000 FILE_HEADER deps=-
 """
-pages/4_Downloads.py — Bobito Export Studio  (v13.40)
+pages/4_Downloads.py — Bobito Export Studio  (v13.44)
 =====================================================
 Pick WHAT to download, pick HOW it is written, preview it, take it.
 
 Pure reader: no mailbox connection, no proxy credit. Sources are the result
 files the checker already wrote, plus the live session buckets.
+
+v13.44 fix on this page
+-----------------------
+* PER-USER PRESETS: the preset store resolves through user_file() at call time.
+  It used to be built at import time in block 002, which runs BEFORE the gate,
+  so the path never carried the unlocked hash and every user on the deployment
+  shared one preset store.
 """
 
 import os
@@ -34,12 +41,14 @@ st.set_page_config(
 
 # @@BLOCK 002 APP_PATHS deps=000
 APP_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-def _preset_file():
-    """Per-user preset file. Resolved at CALL time - block 002 runs before the
-    gate, so the hash is not known yet."""
-    h = st.session_state.get("user_key_hash", "")
-    name = ("%s_download_presets.json" % h) if h else "download_presets.json"
-    return os.path.join(APP_DIR, name)
+def _preset_file() -> str:
+    """v13.44: per-user export presets.
+
+    PRESET_FILE was built at import time in block 002, which runs BEFORE the
+    gate, so the path never carried the unlocked hash and every user on the
+    deployment shared one preset store.
+    """
+    return user_file("download_presets.json")
 # @@END 002 APP_PATHS
 
 
