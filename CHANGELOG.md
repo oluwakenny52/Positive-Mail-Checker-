@@ -1,3 +1,16 @@
+## v13.43 - passphrase gate and full display fit
+
+* NEW `auth.py`: per-user passkey gate on all six entry points, salted-sha256,
+  optional device remember, "start fresh as a different user".
+* Per-user isolation completed: results dir, clean-valid, last account, session
+  cache and unfinished runs all go through `user_file()`.
+* Display Fit (font size, content scale) moved to `auth.fit(st)` and present on
+  every page.
+* Fast-Mode cooldown now arms on `CONNECTION_FAILED` and `RETRY_LATER`.
+* `note_verdict()` retains `DNS_FAILED` and `SMTP_FAILED`.
+* Reader: restored messages keep `raw`/`body`; `LAST_ACCOUNT_FILE` compared by
+  basename.
+* Gates: `hosts.py` and `auth.py` added to `BLOCKED_FILES`; 11 files / 269 blocks.
 Mega Ultimate Mail Checker — v13.40a
 ===================================
 * **Frame Restored**: Every file's block frame structure and ending tag names are verified, with block count alignment fully restored across the workspace (246 blocks total).
