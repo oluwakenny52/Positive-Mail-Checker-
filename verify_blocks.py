@@ -38,14 +38,16 @@ __version__ = "v13.40"
 
 BLOCKED_FILES = [
     "app.py",
+    "auth.py",
     "engine.py",
+    "hosts.py",
+    "ms_oauth.py",
     "status.py",
     "pages/2_Diagnostics.py",
     "pages/3_Mailbox_Reader.py",
     "pages/4_Downloads.py",
     "pages/5_Blocks.py",
     "pages/6_User_Guide.py",
-    "ms_oauth.py",
 ]
 
 FILE_RX = re.compile(r"^#\s*@@FILE\s+(\S+)\s+blocks=(\d+)\s+version=(\S+)\s*$")
