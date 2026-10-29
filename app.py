@@ -486,6 +486,7 @@ str_lit.set_page_config(
 )
 
 import auth
+import runstate
 
 try:                                   # a module cached from before a redeploy
     auth.fit_panel                     # still has the pre-split, one-function shape
@@ -1775,6 +1776,9 @@ def _reset_theme():
 #   * "[data-testid=stSidebar] * { color }" clobbered the sidebar's own icons.
 # Streamlit's own .block-container padding (6rem top / 10rem bottom) is never
 # overridden by this app, which is half of the "does not fit my phone" report.
+# FIX P2-3:
+#   * the palette binding unpacks th["text"] raw, so a light-on-light theme
+#     renders invisible body copy; it now routes through _readable_text().
 def _MOBILE_CSS():
     return """
     .block-container, [data-testid="stMainBlockContainer"] {
@@ -1832,7 +1836,6 @@ def _MOBILE_CSS():
     }
 """
 # @@END 032 MOBILE_CSS
-
 # @@BLOCK 033 THEME_CSS deps=031,032
 def theme_css(th: dict) -> str:
     g1, g2 = th["g1"], th["g2"]
