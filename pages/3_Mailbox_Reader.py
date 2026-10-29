@@ -1250,20 +1250,31 @@ def _looks_like_network_error(err_text: str) -> bool:
 
 # @@BLOCK 019 VALID_STORAGE deps=018
 # ============================================================================
-# VALID ACCOUNT STORAGE  (v13.37: mtime cache + real merge)
+# VALID ACCOUNT STORAGE  (v13.43: per-user isolation)
 # ============================================================================
+_HASH_RX = re.compile(r"^[0-9a-f]{16}_")
+_RES_DIR = user_file("mail_results")
+CLEAN_VALID_FILE = user_file("clean_valid_accounts.txt")
+
 _VALID_FILE_PATTERNS = [
-    "mail_results/*valid*.txt",
-    "mail_results/*clean*.txt",
+    os.path.join(_RES_DIR, "*valid*.txt"),
+    os.path.join(_RES_DIR, "*clean*.txt"),
     "*valid*.txt",
     "*clean*.txt",
-    "manual_valid_accounts.txt"
 ]
 _VALID_IGNORE = ["resume", "unfinished", "remaining", "input", "proxies", "proxy", "config", "blocklist"]
 _VALID_CACHE = {"fp": None, "options": None}   # v13.37
 
 _META_TAGS = ("found:", "proxy:", "path:", "xoauth2", "no standard", "aadsts",
               "http ", "imap.", "retry", "row-level", "rejected before")
+
+
+def _own(path) -> bool:
+    """True when `path` belongs to the unlocked user (unprefixed files count)."""
+    base = os.path.basename(path)
+    if not _HASH_RX.match(base):
+        return True
+    return base.startswith(user_file(""))
 
 
 def _combo_of(raw_line: str) -> str:
@@ -1288,6 +1299,8 @@ def _valid_files() -> List[str]:
     out = []
     for p in dict.fromkeys(files):
         if not os.path.isfile(p):
+            continue
+        if not _own(p):
             continue
         low = os.path.basename(p).lower()
         if any(kw in low for kw in _VALID_IGNORE) or low == os.path.basename(LAST_ACCOUNT_FILE):
@@ -1356,14 +1369,15 @@ def valid_combos(valid_list) -> List[str]:
 
 
 def merge_into_clean_valid(new_combo_lines: List[str]) -> int:
-    """v13.37: MERGE into clean_valid_accounts.txt, deduped by email.
+    """v13.37: MERGE into the per-user clean-valid file, deduped by email.
 
-    The engine used to OVERWRITE this file while this page PREPENDED to it, so a
-    batch import was destroyed by the next engine run (and vice versa).
+    v13.43: the target is now user_file()'d. It used to be the shared
+    clean_valid_accounts.txt while app.py wrote <hash>_clean_valid_accounts.txt,
+    so the reader's merges never reached the engine and vice versa.
     Returns the number of unique accounts now stored.
     """
     merged = {}
-    target = "clean_valid_accounts.txt"
+    target = CLEAN_VALID_FILE
     try:
         if os.path.exists(target):
             with open(target, encoding="utf-8", errors="ignore") as f:
@@ -1394,8 +1408,10 @@ def merge_into_clean_valid(new_combo_lines: List[str]) -> int:
 
 
 def delete_specific_account_from_storage(target_combo: str):
-    search_files = glob.glob("mail_results/*.txt") + glob.glob("*.txt")
+    search_files = glob.glob(os.path.join(_RES_DIR, "*.txt")) + glob.glob("*.txt")
     for path in search_files:
+        if not _own(path):
+            continue
         filename_lower = os.path.basename(path).lower()
         if filename_lower == os.path.basename(LAST_ACCOUNT_FILE) or any(kw in filename_lower for kw in ["resume", "unfinished", "remaining", "input", "proxies", "proxy", "config", "blocklist"]):
             continue
@@ -1429,9 +1445,12 @@ def delete_specific_account_from_storage(target_combo: str):
                 pass
     _VALID_CACHE["fp"] = None
 
+
 def clear_all_valid_accounts_storage():
-    search_files = glob.glob("mail_results/*.txt") + glob.glob("*.txt")
+    search_files = glob.glob(os.path.join(_RES_DIR, "*.txt")) + glob.glob("*.txt")
     for path in search_files:
+        if not _own(path):
+            continue
         filename_lower = os.path.basename(path).lower()
         if "valid" not in filename_lower and "clean" not in filename_lower:
             continue
@@ -1457,20 +1476,21 @@ _ZIP_CACHE = {"fp": None, "blob": None}        # v13.37
 
 
 def generate_all_mail_zip():
-    """v13.37: cached on the same (path, mtime) fingerprint as load_valid()."""
+    """v13.37: cached on the same (path, mtime) fingerprint as load_valid().
+    v13.43: per-user - only this user's result files are packed."""
+    _paths = [p for p in (glob.glob(os.path.join(_RES_DIR, "*.txt")) + glob.glob("*.txt"))
+              if _own(p)]
     fp = _valid_fingerprint() + tuple(sorted(
-        (p, os.path.getmtime(p)) for p in (glob.glob("mail_results/*.txt") + glob.glob("*.txt"))
-        if os.path.isfile(p)))
+        (p, os.path.getmtime(p)) for p in _paths if os.path.isfile(p)))
     if _ZIP_CACHE["fp"] == fp and _ZIP_CACHE["blob"] is not None:
         return _ZIP_CACHE["blob"]
 
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
-        search_paths = glob.glob("mail_results/*.txt") + glob.glob("*.txt")
         added_files = set()
         added_arcnames = set()
 
-        for path in search_paths:
+        for path in _paths:
             filename = os.path.basename(path)
             filename_lower = filename.lower()
             if filename in added_files or filename == os.path.basename(LAST_ACCOUNT_FILE) or any(kw in filename_lower for kw in ["resume", "unfinished", "remaining"]):
