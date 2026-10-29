@@ -24,6 +24,10 @@ AttributeError and the Reset button still wrote the slider keys after the
 sliders were built. fit() is CSS-only again and the reset travels through an
 on_click handler, which Streamlit runs BEFORE the script body.
 
+Because Streamlit re-runs a page in the SAME process, a module imported before a
+redeploy stays in sys.modules and keeps answering with the old shape. Callers
+guard with importlib.reload() - see the note in block 004.
+
 The passphrase is salted-sha256 hashed into passkey.json. It is a LOCK, not
 encryption: per-user files are separated by the hash PREFIX, they are not
 encrypted at rest.
@@ -268,10 +272,6 @@ def _fit_clamp_scale(value):
                      int, None, FIT_SCALE_FACTOR_BELOW)
 
 
-def _fit_normalise(value):
-    return _fit_clamp_scale(value)
-
-
 def _fit_read(key, default, lo, hi, cast, percent_above=None, factor_below=None):
     """Clamped session value for `key`. Safe with no script run (headless)."""
     try:
@@ -319,6 +319,18 @@ def fit_css(font=None, scale=None):
 
 
 # @@BLOCK 004 FIT_UI deps=003
+# NOTE FOR CALLERS: Streamlit re-runs a page in the same process, so an `auth`
+# module imported before a redeploy stays in sys.modules and keeps the OLD
+# shape - which is how fit_panel() answered AttributeError for hours after it
+# existed on disk. Every caller guards like this:
+
+#     import auth
+#     try:
+#         auth.fit_panel
+#     except AttributeError:
+#         import importlib
+#         auth = importlib.reload(auth)
+
 def _fit_seed():
     import streamlit as st
     ss = st.session_state
@@ -375,7 +387,7 @@ def fit(scope=None):
                                        FIT_SCALE_MIN, FIT_SCALE_MAX, int,
                                        None, FIT_SCALE_FACTOR_BELOW)
 
-    font, scale, zoom = _fit_values()
+    font, scale, _zoom = _fit_values()
     ss["_fit_injected_via"] = _fit_apply(fit_css(font, scale))
 
 
@@ -414,7 +426,7 @@ def fit_panel(scope=None):
 # @@END 004 FIT_UI
 
 
-# @@BLOCK 005 SELFTEST deps=001,003
+# @@BLOCK 005 SELFTEST deps=001,003,004
 def _selftest() -> None:
     bad = []
 
@@ -424,6 +436,13 @@ def _selftest() -> None:
                 bad.append(name)
         except Exception as exc:
             bad.append(f"{name} ({type(exc).__name__}: {exc})")
+
+    # ---- the API every caller binds to must exist -------------------------
+    check("fit is callable", lambda: callable(fit))
+    check("fit_panel is callable", lambda: callable(fit_panel))
+    check("fit_panel is not fit", lambda: fit_panel is not fit)
+    check("require is callable", lambda: callable(require))
+    check("user_file is callable", lambda: callable(user_file))
 
     # ---- Display Fit must work with no Streamlit and no script run ---------
     check("fit_css returns str", lambda: isinstance(fit_css(), str))
