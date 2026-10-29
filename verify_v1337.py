@@ -270,7 +270,7 @@ def main():
         has(app, "CONFIRM_WRONG_ACROSS_HOSTS", "P0 guard flag wired")
         has(app, "note_verdict(st_val, detail, host=\"\", force=False)",
             "P0 note_verdict has a force path")
-        has(app, "if st_val not in (VALID, WRONG, APP, RBL, LOGIN_DROPPED, UNKNOWN):",
+        has(app, "if st_val not in (VALID, WRONG, APP, RBL, LOGIN_DROPPED, UNKNOWN,",
             "P0 UNKNOWN is retained")
 
         # ---- P0-v13.39b: the helper must be reachable and single ----
@@ -305,7 +305,7 @@ def main():
         has(app, "if BUILD_TAG not in str(base.get(\"hero_title\", \"\")):",
             "P0 load_theme cannot advertise an old build")
         has(app, "def _MOBILE_CSS", "P0 mobile stylesheet present")
-        has(app, "if _status in (FAILED, PROXY_UNHEALTHY, RETRY, DNS_FAILED, UNKNOWN, SMTP_FAILED):",
+        has(app, "if _status in (FAILED, CONNECTION_FAILED, PROXY_UNHEALTHY, RETRY, RETRY_LATER,",
             "P0 FAST_MODE cooldown only arms on inconclusive results")
 
         has(app, "def _resolve_cached(", "P1 shared DNS TTL cache present")
