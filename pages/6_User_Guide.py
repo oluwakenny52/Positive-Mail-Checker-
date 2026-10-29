@@ -1,13 +1,18 @@
-# @@FILE pages/6_User_Guide.py blocks=17 version=v13.40
+# @@FILE pages/6_User_Guide.py blocks=17 version=v13.47
 # @@BLOCK 000 FILE_HEADER deps=-
 """
-pages/6_User_Guide.py - User Guide  (v13.40)
+pages/6_User_Guide.py - User Guide  (v13.47)
 ============================================
 Everything the app can do, in one read-only page: every sidebar control, every
 button, every verdict the engine can return, every other page, and what each one
 is FOR - so a first-time user knows what a thing does before pressing it.
 
 No mailbox connection. No proxy credit. No file writes. Pure reference.
+
+v13.47: block 005 calls auth.fit_panel(). auth.fit() injects the CSS only, so
+without the panel call the Display Fit control was missing from this page. The
+expander stays collapsed until it is tapped. BUILD_TAG is deliberately still
+v13.40 - it mirrors app.py block 008 and must not drift from it.
 """
 
 import os
@@ -102,7 +107,8 @@ st.markdown(
 import auth
 
 auth.require(st, "Unlock User Guide")
-auth.fit(st)
+auth.fit(st)                        # CSS only, before the first widget
+auth.fit_panel(st)                  # the controls; collapsed until tapped
 # @@END 005 HERO
 
 
