@@ -54,6 +54,11 @@ jobs:
         if: always()
         run: python3 status.py --selftest
 
+      - name: 10. auth --selftest
+        id: g10
+        if: always()
+        run: python3 auth.py --selftest
+
       - name: 8. compileall
         id: g8
         if: always()
@@ -76,6 +81,7 @@ jobs:
           R7: ${{ steps.g7.outcome }}
           R8: ${{ steps.g8.outcome }}
           R9: ${{ steps.g9.outcome }}
+          R10: ${{ steps.g10.outcome }}
         run: |
           fail=0
           {
@@ -83,11 +89,11 @@ jobs:
             echo ""
             echo "| gate | result |"
             echo "| --- | --- |"
-            for pair in "fix_end_names.py --check:$R1" "verify_blocks.py:$R2" "audit_frame.py:$R3" "verify_v1337.py:$R4" "test_verdicts.py:$R5" "engine.py --selftest:$R6" "status.py --selftest:$R7" "compileall -q .:$R8" "pip install -r requirements.txt:$R9"; do
+            for pair in "fix_end_names.py --check:$R1" "verify_blocks.py:$R2" "audit_frame.py:$R3" "verify_v1337.py:$R4" "test_verdicts.py:$R5" "engine.py --selftest:$R6" "status.py --selftest:$R7" "compileall -q .:$R8" "pip install -r requirements.txt:$R9" "auth.py --selftest:$R10"; do
               g="${pair%%:*}"; r="${pair##*:}"
               if [ "$r" = "success" ]; then echo "| \`$g\` | PASS |"; else echo "| \`$g\` | FAIL |"; fail=1; fi
             done
             echo ""
-            if [ "$fail" -eq 0 ]; then echo "**All nine gates green.**"; else echo "**A gate is RED - do not ship.**"; fi
+            if [ "$fail" -eq 0 ]; then echo "**All ten gates green.**"; else echo "**A gate is RED - do not ship.**"; fi
           } >> "$GITHUB_STEP_SUMMARY"
           exit $fail
