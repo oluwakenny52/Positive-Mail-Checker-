@@ -487,6 +487,12 @@ str_lit.set_page_config(
 
 import auth
 
+try:                                   # a module cached from before a redeploy
+    auth.fit_panel                     # still has the pre-split, one-function shape
+except AttributeError:
+    import importlib
+    auth = importlib.reload(auth)
+
 # The passkey gate lives in auth.py so every page shares ONE implementation.
 # user_file() is re-exported: default_cfg(), RESULTS_DIR, CLEAN_VALID_FILE and
 # every results glob prefix per-user names with the unlocked hash.
