@@ -1,5 +1,4 @@
-# @@FILE auth.py blocks=6 version=v13.43
-# @@BLOCK 000 HEADER deps=-
+# @@FILE auth.py blocks=6 version=# @@BLOCK 000 HEADER deps=-
 """auth.py - per-user passkey gate and display-fit controls.
 
 Import-clean: stdlib only, no Streamlit at module level.
@@ -29,8 +28,6 @@ SALT_BYTES = 16
 # Hex chars kept from the sha256 = 64 bits. Do NOT raise this casually:
 # match_key re-derives with the CURRENT value, so every stored hash orphans.
 HASH_LEN = 16
-DEFAULT_FONT = 16
-DEFAULT_SCALE = 100
 MIN_LEN = 8
 # @@END 000 HEADER
 
