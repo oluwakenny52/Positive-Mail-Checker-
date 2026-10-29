@@ -10,23 +10,21 @@ Exit 0 = frame clean AND verifier contract satisfied.
 from __future__ import annotations
 import io, os, re, sys, tokenize
 
-# One source of truth: verify_blocks owns the gated file list, so adding a file
-# there propagates to every gate.  Local copy only if the import fails (e.g. the
-# script is run from a directory where verify_blocks.py is not importable).
+# verify_blocks owns the gated file list AND the frame target, so a frame move is
+# one edit in one file and cannot land half-applied.  Local mirror only if the
+# import fails (e.g. the script is run where verify_blocks.py is not importable).
 try:
-    from verify_blocks import BLOCKED_FILES as GATED
+    from verify_blocks import (BLOCKED_FILES as GATED,
+                               TARGET_FILES as EXPECT_FILES,
+                               TARGET_BLOCKS as EXPECT_BLOCKS)
 except Exception:
-    # Mirror of verify_blocks.BLOCKED_FILES, PRE-Tier-2: app.py and engine.py are
-    # both listed, so 11 files.  After tier2_split.py the pair collapses to app.py
-    # and this drops to 10 - re-derive EXPECT_* at the same time.
+    # Mirror for the import-failure path.  tier2_split.py REWRITES app.py and
+    # OVERWRITES engine.py; it deletes nothing, so EXPECT_FILES stays 11 and only
+    # EXPECT_BLOCKS moves.  The real values live in verify_blocks.py.
     GATED = ["app.py", "auth.py", "engine.py", "hosts.py", "ms_oauth.py",
              "status.py", "pages/2_Diagnostics.py", "pages/3_Mailbox_Reader.py",
              "pages/4_Downloads.py", "pages/5_Blocks.py", "pages/6_User_Guide.py"]
-
-# NOTE: these are the CURRENT counts. tier2_split.py rewrites app.py+engine.py
-# into a different shape, so re-derive both numbers after running it or this
-# gate goes red on drift and looks like a regression.  EXPECT_BLOCKS drift trap.
-EXPECT_FILES, EXPECT_BLOCKS = 11, 269
+    EXPECT_FILES, EXPECT_BLOCKS = 11, 269
 
 FILE_RX  = re.compile(r"^#\s*@@FILE\s+(\S+)\s+blocks=(\d+)\s+version=(\S+)\s*$")
 BLOCK_RX = re.compile(r"^#\s*@@BLOCK\s+(\d{3})\s+([A-Za-z0-9_]+)(?:\s+deps=(\S+))?\s*$")
@@ -148,7 +146,8 @@ def api_conformance():
     except Exception as e:
         return ["verify_blocks import failed: %r" % (e,)]
 
-    for name in ("audit", "audit_file", "block_ids", "audit_all", "totals", "BLOCKED_FILES"):
+    for name in ("audit", "audit_file", "block_ids", "audit_all", "totals",
+                 "BLOCKED_FILES", "TARGET_FILES", "TARGET_BLOCKS"):
         if not hasattr(VB, name):
             bad.append("verify_blocks has no %r" % name)
 
@@ -216,6 +215,8 @@ def api_conformance():
             bad.append("Tier 2: label still 'app.py (new)' -> header_name fault, writes nothing")
         if 'L.append("# @@EOF")' not in t:
             bad.append("Tier 2: emit() does not write @@EOF")
+        if "TARGET_FILES, TARGET_BLOCKS = %d, %d" not in t:
+            bad.append("Tier 2: does not print the post-split frame target")
     return bad
 
 
@@ -279,10 +280,12 @@ def main():
     if drift:
         print("TARGET DRIFT: expected %d file(s) / %d block(s), found %d / %d"
               % (EXPECT_FILES, EXPECT_BLOCKS, _files, _blocks))
+        print("  -> if the frame really moved, edit TARGET_FILES/TARGET_BLOCKS in verify_blocks.py")
+        print("     (tier2_split.py prints the new line; do not compute it by hand)")
 
     ok = (faults == 0) and (not bad) and (not drift)
     print()
-    print("RESULT: %s" % ("GREEN" if ok else "NOT GREEN"))
+    print("RESULT: %s" % ("GREEN" if ok else "RED"))
     return 0 if ok else 1
 
 
