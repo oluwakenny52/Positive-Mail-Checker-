@@ -1,4 +1,4 @@
-# @@FILE verify_blocks.py blocks=1 version=v13.40
+# @@FILE verify_blocks.py blocks=1 version=v13.42
 #!/usr/bin/env python3
 # @@BLOCK 000 VERIFIER deps=-
 """verify_blocks.py - block-integrity gate for the block-edition app.
@@ -13,6 +13,10 @@ Audits every file in BLOCKED_FILES for:
 
 A bare `# @@END` with no id costs 2 faults: one for the missing id and one for
 the unnamed end. Exit status is 1 when any fault is found.
+
+This file audits ITSELF: verify_blocks.py is in BLOCKED_FILES, so the gate can
+catch its own corruption - the failure that once swapped it with status.py and
+silently disarmed everything.
 
 API used elsewhere:
   BLOCKED_FILES            list of audited paths
@@ -35,7 +39,7 @@ import re
 import sys
 import tokenize
 
-__version__ = "v13.40"
+__version__ = "v13.42"
 
 BLOCKED_FILES = [
     "app.py",
@@ -44,6 +48,7 @@ BLOCKED_FILES = [
     "hosts.py",
     "ms_oauth.py",
     "status.py",
+    "verify_blocks.py",
     "pages/2_Diagnostics.py",
     "pages/3_Mailbox_Reader.py",
     "pages/4_Downloads.py",
@@ -56,10 +61,10 @@ BLOCKED_FILES = [
 # copy, and its api_conformance() asserts both names exist.
 #
 # tier2_split.py REWRITES app.py and OVERWRITES engine.py - it deletes no file -
-# so TARGET_FILES stays 11 and only TARGET_BLOCKS moves.  The split prints the
+# so TARGET_FILES stays 12 and only TARGET_BLOCKS moves.  The split prints the
 # new line for you and records it in TIER2_MANIFEST.txt; paste it here.
-TARGET_FILES = 11
-TARGET_BLOCKS = 269
+TARGET_FILES = 12
+TARGET_BLOCKS = 270
 
 FILE_RX = re.compile(r"^#\s*@@FILE\s+(\S+)\s+blocks=(\d+)\s+version=(\S+)\s*$")
 BLOCK_RX = re.compile(r"^#\s*@@BLOCK\s+(\d{3})\s+([A-Za-z0-9_]+)(?:\s+deps=(\S+))?\s*$")
@@ -201,15 +206,22 @@ def audit_source(target, name=None):
     # pages/5_Blocks both advertise this and nothing ever did it - only
     # tokenize() ran, and its exceptions were swallowed.  engine.py, pages/4
     # and pages/5 were compiled by NO gate at all.
+    # ValueError too, not just SyntaxError: a stray NUL byte makes compile()
+    # raise ValueError, which has no .lineno and would otherwise escape and
+    # break this function's "never raises" contract.
     try:
         compile(src, path, "exec")
     except SyntaxError as exc:
         fault(exc.lineno or 0, "syntax", "does not compile: %s" % exc.msg)
+    except ValueError as exc:
+        fault(0, "syntax", "does not compile: %s" % exc)
     else:
         try:
             ast.parse(src, filename=path)
         except SyntaxError as exc:
             fault(exc.lineno or 0, "syntax", "AST parse failed: %s" % exc.msg)
+        except ValueError as exc:
+            fault(0, "syntax", "AST parse failed: %s" % exc)
 
     # v13.42: the README's "nothing but blanks and comments between an @@END and
     # the next @@BLOCK" rule was never implemented either.
