@@ -386,9 +386,6 @@ def fit_panel(scope=None):
             f"Live: font {ss.get('ui_font_size')}px, scale {ss.get('ui_content_scale')}%. "
             "Scale zooms the page content only, never the sidebar."
         )
-        # Key is ui_fit_rst_btn, NOT ui_fit_reset_btn: the longer form contains
-        # the marker string "_fit_reset" and made the fix self-check count 3
-        # against the 2 it expects.
         st.button("Reset Display Fit", key="ui_fit_rst_btn", width="stretch",
                   on_click=_on_reset_click)
 
