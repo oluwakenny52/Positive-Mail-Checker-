@@ -400,6 +400,12 @@ _FIX_CHECKS = (
     ("auth.py", "def require(", 1, "passkey gate exists"),
     ("auth.py", "def fit_css(", 1, "display fit exists"),
     ("app.py", "DNS_FAILED, SMTP_FAILED):", 1, "DNS/SMTP verdicts retained"),
+    ("auth.py", "_fit_reset", 2, "Display Fit reset flag survives"),
+    ("app.py", 'str_lit.session_state["_fit_reset"] = True', 1,
+     "Reset Defaults reaches Display Fit"),
+    ("pages/3_Mailbox_Reader.py", "auth.fit(st)", 1, "fit() called exactly once per page"),
+    ("pages/4_Downloads.py", "from auth import user_file", 1,
+     "Export Studio resolves user paths"),
 )
 
 # order matters in the verdict tail: a server answer must outrank retryable
