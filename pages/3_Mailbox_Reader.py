@@ -2397,7 +2397,7 @@ with st.expander("🗑️ Account Deletion Manager", expanded=False):
                 )
 
             if selected_accounts_to_delete:
-                if st.button("🗑️ Permanently Delete Selected Account(s)", type="primary", use_container_width=True):
+                if st.button("🗑️ Permanently Delete Selected Account(s)", type="primary", width="stretch"):
                     for acc in selected_accounts_to_delete:
                         delete_specific_account_from_storage(acc)
                     flash(f"Permanently deleted {len(selected_accounts_to_delete)} account(s).")
@@ -2408,7 +2408,7 @@ with st.expander("🗑️ Account Deletion Manager", expanded=False):
             st.warning("⚠️ Warning: This will permanently remove all stored valid accounts from local record files!")
             confirm_all = st.checkbox("I confirm I want to delete ALL valid accounts permanently", key="confirm_del_all_checkbox")
             if confirm_all:
-                if st.button("🚨 Permanently Delete ALL Accounts", type="primary", use_container_width=True):
+                if st.button("🚨 Permanently Delete ALL Accounts", type="primary", width="stretch"):
                     clear_all_valid_accounts_storage()
                     flash("Permanently deleted all valid accounts.")
                     save_session_cache()
@@ -2493,7 +2493,7 @@ if clean_download_lines:
         data=valid_text_data,
         file_name=f"valid_accounts_{len(clean_download_lines)}.txt",
         mime="text/plain",
-        use_container_width=True
+        width="stretch"
     )
 
     zip_bytes = generate_all_mail_zip()
@@ -2502,7 +2502,7 @@ if clean_download_lines:
         data=zip_bytes,
         file_name="all_mail_results_bundle.zip",
         mime="application/zip",
-        use_container_width=True
+        width="stretch"
     )
 # @@END 030 SIDEBAR_HUB
 
@@ -2532,7 +2532,7 @@ with st.sidebar.expander("⚙️ App Configuration Settings", expanded=False):
              "so it could never take effect."
     )
 
-    if st.button("💾 Save App Settings", type="secondary", use_container_width=True):
+    if st.button("💾 Save App Settings", type="secondary", width="stretch"):
         st.session_state.app_config["connection_timeout"] = new_timeout
         st.session_state.app_config["imap_port"] = new_port
         st.session_state.app_config["auto_fallback_probing"] = new_fallback
@@ -2587,7 +2587,7 @@ batch_host_override_input = st.sidebar.text_area(
     height=80
 )
 
-if st.sidebar.button("🚀 Validate & Import Batch Accounts", type="primary", use_container_width=True):
+if st.sidebar.button("🚀 Validate & Import Batch Accounts", type="primary", width="stretch"):
     raw_lines = [l.strip() for l in batch_paste_input.splitlines() if l.strip() and not l.strip().startswith("#")]
     # v13.40: duplicates were re-validated and re-tabled.
     _seen, lines = set(), []
@@ -2897,7 +2897,7 @@ with tab_analytics:
         st.dataframe(
             st.session_state.batch_results_table,
             column_order=("Time", "Status", "Email:Password", "Under-The-Hood Background Trace"),
-            use_container_width=True,
+            width="stretch",
             hide_index=True
         )
         # v13.40: results were session-only with no export.
@@ -2910,7 +2910,7 @@ with tab_analytics:
             data=_csv.getvalue(),
             file_name=f"batch_run_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
             mime="text/csv",
-            use_container_width=True,
+            width="stretch",
         )
     else:
         st.caption("No table results available yet.")
@@ -2924,7 +2924,7 @@ st.sidebar.text_input("Email override", key="custom_email")
 st.sidebar.text_input("Password override", type="password", key="custom_pass")
 st.sidebar.text_input("IMAP host override", key="custom_host")
 
-if st.sidebar.button("🔑 Login & Save Account", type="primary", use_container_width=True):
+if st.sidebar.button("🔑 Login & Save Account", type="primary", width="stretch"):
     c_email = st.session_state.custom_email.strip()
     c_pass = st.session_state.custom_pass.strip()
     c_override = st.session_state.custom_host.strip()
@@ -3018,7 +3018,7 @@ if actual_pick != "none" and ":" in actual_pick:
 if active_email:
     st.caption(f"Effective host: `{resolve_active_host(active_email) or '(none)'}` · port {st.session_state.app_config.get('imap_port', 993)}")
 
-if st.sidebar.button("🔄 Refresh Inbox", type="secondary", use_container_width=True):
+if st.sidebar.button("🔄 Refresh Inbox", type="secondary", width="stretch"):
     if active_email and active_password:
         host = resolve_active_host(active_email)
         try:
@@ -3048,7 +3048,7 @@ if active_email and active_password:
 
 
 # @@BLOCK 036 CONNECT_DISCOVER deps=035
-if st.button("Connect & Discover Folders", type="primary", use_container_width=True):
+if st.button("Connect & Discover Folders", type="primary", width="stretch"):
     if actual_pick == "none" or not actual_pick or ":" not in actual_pick:
         st.error("Please select a valid account from the dropdown list first.")
     else:
@@ -3119,7 +3119,7 @@ with col2:
 with col3:
     sort_order = st.selectbox("Sort Order", ["Newest First", "Oldest First"])
 
-if st.button("📂 Load Folder Messages", type="primary", use_container_width=True):
+if st.button("📂 Load Folder Messages", type="primary", width="stretch"):
     host = resolve_active_host(active_email)
     if not active_email or not active_password or not host:
         st.error("Please connect and load folders first.")
@@ -3262,7 +3262,7 @@ if len(active_msgs) > 0 or total_msgs > 0:
         p_col1, p_col2, p_col3 = st.columns([1, 2, 1])
 
         with p_col1:
-            if st.button("Previous Page", disabled=(curr_p <= 1), use_container_width=True, key="msg_stream_prev"):
+            if st.button("Previous Page", disabled=(curr_p <= 1), width="stretch", key="msg_stream_prev"):
                 st.session_state.current_page -= 1
                 host = resolve_active_host(active_email)
                 mail = get_active_mail(active_email, active_password, host)
@@ -3279,7 +3279,7 @@ if len(active_msgs) > 0 or total_msgs > 0:
             st.markdown(f"<h4 style='text-align: center; margin: 0;'>Page {curr_p} of {total_pages}</h4>", unsafe_allow_html=True)
 
         with p_col3:
-            if st.button("Next Page", disabled=(curr_p >= total_pages), use_container_width=True, key="msg_stream_next"):
+            if st.button("Next Page", disabled=(curr_p >= total_pages), width="stretch", key="msg_stream_next"):
                 st.session_state.current_page += 1
                 host = resolve_active_host(active_email)
                 mail = get_active_mail(active_email, active_password, host)
@@ -3340,7 +3340,7 @@ with st.expander("🔑 Standalone OTP, Debit/Credit Cards & Sensitive Data Scann
     otp_custom_keyword = st.text_input("Custom Keyword Override (Optional)", key="otp_custom_kw")
     otp_blacklist_input = st.text_input("Blacklist Keywords (comma-separated)", value="Telegram, spam, scam, promo", key="otp_blacklist_kw")
 
-    if st.button("🚀 Execute Dedicated Security Scan", type="primary", use_container_width=True, key="otp_exec_btn"):
+    if st.button("🚀 Execute Dedicated Security Scan", type="primary", width="stretch", key="otp_exec_btn"):
         host = resolve_active_host(active_email)
         if not active_email or not active_password or not host:
             st.error("Please connect and discover folders first.")
@@ -3463,7 +3463,7 @@ with st.expander("🔑 Standalone OTP, Debit/Credit Cards & Sensitive Data Scann
         op_c1, op_c2, op_c3 = st.columns([1, 2, 1])
 
         with op_c1:
-            if st.button("Previous Page", disabled=(otp_curr_p <= 1), use_container_width=True, key="otp_prev_pg"):
+            if st.button("Previous Page", disabled=(otp_curr_p <= 1), width="stretch", key="otp_prev_pg"):
                 st.session_state.otp_current_page -= 1
                 host = resolve_active_host(active_email)
                 mail = get_active_mail(active_email, active_password, host)
@@ -3485,7 +3485,7 @@ with st.expander("🔑 Standalone OTP, Debit/Credit Cards & Sensitive Data Scann
             st.markdown(f"<h4 style='text-align: center; margin: 0;'>Page {otp_curr_p} of {otp_total_pages}</h4>", unsafe_allow_html=True)
 
         with op_c3:
-            if st.button("Next Page", disabled=(otp_curr_p >= otp_total_pages), use_container_width=True, key="otp_next_pg"):
+            if st.button("Next Page", disabled=(otp_curr_p >= otp_total_pages), width="stretch", key="otp_next_pg"):
                 st.session_state.otp_current_page += 1
                 host = resolve_active_host(active_email)
                 mail = get_active_mail(active_email, active_password, host)
@@ -3531,7 +3531,7 @@ with st.expander("🔍 Deep Keyword Search & Scope Filters", expanded=False):
 
     search_page_size = st.slider("Search Results Page Size", 5, 200, 15, key="search_page_size_slider")
 
-    if st.button("🔍 Execute Keyword Search", type="primary", use_container_width=True, key="deep_search_btn"):
+    if st.button("🔍 Execute Keyword Search", type="primary", width="stretch", key="deep_search_btn"):
         host = resolve_active_host(active_email)
         if not active_email or not active_password or not host:
             st.error("Please connect and load folders first.")
@@ -3645,7 +3645,7 @@ with st.expander("🔍 Deep Keyword Search & Scope Filters", expanded=False):
         sp_col1, sp_col2, sp_col3 = st.columns([1, 2, 1])
 
         with sp_col1:
-            if st.button("Previous Page", disabled=(search_curr_p <= 1), use_container_width=True, key="s_prev_pg"):
+            if st.button("Previous Page", disabled=(search_curr_p <= 1), width="stretch", key="s_prev_pg"):
                 st.session_state.search_current_page -= 1
                 host = resolve_active_host(active_email)
                 mail = get_active_mail(active_email, active_password, host)
@@ -3662,7 +3662,7 @@ with st.expander("🔍 Deep Keyword Search & Scope Filters", expanded=False):
             st.markdown(f"<h4 style='text-align: center; margin: 0;'>Page {search_curr_p} of {search_total_pages}</h4>", unsafe_allow_html=True)
 
         with sp_col3:
-            if st.button("Next Page", disabled=(search_curr_p >= search_total_pages), use_container_width=True, key="s_next_pg"):
+            if st.button("Next Page", disabled=(search_curr_p >= search_total_pages), width="stretch", key="s_next_pg"):
                 st.session_state.search_current_page += 1
                 host = resolve_active_host(active_email)
                 mail = get_active_mail(active_email, active_password, host)
@@ -3710,7 +3710,7 @@ with st.expander("🤖 Mass Bot Purge & Intelligence Hub", expanded=False):
     b_act1, b_act2 = st.columns(2)
 
     with b_act1:
-        if st.button("🔍 Scan Folder For Bot/OTP/Telegram Messages", use_container_width=True):
+        if st.button("🔍 Scan Folder For Bot/OTP/Telegram Messages", width="stretch"):
             host = resolve_active_host(active_email)
             if not active_email or not active_password or not host:
                 st.error("Please connect first.")
@@ -3737,7 +3737,7 @@ with st.expander("🤖 Mass Bot Purge & Intelligence Hub", expanded=False):
                     st.error(str(ex))
 
     with b_act2:
-        if st.button("🚨 Mass Delete All Detected Bot Messages", type="primary", use_container_width=True):
+        if st.button("🚨 Mass Delete All Detected Bot Messages", type="primary", width="stretch"):
             if not all_loaded_bot_msgs:
                 st.warning("No bot messages detected in current loaded stream to delete.")
             else:
@@ -3815,14 +3815,14 @@ with st.expander("🤖 Mass Bot Purge & Intelligence Hub", expanded=False):
         st.markdown("---")
         bp_c1, bp_c2, bp_c3 = st.columns([1, 2, 1])
         with bp_c1:
-            if st.button("Previous Bot Page", disabled=(bot_curr_p <= 1), use_container_width=True, key="bot_prev_pg"):
+            if st.button("Previous Bot Page", disabled=(bot_curr_p <= 1), width="stretch", key="bot_prev_pg"):
                 st.session_state.bot_current_page -= 1
                 save_session_cache()
                 st.rerun()
         with bp_c2:
             st.markdown(f"<h4 style='text-align: center; margin: 0;'>Page {bot_curr_p} of {bot_total_pages}</h4>", unsafe_allow_html=True)
         with bp_c3:
-            if st.button("Next Bot Page", disabled=(bot_curr_p >= bot_total_pages), use_container_width=True, key="bot_next_pg"):
+            if st.button("Next Bot Page", disabled=(bot_curr_p >= bot_total_pages), width="stretch", key="bot_next_pg"):
                 st.session_state.bot_current_page += 1
                 save_session_cache()
                 st.rerun()
