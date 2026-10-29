@@ -882,6 +882,8 @@ _VERDICT_RANK = {
     APP: 70,
     RBL: 60,
     LOGIN_DROPPED: 50,
+    SMTP_FAILED: 46,
+    DNS_FAILED: 45,
     UNKNOWN: 10,
 }
 
@@ -1850,9 +1852,7 @@ def theme_css(th: dict) -> str:
     @keyframes bbShift {{ 0%{{background-position:0% 50%}} 50%{{background-position:100% 50%}} 100%{{background-position:0% 50%}} }}
     """
 
-    # Display fit from sidebar sliders (defaults if gate not yet passed)
-    _font = int(str_lit.session_state.get("ui_font_size", 16))
-    _scale = int(str_lit.session_state.get("ui_content_scale", 100)) / 100.0
+    _fit = auth.fit_css().replace("<style>", "").replace("</style>", "")
 
     return f"""
 <style>
@@ -1860,8 +1860,7 @@ def theme_css(th: dict) -> str:
         --bb-g1: {g1}; --bb-g2: {g2}; --bb-ac: {ac}; --bb-ac2: {ac2};
         --bb-bg: {bg}; --bb-panel: {panel}; --bb-text: {text}; --bb-r: {r}px;
     }}
-    html {{ font-size: {_font}px !important; }}
-    .stApp {{ zoom: {_scale}; }}
+    {_fit}
     .stApp, [data-testid="stAppViewContainer"], [data-testid="stMain"] {{
         background: {bg} !important; color: {text} !important;
     }}
@@ -2147,10 +2146,12 @@ def load_persistent_valid_results():
         return list(_PERSISTENT_VALID_CACHE["data"])
     valid_list, seen = [], set()
     try:
-        paths = sorted(glob.glob("mail_results/valid_*.txt"), reverse=True)
+        _res = user_file("mail_results")
+        paths = sorted(glob.glob(os.path.join(_res, "valid_*.txt")), reverse=True)
         for extra in ("valid_accounts.txt", "clean_valid_accounts.txt"):
-            if os.path.exists(extra):
-                paths.append(extra)
+            _p = user_file(extra)
+            if os.path.exists(_p):
+                paths.append(_p)
         for path in paths:
             try:
                 with open(path, encoding="utf-8", errors="ignore") as f:
@@ -2222,7 +2223,7 @@ def _rehydrate_last_run(force: bool = False):
     """Reload the newest complete run stamp from mail_results/ into session_state."""
     try:
         stamps = set()
-        for p in glob.glob("mail_results/*.txt"):
+        for p in glob.glob(os.path.join(user_file("mail_results"), "*.txt")):
             m = RE_RUN_STAMP.match(os.path.basename(p))
             if m:
                 stamps.add(m.group(2))
@@ -2233,7 +2234,7 @@ def _rehydrate_last_run(force: bool = False):
         for key, tag in RUN_BUCKET_FILES:
             if str_lit.session_state.get(key) and not force:
                 continue
-            p = os.path.join("mail_results", f"{tag}_{stamp}.txt")
+            p = os.path.join(user_file("mail_results"), f"{tag}_{stamp}.txt")
             if not os.path.exists(p):
                 continue
             try:
@@ -5562,8 +5563,9 @@ def is_disposable(email):
 def list_unfinished_runs():
     runs = []
     try:
-        os.makedirs("mail_results", exist_ok=True)
-        for path in sorted(glob.glob("mail_results/unfinished_*.json"), reverse=True):
+        _res = user_file("mail_results")
+        os.makedirs(_res, exist_ok=True)
+        for path in sorted(glob.glob(os.path.join(_res, "unfinished_*.json"), reverse=True)):
             try:
                 with open(path, encoding="utf-8") as f:
                     data = json.load(f)
@@ -5577,8 +5579,9 @@ def list_unfinished_runs():
 
 
 def save_unfinished(reason, remaining, checked, total):
-    os.makedirs("mail_results", exist_ok=True)
-    path = "mail_results/unfinished_live.json"
+    _res = user_file("mail_results")
+    os.makedirs(_res, exist_ok=True)
+    path = os.path.join(_res, "unfinished_live.json")
     with open(path, "w", encoding="utf-8") as f:
         json.dump({"id": "live", "reason": reason, "checked": checked, "total": total,
                    "remaining": remaining,
@@ -5587,7 +5590,7 @@ def save_unfinished(reason, remaining, checked, total):
 
 
 def clear_unfinished():
-    path = "mail_results/unfinished_live.json"
+    path = os.path.join(user_file("mail_results"), "unfinished_live.json")
     if os.path.exists(path):
         os.remove(path)
 # @@END 083 UNFINISHED_IO
@@ -5628,10 +5631,12 @@ def load_previous_valid():
         return set(_PREV_VALID_CACHE["data"])
     seen = set()
     try:
-        paths = sorted(glob.glob("mail_results/valid_*.txt"), reverse=True)
+        _res = user_file("mail_results")
+        paths = sorted(glob.glob(os.path.join(_res, "valid_*.txt")), reverse=True)
         for extra in ("valid_accounts.txt", "clean_valid_accounts.txt"):
-            if os.path.exists(extra):
-                paths.append(extra)
+            _p = user_file(extra)
+            if os.path.exists(_p):
+                paths.append(_p)
         for path in paths:
             try:
                 with open(path, encoding="utf-8", errors="ignore") as f:
@@ -6499,7 +6504,8 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, 
         _status = out[1]
     except Exception:
         _status = None
-    if _status in (FAILED, PROXY_UNHEALTHY, RETRY, DNS_FAILED, UNKNOWN, SMTP_FAILED):
+    if _status in (FAILED, CONNECTION_FAILED, PROXY_UNHEALTHY, RETRY, RETRY_LATER,
+                   DNS_FAILED, UNKNOWN, SMTP_FAILED):
         failed_domain_cache[domain] = time.time()
         trace_logs.append(
             f"Fast Mode: domain '{domain}' armed for cooldown "
@@ -6561,7 +6567,8 @@ def _check_account_core(email, password, conf, domain, proxy_pool, thread_state,
             force=True is for a DEFINITIVE answer that must not be suppressed by
             an earlier, vaguer one (Microsoft XOAUTH2 AADSTS50126).
             """
-            if st_val not in (VALID, WRONG, APP, RBL, LOGIN_DROPPED, UNKNOWN):
+            if st_val not in (VALID, WRONG, APP, RBL, LOGIN_DROPPED, UNKNOWN,
+                              DNS_FAILED, SMTP_FAILED):
                 return
             cur = best_verdict["status"]
             if force or cur is None or _VERDICT_RANK.get(st_val, 0) > _VERDICT_RANK.get(cur, 0):
