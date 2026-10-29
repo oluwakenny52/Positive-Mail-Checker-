@@ -492,8 +492,10 @@ import auth
 # every results glob prefix per-user names with the unlocked hash.
 user_file = auth.user_file
 
-str_lit.markdown(auth.fit_css(), unsafe_allow_html=True)
+# require() first, fit() second - the order every page uses. require() stops the
+# script while locked, so fit() only runs once the gate has passed.
 auth.require(str_lit)
+auth.fit(str_lit)
 # @@END 007 PAGE_CONFIG
 
 # @@BLOCK 008 BUILD_IDENTITY deps=-
