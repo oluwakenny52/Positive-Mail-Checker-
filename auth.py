@@ -4,15 +4,18 @@
 
 Import-clean: stdlib only, no Streamlit at module level.
 
-Every page calls, in this order:
+Every page calls, in this order, in its FIRST block:
 
     import auth
-    auth.require(st)      # early - unlock or stop
-    auth.fit(st)          # late  - font/scale sliders + CSS
+    auth.require(st)      # unlock or stop
+    auth.fit(st)          # sliders + CSS
 
 The passphrase is salted-sha256 hashed into passkey.json. It is a LOCK, not
 encryption: per-user files are separated by the hash PREFIX, they are not
 encrypted at rest.
+
+passkey.json holds a LIST of keys, so several people can share one deployment.
+"Forget this passkey" removes only yours. "Forget all" removes every key.
 """
 
 import hashlib
@@ -80,6 +83,23 @@ def match_key(phrase):
     return ""
 
 
+def forget_current(h):
+    """Drop ONE key. Every other user keeps working. Empty list -> delete file."""
+    if not h:
+        return
+    data = _load()
+    data["keys"] = [k for k in (data.get("keys") or []) if k.get("hash") != h]
+    if data["keys"]:
+        _save(data)
+    else:
+        for p in (PASSKEY_FILE, PASSKEY_FILE + ".tmp"):
+            try:
+                if os.path.exists(p):
+                    os.remove(p)
+            except Exception:
+                pass
+
+
 def forget_all():
     for p in (PASSKEY_FILE, PASSKEY_FILE + ".tmp"):
         try:
@@ -124,7 +144,7 @@ def require(st, title="Unlock Positive Mail-Checker"):
             else:
                 st.error("Wrong passphrase.")
         with st.expander("Start fresh as a different user on this device"):
-            st.caption("Adds a SECOND passkey. The existing one keeps working.")
+            st.caption("Adds a SECOND passkey. The existing ones keep working.")
             with st.form("auth_new"):
                 p2 = st.text_input("New passphrase", type="password", key="au_p2")
                 p3 = st.text_input("Repeat it", type="password", key="au_p3")
@@ -139,10 +159,15 @@ def require(st, title="Unlock Positive Mail-Checker"):
                 else:
                     st.session_state["user_key_hash"] = add_key(p2, lbl)
                     st.rerun()
-        with st.expander("Forget this device and start over"):
-            st.caption("Deletes every stored passkey. Files already written stay "
-                       "on disk but become unreachable.")
-            if st.button("Forget all passkeys", key="au_forget"):
+        with st.expander("Forget a passkey"):
+            st.caption("Forget THIS passkey removes only the one you are signed "
+                       "in with. Every other user on this deployment keeps theirs.")
+            if st.button("Forget this passkey", key="au_forget_one"):
+                forget_current(st.session_state.get("user_key_hash", ""))
+                st.session_state.pop("user_key_hash", None)
+                st.rerun()
+            st.caption("Forget ALL passkeys removes every key, for everyone.")
+            if st.button("Forget all passkeys", key="au_forget_all"):
                 forget_all()
                 st.session_state.pop("user_key_hash", None)
                 st.rerun()
@@ -206,7 +231,6 @@ def _selftest():
     checks.append(("salt matters", h1 != _digest("abc", "t")))
     checks.append(("length", len(h1) == HASH_LEN))
     checks.append(("hex", all(c in "0123456789abcdef" for c in h1)))
-    checks.append(("user_file prefix", _digest("x", "y")[:4] in (_digest("x", "y") + "_a")))
     bad = [n for n, ok in checks if not ok]
     if bad:
         raise AssertionError("auth selftest failed: " + ", ".join(bad))
