@@ -1849,8 +1849,8 @@ def theme_css(th: dict) -> str:
 
     return f"""
 <style>
-    <!-- Display Fit CSS is emitted once, by auth.fit() in block 007. It used to
-         be re-embedded here as well, which fought the 88vw sidebar rule. -->
+    /* Display Fit CSS is emitted once, by auth.fit() in block 007. It used to
+       be re-embedded here as well, which fought the 88vw sidebar rule. */
     :root {{
         --bb-g1: {g1}; --bb-g2: {g2}; --bb-ac: {ac}; --bb-ac2: {ac2};
         --bb-bg: {bg}; --bb-panel: {panel}; --bb-text: {text}; --bb-r: {r}px;
