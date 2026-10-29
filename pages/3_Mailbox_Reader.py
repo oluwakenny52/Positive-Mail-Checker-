@@ -89,6 +89,7 @@ if _ROOT not in _sys.path:
     _sys.path.insert(0, _ROOT)
 
 import auth
+from auth import user_file
 
 try:                                   # a module cached from before a redeploy
     auth.fit_panel                     # still has the pre-split, one-function shape
