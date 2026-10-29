@@ -30,7 +30,9 @@ WHY THIS REVISION EXISTS (v13.47)
     actually defines.  The fit_panel AttributeError shipped because nothing ever
     compared the two: the callers were updated, the module was not, and every
     gate stayed green.  The match is anchored on the call paren so that the
-    prose "auth.py" does not read as a call to a function named py.
+    prose "auth.py" does not read as a call to a function named py, and the scan
+    runs against code_view() so a `auth.split(` written in a docstring or a
+    comment is not read as a call site either.  A real miss quotes the line.
   * A NOTE (not a failure) is printed for any block file whose own header
     version trails the app, so the drift stays visible without breaking CI.
 
@@ -86,7 +88,8 @@ def code_view(src):
     """Source with every COMMENT and STRING token blanked out, layout preserved.
 
     Newlines inside multi-line strings are kept, so line numbers still line up
-    with the real file.  This is the view gone() must use.
+    with the real file.  This is the view gone() must use, and the view
+    auth_api() must scan.
     """
     chars = list(src)
     offs = _line_offsets(src)
@@ -270,6 +273,10 @@ def auth_api():
 
     The AttributeError for fit_panel shipped because nothing compared the two:
     the callers were updated, the module was not, and every gate was green.
+
+    The scan runs against code_view(), so a mention in a docstring or a comment
+    ("auth.split()", "imported from auth.") is not read as a call site - only
+    real code counts.  A genuine miss quotes the line it came from.
     """
     if not os.path.exists("auth.py"):
         FAILS.append("auth.py is MISSING")
@@ -279,15 +286,21 @@ def auth_api():
     for c in AUTH_CALLERS:
         if not os.path.exists(c):
             continue
-        called = sorted(set(AUTH_CALL.findall(read(c))))
-        if not called:
+        raw_lines = read(c).splitlines()
+        seen = set()
+        for i, line in enumerate(code_view(read(c)).splitlines(), 1):
+            for name in AUTH_CALL.findall(line):
+                if name in seen:
+                    continue
+                seen.add(name)
+                if name in defined:
+                    PASSES.append("%s: auth.%s exists" % (c, name))
+                else:
+                    src_line = raw_lines[i - 1].strip() if i <= len(raw_lines) else ""
+                    FAILS.append("%s line %d calls auth.%s, which auth.py does "
+                                 "not define: %r" % (c, i, name, src_line[:90]))
+        if not seen:
             NOTES.append("%s calls no auth.<name> - nothing to compare" % c)
-        for name in called:
-            if name in defined:
-                PASSES.append("%s: auth.%s exists" % (c, name))
-            else:
-                FAILS.append("%s calls auth.%s, which auth.py does not define"
-                             % (c, name))
     for need in AUTH_REQUIRED:
         if need in defined:
             PASSES.append("auth.py defines %s" % need)
