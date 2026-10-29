@@ -120,12 +120,18 @@ st.markdown(
 # @@END 003 CSS
 
 
-# @@BLOCK 004 HERO deps=003
+# @@BLOCK 004 HERO deps=000,003
 st.markdown(
     '<div class="bl-hero"><h1>🧱 Block Inspector</h1>'
     '<p>Frame integrity for every block file, plus paste validation before you commit.</p></div>',
     unsafe_allow_html=True,
 )
+
+import auth
+
+if not _CLI_FIX_CHECK:
+    auth.require(st, "Unlock Block Inspector")
+    auth.fit(st)
 # @@END 004 HERO
 
 
@@ -373,6 +379,9 @@ _FIX_CHECKS = (
     ("fix_end_names.py", "(\\d{3})", 2, "marker id width matches verify_blocks (RE_BLOCK & RE_END)"),
     ("fix_end_names.py", "gate_faults", 3, "re-gate drives the exit code"),
     ("audit_frame.py", "EXPECT_BLOCKS drift trap", 1, "drift trap documented"),
+    ("auth.py", "def require(", 1, "passkey gate exists"),
+    ("auth.py", "def fit_css(", 1, "display fit exists"),
+    ("app.py", "DNS_FAILED, SMTP_FAILED):", 1, "DNS/SMTP verdicts retained"),
 )
 
 # order matters in the verdict tail: a server answer must outrank retryable
