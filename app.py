@@ -662,7 +662,7 @@ SETTING_DEFAULTS = {
     # font size and content scale at whatever the user last dragged, and they
     # were the only sidebar widgets with no reset target.
     "ui_font_size": 16,
-    "ui_content_scale": 1.00,
+    "ui_content_scale": 100,
     "ui_mode": "Normal Mode",
     "ui_protocols": list(PROTOCOL_SELECTION_DEFAULT),
     "ui_workers": WORKERS_NORMAL,
@@ -2653,10 +2653,11 @@ str_lit.sidebar.caption(
     "BROWSER holding a stale JavaScript chunk after a redeploy - hard-refresh the tab "
     "(Ctrl/Cmd+Shift+R). It is not an app error."
 )
+
 # Display Fit is NOT defined here. auth.fit() (block 007) already owns
 # ui_font_size / ui_content_scale and renders them in the 🔎 Display Fit expander.
-# A second pair with the same keys is an instant StreamlitDuplicateElementKey, and
-# its 80-140 percent range fought fit_css()'s 0.75-1.60 factor clamp.
+# A second pair with the same keys is an instant StreamlitDuplicateElementKey -
+# and its 80-140 percent range fought fit_css()'s factor clamp.
 str_lit.sidebar.caption("Text size and content scale live in **🔎 Display Fit** above.")
 
 str_lit.sidebar.markdown("---")
