@@ -348,6 +348,10 @@ def main():
     if os.path.exists(BACKUP):
         os.replace(BACKUP, BACKUP + "." + time.strftime("%H%M%S"))
     os.replace(SRC, BACKUP)
+    # engine.py is OVERWRITTEN, not deleted - and the hand-written engine that is
+    # there now is 12 blocks of work that git alone will not give back.
+    if os.path.exists(ENGINE):
+        os.replace(ENGINE, ENGINE + ".pre_tier2.bak")
     write(ENGINE, engine_src)
     write(SRC, app_src)
 
@@ -359,10 +363,21 @@ def main():
         fh.write("app.py: %d blocks\n" % len(app_entries))
         for i, (_o, n, _d, b) in enumerate(app_entries):
             fh.write("  %03d %s (%d lines)\n" % (i, n, len(b)))
+        _files = sum(1 for p in VB.BLOCKED_FILES if os.path.isfile(p))
+        _blocks = sum(len(VB.block_ids(p)) for p in VB.BLOCKED_FILES)
+        fh.write("\nFRAME TARGET after this split: "
+                 "TARGET_FILES, TARGET_BLOCKS = %d, %d\n" % (_files, _blocks))
+        fh.write("  paste that line into verify_blocks.py beside BLOCKED_FILES\n")
+        fh.write("  audit_frame.py imports it, so that is the ONLY place\n")
 
     print("OK - wrote engine.py and app.py")
     print("     old app.py backed up to %s" % BACKUP)
+    print("     old engine.py backed up to %s.pre_tier2.bak" % ENGINE)
     print("     manifest -> %s" % MANIFEST)
+    print("")
+    print("FRAME TARGET after this split: "
+          "TARGET_FILES, TARGET_BLOCKS = %d, %d" % (_files, _blocks))
+    print("  -> paste it into verify_blocks.py, or gate 3 goes red on drift")
     print("")
     print("next:  python verify_blocks.py && python verify_v1337.py")
     return 0
