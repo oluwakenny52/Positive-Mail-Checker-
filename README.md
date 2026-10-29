@@ -27,10 +27,10 @@ NAMED, NUMBERED, REPLACEABLE block.
     python verify_v1337.py               # must print FAILED 0
     python test_verdicts.py              # must print FAILED 0
     python engine.py --selftest          # exit 0 = headless engine sanity
-    python status.py --alias-selftest    # exit 0 = verdict alias sanity
+    python status.py --selftest          # exit 0 = verdict alias sanity
+    python auth.py --selftest            # exit 0 = gate + Display Fit sanity
     python -m compileall -q .            # exit 0 = everything compiles
     pip install -r requirements.txt      # exit 0 = pins still resolve
-    python auth.py --selftest            # exit 0 = gate + Display Fit sanity
     python pages/5_Blocks.py --fix-check # exit 0 = the fixes are still in the code
 
 `.github/workflows/gates.yml` runs all eleven on every push and writes a PASS/FAIL
@@ -61,7 +61,9 @@ is per-deployment and resets on redeploy; `theme.json` and `proxies.txt` stay
 shared on purpose.
 
 Display Fit (font size / content scale) is in every page's sidebar via
-`auth.fit(st)`.
+`auth.fit(st)`. Call it **exactly once per page**: it writes the two widget keys
+before creating the widgets, and a second call in the same run raises
+`StreamlitWidgetAlreadyInstantiatedError` inside its own `try/except`.
 
 ## Layout
 
