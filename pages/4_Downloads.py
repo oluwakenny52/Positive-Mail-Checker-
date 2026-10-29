@@ -131,6 +131,7 @@ import sys as _sys
 if APP_DIR not in _sys.path:
     _sys.path.insert(0, APP_DIR)
 import auth
+from auth import user_file
 
 auth.require(st, "Unlock Export Studio")
 auth.fit(st)
@@ -142,10 +143,16 @@ auth.fit(st)
 # sources
 # --------------------------------------------------------------------------
 def _results_dir():
-    h = st.session_state.get("user_key_hash", "")
-    return f"{h}_mail_results" if h else "mail_results"
-    
-    
+    """v13.45: the SAME per-user prefix app.py writes with.
+
+    This used to re-implement user_file() inline, while _preset_file() in block
+    002 called user_file() directly and nothing in this file ever imported it -
+    so every preset save and load raised NameError inside a try/except and
+    Export Studio presets were dead in both directions.
+    """
+    return user_file("mail_results")
+
+
 IGNORE = {
     "last_account.txt", "proxies.txt", "proxies_all.txt", "disposable_domains.txt",
     "clean_proxies.txt", "proxy_pool.txt", "download_presets.json",
