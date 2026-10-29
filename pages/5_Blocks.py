@@ -1,7 +1,7 @@
-# @@FILE pages/5_Blocks.py blocks=12 version=v13.43
+# @@FILE pages/5_Blocks.py blocks=12 version=v13.47
 # @@BLOCK 000 FILE_HEADER deps=-
 """
-pages/5_Blocks.py - Block Inspector  (v13.43)
+pages/5_Blocks.py - Block Inspector  (v13.47)
 =============================================
 Validates the @@BLOCK frame of every big file IN THE BROWSER, so you never
 need a terminal, and lets you VALIDATE A PASTE before you commit it.
@@ -11,6 +11,11 @@ Uses verify_blocks.py from the repo root as the single source of truth.
 Headless mode for CI (gate 11) - no Streamlit server and no streamlit import:
 
     python3 pages/5_Blocks.py --fix-check
+
+v13.47: block 004 calls auth.fit_panel() in browser mode only. auth.fit() injects
+the CSS, so without the panel call the Display Fit control was missing here. The
+call stays inside the `if not _CLI_FIX_CHECK:` branch so `--fix-check` still runs
+without importing Streamlit. The expander stays collapsed until it is tapped.
 """
 
 import os
@@ -136,7 +141,8 @@ if not _CLI_FIX_CHECK:
     import auth
 
     auth.require(st, "Unlock Block Inspector")
-    auth.fit(st)
+    auth.fit(st)                    # CSS only, before the first widget
+    auth.fit_panel(st)              # the controls; collapsed until tapped
 # @@END 004 HERO
 
 
