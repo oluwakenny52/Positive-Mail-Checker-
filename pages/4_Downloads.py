@@ -510,7 +510,7 @@ with st.sidebar:
     pname = st.text_input("Preset name", value="")
     c1, c2 = st.columns(2)
     with c1:
-        if st.button("Save preset", use_container_width=True) and pname.strip():
+        if st.button("Save preset", width="stretch") and pname.strip():
             _ps[pname.strip()] = {"template": template, "delim": delim, "eol": eol,
                                   "header": header, "prefix": prefix, "suffix": suffix,
                                   "sort": sort_key, "dedupe": dedupe, "lower": lower,
@@ -520,7 +520,7 @@ with st.sidebar:
     with c2:
         if _ps:
             p_use = st.selectbox("Load preset", ["--"] + sorted(_ps.keys()))
-            if p_use != "--" and st.button("Apply", use_container_width=True):
+            if p_use != "--" and st.button("Apply", width="stretch"):
                 st.session_state["_ex_apply"] = p_use
                 st.rerun()
 # @@END 010 SIDEBAR
@@ -588,7 +588,7 @@ st.download_button(
     file_name=fname,
     mime="text/plain",
     type="primary",
-    use_container_width=True,
+    width="stretch",
 )
 # @@END 012 BUILD
 
@@ -608,7 +608,7 @@ with tab_csv:
     ctext = _csv_of(sel, _sep)
     st.download_button("⬇️ Download CSV", data=ctext.encode("utf-8"),
                        file_name=fname.rsplit(".", 1)[0] + ".csv",
-                       mime="text/csv", use_container_width=True)
+                       mime="text/csv", width="stretch")
     st.code("\n".join(ctext.splitlines()[:30]), language="text")
 
 with tab_json:
@@ -616,7 +616,7 @@ with tab_json:
     jtext = _json_of(sel, lines=jl)
     st.download_button("⬇️ Download JSON", data=jtext.encode("utf-8"),
                        file_name=fname.rsplit(".", 1)[0] + (".jsonl" if jl else ".json"),
-                       mime="application/json", use_container_width=True)
+                       mime="application/json", width="stretch")
     st.code("\n".join(jtext.splitlines()[:30]), language="text")
 
 with tab_zip:
@@ -635,7 +635,7 @@ with tab_zip:
                            "\n".join(g["line"] for g in group))
         st.download_button("⬇️ Download ZIP", data=buf.getvalue(),
                            file_name=fname.rsplit(".", 1)[0] + ".zip",
-                           mime="application/zip", use_container_width=True)
+                           mime="application/zip", width="stretch")
 
 with tab_break:
     by = {}
