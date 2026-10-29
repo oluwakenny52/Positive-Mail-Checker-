@@ -593,7 +593,7 @@ def host_tier(host, domain):
 # @@END 010 ROUTER_DETECTION
 
 
-# @@BLOCK 011 PROBE_RANK deps=010,013
+# @@BLOCK 011 PROBE_RANK deps=010
 _probe_lock = threading.Lock()
 _probe_cache = {}
 _PROBE_TTL = 600
