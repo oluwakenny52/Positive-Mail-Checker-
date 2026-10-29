@@ -589,6 +589,10 @@ def load_app_proxies() -> List[dict]:
 # src, where a root-relative fetch has no app origin to resolve against; a bare
 # HTML string goes to srcdoc and keeps the parent origin, which is what makes the
 # health fetch work at all.
+#
+# v13.47b: height=1 still left a ~90px bordered empty frame under the header, so
+# the page opened on a blank panel and looked hung. The frame is pinned to zero
+# height by the stylesheet (block 007) instead of being trusted to honour 1px.
 _PING_HTML = (
     "<script>setInterval(function(){try{fetch('/_stcore/health',{cache:'no-store'});}"
     "catch(e){}},30000);</script>"
