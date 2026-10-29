@@ -63,8 +63,10 @@ for p in ("engine.py", "app.py"):
 
 NEEDLES = (
     "def note_verdict(st_val, detail, host=\"\", force=False):",
-    "if st_val not in (VALID, WRONG, APP, RBL, LOGIN_DROPPED, UNKNOWN):",
+    "if st_val not in (VALID, WRONG, APP, RBL, LOGIN_DROPPED, UNKNOWN,",
     "_VERDICT_RANK.get(st_val, 0) > _VERDICT_RANK.get(cur, 0)",
+    "UNKNOWN, DNS_FAILED, SMTP_FAILED):",
+    "CONNECTION_FAILED, PROXY_UNHEALTHY, RETRY, RETRY_LATER",
 )
 for n in NEEDLES:
     if n in src:
