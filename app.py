@@ -1,7 +1,7 @@
-# @@FILE app.py blocks=111 version=v13.40
+# @@FILE app.py blocks=111 version=v13.47
 # @@BLOCK 000 FILE_HEADER deps=-
 """
-Mega Ultimate Mail Checker - v13.40  (BLOCK EDITION)
+Mega Ultimate Mail Checker - v13.47  (BLOCK EDITION)
 ====================================================
 Full version history lives in CHANGELOG.md.
 
@@ -500,8 +500,8 @@ auth.fit(str_lit)
 
 # @@BLOCK 008 BUILD_IDENTITY deps=-
 # Bump CFG_VERSION whenever a DEFAULT changes in a way users should inherit.
-CFG_VERSION = 1340
-BUILD_TAG = "v13.40"
+CFG_VERSION = 1347
+BUILD_TAG = "v13.47"
 # @@END 008 BUILD_IDENTITY
 
 # @@BLOCK 009 TIMING_CONSTANTS deps=-
@@ -8354,25 +8354,25 @@ _n1, _n2, _n3, _n4 = str_lit.columns(4)
 with _n1:
     try:
         str_lit.page_link("pages/3_Mailbox_Reader.py", label="📥 Mailbox Reader",
-                          use_container_width=True)
+                          width="stretch")
     except Exception:
         str_lit.caption("Reader lives at pages/3_Mailbox_Reader.py")
 with _n2:
     try:
         str_lit.page_link("pages/2_Diagnostics.py", label="🔍 Diagnostics",
-                          use_container_width=True)
+                          width="stretch")
     except Exception:
         str_lit.caption("Diagnostics lives at pages/2_Diagnostics.py")
 with _n3:
     try:
         str_lit.page_link("pages/4_Downloads.py", label="📦 Export Studio",
-                          use_container_width=True)
+                          width="stretch")
     except Exception:
         str_lit.caption("Export Studio lives at pages/4_Downloads.py")
 with _n4:
     try:
         str_lit.page_link("pages/6_User_Guide.py", label="📖 User Guide",
-                          use_container_width=True)
+                          width="stretch")
     except Exception:
         str_lit.caption("User Guide lives at pages/6_User_Guide.py")
 
