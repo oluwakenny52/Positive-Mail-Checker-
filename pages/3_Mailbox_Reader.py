@@ -1,7 +1,7 @@
-# @@FILE pages/3_Mailbox_Reader.py blocks=44 version=v13.43
+# @@FILE pages/3_Mailbox_Reader.py blocks=44 version=v13.47
 # @@BLOCK 000 FILE_HEADER deps=-
 """
-pages/3_Mailbox_Reader.py — Bobito Mailbox Reader & Portal Hub  (v13.43)
+pages/3_Mailbox_Reader.py — Bobito Mailbox Reader & Portal Hub  (v13.47)
 =======================================================================
 Interactive inbox inspection: bot intelligence, OTP / debit-card / credential
 scanning, multi-field search, Telegram + blacklist filtering.
@@ -40,6 +40,18 @@ v13.43 fixes on this page
 * CACHE WRITE THROTTLE: log() no longer rewrites the whole session cache per line.
 * KEEPALIVE: st.iframe data: URI with a components.html fallback.
 * PAGER CLAMPS: the bot page counter cannot reach 0; the purge checks the STORE reply.
+
+v13.47 fixes on this page
+-------------------------
+* USER_FILE IMPORT: block 001 imports user_file from auth. Blocks 012 and 019 use
+  it at module level and block 032 inside append_result(); without the import the
+  page died at block 012 with NameError before rendering anything.
+* DISPLAY FIT PANEL: auth.fit_panel() is called in block 001. auth.fit() injects
+  the CSS only, so without this the whole Display Fit control disappeared.
+* KEEPALIVE HEIGHT: st.iframe rejects height=0 (validate_height raises on <= 0),
+  so every run fell through to the deprecated components.html. A bare HTML string
+  is also passed now instead of a data: URI, because src-loaded data: frames have
+  no app origin for a root-relative fetch; srcdoc keeps it.
 """
 
 import streamlit as st
@@ -77,9 +89,11 @@ if _ROOT not in _sys.path:
     _sys.path.insert(0, _ROOT)
 
 import auth
+from auth import user_file          # blocks 012, 019 and 032 resolve paths through it
 
 auth.require(st, "Unlock Mailbox Reader")
-auth.fit(st)
+auth.fit(st)                        # CSS only, before the first widget
+auth.fit_panel(st)                  # the controls; collapsed until tapped
 # @@END 001 PAGE_CONFIG
 
 
@@ -545,14 +559,17 @@ def load_app_proxies() -> List[dict]:
 
 # @@BLOCK 010 KEEPALIVE_AND_THEME_APPLY deps=007
 # v13.40: st.markdown() strips <script>, so a real embed is required to run it.
-# v13.43: st.iframe with a data: URI is the current API and components.v1.html is
-# deprecated. Both are guarded so the 30s health ping can never silently stop.
+# v13.47: st.iframe rejects height=0 (validate_height raises on <= 0), so every
+# run fell through to the deprecated components.html. A data: URI also loads via
+# src, where a root-relative fetch has no app origin to resolve against; a bare
+# HTML string goes to srcdoc and keeps the parent origin, which is what makes the
+# health fetch work at all.
 _PING_HTML = (
     "<script>setInterval(function(){try{fetch('/_stcore/health',{cache:'no-store'});}"
     "catch(e){}},30000);</script>"
 )
 try:
-    st.iframe("data:text/html;charset=utf-8," + quote(_PING_HTML), height=0)
+    st.iframe(_PING_HTML, height=1)
 except Exception:
     try:
         components.html(_PING_HTML, height=0)
@@ -3898,7 +3915,7 @@ except Exception:
 # v13.45: fit() already ran in block 001. Calling it again here assigned the
 # widget keys after the widgets existed, which raised inside fit()'s own
 # try/except - so it silently did nothing except emit the CSS a second time.
-# fit() must be called exactly once per page.
+# fit() must be called exactly once per page, and the panel is its own late call.
 # @@END 042 BACK_TO_CHECKER
 
 
