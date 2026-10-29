@@ -447,8 +447,8 @@ with tab_plan:
     # v13.37: defaults first, so later tabs and the footer always have values
     got, all_imap, all_pop, primary, fallback, kind = {}, [], [], [], [], "ok"
     plan_error = ""
-    # v13.40: fam/fam_pop belong up here too. They used to be bound only inside
-    # the success branch, so on plan_error / zero_access the bundle button in
+    # v13.40: fam/fam_pop belong up here too. They were bound only inside the
+    # success branch, so on plan_error / zero_access the bundle button in
     # block 018 raised NameError: name 'fam' is not defined.
     fam = []
     fam_pop = []
