@@ -3451,10 +3451,10 @@ if _settings_dirty:
 
 _btn_c1, _btn_c2 = str_lit.sidebar.columns(2)
 with _btn_c1:
-    _apply_clicked = str_lit.button("💾 Apply Settings", type="primary", use_container_width=True)
+    _apply_clicked = str_lit.button("💾 Apply Settings", type="primary", width="stretch")
 with _btn_c2:
     _reset_clicked = str_lit.button(
-        "♻️ Reset Defaults", use_container_width=True,
+        "♻️ Reset Defaults", width="stretch",
         help="Restore every setting to the universal default (protocols back to IMAP + POP3).")
 
 if _reset_clicked:
@@ -3583,13 +3583,13 @@ with str_lit.sidebar.expander("🎨 Theme Studio & Colours", expanded=False):
 
     b_a, b_b = str_lit.columns(2)
     with b_a:
-        str_lit.button("♻️ Reset Theme", on_click=_reset_theme, use_container_width=True)
+        str_lit.button("♻️ Reset Theme", on_click=_reset_theme, width="stretch")
     with b_b:
         str_lit.download_button(
             "⬇️ Export Theme",
             data=json.dumps(str_lit.session_state.theme, indent=2),
             file_name="theme.json", mime="application/json",
-            use_container_width=True,
+            width="stretch",
         )
 
     _sync_theme_from_widgets()
@@ -5259,13 +5259,13 @@ with str_lit.sidebar:
 
     _rc1, _rc2, _rc3 = str_lit.columns(3)
     with _rc1:
-        if str_lit.button("🔁 Re-probe pool now", use_container_width=True):
+        if str_lit.button("🔁 Re-probe pool now", width="stretch"):
             clear_tunnel_cache()
             refresh_alive_pool(force=True, budget=PROBE_BATCH_BUDGET)
             str_lit.success("Pool re-probed.")
             str_lit.rerun()
     with _rc2:
-        if str_lit.button("🧾 Show raw proxies.txt", use_container_width=True):
+        if str_lit.button("🧾 Show raw proxies.txt", width="stretch"):
             try:
                 with open(CFG["PROXY_FILE"], encoding="utf-8", errors="ignore") as _pf:
                     _lines = [l.rstrip() for l in _pf if l.strip()]
@@ -5276,7 +5276,7 @@ with str_lit.sidebar:
             except Exception as _pf_err:
                 str_lit.error(f"Could not read proxies.txt: {_pf_err}")
     with _rc3:
-        if str_lit.button("↩️ Restore from proxies_all.txt", use_container_width=True,
+        if str_lit.button("↩️ Restore from proxies_all.txt", width="stretch",
                           help="Fetch & Test writes only the SURVIVORS into proxies.txt. "
                                "This puts the full raw fetched pool back."):
             try:
@@ -5380,7 +5380,7 @@ with str_lit.sidebar:
                 f"idle_probe={CFG.get('PROBER_IDLE_ENABLED')} · "
                 f"mail_spot={CFG.get('MAIL_SPOT_CHECK')}"
             )
-            str_lit.dataframe(pd.DataFrame(rows), use_container_width=True)
+            str_lit.dataframe(pd.DataFrame(rows), width="stretch")
             col_ref1, col_ref2, col_ref3, col_ref4 = str_lit.columns(4)
             with col_ref1:
                 if str_lit.button("🔄 Refresh Dashboard"):
@@ -5419,11 +5419,11 @@ with str_lit.expander("🔬 Deep Diagnostics - copy/paste this to debug", expand
 
     _dc1, _dc2 = str_lit.columns(2)
     with _dc1:
-        if str_lit.button("🔁 Rebuild", use_container_width=True):
+        if str_lit.button("🔁 Rebuild", width="stretch"):
             STATE["diag_cache"] = {"ts": 0.0, "text": ""}
             str_lit.rerun()
     with _dc2:
-        if str_lit.button("🧪 Direct self-test", use_container_width=True):
+        if str_lit.button("🧪 Direct self-test", width="stretch"):
             with str_lit.spinner("Running direct self-test..."):
                 _probe_target_reachability(force=True)
                 _lines = [f"self-test {datetime.now().strftime('%H:%M:%S')}"]
@@ -5477,7 +5477,7 @@ with str_lit.expander("🔬 Deep Diagnostics - copy/paste this to debug", expand
     str_lit.download_button(
         "⬇️ Download bundle", data=_diag,
         file_name=f"diag_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt",
-        mime="text/plain", use_container_width=True,
+        mime="text/plain", width="stretch",
     )
     str_lit.code(_diag, language="text")
 # @@END 081 DIAG_UI
@@ -7929,7 +7929,7 @@ if start_engine_btn:
                                     _last_df_ts = _now_ui
                                     report_log_container.dataframe(
                                         pd.DataFrame(current_reports[::-1]),
-                                        use_container_width=True, height=320)
+                                        width="stretch", height=320)
 
                     except Exception as ex:
                         err_msg = f"[EXCEPTION] {str(ex)}"
@@ -8252,7 +8252,7 @@ if str_lit.session_state.engine_has_run or load_persistent_valid_results():
     with exec_tab2_p:
         if report_entries_copy:
             str_lit.dataframe(pd.DataFrame(report_entries_copy[::-1]),
-                              use_container_width=True, height=320)
+                              width="stretch", height=320)
         else:
             str_lit.info("No report logs available.")
 
