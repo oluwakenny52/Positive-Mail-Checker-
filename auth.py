@@ -211,9 +211,8 @@ FIT_SCALE_DEFAULT = 1.00
 FIT_FONT_MIN, FIT_FONT_MAX = 12, 24
 FIT_SCALE_MIN, FIT_SCALE_MAX = 0.75, 1.60
 # Above these a stored value is read as a PERCENT and scaled back down.
-# app.py block 019's SETTING_DEFAULTS seeds 100 / 100, which sits far outside
-# both ranges; without this the sliders were pinned at maximum and could not be
-# moved at all, because fit() only ever seeded a key that was ABSENT.
+# app.py block 019's SETTING_DEFAULTS seeds 100 / 100 in older trees; without
+# this the sliders were pinned at maximum and could not be moved at all.
 FIT_FONT_PERCENT_ABOVE = 40
 FIT_SCALE_PERCENT_ABOVE = 3
 
@@ -266,13 +265,15 @@ def fit_css(font=None, scale=None) -> str:
     """CSS for the Display Fit sliders. Always returns a str.
 
     font / scale are optional overrides, so the values can be exercised with no
-    Streamlit at all. No argument = read the live settings. The fallback is a
-    harmless 16px / 1.00.
+    Streamlit at all. No argument = read the live settings.
 
-    Specificity is deliberately high (`:root`, `html body div.stApp`) and every
-    declaration is `!important`, so a later font-size or zoom rule in app.py
-    cannot outrank this one. `:root` beats a bare `html` rule, which is what
-    makes the font-size reach rem-based text at all.
+    v13.45 LAYOUT FIX. `zoom` used to sit on `html body div.stApp`, which
+    CONTAINS the sidebar - and the mobile sheet sets the sidebar to 88vw. A vw
+    unit is not divided by the zoom factor, so at 1.40 the sidebar laid out at
+    123vw of visual width and shoved the main column off the screen. zoom now
+    sits on the MAIN container only: the sidebar keeps native geometry (its text
+    still grows, because :root is the rem base) and the main column scales.
+    Every declaration stays `!important` so a later sheet cannot outrank it.
     """
     if font is None:
         size = _fit_normalise(FIT_FONT_KEY, FIT_FONT_DEFAULT,
@@ -287,34 +288,41 @@ def fit_css(font=None, scale=None) -> str:
 
     return (
         "<style>"
-        ":root, html body, html body div.stApp, html body .stApp p,"
-        " html body .stApp li, html body .stApp label, html body .stApp input,"
-        " html body .stApp textarea, html body .stApp select"
+        ":root, html, html body"
         " { font-size: %dpx !important; }"
-        "html body div.stApp, html body [data-testid=\"stAppViewContainer\"]"
-        " { zoom: %.2f !important; }"
-        ".block-container, [data-testid=\"stMainBlockContainer\"]"
-        " { max-width: 100%% !important; }"
-        "</style>" % (size, zoom)
+        "html body .stApp p, html body .stApp li, html body .stApp label,"
+        " html body .stApp input, html body .stApp textarea,"
+        " html body .stApp select,"
+        " html body .stApp [data-testid=\"stMarkdownContainer\"]"
+        " { font-size: %dpx !important; }"
+        "html body [data-testid=\"stMainBlockContainer\"],"
+        " html body .block-container"
+        " { zoom: %.2f !important; max-width: 100%% !important; }"
+        "</style>" % (size, size, zoom)
     )
 # @@END 003 FIT_CSS
 
 
 # @@BLOCK 004 FIT_UI deps=003
 def fit(st) -> None:
-    """Sidebar sliders + the CSS they drive. Call LATE in the page. Never raises.
+    """Sidebar sliders + the CSS they drive. Never raises.
 
-    This is the ONLY definition of fit().
+    This is the ONLY definition of fit(), and it must be called EXACTLY ONCE per
+    page. A second call assigns ui_font_size / ui_content_scale after those
+    widgets already exist, which raises StreamlitWidgetAlreadyInstantiatedError
+    inside the try/except below: the sliders survive, but the call is wasted and
+    anything written for them later in that run is lost. pages/3 called it twice
+    until v13.45.
     """
     try:
         if st.session_state.pop("_fit_reset", False):
             # Assigned BEFORE either widget exists. Assigning after them raises
-            # StreamlitWidgetAlreadyInstantiatedError - the v13.35 reset lesson.
+            # the v13.35 StreamlitWidgetAlreadyInstantiatedError.
             st.session_state[FIT_FONT_KEY] = FIT_FONT_DEFAULT
             st.session_state[FIT_SCALE_KEY] = FIT_SCALE_DEFAULT
 
-        # v13.44: normalise UNCONDITIONALLY, not only when the key is missing.
-        # A key that is merely present can still hold a percent (100) from
+        # Normalise UNCONDITIONALLY, not only when the key is missing. A key
+        # that is merely present can still hold a percent (100) from an older
         # SETTING_DEFAULTS, and a slider handed 100 against 0.75-1.60 is pinned
         # at maximum and immovable. Before the widgets, so no
         # WidgetAlreadyInstantiatedError.
