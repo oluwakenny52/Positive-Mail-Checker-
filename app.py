@@ -2658,7 +2658,8 @@ str_lit.sidebar.caption(
 # ui_font_size / ui_content_scale and renders them in the 🔎 Display Fit expander.
 # A second pair with the same keys is an instant StreamlitDuplicateElementKey -
 # and its 80-140 percent range fought fit_css()'s factor clamp.
-str_lit.sidebar.caption("Text size and content scale live in **🔎 Display Fit** above.")
+str_lit.sidebar.subheader("🔎 Display Fit")
+str_lit.sidebar.caption("The sliders live in the Display Fit box at the top of the page.")
 
 str_lit.sidebar.markdown("---")
 
