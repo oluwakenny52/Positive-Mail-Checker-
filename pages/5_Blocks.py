@@ -466,6 +466,11 @@ _FIX_CHECKS = (
     ("app.py", "_metric_phs", 2, "metric cells are built once, not per tick"),
     ("app.py", "for _ph, _ml, _mv in zip(_metric_phs, _metric_labels, _vals):", 1,
      "metric cells unpack label AND value, not a bare int"),
+    # ---- v13.48 per-user isolation ----
+    ("app.py", "own = str_lit.session_state.startup_entries", 1,
+     "startup ledger dedupes per session, not per process"),
+    ("pages/7_Logs.py", "_RES_IS_MINE", 3, "the log page proves whose directory it reads"),
+    ("pages/7_Logs.py", "Strict: only my own directory", 1, "strict mode refuses a shared dir"),
 )
 
 # order matters in the verdict tail: a server answer must outrank retryable
