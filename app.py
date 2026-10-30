@@ -2336,14 +2336,20 @@ def log_startup(msg, quiet: bool = False):
             if len(_STARTUP_BUFFER) > _STARTUP_MAX:
                 del _STARTUP_BUFFER[:-_STARTUP_MAX]
         return
+    # FIX ISO-1: _STARTUP_SEEN is PROCESS state (STATE-backed on purpose), so on a
+    # shared deployment a second user never saw a line the first user had already
+    # logged - their ledger came up short through no fault of their own, and the
+    # Full Log page showed the gap. The SESSION now dedupes against its OWN list;
+    # _STARTUP_SEEN still guards the shared buffer path below.
     try:
+        own = str_lit.session_state.startup_entries
+        if any(msg in str(e) for e in own):
+            return
+        own.append(entry)
+        if len(own) > _STARTUP_MAX:
+            del own[:-_STARTUP_MAX]
         with _STARTUP_BUFFER_LOCK:
-            if msg in _STARTUP_SEEN:
-                return
             _STARTUP_SEEN.add(msg)
-        str_lit.session_state.startup_entries.append(entry)
-        if len(str_lit.session_state.startup_entries) > _STARTUP_MAX:
-            del str_lit.session_state.startup_entries[:-_STARTUP_MAX]
     except Exception:
         with _STARTUP_BUFFER_LOCK:
             _STARTUP_BUFFER.append(entry)
