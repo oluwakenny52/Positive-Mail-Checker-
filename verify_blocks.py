@@ -1,5 +1,3 @@
-# @@FILE verify_blocks.py blocks=1 version=v13.42
-#!/usr/bin/env python3
 # @@BLOCK 000 VERIFIER deps=-
 """verify_blocks.py - block-integrity gate for the block-edition app.
 
@@ -54,6 +52,7 @@ BLOCKED_FILES = [
     "pages/4_Downloads.py",
     "pages/5_Blocks.py",
     "pages/6_User_Guide.py",
+    "pages/7_Logs.py",
 ]
 
 # The frame target lives HERE, beside the list it describes, so a frame move is
@@ -61,10 +60,10 @@ BLOCKED_FILES = [
 # copy, and its api_conformance() asserts both names exist.
 #
 # tier2_split.py REWRITES app.py and OVERWRITES engine.py - it deletes no file -
-# so TARGET_FILES stays 12 and only TARGET_BLOCKS moves.  The split prints the
+# so TARGET_FILES stays 13 and only TARGET_BLOCKS moves.  The split prints the
 # new line for you and records it in TIER2_MANIFEST.txt; paste it here.
-TARGET_FILES = 12
-TARGET_BLOCKS = 270
+TARGET_FILES = 13
+TARGET_BLOCKS = 284
 
 FILE_RX = re.compile(r"^#\s*@@FILE\s+(\S+)\s+blocks=(\d+)\s+version=(\S+)\s*$")
 BLOCK_RX = re.compile(r"^#\s*@@BLOCK\s+(\d{3})\s+([A-Za-z0-9_]+)(?:\s+deps=(\S+))?\s*$")
@@ -295,7 +294,7 @@ def audit_source(target, name=None):
         if not ename:
             fault(eline, "unnamed_end", "END %03d carries no block name" % bid)
         elif ename != bname:
-            fault(eline, "end_name_mismatch", "END %03d name '%s' != block name '%s'" % (bid, ename, bname))
+            fault(eline, "end_name_mismatch", "END %03d name '%s' != block name '%s'" % (eline, ename, bname))
 
     for bid in sorted(ends):
         if not any(b[0] == bid for b in rep["blocks"]):
