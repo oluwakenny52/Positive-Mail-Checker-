@@ -74,6 +74,11 @@ jobs:
         if: always()
         run: python3 pages/5_Blocks.py --fix-check
 
+      - name: 12. runstate selftest
+        id: g12
+        if: always()
+        run: python3 runstate.py --selftest
+
       - name: Summary
         if: always()
         env:
@@ -88,6 +93,7 @@ jobs:
           R9: ${{ steps.g9.outcome }}
           R10: ${{ steps.g10.outcome }}
           R11: ${{ steps.g11.outcome }}
+          R12: ${{ steps.g12.outcome }}
         run: |
           fail=0
           {
@@ -95,11 +101,11 @@ jobs:
             echo ""
             echo "| gate | result |"
             echo "| --- | --- |"
-            for pair in "fix_end_names.py --check:$R1" "verify_blocks.py:$R2" "audit_frame.py:$R3" "verify_v1337.py:$R4" "test_verdicts.py:$R5" "engine.py --selftest:$R6" "status.py --selftest:$R7" "auth.py --selftest:$R8" "compileall -q .:$R9" "pip install -r requirements.txt:$R10" "pages/5_Blocks.py --fix-check:$R11"; do
+            for pair in "fix_end_names.py --check:$R1" "verify_blocks.py:$R2" "audit_frame.py:$R3" "verify_v1337.py:$R4" "test_verdicts.py:$R5" "engine.py --selftest:$R6" "status.py --selftest:$R7" "auth.py --selftest:$R8" "compileall -q .:$R9" "pip install -r requirements.txt:$R10" "pages/5_Blocks.py --fix-check:$R11" "runstate.py --selftest:$R12"; do
               g="${pair%%:*}"; r="${pair##*:}"
               if [ "$r" = "success" ]; then echo "| \`$g\` | PASS |"; else echo "| \`$g\` | FAIL |"; fail=1; fi
             done
             echo ""
-            if [ "$fail" -eq 0 ]; then echo "**All eleven gates green.**"; else echo "**A gate is RED - do not ship.**"; fi
+            if [ "$fail" -eq 0 ]; then echo "**All twelve gates green.**"; else echo "**A gate is RED - do not ship.**"; fi
           } >> "$GITHUB_STEP_SUMMARY"
           exit $fail
