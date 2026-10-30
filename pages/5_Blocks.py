@@ -149,12 +149,14 @@ st.markdown(
 # `auth.fit_panel` is reached with `auth` never bound, and the resulting
 # NameError is not an AttributeError, so --fix-check died here.
 if not _CLI_FIX_CHECK:
+    import importlib
+
     import auth
 
-    try:                                # a module cached from before a redeploy
-        auth.fit_panel                  # still has the pre-split, one-function shape
-    except AttributeError:
-        import importlib
+    # hasattr(), not a bare `auth.fit_panel` expression: the bare form is
+    # magic-written by Streamlit (st.help -> ast.parse) and can raise
+    # IndentationError on the enclosing `try:`.
+    if not hasattr(auth, "fit_panel"):
         auth = importlib.reload(auth)
 
     auth.require(st, "Unlock Block Inspector")
@@ -422,7 +424,7 @@ _FIX_CHECKS = (
     ("pages/4_Downloads.py", '_cut = raw.find("|", _colon + 1)', 1, "no pipe truncation"),
     ("pages/5_Blocks.py", "out.insert(len(out) - 1, _end)", 3, "@@EOF stays last"),
     ("pages/5_Blocks.py", "def run_fix_check():", 2, "one implementation, button and CLI"),
-    ("pages/5_Blocks.py", "if _CLI_FIX_CHECK:", 4, "CLI dispatch stays wired (000, 002, 011)"),
+    ("pages/5_Blocks.py", "if _CLI_FIX_CHECK:", 3, "CLI dispatch stays wired (000, 002, 011)"),
     ("engine.py", '_conf = getattr(_hosts, "conf", None)', 1, "engine reads hosts.conf"),
     ("engine.py", "state.cooldown_host(rung.host, 30.0)", 1, "cooldown table is armed"),
     ("engine.py", "def _local_to(domain, host):", 1, "pick_verdict checks locality"),
