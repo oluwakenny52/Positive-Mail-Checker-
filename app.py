@@ -485,20 +485,23 @@ str_lit.set_page_config(
     initial_sidebar_state="collapsed",
 )
 
+import importlib
+
 import auth
 import runstate
 
-try:                                   # a module cached from before a redeploy
-    auth.fit_panel                     # still has the pre-split, one-function shape
-except AttributeError:
-    import importlib
+# A Streamlit rerun re-uses the SAME process, so a module imported before a
+# redeploy stays in sys.modules and keeps answering with the OLD shape.  BOTH
+# modules need the guard - it was applied to auth and not to runstate, which is
+# why runstate.tick() answered AttributeError after a redeploy.  Both guards are
+# hasattr(): a bare `auth.fit_panel` expression is picked up by Streamlit's
+# magic-write, which routes it through st.help -> ast.parse and can raise
+# IndentationError on the enclosing `try:` - and it also dumps a help panel into
+# the page above the hero.
+if not hasattr(auth, "fit_panel"):
     auth = importlib.reload(auth)
-
-# Watchdog. A Streamlit rerun tears the script down and the run loop in block 106
-# never returns, so the loop's own finally never runs. tick() notices the quiet
-# heartbeat on the NEXT page load and records the run as interrupted - which is
-# why no try/finally is needed around the loop. Returns None when no run is open.
-_rs_path = runstate.tick()
+if not hasattr(runstate, "tick"):
+    runstate = importlib.reload(runstate)
 
 # The passkey gate lives in auth.py so every page shares ONE implementation.
 # user_file() is re-exported: default_cfg(), RESULTS_DIR, CLEAN_VALID_FILE and
@@ -509,6 +512,17 @@ user_file = auth.user_file
 # script while locked, so fit() only runs once the gate has passed.
 auth.require(str_lit)
 auth.fit(str_lit)
+
+# Watchdog, and it MUST be after require(): runstate._dir() resolves through
+# auth.user_file(), which is a throwaway anon<hex> prefix until the passphrase is
+# unlocked.  Called before require() it read - and CREATED - anon<hex>_mail_results/
+# while begin(), progress() and finish() all wrote to <hash>_mail_results/, so it
+# could never see the record it exists to watch.  A Streamlit rerun tears the
+# script down and the run loop in block 106 never returns, so the loop's own
+# finally never runs. tick() notices the quiet heartbeat on the NEXT page load and
+# records the run as interrupted - which is why no try/finally is needed around
+# the loop. Returns None when no run is open.
+_rs_path = runstate.tick()
 # @@END 007 PAGE_CONFIG
 
 # @@BLOCK 008 BUILD_IDENTITY deps=-
@@ -6549,7 +6563,7 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, 
     except Exception:
         _status = None
     if _status in (FAILED, CONNECTION_FAILED, PROXY_UNHEALTHY, RETRY, RETRY_LATER,
-                   DNS_FAILED, UNKNOWN, SMTP_FAILED):
+                   UNKNOWN, DNS_FAILED, SMTP_FAILED):
         failed_domain_cache[domain] = time.time()
         trace_logs.append(
             f"Fast Mode: domain '{domain}' armed for cooldown "
