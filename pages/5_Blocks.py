@@ -455,6 +455,15 @@ _FIX_CHECKS = (
     ("pages/3_Mailbox_Reader.py", "_readable_text(th)", 1,
      "text colour is contrast-checked"),
     ("runstate.py", "def begin(", 1, "unfinished run lifecycle exists"),
+    # ---- v13.48 resume / 407 / lag fixes ----
+    ("app.py", "sorted(glob.glob(os.path.join(_res, \"unfinished_*.json\")), reverse=True)",
+     1, "resume glob uses sorted(), not glob(reverse=)"),
+    ("app.py", "def unfinished_remaining_count(", 1, "resume counts accounts, not files"),
+    ("app.py", "unfinished_count = unfinished_remaining_count()", 1,
+     "the Resume metric uses the helper"),
+    ("app.py", "if _is_proxy_auth_fail(s):", 1, "raw 407 text is recognised, not normalised"),
+    ("app.py", "executor.shutdown(wait=False)", 1, "a teardown does not drain the queue"),
+    ("app.py", "_metric_phs", 2, "metric cells are built once, not per tick"),
 )
 
 # order matters in the verdict tail: a server answer must outrank retryable
