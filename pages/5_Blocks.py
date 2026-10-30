@@ -469,7 +469,7 @@ _FIX_CHECKS = (
     # ---- v13.48 per-user isolation ----
     ("app.py", "own = str_lit.session_state.startup_entries", 1,
      "startup ledger dedupes per session, not per process"),
-    ("pages/7_Logs.py", "_RES_IS_MINE", 3, "the log page proves whose directory it reads"),
+    ("pages/7_Logs.py", "_RES_IS_MINE", 4, "the log page proves whose directory it reads"),
     ("pages/7_Logs.py", "Strict: only my own directory", 1, "strict mode refuses a shared dir"),
 )
 
