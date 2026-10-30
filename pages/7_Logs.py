@@ -174,10 +174,19 @@ TAG_ORDER = ("SKIPPED_COOLDOWN", "SKIPPED", "WRONG_PASSWORD", "WRONG",
              "VALID", "EXCEPTION", "ERROR")
 STAMP_RX = re.compile(r"^(.*)_(\d{8}_\d{6})\.txt$")
 
-# This session's own per-user prefix. require() has already stopped the script if
-# the gate is locked, so this is the unlocked hash, never an anon placeholder.
+# v13.48: this session's own per-user prefix.
+#
+# It used to be auth._anon_id(), which is WRONG once the passphrase is unlocked:
+# user_file() prefixes with user_key_hash() in that state, never with the anon
+# id, so basename.startswith(_anon_id()) was False on every unlocked session -
+# the strict-mode banner fired every time and the header said "may be shared"
+# even when the directory was demonstrably yours.
+#
+# user_file("") returns the bare prefix (its `if name else h` branch), so the
+# prefix is DERIVED from the same function that names the files. No second
+# identity source can drift from it.
 try:
-    _IDENT = auth._anon_id()
+    _IDENT = os.path.basename(auth.user_file("")) or ""
 except Exception:
     _IDENT = ""
 
