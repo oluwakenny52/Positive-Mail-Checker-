@@ -4,20 +4,31 @@ The run loop lives in app.py block 106. A Streamlit rerun (tab backgrounded,
 WebSocket drop, phone lock, redeploy) tears the script down and the loop never
 returns, so its own `finally` never runs and the run is never recorded.
 
-tick() is called from app.py block 007 on EVERY page load. If a record is still
-marked "running" and its heartbeat has gone quiet, tick() flips it to
-"interrupted" - so a torn-down run is recorded on the NEXT load, with no
-try/finally around the loop.
+app.py block 007 detects that: run_active is PROCESS state, so it is still True
+on the load after a teardown, while the loop that owned it is gone. That is the
+proof, and it is immediate - no waiting for a stale heartbeat.
+
+REASONS
+-------
+tick() used to be the only writer and it always wrote "Streamlit rerun / tab
+teardown (watchdog)", so a user Stop and a dropped connection were both reported
+as a rerun. Three writers now exist and the specific ones win:
+
+    note(reason)       an in-progress cause, stamped on the live record
+    interrupt(reason)  the teardown itself, stamped by block 007 on the next load
+    tick()             the last-resort sweep for a record with no cause at all
+
+interrupt() also rewrites the reason in unfinished_live.json, because that is
+where the results summary reads it from.
 
 One record per user, in that user's own mail_results/ directory, so two users
 cannot see each other's progress. The record holds COUNTS only; the remaining
-ACCOUNT LINES stay in unfinished_live.json, which app.py already writes at every
-100-check checkpoint and in its own finally. remaining() reads that file and
-nothing else.
+ACCOUNT LINES stay in unfinished_live.json, which app.py writes on every
+checkpoint and in its own finally. remaining() reads that file and nothing else.
 
 _write() always stamps the heartbeat with "now" - every production caller
-(begin, progress, tick, finish) means exactly that. Only the selftest needs to
-lie about the clock, so it rewrites the record by hand.
+(begin, progress, note, tick, interrupt, finish) means exactly that. Only the
+selftest needs to lie about the clock, so it rewrites the record by hand.
 
 Selftest (gate 12):   python3 runstate.py --selftest
 """
@@ -81,29 +92,76 @@ def _write(rec):
 def begin(total):
     """Start a run record. Called once, when the queue is ready."""
     rec = {"state": "running", "total": int(total or 0), "checked": 0,
-           "started_at": _stamp(), "reason": ""}
+           "started_at": _stamp(), "reason": "", "cause": ""}
     return _write(rec)
 
 
-def progress(checked, total):
-    """Heartbeat plus counts. Called from the 100-account checkpoint."""
-    rec = _read() or {"state": "running", "started_at": _stamp(), "reason": ""}
+def progress(checked, total, cause=None):
+    """Heartbeat plus counts. Called from the checkpoint.
+
+    `cause` is written when given, so the checkpoint is also where a live
+    network problem gets recorded.
+    """
+    rec = _read() or {"state": "running", "started_at": _stamp(), "reason": "",
+                      "cause": ""}
     rec["state"] = "running"
     rec["checked"] = int(checked or 0)
     rec["total"] = int(total or 0)
+    if cause is not None:
+        rec["cause"] = str(cause)[:200]
     return _write(rec)
 
 
+def note(reason):
+    """Stamp an in-progress cause without changing the state."""
+    rec = _read()
+    if not rec or rec.get("state") != "running":
+        return None
+    rec["cause"] = str(reason or "")[:200]
+    return _write(rec)
+
+
+def cause():
+    """The cause stamped on the live record, or ''."""
+    rec = _read() or {}
+    return str(rec.get("cause") or "")
+
+
+def interrupt(reason):
+    """Mark the live record interrupted, with the reason, and mirror the reason
+    into unfinished_live.json so the results summary can name it."""
+    rec = _read()
+    if not rec or rec.get("state") != "running":
+        return None
+    rec["state"] = "interrupted"
+    rec["reason"] = str(reason or "interrupted")[:200]
+    rec["interrupted_at"] = _stamp()
+    p = _write(rec)
+    try:
+        uf = os.path.join(_dir(), UNFINISHED_FILE)
+        if os.path.exists(uf):
+            with open(uf, encoding="utf-8") as f:
+                data = json.load(f) or {}
+            data["reason"] = rec["reason"]
+            with open(uf, "w", encoding="utf-8") as f:
+                json.dump(data, f)
+    except Exception:
+        pass
+    return p
+
+
 def tick():
-    """Watchdog. Returns the record path while a live run is still beating, or
-    after marking a quiet one interrupted. Returns None when nothing is open."""
+    """Last-resort watchdog. Returns the record path while a live run is still
+    beating, or after marking a quiet one interrupted. Returns None when nothing
+    is open."""
     rec = _read()
     if not rec or rec.get("state") != "running":
         return None
     if (time.time() - float(rec.get("heartbeat") or 0.0)) < STALE_SECONDS:
         return _path()
     rec["state"] = "interrupted"
-    rec["reason"] = "Streamlit rerun / tab teardown (watchdog)"
+    rec["reason"] = (rec.get("cause")
+                     or "Streamlit rerun / tab teardown (watchdog)")
     rec["interrupted_at"] = _stamp()
     return _write(rec)
 
@@ -216,19 +274,30 @@ def _selftest():
     try:
         check("no record before begin", _read() is None)
         check("tick with no record is None", tick() is None)
+        check("interrupt with no record is None", interrupt("x") is None)
+        check("cause with no record is empty", cause() == "")
 
         p = begin(120)
         check("begin writes a record", os.path.exists(p))
         rec = _read() or {}
         check("state is running", rec.get("state") == "running")
         check("total is stored", rec.get("total") == 120)
+        check("cause starts empty", rec.get("cause") == "")
 
         check("tick keeps a beating run", tick() == p)
 
-        progress(100, 120)
+        progress(100, 120, cause="8 consecutive transport failures")
         rec = _read() or {}
         check("progress stores counts",
               rec.get("checked") == 100 and rec.get("total") == 120)
+        check("progress stores the cause",
+              rec.get("cause") == "8 consecutive transport failures")
+        check("cause() reads it back",
+              cause() == "8 consecutive transport failures")
+
+        note("Stopped by user (Stop button)")
+        check("note overwrites the cause",
+              cause() == "Stopped by user (Stop button)")
 
         backdate(STALE_SECONDS + 5.0)
         check("the backdated record is stale",
@@ -236,18 +305,36 @@ def _selftest():
         tick()
         rec = _read() or {}
         check("a quiet run is interrupted", rec.get("state") == "interrupted")
+        check("tick reuses the stamped cause",
+              rec.get("reason") == "Stopped by user (Stop button)")
         check("an interrupted run is not re-ticked", tick() is None)
+        check("interrupt on a non-running record is None", interrupt("late") is None)
 
         with open(os.path.join(d, UNFINISHED_FILE), "w", encoding="utf-8") as f:
             json.dump({"saved_at": "2026-01-01 00:00:00",
-                       "remaining": ["a@b.c:1", "d@e.f:2"]}, f)
+                       "remaining": ["a@b.c:1", "d@e.f:2"],
+                       "reason": "In Progress (Running)"}, f)
         check("remaining reads both lines", len(remaining()) == 2)
-        check("summary reports the interruption",
-              any("interrupted" in ln for ln in summary()))
 
         progress(120, 120)
         check("progress revives the record",
               (_read() or {}).get("state") == "running")
+        check("progress keeps the cause when none is passed",
+              cause() == "Stopped by user (Stop button)")
+
+        interrupt("UI interaction / rerun - the run loop was torn down")
+        rec = _read() or {}
+        check("interrupt marks it interrupted", rec.get("state") == "interrupted")
+        check("interrupt stores the reason",
+              rec.get("reason") == "UI interaction / rerun - the run loop was torn down")
+        with open(os.path.join(d, UNFINISHED_FILE), encoding="utf-8") as f:
+            uf = json.load(f) or {}
+        check("interrupt mirrors the reason into unfinished_live.json",
+              uf.get("reason") == rec.get("reason"))
+        check("summary reports the interruption",
+              any("interrupted" in ln for ln in summary()))
+
+        progress(120, 120)
         finish()
         check("finish marks it finished",
               (_read() or {}).get("state") == "finished")
