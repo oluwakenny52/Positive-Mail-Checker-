@@ -23,6 +23,11 @@ reached `auth.fit_panel` with `auth` never imported - a NameError, which
 require/fit/fit_panel calls are also OUTSIDE the except: nested inside it, they
 only ran when the module was stale, so a healthy module rendered the page with
 no passkey gate and no Display Fit panel.
+
+The guard itself is hasattr() + importlib.reload(), NOT a bare `auth.fit_panel`
+expression inside a try. The bare form is magic-written by Streamlit, which
+routes it through st.help -> ast.parse and can raise IndentationError on the
+enclosing `try:` - and it dumps a help panel onto the page.
 """
 
 import os
@@ -424,7 +429,7 @@ _FIX_CHECKS = (
     ("pages/4_Downloads.py", '_cut = raw.find("|", _colon + 1)', 1, "no pipe truncation"),
     ("pages/5_Blocks.py", "out.insert(len(out) - 1, _end)", 3, "@@EOF stays last"),
     ("pages/5_Blocks.py", "def run_fix_check():", 2, "one implementation, button and CLI"),
-    ("pages/5_Blocks.py", "if _CLI_FIX_CHECK:", 3, "CLI dispatch stays wired (000, 002, 011)"),
+    ("pages/5_Blocks.py", "if _CLI_FIX_CHECK:", 4, "CLI dispatch stays wired (000, 002, 011)"),
     ("engine.py", '_conf = getattr(_hosts, "conf", None)', 1, "engine reads hosts.conf"),
     ("engine.py", "state.cooldown_host(rung.host, 30.0)", 1, "cooldown table is armed"),
     ("engine.py", "def _local_to(domain, host):", 1, "pick_verdict checks locality"),
@@ -433,7 +438,7 @@ _FIX_CHECKS = (
     ("audit_frame.py", "TARGET_FILES as EXPECT_FILES", 1, "frame target is imported, not duplicated"),
     ("auth.py", "def require(", 1, "passkey gate exists"),
     ("auth.py", "def fit_css(", 1, "display fit exists"),
-    ("app.py", "DNS_FAILED, SMTP_FAILED):", 1, "DNS/SMTP verdicts retained"),
+    ("app.py", "DNS_FAILED, SMTP_FAILED):", 2, "DNS/SMTP verdicts retained"),
     ("auth.py", "_fit_reset", 2, "Display Fit reset flag survives"),
     ("app.py", 'str_lit.session_state["_fit_reset"] = True', 1,
      "Reset Defaults reaches Display Fit"),
