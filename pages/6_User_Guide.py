@@ -16,6 +16,14 @@ merge of the two once produced duplicate ids 006-016, a "with _t1:" with no body
 and a stylesheet pasted into an f-string with single braces. All three are fixed
 here and each has its own note below.
 
+AUTH GUARD (block 004)
+----------------------
+The stale-module guard is hasattr() + importlib.reload(), NOT a bare
+`auth.fit_panel` expression inside a try. The bare form is magic-written by
+Streamlit, which routes it through st.help -> ast.parse and can raise
+IndentationError on the enclosing `try:` - and it dumps a help panel onto the
+page. The reload is what makes a module cached from before a redeploy safe.
+
 BUILD_TAG / CFG_VERSION mirror app.py block 008 exactly. verify_v1337.py derives
 both from app.py's @@FILE header and fails if this page disagrees, so the parity
 is a check now, not a comment.
@@ -130,14 +138,21 @@ st.markdown(_CSS, unsafe_allow_html=True)
 # @@END 003 THEME_CSS
 
 # @@BLOCK 004 AUTH deps=001
+import importlib
+
 import auth
 
-try:                                   # a module cached from before a redeploy
-    auth.fit_panel                     # still has the pre-split, one-function shape
-except AttributeError:
-    import importlib
+# A Streamlit rerun re-uses the SAME process, so a module imported before a
+# redeploy stays in sys.modules and keeps answering with the OLD shape - which is
+# how fit_panel() answered AttributeError for hours after it existed on disk.
+# hasattr(), not a bare `auth.fit_panel` expression: the bare form is picked up by
+# Streamlit's magic-write, which routes it through st.help -> ast.parse and can
+# raise IndentationError on the enclosing `try:` - and it dumps a help panel onto
+# the page above the hero.
+if not hasattr(auth, "fit_panel"):
     auth = importlib.reload(auth)
-from auth import user_file
+
+from auth import user_file         # AFTER the reload, so it binds to the live module
 
 # require() first, fit() second - the order every page uses. fit() is CSS-only
 # and must land before the first widget. fit_panel() lands after the hero.
