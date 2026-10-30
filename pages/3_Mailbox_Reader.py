@@ -88,15 +88,18 @@ _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _ROOT not in _sys.path:
     _sys.path.insert(0, _ROOT)
 
+import importlib
+
 import auth
 
-try:                                   # a module cached from before a redeploy
-    auth.fit_panel                     # still has the pre-split, one-function shape
-except AttributeError:
-    import importlib
+# A module cached from before a redeploy keeps the OLD shape. hasattr(), not a
+# bare `auth.fit_panel` expression - the bare form is magic-written by Streamlit
+# (st.help -> ast.parse) and can raise IndentationError on the `try:`.
+if not hasattr(auth, "fit_panel"):
     auth = importlib.reload(auth)
 
 from auth import user_file          # blocks 012, 019 and 032 resolve paths through it
+                                    # NB: must stay AFTER the reload above
 
 auth.require(st, "Unlock Mailbox Reader")
 auth.fit(st)                        # CSS only, before the first widget
