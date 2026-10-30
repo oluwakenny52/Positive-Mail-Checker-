@@ -589,10 +589,30 @@ with _t8:
 | Lots of `LOGIN_DROPPED` | The mail server answered and hung up. Retry from a different IP, or use an app password. **Not** a wrong password. |
 | Lots of `APP` | Normal for Gmail / Yahoo / O365. Generate app passwords. |
 | `Every proxy was filtered out` | `Min Proxy Score`, pool mode or the circuit breaker emptied the pool. The raw list is **not** used as a silent fallback - by design. |
-| Run feels slow | `Confirm a WRONG verdict across hosts` is ON (intended), and the live panels re-render 8×/second. Raise the mode to `Fast`, or narrow the protocol list. |
+| Run feels slow | Two separate things. (1) `Confirm a WRONG verdict across hosts` is ON, so a provisional WRONG keeps the ladder dialling - that is intended. (2) The **tail** is slow by construction: whatever is still queued has already exhausted most of its ladder. The last cohort gets its per-account budget capped at 45 s, so it no longer sits on the full slider value. Raise the mode to `Fast`, or narrow the protocol list. |
 | Settings do not change | Nothing applies until **💾 Apply Settings**. |
 | `⚠ You have UNAPPLIED settings changes` | Exactly that. Press Apply. |
 | `407` shown as a proxy failure, not a password failure | Correct. The mailbox was never reached. |
+"""
+    )
+
+    ug_h("Stopping and resuming a run")
+    st.markdown(
+        """
+`⏹ Stop Engine` stamps a reason on the run record first, so the stop is reported
+honestly instead of looking like a crash.
+
+To continue where you left off:
+
+1. Set **Engine Action Mode** to `Resume Unfinished`.
+2. The box under it prints the record and how many accounts are still to check.
+   The `Resume Unfinished` tile above shows the same account count, and
+   `Filter & Result Categories Inspector` lists the lines themselves.
+3. Press `🔥 Start Live Checking Engine`. Only the unchecked lines are dialled.
+
+The record is per user, lives beside your results, and is deleted the moment a
+run finishes cleanly. `Resume Unfinished` reading **0** with a record on disk
+means the resume read path is broken - run the Block Inspector fix self-check.
 """
     )
 
