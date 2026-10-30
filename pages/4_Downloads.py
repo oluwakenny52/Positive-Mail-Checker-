@@ -91,43 +91,49 @@ _TH = _load_theme()
 
 
 # @@BLOCK 004 CSS deps=003
-st.markdown(
-    f"""
+# A PLAIN string with __TOKEN__ placeholders, not an f-string - the sheet is full
+# of braces and doubling every one is what pastes get wrong.
+_CSS_TMPL = """
 <style>
-    .stApp, [data-testid="stAppViewContainer"] {{ background: {_TH['bg']}; color: {_TH['text']}; }}
-    h1, h2, h3, h4 {{ color: {_TH['text']} !important; }}
-    [data-testid="stSidebar"] {{ background: {_TH['panel']}; }}
-    [data-testid="stSidebar"] p, [data-testid="stSidebar"] label,
-    [data-testid="stSidebar"] span {{ color: {_TH['text']}; }}
-    .ex-hero {{
-        background: linear-gradient(135deg, {_TH['g1']} 0%, {_TH['g2']} 100%);
+    .ex-hero {
+        background: linear-gradient(135deg, __G1__ 0%, __G2__ 100%);
         padding: 18px 24px; border-radius: 14px; margin-bottom: 14px;
         border: 1px solid rgba(255,255,255,.12);
-    }}
-    .ex-hero h1 {{ color: #fff !important; margin: 0; font-size: 1.5rem; font-weight: 800; }}
-    .ex-hero p {{ color: rgba(255,255,255,.92) !important; margin: 6px 0 0 0; font-size: .85rem; }}
-    code, pre, [data-testid="stCodeBlock"] {{
-        background: {_TH['bg']} !important; color: {_TH['accent2']} !important;
-        border: 1px solid rgba(255,255,255,.10) !important; border-radius: 10px !important;
-    }}
-    [data-testid="stMetric"] {{
-        background: {_TH['panel']}; border: 1px solid rgba(255,255,255,.10);
-        border-left: 4px solid {_TH['accent']}; border-radius: 12px; padding: 10px 12px;
-    }}
-    .block-container {{ padding-top: 1.2rem !important; padding-bottom: 2rem !important; }}
-    @media (max-width: 820px) {{
-        .block-container {{ padding: .55rem .7rem 1.3rem .7rem !important; }}
-        .ex-hero {{ padding: 12px 14px; }}
-        .ex-hero h1 {{ font-size: 1.15rem; }}
-        .ex-hero p {{ font-size: .74rem; }}
-        [data-testid="stMetricValue"] {{ font-size: 1.05rem !important; }}
-        [data-testid="stMetricLabel"] {{ font-size: .6rem !important; }}
-        pre, code {{ font-size: .68rem !important; }}
-    }}
+    }
+    .ex-hero h1 { color: #fff !important; margin: 0; font-size: 1.45rem; font-weight: 800; }
+    .ex-hero p { color: rgba(255,255,255,.93) !important; margin: 6px 0 0 0; font-size: .84rem; }
+    /* v13.48: `.stMarkdown span`, not a bare `span`. A bare selector repaints the
+       sidebar's own icons - the same defect P2-2 fixed in app.py block 032. */
+    [data-testid="stSidebar"] p, [data-testid="stSidebar"] label,
+    [data-testid="stSidebar"] .stMarkdown span { color: __TEXT__; }
+    .ex-box {
+        background: __BG__; border: 1px solid rgba(255,255,255,.10);
+        border-radius: 10px; padding: 10px 12px; overflow-x: auto;
+        font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: .74rem;
+    }
+    .block-container, [data-testid="stMainBlockContainer"] {
+        padding-top: 1.2rem !important; padding-bottom: 2rem !important;
+        max-width: 1150px !important;
+    }
+    @media (max-width: 820px) {
+        .block-container, [data-testid="stMainBlockContainer"] {
+            padding-top: 0.55rem !important;
+            padding-left: 0.7rem !important; padding-right: 0.7rem !important;
+        }
+        .ex-hero { padding: 12px 14px !important; }
+        .ex-hero h1 { font-size: 1.15rem !important; }
+        .ex-box { font-size: .66rem !important; }
+    }
 </style>
-""",
-    unsafe_allow_html=True,
-)
+"""
+
+_CSS = (_CSS_TMPL
+        .replace("__G1__", _TH["g1"])
+        .replace("__G2__", _TH["g2"])
+        .replace("__BG__", _TH["bg"])
+        .replace("__TEXT__", _TH["text"]))
+
+st.markdown(_CSS, unsafe_allow_html=True)
 # @@END 004 CSS
 
 
