@@ -507,8 +507,9 @@ with _t5:
     ug_h("Presets")
     st.markdown(
         "Set the format once, type a name, `Save preset`. Next time, `Load preset` → "
-        "`Apply`. Presets live in `download_presets.json` next to `app.py`, so on a "
-        "cloud deploy they reset on redeploy."
+        "`Apply`. Presets are PER USER: they live in "
+        "`<your-prefix>_download_presets.json` next to `app.py`, so two people on one "
+        "deployment never share a preset store. On a cloud deploy they reset on redeploy."
     )
 # @@END 012 TAB_DOWNLOADS
 
