@@ -347,7 +347,8 @@ class EngineState:
         with self._lock:
             self.errors += 1
 
-    def cooled(self, host, seconds):
+    def cooled(self, host):
+        """True while this host is still inside the cooldown cooldown_host() set."""
         until = self.cooldown.get(host, 0)
         return until > time.time()
 
@@ -449,7 +450,7 @@ def run_engine(targets, probe, *, workers=DEFAULT_WORKERS, limit=DEFAULT_RUNG_LI
         rungs = plan_rungs(target.domain, target.local, include_pop=pop, limit=limit)
         results = []
         for rung in rungs:
-            if state.cooled(rung.host, 0):
+            if state.cooled(rung.host):
                 continue
             results.append(run_rung(target, rung, probe, state=state,
                                     attempts=attempts, sleep=sleep))
@@ -527,6 +528,11 @@ def _selftest():
     st.total = 1
     st.bump()
     add("state", st.snapshot()["done"] == 1)
+
+    st2 = EngineState()
+    st2.cooldown_host("mail.example.com", 30.0)
+    add("cooled_after_arming", st2.cooled("mail.example.com") is True)
+    add("cooled_unarmed", st2.cooled("other.example.com") is False)
 
     def fake_probe(target, rung, timeout):
         return (True, "") if rung.port == 993 else (False, "Connection refused")
