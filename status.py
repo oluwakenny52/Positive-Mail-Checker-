@@ -1,4 +1,4 @@
-# @@FILE status.py blocks=13 version=v13.42
+# @@FILE status.py blocks=13 version=v13.47
 # ===========================================================================
 # status.py - canonical mail-verdict taxonomy, classifier and presentation.
 #
