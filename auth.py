@@ -561,4 +561,3 @@ if __name__ == "__main__":
     print("auth selftest OK")
 # @@END 005 SELFTEST
 # @@EOF
-# @@EOF
