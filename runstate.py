@@ -1,165 +1,255 @@
-#!/usr/bin/env python3
-"""runstate.py - per-user unfinished-run persistence.
+"""runstate.py - unfinished-run watchdog  (v13.47)
+================================================
+The run loop lives in app.py block 106. A Streamlit rerun (tab backgrounded,
+WebSocket drop, phone lock, redeploy) tears the script down and the loop never
+returns, so its own `finally` never runs and the run is never recorded.
 
-WHY THIS EXISTS
----------------
-The checker printed "saved as unfinished" and wrote nothing. Two causes:
+tick() is called from app.py block 007 on EVERY page load. If a record is still
+marked "running" and its heartbeat has gone quiet, tick() flips it to
+"interrupted" - so a torn-down run is recorded on the NEXT load, with no
+try/finally around the loop.
 
-  1. the writer and the Resume reader each spelled the filename themselves, so
-     the reader globbed a path the writer never produced;
-  2. the write sat AFTER the run loop, so a tab-background rerun tore the script
-     down before it ran - only a graceful finish ever wrote.
+One record per user, in that user's own mail_results/ directory, so two users
+cannot see each other's progress. The record holds COUNTS only; the remaining
+ACCOUNT LINES stay in unfinished_live.json, which app.py already writes at every
+100-check checkpoint and in its own finally. remaining() reads that file and
+nothing else.
 
-So: ONE path expression, used by both, and save() is cheap enough to call from a
-finally and from the 100-account checkpoint.
-
-    python runstate.py --selftest
+Selftest (gate 12):   python3 runstate.py --selftest
 """
-import glob
-import io
+
 import json
 import os
-import sys
 import time
+from datetime import datetime
 
-import auth
-
-STEM = "unfinished"
-KEEP = 25
-KEYS = ("reason", "done", "total", "saved", "note")
-
-
-def _path(stamp=None):
-    """THE single filename expression. Writer and reader both come through here."""
-    stamp = stamp or time.strftime("%Y%m%d_%H%M%S")
-    return auth.user_file("%s_%s.json" % (STEM, stamp))
+STALE_SECONDS = 60.0
+RUN_FILE = "unfinished_run.json"
+UNFINISHED_FILE = "unfinished_live.json"
 
 
-def _pattern():
-    return auth.user_file("%s_*.json" % STEM)
+def _stamp():
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 
-def save(reason, done=0, total=None, note=""):
-    """Write the current state. Never raises. Returns the path, or ''.
-
-    Atomic (.tmp + os.replace) so a torn write cannot leave a half file that the
-    reader then chokes on.
-    """
-    path = _path()
-    payload = {
-        "reason": str(reason or "stopped"),
-        "done": int(done or 0),
-        "total": int(total) if total is not None else None,
-        "saved": time.strftime("%Y-%m-%d %H:%M:%S"),
-        "note": str(note or "")[:400],
-    }
+def _dir():
+    ov = os.environ.get("BB_RUN_DIR")
+    if ov:
+        return ov
     try:
-        tmp = path + ".tmp"
-        with io.open(tmp, "w", encoding="utf-8") as fh:
-            json.dump(payload, fh, indent=2)
-        os.replace(tmp, path)
+        import auth
+        return auth.user_file("mail_results")
     except Exception:
-        return ""
-    prune()
-    return path
+        return "mail_results"
 
 
-def load():
-    """Every readable unfinished file for THIS user, newest first."""
+def _path():
+    d = _dir()
+    try:
+        os.makedirs(d, exist_ok=True)
+    except Exception:
+        pass
+    return os.path.join(d, RUN_FILE)
+
+
+def _read():
+    try:
+        with open(_path(), encoding="utf-8") as f:
+            rec = json.load(f)
+        return rec if isinstance(rec, dict) else None
+    except Exception:
+        return None
+
+
+def _write(rec):
+    p = _path()
+    rec["heartbeat"] = time.time()
+    tmp = p + ".tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(rec, f)
+        os.replace(tmp, p)
+    except Exception:
+        return p
+    return p
+
+
+def begin(total):
+    """Start a run record. Called once, when the queue is ready."""
+    rec = {"state": "running", "total": int(total or 0), "checked": 0,
+           "started_at": _stamp(), "reason": ""}
+    return _write(rec)
+
+
+def progress(checked, total):
+    """Heartbeat plus counts. Called from the 100-account checkpoint."""
+    rec = _read() or {"state": "running", "started_at": _stamp(), "reason": ""}
+    rec["state"] = "running"
+    rec["checked"] = int(checked or 0)
+    rec["total"] = int(total or 0)
+    return _write(rec)
+
+
+def tick():
+    """Watchdog. Returns the record path while a live run is still beating, or
+    after marking a quiet one interrupted. Returns None when nothing is open."""
+    rec = _read()
+    if not rec or rec.get("state") != "running":
+        return None
+    if (time.time() - float(rec.get("heartbeat") or 0.0)) < STALE_SECONDS:
+        return _path()
+    rec["state"] = "interrupted"
+    rec["reason"] = "Streamlit rerun / tab teardown (watchdog)"
+    rec["interrupted_at"] = _stamp()
+    return _write(rec)
+
+
+def finish():
+    """Clean completion - the record stops beating."""
+    rec = _read()
+    if not rec:
+        return None
+    rec["state"] = "finished"
+    rec["reason"] = "Completed"
+    rec["checked"] = rec.get("total", rec.get("checked", 0))
+    rec["finished_at"] = _stamp()
+    return _write(rec)
+
+
+def _label(rec):
+    s = rec.get("state")
+    if s == "running":
+        return "running now"
+    if s == "interrupted":
+        return "interrupted"
+    return "completed"
+
+
+def _saved_at():
+    try:
+        with open(os.path.join(_dir(), UNFINISHED_FILE), encoding="utf-8") as f:
+            return (json.load(f) or {}).get("saved_at") or "?"
+    except Exception:
+        return "?"
+
+
+def remaining():
+    """The account lines still to check, straight from unfinished_live.json."""
+    try:
+        with open(os.path.join(_dir(), UNFINISHED_FILE), encoding="utf-8") as f:
+            rec = json.load(f) or {}
+        return [str(x) for x in (rec.get("remaining") or []) if str(x).strip()]
+    except Exception:
+        return []
+
+
+def summary():
+    """Lines for the Resume control. Empty when nothing is worth resuming."""
     out = []
-    for p in glob.glob(_pattern()):
-        try:
-            with io.open(p, encoding="utf-8") as fh:
-                data = json.load(fh)
-            if not isinstance(data, dict):
-                continue
-            data["path"] = p
-            data.setdefault("reason", "unknown")
-            data.setdefault("done", 0)
-            data.setdefault("total", None)
-            data.setdefault("saved", "")
-            out.append(data)
-        except Exception:
-            continue
-    out.sort(key=lambda d: str(d.get("saved", "")), reverse=True)
+    rec = _read()
+    if rec and rec.get("state") in ("running", "interrupted"):
+        line = ("%s | %s | %s/%s checked"
+                % (rec.get("started_at", "?"), _label(rec),
+                   rec.get("checked", 0), rec.get("total", 0)))
+        if rec.get("reason"):
+            line += " | " + str(rec["reason"])
+        out.append(line)
+    left = remaining()
+    if left:
+        out.append("%d account(s) still to check, saved %s" % (len(left), _saved_at()))
     return out
 
 
-def drop(path):
-    """Delete one unfinished file (call on a clean completion)."""
-    for p in (path, path + ".tmp"):
+def load():
+    return _read()
+
+
+def drop():
+    d = _dir()
+    for name in (RUN_FILE, UNFINISHED_FILE):
         try:
-            if p and os.path.exists(p):
-                os.remove(p)
+            os.remove(os.path.join(d, name))
         except Exception:
             pass
 
 
-def drop_all():
-    for d in load():
-        drop(d.get("path"))
-
-
-def prune(keep=KEEP):
-    """Keep the newest `keep` files; a stale run must not accumulate forever."""
-    files = sorted(glob.glob(_pattern()), reverse=True)
-    for p in files[keep:]:
-        drop(p)
-
-
-def summary():
-    """One line per unfinished run, for the Resume control."""
-    rows = load()
-    if not rows:
-        return ["No unfinished runs for this user."]
-    out = []
-    for d in rows:
-        total = d.get("total")
-        prog = "%s/%s" % (d.get("done", 0), total) if total else str(d.get("done", 0))
-        out.append("%s  stopped at %s  (%s)%s"
-                   % (d.get("saved", "?"), prog, d.get("reason", "?"),
-                      "  " + d["note"] if d.get("note") else ""))
-    return out
+def prune(max_age_days=7):
+    """Delete a finished record older than max_age_days."""
+    rec = _read()
+    if not rec or rec.get("state") != "finished":
+        return False
+    if (time.time() - float(rec.get("heartbeat") or 0.0)) < max_age_days * 86400:
+        return False
+    drop()
+    return True
 
 
 def _selftest():
-    bad = []
+    import shutil
+    import tempfile
 
-    def check(name, fn):
-        try:
-            if fn() is False:
-                bad.append(name)
-        except Exception as exc:
-            bad.append("%s (%s: %s)" % (name, type(exc).__name__, exc))
+    d = tempfile.mkdtemp(prefix="runstate_")
+    os.environ["BB_RUN_DIR"] = d
+    fails = []
 
-    check("path is per-user", lambda: _path("X").endswith("_unfinished_X.json"))
-    check("path is not bare", lambda: "_" in _path("X"))
-    check("pattern is per-user", lambda: _pattern().endswith("_unfinished_*.json"))
-    check("path is stable for a stamp", lambda: _path("S") == _path("S"))
-    check("save returns a path", lambda: bool(save("selftest", 1, 2)))
-    check("saved file loads back", lambda: any(d.get("reason") == "selftest" for d in load()))
-    check("summary is a list", lambda: isinstance(summary(), list))
-    check("drop removes it", lambda: (drop(_path_by_reason("selftest")),
-                                      not any(d.get("reason") == "selftest" for d in load()))[1])
-    check("load is empty-safe", lambda: isinstance(load(), list))
-    check("prune keeps newest", lambda: prune(5) is None)
+    def check(name, cond):
+        print("%s %s" % ("OK  " if cond else "FAIL", name))
+        if not cond:
+            fails.append(name)
 
-    if bad:
-        raise AssertionError("runstate selftest failed: " + ", ".join(bad))
-    print("runstate selftest OK")
+    try:
+        check("no record before begin", _read() is None)
+        check("tick with no record is None", tick() is None)
 
+        p = begin(120)
+        check("begin writes a record", os.path.exists(p))
+        rec = _read() or {}
+        check("state is running", rec.get("state") == "running")
+        check("total is stored", rec.get("total") == 120)
 
-def _path_by_reason(reason):
-    for d in load():
-        if d.get("reason") == reason:
-            return d.get("path", "")
-    return ""
+        check("tick keeps a beating run", tick() == p)
+
+        progress(100, 120)
+        rec = _read() or {}
+        check("progress stores counts",
+              rec.get("checked") == 100 and rec.get("total") == 120)
+
+        rec["heartbeat"] = time.time() - (STALE_SECONDS + 5.0)
+        _write(rec)
+        tick()
+        rec = _read() or {}
+        check("a quiet run is interrupted", rec.get("state") == "interrupted")
+        check("an interrupted run is not re-ticked", tick() is None)
+
+        with open(os.path.join(d, UNFINISHED_FILE), "w", encoding="utf-8") as f:
+            json.dump({"saved_at": "2026-01-01 00:00:00",
+                       "remaining": ["a@b.c:1", "d@e.f:2"]}, f)
+        check("remaining reads both lines", len(remaining()) == 2)
+        check("summary reports the interruption",
+              any("interrupted" in ln for ln in summary()))
+
+        progress(120, 120)
+        check("progress revives the record",
+              (_read() or {}).get("state") == "running")
+        finish()
+        check("finish marks it finished",
+              (_read() or {}).get("state") == "finished")
+        check("a finished run is not listed as running",
+              not any("running now" in ln for ln in summary()))
+
+        drop()
+        check("drop clears the record", _read() is None)
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+        os.environ.pop("BB_RUN_DIR", None)
+
+    print("SELFTEST: %s (%d failure(s))"
+          % ("OK" if not fails else "FAILED", len(fails)))
+    return 1 if fails else 0
 
 
 if __name__ == "__main__":
+    import sys
     if "--selftest" in sys.argv:
-        _selftest()
-    else:
-        for line in summary():
-            print(line)
-    sys.exit(0)
+        raise SystemExit(_selftest())
+    print("usage: python3 runstate.py --selftest")
