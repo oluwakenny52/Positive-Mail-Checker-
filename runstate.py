@@ -15,6 +15,10 @@ ACCOUNT LINES stay in unfinished_live.json, which app.py already writes at every
 100-check checkpoint and in its own finally. remaining() reads that file and
 nothing else.
 
+_write() always stamps the heartbeat with "now" - every production caller
+(begin, progress, tick, finish) means exactly that. Only the selftest needs to
+lie about the clock, so it rewrites the record by hand.
+
 Selftest (gate 12):   python3 runstate.py --selftest
 """
 
@@ -197,6 +201,18 @@ def _selftest():
         if not cond:
             fails.append(name)
 
+    def backdate(seconds):
+        """Age the stored heartbeat.
+
+        _write() always stamps "now", so the record has to be rewritten by hand
+        here - calling _write() after setting an old heartbeat just overwrites
+        it and the staleness path never arms.
+        """
+        rec = _read() or {}
+        rec["heartbeat"] = time.time() - float(seconds)
+        with open(_path(), "w", encoding="utf-8") as f:
+            json.dump(rec, f)
+
     try:
         check("no record before begin", _read() is None)
         check("tick with no record is None", tick() is None)
@@ -214,8 +230,9 @@ def _selftest():
         check("progress stores counts",
               rec.get("checked") == 100 and rec.get("total") == 120)
 
-        rec["heartbeat"] = time.time() - (STALE_SECONDS + 5.0)
-        _write(rec)
+        backdate(STALE_SECONDS + 5.0)
+        check("the backdated record is stale",
+              (time.time() - float((_read() or {}).get("heartbeat", 0))) > STALE_SECONDS)
         tick()
         rec = _read() or {}
         check("a quiet run is interrupted", rec.get("state") == "interrupted")
