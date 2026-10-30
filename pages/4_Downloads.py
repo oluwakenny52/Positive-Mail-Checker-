@@ -143,14 +143,20 @@ import sys as _sys
 
 if APP_DIR not in _sys.path:
     _sys.path.insert(0, APP_DIR)
+
+import importlib
+
 import auth
 
-try:                                   # a module cached from before a redeploy
-    auth.fit_panel                     # still has the pre-split, one-function shape
-except AttributeError:
-    import importlib
+# hasattr(), not a bare `auth.fit_panel` expression. The bare form is
+# magic-written by Streamlit, which routes it through st.help -> ast.parse and
+# can raise IndentationError on the enclosing `try:` - and it dumps a help panel
+# onto the page above the hero. The reload is what makes a module cached from
+# before a redeploy safe.
+if not hasattr(auth, "fit_panel"):
     auth = importlib.reload(auth)
-from auth import user_file
+
+from auth import user_file         # AFTER the reload, so it binds to the live module
 
 auth.require(st, "Unlock Export Studio")
 auth.fit(st)                        # CSS only, before the first widget
