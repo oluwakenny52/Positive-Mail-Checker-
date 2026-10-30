@@ -35,6 +35,13 @@ WHY THE REGEXES LOOK LIKE THIS
 * deps= is OPTIONAL and may be empty or contain spaces.  The old version
   required a non-empty, space-free deps=, which is why it matched nothing and
   reported 'repaired 0'.
+
+WHY THE REPAIR INSERTS BEFORE @@EOF
+-----------------------------------
+The last line of every block file is '# @@EOF'.  An unclosed FINAL block used to
+get its '# @@END' appended BELOW that marker, so the file ended '# @@EOF' then
+'# @@END 016 X'.  pages/5_Blocks.canon_end_names() already keeps @@EOF last; this
+file now does the same, and the two implementations agree.
 """
 import argparse
 import io
@@ -44,12 +51,16 @@ import sys
 
 # One source of truth: verify_blocks owns the gated file list.  Local copy only
 # if the import fails (e.g. run from a directory without verify_blocks.py).
+# It MUST mirror verify_blocks.BLOCKED_FILES exactly - it had drifted to nine
+# entries, dropping auth.py, hosts.py and verify_blocks.py, which is precisely
+# the case where nobody can check it.
 try:
     from verify_blocks import BLOCKED_FILES as FILES
 except Exception:
-    FILES = ("app.py", "engine.py", "status.py", "pages/2_Diagnostics.py",
+    FILES = ("app.py", "auth.py", "engine.py", "hosts.py", "ms_oauth.py",
+             "status.py", "verify_blocks.py", "pages/2_Diagnostics.py",
              "pages/3_Mailbox_Reader.py", "pages/4_Downloads.py",
-             "pages/5_Blocks.py", "pages/6_User_Guide.py", "ms_oauth.py")
+             "pages/5_Blocks.py", "pages/6_User_Guide.py")
 
 RE_ANY_MARKER = re.compile(r"@@(?:BLOCK|END)\b")
 RE_BLOCK = re.compile(r"^#\s*@@BLOCK\s+(\d{3})\s+([A-Za-z0-9_]+)"
@@ -134,7 +145,11 @@ def _rewrite(lines, names):
         out.append(ln)
 
     if open_id is not None and names.get(open_id):
-        out.append("# @@END %03d %s" % (open_id, names[open_id]))
+        _end = "# @@END %03d %s" % (open_id, names[open_id])
+        if out and out[-1].strip().startswith("# @@EOF"):
+            out.insert(len(out) - 1, _end)
+        else:
+            out.append(_end)
         inserted += 1
 
     return out, (bare + mismatched), bare, mismatched, inserted, orphan
@@ -204,6 +219,23 @@ def _selftest():
     bad += 0 if ok else 1
     print("  %-4s %s" % ("OK" if ok else "FAIL",
                          "fixture: bare repaired + missing @@END inserted"))
+
+    # an unclosed FINAL block must get its @@END ABOVE the @@EOF marker
+    eof_fixture = ("# @@FILE demo.py blocks=1 version=v1\n"
+                   "# @@BLOCK 000 HEAD deps=-\n"
+                   "x = 1\n"
+                   "# @@EOF\n")
+    names2, _o2, _d2, _m2 = _analyse(eof_fixture.splitlines())
+    out2, _c2, _b2, _mm2, ins2, _or2 = _rewrite(eof_fixture.splitlines(), names2)
+    want2 = ["# @@FILE demo.py blocks=1 version=v1",
+             "# @@BLOCK 000 HEAD deps=-",
+             "x = 1",
+             "# @@END 000 HEAD",
+             "# @@EOF"]
+    ok2 = (out2 == want2 and ins2 == 1)
+    bad += 0 if ok2 else 1
+    print("  %-4s %s" % ("OK" if ok2 else "FAIL",
+                         "fixture: inserted @@END stays ABOVE @@EOF"))
     print("")
     print("SELFTEST %s" % ("PASSED" if not bad else "FAILED (%d)" % bad))
     print("=" * 74)
@@ -244,7 +276,7 @@ def main(argv=None):
     ap.add_argument("--selftest", action="store_true",
                     help="prove the marker regexes on fixtures, then exit")
     ap.add_argument("--files", nargs="*", default=None,
-                    help="only these files (default: the seven blocked files)")
+                    help="only these files (default: every blocked file)")
     ap.add_argument("--no-gate", action="store_true",
                     help="skip the verify_blocks.py re-gate")
     args = ap.parse_args(argv)
