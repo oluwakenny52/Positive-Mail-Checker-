@@ -524,11 +524,23 @@ auth.fit(str_lit)
 # the loop's finally, so it is still True on the load after a teardown while the
 # loop that owned it is gone. That is the proof, and it is immediate - the old
 # path waited 60s for a stale heartbeat and then blamed the watchdog.
-if STATE.get("run_active"):
+#
+# STATE is built in block 008, which has NOT run yet at this point, so it cannot
+# be dereferenced directly - that was the NameError. STATE is also rebuilt on
+# every script run, so the flag is carried in session_state, which survives a
+# rerun. cause() is read first so a reason already stamped (the Stop button)
+# is preserved instead of being overwritten by the generic text.
+_st_run = globals().get("STATE")
+_run_was_active = bool(str_lit.session_state.get("run_active"))
+if not _run_was_active and isinstance(_st_run, dict):
+    _run_was_active = bool(_st_run.get("run_active"))
+if _run_was_active:
     runstate.interrupt(
         runstate.cause()
         or "UI interaction / rerun - the run loop was torn down")
-    STATE["run_active"] = False
+    str_lit.session_state["run_active"] = False
+    if isinstance(_st_run, dict):
+        _st_run["run_active"] = False
 
 # Last-resort sweep for a record with no run_active behind it (a redeploy or a
 # full process restart), and it still respects the 60s staleness window.
@@ -7718,6 +7730,7 @@ if start_engine_btn:
         filtered_pool[:] = get_filtered_active_proxies()
 
         STATE["run_active"] = True
+        str_lit.session_state["run_active"] = True
 
         _prev_tg = list(STATE.get("probe_targets_override") or [])
         _tg = _set_probe_targets_from_queue(
@@ -8149,6 +8162,7 @@ if start_engine_btn:
             runstate.note(detected_stop_reason)
         finally:
             STATE["run_active"] = False
+            str_lit.session_state["run_active"] = False
             with session_state_lock:
                 done = set(str_lit.session_state.checked_emails_set)
             left = [raw for raw in all_target_accounts
