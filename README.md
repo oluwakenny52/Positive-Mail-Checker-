@@ -19,7 +19,7 @@ NAMED, NUMBERED, REPLACEABLE block.
   prints target against found and warns on drift - so a stale number cannot hide
   in a doc. A frame move is one edit, in `verify_blocks.py`.
 
-## Gates - all eleven must be green before every commit
+## Gates - all twelve must be green before every commit
 
     python fix_end_names.py --check      # exit 0 = no bare @@END pending
     python verify_blocks.py              # exit 0 = frame intact
@@ -32,8 +32,9 @@ NAMED, NUMBERED, REPLACEABLE block.
     python -m compileall -q .            # exit 0 = everything compiles
     pip install -r requirements.txt      # exit 0 = pins still resolve
     python pages/5_Blocks.py --fix-check # exit 0 = the fixes are still in the code
+    python runstate.py --selftest        # exit 0 = watchdog lifecycle sanity
 
-`.github/workflows/gates.yml` runs all eleven on every push and writes a PASS/FAIL
+`.github/workflows/gates.yml` runs all twelve on every push and writes a PASS/FAIL
 table to the run summary, so the gates are checkable from a phone with no
 terminal. The Summary step exits non-zero when a gate fails, so the run itself
 goes red. The step names in the workflow are the authority if a command above
@@ -65,6 +66,13 @@ Display Fit (font size / content scale) is in every page's sidebar via
 before creating the widgets, and a second call in the same run raises
 `StreamlitWidgetAlreadyInstantiatedError` inside its own `try/except`.
 
+Every page guards the import with `hasattr(auth, "fit_panel")` +
+`importlib.reload(auth)`, never a bare `auth.fit_panel` expression inside a
+`try:`. The bare form is intercepted by Streamlit's magic-write, which routes it
+through `st.help` -> `ast.parse` and can raise `IndentationError` on the
+enclosing `try:`; the reload is what makes a module cached from before a redeploy
+safe.
+
 ## Layout
 
 | File | Role |
@@ -75,6 +83,7 @@ before creating the widgets, and a second call in the same run raises
 | `status.py` | canonical verdict taxonomy + classifier (13 blocks) |
 | `hosts.py` | host discovery, family priority, ranking |
 | `ms_oauth.py` | Microsoft XOAUTH2 (personal accounts) |
+| `runstate.py` | unfinished-run watchdog (plain module, not frame-gated) |
 | `pages/2_Diagnostics.py` | read-only rung/DNS/proxy inspection |
 | `pages/3_Mailbox_Reader.py` | inbox reader, OTP/card scanner |
 | `pages/4_Downloads.py` | export studio |
