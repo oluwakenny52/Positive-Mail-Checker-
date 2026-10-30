@@ -11,8 +11,12 @@ it. The function returned [] on every call, so the Resume Unfinished counter
 read 0 and the inspector said "No items" while the record sat on disk.
 
 A substring gate cannot catch that - the broken text was right there and looked
-right. This one CALLS the expression, then proves the source no longer uses the
-broken form.
+right. This one CALLS the expression, then proves the source no longer calls
+glob() with reverse=.
+
+NOTE ON THE DOCSTRING: block 083's own docstring quotes the broken form, so a
+plain `"reverse=True" in body` test fails on a correct file. Test 3 therefore
+looks at the CALL LINE and explicitly allows a docstring mention.
 
     python test_resume_io.py     # exit 0 = clean
 """
@@ -62,15 +66,24 @@ def main():
     except TypeError:
         ok("glob.glob(..., reverse=True) still raises TypeError")
 
-    # 3. list_unfinished_runs() must not use the broken form
+    # 3. list_unfinished_runs() must CALL sorted(glob.glob(...), reverse=True).
+    #    A docstring that merely quotes the broken form is fine, so the search is
+    #    on lines that contain a glob.glob( call WITHOUT a surrounding sorted().
     src = io.open("app.py", encoding="utf-8").read()
     body = between(src, "def list_unfinished_runs", "def unfinished_remaining_count")
     if not body:
         bad("app.py", "list_unfinished_runs() body not found")
-    elif "reverse=True" in body:
-        bad("app.py", "list_unfinished_runs() still passes reverse= to glob()")
     else:
-        ok("list_unfinished_runs() no longer passes reverse= to glob()")
+        bad_lines = [l.strip() for l in body.splitlines()
+                     if "glob.glob(" in l and "reverse=True" in l and "sorted(" not in l]
+        good_call = ('sorted(glob.glob(os.path.join(_res, "unfinished_*.json")), '
+                     'reverse=True)')
+        if bad_lines:
+            bad("app.py", "glob() is still CALLED with reverse=: %r" % bad_lines[0])
+        elif good_call in body:
+            ok("list_unfinished_runs() calls sorted(glob.glob(...), reverse=True)")
+        else:
+            bad("app.py", "the sorted(glob.glob(...), reverse=True) call is missing")
 
     # 4. the account-count helper must exist and read the watchdog record
     if "def unfinished_remaining_count(" in src:
@@ -78,7 +91,7 @@ def main():
     else:
         bad("app.py", "unfinished_remaining_count() is missing")
     helper = between(src, "def unfinished_remaining_count", "def save_unfinished")
-    if "runstate.remaining()" in helper:
+    if "return len(runstate.remaining())" in helper:
         ok("unfinished_remaining_count() reads runstate.remaining()")
     else:
         bad("app.py", "unfinished_remaining_count() does not read runstate.remaining()")
@@ -95,6 +108,12 @@ def main():
         ok("save_unfinished() writes atomically")
     else:
         bad("app.py", "save_unfinished() still truncates in place")
+
+    # 7. the metric must be used where the tile is drawn
+    if '("Resume Unfinished", unfinished_count)' in src:
+        ok("the tile is wired to the account count")
+    else:
+        bad("app.py", "the Resume Unfinished tile is not wired to the count")
 
     print("PASSED %d  FAILED %d" % (len(PASSES), len(FAILS)))
     for f in FAILS:
