@@ -2193,18 +2193,39 @@ def render_logs(lines: List[str], height: int = 300):
 # @@END 036 LOG_COLOR
 
 # @@BLOCK 037 SESSION_INIT deps=024,031
-_PERSISTENT_VALID_CACHE = STATE.setdefault("persistent_valid_cache", {"ts": 0.0, "data": []})
-_PREV_VALID_CACHE = STATE.setdefault("prev_valid_cache", {"ts": 0.0, "data": set()})
+_PERSISTENT_VALID_CACHE = STATE.setdefault(
+    "persistent_valid_cache", {"ts": 0.0, "data": [], "user": ""})
+_PREV_VALID_CACHE = STATE.setdefault(
+    "prev_valid_cache", {"ts": 0.0, "data": set(), "user": ""})
+
+
+def _cache_owner():
+    """The per-user prefix this session's files carry.
+
+    v13.48: both valid caches live in process STATE and were keyed on a
+    timestamp ONLY, so user B loading inside the 15s/20s window got user A's
+    valid list - passwords included. The owner is DERIVED from user_file("")
+    (its `if name else h` branch) so no second identity source can drift.
+    """
+    try:
+        return os.path.basename(user_file("")) or ""
+    except Exception:
+        return ""
 
 
 def invalidate_valid_caches():
     _PERSISTENT_VALID_CACHE["ts"] = 0.0
+    _PERSISTENT_VALID_CACHE["user"] = ""
     _PREV_VALID_CACHE["ts"] = 0.0
+    _PREV_VALID_CACHE["user"] = ""
 
 
 def load_persistent_valid_results():
     now = time.time()
-    if _PERSISTENT_VALID_CACHE["data"] and (now - _PERSISTENT_VALID_CACHE["ts"]) < 15.0:
+    who = _cache_owner()
+    if (_PERSISTENT_VALID_CACHE["data"]
+            and _PERSISTENT_VALID_CACHE.get("user") == who
+            and (now - _PERSISTENT_VALID_CACHE["ts"]) < 15.0):
         return list(_PERSISTENT_VALID_CACHE["data"])
     valid_list, seen = [], set()
     try:
@@ -2229,6 +2250,7 @@ def load_persistent_valid_results():
     except Exception:
         pass
     _PERSISTENT_VALID_CACHE["ts"] = now
+    _PERSISTENT_VALID_CACHE["user"] = who
     _PERSISTENT_VALID_CACHE["data"] = list(valid_list)
     return valid_list
 
@@ -5768,7 +5790,10 @@ def check_domain_resolvable(domain, persist=True):
 # @@BLOCK 085 PREV_VALID_IO deps=037,038
 def load_previous_valid():
     now = time.time()
-    if _PREV_VALID_CACHE["data"] and (now - _PREV_VALID_CACHE["ts"]) < 20.0:
+    who = _cache_owner()
+    if (_PREV_VALID_CACHE["data"]
+            and _PREV_VALID_CACHE.get("user") == who
+            and (now - _PREV_VALID_CACHE["ts"]) < 20.0):
         return set(_PREV_VALID_CACHE["data"])
     seen = set()
     try:
@@ -5793,6 +5818,7 @@ def load_previous_valid():
     except Exception as e:
         log_startup(f"WARNING: Error loading previous valid accounts: {e}")
     _PREV_VALID_CACHE["ts"] = now
+    _PREV_VALID_CACHE["user"] = who
     _PREV_VALID_CACHE["data"] = set(seen)
     return seen
 
@@ -8346,7 +8372,11 @@ if start_engine_btn:
             clean_valid_path = CLEAN_VALID_FILE
             temp_clean_count = _write_clean_valid(hdr, valid_snapshot)
 
-            zip_output_name = f"mail_results_{stamp}.zip"
+            # v13.48: the bundle used to be written to the working directory as a
+            # bare mail_results_<stamp>.zip, so two users finishing in the same
+            # second overwrote each other's file. Prefix it with the session's own
+            # user prefix - the same prefix every other per-user file carries.
+            zip_output_name = f"{_cache_owner() or 'anon'}_mail_results_{stamp}.zip"
             with zipfile.ZipFile(zip_output_name, "w", zipfile.ZIP_DEFLATED) as z:
                 for p, arc in ((clean_valid_path, "valid_email_password.txt"),
                                (wrong_path, os.path.basename(wrong_path)),
