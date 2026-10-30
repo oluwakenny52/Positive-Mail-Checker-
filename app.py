@@ -3248,7 +3248,6 @@ _VPN_BRANDS = (
     "astrill", "vyprvpn", "hotspot shield", "ivacy", "torguard", "perfect privacy",
     "azirevpn", "airvpn", "openvpn", "wireguard",
 )
-_VPN_TOKENS = _VPN_BRANDS
 
 
 def vpn_state_label():
@@ -7793,7 +7792,10 @@ if start_engine_btn:
                 f"reason={_rec.get('reason') or _rec.get('cause') or 'none'} | "
                 f"remaining file={'present' if runstate.remaining() else 'empty/absent'}")
     else:
-        filtered_pool[:] = get_filtered_active_proxies()
+        # v13.48: active_proxy_pool a few lines up ALREADY holds the filtered pool
+        # for this rerun. Re-running get_filtered_active_proxies() re-read and
+        # re-filter all of proxies.txt for the same answer.
+        filtered_pool[:] = active_proxy_pool
 
         STATE["run_active"] = True
         str_lit.session_state["run_active"] = True
@@ -8560,16 +8562,19 @@ else:
                 else:
                     with str_lit.spinner(f"Connecting via [{px_tag(mailbox_proxy)}] and "
                                          f"fetching inbox for {acc_email}..."):
+                        # v13.48: read_mailbox_messages() already resolves the whole
+                        # host ladder itself via get_servers() and falls back to the
+                        # host passed in. The old `for srv in imap_hosts:` loop re-ran
+                        # that entire ladder once per host, so a 4-host domain could
+                        # open 4x4 ladders and burn proxy credit before giving up.
                         success_read, fetched_msgs = False, []
-                        for srv in imap_hosts:
-                            msgs = read_mailbox_messages(acc_email, acc_pass, srv,
-                                                         proxy_str=mailbox_proxy,
-                                                         limit=max_msgs)
-                            if msgs and not any("Error reading mailbox" in m for m in msgs):
-                                fetched_msgs, success_read = msgs, True
-                                break
-                            elif msgs:
-                                fetched_msgs = msgs
+                        msgs = read_mailbox_messages(acc_email, acc_pass, imap_hosts[0],
+                                                     proxy_str=mailbox_proxy,
+                                                     limit=max_msgs)
+                        if msgs and not any("Error reading mailbox" in m for m in msgs):
+                            fetched_msgs, success_read = msgs, True
+                        elif msgs:
+                            fetched_msgs = msgs
                         if success_read:
                             str_lit.success("Successfully retrieved recent messages "
                                             "from mailbox!")
