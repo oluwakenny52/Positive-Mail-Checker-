@@ -1,3 +1,4 @@
+# @@FILE verify_blocks.py blocks=1 version=v13.42
 # @@BLOCK 000 VERIFIER deps=-
 """verify_blocks.py - block-integrity gate for the block-edition app.
 
