@@ -1,7 +1,7 @@
-# @@FILE pages/7_Logs.py blocks=14 version=v13.48
+# @@FILE pages/7_Logs.py blocks=14 version=v13.47
 # @@BLOCK 000 FILE_HEADER deps=-
 """
-pages/7_Logs.py - Full Log & Operator Trace  (v13.48)
+pages/7_Logs.py - Full Log & Operator Trace  (v13.47)
 =====================================================
 Everything the engine did, in one place: the live execution log, the per-account
 dial trace, the startup ledger, the run record and every result file on disk.
