@@ -295,7 +295,7 @@ def is_light(th: dict) -> bool:
 # @@END 006 THEME_DATA
 
 
-# # @@BLOCK 007 THEME_CSS deps=006
+# @@BLOCK 007 THEME_CSS deps=006
 def _readable_text(th: dict) -> str:
     """`text`, or white/black when `text` and `bg` are too close to read.
 
@@ -1309,7 +1309,11 @@ def _looks_like_network_error(err_text: str) -> bool:
 # ============================================================================
 # VALID ACCOUNT STORAGE  (v13.43: per-user isolation)
 # ============================================================================
-_HASH_RX = re.compile(r"^[0-9a-f]{16}_")
+# v13.47: the hash prefix is optional, not fixed. Before the passkey unlock
+# user_file() returns an "anon<16 hex>_" name, which the old ^[0-9a-f]{16}_
+# never matched - so _own() called every anon file unprefixed, showed it to
+# every user, and the isolation this page is built around leaked again.
+_HASH_RX = re.compile(r"^(?:anon)?[0-9a-f]{16}_")
 _RES_DIR = user_file("mail_results")
 CLEAN_VALID_FILE = user_file("clean_valid_accounts.txt")
 
