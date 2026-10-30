@@ -500,7 +500,7 @@ import runstate
 # the page above the hero.
 if not hasattr(auth, "fit_panel"):
     auth = importlib.reload(auth)
-if not hasattr(runstate, "tick"):
+if not hasattr(runstate, "interrupt"):
     runstate = importlib.reload(runstate)
 
 # The passkey gate lives in auth.py so every page shares ONE implementation.
@@ -513,15 +513,25 @@ user_file = auth.user_file
 auth.require(str_lit)
 auth.fit(str_lit)
 
-# Watchdog, and it MUST be after require(): runstate._dir() resolves through
-# auth.user_file(), which is a throwaway anon<hex> prefix until the passphrase is
-# unlocked.  Called before require() it read - and CREATED - anon<hex>_mail_results/
-# while begin(), progress() and finish() all wrote to <hash>_mail_results/, so it
-# could never see the record it exists to watch.  A Streamlit rerun tears the
-# script down and the run loop in block 106 never returns, so the loop's own
-# finally never runs. tick() notices the quiet heartbeat on the NEXT page load and
-# records the run as interrupted - which is why no try/finally is needed around
-# the loop. Returns None when no run is open.
+# ---- teardown watchdog, and it MUST be after require() ---------------------
+# runstate._dir() resolves through auth.user_file(), which is a throwaway
+# anon<hex> prefix until the passphrase is unlocked. Called before require() it
+# read - and CREATED - anon<hex>_mail_results/ while begin(), progress() and
+# finish() all wrote to <hash>_mail_results/, so it could never see the record it
+# exists to watch.
+#
+# run_active is PROCESS state and a rerun tears the script down without running
+# the loop's finally, so it is still True on the load after a teardown while the
+# loop that owned it is gone. That is the proof, and it is immediate - the old
+# path waited 60s for a stale heartbeat and then blamed the watchdog.
+if STATE.get("run_active"):
+    runstate.interrupt(
+        runstate.cause()
+        or "UI interaction / rerun - the run loop was torn down")
+    STATE["run_active"] = False
+
+# Last-resort sweep for a record with no run_active behind it (a redeploy or a
+# full process restart), and it still respects the 60s staleness window.
 _rs_path = runstate.tick()
 # @@END 007 PAGE_CONFIG
 
@@ -631,6 +641,13 @@ REPORT_ENTRIES_MAX = 2000
 # FIX P1-3 / P1-4: the two per-rerun and per-account hogs get their own clocks.
 DIAG_CACHE_TTL = 30.0
 REPORT_DF_MIN_INTERVAL = 1.0
+# Checkpoint clock. The 100-account counter alone meant a 47-account run never
+# reached a checkpoint before a teardown: the record stayed at 0/N, the heartbeat
+# went stale and unfinished_live.json was never written, so Resume was empty and
+# the stop had no reason. 5s keeps counts, remaining and the reason real.
+CHECKPOINT_SECONDS = 5.0
+# Consecutive transport-ish verdicts before the connection is called down.
+NET_STREAK_TRIP = 8
 # @@END 014 UI_RENDER_CONSTANTS
 
 # @@BLOCK 015 MAIL_SPOT_CONSTANTS deps=-
@@ -7600,6 +7617,11 @@ ACTION_OPTIONS = list(PREFILTER_LABELS) + [label for label, _ in BUCKETS]
 col_action1, col_action2 = str_lit.columns([0.65, 0.35])
 with col_action1:
     start_engine_btn = str_lit.button("🔥 Start Live Checking Engine", type="primary")
+    stop_engine_btn = str_lit.button(
+        "⏹ Stop Engine (records the reason)",
+        help="A click reruns the script, which kills the run loop. Stop stamps the "
+             "reason on the run record FIRST, then reruns, so the next page load "
+             "reports 'Stopped by user' and leaves the queue resumable.")
 with col_action2:
     engine_action_mode = str_lit.selectbox(
         "Engine Action Mode:", options=ACTION_OPTIONS, index=0,
@@ -7618,6 +7640,13 @@ with col_action2:
             str_lit.caption("No interrupted run recorded.")
 
 active_proxy_pool = get_filtered_active_proxies()
+
+# The stop is a rerun with a reason attached: the click tears the loop down
+# before anything below executes, so the stamp has to happen here and the
+# interrupt itself is performed by block 007 on the next load.
+if stop_engine_btn and STATE.get("run_active"):
+    runstate.note("Stopped by user (Stop button)")
+    str_lit.rerun()
 
 if start_engine_btn:
     clear_proxy_quarantine()
@@ -7678,6 +7707,13 @@ if start_engine_btn:
     if not accounts_to_check:
         str_lit.warning(f"⚠ No accounts found in the selected category: "
                         f"'{engine_action_mode}'.")
+        if engine_action_mode == "Resume Unfinished":
+            _rec = runstate.load() or {}
+            str_lit.caption(
+                f"Record: state={_rec.get('state', 'none')} | "
+                f"{_rec.get('checked', 0)}/{_rec.get('total', 0)} checked | "
+                f"reason={_rec.get('reason') or _rec.get('cause') or 'none'} | "
+                f"remaining file={'present' if runstate.remaining() else 'empty/absent'}")
     else:
         filtered_pool[:] = get_filtered_active_proxies()
 
@@ -7800,6 +7836,8 @@ if start_engine_btn:
         log_cap = LOG_CAP_DEBUG if CFG.get("DEBUG", False) else LOG_CAP_QUIET
         _last_ui_ts = 0.0
         _last_df_ts = 0.0
+        _last_ck_ts = 0.0
+        _net_streak = 0
 
         def render_buckets(snapshot):
             for key, title in BUCKET_SPEC:
@@ -7876,6 +7914,23 @@ if start_engine_btn:
                         if res:
                             st_val = res["status"]
                             em_val = res.get('email', '').strip().lower()
+
+                            # Connection-loss evidence: consecutive transport-ish
+                            # verdicts. One bad host is normal; eight in a row is
+                            # not, so stamp it on the record while it is happening.
+                            if st_val in (CONNECTION_FAILED, PROXY_UNHEALTHY,
+                                          DNS_FAILED, RETRY):
+                                _net_streak += 1
+                                if _net_streak == NET_STREAK_TRIP:
+                                    runstate.note(
+                                        f"{_net_streak} consecutive transport failures "
+                                        f"(last: {st_val}) - connection looks down")
+                                    log_probe_event(
+                                        f"run: {_net_streak} consecutive transport "
+                                        f"failures ({st_val}) - connection looks down")
+                            else:
+                                _net_streak = 0
+
                             # FIX LAG-1: decide the UI tick BEFORE doing any list copies.
                             _now_ui = time.time()
                             _tick = (checked_count >= total_accs) or \
@@ -8013,7 +8068,15 @@ if start_engine_btn:
                         else:
                             log_container.code("\n".join(current_logs[-120:]), language="text")
 
-                    if checked_count % 100 == 0 or checked_count == total_accs:
+                    # Checkpoint on TIME as well as on count. The counter alone
+                    # meant a 47-account run never reached a checkpoint before a
+                    # teardown: checked stayed 0, the heartbeat went stale and
+                    # unfinished_live.json was never written, so Resume was empty
+                    # and the stop had no reason.
+                    _now_ck = time.time()
+                    if ((checked_count % 100 == 0) or (checked_count == total_accs)
+                            or (_now_ck - _last_ck_ts) >= CHECKPOINT_SECONDS):
+                        _last_ck_ts = _now_ck
                         # Heartbeat first: this is what stops tick() from calling a
                         # healthy long run interrupted on the next page load.
                         runstate.progress(checked_count, total_accs)
@@ -8052,16 +8115,19 @@ if start_engine_btn:
         except MemoryError as me:
             run_interrupted = True
             detected_stop_reason = "Resource Exhaustion: RAM full / Out of Memory"
+            runstate.note(detected_stop_reason)
             str_lit.error(f"⚠ Engine Stopped: RAM Full: {me}")
         except (socket.timeout, ConnectionError, ssl.SSLError) as net_err:
             run_interrupted = True
             detected_stop_reason = f"Network Connection Failure: {net_err}"
+            runstate.note(detected_stop_reason)
             str_lit.error(f"⚠ Engine Stopped: {detected_stop_reason}")
         except (OSError, IOError) as oe:
             run_interrupted = True
             detected_stop_reason = ("Resource Exhaustion: Disk Space / ROM full"
                                     if getattr(oe, 'errno', 0) == 28
                                     else f"Filesystem / I/O Error: {oe}")
+            runstate.note(detected_stop_reason)
             str_lit.error(f"⚠ Engine Stopped: {detected_stop_reason}")
         except BaseException as be:
             if isinstance(be, (SystemExit, KeyboardInterrupt)):
@@ -8080,6 +8146,7 @@ if start_engine_btn:
                     detected_stop_reason = "User Interruption: UI interaction"
                 else:
                     detected_stop_reason = f"Unexpected Error / Interruption: {be}"
+            runstate.note(detected_stop_reason)
         finally:
             STATE["run_active"] = False
             with session_state_lock:
