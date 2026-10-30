@@ -526,6 +526,7 @@ with _t6:
 | **`pages/4_Downloads.py`** | Export Studio. Text / CSV / JSON / ZIP / per-status split, with filters, sorting, dedupe and presets. | zero |
 | **`pages/5_Blocks.py`** | Block Inspector. Frame audit, paste validation, `@@END` canonicaliser, fix self-check. | zero |
 | **`pages/6_User_Guide.py`** | This page. | zero |
+| **`pages/7_Logs.py`** | Full log & operator trace: the execution log, per-account dial traces, boot ledger, run record and every result file. Read-only, per user. | zero |
 """
     )
     st.markdown(
