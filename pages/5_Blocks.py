@@ -443,6 +443,11 @@ _FIX_CHECKS = (
     ("pages/3_Mailbox_Reader.py", "from auth import user_file", 1,
      "reader resolves per-user paths"),
     ("app.py", "importlib.reload(auth)", 1, "app survives a stale cached auth module"),
+    ("auth.py", "def _anon_id(", 1, "pre-unlock identity is never a bare name"),
+    ("auth.py", 'return "%s_%s" % (h, name) if name else h', 1, "user_file always prefixes"),
+    ("pages/3_Mailbox_Reader.py", "_readable_text(th)", 1,
+     "text colour is contrast-checked"),
+    ("runstate.py", "def begin(", 1, "unfinished run lifecycle exists"),
 )
 
 # order matters in the verdict tail: a server answer must outrank retryable
