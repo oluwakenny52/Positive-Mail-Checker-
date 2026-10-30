@@ -525,22 +525,18 @@ auth.fit(str_lit)
 # loop that owned it is gone. That is the proof, and it is immediate - the old
 # path waited 60s for a stale heartbeat and then blamed the watchdog.
 #
-# STATE is built in block 008, which has NOT run yet at this point, so it cannot
-# be dereferenced directly - that was the NameError. STATE is also rebuilt on
-# every script run, so the flag is carried in session_state, which survives a
-# rerun. cause() is read first so a reason already stamped (the Stop button)
-# is preserved instead of being overwritten by the generic text.
-_st_run = globals().get("STATE")
+# STATE is built in block 024, which has NOT run yet at this point, and Streamlit
+# hands every rerun a FRESH module namespace - so globals().get("STATE") was
+# always None and every isinstance(_st_run, dict) branch below was dead. The flag
+# is carried in session_state instead, which survives a rerun.
+# cause() is read first so a reason already stamped (the Stop button) is
+# preserved instead of being overwritten by the generic text.
 _run_was_active = bool(str_lit.session_state.get("run_active"))
-if not _run_was_active and isinstance(_st_run, dict):
-    _run_was_active = bool(_st_run.get("run_active"))
 if _run_was_active:
     runstate.interrupt(
         runstate.cause()
         or "UI interaction / rerun - the run loop was torn down")
     str_lit.session_state["run_active"] = False
-    if isinstance(_st_run, dict):
-        _st_run["run_active"] = False
 
 # Last-resort sweep for a record with no run_active behind it (a redeploy or a
 # full process restart), and it still respects the 60s staleness window.
@@ -4320,12 +4316,27 @@ def classify_error(err, domain=""):
 
 
 def _is_proxy_level_error(msg):
-    """True when the failure is a PROXY CREDENTIAL rejection - not a tunnel reset."""
+    """True when the failure is a PROXY CREDENTIAL rejection - not a tunnel reset.
+
+    FIX PX-1: status.is_proxy_level_error() runs normalise() on its argument, so
+    it only answers for a TOKEN ("PROXY_UNHEALTHY"). Every caller here passes RAW
+    error TEXT, for which normalise() yields UNKNOWN - the answer was therefore
+    always False and a 407 arriving as a generic exception never set saw_407,
+    never recorded an is_proxy_auth strike and never armed the quarantine. The
+    inline fallback in block 004 does substring matching and was right all along.
+    This now does the same thing first, and only falls back to the token test.
+    """
+    s = (msg or "").lower()
+    if not s:
+        return False
+    if _is_proxy_auth_fail(s):
+        return True
+    if "proxy auth" in s or "proxyconnect" in s:
+        return True
     try:
-        return st_proxy_level(msg)
+        return st_proxy_level(s) is True
     except Exception:
-        s = (msg or "").lower()
-        return any(k in s for k in ("407", "proxy auth", "proxy connect", "socks"))
+        return False
 
 
 def record_proxy_attempt(proxy_str, success, is_network_error=False, is_proxy_auth=False):
@@ -5646,40 +5657,78 @@ def is_disposable(email):
         return False
 # @@END 082 PREFILTER_TABLES
 
-# @@BLOCK 083 UNFINISHED_IO deps=082
+# @@BLOCK 083 UNFINISHED_IO deps=007,082
 def list_unfinished_runs():
+    """Every unfinished record on disk, newest first.
+
+    FIX RS-1: this used to call
+
+        glob.glob(path, reverse=True)
+
+    `reverse` is a sorted() keyword, not a glob() one, so the call raised
+    TypeError and the bare `except Exception: pass` below swallowed it. This
+    function therefore returned [] on EVERY call: the Resume Unfinished counter
+    read 0, the inspector said "No items", and the results summary could never
+    name a stop reason - while unfinished_live.json sat on disk holding the
+    remaining lines. A substring gate cannot catch that, so test_resume_io.py
+    now calls the expression.
+    """
     runs = []
+    _res = user_file("mail_results")
     try:
-        _res = user_file("mail_results")
         os.makedirs(_res, exist_ok=True)
-        for path in sorted(glob.glob(os.path.join(_res, "unfinished_*.json"), reverse=True)):
-            try:
-                with open(path, encoding="utf-8") as f:
-                    data = json.load(f)
-                data["file"] = path
-                runs.append(data)
-            except Exception:
-                continue
-    except Exception:
-        pass
+        paths = sorted(glob.glob(os.path.join(_res, "unfinished_*.json")), reverse=True)
+    except Exception as e:
+        warnings.warn(f"list_unfinished_runs: glob failed ({e})")
+        return runs
+    for path in paths:
+        try:
+            with open(path, encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception:
+            continue
+        if isinstance(data, dict):
+            data["file"] = path
+            runs.append(data)
     return runs
 
 
+def unfinished_remaining_count():
+    """How many account LINES are resumable right now - not how many FILES.
+
+    The metric sits in a row of account counts ("Ready to Check", "Disposables"),
+    and len(list_unfinished_runs()) counts files. There is only ever one file, so
+    a fixed glob alone would print 1 for 25 accounts.
+    """
+    return len(runstate.remaining())
+
+
 def save_unfinished(reason, remaining, checked, total):
+    """Write the resume record ATOMICALLY.
+
+    runstate.interrupt() re-reads and rewrites unfinished_live.json while the
+    loop's checkpoint may be mid-write; a plain truncating write can hand it a
+    half file and the reason mirror is then lost.
+    """
     _res = user_file("mail_results")
     os.makedirs(_res, exist_ok=True)
     path = os.path.join(_res, "unfinished_live.json")
-    with open(path, "w", encoding="utf-8") as f:
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
         json.dump({"id": "live", "reason": reason, "checked": checked, "total": total,
                    "remaining": remaining,
                    "saved_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S")}, f)
+    os.replace(tmp, path)
     return path
 
 
 def clear_unfinished():
     path = os.path.join(user_file("mail_results"), "unfinished_live.json")
     if os.path.exists(path):
-        os.remove(path)
+        try:
+            os.remove(path)
+        except Exception:
+            pass
 # @@END 083 UNFINISHED_IO
 
 # @@BLOCK 084 DOMAIN_RESOLVE deps=039,052,058
@@ -5929,7 +5978,11 @@ if raw_text:
     str_lit.session_state.pre_dns_failed = list(dns_skipped)
     str_lit.session_state.pre_smtp_failed = list(smtp_skipped)
 
-    unfinished_count = len(list_unfinished_runs())
+    # FIX RS-2: this counted FILES (there is only ever one) and read a glob that
+    # raised TypeError, so it read 0 no matter what was on disk. It now counts
+    # the resumable LINES, which is what the label promises and what the row of
+    # neighbouring account counts means.
+    unfinished_count = unfinished_remaining_count()
     _pf_metrics = [
         ("Ready to Check", len(clean_lines)),
         ("Resume Unfinished", unfinished_count),
@@ -5953,11 +6006,18 @@ if raw_text:
         "Select category to inspect contents:", options=inspect_options,
         key="bb_inspect_cat")
 
+    # FIX RS-3: the preview used to append a metadata line per run into the SAME
+    # list as the account lines, so "Showing N items" counted headers too. The
+    # metadata is a caption now and the list holds account lines only.
+    unfinished_runs = list_unfinished_runs()
     unfinished_preview = []
-    for run in list_unfinished_runs():
-        unfinished_preview.append(f"{run.get('saved_at', '')} | {run.get('reason', '')} | "
-                                  f"left {len(run.get('remaining') or [])}")
+    for run in unfinished_runs:
         unfinished_preview.extend(run.get("remaining") or [])
+    if unfinished_runs:
+        _r0 = unfinished_runs[0]
+        str_lit.caption(
+            f"Record: {_r0.get('saved_at', '?')} | reason: {_r0.get('reason', '?')} | "
+            f"{_r0.get('checked', 0)}/{_r0.get('total', 0)} checked at stop")
 
     category_map = {
         "Ready to Check": clean_lines,
@@ -5970,10 +6030,10 @@ if raw_text:
         "DNS Failed": dns_skipped,
         "SMTP Failed": smtp_skipped,
     }
-    _label_to_key = dict(BUCKETS)
-    if filter_category_choice in _label_to_key:
+    _inspect_to_key = dict(BUCKETS)
+    if filter_category_choice in _inspect_to_key:
         category_map[filter_category_choice] = list(
-            str_lit.session_state.get(_label_to_key[filter_category_choice], []))
+            str_lit.session_state.get(_inspect_to_key[filter_category_choice], []))
 
     selected_list_items = category_map.get(filter_category_choice, [])
     if selected_list_items:
@@ -7903,9 +7963,10 @@ if start_engine_btn:
                         pass
 # @@END 105 RUN_TRIGGER_UI
 
-# @@BLOCK 106 RUN_LOOP deps=014,083,105
+# @@BLOCK 106 RUN_LOOP deps=009,014,083,105
         detected_stop_reason = "Interrupted / Stopped before completion"
         run_interrupted = False
+        _orig_deadline = CFG.get("ACCOUNT_DEADLINE")
         try:
             current_workers = CFG["MAX_WORKERS_START"]
             if CFG.get("DYNAMIC_WORKER_SCALING", False):
@@ -7915,12 +7976,41 @@ if start_engine_btn:
                 elif total_accs < 20:
                     current_workers = max(2, min(5, total_accs))
 
-            with ThreadPoolExecutor(max_workers=current_workers) as executor:
+            # FIX LAG-2: the metric cells are built ONCE, here. Rebuilding 14
+            # st.columns inside every 0.12s tick was the single biggest per-tick
+            # cost, and that cost grew with the result set - so it was at its
+            # worst exactly when the queue was at its shortest.
+            _m_pairs = [
+                ("✅ Valid", 0), ("❌ Wrong", 0), ("🔑 AppPass/2FA", 0),
+                ("🚪 Login Dropped", 0), ("🔌 Conn Failed", 0), ("🩹 Proxy Dead", 0),
+                ("🕓 RETRY_LATER", 0), ("🚫 RBL", 0), ("📮 SMTP Failed", 0),
+                ("⏭ Skipped", 0), ("❓ Unclassified", 0), ("📋 Checked", 0),
+                ("📚 Queue", 0),
+            ]
+            with report_metrics_placeholder.container():
+                _metric_phs = [c.empty() for c in metric_grid(_m_pairs, per_row=3)]
+
+            # FIX LAG-3: an explicit executor, not `with`. ThreadPoolExecutor's
+            # __exit__ calls shutdown(wait=True), so a teardown mid-run blocked
+            # until EVERY queued account finished before the page could come back.
+            executor = ThreadPoolExecutor(max_workers=current_workers)
+            try:
                 future_to_line = {executor.submit(check_task, line): line
                                   for line in all_target_accounts}
 
                 for index, future in enumerate(as_completed(future_to_line), 1):
                     checked_count += 1
+                    # FIX LAG-4: the tail is the slowest work by construction -
+                    # everything still queued has already exhausted most of its
+                    # ladder. Once only one worker-cohort is left, cap the budget
+                    # so the last few accounts cannot each spend the full slider.
+                    _tail_left = total_accs - checked_count
+                    if _tail_left and _tail_left <= current_workers:
+                        try:
+                            CFG["ACCOUNT_DEADLINE"] = min(
+                                int(CFG.get("ACCOUNT_DEADLINE", DEADLINE_NORMAL)), 45)
+                        except Exception:
+                            pass
                     try:
                         res = future.result(
                             timeout=max(30, int(CFG["ACCOUNT_DEADLINE"])) + WORKER_FUTURE_PAD)
@@ -7948,6 +8038,8 @@ if start_engine_btn:
                             _now_ui = time.time()
                             _tick = (checked_count >= total_accs) or \
                                     ((_now_ui - _last_ui_ts) >= UI_MIN_INTERVAL)
+                            _df_tick = ((checked_count >= total_accs)
+                                        or ((_now_ui - _last_df_ts) >= REPORT_DF_MIN_INTERVAL))
 
                             with session_state_lock:
                                 if em_val:
@@ -8015,8 +8107,10 @@ if start_engine_btn:
                                 unknown_len = len(str_lit.session_state.unknown_results)
                                 current_logs = (list(str_lit.session_state.log_lines)
                                                 if _tick else [])
+                                # FIX LAG-5: up to 2000 entries were copied on every
+                                # tick; they are only needed when the table redraws.
                                 current_reports = (list(str_lit.session_state.report_entries)
-                                                   if _tick else [])
+                                                   if _df_tick else [])
                                 bucket_snapshot = ({
                                     "valid_results": list(str_lit.session_state.valid_results),
                                     "wrong_results": list(str_lit.session_state.wrong_results),
@@ -8040,30 +8134,16 @@ if start_engine_btn:
                                 else:
                                     log_container.code("\n".join(current_logs[-120:]), language="text")
 
-                                with report_metrics_placeholder.container():
-                                    _m_pairs = [
-                                        ("✅ Valid", valid_len), ("❌ Wrong", wrong_len),
-                                        ("🔑 AppPass/2FA", need_len),
-                                        ("🚪 Login Dropped", login_drop_len),
-                                        ("🔌 Conn Failed", conn_len),
-                                        ("🩹 Proxy Dead", proxy_len),
-                                        ("🕓 RETRY_LATER", retry_len), ("🚫 RBL", rbl_len),
-                                        ("📮 SMTP Failed", smtp_len),
-                                        ("⏭ Skipped", skip_len),
-                                        ("❓ Unclassified", unknown_len),
-                                        ("📋 Checked", checked_count),
-                                        ("📚 Queue", total_accs),
-                                    ]
-                                    for _mc, (_ml, _mv) in zip(metric_grid(_m_pairs, per_row=3),
-                                                               _m_pairs):
-                                        _mc.metric(_ml, _mv)
+                                _vals = [valid_len, wrong_len, need_len, login_drop_len,
+                                         conn_len, proxy_len, retry_len, rbl_len,
+                                         smtp_len, skip_len, unknown_len,
+                                         checked_count, total_accs]
+                                for _ph, (_ml, _mv) in zip(_metric_phs, _vals):
+                                    _ph.metric(_ml, _mv)
 
                                 render_buckets(bucket_snapshot)
 
-                                # FIX P1-4: rebuilding a DataFrame from scratch every
-                                # 0.12s was the other half of the run-time lag.
-                                if (checked_count >= total_accs) \
-                                        or (_now_ui - _last_df_ts) >= REPORT_DF_MIN_INTERVAL:
+                                if _df_tick:
                                     _last_df_ts = _now_ui
                                     report_log_container.dataframe(
                                         pd.DataFrame(current_reports[::-1]),
@@ -8125,6 +8205,9 @@ if start_engine_btn:
                         f"Wrong: {w_len} | Login Dropped: {ld_len} | Proxy Dead: {px_len} | "
                         f"RETRY_LATER: {rt_len}")
 
+            finally:
+                executor.shutdown(wait=False)
+
         except MemoryError as me:
             run_interrupted = True
             detected_stop_reason = "Resource Exhaustion: RAM full / Out of Memory"
@@ -8161,6 +8244,10 @@ if start_engine_btn:
                     detected_stop_reason = f"Unexpected Error / Interruption: {be}"
             runstate.note(detected_stop_reason)
         finally:
+            # Restore the slider's own deadline so the sidebar does not report
+            # unapplied settings after a run that used the tail cap.
+            if _orig_deadline is not None:
+                CFG["ACCOUNT_DEADLINE"] = _orig_deadline
             STATE["run_active"] = False
             str_lit.session_state["run_active"] = False
             with session_state_lock:
@@ -8275,7 +8362,7 @@ if start_engine_btn:
             str_lit.error(f"Error compiling results export files: {ex}")
 # @@END 107 RUN_EXPORT
 
-# @@BLOCK 108 RESULTS_SUMMARY deps=035,036,037,087,106
+# @@BLOCK 108 RESULTS_SUMMARY deps=007,035,036,037,087,106
 if str_lit.session_state.engine_has_run or load_persistent_valid_results():
     section_title("📊", "Live Results Summary & ZIP Archive",
                   "persisted results, downloadable bundle, full under-the-hood traces")
@@ -8327,13 +8414,18 @@ if str_lit.session_state.engine_has_run or load_persistent_valid_results():
                        if any(p in ("SMTP", "ManageSieve") for p in active_protocols()) else ""))
 
     if str_lit.session_state.run_completion_status == "Unfinished":
-        unfinished_list = list_unfinished_runs()
-        if unfinished_list:
-            r0 = unfinished_list[0]
+        # FIX RS-4: the reason came from list_unfinished_runs(), so the TypeError
+        # in block 083 degraded this to a bare warning with no cause and no
+        # progress. It reads the watchdog record and remaining() directly now.
+        _rec = runstate.load() or {}
+        _left = runstate.remaining()
+        if _rec or _left:
             str_lit.warning(
-                f"⚠ **Engine Stopped Unfinished:** Reason: *{r0.get('reason', 'Unknown')}* | "
-                f"Progress at stop: {r0.get('checked', 0)}/{r0.get('total', 0)} | "
-                f"Saved at: {r0.get('saved_at', '')}")
+                f"⚠ **Engine Stopped Unfinished:** Reason: "
+                f"*{_rec.get('reason') or _rec.get('cause') or 'Unknown'}* | "
+                f"Progress at stop: {_rec.get('checked', 0)}/{_rec.get('total', 0)} | "
+                f"**{len(_left)} account(s) still to check** - set Engine Action Mode "
+                f"to 'Resume Unfinished' and press Start to continue.")
         else:
             str_lit.warning("⚠ **Engine Stopped Unfinished.**")
 
