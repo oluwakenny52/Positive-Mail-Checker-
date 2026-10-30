@@ -494,6 +494,12 @@ except AttributeError:
     import importlib
     auth = importlib.reload(auth)
 
+# Watchdog. A Streamlit rerun tears the script down and the run loop in block 106
+# never returns, so the loop's own finally never runs. tick() notices the quiet
+# heartbeat on the NEXT page load and records the run as interrupted - which is
+# why no try/finally is needed around the loop. Returns None when no run is open.
+_rs_path = runstate.tick()
+
 # The passkey gate lives in auth.py so every page shares ONE implementation.
 # user_file() is re-exported: default_cfg(), RESULTS_DIR, CLEAN_VALID_FILE and
 # every results glob prefix per-user names with the unlocked hash.
@@ -1663,6 +1669,19 @@ def _lum(hex_color: str) -> float:
         return 0.0
 
 
+def _readable_text(th: dict) -> str:
+    """`text`, or white/black when `text` and `bg` are too close to read.
+
+    is_light() only looked at bg, so a dark bg with a dark text colour rendered
+    every character in near-black on black. Emoji survived (colour glyphs) and
+    the words vanished, which reads as "the page hangs / only dark".
+    """
+    t, b = _lum(th.get("text", "#ffffff")), _lum(th.get("bg", "#000000"))
+    if abs(t - b) >= 0.35:
+        return th.get("text", "#ffffff")
+    return "#0f172a" if b > 0.6 else "#f4f6fb"
+
+
 def default_theme() -> dict:
     p = THEME_PRESETS["Aurora"]
     return {
@@ -1836,11 +1855,12 @@ def _MOBILE_CSS():
     }
 """
 # @@END 032 MOBILE_CSS
+
 # @@BLOCK 033 THEME_CSS deps=031,032
 def theme_css(th: dict) -> str:
     g1, g2 = th["g1"], th["g2"]
     ac, ac2 = th["accent"], th["accent2"]
-    bg, panel, text = th["bg"], th["panel"], th["text"]
+    bg, panel, text = th["bg"], th["panel"], _readable_text(th)
     r = int(th.get("radius", 14))
     light = is_light(th)
     border = "rgba(15,23,42,0.14)" if light else "rgba(255,255,255,0.10)"
@@ -7573,13 +7593,15 @@ with col_action2:
         help="Pick a pre-filter bucket (SMTP Failed sits right after DNS Failed) or a "
              "previous result bucket to re-run."
     )
-    unfinished_runs = list_unfinished_runs()
-    unfinished_pick = None
     if engine_action_mode == "Resume Unfinished":
-        labels = [f"{r.get('saved_at', '')} | {r.get('reason', 'stop')} | "
-                  f"{r.get('checked', 0)}/{r.get('total', 0)}" for r in unfinished_runs] \
-                 or ["none saved"]
-        unfinished_pick = str_lit.selectbox("Unfinished run:", labels, key="bb_unfinished_pick")
+        # runstate.summary() reads the watchdog record, so this is the truth about
+        # whether anything is actually resumable - not a glob that always matched.
+        _rs_lines = runstate.summary()
+        if _rs_lines:
+            for _rs_line in _rs_lines:
+                str_lit.text(_rs_line)
+        else:
+            str_lit.caption("No interrupted run recorded.")
 
 active_proxy_pool = get_filtered_active_proxies()
 
@@ -7613,12 +7635,8 @@ if start_engine_btn:
     )
 
     resume_lines = []
-    if engine_action_mode == "Resume Unfinished" and unfinished_runs \
-            and unfinished_pick and unfinished_pick != "none saved":
-        idx = [f"{r.get('saved_at', '')} | {r.get('reason', 'stop')} | "
-               f"{r.get('checked', 0)}/{r.get('total', 0)}"
-               for r in unfinished_runs].index(unfinished_pick)
-        resume_lines = unfinished_runs[idx].get("remaining") or []
+    if engine_action_mode == "Resume Unfinished":
+        resume_lines = runstate.remaining()
 
     _label_to_key = dict(RESULT_ACTION_MODES)
 
@@ -7762,6 +7780,8 @@ if start_engine_btn:
                                if CFG["MAX_ACCOUNTS"] > 0 else accounts_to_check)
         total_accs = len(all_target_accounts)
         checked_count = 0
+        # The queue is final and counted - open the run record here.
+        _rs_path = runstate.begin(total_accs)
         thread_local = threading.local()
         log_cap = LOG_CAP_DEBUG if CFG.get("DEBUG", False) else LOG_CAP_QUIET
         _last_ui_ts = 0.0
@@ -7980,6 +8000,9 @@ if start_engine_btn:
                             log_container.code("\n".join(current_logs[-120:]), language="text")
 
                     if checked_count % 100 == 0 or checked_count == total_accs:
+                        # Heartbeat first: this is what stops tick() from calling a
+                        # healthy long run interrupted on the next page load.
+                        runstate.progress(checked_count, total_accs)
                         with session_state_lock:
                             done = set(str_lit.session_state.checked_emails_set)
                             valids = list(str_lit.session_state.valid_results)
@@ -8050,6 +8073,8 @@ if start_engine_btn:
             left = [raw for raw in all_target_accounts
                     if (raw.split(":", 1)[0].strip().lower() if ":" in raw else raw) not in done]
             if checked_count >= total_accs and not run_interrupted:
+                # Clean completion: close the watchdog record, then drop the data.
+                runstate.finish()
                 clear_unfinished()
             elif left:
                 save_unfinished(detected_stop_reason, left, checked_count, total_accs)
