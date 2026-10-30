@@ -248,34 +248,6 @@ def _session_sources():
     return out
 
 
-# FIX DL-2: one-click per-status download. tag -> newest file in mail_results/.
-STATUS_FILE_TAGS = (
-    ("valid", "Valid"),
-    ("wrong", "Wrong password"),
-    ("need_app", "App password / 2FA"),
-    ("login_dropped", "Login dropped (* BYE)"),
-    ("retry_later", "RETRY_LATER"),
-    ("rbl_blocked", "RBL blocked"),
-    ("failed", "Connection failed"),
-    ("proxy_unhealthy", "Proxy unhealthy"),
-    ("dns_failed", "DNS failed"),
-    ("smtp_failed", "SMTP failed"),
-    ("skipped", "Skipped / filtered"),
-    ("unclassified", "Unclassified"),
-)
-
-
-def _latest_per_tag():
-    """{tag: newest path} for every status that has a file on disk."""
-    out = {}
-    for tag, _lbl in STATUS_FILE_TAGS:
-        hits = sorted(glob.glob(os.path.join(APP_DIR, _results_dir(), f"{tag}_*.txt")),
-                      reverse=True)
-        if hits:
-            out[tag] = hits[0]
-    return out
-
-
 FIELDS = ["email", "password", "domain", "local", "status", "host", "port",
           "detail", "time", "n", "source"]
 
@@ -490,6 +462,14 @@ if _pending_preset:
         st.session_state["ex_name"] = _pp.get("name_pat", "export_{status}_{count}_{stamp}")
         st.session_state["_ex_active"] = _pending_preset
 
+# v13.48: these four used value="" with no key, so every rerun (a toggle, a
+# slider, pressing Save) wiped whatever had been typed. Seed the keys here,
+# before the widgets exist, then create the widgets key-only - the same rule
+# ex_tpl follows, so no "default value AND session state" warning.
+for _k in ("ex_inc", "ex_exc", "ex_hosts", "ex_pname"):
+    if _k not in st.session_state:
+        st.session_state[_k] = ""
+
 with st.sidebar:
     st.markdown("### 1. What to download")
     labels = list(sess.keys()) + list(srcs.keys())
@@ -548,9 +528,9 @@ with st.sidebar:
     sort_key = st.selectbox("Sort by", ["none", "email", "domain", "status"], index=0, key="ex_sort")
     dedupe = st.toggle("Dedupe by email (first wins)", value=True, key="ex_dedupe")
     lower = st.toggle("Lowercase email", value=True, key="ex_lower")
-    regex_inc = st.text_input("Include regex", value="")
-    regex_exc = st.text_input("Exclude regex", value="")
-    host_filter = st.text_input("Only these hosts (comma)", value="")
+    regex_inc = st.text_input("Include regex", key="ex_inc")
+    regex_exc = st.text_input("Exclude regex", key="ex_exc")
+    host_filter = st.text_input("Only these hosts (comma)", key="ex_hosts")
 
     st.markdown("---")
     st.markdown("### 4. File name")
@@ -562,7 +542,7 @@ with st.sidebar:
     st.markdown("---")
     st.markdown("### 5. Presets")
     _ps = _presets()
-    pname = st.text_input("Preset name", value="")
+    pname = st.text_input("Preset name", key="ex_pname")
     c1, c2 = st.columns(2)
     with c1:
         if st.button("Save preset", width="stretch") and pname.strip():
