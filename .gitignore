@@ -13,6 +13,10 @@ disposable_domains.txt
 clean_valid_accounts.txt
 valid_accounts.txt
 mail_results/
+# v13.47: the per-user store. runstate.py and user_file() write <hash>_mail_results/
+# under here, so a local run no longer litters the repo root with one directory per
+# unlock. The old bare mail_results/ line stays above for repos that already have one.
+data/
 *.zip
 __pycache__/
 *.py[cod]
