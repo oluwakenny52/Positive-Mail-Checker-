@@ -464,6 +464,8 @@ _FIX_CHECKS = (
     ("app.py", "if _is_proxy_auth_fail(s):", 1, "raw 407 text is recognised, not normalised"),
     ("app.py", "executor.shutdown(wait=False)", 1, "a teardown does not drain the queue"),
     ("app.py", "_metric_phs", 2, "metric cells are built once, not per tick"),
+    ("app.py", "for _ph, _ml, _mv in zip(_metric_phs, _metric_labels, _vals):", 1,
+     "metric cells unpack label AND value, not a bare int"),
 )
 
 # order matters in the verdict tail: a server answer must outrank retryable
