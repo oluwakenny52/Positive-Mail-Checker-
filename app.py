@@ -7980,15 +7980,21 @@ if start_engine_btn:
             # st.columns inside every 0.12s tick was the single biggest per-tick
             # cost, and that cost grew with the result set - so it was at its
             # worst exactly when the queue was at its shortest.
-            _m_pairs = [
-                ("✅ Valid", 0), ("❌ Wrong", 0), ("🔑 AppPass/2FA", 0),
-                ("🚪 Login Dropped", 0), ("🔌 Conn Failed", 0), ("🩹 Proxy Dead", 0),
-                ("🕓 RETRY_LATER", 0), ("🚫 RBL", 0), ("📮 SMTP Failed", 0),
-                ("⏭ Skipped", 0), ("❓ Unclassified", 0), ("📋 Checked", 0),
-                ("📚 Queue", 0),
+            # FIX LAG-6: the labels are their own list. The first version paired
+            # the placeholders with a list of INTEGERS but kept the old
+            # `(_ml, _mv)` double-unpack, so every tick raised "cannot unpack
+            # non-iterable int object" inside the per-account try/except. It was
+            # swallowed, and it aborted the checkpoint, the progress bar and the
+            # bucket render on every tick while looking like a harmless log line.
+            _metric_labels = [
+                "✅ Valid", "❌ Wrong", "🔑 AppPass/2FA",
+                "🚪 Login Dropped", "🔌 Conn Failed", "🩹 Proxy Dead",
+                "🕓 RETRY_LATER", "🚫 RBL", "📮 SMTP Failed",
+                "⏭ Skipped", "❓ Unclassified", "📋 Checked",
+                "📚 Queue",
             ]
             with report_metrics_placeholder.container():
-                _metric_phs = [c.empty() for c in metric_grid(_m_pairs, per_row=3)]
+                _metric_phs = [c.empty() for c in metric_grid(_metric_labels, per_row=3)]
 
             # FIX LAG-3: an explicit executor, not `with`. ThreadPoolExecutor's
             # __exit__ calls shutdown(wait=True), so a teardown mid-run blocked
@@ -8138,7 +8144,7 @@ if start_engine_btn:
                                          conn_len, proxy_len, retry_len, rbl_len,
                                          smtp_len, skip_len, unknown_len,
                                          checked_count, total_accs]
-                                for _ph, (_ml, _mv) in zip(_metric_phs, _vals):
+                                for _ph, _ml, _mv in zip(_metric_phs, _metric_labels, _vals):
                                     _ph.metric(_ml, _mv)
 
                                 render_buckets(bucket_snapshot)
