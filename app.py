@@ -3730,6 +3730,13 @@ render_hero(_theme)
 # CSS only; the panel is drawn here.
 auth.fit_panel(str_lit)
 
+# v13.48: the click/outcome ledger. MUST come after auth.require() (block 007),
+# because audit_log resolves its file through auth.user_file() - before the gate
+# that is a throwaway anon<hex> prefix the session then abandons.
+import audit_log
+
+audit_log.install(str_lit, "app.py")
+
 try:
     os.makedirs(CFG["RESULTS_DIR"], exist_ok=True)
     log_startup(f"Verified/Created results directory at '{CFG['RESULTS_DIR']}'.")
