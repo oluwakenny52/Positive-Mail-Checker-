@@ -297,7 +297,22 @@ with st.sidebar:
     st.markdown("### 📜 Log controls")
     if st.button("🔄 Re-read everything", width="stretch"):
         st.rerun()
-    st.caption("Re-reads the session buckets and your result directory.")
+    st.caption("Re-reads the session buckets, your result directory and your "
+               "action ledger.")
+
+    st.markdown("---")
+    st.caption("Action ledger")
+    _act_all = audit_log.entries(limit=audit_log.MAX_LINES)
+    _act_bad = sum(1 for a in _act_all if a.get("outcome") in ("FAILED", "ERROR", "NO RESULT"))
+    st.caption(f"{len(_act_all)} press(es) recorded · **{_act_bad}** with no good outcome")
+    if st.button("🧹 Reset action log", width="stretch",
+                 help="Deletes YOUR action ledger only. Other users keep theirs."):
+        _removed = audit_log.reset()
+        st.session_state.pop("_audit_pending", None)
+        st.session_state["_audit_reset_note"] = _removed
+        st.rerun()
+    if st.session_state.get("_audit_reset_note") is not None:
+        st.success("Cleared %d line(s)." % st.session_state.pop("_audit_reset_note"))
 
     st.markdown("---")
     strict = st.toggle(
@@ -317,6 +332,12 @@ with st.sidebar:
     search = st.text_input("Search (substring, case-insensitive)", value="")
     order = st.radio("Order", ["newest first", "oldest first"], index=0)
     wrap = st.toggle("Colourise status tags", value=True)
+
+    st.markdown("---")
+    st.caption("Action ledger filters")
+    _act_outcomes = ["OK", "FAILED", "WARN", "ERROR", "STOPPED", "NO RESULT", "INFO"]
+    act_filter = st.multiselect("Only these outcomes", _act_outcomes, default=[])
+    act_search = st.text_input("Search the ledger", value="", key="lg_act_search")
 
     st.markdown("---")
     st.caption("File history")
