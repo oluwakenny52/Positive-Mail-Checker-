@@ -5547,8 +5547,20 @@ with str_lit.expander("🔍 View All Startup Entries & What Is Going On In The H
     with col_st2:
         if str_lit.button("🧹 Clear Startup Logs"):
             str_lit.session_state.startup_entries = []
+            # FIX ISO-5 (v13.50): _STARTUP_BUFFER is PROCESS state, so a blanket
+            # clear() also deleted the OTHER user's quiet-mode lines - which their
+            # session list does not hold, so their panel and diagnostic bundle lost
+            # lines they never asked to lose. Keep every entry that is not stamped
+            # with this caller's owner and drop only our own.
+            # _STARTUP_SEEN holds bare messages with no owner, so it is still
+            # cleared wholesale; the cost is at most one re-logged duplicate line
+            # on the other session, never a lost one.
+            _clear_who = _startup_who()
             with _STARTUP_BUFFER_LOCK:
-                _STARTUP_BUFFER.clear()
+                _keep = [i for i in _STARTUP_BUFFER
+                         if not (isinstance(i, (list, tuple)) and len(i) == 2
+                                 and i[0] == _clear_who)]
+                _STARTUP_BUFFER[:] = _keep
                 _STARTUP_SEEN.clear()
             log_startup("Startup logs cleared by user.")
             str_lit.rerun()
