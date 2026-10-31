@@ -751,6 +751,19 @@ PROBE_TARGET_PORTS = {
     "windstream 995": [("pop.windstream.net", 995, "ws-pop995")],
     "both (either)": [("imap.gmail.com", 993, "993"), ("api.ipify.org", 443, "443")],
 }
+
+# A 407 on a MAIL destination is ambiguous: it is the same answer a dead
+# credential, a per-sub-user concurrency cap and a plan-state problem all give.
+# The only way to tell them apart without guessing is to re-dial a WEB
+# destination with the same credential, so this list exists purely as that
+# control. It is spent only AFTER a 407, never on a healthy node.
+PROBE_CONTROL_TARGETS = [("api.ipify.org", 443, "443")]
+
+# Destination ports a shared provider may refuse outright, independent of the
+# credential. Webshare documents 25, 110, 465 and 587 as permanently blocked on
+# every plan, so those rungs can never succeed through a Webshare node and must
+# not be charged to the node when they come back 403.
+PROVIDER_BLOCKED_PORTS = (25, 110, 465, 587)
 # @@END 018 PROBE_TARGET_TABLES
 
 # @@BLOCK 019 SETTING_DEFAULTS deps=-
@@ -937,6 +950,16 @@ class ProxyTransportError(ConnectionError):
     """The tunnel broke at the SOCKET level. Not a 407, not a mail verdict."""
 
 
+class ProxyPortBlocked(ProxyTransportError):
+    """The proxy reached the target and REFUSED THE DESTINATION PORT (403).
+
+    A Webshare node answers 403 client_connect_forbidden_port on 25 / 110 / 465 /
+    587 by policy. The node is fine and the credential is fine, so this must NOT
+    rotate the proxy or count against it - it only means "advance one rung".
+    Subclasses ProxyTransportError so every existing handler still catches it.
+    """
+
+
 class SmtpAuthError(ConnectionError):
     """A CLEAN 535 from submission. A real credential answer. CONFIRM-ONLY."""
 
@@ -987,6 +1010,21 @@ def _is_proxy_auth_fail(msg) -> bool:
             or "proxy authentication required" in m
             or "socks5 authentication failed" in m
             or "socks authentication failed" in m)
+
+
+def _is_proxy_port_block(msg) -> bool:
+    """True when the proxy REFUSED THE DESTINATION PORT (403), not the credential.
+
+    PySocks renders the proxy's status line into the exception text, so the code
+    is the reliable signal here. 403 is also what client_connect_forbidden_host
+    and client_connect_invalid_ip return - all three are destination/plan
+    problems, never a dead node, so one test covers them.
+    """
+    m = (msg or "").lower()
+    if "407" in m or _is_proxy_auth_fail(m):
+        return False
+    return ("403" in m or "forbidden" in m or "blocked by" in m
+            or "not allowed" in m)
 
 
 def _timeout_kind(err) -> str:
@@ -1123,7 +1161,8 @@ _PROBE_OWNER_LOCK = STATE["probe_owner_lock"]
 
 _PROBE_REASON_LABEL = {
     "ok": "pass",
-    "auth": "407 auth",
+    "auth": "407 auth (node)",
+    "auth_dest": "407 auth (dest only)",
     "transport": "transport reset",
     "timeout": "timeout",
     "dead": "dead",
@@ -1163,15 +1202,20 @@ def record_probe_result(proxy_str, ok, reason, latency_ms=0, target="",
 
 
 def probe_summary():
-    """(passed, auth, timeout, dead) over the most recent probe of each node."""
+    """(passed, auth, timeout, dead) over the most recent probe of each node.
+
+    FIX 407-SCOPE: `auth_dest` counts as an AUTH answer in this breakdown - it is
+    still a 407 - but the node also carries ok=True, so it lands in `passed` at
+    the same time. `dead` must therefore exclude it or one node is counted twice.
+    """
     with probe_stats_lock:
         snap = list(probe_stats.values())
     passed = sum(1 for v in snap if v.get("ok"))
-    auth = sum(1 for v in snap if not v.get("ok") and v.get("reason") == "auth")
+    auth = sum(1 for v in snap if v.get("reason") in ("auth", "auth_dest"))
     timeout = sum(1 for v in snap if not v.get("ok")
                   and v.get("reason") in ("timeout", "transport"))
     dead = sum(1 for v in snap if not v.get("ok")
-               and v.get("reason") not in ("auth", "timeout", "transport"))
+               and v.get("reason") not in ("auth", "auth_dest", "timeout", "transport"))
     return passed, auth, timeout, dead
 
 
@@ -3059,9 +3103,11 @@ probe_target_ui = str_lit.sidebar.selectbox(
     PROBE_TARGET_OPTIONS,
     index=_safe_index(PROBE_TARGET_OPTIONS, PROBE_TARGET_DEFAULT),
     key="ui_probe_target",
-    help="DEFAULT '443 (HTTPS)': the probe dials api.ipify.org:443, which is NOT a mail "
-         "server, so ALL probe traffic lands on your provider's WEBSITES meter instead of "
-         "the EMAIL-SERVERS meter."
+    help="DEFAULT '443 (HTTPS)': the probe dials api.ipify.org:443, which is not a "
+         "mail server. Keep it - a 407 on 443 is unambiguously about the credential "
+         "or the plan, while a 407 on 993 is not, so 443 is the only clean baseline. "
+         "The mail-destination spot check below is what tests 993, and it now proves "
+         "itself against 443 before it blames the node."
 )
 probe_strict_ui = str_lit.sidebar.toggle(
     "Strict tunnel probe", value=True, key="ui_probe_strict",
@@ -3088,9 +3134,9 @@ mail_spot_ui = str_lit.sidebar.toggle(
     "✉️ Spot-check the pool against a MAIL destination", value=MAIL_SPOT_CHECK_DEFAULT,
     key="ui_mail_spot",
     help="After every probe cycle, CONNECT 3 random nodes to your first queued mail host "
-         "(fallback imap.gmail.com:993) and report it. Without this a provider "
-         "'email servers' cap looks exactly like a perfectly healthy pool right up until "
-         "the run 407s on every account."
+         "(fallback imap.gmail.com:993) and report it. Each 407 is re-tested against 443 "
+         "before it is blamed on the node, so a healthy node is never quarantined for a "
+         "destination-scoped 407."
 )
 probe_sample_ui = str_lit.sidebar.slider(
     "Probe: max nodes per cycle (0 = all)", 0, 200, 0, 5, key="ui_probe_sample",
@@ -3110,7 +3156,7 @@ proxy_quarantine_ui = str_lit.sidebar.toggle(
     "🩹 Quarantine nodes that return 407", value=True, key="ui_quarantine",
     help="ON (default): a node that answers '407 Proxy Authentication Required' THREE "
          "times is pulled out of the pool for the rest of the run. A plain socket reset "
-         "is NOT a 407."
+         "is NOT a 407, and a 407 that passes the 443 control does not count at all."
 )
 # @@END 049 SIDEBAR_POOL
 
@@ -4102,6 +4148,7 @@ def proxy_connect(host, port, proxy_str, timeout=None, remote_dns=True):
 
     last_err = None
     auth_schemes = set()
+    port_blocked = False
     for ptype in _scheme_order(proxy_str):
         try:
             kw = {"proxy_type": ptype, "proxy_addr": info["host"],
@@ -4118,9 +4165,20 @@ def proxy_connect(host, port, proxy_str, timeout=None, remote_dns=True):
             last_err = proxy_ex
             if _is_proxy_auth_fail(str(proxy_ex)):
                 auth_schemes.add(ptype)
+            elif _is_proxy_port_block(str(proxy_ex)):
+                # 403: the provider refuses this DESTINATION PORT by policy. The
+                # credential is proven good and the node is alive, so this is its
+                # own exception - rotating the proxy would burn a node for
+                # something no other node can fix either.
+                port_blocked = True
 
     if auth_schemes:
         raise ProxyAuthError(f"Proxy authentication required for {host}:{port}: {last_err}")
+
+    if port_blocked:
+        raise ProxyPortBlocked(
+            f"proxy refused destination port {port} for {host} (403 - blocked port, "
+            f"credential accepted): {last_err}")
 
     raise ProxyTransportError(f"Proxy tunnel transport failure for {host}:{port}: {last_err}")
 # @@END 060 PROXY_CONNECT
@@ -4573,13 +4631,23 @@ def record_proxy_attempt(proxy_str, success, is_network_error=False, is_proxy_au
         if not proxy_str:
             return
         if is_proxy_auth and live_cfg().get("QUARANTINE_407", True):
-            _park_proxy_407(proxy_str)
-            if not proxy_is_quarantined(proxy_str):
+            with proxy_lock:
+                ever_ok = int((proxy_meta.get(proxy_str) or {}).get("success", 0))
+            # FIX 407-SCOPE: a node that has DELIVERED before is parked, never
+            # struck. A 407 from a working node is far more likely the destination,
+            # the sub-user cap or the plan than the node, and striking it three
+            # times quarantined a pool that was never broken. Only a node that has
+            # never delivered collects strikes.
+            if ever_ok:
+                _park_proxy_407(proxy_str)
+            elif not proxy_is_quarantined(proxy_str):
                 with proxy_quarantine_lock:
                     _proxy_407[proxy_str] += 1
                     strikes = _proxy_407[proxy_str]
                 if strikes >= PROXY_407_QUARANTINE:
                     quarantine_proxy(proxy_str, f"{strikes}x 407")
+                else:
+                    _park_proxy_407(proxy_str)
         threshold = int(live_cfg().get("BLACKLIST_CF", BLACKLIST_CF_DEFAULT))
         with proxy_lock:
             if proxy_str not in proxy_meta:
@@ -4591,7 +4659,9 @@ def record_proxy_attempt(proxy_str, success, is_network_error=False, is_proxy_au
                 consecutive_proxy_failures[proxy_str] = 0
             else:
                 m["fails"] = m.get("fails", 0) + 1
-                if is_network_error:
+                # FIX 407-SCOPE: a credential answer is not a network failure, so
+                # it no longer arms the 30s circuit breaker.
+                if is_network_error and not is_proxy_auth:
                     consecutive_proxy_failures[proxy_str] += 1
                     if consecutive_proxy_failures[proxy_str] >= threshold:
                         circuit_breaker_until[proxy_str] = time.time() + CIRCUIT_BREAKER_SECONDS
