@@ -5564,7 +5564,7 @@ with str_lit.expander("🔬 Deep Diagnostics - copy/paste this to debug", expand
     _dc1, _dc2 = str_lit.columns(2)
     with _dc1:
         if str_lit.button("🔁 Rebuild", width="stretch"):
-            STATE["diag_cache"] = {"ts": 0.0, "text": ""}
+            STATE["diag_cache"] = {"ts": 0.0, "text": "", "user": ""}
             str_lit.rerun()
     with _dc2:
         if str_lit.button("🧪 Direct self-test", width="stretch"):
@@ -5601,15 +5601,22 @@ with str_lit.expander("🔬 Deep Diagnostics - copy/paste this to debug", expand
                 else:
                     _lines.append("  tunnel: no alive node to test")
                 STATE["selftest"] = {"ts": time.time(), "text": "\n".join(_lines)}
-            STATE["diag_cache"] = {"ts": 0.0, "text": ""}
+            STATE["diag_cache"] = {"ts": 0.0, "text": "", "user": ""}
             str_lit.success("Self-test done.")
 
     # FIX P1-3: this used to run on EVERY rerun, inside a COLLAPSED expander -
     # and it reads proxies.txt, walks proxy_meta, probes target reachability,
     # resolves the egress geo and calls socket.getfqdn().  Cache it.
-    _dcache = STATE.setdefault("diag_cache", {"ts": 0.0, "text": ""})
-    if (not _dcache.get("text")) or (time.time() - _dcache.get("ts", 0.0)) > DIAG_CACHE_TTL:
-        _dcache = {"ts": time.time(), "text": build_diagnostics_text()}
+    #
+    # v13.48: STATE is process-wide, so that cache was shared across users -
+    # raw proxies.txt credentials and the active CFG included - for the whole
+    # TTL.  Stamp the owner (block 037) and rebuild on a mismatch, exactly the
+    # way the two valid caches are keyed.
+    _dcache = STATE.setdefault("diag_cache", {"ts": 0.0, "text": "", "user": ""})
+    _dc_who = _cache_owner()
+    if ((not _dcache.get("text")) or (_dcache.get("user") != _dc_who)
+            or (time.time() - _dcache.get("ts", 0.0)) > DIAG_CACHE_TTL):
+        _dcache = {"ts": time.time(), "text": build_diagnostics_text(), "user": _dc_who}
         STATE["diag_cache"] = _dcache
     _diag = _dcache["text"]
 
