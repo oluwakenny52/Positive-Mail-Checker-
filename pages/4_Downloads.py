@@ -185,6 +185,36 @@ def _results_dir():
     return user_file("mail_results")
 
 
+# v13.48: PER-USER OWNERSHIP of a source file.
+#
+# _sources() globs the working directory as well as the per-user results dir, and
+# the working directory holds every user's <hash>_*.txt. Nothing filtered them,
+# so each user's Sources box listed - and could export, passwords included -
+# every other user's result files. The prefix is DERIVED from user_file(""), the
+# same function that names the files, so no second identity source can drift.
+_HASH_RX = re.compile(r"^(?:anon)?[0-9a-f]{16}_")
+
+
+def _prefix() -> str:
+    try:
+        return os.path.basename(user_file("")) or ""
+    except Exception:
+        return ""
+
+
+def _own(path) -> bool:
+    """False only for a file that is prefixed to somebody else.
+
+    An UNPREFIXED file is legacy / shared and stays visible to everyone; a file
+    carrying another user's hash prefix is not yours.
+    """
+    base = os.path.basename(path)
+    if not _HASH_RX.match(base):
+        return True
+    pfx = _prefix()
+    return bool(pfx) and base.startswith(pfx)
+
+
 IGNORE = {
     "last_account.txt", "proxies.txt", "proxies_all.txt", "disposable_domains.txt",
     "clean_proxies.txt", "proxy_pool.txt", "download_presets.json",
@@ -220,6 +250,9 @@ def _sources():
         for p in glob.glob(os.path.join(APP_DIR, pat)):
             b = os.path.basename(p)
             if b in IGNORE or any(t in b.lower() for t in IGNORE_TOKENS):
+                continue
+            # v13.48: the root glob reaches every user's <hash>_*.txt.
+            if not _own(p):
                 continue
             try:
                 with open(p, encoding="utf-8", errors="ignore") as _fh:
