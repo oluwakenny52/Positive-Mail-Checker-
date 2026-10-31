@@ -256,9 +256,11 @@ BUCKET_OF = {
 # Order matters: classify_error() walks these top to bottom.
 _WRONG_STRONG = re.compile(
     r"authenticationfailed|authentication failed|invalid credentials|"
-    r"invalid username or password|invalid login|bad credentials|"
-    r"loginfailed|login failed|auth(?:entication)? failed|"
-    r"password incorrect|incorrect password|credentials invalid",
+    r"invalid username or password|invalid user name or password|invalid login|"
+    r"invalid login or password|bad credentials|loginfailed|login failed|"
+    r"auth(?:entication)? failed|authenticate error|realmless(?: login)? not allowed|"
+    r"login incorrect|wrong password|password incorrect|incorrect password|"
+    r"credentials invalid",
     re.I,
 )
 _WRONG_USER = re.compile(
@@ -274,15 +276,25 @@ _APP = re.compile(
     r"log in via your web browser|web browser to log in",
     re.I,
 )
+# v13.50: rbl is BOUNDED. As a bare substring it fired inside unrelated words,
+# and abusix / ip blocked (both in the app.py fallback table) were missing, so a
+# real RBL answer fell through to UNKNOWN.
 _RBL = re.compile(
-    r"blacklist|blacklisted|spamhaus|spam block|blocked by|dnsbl|rbl|"
-    r"listed at|reputation",
+    r"blacklist|blacklisted|blocklist|blocklisted|spamhaus|spam block|"
+    r"blocked by|dnsbl|abusix|\brbl\b|listed at|listed in|reputation|ip blocked",
     re.I,
 )
+# v13.50: dns is BOUNDED and gaierror / does not resolve / failed to resolve /
+# could not resolve / unable to resolve are added - every one of them exists in
+# the app.py block 004 fallback table, and the two are required to stay in
+# lockstep. A bare `resolution` made "high resolution image" a DNS failure.
 _DNS = re.compile(
     r"name or service not known|nodename nor servname|no address associated|"
-    r"temporary failure in name resolution|getaddrinfo|dns|no such host|"
-    r"host not found|servfail|nxdomain|resolution",
+    r"temporary failure in name resolution|getaddrinfo|gaierror|"
+    r"no such host|host not found|servfail|nxdomain|"
+    r"\bdns\b|dnsbl|dns lookup|dns resolution|dns query|"
+    r"does not resolve|failed to resolve|could not resolve|unable to resolve|"
+    r"name resolution (?:failed|error)|resolution failed|resolution error",
     re.I,
 )
 _RETRY_HARD = re.compile(
@@ -318,8 +330,11 @@ _CONN = re.compile(
 
 # "blocked by" is claimed by _RBL, so a proxy refusal was filed as RBL. This
 # runs before _RBL and owns only the proxy spelling.
+# v13.50: a proxy-side DNS/lookup failure is also the PROXY hop, not the
+# mailbox, so it belongs here rather than in _DNS.
 _PROXY_BLOCKED = re.compile(
-    r"blocked by (?:the )?proxy|proxy (?:is )?blocked|proxy denied",
+    r"blocked by (?:the )?proxy|proxy (?:is )?blocked|proxy denied|"
+    r"proxy (?:dns|lookup|resolve)",
     re.I,
 )
 
