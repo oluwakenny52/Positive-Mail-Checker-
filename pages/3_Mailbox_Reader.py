@@ -104,6 +104,12 @@ from auth import user_file          # blocks 012, 019 and 032 resolve paths thro
 auth.require(st, "Unlock Mailbox Reader")
 auth.fit(st)                        # CSS only, before the first widget
 auth.fit_panel(st)                  # the controls; collapsed until tapped
+
+# v13.48: click/outcome ledger, after the gate so the file lands on the unlocked
+# prefix rather than the anon placeholder.
+import audit_log
+
+audit_log.install(st, "pages/3_Mailbox_Reader.py")
 # @@END 001 PAGE_CONFIG
 
 
