@@ -4409,7 +4409,7 @@ def smtp_helo_name() -> str:
         name = ""
         try:
             name = socket.getfqdn() or ""
-            except Exception:
+        except Exception:
             name = ""
         if "." not in name:
             ip = public_ip()
@@ -5070,6 +5070,26 @@ def precheck_proxy_fast(proxy_str):
                             latency_ms=res.get("latency_ms", 0),
                             target=res.get("target", ""), scheme=res.get("scheme"),
                             error=res.get("error", ""))
+
+        # FIX 407-SCOPE: auth_dest is a PASS for pool purposes. The node proved it
+        # authenticates by clearing the 443 control, so it keeps its score, its
+        # strike count and its place in the pool - the destination was the problem.
+        # Tested BEFORE the generic ok arm because auth_dest also carries ok=True.
+        if res["reason"] == "auth_dest":
+            record_proxy_attempt(proxy_str, success=True)
+            try:
+                with proxy_lock:
+                    m = proxy_meta.setdefault(
+                        proxy_str, {"fails": 0, "success": 0, "country": "Unknown",
+                                    "region": "Unknown", "latency_ms": 0})
+                    if res.get("latency_ms"):
+                        m["latency_ms"] = int(res["latency_ms"])
+            except Exception:
+                pass
+            log_probe_event(
+                f"AUTH407-DEST {info['host']}:{info['port']} -> control "
+                f"{res.get('control', '?')} passed; node kept, destination refused")
+            return True
 
         if res["ok"]:
             record_proxy_attempt(proxy_str, success=True)
@@ -8022,10 +8042,13 @@ def _check_account_core(email, password, conf, domain, proxy_pool, thread_state,
                             flags["saw_nonproxy"] = True
                             flags["saw_server"] = True
                             record_proxy_attempt(px_used, success=True)
+                            _perm = int(port) in PROVIDER_BLOCKED_PORTS
                             trace_logs.append(
                                 f"{px_tag(px_used)} -> PORT BLOCKED {proto} {server}:{port}: "
                                 f"{err_text[:160]} [provider refuses this destination port - "
-                                f"advancing, node credited]")
+                                f"advancing, node credited"
+                                + (", permanently blocked on the plan" if _perm else "")
+                                + "]")
                             server_level_fail = True
                             rotate_now = False
 
@@ -8465,8 +8488,10 @@ def _check_account_core(email, password, conf, domain, proxy_pool, thread_state,
             f"reached, so the password is still untested. Per-host 407 map: {host_407}")
         return None, PROXY_UNHEALTHY, (
             f"proxy refused the MAIL ports with 407 on {acct_407_total} attempt(s) - the mail "
-            f"host was never reached; the pool passes the web probe but cannot pass "
-            f"email-server destinations (provider 'email servers' cap)"
+            f"host was never reached, so the password is still untested. Each of those nodes "
+            f"was re-tested on the 443 control first: the pool authenticates and the provider "
+            f"is refusing the mail destination (destination scope, or the plan's concurrency "
+            f"cap). Set Proxy Mode Engine = off (DIRECT) for the run."
         ), None, trace_logs
     if not dns_ok and not flags.get("saw_server") and not flags.get("saw_login_drop"):
         return None, DNS_FAILED, "Fast-fail DNS check failed: no host resolves locally", None, trace_logs
