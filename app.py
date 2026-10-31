@@ -650,13 +650,16 @@ SMTP_HOST_CAP = 1
 # @@END 011 PROTOCOL_CONSTANTS
 
 # @@BLOCK 012 CONCURRENCY_CONSTANTS deps=-
-PROXY_CONCURRENCY_DEFAULT = 4
+# FIX PERF-1: 4 / 1 / 1 meant a 92-line fetch ran in 23 SERIAL waves. The global
+# gate is the real ceiling; the per-IP and per-sub-user gates exist only to stop a
+# single node being hammered, so they never needed to be 1.
+PROXY_CONCURRENCY_DEFAULT = 10
 HOST_CONCURRENCY_DEFAULT = 2
-PROXY_IP_CONCURRENCY_DEFAULT = 1
-PROXY_SUBUSER_CONCURRENCY_DEFAULT = 1
-PROBE_WORKERS_DEFAULT = 3
-PROBE_WORKERS_BUSY = 2
-PROBE_WORKERS_BULK = 6
+PROXY_IP_CONCURRENCY_DEFAULT = 2
+PROXY_SUBUSER_CONCURRENCY_DEFAULT = 2
+PROBE_WORKERS_DEFAULT = 4
+PROBE_WORKERS_BUSY = 3
+PROBE_WORKERS_BULK = 10
 
 
 def _gate_wait(attempt_to: float) -> float:
@@ -720,7 +723,11 @@ MAX_ROTATIONS_DEFAULT = 2
 CHECK_PASS2_DEFAULT = False
 DEDUPE_PROXIES_DEFAULT = True
 PROBE_STRICT_DEFAULT = True
-MIN_PROXY_SCORE_DEFAULT = 10
+# FIX SCORE-1: compute_real_score() subtracts 5 per fail on top of a decaying
+# base, so 0-success/4-fail lands on 8 - a fresh node was being filtered out of
+# the pool after four bad attempts. 5 matches the "< 5" test the Clean Dead /
+# Low-Score button already uses.
+MIN_PROXY_SCORE_DEFAULT = 5
 BLACKLIST_CF_DEFAULT = 15
 CIRCUIT_BREAKER_SECONDS = 30.0
 # @@END 017 POOL_FILTER_CONSTANTS
@@ -1221,16 +1228,21 @@ def protocol_flags():
 
 
 def probe_targets():
-    """Targets for the tunnel probe."""
+    """Targets for the tunnel probe.
+
+    FIX PERF-4: the override is consulted FIRST and unconditionally. It used to be
+    honoured only in AUTO mode, so a user on the default '443 (HTTPS)' could never
+    be steered onto a mail endpoint - and ipify:443 is exactly the target that lets
+    a pool pass validation and then 407 on every IMAP login. Start Live Checking
+    overwrites the override with the real queue-derived target.
+    """
+    ov = STATE.get("probe_targets_override") or []
+    if ov:
+        return list(ov)
     try:
         name = CFG.get("PROBE_TARGET", PROBE_TARGET_DEFAULT)
     except Exception:
         name = PROBE_TARGET_DEFAULT
-    if name == PROBE_TARGET_AUTO:
-        ov = STATE.get("probe_targets_override") or []
-        if ov:
-            return list(ov)
-        return PROBE_TARGET_PORTS[PROBE_TARGET_AUTO]
     return PROBE_TARGET_PORTS.get(name) or PROBE_TARGET_PORTS[PROBE_TARGET_AUTO]
 
 
@@ -2548,7 +2560,7 @@ log_startup(f"ms_oauth.py status -> loaded={MS_OAUTH_OK} "
             f"(Microsoft XOAUTH2 {'active' if MS_OAUTH_OK else 'INACTIVE'})")
 # @@END 039 STATE_ALIASES
 
-# @@BLOCK 040 GATES deps=039
+# @@BLOCK 040 GATES deps=012,024,025,039
 class _NullGate:
     def acquire(self, timeout=None):
         return True
@@ -2559,37 +2571,74 @@ class _NullGate:
 
 _null_gate = _NullGate()
 
+# FIX ISO-5: every gate was keyed by host / IP / sub-user ALONE in ONE process
+# table, so two users on one process shared a single PROXY_CONCURRENCY semaphore
+# and halved each other's throughput, and one user's Apply Settings rebuilt the
+# other user's live gates underneath it. Every key is prefixed with the SESSION
+# scope. The pool itself stays shared on purpose - it describes the provider's
+# IPs, not the user - but the THROUGHPUT is now per user.
+_GATE_SCOPE = {"id": "anon"}
 
-def _proxy_gate():
-    """Global cap on simultaneous proxy tunnels (persistent across reruns)."""
-    g = STATE.get("proxy_gate")
+
+def _refresh_gate_scope():
+    """Re-read the session token. Runs once per rerun on the script thread -
+    session_state is not reliable from a worker thread."""
+    try:
+        tok = (str_lit.session_state.get("user_key_hash")
+               or str_lit.session_state.get("_anon_hash")
+               or "anon")
+    except Exception:
+        tok = "anon"
+    _GATE_SCOPE["id"] = str(tok) or "anon"
+    return _GATE_SCOPE["id"]
+
+
+def _gate_scope() -> str:
+    return _GATE_SCOPE.get("id") or "anon"
+
+
+def _gate_table(name):
+    tbl = STATE.get(name)
+    if tbl is None:
+        tbl = {}
+        STATE[name] = tbl
+    return tbl
+
+
+def _make_gate(table, key, limit):
+    g = table.get(key)
     if g is None:
-        try:
-            limit = int(CFG.get("PROXY_CONCURRENCY", PROXY_CONCURRENCY_DEFAULT)) \
-                or PROXY_CONCURRENCY_DEFAULT
-        except Exception:
-            limit = PROXY_CONCURRENCY_DEFAULT
-        g = threading.BoundedSemaphore(max(1, limit))
-        STATE["proxy_gate"] = g
+        g = threading.BoundedSemaphore(max(1, int(limit)))
+        table[key] = g
     return g
 
 
+def _limit(cfg_key, default):
+    """CFG value, but never below `default`.
+
+    The defaults were raised without a CFG_VERSION bump, so a config saved under
+    the old numbers must not pin a user back to 4.
+    """
+    try:
+        got = int(CFG.get(cfg_key, default) or 0)
+    except Exception:
+        got = int(default)
+    return max(int(default), got)
+
+
+def _proxy_gate():
+    """Global cap on simultaneous proxy tunnels - PER SESSION."""
+    return _make_gate(_gate_table("proxy_gates"), _gate_scope(),
+                      _limit("PROXY_CONCURRENCY", PROXY_CONCURRENCY_DEFAULT))
+
+
 def _host_gate(host):
-    """Per-destination-HOSTNAME cap so 50 workers do not slam one IMAP box."""
+    """Per-destination-HOSTNAME cap so many workers do not slam one IMAP box."""
     if not host:
         return _null_gate
     with STATE["host_gate_lock"]:
-        gates = STATE["host_gates"]
-        g = gates.get(host)
-        if g is None:
-            try:
-                limit = int(CFG.get("HOST_CONCURRENCY", HOST_CONCURRENCY_DEFAULT)) \
-                    or HOST_CONCURRENCY_DEFAULT
-            except Exception:
-                limit = HOST_CONCURRENCY_DEFAULT
-            g = threading.BoundedSemaphore(max(1, limit))
-            gates[host] = g
-        return g
+        return _make_gate(STATE["host_gates"], _gate_scope() + "|" + host,
+                          _limit("HOST_CONCURRENCY", HOST_CONCURRENCY_DEFAULT))
 
 
 def _ip_gate(ip):
@@ -2597,17 +2646,8 @@ def _ip_gate(ip):
     if not ip:
         return _null_gate
     with STATE["host_gate_lock"]:
-        gates = STATE["ip_gates"]
-        g = gates.get(ip)
-        if g is None:
-            try:
-                limit = int(CFG.get("PROXY_IP_CONCURRENCY", PROXY_IP_CONCURRENCY_DEFAULT)) \
-                    or PROXY_IP_CONCURRENCY_DEFAULT
-            except Exception:
-                limit = PROXY_IP_CONCURRENCY_DEFAULT
-            g = threading.BoundedSemaphore(max(1, limit))
-            gates[ip] = g
-        return g
+        return _make_gate(STATE["ip_gates"], _gate_scope() + "|" + ip,
+                          _limit("PROXY_IP_CONCURRENCY", PROXY_IP_CONCURRENCY_DEFAULT))
 
 
 def _subuser_of(proxy_str) -> str:
@@ -2624,28 +2664,24 @@ def _subuser_gate(subuser):
     if not subuser:
         return _null_gate
     with STATE["host_gate_lock"]:
-        gates = STATE["subuser_gates"]
-        g = gates.get(subuser)
-        if g is None:
-            try:
-                limit = int(CFG.get("PROXY_SUBUSER_CONCURRENCY",
-                                    PROXY_SUBUSER_CONCURRENCY_DEFAULT)) \
-                    or PROXY_SUBUSER_CONCURRENCY_DEFAULT
-            except Exception:
-                limit = PROXY_SUBUSER_CONCURRENCY_DEFAULT
-            g = threading.BoundedSemaphore(max(1, limit))
-            gates[subuser] = g
-        return g
+        return _make_gate(STATE["subuser_gates"], _gate_scope() + "|" + subuser,
+                          _limit("PROXY_SUBUSER_CONCURRENCY",
+                                 PROXY_SUBUSER_CONCURRENCY_DEFAULT))
 
 
 def _reset_gates():
-    """Rebuild every gate (called when settings are applied)."""
+    """Rebuild THIS session's gates only."""
+    prefix = _gate_scope() + "|"
     with STATE["host_gate_lock"]:
-        STATE["host_gates"] = {}
-        STATE["ip_gates"] = {}
-        STATE["subuser_gates"] = {}
-    STATE["proxy_gate"] = None
+        for name in ("host_gates", "ip_gates", "subuser_gates"):
+            tbl = _gate_table(name)
+            for k in [k for k in tbl if k.startswith(prefix)]:
+                tbl.pop(k, None)
+    _gate_table("proxy_gates").pop(_gate_scope(), None)
     log_probe_event("concurrency gates rebuilt")
+
+
+_refresh_gate_scope()
 # @@END 040 GATES
 
 # @@BLOCK 041 PROXY_407_PARK deps=016,039,040
@@ -4772,7 +4808,11 @@ def tunnel_probe(proxy_str, targets=None, timeout=None):
 
     A 407 arriving on ANY scheme is an auth refusal, decided AFTER the loops -
     the node's scheme memory is driven by an actual SUCCESS only.  A FAILURE
-    always tries the alternate scheme.
+    always tries the alternate scheme, EXCEPT on auth.
+
+    FIX PERF-6: a 407 on the first scheme used to fall through and burn a second
+    full timeout on the alternate scheme, which cannot succeed either - the
+    credential is the problem, not the scheme. Auth now breaks out of both loops.
     """
     out = {"ok": False, "reason": "dead", "latency_ms": 0, "target": "",
            "scheme": None, "error": ""}
@@ -4806,6 +4846,7 @@ def tunnel_probe(proxy_str, targets=None, timeout=None):
 
     errors = []
     auth_schemes = set()
+    auth_hit = False
     started_all = time.time()
 
     for host, port, label in targets:
@@ -4837,6 +4878,7 @@ def tunnel_probe(proxy_str, targets=None, timeout=None):
                               f"{type(e).__name__}: {msg[:110]}")
                 if _is_proxy_auth_fail(msg):
                     auth_schemes.add(ptype)
+                    auth_hit = True
                 elif isinstance(e, (socket.timeout, TimeoutError)) or "timed out" in msg.lower():
                     if out["reason"] != "auth":
                         out["reason"] = "timeout"
@@ -4851,6 +4893,10 @@ def tunnel_probe(proxy_str, targets=None, timeout=None):
                         s.close()
                     except Exception:
                         pass
+            if auth_hit:
+                break
+        if auth_hit:
+            break
         if out["ok"] and not _second_scheme:
             return out
 
@@ -4927,33 +4973,45 @@ def precheck_proxy_fast(proxy_str):
 
 # @@BLOCK 072 RUN_BATCH deps=-
 def _run_batch(fn, items, workers, budget):
-    """Run fn(item) over items with a HARD wall-clock budget."""
-    done_ids = set()
-    timed_out = False
+    """Run fn(item) over items with a HARD wall-clock budget.
+
+    FIX PERF-2: results are keyed by LIST INDEX, not id(). id() of a str is only
+    stable while something holds a reference and two equal strings can share one,
+    so a duplicate line could be credited twice. Items are materialised once so
+    the caller's list cannot be mutated underneath the pool.
+    """
+    items = list(items or ())
     if not items:
         return [], False
-    ex = ThreadPoolExecutor(max_workers=max(1, min(int(workers), len(items))))
+    done = set()
+    timed_out = False
+    budget = max(1.0, float(budget or 1.0))
+    ex = ThreadPoolExecutor(max_workers=max(1, min(int(workers or 1), len(items))))
+    f2i = {}
     try:
-        f2i = {ex.submit(fn, it): it for it in items}
+        for idx, it in enumerate(items):
+            f2i[ex.submit(fn, it)] = idx
         try:
             for fut in as_completed(f2i, timeout=budget):
+                idx = f2i.get(fut)
                 try:
                     if fut.result():
-                        done_ids.add(id(f2i[fut]))
+                        done.add(idx)
                 except Exception:
                     continue
         except Exception:
             timed_out = True
-        for fut in f2i:
-            if fut.done():
+        # Anything that finished inside the budget but after the sweep tripped.
+        for fut, idx in f2i.items():
+            if fut.done() and not fut.cancelled():
                 try:
                     if fut.result():
-                        done_ids.add(id(f2i[fut]))
+                        done.add(idx)
                 except Exception:
                     pass
     finally:
         ex.shutdown(wait=False)
-    return [it for it in items if id(it) in done_ids], timed_out
+    return [it for idx, it in enumerate(items) if idx in done], timed_out
 # @@END 072 RUN_BATCH
 
 # @@BLOCK 073 MAIL_SPOT_CHECK deps=015,025,070
@@ -5221,10 +5279,19 @@ def _set_probe_targets_from_queue(accounts, cap=1):
     return out
 # @@END 076 QUEUE_PROBE_TARGETS
 
-# @@BLOCK 077 FETCH_AND_TEST deps=014,025,058,071,073
+# @@BLOCK 077 FETCH_AND_TEST deps=012,014,015,025,026,052,058,067,070,071,072,073
 def fetch_and_test_all_proxies(silent: bool = False):
     """Fetch every configured provider's lines, validate them, write proxies.txt
     and ARM the live pool.  Returns (alive_count, total_count).
+
+    FIX PERF-3: the batch was ONE as_completed() call under a 276s budget on the
+    Streamlit script thread, so the page was dead for minutes with a spinner and
+    no numbers. It now runs in 24-line chunks with a progress bar.
+    FIX PERF-4: the probe target is pointed at a MAIL endpoint for the duration of
+    the fetch - an ipify:443 probe is exactly what let a pool pass validation and
+    then 407 on every IMAP login. The previous override is restored afterwards.
+    FIX PERF-5: the 0-alive TCP fallback was a SERIAL loop of is_proxy_alive()
+    calls - 92 nodes x 5s is ~460s of dead page. It is pooled now.
     """
     global all_proxies, filtered_pool
 
@@ -5276,7 +5343,7 @@ def fetch_and_test_all_proxies(silent: bool = False):
     total = len(all_raw)
 
     if not all_raw:
-        log_startup("Fetch & test: no proxy lines returned.")
+        log_startup("Fetch & test: no proxy line returned.")
         if not silent:
             str_lit.warning("No proxies returned. Check WEBSHARE_KEYS in secrets.")
         return (0, 0)
@@ -5297,9 +5364,53 @@ def fetch_and_test_all_proxies(silent: bool = False):
         probe_stats.clear()
     clear_proxy_quarantine()
 
+    _prev_ov = list(STATE.get("probe_targets_override") or [])
+    try:
+        STATE["probe_targets_override"] = [
+            (MAIL_SPOT_FALLBACK[0], MAIL_SPOT_FALLBACK[1], "fetch:mail")]
+    except Exception:
+        pass
+
+    alive = []
+    _ft_timed_out = False
     batch_timeout = max(60.0, min(PROBE_BATCH_BUDGET * 3.0, len(all_raw) * 3.0))
-    alive, _ft_timed_out = _run_batch(precheck_proxy_fast, all_raw,
-                                      probe_workers(bulk=True), batch_timeout)
+    _chunk = 24
+    _started = time.time()
+    _pbar = None
+    try:
+        _pbar = str_lit.progress(0.0, text=f"Validating 0/{len(all_raw)} ...")
+    except Exception:
+        _pbar = None
+
+    try:
+        for _i in range(0, len(all_raw), _chunk):
+            _left = batch_timeout - (time.time() - _started)
+            if _left <= 1.0:
+                _ft_timed_out = True
+                break
+            _part = all_raw[_i:_i + _chunk]
+            _got, _ = _run_batch(precheck_proxy_fast, _part, probe_workers(bulk=True),
+                                 min(_left, _chunk * 6.0))
+            alive.extend(_got)
+            _done_n = min(len(all_raw), _i + _chunk)
+            if _pbar is not None:
+                try:
+                    _pbar.progress(_done_n / max(1, len(all_raw)),
+                                   text=f"Validating {_done_n}/{len(all_raw)} - "
+                                        f"{len(alive)} alive")
+                except Exception:
+                    pass
+    finally:
+        try:
+            STATE["probe_targets_override"] = _prev_ov
+        except Exception:
+            pass
+        if _pbar is not None:
+            try:
+                _pbar.empty()
+            except Exception:
+                pass
+
     if _ft_timed_out:
         log_startup(f"Fetch & test: batch budget {batch_timeout:.0f}s spent; "
                     f"keeping the {len(alive)} node(s) that finished.")
@@ -5307,12 +5418,16 @@ def fetch_and_test_all_proxies(silent: bool = False):
     alive = list(dict.fromkeys(alive))
 
     if not alive:
-        tcp_ok = []
         _pt = float(CFG.get("PROXY_PRECHECK_TIMEOUT", PROXY_PRECHECK_TIMEOUT_DEFAULT))
-        for p in all_raw:
+
+        def _tcp_ok(p):
             info = parse_proxy(p)
-            if info and is_proxy_alive(info["host"], info["port"], timeout=_pt):
-                tcp_ok.append(p)
+            if not info:
+                return False
+            return is_proxy_alive(info["host"], info["port"], timeout=_pt)
+
+        tcp_ok, _ = _run_batch(_tcp_ok, all_raw, probe_workers(bulk=True),
+                               max(30.0, len(all_raw) * 1.0))
         alive = tcp_ok or all_raw
         log_startup(f"Fetch & test: 0 nodes passed the tunnel probe; "
                     f"fell back to {len(alive)} TCP-alive line(s).")
@@ -5458,25 +5573,52 @@ with str_lit.sidebar:
     _age = int(time.time() - _last_ts) if _last_ts else -1
     _age_txt = f"{_age}s ago" if _age >= 0 else "never"
 
-    _ips = {parse_proxy(p)["host"] for p in all_proxies if parse_proxy(p)}
-    _subs = {_subuser_of(p) for p in all_proxies if _subuser_of(p)}
+    # FIX LAG-P: parse_proxy() ran TWICE per line here for the IP set and twice
+    # again via _subuser_of() for the user set - four parses per line, every
+    # rerun. One pass fills both.
+    _ips, _subs = set(), set()
+    for _p in all_proxies:
+        _pi = parse_proxy(_p)
+        if _pi:
+            _ips.add(_pi["host"])
+            _su = (_pi.get("user") or "").strip().lower()
+            if _su:
+                _subs.add(_su)
     str_lit.info(f"Loaded Proxies: **{len(all_proxies)}** lines / **{len(_ips)}** IPs / "
                  f"**{len(_subs)}** sub-users | Filtered: **{len(filtered_pool)}** | "
                  f"Alive: **{_alive_now}**")
 
+    # FIX UI-1 (the ledger lie): filtered_pool is re-created EMPTY at module level
+    # on EVERY rerun (block 058) and nothing fills it before this point, so
+    # `not filtered_pool` was true on every single load - the error below fired
+    # unconditionally and, because st.error CLOSES the pending press, Reset Theme,
+    # Reset Display Fit, every help_btn and Show raw proxies.txt were all recorded
+    # as FAILED with a proxy message. The pool was never broken; the banner was.
+    # Compute the real answer first, then judge it.
+    #
+    # FIX UI-2: a page-level banner also steals presses when it is healthy - the
+    # READY success below did exactly the same thing. Both banners now only use a
+    # real message widget when nothing has reported yet, and degrade to a caption
+    # otherwise, so an unrelated press closes honestly as NO RESULT.
+    _pend = str_lit.session_state.get("_audit_pending") or {}
+    _steal = bool(_pend) and not _pend.get("outcome")
+
     if all_proxies and not filtered_pool:
-        str_lit.error("⚠ **Every proxy was filtered out** by Min Proxy Score / pool mode / "
-                      "circuit breaker. Lower 'Min Proxy Score' or press ♻️ Lift 407 "
-                      "Quarantine. The raw list is NOT used as a silent fallback.")
+        filtered_pool = get_filtered_active_proxies(quiet=True)
+    if all_proxies and not filtered_pool:
+        _etxt = ("⚠ **Every proxy was filtered out** by Min Proxy Score / pool mode / "
+                 "circuit breaker. Lower 'Min Proxy Score' or press ♻️ Lift 407 "
+                 "Quarantine. The raw list is NOT used as a silent fallback.")
+        (str_lit.caption if _steal else str_lit.error)(_etxt)
 
     # FIX ISO-4: _any_run_active(), not STATE["run_active"] - the bool used to be
     # cleared by whichever run ended first, so one user's exit hid another user's
     # live run and this banner claimed READY mid-run.
     if _alive_now and not _any_run_active():
-        str_lit.success(
-            f"✅ READY - **{_alive_now}** validated node(s) armed. "
-            f"Paste your combos and press 🔥 Start Live Checking Engine. Nothing else to set."
-        )
+        _rtxt = (f"✅ READY - **{_alive_now}** validated node(s) armed. "
+                 f"Paste your combos and press 🔥 Start Live Checking Engine. "
+                 f"Nothing else to set.")
+        (str_lit.caption if _steal else str_lit.success)(_rtxt)
     elif not all_proxies and not WEBSHARE_KEYS:
         str_lit.info("No proxies configured - press 📥 Fetch & Test All Proxies, or run "
                      "fully DIRECT.")
@@ -5624,9 +5766,12 @@ with str_lit.sidebar:
                 except Exception as ex:
                     str_lit.error(f"Error saving custom proxies: {ex}")
 
+    # FIX PERF-7: the blocking st.spinner is gone - block 077 now drives its own
+    # progress bar in 24-line chunks, so the sidebar keeps painting instead of
+    # freezing for the whole batch budget.
     if str_lit.button("📥 Fetch & Test All Proxies"):
-        with str_lit.spinner("Fetching from Webshare & Oxylabs and validating every line..."):
-            _n_alive, _n_total = fetch_and_test_all_proxies()
+        str_lit.caption("Validating in 24-line chunks - the bar below moves.")
+        _n_alive, _n_total = fetch_and_test_all_proxies()
         _msr = STATE.get("mail_spot") or {}
         if _n_alive:
             _msg = (f"✅ READY - **{_n_alive}** working node(s) from **{_n_total}** line(s) "
