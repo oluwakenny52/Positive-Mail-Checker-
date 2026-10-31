@@ -3978,7 +3978,10 @@ def get_filtered_active_proxies(quiet: bool = False):
             if mode == "all":
                 filtered.append(p)
             elif mode == "us_only":
-                if "US" in country or "UNITED STATES" in country:
+                # FIX GEO-1 (v13.50): "US" as a SUBSTRING matched AUSTRALIA,
+                # AUSTRIA, RUSSIA and BELARUS, so us_only was never US-only.
+                if (country in ("US", "USA", "UNITED STATES")
+                        or country.startswith("UNITED STATES")):
                     filtered.append(p)
             elif mode == "country":
                 if any(cc in country or cc in p.upper() for cc in chosen_countries):
@@ -4805,9 +4808,12 @@ def sample_alive_proxy(exclude=None, domain=None, avoid=None):
         cand = pool
 
     if not live_cfg().get("RANDOM_ROTATION", True):
+        # FIX RR-1 (v13.50): index into cand, not pool. The avoid-set was built
+        # and then thrown away, so round-robin re-served a node the account had
+        # just failed through - the one thing the avoid-set exists to stop.
         with STATE["rr_lock"]:
-            STATE["rr_index"] = (STATE["rr_index"] + 1) % len(pool)
-            return pool[STATE["rr_index"]]
+            STATE["rr_index"] = (STATE["rr_index"] + 1) % len(cand)
+            return cand[STATE["rr_index"]]
 
     with STATE["rr_lock"]:
         last = STATE.get("rr_last")
