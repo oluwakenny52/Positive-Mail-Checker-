@@ -594,6 +594,18 @@ def alias_selftest(verbose=False):
     checks.append(("classify:407_is_conn", classify_error("Socket error: 407: Proxy Authentication Required") == STATUS_CONNECTION_FAILED))
     checks.append(("classify:empty", classify_error("") == STATUS_UNKNOWN))
     checks.append(("classify:domain_bind", classify_error("needs app password", "gmail.com") == STATUS_NEED_APP_PASSWORD))
+    # ---- v13.50: the five misclassifications the bounded tokens fix ----
+    checks.append(("classify:realmless",
+                   classify_error("realmless login not allowed") == STATUS_WRONG_PASSWORD))
+    checks.append(("classify:gaierror",
+                   classify_error("socket.gaierror: [Errno -2] Name or service not known")
+                   == STATUS_DNS_FAILED))
+    checks.append(("classify:proxy_dns",
+                   classify_error("Proxy DNS lookup failed") == STATUS_CONNECTION_FAILED))
+    checks.append(("classify:bare_resolution_is_not_dns",
+                   classify_error("high resolution image attached") == STATUS_UNKNOWN))
+    checks.append(("classify:ip_blocked_is_rbl",
+                   classify_error("IP blocked by provider") == STATUS_RBL_BLOCKED))
     checks.append(("proxy_level", is_proxy_level_error(STATUS_DNS_FAILED) is True))
     checks.append(("priority_order", PRIORITY[STATUS_WRONG] > PRIORITY[STATUS_VALID] > PRIORITY[STATUS_RETRY_LATER]))
     checks.append(("worse_of:skip", worse_of(STATUS_SKIP) == STATUS_SKIP))
