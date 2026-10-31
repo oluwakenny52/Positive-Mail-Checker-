@@ -572,6 +572,9 @@ if _run_was_active:
         runstate.cause()
         or "UI interaction / rerun - the run loop was torn down")
     str_lit.session_state["run_active"] = False
+    # FIX ISO-4: STATE does not exist yet, so the runs_active decrement this
+    # teardown owes is left on the session and repaid in block 039.
+    str_lit.session_state["_run_owed"] = True
 
 # Last-resort sweep for a record with no run_active behind it (a redeploy or a
 # full process restart), and it still respects the 60s staleness window.
@@ -1069,7 +1072,7 @@ def _engine_state():
         "direct_isp": {"ts": 0.0, "isp": ""},
         "smtp_domain_cache": {},
         "target_reach": {"ts": 0.0, "rows": []},
-        "selftest": {"ts": 0.0, "text": ""},
+        "selftest": {"ts": 0.0, "text": "", "user": ""},
         "helo_name": {"name": "", "ts": 0.0},
         "mail_spot": {"ts": 0.0, "host": "", "port": 0, "ok": 0, "auth": 0,
                       "other": 0, "n": 0, "error": ""},
@@ -1078,6 +1081,13 @@ def _engine_state():
         "last_probe_ts": 0.0,
         "probe_runs": 0,
         "run_active": False,
+        # FIX ISO-4 (v13.49): run_active is a single process bool, but more than
+        # one session can run at once. A plain bool cleared by whichever run
+        # finished FIRST put every other user's prober into idle cadence and made
+        # refresh_alive_pool drop its "keep the current pool" guard, so an empty
+        # probe wiped a live run's pool. runs_active is the real count;
+        # run_active is kept only as its derived bool.
+        "runs_active": 0,
         "probe_targets_override": [],
         "bootstrap_done": False,
         "first_probe_kicked": False,
@@ -1092,7 +1102,7 @@ def _engine_state():
         "geo_fail": {},
         "geo_last_call": {"ts": 0.0},
         "proxy_407_until": {},
-        "diag_cache": {"ts": 0.0, "text": ""},
+        "diag_cache": {"ts": 0.0, "text": "", "user": ""},
     }
 
 
@@ -1224,11 +1234,32 @@ def probe_targets():
     return PROBE_TARGET_PORTS.get(name) or PROBE_TARGET_PORTS[PROBE_TARGET_AUTO]
 
 
+def _any_run_active() -> bool:
+    """True while ANY session has a run in flight.
+
+    FIX ISO-4 (v13.49): run_active used to be a single process bool that whichever
+    run finished FIRST cleared, so one user's exit told every other user's prober
+    that nothing was running. Two consequences: the prober dropped to idle cadence
+    (PROBE_WORKERS_DEFAULT, and the 300s staleness skip started applying), and
+    refresh_alive_pool's "keep the current pool" guard stopped firing - so the
+    next probe cycle that returned 0 wiped the pool out from under a live run and
+    every remaining account went DIRECT.
+
+    The count is the truth; the bool is derived from it. A teardown never reaches
+    block 106's finally, so block 007 leaves the debt on the session and block 039
+    repays it.
+    """
+    try:
+        return int(STATE.get("runs_active", 0)) > 0
+    except Exception:
+        return bool(STATE.get("run_active"))
+
+
 def probe_workers(bulk: bool = False) -> int:
     try:
         if bulk:
             return max(1, int(PROBE_WORKERS_BULK))
-        base = PROBE_WORKERS_BUSY if STATE.get("run_active") else PROBE_WORKERS_DEFAULT
+        base = PROBE_WORKERS_BUSY if _any_run_active() else PROBE_WORKERS_DEFAULT
         return max(1, int(base))
     except Exception:
         return PROBE_WORKERS_DEFAULT
@@ -2496,6 +2527,18 @@ _SMTP_PRECHECK_BUDGET = 45.0
 _SMTP_PRECHECK_WORKERS = 32
 
 STATE.setdefault("proxy_407_until", {})
+
+# FIX ISO-4 (v13.49): a teardown never reaches block 106's finally, so the
+# runs_active increment it made has to be repaid by somebody. Block 007 is the
+# only place that ever PROVES the loop is gone (run_active is process state, so it
+# is still set on the load after a teardown while the loop that owned it is not),
+# and block 007 runs before STATE exists - so it leaves the debt on the session
+# and it is settled here. max(0, ...) means a double repayment cannot go negative
+# and strand the prober in busy cadence for ever.
+if str_lit.session_state.pop("_run_owed", False):
+    STATE["runs_active"] = max(0, int(STATE.get("runs_active", 0)) - 1)
+    STATE["run_active"] = STATE["runs_active"] > 0
+    log_probe_event(f"teardown repaid: runs_active now {STATE['runs_active']}")
 
 log_startup("Application process started. Initializing session state and loading configurations...")
 log_startup(f"hosts.py status -> loaded={HOSTS_OK} has_ranking={HOSTS_HAS_RANKING} "
@@ -4971,7 +5014,7 @@ def mail_dest_spot_check(force: bool = False):
 def refresh_alive_pool(force: bool = False, budget: float = None):
     budget = float(budget if budget is not None else PROBE_BATCH_BUDGET)
 
-    if (not force) and (not STATE.get("run_active")) \
+    if (not force) and (not _any_run_active()) \
             and not live_cfg().get("PROBER_IDLE_ENABLED", PROBER_IDLE_ENABLED_DEFAULT):
         return
 
@@ -4984,7 +5027,7 @@ def refresh_alive_pool(force: bool = False, budget: float = None):
         if not _PROBE_OWNER_LOCK.acquire(blocking=False):
             return
 
-    if (not force) and STATE.get("run_active"):
+    if (not force) and _any_run_active():
         last = STATE.get("last_probe_ts", 0.0)
         if last and (time.time() - last) < PROBER_STALE_WHILE_RUNNING:
             try:
@@ -5052,7 +5095,7 @@ def refresh_alive_pool(force: bool = False, budget: float = None):
         _tgts = probe_targets()
         log_probe_event(f"refresh start: {len(raw)} candidate(s), target={live_cfg().get('PROBE_TARGET')} "
                         f"({[t[0] for t in _tgts]}), budget={budget:.0f}s, "
-                        f"workers={probe_workers()}")
+                        f"workers={probe_workers()}, runs_active={STATE.get('runs_active', 0)}")
 
         live, batch_timed_out = _run_batch(precheck_proxy_fast, raw, probe_workers(), budget)
 
@@ -5064,7 +5107,7 @@ def refresh_alive_pool(force: bool = False, budget: float = None):
         elif not live and batch_timed_out:
             note = f" | probe batch budget ({budget:.0f}s) spent"
 
-        if not live and STATE.get("run_active"):
+        if not live and _any_run_active():
             with alive_pool_lock:
                 still = [p for p in alive_pool if p]
             if still:
@@ -5426,7 +5469,10 @@ with str_lit.sidebar:
                       "circuit breaker. Lower 'Min Proxy Score' or press ♻️ Lift 407 "
                       "Quarantine. The raw list is NOT used as a silent fallback.")
 
-    if _alive_now and not STATE.get("run_active"):
+    # FIX ISO-4: _any_run_active(), not STATE["run_active"] - the bool used to be
+    # cleared by whichever run ended first, so one user's exit hid another user's
+    # live run and this banner claimed READY mid-run.
+    if _alive_now and not _any_run_active():
         str_lit.success(
             f"✅ READY - **{_alive_now}** validated node(s) armed. "
             f"Paste your combos and press 🔥 Start Live Checking Engine. Nothing else to set."
@@ -5712,7 +5758,11 @@ with str_lit.expander("🔬 Deep Diagnostics - copy/paste this to debug", expand
                                   f"err={_mres.get('error', '')}")
                 else:
                     _lines.append("  tunnel: no alive node to test")
-                STATE["selftest"] = {"ts": time.time(), "text": "\n".join(_lines)}
+                # FIX ISO-5 (v13.49): selftest is PROCESS state and this text names
+                # the alive node and the egress geo, so it was rendering in the
+                # OTHER user's expander. Stamp the owner, exactly as diag_cache is.
+                STATE["selftest"] = {"ts": time.time(), "text": "\n".join(_lines),
+                                     "user": _cache_owner()}
             STATE["diag_cache"] = {"ts": 0.0, "text": "", "user": ""}
             str_lit.success("Self-test done.")
 
@@ -5732,7 +5782,10 @@ with str_lit.expander("🔬 Deep Diagnostics - copy/paste this to debug", expand
         STATE["diag_cache"] = _dcache
     _diag = _dcache["text"]
 
+    # FIX ISO-5: only show a self-test that belongs to THIS user.
     _st = STATE.get("selftest") or {}
+    if _st.get("user") != _cache_owner():
+        _st = {}
     if _st.get("text"):
         str_lit.markdown("**Last self-test:**")
         str_lit.code(_st["text"], language="text")
@@ -7971,6 +8024,10 @@ if start_engine_btn:
         # re-filter all of proxies.txt for the same answer.
         filtered_pool[:] = active_proxy_pool
 
+        # FIX ISO-4 (v13.49): runs_active is the truth and run_active is derived,
+        # so one user's exit can no longer tell another user's prober that the
+        # deployment is idle.
+        STATE["runs_active"] = int(STATE.get("runs_active", 0)) + 1
         STATE["run_active"] = True
         str_lit.session_state["run_active"] = True
 
@@ -8436,7 +8493,11 @@ if start_engine_btn:
             # unapplied settings after a run that used the tail cap.
             if _orig_deadline is not None:
                 CFG["ACCOUNT_DEADLINE"] = _orig_deadline
-            STATE["run_active"] = False
+            # FIX ISO-4 (v13.49): decrement the count and DERIVE the bool, so a
+            # second user's run is not told the deployment went idle when this one
+            # ends. max(0, ...) keeps a double release from going negative.
+            STATE["runs_active"] = max(0, int(STATE.get("runs_active", 0)) - 1)
+            STATE["run_active"] = STATE["runs_active"] > 0
             str_lit.session_state["run_active"] = False
             with session_state_lock:
                 done = set(str_lit.session_state.checked_emails_set)
