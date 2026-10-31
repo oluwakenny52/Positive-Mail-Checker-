@@ -8177,7 +8177,7 @@ def _check_account_core(email, password, conf, domain, proxy_pool, thread_state,
             return None, had_net, saw_retry, True
 # @@END 101 CORE_VERDICT_HELPERS
 
-# @@BLOCK 102 CORE_SWEEP deps=016,100,101
+# @@BLOCK 102 CORE_SWEEP deps=016,022,100,101
         def sweep(px_used, rungs, deadline_ts, label, allow_rotate=True):
             nonlocal acct_407_total, err_text
             had_net = False
@@ -8271,6 +8271,21 @@ def _check_account_core(email, password, conf, domain, proxy_pool, thread_state,
                                 retry_same_node = True
                                 proxy_dead = False
                                 rotate_now = False
+
+                        except ProxyPlanError as pln:
+                            # FIX PLAN-1: 402 is the provider refusing SERVICE on a
+                            # node that is alive and authenticated. It is not the
+                            # node, not the password, and not a network fault, so it
+                            # advances the rung without rotating or striking.
+                            err_text = str(pln)
+                            flags["saw_nonproxy"] = True
+                            record_proxy_attempt(px_used, success=False, is_plan=True)
+                            trace_logs.append(
+                                f"{px_tag(px_used)} -> PROVIDER REFUSING SERVICE {proto} "
+                                f"{server}:{port}: {err_text[:140]} "
+                                f"[402 plan/bandwidth - node kept, advancing]")
+                            server_level_fail = True
+                            rotate_now = False
 
                         except ProxyPortBlocked as pblk:
                             # FIX 407-SCOPE: 403 means the provider refuses this
