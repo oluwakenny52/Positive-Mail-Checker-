@@ -2396,12 +2396,26 @@ _STARTUP_SEEN = STATE.setdefault("startup_seen", set())
 _STARTUP_MAX = 400
 
 
+def _startup_who() -> str:
+    """The owner stamp for a shared-buffer line (block 037's cache owner)."""
+    try:
+        return _cache_owner()
+    except Exception:
+        return ""
+
+
 def log_startup(msg, quiet: bool = False):
     ts = datetime.now().strftime("%H:%M:%S.%f")[:-3]
     entry = f"[{ts}] [INIT/HOOD] {msg}"
+    # FIX ISO-3 (v13.49): _STARTUP_BUFFER is PROCESS state, so this used to append
+    # straight into one list that startup_panel_lines() then handed to whoever
+    # asked - user B's panel and diagnostic bundle carried user A's boot lines,
+    # ACTIVE CONFIG line and proxy-refresh messages, and A's volume could push B's
+    # own lines past the 400 cap. Every buffered line now carries its owner and
+    # the reader filters. A bare string is a pre-fix entry and stays shared.
     if quiet:
         with _STARTUP_BUFFER_LOCK:
-            _STARTUP_BUFFER.append(entry)
+            _STARTUP_BUFFER.append([_startup_who(), entry])
             if len(_STARTUP_BUFFER) > _STARTUP_MAX:
                 del _STARTUP_BUFFER[:-_STARTUP_MAX]
         return
@@ -2421,7 +2435,7 @@ def log_startup(msg, quiet: bool = False):
             _STARTUP_SEEN.add(msg)
     except Exception:
         with _STARTUP_BUFFER_LOCK:
-            _STARTUP_BUFFER.append(entry)
+            _STARTUP_BUFFER.append([_startup_who(), entry])
 
 
 def startup_panel_lines():
@@ -2429,8 +2443,15 @@ def startup_panel_lines():
         main = list(str_lit.session_state.startup_entries)
     except Exception:
         main = []
+    who = _startup_who()
     with _STARTUP_BUFFER_LOCK:
-        buffered = list(_STARTUP_BUFFER)
+        buffered = []
+        for item in _STARTUP_BUFFER:
+            if isinstance(item, (list, tuple)) and len(item) == 2:
+                if item[0] == who:
+                    buffered.append(item[1])
+            elif isinstance(item, str):
+                buffered.append(item)
     if not buffered:
         return main
     return main + ["", "-- background thread (quiet mode) --"] + buffered
@@ -3614,15 +3635,32 @@ def build_cfg():
 # @@END 054 BUILD_CFG
 
 # @@BLOCK 055 APPLY_SETTINGS deps=020,040,054
+# FIX ISO-2 (v13.49): applied_cfg lives in session_state and RESULTS_DIR is baked
+# into it from user_file() at Apply time. It was only rebuilt when MISSING or when
+# the version changed - so after "Forget this passkey" and a second unlock in the
+# same tab, RESULTS_DIR still pointed at the PREVIOUS user's directory and every
+# bucket file was written there, while clean_valid and the resume record followed
+# the new user. The owner is now part of the rebuild condition.
+_cfg_owner = _cache_owner()
+
 if "applied_cfg" not in str_lit.session_state:
     str_lit.session_state.applied_cfg = build_cfg()
     str_lit.session_state.applied_cfg_version = CFG_VERSION
+    str_lit.session_state.applied_cfg_owner = _cfg_owner
 elif str_lit.session_state.get("applied_cfg_version") != CFG_VERSION:
     _migrated = build_cfg()
     str_lit.session_state.applied_cfg = _migrated
     str_lit.session_state.applied_cfg_version = CFG_VERSION
+    str_lit.session_state.applied_cfg_owner = _cfg_owner
     log_startup(f"Config migrated to v{CFG_VERSION} defaults "
                 f"(untouched widgets adopted the new defaults).")
+elif str_lit.session_state.get("applied_cfg_owner") != _cfg_owner:
+    _migrated = build_cfg()
+    str_lit.session_state.applied_cfg = _migrated
+    str_lit.session_state.applied_cfg_version = CFG_VERSION
+    str_lit.session_state.applied_cfg_owner = _cfg_owner
+    log_startup("Config re-pathed: the unlocked user changed, so RESULTS_DIR was "
+                "still pointing at the previous user's directory.")
 
 _settings_dirty = build_cfg() != str_lit.session_state.applied_cfg
 if _settings_dirty:
@@ -3643,6 +3681,7 @@ if _reset_clicked:
 if _apply_clicked:
     str_lit.session_state.applied_cfg = build_cfg()
     str_lit.session_state.applied_cfg_version = CFG_VERSION
+    str_lit.session_state.applied_cfg_owner = _cfg_owner
     _reset_gates()
     str_lit.sidebar.success("Settings applied successfully!")
     log_startup("User applied new configuration settings via sidebar control panel.")
@@ -3684,6 +3723,10 @@ for _k, _v in (
     ("PROTOCOLS", list(PROTOCOL_SELECTION_DEFAULT)),
 ):
     CFG.setdefault(_k, _v)
+
+# The path is re-asserted every run, so an applied_cfg inherited from a previous
+# user can never outlive the switch even if a branch above was skipped.
+CFG["RESULTS_DIR"] = user_file("mail_results")
 
 STATE["cfg"] = CFG
 
