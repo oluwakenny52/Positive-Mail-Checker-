@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""verify_v1337.py - regression harness for the v13.37 patch set (v13.47 revision).
+"""verify_v1337.py - regression harness for the v13.37 patch set (v13.48 revision).
 
 Run from the repo root:   python verify_v1337.py
 Exit code 0 = clean.
@@ -14,8 +14,29 @@ plus that no two files in pages/ share a page number, that the build identity in
 app.py, its @@FILE header and pages/6_User_Guide.py all agree, and that every
 auth.<name> a page CALLS is actually defined in auth.py.
 
-WHY THIS REVISION EXISTS (v13.47)
+WHY THIS REVISION EXISTS (v13.48)
 ---------------------------------
+  * THE STATE-BACKED CACHE GATE WAS FORMAT-DEPENDENT.  It asserted the literal
+    '_PERSISTENT_VALID_CACHE = STATE.setdefault("persistent_valid_cache"' as ONE
+    line, but app.py wraps that call across two, so the needle was split by the
+    newline and indentation and the gate went red on a pure reflow.  A gate that
+    fails on reformatting is the same defect this file already fixed for the
+    build identity - it gets hand-edited instead of trusted.  has_flat()
+    compares both sides with all whitespace removed, so the wrap cannot matter.
+  * _PREV_VALID_CACHE HAD NO GATE AT ALL.  It is the second STATE-backed valid
+    cache (block 037 binds it, block 085 keys it to the cache owner) and nothing
+    asserted either fact.  Both caches are now gated identically, including the
+    `.get("user") == who` owner comparison that keeps one user's valid list out
+    of the other user's session.
+  * BOTH ALIASES ARE COUNTED.  exactly(..., 1) catches a second binding, which
+    would silently rebind and win - the same override class the build-identity
+    constants are already guarded against.
+  * The whole group is has_flat(), not just the one needle that happened to be
+    wrapped: the other three were only passing by luck of formatting and would
+    have gone red the moment a formatter wrapped them too.
+
+WHY THE PREVIOUS REVISION EXISTED (v13.47)
+------------------------------------------
   * BUILD IDENTITY IS DERIVED, NOT HARDCODED.  The harness used to assert the
     literals "CFG_VERSION = 1340" and 'BUILD_TAG = "v13.40"'.  app.py moved to
     1347 / v13.47 and the gate went red on every single bump until someone
@@ -116,6 +137,25 @@ def code_view(src):
 
 def has(src, needle, label):
     if needle in src:
+        PASSES.append(label)
+    else:
+        FAILS.append("MISSING: " + label + "   -> " + repr(needle[:80]))
+
+
+def _flat(s):
+    """Whitespace-free projection: a needle the formatter wrapped still matches."""
+    return re.sub(r"\s+", "", s)
+
+
+def has_flat(src, needle, label):
+    """has() for a needle a formatter may split across lines.
+
+    app.py wraps long STATE.setdefault(...) calls across two lines.  A raw
+    substring gate goes red on a pure reflow and then gets hand-edited - the
+    exact thing this file exists to stop.  Compare with all whitespace removed
+    instead, so only a real change to the code can fail it.
+    """
+    if _flat(needle) in _flat(src):
         PASSES.append(label)
     else:
         FAILS.append("MISSING: " + label + "   -> " + repr(needle[:80]))
@@ -427,19 +467,36 @@ def main():
         gone(app_code, "st_val in (WRONG, UNKNOWN, LOGIN_DROPPED)",
              "P0 the shadowed WRONG/UNKNOWN branch is re-gated")
 
-                # ---- P0-v13.39: TLS switch, STATE caches, mobile, hero guard ----
+        # ---- P0-v13.39: TLS switch, STATE caches, mobile, hero guard ----
         has(app, "def tls_connect(host, port, proxy_str=None, insecure=None, timeout=None):",
             "P0 tls_connect resolves insecure from CFG")
         has(app, "TLS_STRICT is ON so NOT falling back", "P0 TLS_STRICT is honoured")
         has(app, '"TLS_STRICT": not self_signed', "P0 TLS_STRICT follows the checkbox")
-        has(app, '_STARTUP_SEEN = STATE.setdefault("startup_seen", set())',
-            "P0 startup dedupe set is STATE-backed")
-        has(app, '_DNS_CACHE = STATE.setdefault("dns_cache", {})',
-            "P0 DNS cache is STATE-backed")
-        has(app, '_PERSISTENT_VALID_CACHE = STATE.setdefault("persistent_valid_cache"',
-            "P0 valid cache is STATE-backed")
-        has(app, '_geo_last_call = STATE.setdefault("geo_last_call"',
-            "P0 geo throttle state is STATE-backed")
+        # v13.48: has_flat, not has - every one of these is a STATE.setdefault()
+        # call that a formatter may wrap, and two of them (block 037) already are.
+        has_flat(app, '_STARTUP_SEEN = STATE.setdefault("startup_seen", set())',
+                 "P0 startup dedupe set is STATE-backed")
+        has_flat(app, '_DNS_CACHE = STATE.setdefault("dns_cache", {})',
+                 "P0 DNS cache is STATE-backed")
+        has_flat(app, '_PERSISTENT_VALID_CACHE = STATE.setdefault("persistent_valid_cache"',
+                 "P0 valid cache is STATE-backed")
+        has_flat(app, '_PREV_VALID_CACHE = STATE.setdefault("prev_valid_cache"',
+                 "P0 previous valid cache is STATE-backed")
+        has_flat(app, '_geo_last_call = STATE.setdefault("geo_last_call"',
+                 "P0 geo throttle state is STATE-backed")
+        # The cache is process-wide, so both must be keyed to the cache OWNER or
+        # one user's valid list (passwords included) is served to the next user.
+        has_flat(app, '_PERSISTENT_VALID_CACHE.get("user") == who',
+                 "P0 valid cache is keyed to the cache owner")
+        has_flat(app, '_PREV_VALID_CACHE.get("user") == who',
+                 "P0 previous valid cache is keyed to the cache owner")
+        # Exactly once each: a second binding silently wins by rebinding.
+        # `_PERSISTENT_VALID_CACHE["ts"] = 0.0` does not contain the needle
+        # because the bracket breaks it, and neither name is a prefix of the other.
+        exactly(app_code, "_PERSISTENT_VALID_CACHE =", 1,
+                "P0 valid cache alias is bound once")
+        exactly(app_code, "_PREV_VALID_CACHE =", 1,
+                "P0 previous valid cache alias is bound once")
         has(app, "def metric_grid(pairs, per_row: int = 3):", "P0 metrics wrap per row")
         has(app, "initial_sidebar_state=\"collapsed\"", "P0 sidebar starts collapsed")
         has(app, "if BUILD_TAG not in str(base.get(\"hero_title\", \"\")):",
@@ -456,8 +513,8 @@ def main():
         has(app, "while page <= 20:", "P1 fetch_ws paginates")
         has(app, "GEO_FAIL_TTL = 300.0", "P1 geo negative-cache TTL present")
         has(app, "GEO_MIN_INTERVAL", "P1 geo throttle constant present")
-        has(app, '_GEO_FAIL = STATE.setdefault("geo_fail", {})',
-            "P1 geo negative cache is STATE-backed")
+        has_flat(app, '_GEO_FAIL = STATE.setdefault("geo_fail", {})',
+                 "P1 geo negative cache is STATE-backed")
         has(app, "_geo_last_call", "P1 geo throttle state present")
 
         # ---- P2 ----
