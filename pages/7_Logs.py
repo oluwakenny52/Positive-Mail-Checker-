@@ -166,14 +166,19 @@ st.markdown(
 
 import auth
 
+# v13.48: ledger. page() before the gate, install() after it, install BEFORE
+# fit_panel so this page's own controls are recorded too.
+import audit_log
+
+audit_log.page("pages/7_Logs.py")
+
 auth.require(st, "Unlock Full Log")
 auth.fit(st)                        # CSS only, before the first widget
 from auth import user_file          # after the gate, so it binds the live module
-auth.fit_panel(st)                  # the controls; collapsed until tapped
-
-import audit_log
 
 audit_log.install(st, "pages/7_Logs.py")
+
+auth.fit_panel(st)                  # the controls; collapsed until tapped
 # @@END 005 HERO
 
 # @@BLOCK 006 SOURCES deps=005
