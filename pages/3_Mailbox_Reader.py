@@ -101,15 +101,16 @@ if not hasattr(auth, "fit_panel"):
 from auth import user_file          # blocks 012, 019 and 032 resolve paths through it
                                     # NB: must stay AFTER the reload above
 
+# v13.48: ledger. page() before the gate, install() after it, both above the
+# first widget so the sidebar and the page body are wrapped. fit_panel() is NOT
+# called here - it renders the Display Fit expanders and belongs under the hero
+# (block 027), so install() must land before it to see its sliders.
+import audit_log
+
+audit_log.page("pages/3_Mailbox_Reader.py")
+
 auth.require(st, "Unlock Mailbox Reader")
 auth.fit(st)                        # CSS only, before the first widget
-
-# v13.48: click/outcome ledger, after the gate so the file lands on the unlocked
-# prefix rather than the anon placeholder.
-#
-# fit_panel() is NOT called here any more: it renders the Display Fit expanders,
-# and those belong UNDER the hero, not above it. It is called in block 027.
-import audit_log
 
 audit_log.install(st, "pages/3_Mailbox_Reader.py")
 # @@END 001 PAGE_CONFIG
