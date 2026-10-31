@@ -129,13 +129,18 @@ st.markdown(
 
 import auth
 
-auth.require(st, "Unlock Diagnostics")
-auth.fit(st)                        # CSS only, before the first widget
-auth.fit_panel(st)                  # the controls; collapsed until tapped
-
+# v13.48: ledger. page() before the gate, install() after it, install BEFORE
+# fit_panel so the Display Fit sliders are recorded too.
 import audit_log
 
+audit_log.page("pages/2_Diagnostics.py")
+
+auth.require(st, "Unlock Diagnostics")
+auth.fit(st)                        # CSS only, before the first widget
+
 audit_log.install(st, "pages/2_Diagnostics.py")
+
+auth.fit_panel(st)                  # the controls; collapsed until tapped
 # @@END 005 HERO
 
 
