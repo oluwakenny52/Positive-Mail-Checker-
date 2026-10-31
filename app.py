@@ -5584,9 +5584,6 @@ with str_lit.sidebar:
             _su = (_pi.get("user") or "").strip().lower()
             if _su:
                 _subs.add(_su)
-    str_lit.info(f"Loaded Proxies: **{len(all_proxies)}** lines / **{len(_ips)}** IPs / "
-                 f"**{len(_subs)}** sub-users | Filtered: **{len(filtered_pool)}** | "
-                 f"Alive: **{_alive_now}**")
 
     # FIX UI-1 (the ledger lie): filtered_pool is re-created EMPTY at module level
     # on EVERY rerun (block 058) and nothing fills it before this point, so
@@ -5594,36 +5591,50 @@ with str_lit.sidebar:
     # unconditionally and, because st.error CLOSES the pending press, Reset Theme,
     # Reset Display Fit, every help_btn and Show raw proxies.txt were all recorded
     # as FAILED with a proxy message. The pool was never broken; the banner was.
-    # Compute the real answer first, then judge it.
-    #
+    # FIX UI-3: the compute now sits ABOVE the info line, so "Filtered:" is never
+    # the stale module-level 0 either.
+    if all_proxies and not filtered_pool:
+        filtered_pool = get_filtered_active_proxies(quiet=True)
+
     # FIX UI-2: a page-level banner also steals presses when it is healthy - the
-    # READY success below did exactly the same thing. Both banners now only use a
-    # real message widget when nothing has reported yet, and degrade to a caption
-    # otherwise, so an unrelated press closes honestly as NO RESULT.
+    # READY success below did exactly the same thing. Every banner now only uses a
+    # real message widget when nothing has reported yet, and degrades to a caption
+    # otherwise, so an unrelated press closes honestly.
     _pend = str_lit.session_state.get("_audit_pending") or {}
     _steal = bool(_pend) and not _pend.get("outcome")
 
-    if all_proxies and not filtered_pool:
-        filtered_pool = get_filtered_active_proxies(quiet=True)
+    str_lit.info(f"Loaded Proxies: **{len(all_proxies)}** lines / **{len(_ips)}** IPs / "
+                 f"**{len(_subs)}** sub-users | Filtered: **{len(filtered_pool)}** | "
+                 f"Alive: **{_alive_now}**")
+
     if all_proxies and not filtered_pool:
         _etxt = ("⚠ **Every proxy was filtered out** by Min Proxy Score / pool mode / "
                  "circuit breaker. Lower 'Min Proxy Score' or press ♻️ Lift 407 "
                  "Quarantine. The raw list is NOT used as a silent fallback.")
         (str_lit.caption if _steal else str_lit.error)(_etxt)
 
+    _p_ok, _p_auth, _p_to, _p_dead = probe_summary()
+
     # FIX ISO-4: _any_run_active(), not STATE["run_active"] - the bool used to be
     # cleared by whichever run ended first, so one user's exit hid another user's
     # live run and this banner claimed READY mid-run.
+    # FIX UI-4: "N validated node(s) armed" was a lie when NONE passed the probe.
     if _alive_now and not _any_run_active():
-        _rtxt = (f"✅ READY - **{_alive_now}** validated node(s) armed. "
-                 f"Paste your combos and press 🔥 Start Live Checking Engine. "
-                 f"Nothing else to set.")
-        (str_lit.caption if _steal else str_lit.success)(_rtxt)
+        if _p_ok:
+            _rtxt = (f"✅ READY - **{_alive_now}** validated node(s) armed. "
+                     f"Paste your combos and press 🔥 Start Live Checking Engine. "
+                     f"Nothing else to set.")
+            _rfunc = str_lit.caption if _steal else str_lit.success
+        else:
+            _rtxt = (f"⚠ **{_alive_now}** node(s) armed but **0 passed the probe** - "
+                     f"they will mostly 407. Set **Proxy Mode Engine = off** (DIRECT), "
+                     f"or press ♻️ Lift 407 Quarantine.")
+            _rfunc = str_lit.caption if _steal else str_lit.warning
+        _rfunc(_rtxt)
     elif not all_proxies and not WEBSHARE_KEYS:
         str_lit.info("No proxies configured - press 📥 Fetch & Test All Proxies, or run "
                      "fully DIRECT.")
 
-    _p_ok, _p_auth, _p_to, _p_dead = probe_summary()
     str_lit.caption(
         f"Probe ({CFG.get('PROBE_TARGET', PROBE_TARGET_DEFAULT)}, {probe_timeout():.0f}s): "
         f"pass **{_p_ok}** | 407 auth **{_p_auth}** | timeout/reset **{_p_to}** | "
@@ -5641,12 +5652,19 @@ with str_lit.sidebar:
                    f"pass **{_ms['ok']}** | 407 **{_ms['auth']}** | other **{_ms['other']}** "
                    f"/ {_ms['n']} node(s), {_ms_age}s ago")
         if _ms.get("auth") and not _ms.get("ok"):
-            str_lit.error(
-                "🚨 " + _ms_txt + " - the pool passes the WEB probe but the provider is "
-                "refusing MAIL destinations with 407. Set **Proxy Mode Engine = off** "
-                "(DIRECT) or wait for the 'email servers' cap to reset. Those passwords "
-                "are still untested."
-            )
+            if _p_ok:
+                _mtail = ("the provider is refusing MAIL destinations with 407. Set "
+                          "**Proxy Mode Engine = off** (DIRECT) or wait for the 'email "
+                          "servers' cap to reset. Those passwords are still untested.")
+            else:
+                _mtail = ("every node is failing with 407, INCLUDING the web probe - the "
+                          "provider is rejecting the proxy credentials themselves, not "
+                          "just mail. Set **Proxy Mode Engine = off** (DIRECT), or check "
+                          "the sub-user passwords and the plan's concurrency cap.")
+            # FIX UI-5: this was the THIRD unconditional st.error and the one still
+            # stamping FAILED onto Reset Display Fit.
+            _mfull = "🚨 " + _ms_txt + " - " + _mtail
+            (str_lit.caption if _steal else str_lit.error)(_mfull)
         else:
             str_lit.caption(_ms_txt)
 
@@ -5802,10 +5820,14 @@ with str_lit.sidebar:
                     _last = f"{_rlabel} · {_age2}"
                 else:
                     _last = "-"
+                # FIX UI-6: the Latency column read proxy_meta, which is only ever
+                # written on SUCCESS - so every 407 node showed a flat 0 ms. The
+                # probe records latency on failure too; read that first.
+                _lat = _ps.get("latency_ms", meta.get("latency_ms", 0))
                 rows.append({
                     "Proxy": f"{info['host']}:{info['port']}" if info else "Unknown",
                     "User": (info.get("user") if info else "") or "",
-                    "Latency": f"{meta.get('latency_ms', 'N/A')} ms",
+                    "Latency": f"{_lat} ms",
                     "Country": meta.get("country", "Unknown"),
                     "Region": meta.get("region", "Unknown"),
                     "Score": meta.get("score", 50),
