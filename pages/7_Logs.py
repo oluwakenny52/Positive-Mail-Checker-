@@ -1,4 +1,5 @@
-# @@FILE pages/7_Logs.py blocks=14 version=# @@BLOCK 000 FILE_HEADER deps=-
+# @@FILE pages/7_Logs.py blocks=14 version=v13.48
+# @@BLOCK 000 FILE_HEADER deps=-
 """
 pages/7_Logs.py - Full Log & Operator Trace  (v13.48)
 =====================================================
@@ -169,6 +170,10 @@ auth.require(st, "Unlock Full Log")
 auth.fit(st)                        # CSS only, before the first widget
 from auth import user_file          # after the gate, so it binds the live module
 auth.fit_panel(st)                  # the controls; collapsed until tapped
+
+import audit_log
+
+audit_log.install(st, "pages/7_Logs.py")
 # @@END 005 HERO
 
 # @@BLOCK 006 SOURCES deps=005
@@ -411,6 +416,14 @@ def _as_text():
     L.append("")
     L.append("--- STARTUP LEDGER (%d line(s)) ---" % len(STARTUP))
     L.extend(STARTUP)
+    L.append("")
+    _act_all_export = audit_log.entries(limit=audit_log.MAX_LINES)
+    L.append("--- ACTION LEDGER (%d press(es)) ---" % len(_act_all_export))
+    for a in _act_all_export:
+        L.append("%s | %-9s | %s | %s%s"
+                 % (a.get("ts", ""), a.get("outcome", ""), a.get("page", ""),
+                    a.get("label", ""),
+                    (" | " + a.get("detail", "")) if a.get("detail") else ""))
     return "\n".join(L)
 # @@END 008 FILTERS
 
@@ -455,9 +468,9 @@ st.download_button(
 # @@END 009 SUMMARY
 
 # @@BLOCK 010 TAB_EXEC_LOG deps=008
-_t_log, _t_trace, _t_boot, _t_rec, _t_files = st.tabs(
+_t_log, _t_trace, _t_boot, _t_rec, _t_files, _t_actions = st.tabs(
     ["⚡ Execution log", "🎯 Operator trace", "🖥 Boot ledger",
-     "🗂 Run record", "📁 File history"])
+     "🗂 Run record", "📁 File history", "🖱 Action ledger"])
 
 with _t_log:
     st.caption("One line per account as it was produced. The status tag is the verdict.")
@@ -549,5 +562,61 @@ with _t_rec:
             st.download_button("⬇️ Download traces .csv", data=_buf.getvalue().encode("utf-8"),
                                file_name="traces_%s.csv" % datetime.now().strftime("%Y%m%d_%H%M%S"),
                                mime="text/csv", width="stretch")
+
+with _t_actions:
+    st.caption("Every press recorded for YOUR user, newest first, with the outcome the "
+               "run reported. NO RESULT means the action finished without saying anything "
+               "- that is the one worth looking at. The ledger is capped at "
+               f"{audit_log.MAX_LINES} lines; the oldest are trimmed.")
+    st.caption("A rerun is not an outcome: an action that ends in flash() + rerun is "
+               "attributed to the message the NEXT run renders, and only closes as "
+               "NO RESULT if none arrives.")
+
+    _act_rows = audit_log.entries(limit=audit_log.MAX_LINES)
+    if act_filter:
+        _act_rows = [a for a in _act_rows if a.get("outcome") in act_filter]
+    if act_search.strip():
+        _q = act_search.strip().lower()
+        _act_rows = [a for a in _act_rows
+                     if _q in (a.get("label", "") + a.get("page", "")
+                               + a.get("detail", "")).lower()]
+    if order == "oldest first":
+        _act_rows = _act_rows[::-1]
+
+    _c1, _c2, _c3, _c4 = st.columns(4)
+    _c1.metric("Presses", len(_act_rows))
+    _c2.metric("OK", sum(1 for a in _act_rows if a.get("outcome") == "OK"))
+    _c3.metric("Failed", sum(1 for a in _act_rows if a.get("outcome") == "FAILED"))
+    _c4.metric("No result", sum(1 for a in _act_rows if a.get("outcome") == "NO RESULT"))
+
+    if not _act_rows:
+        st.info("No presses recorded yet for this user"
+                + (" matching the filter." if (act_filter or act_search.strip()) else
+                   ". Use the app and they will appear here."))
+    else:
+        _ACT_COLOUR = {"OK": "#22c55e", "FAILED": "#ef4444", "ERROR": "#fb7185",
+                       "WARN": "#facc15", "STOPPED": "#38bdf8",
+                       "NO RESULT": "#e879f9", "INFO": "#94a3b8"}
+        if wrap:
+            _html = "".join(
+                '<div class="lg-line" style="color:%s">%s · <b>%s</b> · %s · %s%s</div>'
+                % (_ACT_COLOUR.get(a.get("outcome", ""), "inherit"),
+                   _esc(a.get("ts", "")), _esc(a.get("outcome", "")),
+                   _esc(a.get("page", "")), _esc(a.get("label", "")),
+                   (" — " + _esc(a.get("detail", ""))) if a.get("detail") else "")
+                for a in _act_rows)
+            st.markdown('<div class="lg-box">%s</div>' % _html, unsafe_allow_html=True)
+        else:
+            st.code("\n".join("%s | %-9s | %s | %s%s"
+                              % (a.get("ts", ""), a.get("outcome", ""), a.get("page", ""),
+                                 a.get("label", ""),
+                                 (" | " + a.get("detail", "")) if a.get("detail") else "")
+                              for a in _act_rows), language="text")
+
+        st.download_button(
+            "⬇️ Download this ledger view",
+            data="\n".join(json.dumps(a, ensure_ascii=False) for a in _act_rows).encode("utf-8"),
+            file_name="action_log_%s.jsonl" % datetime.now().strftime("%Y%m%d_%H%M%S"),
+            mime="application/json", width="stretch")
 # @@END 013 TAB_RECORD
 # @@EOF
