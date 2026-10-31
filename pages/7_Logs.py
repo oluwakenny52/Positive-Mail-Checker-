@@ -1,16 +1,17 @@
-# @@FILE pages/7_Logs.py blocks=14 version=v13.47
-# @@BLOCK 000 FILE_HEADER deps=-
+# @@FILE pages/7_Logs.py blocks=14 version=# @@BLOCK 000 FILE_HEADER deps=-
 """
-pages/7_Logs.py - Full Log & Operator Trace  (v13.47)
+pages/7_Logs.py - Full Log & Operator Trace  (v13.48)
 =====================================================
 Everything the engine did, in one place: the live execution log, the per-account
-dial trace, the startup ledger, the run record and every result file on disk.
+dial trace, the startup ledger, the run record, every result file on disk, and
+the ACTION LEDGER - every press and whether it did its job.
 
-READ-ONLY. No mailbox connection, no proxy credit, no writes.
+READ-ONLY except for one thing: the action ledger's Reset button. No mailbox
+connection, no proxy credit.
 
 PER-USER ISOLATION - the contract
 ---------------------------------
-Two people on one deployment must never see each other's runs. Three separate
+Two people on one deployment must never see each other's runs. Four separate
 boundaries, and every one of them is enforced here, not assumed:
 
   1. SESSION BUCKETS are per browser session. log_lines, report_entries and
@@ -27,8 +28,21 @@ boundaries, and every one of them is enforced here, not assumed:
      against process-wide STATE, so user two silently lost every line user one
      had already logged.
 
+  4. ACTION LEDGER is <hash>_mail_results/action_log.jsonl - one file per user,
+     written by audit_log.py. Reset removes only YOUR ledger.
+
 theme.json, proxies.txt and proxy_meta.json stay SHARED on purpose - they are
 deployment infrastructure, not user data.
+
+WHY THE ACTION LEDGER EXISTS (v13.48)
+-------------------------------------
+"Did the button do anything?" was previously answerable only by watching the
+screen. audit_log.py wraps the click surface of every page and the message
+surface that follows it, so a press and its outcome (OK / FAILED / WARN /
+ERROR / STOPPED / NO RESULT) are recorded together, per user, without a single
+call added inside an action body. A press that reports nothing is closed as
+NO RESULT on the following run - an action that said nothing is a finding, not
+an absence.
 
 WHY THIS IS A FORENSIC VIEW AND NOT A LIVE WINDOW
 -------------------------------------------------
