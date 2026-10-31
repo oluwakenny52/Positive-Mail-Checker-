@@ -164,16 +164,19 @@ if not _CLI_FIX_CHECK:
     if not hasattr(auth, "fit_panel"):
         auth = importlib.reload(auth)
 
-    auth.require(st, "Unlock Block Inspector")
-    auth.fit(st)                        # CSS only, before the first widget
-    auth.fit_panel(st)                  # the controls; collapsed until tapped
-
-    # v13.48: click/outcome ledger. INSIDE the branch - audit_log needs the real
-    # st (the _BareSt stand-in has no working session_state for the pending
-    # entry), and the branch is what keeps --fix-check free of Streamlit.
+    # v13.48: ledger, all inside the branch - audit_log needs the real st, and
+    # the branch is what keeps --fix-check free of Streamlit. page() before the
+    # gate, install() after it and before the first widget.
     import audit_log
 
+    audit_log.page("pages/5_Blocks.py")
+
+    auth.require(st, "Unlock Block Inspector")
+    auth.fit(st)                        # CSS only, before the first widget
+
     audit_log.install(st, "pages/5_Blocks.py")
+
+    auth.fit_panel(st)                  # the controls; collapsed until tapped
 # @@END 004 HERO
 
 
