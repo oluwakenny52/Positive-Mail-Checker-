@@ -164,15 +164,18 @@ if not hasattr(auth, "fit_panel"):
 
 from auth import user_file         # AFTER the reload, so it binds to the live module
 
-auth.require(st, "Unlock Export Studio")
-auth.fit(st)                        # CSS only, before the first widget
-auth.fit_panel(st)                  # the controls; collapsed until tapped
-
-# v13.48: click/outcome ledger, after the gate so the file lands on the unlocked
-# prefix rather than the anon placeholder.
+# v13.48: ledger. page() before the gate, install() after it, and install BEFORE
+# fit_panel so the Display Fit sliders are wrapped too.
 import audit_log
 
+audit_log.page("pages/4_Downloads.py")
+
+auth.require(st, "Unlock Export Studio")
+auth.fit(st)                        # CSS only, before the first widget
+
 audit_log.install(st, "pages/4_Downloads.py")
+
+auth.fit_panel(st)                  # the controls; collapsed until tapped
 # @@END 005 HERO
 
 
