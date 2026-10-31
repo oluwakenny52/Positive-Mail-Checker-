@@ -322,6 +322,16 @@ LIVE_REC = _record("unfinished_live.json")
 # @@END 006 SOURCES
 
 # @@BLOCK 007 SIDEBAR deps=006
+# v13.50: both search boxes are created key-only.  A text_input that carries
+# value="" AND a key already present in session_state raises Streamlit's
+# "created with a default value but also had its value set via the Session
+# State API" warning on every rerun after the first.  Seed the keys before any
+# widget exists, then create them key-only - the typed text also stops being
+# wiped by an unrelated rerun.
+for _k in ("lg_search", "lg_act_search"):
+    if _k not in st.session_state:
+        st.session_state[_k] = ""
+
 with st.sidebar:
     st.markdown("### 📜 Log controls")
     if st.button("🔄 Re-read everything", width="stretch"):
@@ -358,7 +368,7 @@ with st.sidebar:
                key=lambda s: (s not in TAG_ORDER, s)),
         default=[],
         help="Empty = every status.")
-    search = st.text_input("Search (substring, case-insensitive)", value="")
+    search = st.text_input("Search (substring, case-insensitive)", key="lg_search")
     order = st.radio("Order", ["newest first", "oldest first"], index=0)
     wrap = st.toggle("Colourise status tags", value=True)
 
@@ -369,7 +379,7 @@ with st.sidebar:
     _act_outcomes = ["PAGE", "OK", "FAILED", "WARN", "ERROR", "STOPPED",
                      "NO RESULT", "CHANGED"]
     act_filter = st.multiselect("Only these outcomes", _act_outcomes, default=[])
-    act_search = st.text_input("Search the ledger", value="", key="lg_act_search")
+    act_search = st.text_input("Search the ledger", key="lg_act_search")
 
     st.markdown("---")
     st.caption("File history")
