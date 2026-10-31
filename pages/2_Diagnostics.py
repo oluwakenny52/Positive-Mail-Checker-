@@ -132,6 +132,10 @@ import auth
 auth.require(st, "Unlock Diagnostics")
 auth.fit(st)                        # CSS only, before the first widget
 auth.fit_panel(st)                  # the controls; collapsed until tapped
+
+import audit_log
+
+audit_log.install(st, "pages/2_Diagnostics.py")
 # @@END 005 HERO
 
 
