@@ -4121,6 +4121,56 @@ def _dedupe_hosts_by_ip(hosts, cap=3):
 # @@END 059 DNS_CACHE
 
 # @@BLOCK 060 PROXY_CONNECT deps=022,023,059
+def _raw_http_connect(host, port, info, timeout):
+    """CONNECT through an HTTP proxy with a hand-built request.
+
+    PySocks is a thin wrapper around exactly these bytes, but it only attaches
+    Proxy-Authorization when BOTH the username and the password are truthy, and
+    a build that drops the header silently is indistinguishable from a wrong
+    password (407). Building the request here removes that dependency for the
+    HTTP scheme - and it is the same exchange the Proxy Debug Console performs.
+    """
+    sk = socket.create_connection((info["host"], int(info["port"])), timeout=timeout)
+    try:
+        sk.settimeout(timeout)
+        tok = base64.b64encode(
+            f"{info.get('user') or ''}:{info.get('pass') or ''}".encode()).decode()
+        req = (f"CONNECT {host}:{port} HTTP/1.1\r\n"
+               f"Host: {host}:{port}\r\n"
+               f"Proxy-Connection: keep-alive\r\n"
+               f"Proxy-Authorization: Basic {tok}\r\n\r\n")
+        sk.sendall(req.encode())
+        buf = b""
+        while b"\r\n" not in buf and len(buf) < 2048:
+            ch = sk.recv(2048)
+            if not ch:
+                break
+            buf += ch
+        line = buf.split(b"\r\n", 1)[0].decode("latin-1", "replace")
+        parts = line.split()
+        code = int(parts[1]) if len(parts) >= 2 and parts[1].isdigit() else 0
+        if code == 200:
+            return sk
+        try:
+            sk.close()
+        except Exception:
+            pass
+        if code == 407:
+            raise ProxyAuthError(f"proxy rejected the credential (raw CONNECT 407): {line}")
+        if code == 403:
+            raise ProxyPortBlocked(f"proxy refused the destination (raw CONNECT 403): {line}")
+        raise ProxyTransportError(
+            f"proxy answered {code or 'nothing'} to CONNECT: {line[:140]}")
+    except (ProxyAuthError, ProxyPortBlocked, ProxyTransportError):
+        raise
+    except Exception:
+        try:
+            sk.close()
+        except Exception:
+            pass
+        raise
+
+
 def proxy_connect(host, port, proxy_str, timeout=None, remote_dns=True):
     """Open a tunnel.  This is ALWAYS a proxy hop."""
     base_timeout = timeout or live_cfg()["PROXY_CONNECT_TIMEOUT"]
@@ -4151,12 +4201,16 @@ def proxy_connect(host, port, proxy_str, timeout=None, remote_dns=True):
     port_blocked = False
     for ptype in _scheme_order(proxy_str):
         try:
-            kw = {"proxy_type": ptype, "proxy_addr": info["host"],
-                  "proxy_port": info["port"], "proxy_rdns": remote_dns}
-            if info["user"]:
-                kw["proxy_username"] = info["user"]
-                kw["proxy_password"] = info["pass"]
-            s = socks.create_connection((host, port), timeout=leg_to, **kw)
+            # HTTP is dialled by hand - the auth header is ours, not PySocks'.
+            if ptype == socks.HTTP:
+                s = _raw_http_connect(host, port, info, leg_to)
+            else:
+                kw = {"proxy_type": ptype, "proxy_addr": info["host"],
+                      "proxy_port": info["port"], "proxy_rdns": remote_dns}
+                if info["user"]:
+                    kw["proxy_username"] = info["user"]
+                    kw["proxy_password"] = info["pass"]
+                s = socks.create_connection((host, port), timeout=leg_to, **kw)
             s.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
             s.settimeout(read_to)
             _remember_scheme(proxy_str, ptype)
@@ -4894,7 +4948,7 @@ def sample_alive_proxy(exclude=None, domain=None, avoid=None):
         return pick
 # @@END 069 POOL_SAMPLE
 
-# @@BLOCK 070 TUNNEL_PROBE deps=018,023,052,053
+# @@BLOCK 070 TUNNEL_PROBE deps=018,023,052,053,060
 def _control_targets(used):
     """A target that is NOT already under test.
 
@@ -4943,6 +4997,13 @@ def tunnel_probe(proxy_str, targets=None, timeout=None):
         out["reason"] = "format"
         out["error"] = "parse_proxy() returned None (unrecognised line shape)"
         return out
+    if info.get("user") and not info.get("pass"):
+        # PySocks skips the auth header entirely on a falsy password, so a
+        # user@host:port line 407s on every node and reads as a dead pool.
+        out["reason"] = "format"
+        out["error"] = ("line carries a username but NO password - every CONNECT will "
+                        "407; fix the proxies.txt line")
+        return out
     if not SOCKS_OK:
         out["reason"] = "nosocks"
         out["error"] = "PySocks not installed"
@@ -4978,12 +5039,16 @@ def tunnel_probe(proxy_str, targets=None, timeout=None):
             s = None
             started = time.time()
             try:
-                kw = {"proxy_type": ptype, "proxy_addr": info["host"],
-                      "proxy_port": info["port"], "proxy_rdns": True}
-                if info["user"]:
-                    kw["proxy_username"] = info["user"]
-                    kw["proxy_password"] = info["pass"]
-                s = socks.create_connection((host, port), timeout=attempt_to, **kw)
+                # HTTP is dialled by hand - the auth header is ours, not PySocks'.
+                if ptype == socks.HTTP:
+                    s = _raw_http_connect(host, port, info, attempt_to)
+                else:
+                    kw = {"proxy_type": ptype, "proxy_addr": info["host"],
+                          "proxy_port": info["port"], "proxy_rdns": True}
+                    if info["user"]:
+                        kw["proxy_username"] = info["user"]
+                        kw["proxy_password"] = info["pass"]
+                    s = socks.create_connection((host, port), timeout=attempt_to, **kw)
                 _remember_scheme(proxy_str, ptype)
                 out.update(ok=True, reason="ok", scheme=ptype, target=label,
                            latency_ms=int((time.time() - started_all) * 1000))
