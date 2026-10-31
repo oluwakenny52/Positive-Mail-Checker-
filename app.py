@@ -5896,6 +5896,208 @@ with str_lit.sidebar:
             str_lit.info("No proxy metadata recorded yet.")
 # @@END 080 PROXY_MGMT_UI
 
+# @@BLOCK 081 PROXY_DEBUG_CONSOLE deps=014,016,026,052,080
+with str_lit.sidebar:
+    with str_lit.expander("🩺 Proxy Debug Console", expanded=False):
+        str_lit.caption(
+            "Runs ONE line through a raw CONNECT trace and prints the exact bytes the "
+            "proxy sends back, plus the parsed credential fields. Read-only - it does "
+            "not touch the pool, the scores or the quarantine."
+        )
+
+        if not all_proxies:
+            str_lit.info("No proxy lines loaded - run Fetch & Test first.")
+        else:
+            _dbg_opts = [f"#{i + 1}  {p[:64]}" for i, p in enumerate(all_proxies[:200])]
+            _dbg_sel = str_lit.selectbox(
+                "Line to trace", range(len(_dbg_opts)),
+                format_func=lambda i: _dbg_opts[i], key="_dbg_sel")
+            _dbg_sel = min(_dbg_sel, len(all_proxies) - 1)
+            _dbg_line = all_proxies[_dbg_sel]
+
+            try:
+                _tgt0 = probe_targets()[0]
+                _tgt_def = f"{_tgt0[0]}:{_tgt0[1]}"
+            except Exception:
+                _tgt_def = "imap.gmail.com:993"
+            _dbg_target = str_lit.text_input("CONNECT target (host:port)",
+                                             value=_tgt_def, key="_dbg_target")
+
+            # ---- parse audit -------------------------------------------------
+            _dp = parse_proxy(_dbg_line)
+            _has_at = "@" in _dbg_line
+            _n_at = _dbg_line.count("@")
+            _man_user, _man_pw = "", ""
+            if _has_at:
+                _lhs = _dbg_line.rsplit("@", 1)[0]
+                if ":" in _lhs:
+                    _man_user, _man_pw = _lhs.split(":", 1)
+
+            def _mask(s):
+                if not s:
+                    return "(EMPTY)"
+                if len(s) <= 4:
+                    return "*" * len(s)
+                return s[:2] + "*" * (len(s) - 4) + s[-2:]
+
+            _RISKY = set("@:/?#[]% ")
+            _risky_pw = sorted(set(_man_pw) & _RISKY)
+            _risky_user = sorted(set(_man_user) & _RISKY)
+
+            str_lit.code("\n".join([
+                f"raw line      : {_dbg_line}",
+                f"@ count       : {_n_at}" + ("   <-- WRONG, must be 1" if _n_at != 1 else ""),
+                f"parse_proxy() : {'OK' if _dp else 'FAILED -> None'}",
+                f"  host        : {(_dp or {}).get('host', '(none)')}",
+                f"  port        : {(_dp or {}).get('port', '(none)')}",
+                f"  user        : {_man_user or '(none)'}",
+                f"  password    : {_mask(_man_pw)}   len={len(_man_pw)}",
+                f"risky chars in user     : {_risky_user or 'none'}",
+                f"risky chars in password : {_risky_pw or 'none'}",
+            ]), language="text")
+
+            if not _has_at:
+                str_lit.error("No '@' in the line - it is an IP-auth line, no credentials "
+                              "are sent at all. Webshare must be switched off IP "
+                              "Authorization and onto Username/Password.")
+            elif not _man_pw:
+                str_lit.error("Password is EMPTY - the line has user@host:port with no "
+                              "colon and password. That produces 407 on every node.")
+            elif _risky_pw or _risky_user:
+                str_lit.warning("Credential contains characters that break URL parsing "
+                                f"({', '.join(sorted(set(_risky_pw) | set(_risky_user)))}). "
+                                "URL-encode them in proxies.txt.")
+
+            # ---- trace engine -------------------------------------------------
+            def _dbg_connect(host, port, thost, tport, user, pw, mode):
+                out = []
+                t0 = time.time()
+                try:
+                    sk = socket.create_connection((host, int(port)), timeout=10)
+                except Exception as e:
+                    return [f"TCP connect FAILED after {(time.time() - t0) * 1000:.0f} ms "
+                            f"-> {type(e).__name__}: {e}"], None
+                out.append(f"TCP connect OK in {(time.time() - t0) * 1000:.0f} ms")
+                status = None
+                try:
+                    sk.settimeout(10)
+                    hdr = [f"CONNECT {thost}:{tport} HTTP/1.1",
+                           f"Host: {thost}:{tport}",
+                           "Proxy-Connection: keep-alive"]
+                    if mode == "auth" and user and pw:
+                        _b64 = base64.b64encode(f"{user}:{pw}".encode()).decode()
+                        hdr.append(f"Proxy-Authorization: Basic {_b64}")
+                    out.append("--- sent ---")
+                    for h in hdr:
+                        out.append("  " + (h[:48] + "..."
+                                           if h.startswith("Proxy-Authorization") else h))
+                    out.append("--- end ---")
+                    sk.sendall(("\r\n".join(hdr) + "\r\n\r\n").encode())
+                    t1 = time.time()
+                    buf = b""
+                    while b"\r\n" not in buf and len(buf) < 1024:
+                        ch = sk.recv(1024)
+                        if not ch:
+                            break
+                        buf += ch
+                    out.append(f"first byte after {(time.time() - t1) * 1000:.0f} ms")
+                    first = buf.split(b"\r\n", 1)[0].decode("latin-1", "replace")
+                    out.append("--- response ---")
+                    out.append(buf[:400].decode("latin-1", "replace").rstrip())
+                    out.append("--- end ---")
+                    _parts = first.split()
+                    if len(_parts) >= 2 and _parts[1].isdigit():
+                        status = int(_parts[1])
+                except Exception as e:
+                    out.append(f"exchange FAILED -> {type(e).__name__}: {e}")
+                finally:
+                    try:
+                        sk.close()
+                    except Exception:
+                        pass
+                return out, status
+
+            def _dbg_verdict(status, sent_creds):
+                if status is None:
+                    return "NO STATUS LINE - connected but the proxy answered nothing."
+                if status == 200:
+                    return ("200 AUTH ACCEPTED - proxy and these exact credentials are "
+                            "fine for this target. If the pool still 407s, the app is "
+                            "feeding it a different string than this one.")
+                if status == 407:
+                    if not sent_creds:
+                        return ("407 with NO credentials on the wire - the line carries no "
+                                "usable user:pass. Fix proxies.txt, not the app.")
+                    return ("407 WITH correct Basic credentials on the wire - the PROVIDER "
+                            "is rejecting this exact user:pass. Wrong password, wrong "
+                            "sub-user, or IP Authorization still on against a changing "
+                            "egress IP.")
+                if status in (403, 429, 502, 503):
+                    return (f"{status} - proxy reachable but refusing service (plan, "
+                            f"concurrency cap or ban), not a credential typo.")
+                return f"Unexpected status {status}."
+
+            def _dbg_run(kind):
+                thost, _, tport = _dbg_target.rpartition(":")
+                tport = int(tport or 993)
+                log = [f"=== {kind} | {time.strftime('%H:%M:%S')} ==="]
+                if kind == "web-requests":
+                    try:
+                        import requests as _rq
+                        _px = {"http": f"http://{_dbg_line}", "https": f"http://{_dbg_line}"}
+                        _t0 = time.time()
+                        _rr = _rq.get("https://api.ipify.org", proxies=_px, timeout=15)
+                        log.append(f"GET api.ipify.org -> {_rr.status_code} in "
+                                   f"{(time.time() - _t0) * 1000:.0f} ms, body={_rr.text[:40]!r}")
+                        log.append(_dbg_verdict(_rr.status_code, True))
+                    except Exception as e:
+                        log.append(f"requests FAILED -> {type(e).__name__}: {e}")
+                        log.append("Could not even reach the proxy with requests.")
+                    return log
+                _mode = "noauth" if kind == "raw-noauth" else "auth"
+                if kind == "raw-noauth":
+                    _host, _port, _u, _pw = "", "", "", ""
+                    _q = parse_proxy(_dbg_line) or {}
+                    _host, _port = _q.get("host", ""), _q.get("port", 0)
+                else:
+                    _q = parse_proxy(_dbg_line) or {}
+                    _host, _port = _q.get("host", ""), _q.get("port", 0)
+                    _u, _pw = _man_user, _man_pw
+                if not _host:
+                    return log + ["Could not parse host from the line."]
+                lines, status = _dbg_connect(_host, _port, thost, tport, _u, _pw, _mode)
+                log.extend(lines)
+                log.append("VERDICT: " + _dbg_verdict(status, _mode == "auth"))
+                return log
+
+            _bc1, _bc2 = str_lit.columns(2)
+            with _bc1:
+                _go_auth = str_lit.button("▶️ Trace WITH credentials", width="stretch")
+                _go_none = str_lit.button("▶️ Trace WITHOUT credentials", width="stretch")
+            with _bc2:
+                _go_web = str_lit.button("▶️ Web probe (ipify)", width="stretch")
+                _go_clear = str_lit.button("🧽 Clear trace log", width="stretch")
+
+            if _go_clear:
+                str_lit.session_state["_dbg_log"] = []
+            if _go_auth or _go_none or _go_web:
+                _kind = ("raw-auth" if _go_auth else
+                         "raw-noauth" if _go_none else "web-requests")
+                _add = _dbg_run(_kind)
+                _log = str_lit.session_state.setdefault("_dbg_log", [])
+                _log.extend(_add)
+                str_lit.session_state["_dbg_log"] = _log[-400:]
+
+            _show = str_lit.session_state.get("_dbg_log") or []
+            if _show:
+                str_lit.code("\n".join(_show), language="text")
+                str_lit.download_button(
+                    "💾 Download trace log", "\n".join(_show),
+                    file_name=f"proxy_trace_{int(time.time())}.txt", mime="text/plain")
+            else:
+                str_lit.caption("No trace yet. Start with **WITH credentials** on line #1.")
+# @@END 081 PROXY_DEBUG_CONSOLE
+
 # @@BLOCK 081 DIAG_UI deps=014,024,027,030,070,073
 with str_lit.expander("🔬 Deep Diagnostics - copy/paste this to debug", expanded=False):
     str_lit.caption(
