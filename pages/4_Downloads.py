@@ -167,6 +167,12 @@ from auth import user_file         # AFTER the reload, so it binds to the live m
 auth.require(st, "Unlock Export Studio")
 auth.fit(st)                        # CSS only, before the first widget
 auth.fit_panel(st)                  # the controls; collapsed until tapped
+
+# v13.48: click/outcome ledger, after the gate so the file lands on the unlocked
+# prefix rather than the anon placeholder.
+import audit_log
+
+audit_log.install(st, "pages/4_Downloads.py")
 # @@END 005 HERO
 
 
