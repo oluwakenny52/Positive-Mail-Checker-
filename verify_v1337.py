@@ -427,7 +427,7 @@ def main():
         gone(app_code, "st_val in (WRONG, UNKNOWN, LOGIN_DROPPED)",
              "P0 the shadowed WRONG/UNKNOWN branch is re-gated")
 
-        # ---- P0-v13.39: TLS switch, STATE caches, mobile, hero guard ----
+                # ---- P0-v13.39: TLS switch, STATE caches, mobile, hero guard ----
         has(app, "def tls_connect(host, port, proxy_str=None, insecure=None, timeout=None):",
             "P0 tls_connect resolves insecure from CFG")
         has(app, "TLS_STRICT is ON so NOT falling back", "P0 TLS_STRICT is honoured")
