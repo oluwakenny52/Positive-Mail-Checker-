@@ -1,9 +1,9 @@
-"""audit_log.py - per-user action & outcome ledger  (v13.48)
+"""audit_log.py - per-user action & outcome ledger  (v13.49)
 
 Records every press AND every state change with the page it came from, and
 records what the run then reports: OK / FAILED / WARN / ERROR / STOPPED. A press
-that reports nothing closes as NO RESULT; a state change that reports nothing
-closes as CHANGED, with the old -> new value in the detail.
+that reports nothing closes as NO RESULT; a state change is written as CHANGED
+with the old -> new value the moment it happens.
 
 Plain module, NOT frame-gated - like runstate.py.  Nothing here renders.
 
@@ -11,8 +11,24 @@ INSTALL ORDER IS THE WHOLE POINT
 --------------------------------
 install() must run BEFORE the first widget of the page. A widget created by the
 unwrapped function is invisible to this module, so a hook placed after the
-sidebar records the sidebar's buttons and nothing else. Every page now calls
+sidebar records the sidebar's buttons and nothing else. Every page calls
 page() + install() in its auth block, ahead of its own widgets.
+
+WHY THE COMPARE BASE IS A MEMO AND NOT session_state  (v13.49)
+--------------------------------------------------------------
+v13.48 read the old value out of st.session_state BEFORE the widget call and
+compared it to the value AFTER. In real Streamlit the client's widget update is
+already committed to session_state before the script body runs, so `before` was
+already the NEW value, `after` equalled it, and the comparison was always false:
+no slider, toggle, checkbox, selectbox or multiselect change was ever recorded.
+The selftest missed it because its fake widget wrote session_state itself, which
+is the opposite of the real timing. The ledger proved it: on a page where a
+button logged three lines, the two sliders next to it logged none.
+
+The baseline is now _SEEN - a per-session memo written AFTER each widget call,
+so it always holds the PREVIOUS run's value regardless of when Streamlit commits
+state. A run of edits on one widget inside 1.5s rewrites the same ledger line
+instead of appending one per keystroke.
 
 WHAT IS AND IS NOT VISIBLE
 --------------------------
@@ -20,22 +36,15 @@ st.expander / st.tabs / st.popover are drawn by the browser. Opening one does
 not contact the server, so no server-side hook can see it. Everything whose
 change forces a rerun IS captured: button, form_submit_button, download_button,
 toggle, checkbox, slider, selectbox, multiselect, radio, number_input,
-color_picker, file_uploader, text_input, text_area, date_input.
-
-HOW A STATE CHANGE IS DETECTED
-------------------------------
-For a widget with key=, the value in st.session_state BEFORE the call is the
-previous run's value and the value after it is the current one, so the compare
-needs no cross-run memo at all. Widgets without key= get a synthetic key and a
-memo. Consecutive edits to the same widget collapse into one line instead of one
-line per keystroke.
+color_picker, file_uploader, text_input, text_area, date_input. Page visits are
+written by page() itself, as a PAGE record.
 
 WHY A RERUN IS NOT AN OUTCOME
 -----------------------------
-Most actions here end in flash(...) + st.rerun(), and the flash is rendered on
+Most presses here end in flash(...) + st.rerun(), and the flash is rendered on
 the NEXT run. st.rerun keeps the entry OPEN for one more run so that message can
-be attributed to it. Anything still open after that closes with its kind's
-default - NO RESULT for a press, CHANGED for a state move.
+be attributed to it. A press still open after that closes as NO RESULT. State
+changes are not deferred at all - they have no flash to wait for.
 
 st.info does NOT close an entry: it is page-render chrome ("Loaded Proxies..."),
 not a response, and it was claiming unrelated clicks. Only success / error /
@@ -60,7 +69,10 @@ _PEND = "_audit_pending"
 _PAGE = "_audit_page"
 _SEEN = "_audit_seen"
 _USED = "_audit_used"
+_LAST = "_audit_last"
 _MISSING = object()
+# A burst of edits on one widget inside this window is one ledger line.
+BURST_SECONDS = 1.5
 
 # Passphrase boxes: the value is masked, so the detail would be useless.
 _SKIP_KEYS = frozenset({"au_p1", "au_p2", "au_p3", "au_c1", "au_c2", "au_lbl"})
@@ -72,8 +84,6 @@ _STATE_WIDGETS = ("toggle", "checkbox", "slider", "selectbox", "multiselect",
 # st.info is deliberately absent - see the docstring.
 _MESSAGES = (("success", "OK"), ("error", "FAILED"), ("warning", "WARN"),
              ("exception", "ERROR"), ("stop", "STOPPED"))
-
-_DEFAULT = {"click": "NO RESULT", "state": "CHANGED"}
 
 
 def _path() -> str:
@@ -101,6 +111,24 @@ def _append(rec: dict) -> None:
     _trim(p)
 
 
+def _rewrite_last(rec: dict) -> None:
+    """Replace the final line - used to fold a burst of edits into one record."""
+    p = _path()
+    if not p:
+        return
+    try:
+        with open(p, encoding="utf-8", errors="ignore") as f:
+            lines = f.readlines()
+        if not lines:
+            _append(rec)
+            return
+        lines[-1] = json.dumps(rec, ensure_ascii=False) + "\n"
+        with open(p, "w", encoding="utf-8") as f:
+            f.writelines(lines)
+    except Exception:
+        _append(rec)
+
+
 def _trim(p: str) -> None:
     try:
         with open(p, encoding="utf-8", errors="ignore") as f:
@@ -126,10 +154,24 @@ def _short(value, limit: int = 90) -> str:
 
 
 def page(name: str) -> None:
-    """Tag the page BEFORE auth.require, so even the Unlock press has an owner."""
+    """Tag the page BEFORE auth.require, and log the visit when it changes.
+
+    Every rerun re-enters page(), so only a genuine navigation writes a line.
+    """
     try:
         import streamlit as st
-        st.session_state[_PAGE] = name
+        ss = st.session_state
+        prev = ss.get(_PAGE)
+        ss[_PAGE] = name
+        if prev == name:
+            return
+        try:
+            ss.setdefault(_SEEN, {}).clear()
+        except Exception:
+            pass
+        ss[_LAST] = None
+        _append({"ts": _stamp(), "page": name, "widget": "page", "label": name,
+                 "key": "", "outcome": "PAGE", "detail": ""})
     except Exception:
         pass
 
@@ -183,7 +225,7 @@ def _emit(p: dict, outcome: str, detail: str = "") -> None:
 
 
 def _close(st, outcome: str, detail: str = "") -> None:
-    """Attach the first reported outcome to the open entry, then close it."""
+    """Attach the first reported outcome to the open press, then close it."""
     try:
         p = st.session_state.get(_PEND)
     except Exception:
@@ -198,29 +240,43 @@ def _close(st, outcome: str, detail: str = "") -> None:
     _emit(p, outcome, str(detail or "")[:300])
 
 
-def _record(st, widget: str, kind: str, label: str, key: str, detail: str = "") -> None:
+def _record_click(st, widget: str, label: str, key: str) -> None:
     if key in _SKIP_KEYS:
         return
     try:
-        page_ = st.session_state.get(_PAGE, "?")
-        prev = st.session_state.get(_PEND)
-        # Collapse a run of edits on the SAME widget into one line: a slider drag
-        # or a typed word is one action, not twenty.
-        if (prev and not prev.get("outcome") and prev.get("key") == key
-                and prev.get("kind") == kind):
-            prev["detail"] = detail[:120] or prev.get("detail", "")
-            prev["age"] = 0
-            st.session_state[_PEND] = prev
-            return
-        st.session_state[_PEND] = {"page": page_, "widget": widget, "kind": kind,
+        st.session_state[_PEND] = {"page": st.session_state.get(_PAGE, "?"),
+                                   "widget": widget, "kind": "click",
                                    "label": str(label or "")[:120], "key": key[:80],
-                                   "outcome": "", "detail": detail[:120], "age": 0}
+                                   "outcome": "", "detail": "", "age": 0}
+    except Exception:
+        pass
+
+
+def _record_state(st, widget: str, label: str, key: str, old: str, new: str) -> None:
+    """Write a state change NOW. Folds a burst on the same widget into one line."""
+    if key in _SKIP_KEYS:
+        return
+    try:
+        ss = st.session_state
+        now = time.time()
+        last = ss.get(_LAST) or {}
+        burst = (last.get("key") == key
+                 and (now - float(last.get("ts", 0.0))) < BURST_SECONDS)
+        first = last.get("old", old) if burst else old
+        rec = {"ts": _stamp(), "page": ss.get(_PAGE, "?"), "widget": widget,
+               "label": str(label or "")[:120], "key": key[:80],
+               "outcome": "CHANGED", "detail": "%s -> %s" % (first, new)}
+        if burst:
+            _rewrite_last(rec)
+        else:
+            _append(rec)
+        ss[_LAST] = {"key": key, "ts": now, "old": first}
     except Exception:
         pass
 
 
 def _close_stale(st) -> None:
-    """Close an entry the previous run left open, or give it one more run."""
+    """Close a press the previous run left open, or give it one more run."""
     try:
         p = st.session_state.get(_PEND)
     except Exception:
@@ -234,8 +290,7 @@ def _close_stale(st) -> None:
             pass
         return
     if int(p.get("age", 0)) >= 1:
-        _emit(p, _DEFAULT.get(p.get("kind", "click"), "NO RESULT"),
-              p.get("detail", "") or "finished without reporting")
+        _emit(p, "NO RESULT", p.get("detail", "") or "finished without reporting")
         try:
             st.session_state.pop(_PEND, None)
         except Exception:
@@ -267,31 +322,35 @@ def _wrap_one(st, name: str, kind: str) -> None:
 
     def wrapper(*a, _fn=fn, _name=name, _kind=kind, **k):
         real_key = k.get("key")
+        seen = {}
+        before = _MISSING
         try:
             page_ = st.session_state.get(_PAGE, "?")
             label = k.get("label") or (a[0] if a else "") or real_key or _name
             if real_key:
                 key = str(real_key)
-                before = st.session_state.get(key, _MISSING)
             else:
                 key = _synth_key(st, page_, str(label)[:60])
-                before = st.session_state.setdefault(_SEEN, {}).get(key, _MISSING)
+            seen = st.session_state.setdefault(_SEEN, {})
+            before = seen.get(key, _MISSING)
         except Exception:
-            real_key, key, label, before, _kind = None, "", name, _MISSING, kind
+            key, label = "", name
 
         res = _fn(*a, **k)
 
         try:
             if _kind == "click":
                 if res:
-                    _record(st, _name, "click", str(label), key)
+                    _record_click(st, _name, str(label), key)
             else:
-                after = st.session_state.get(real_key, res) if real_key else res
-                if before is not _MISSING and before != after:
-                    _record(st, _name, "state", str(label), key,
-                            "%s -> %s" % (_short(before), _short(after)))
-                if not real_key:
-                    st.session_state.setdefault(_SEEN, {})[key] = after
+                # The memo - NOT session_state - is the baseline: Streamlit has
+                # already committed the client's new value to session_state by the
+                # time the script body runs, so comparing against it compares a
+                # value to itself and never fires.
+                if before is not _MISSING and before != res:
+                    _record_state(st, _name, str(label), key,
+                                  _short(before), _short(res))
+                seen[key] = res
         except Exception:
             pass
         return res
@@ -367,7 +426,9 @@ def install(st, page_: str) -> None:
 
 def selftest() -> int:
     import shutil
+    import sys
     import tempfile
+    import types
 
     d = tempfile.mkdtemp(prefix="audit_")
     os.environ["BB_RUN_DIR"] = d
@@ -378,19 +439,20 @@ def selftest() -> int:
         def user_file(name):
             return os.path.join(d, name.replace("/", "_"))
 
-    import sys
     sys.modules["auth"] = _A
 
     class _St:
+        """Models REAL Streamlit: the client's widget value is already in
+        session_state before the script body runs."""
+
         def __init__(self):
             self.session_state = {}
 
         def button(self, label, key=None):
             return True
 
-        def slider(self, label, lo, hi, val, step=1, key=None):
-            self.session_state[key] = val
-            return val
+        def slider(self, label, lo, hi, key=None):
+            return self.session_state.get(key)
 
         def success(self, msg):
             return None
@@ -406,8 +468,18 @@ def selftest() -> int:
         if not cond:
             bad.append(name)
 
+    def drag(value, key="vol"):
+        st.session_state[key] = value          # the client already committed it
+        st.slider("Volume", 0, 10, key=key)    # the widget just returns it
+
+    st = _St()
+    # page() imports streamlit itself - give it the SAME session_state dict.
+    saved_st = sys.modules.get("streamlit")
+    stub = types.ModuleType("streamlit")
+    stub.session_state = st.session_state
+    sys.modules["streamlit"] = stub
+
     try:
-        st = _St()
         check("empty at start", entries() == [])
         note("unit action", "OK", "fine")
         check("note is stored", len(entries()) == 1)
@@ -419,26 +491,37 @@ def selftest() -> int:
         check("its outcome is attached",
               any(e["label"] == "Press me" and e["outcome"] == "OK" for e in entries()))
 
-        st.slider("Volume", 0, 10, 3, key="vol")
         install(st, "p.py")
-        st.slider("Volume", 0, 10, 7, key="vol")
+        drag(3)
+        check("the baseline render is not a change",
+              not any(e["label"] == "Volume" for e in entries()))
+
+        # a real move: session_state ALREADY holds 7 when the run starts
         install(st, "p.py")
-        install(st, "p.py")
-        check("a slider move is recorded",
+        drag(7)
+        check("a slider move is recorded (the v13.48 regression)",
               any(e["label"] == "Volume" for e in entries()))
         check("old and new are kept",
               any("3 -> 7" in (e.get("detail") or "") for e in entries()))
-        check("a silent state change closes as CHANGED",
-              any(e["label"] == "Volume" and e["outcome"] == "CHANGED" for e in entries()))
+        check("a state change closes as CHANGED",
+              any(e["label"] == "Volume" and e["outcome"] == "CHANGED"
+                  for e in entries()))
 
         _n = len(entries())
-        st.slider("Volume", 0, 10, 8, key="vol")
-        check("a second edit collapses into one line", len(entries()) == _n + 0
-              or entries()[0]["label"] == "Volume")
+        install(st, "p.py")
+        drag(8)
+        check("a burst does not add a second line", len(entries()) == _n)
+        check("the burst line still starts at the original value",
+              any("3 -> 8" in (e.get("detail") or "") for e in entries()))
+
+        _n = len(entries())
+        install(st, "p.py")
+        drag(8)
+        check("an unchanged render is not a change", len(entries()) == _n)
 
         st.info("chrome")
         check("st.info does not close an entry",
-              not any(e["outcome"] == "INFO" for e in entries()))
+              not any(e.get("outcome") == "INFO" for e in entries()))
 
         st.button("Silent press")
         install(st, "p.py")
@@ -447,11 +530,22 @@ def selftest() -> int:
               any(e["label"] == "Silent press" and e["outcome"] == "NO RESULT"
                   for e in entries()))
 
+        page("q.py")
+        check("a page visit is recorded",
+              any(e.get("outcome") == "PAGE" and e.get("page") == "q.py"
+                  for e in entries()))
+        _n = len(entries())
+        page("q.py")
+        check("a rerun on the same page is not a second visit", len(entries()) == _n)
+
         for i in range(MAX_LINES + 25):
             note("bulk %d" % i, "OK")
         check("capped at MAX_LINES", len(entries(limit=MAX_LINES + 50)) == MAX_LINES)
         check("reset empties the file", reset() > 0 and entries() == [])
     finally:
+        sys.modules.pop("streamlit", None)
+        if saved_st is not None:
+            sys.modules["streamlit"] = saved_st
         shutil.rmtree(d, ignore_errors=True)
         os.environ.pop("BB_RUN_DIR", None)
         sys.modules.pop("auth", None)
