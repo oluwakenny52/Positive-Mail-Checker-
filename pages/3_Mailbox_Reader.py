@@ -3279,6 +3279,34 @@ if st.button("📂 Load Folder Messages", type="primary", width="stretch"):
 
 
 # @@BLOCK 038 MAIN_STREAM deps=037
+def _reader_reload_page(page_no, folders, mode, page_size, sort_order, log_target,
+                        bucket, query="", field="TEXT"):
+    """Re-fetch one page for a pager button.
+
+    FIX PG-1 (v13.50): the six pager buttons called get_active_mail() with no
+    guard. Messages survive a session reset (tab backgrounded, WebSocket drop,
+    redeploy) while active_mail does not, so clicking Next on a restored stream
+    raised inside open_mail("", "", "") and printed a raw traceback.
+    """
+    host = resolve_active_host(active_email)
+    if not active_email or not active_password or not host:
+        st.error("Reconnect first - this session lost its mailbox (restored tab, "
+                 "dropped socket or redeploy). Use Connect & Discover Folders.")
+        return
+    try:
+        mail = get_active_mail(active_email, active_password, host)
+        msgs = fetch_messages_paginated(
+            mail, active_email, active_password, host, folders, query, field,
+            mode=mode, page_size=page_size, page_number=page_no,
+            sort_order=sort_order, log_target=log_target)
+    except Exception as exc:
+        st.error(str(exc))
+        return
+    st.session_state[bucket] = msgs
+    save_session_cache()
+    st.rerun()
+
+
 # Main Message Stream
 _bot_mode = bool(st.session_state.bot_filter_mode)
 if _bot_mode:
@@ -3339,7 +3367,14 @@ if len(active_msgs) > 0 or total_msgs > 0:
                         st.markdown(f"- [{link}]({link})", unsafe_allow_html=True)
 
                 st.markdown("---")
-                st.text_area("Cleaned Message Body", value=msg["body"], height=150, key=f"body_{msg['folder']}_{msg['id']}_{idx}")
+                # FIX W-2 (v13.50): the body box carried BOTH value= and key=, so
+                # every rerun raised "created with a default value but also had its
+                # value set via the Session State API". Seeded instead - the key
+                # still keeps an edit alive across a rerun.
+                _body_key = f"body_{msg['folder']}_{msg['id']}_{idx}"
+                if _body_key not in st.session_state:
+                    st.session_state[_body_key] = msg["body"]
+                st.text_area("Cleaned Message Body", height=150, key=_body_key)
 
                 op_col1, op_col2, op_col3, op_col4 = st.columns(4)
                 host = resolve_active_host(active_email)
@@ -3398,16 +3433,8 @@ if len(active_msgs) > 0 or total_msgs > 0:
         with p_col1:
             if st.button("Previous Page", disabled=(curr_p <= 1), width="stretch", key="msg_stream_prev"):
                 st.session_state.current_page -= 1
-                host = resolve_active_host(active_email)
-                mail = get_active_mail(active_email, active_password, host)
-                st.session_state.current_messages = fetch_messages_paginated(
-                    mail, active_email, active_password, host, [folder],
-                    mode="FOLDER_ONLY",
-                    page_size=page_size, page_number=st.session_state.current_page, sort_order=sort_order,
-                    log_target="DEBUG"
-                )
-                save_session_cache()
-                st.rerun()
+                _reader_reload_page(st.session_state.current_page, [folder], "FOLDER_ONLY",
+                                    page_size, sort_order, "DEBUG", "current_messages")
 
         with p_col2:
             st.markdown(f"<h4 style='text-align: center; margin: 0;'>Page {curr_p} of {total_pages}</h4>", unsafe_allow_html=True)
@@ -3415,16 +3442,8 @@ if len(active_msgs) > 0 or total_msgs > 0:
         with p_col3:
             if st.button("Next Page", disabled=(curr_p >= total_pages), width="stretch", key="msg_stream_next"):
                 st.session_state.current_page += 1
-                host = resolve_active_host(active_email)
-                mail = get_active_mail(active_email, active_password, host)
-                st.session_state.current_messages = fetch_messages_paginated(
-                    mail, active_email, active_password, host, [folder],
-                    mode="FOLDER_ONLY",
-                    page_size=page_size, page_number=st.session_state.current_page, sort_order=sort_order,
-                    log_target="DEBUG"
-                )
-                save_session_cache()
-                st.rerun()
+                _reader_reload_page(st.session_state.current_page, [folder], "FOLDER_ONLY",
+                                    page_size, sort_order, "DEBUG", "current_messages")
 # @@END 038 MAIN_STREAM
 
 
@@ -3434,28 +3453,43 @@ st.markdown("---")
 with st.expander("🔑 Standalone OTP, Debit/Credit Cards & Sensitive Data Scanner", expanded=False):
     st.markdown("#### Dynamic OTP, Password, Debit & Credit Cards, Gift Cards, Telegram & Credential Scanner Controls")
 
+    # FIX W-2 (v13.50): every widget below is SEEDED here and created key-only.
+    # A widget given BOTH a default and a session_state value raises Streamlit's
+    # "created with a default value but also had its value set via the Session
+    # State API" warning on every rerun after the first.
+    if "otp_scan_scope" not in st.session_state:
+        st.session_state["otp_scan_scope"] = ["INBOX"]
+    if "otp_category_select" not in st.session_state:
+        st.session_state["otp_category_select"] = ["All Security Categories"]
+    if "otp_page_size_slider" not in st.session_state:
+        st.session_state["otp_page_size_slider"] = 15
+    if "otp_clean_toggle" not in st.session_state:
+        st.session_state["otp_clean_toggle"] = True
+    if "otp_regex_chk" not in st.session_state:
+        st.session_state["otp_regex_chk"] = True
+
     otp_c1, otp_c2, otp_c3 = st.columns([2, 1, 1])
     otp_folder_options = ["INBOX"] + [f for f in st.session_state.mb_folders if f != "INBOX"]
 
     with otp_c1:
-        otp_scope_choice = st.multiselect("Target Folder Scope", otp_folder_options, default=["INBOX"], key="otp_scan_scope")
+        otp_scope_choice = st.multiselect("Target Folder Scope", otp_folder_options, key="otp_scan_scope")
     with otp_c2:
         category_options = [
             "All Security Categories", "Debit Card & Credit Card Details", "Bank Debit Alert & Online Debit",
             "Order Tracking & Purchase Confirmation", "OTP Message & Verification", "Telegram Alerts & Blacklist",
             "Password / Reset Code", "Gift Cards", "ID Cards / Credentials", "Application Passwords", "Login Info / Info"
         ]
-        otp_scan_category = st.multiselect("Target Data Type Dropdown", category_options, default=["All Security Categories"], key="otp_category_select")
+        otp_scan_category = st.multiselect("Target Data Type Dropdown", category_options, key="otp_category_select")
     with otp_c3:
         otp_search_field = st.selectbox("Scan Field", ["TEXT", "SUBJECT", "BODY", "FROM"], key="otp_search_field")
 
-    otp_page_size = st.slider("OTP Scanner Results Page Size", 5, 200, 15, key="otp_page_size_slider")
+    otp_page_size = st.slider("OTP Scanner Results Page Size", 5, 200, key="otp_page_size_slider")
 
     t_col1, t_col2 = st.columns(2)
     with t_col1:
-        otp_auto_clean_toggle = st.toggle("Auto-Clean HTML & Boilerplate", value=True, key="otp_clean_toggle")
+        otp_auto_clean_toggle = st.toggle("Auto-Clean HTML & Boilerplate", key="otp_clean_toggle")
     with t_col2:
-        otp_deep_regex_chk = st.checkbox("Enable Deep Regex Code, Debit & Credit Card Extraction", value=True, key="otp_regex_chk")
+        otp_deep_regex_chk = st.checkbox("Enable Deep Regex Code, Debit & Credit Card Extraction", key="otp_regex_chk")
 
     preset_keywords_map = {
         "All Security Categories": "OTP password debit credit card gift payment credential login verification reset order tracking confirmation telegram blacklist banned",
@@ -3474,6 +3508,13 @@ with st.expander("🔑 Standalone OTP, Debit/Credit Cards & Sensitive Data Scann
     otp_custom_keyword = st.text_input("Custom Keyword Override (Optional)", key="otp_custom_kw")
     otp_blacklist_input = st.text_input("Blacklist Keywords (comma-separated)", value="Telegram, spam, scam, promo", key="otp_blacklist_kw")
 
+    def _otp_keywords():
+        """The keyword string the scan uses - one implementation, three callers."""
+        if otp_custom_keyword.strip():
+            return otp_custom_keyword.strip()
+        picked = [preset_keywords_map[cat] for cat in otp_scan_category if cat in preset_keywords_map]
+        return " ".join(picked) if picked else "card OTP debit telegram blacklist"
+
     if st.button("🚀 Execute Dedicated Security Scan", type="primary", width="stretch", key="otp_exec_btn"):
         host = resolve_active_host(active_email)
         if not active_email or not active_password or not host:
@@ -3483,11 +3524,7 @@ with st.expander("🔑 Standalone OTP, Debit/Credit Cards & Sensitive Data Scann
         else:
             try:
                 target_scope = otp_scope_choice
-                if otp_custom_keyword.strip():
-                    kw_to_use = otp_custom_keyword.strip()
-                else:
-                    selected_kws = [preset_keywords_map[cat] for cat in otp_scan_category if cat in preset_keywords_map]
-                    kw_to_use = " ".join(selected_kws) if selected_kws else "card OTP debit telegram blacklist"
+                kw_to_use = _otp_keywords()
 
                 with st.spinner(f"Scanning target folders ({len(target_scope)}) for security payload [{kw_to_use}]..."):
                     mail = get_active_mail(active_email, active_password, host)
@@ -3541,7 +3578,11 @@ with st.expander("🔑 Standalone OTP, Debit/Credit Cards & Sensitive Data Scann
                 st.markdown("---")
                 # v13.40: both branches were msg["body"], so the toggle did nothing.
                 display_body = msg["body"] if otp_auto_clean_toggle else msg.get("body_raw", msg["body"])
-                st.text_area("Message Payload Body", value=display_body, height=150, key=f"otp_b_{msg['folder']}_{msg['id']}_{idx}")
+                # FIX W-2: seeded, not value= + key=.
+                _ob_key = f"otp_b_{msg['folder']}_{msg['id']}_{idx}"
+                if _ob_key not in st.session_state:
+                    st.session_state[_ob_key] = display_body
+                st.text_area("Message Payload Body", height=150, key=_ob_key)
 
                 o_col1, o_col2, o_col3, o_col4 = st.columns(4)
                 host = resolve_active_host(active_email)
@@ -3599,21 +3640,11 @@ with st.expander("🔑 Standalone OTP, Debit/Credit Cards & Sensitive Data Scann
         with op_c1:
             if st.button("Previous Page", disabled=(otp_curr_p <= 1), width="stretch", key="otp_prev_pg"):
                 st.session_state.otp_current_page -= 1
-                host = resolve_active_host(active_email)
-                mail = get_active_mail(active_email, active_password, host)
-                target_scope = otp_scope_choice if otp_scope_choice else [folder]
-                if otp_custom_keyword.strip():
-                    kw_to_use = otp_custom_keyword.strip()
-                else:
-                    selected_kws = [preset_keywords_map[cat] for cat in otp_scan_category if cat in preset_keywords_map]
-                    kw_to_use = " ".join(selected_kws) if selected_kws else "card OTP debit telegram blacklist"
-                st.session_state.otp_messages = fetch_messages_paginated(
-                    mail, active_email, active_password, host, target_scope, kw_to_use, otp_search_field,
-                    mode="SEARCH", page_size=otp_page_size, page_number=st.session_state.otp_current_page,
-                    sort_order=sort_order, log_target="OTP"
-                )
-                save_session_cache()
-                st.rerun()
+                _reader_reload_page(st.session_state.otp_current_page,
+                                    otp_scope_choice if otp_scope_choice else [folder],
+                                    "SEARCH", otp_page_size, sort_order, "OTP",
+                                    "otp_messages", query=_otp_keywords(),
+                                    field=otp_search_field)
 
         with op_c2:
             st.markdown(f"<h4 style='text-align: center; margin: 0;'>Page {otp_curr_p} of {otp_total_pages}</h4>", unsafe_allow_html=True)
@@ -3621,21 +3652,11 @@ with st.expander("🔑 Standalone OTP, Debit/Credit Cards & Sensitive Data Scann
         with op_c3:
             if st.button("Next Page", disabled=(otp_curr_p >= otp_total_pages), width="stretch", key="otp_next_pg"):
                 st.session_state.otp_current_page += 1
-                host = resolve_active_host(active_email)
-                mail = get_active_mail(active_email, active_password, host)
-                target_scope = otp_scope_choice if otp_scope_choice else [folder]
-                if otp_custom_keyword.strip():
-                    kw_to_use = otp_custom_keyword.strip()
-                else:
-                    selected_kws = [preset_keywords_map[cat] for cat in otp_scan_category if cat in preset_keywords_map]
-                    kw_to_use = " ".join(selected_kws) if selected_kws else "card OTP debit telegram blacklist"
-                st.session_state.otp_messages = fetch_messages_paginated(
-                    mail, active_email, active_password, host, target_scope, kw_to_use, otp_search_field,
-                    mode="SEARCH", page_size=otp_page_size, page_number=st.session_state.otp_current_page,
-                    sort_order=sort_order, log_target="OTP"
-                )
-                save_session_cache()
-                st.rerun()
+                _reader_reload_page(st.session_state.otp_current_page,
+                                    otp_scope_choice if otp_scope_choice else [folder],
+                                    "SEARCH", otp_page_size, sort_order, "OTP",
+                                    "otp_messages", query=_otp_keywords(),
+                                    field=otp_search_field)
     else:
         st.caption("No security messages scanned yet. Select categories or keywords and click 'Execute Dedicated Security Scan'.")
 
@@ -3652,18 +3673,24 @@ with st.expander("🔑 Standalone OTP, Debit/Credit Cards & Sensitive Data Scann
 # Deep Keyword Search & Scope Filters
 st.markdown("---")
 with st.expander("🔍 Deep Keyword Search & Scope Filters", expanded=False):
+    # FIX W-2 (v13.50): seeded, not default= / value= + key=.
+    if "deep_search_scope" not in st.session_state:
+        st.session_state["deep_search_scope"] = ["INBOX"]
+    if "search_page_size_slider" not in st.session_state:
+        st.session_state["search_page_size_slider"] = 15
+
     s_col1, s_col2 = st.columns([1, 1])
     search_scope_options = ["INBOX"] + [f for f in st.session_state.mb_folders if f != "INBOX"]
 
     with s_col1:
-        search_scope_choice = st.multiselect("Search Scope Option", search_scope_options, default=["INBOX"], key="deep_search_scope")
+        search_scope_choice = st.multiselect("Search Scope Option", search_scope_options, key="deep_search_scope")
     with s_col2:
         search_field_choice = st.selectbox("Search Field Option", ["TEXT", "SUBJECT", "BODY", "FROM"], key="deep_search_field")
 
     search_query_input = st.text_input("Search term or keyword", key="deep_search_query")
     search_blacklist_input = st.text_input("Blacklist Keywords (comma-separated)", value="Telegram, spam, scam, promo", key="deep_search_blacklist_kw")
 
-    search_page_size = st.slider("Search Results Page Size", 5, 200, 15, key="search_page_size_slider")
+    search_page_size = st.slider("Search Results Page Size", 5, 200, key="search_page_size_slider")
 
     if st.button("🔍 Execute Keyword Search", type="primary", width="stretch", key="deep_search_btn"):
         host = resolve_active_host(active_email)
@@ -3722,7 +3749,11 @@ with st.expander("🔍 Deep Keyword Search & Scope Filters", expanded=False):
                         st.markdown(f"- [{link}]({link})", unsafe_allow_html=True)
 
                 st.markdown("---")
-                st.text_area("Cleaned Message Body", value=msg["body"], height=150, key=f"s_body_{msg['folder']}_{msg['id']}_{idx}")
+                # FIX W-2: seeded, not value= + key=.
+                _sb_key = f"s_body_{msg['folder']}_{msg['id']}_{idx}"
+                if _sb_key not in st.session_state:
+                    st.session_state[_sb_key] = msg["body"]
+                st.text_area("Cleaned Message Body", height=150, key=_sb_key)
 
                 s_op1, s_op2, s_op3, s_op4 = st.columns(4)
                 host = resolve_active_host(active_email)
@@ -3781,16 +3812,11 @@ with st.expander("🔍 Deep Keyword Search & Scope Filters", expanded=False):
         with sp_col1:
             if st.button("Previous Page", disabled=(search_curr_p <= 1), width="stretch", key="s_prev_pg"):
                 st.session_state.search_current_page -= 1
-                host = resolve_active_host(active_email)
-                mail = get_active_mail(active_email, active_password, host)
-                target_scope = search_scope_choice if search_scope_choice else [folder]
-                st.session_state.search_messages = fetch_messages_paginated(
-                    mail, active_email, active_password, host, target_scope, search_query_input, search_field_choice,
-                    mode="SEARCH", page_size=search_page_size, page_number=st.session_state.search_current_page,
-                    sort_order=sort_order, log_target="SEARCH"
-                )
-                save_session_cache()
-                st.rerun()
+                _reader_reload_page(st.session_state.search_current_page,
+                                    search_scope_choice if search_scope_choice else [folder],
+                                    "SEARCH", search_page_size, sort_order, "SEARCH",
+                                    "search_messages", query=search_query_input,
+                                    field=search_field_choice)
 
         with sp_col2:
             st.markdown(f"<h4 style='text-align: center; margin: 0;'>Page {search_curr_p} of {search_total_pages}</h4>", unsafe_allow_html=True)
@@ -3798,16 +3824,11 @@ with st.expander("🔍 Deep Keyword Search & Scope Filters", expanded=False):
         with sp_col3:
             if st.button("Next Page", disabled=(search_curr_p >= search_total_pages), width="stretch", key="s_next_pg"):
                 st.session_state.search_current_page += 1
-                host = resolve_active_host(active_email)
-                mail = get_active_mail(active_email, active_password, host)
-                target_scope = search_scope_choice if search_scope_choice else [folder]
-                st.session_state.search_messages = fetch_messages_paginated(
-                    mail, active_email, active_password, host, target_scope, search_query_input, search_field_choice,
-                    mode="SEARCH", page_size=search_page_size, page_number=st.session_state.search_current_page,
-                    sort_order=sort_order, log_target="SEARCH"
-                )
-                save_session_cache()
-                st.rerun()
+                _reader_reload_page(st.session_state.search_current_page,
+                                    search_scope_choice if search_scope_choice else [folder],
+                                    "SEARCH", search_page_size, sort_order, "SEARCH",
+                                    "search_messages", query=search_query_input,
+                                    field=search_field_choice)
     else:
         st.caption("No search results loaded yet. Enter a query and click 'Execute Keyword Search'.")
 
@@ -3826,15 +3847,21 @@ st.markdown("---")
 with st.expander("🤖 Mass Bot Purge & Intelligence Hub", expanded=False):
     all_loaded_bot_msgs = [m for m in st.session_state.current_messages if m["is_bot"]]
 
+    # FIX W-2 (v13.50): seeded, not default= / value= + key=.
+    if "bot_hub_folder_select" not in st.session_state:
+        st.session_state["bot_hub_folder_select"] = ["INBOX"]
+    if "bot_page_size_slider" not in st.session_state:
+        st.session_state["bot_page_size_slider"] = 15
+
     bot_col1, bot_col2 = st.columns([2, 1])
     bot_scope_options = ["INBOX"] + [f for f in st.session_state.mb_folders if f != "INBOX"]
 
     with bot_col1:
-        bot_target_folder = st.multiselect("Select Bot Target Scope", bot_scope_options, default=["INBOX"], key="bot_hub_folder_select")
+        bot_target_folder = st.multiselect("Select Bot Target Scope", bot_scope_options, key="bot_hub_folder_select")
     with bot_col2:
         bot_scan_limit = st.selectbox("Bot Scan Depth", [50, 100, 200, 500], index=1)
 
-    bot_page_size = st.slider("Bot Stream Results Page Size", 5, 200, 15, key="bot_page_size_slider")
+    bot_page_size = st.slider("Bot Stream Results Page Size", 5, 200, key="bot_page_size_slider")
 
     # v13.41: purge now deletes only the already-detected bot messages in the loaded stream.
     # No SEARCH TEXT. Only the IDs the user has already seen as bots.
