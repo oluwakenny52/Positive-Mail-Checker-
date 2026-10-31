@@ -105,14 +105,31 @@ from auth import user_file          # blocks 012, 019 and 032 resolve paths thro
 # first widget so the sidebar and the page body are wrapped. fit_panel() is NOT
 # called here - it renders the Display Fit expanders and belongs under the hero
 # (block 027), so install() must land before it to see its sliders.
-import audit_log
+#
+# FIX AU-1 (v13.49): a module imported before a redeploy stays in sys.modules and
+# keeps answering with the OLD shape. audit_log gained page() at 02:25, two hours
+# after this process had already imported it at 00:42, so this page died on the
+# next line with AttributeError - and install() below never ran, which is why the
+# ledger only ever held button presses and never a single slider. Same hasattr +
+# reload guard auth and runstate already use; both calls are optional, so a
+# reload that also fails degrades to "no ledger" instead of a dead page.
+import audit_log as _audit
 
-audit_log.page("pages/3_Mailbox_Reader.py")
+if not (hasattr(_audit, "page") and hasattr(_audit, "install")):
+    try:
+        _audit = importlib.reload(_audit)
+    except Exception:
+        pass
+audit_log = _audit
+
+if hasattr(audit_log, "page"):
+    audit_log.page("pages/3_Mailbox_Reader.py")
 
 auth.require(st, "Unlock Mailbox Reader")
 auth.fit(st)                        # CSS only, before the first widget
 
-audit_log.install(st, "pages/3_Mailbox_Reader.py")
+if hasattr(audit_log, "install"):
+    audit_log.install(st, "pages/3_Mailbox_Reader.py")
 # @@END 001 PAGE_CONFIG
 
 
