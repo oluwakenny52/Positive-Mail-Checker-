@@ -340,7 +340,8 @@ with st.sidebar:
 
     st.markdown("---")
     st.caption("Action ledger filters")
-    _act_outcomes = ["OK", "FAILED", "WARN", "ERROR", "STOPPED", "NO RESULT", "INFO"]
+    _act_outcomes = ["OK", "FAILED", "WARN", "ERROR", "STOPPED", "NO RESULT",
+                     "CHANGED", "INFO"]
     act_filter = st.multiselect("Only these outcomes", _act_outcomes, default=[])
     act_search = st.text_input("Search the ledger", value="", key="lg_act_search")
 
