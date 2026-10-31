@@ -1019,6 +1019,11 @@ class MsVerdict(Exception):
 # while the fallback's ST_PRIORITY is low-wins.  note_verdict() compared with
 # `<`, so under status.py a later WRONG could never overwrite an earlier
 # LOGIN_DROPPED, and a bare UNKNOWN always won.
+#
+# v13.51: CONNECTION_FAILED has a rank now.  It used to fall through
+# _VERDICT_RANK.get(..., 0), so a real transport answer ranked BELOW a bare
+# UNKNOWN and could never be the retained verdict - which is why every
+# transport failure ended on the generic tail text instead of its own.
 _VERDICT_RANK = {
     WRONG: 90,
     VALID: 80,
@@ -1027,8 +1032,28 @@ _VERDICT_RANK = {
     LOGIN_DROPPED: 50,
     SMTP_FAILED: 46,
     DNS_FAILED: 45,
+    CONNECTION_FAILED: 40,
     UNKNOWN: 10,
 }
+
+# v13.51: the three ways a server says "no TLS here".  A rung that is refused
+# STARTTLS never issues a LOGIN, so it must not be reported as a dropped LOGIN
+# and must not spend an in-place retry - the answer will be identical.
+_TLS_REFUSED_TOKENS = (
+    "tls not supported by server",
+    "stls not supported",
+    "starttls not supported",
+    "tls not supported",
+    "not supported by server",
+)
+
+
+def _is_tls_refused(msg) -> bool:
+    """True when the server refused the TLS upgrade itself (no LOGIN was sent)."""
+    m = (msg or "").lower()
+    if not m:
+        return False
+    return any(tok in m for tok in _TLS_REFUSED_TOKENS)
 
 
 def _is_proxy_auth_fail(msg) -> bool:
@@ -1117,7 +1142,11 @@ def _engine_state():
         # locks
         "cache_lock": threading.Lock(),
         "proxy_lock": threading.Lock(),
-        "file_write_lock": threading.Lock(),
+        # v13.51: RLock, not Lock.  _write_clean_valid() takes this lock itself,
+        # and block 107 already holds it while writing the result files - so any
+        # call site that nests the two deadlocked the SCRIPT THREAD for ever and
+        # the page never returned.
+        "file_write_lock": threading.RLock(),
         "session_state_lock": threading.Lock(),
         "alive_pool_lock": threading.Lock(),
         "host_dns_lock": threading.Lock(),
@@ -2674,6 +2703,65 @@ class _NullGate:
 
 _null_gate = _NullGate()
 
+
+class _Gate:
+    """Counted gate whose release() can NEVER raise and whose ceiling can move.
+
+    WHY THIS REPLACES BoundedSemaphore (v13.51)
+    -------------------------------------------
+    BoundedSemaphore.release() raises ValueError("Semaphore released too many
+    times") when the count is already at maximum.  Every gate here was acquired
+    through a LOOKUP (`_proxy_gate()`) and released through the same lookup a
+    moment later, and `_reset_gates()` POPS those keys - so Apply Settings or
+    Reset Defaults, pressed while a run's futures are still executing (the run
+    loop's executor is shutdown(wait=False) and nothing cancels the queue),
+    handed the release a brand-new semaphore that had never been acquired.
+    Over-release.  ValueError.  The release sits in a `finally`, so the
+    ValueError REPLACED the attempt result - a successful login was thrown away
+    - and it was then classified RETRY because status.py's _RETRY_HARD matches
+    the word "too many".
+
+    This class fixes all of it: the object is never replaced, the ceiling is
+    changed in place, and an unmatched release is simply ignored.
+    """
+
+    __slots__ = ("_limit", "_used", "_cv")
+
+    def __init__(self, limit):
+        self._limit = max(1, int(limit))
+        self._used = 0
+        self._cv = threading.Condition()
+
+    def set_limit(self, limit):
+        with self._cv:
+            self._limit = max(1, int(limit))
+            self._cv.notify_all()
+
+    def acquire(self, timeout=None):
+        with self._cv:
+            end = None if timeout is None else time.time() + float(timeout)
+            while self._used >= self._limit:
+                if end is None:
+                    self._cv.wait(0.25)
+                    continue
+                left = end - time.time()
+                if left <= 0:
+                    return False
+                self._cv.wait(min(left, 0.25))
+            self._used += 1
+            return True
+
+    def release(self):
+        with self._cv:
+            if self._used > 0:
+                self._used -= 1
+            self._cv.notify()
+
+    def in_use(self):
+        with self._cv:
+            return self._used
+
+
 # FIX ISO-5: every gate was keyed by host / IP / sub-user ALONE in ONE process
 # table, so two users on one process shared a single PROXY_CONCURRENCY semaphore
 # and halved each other's throughput, and one user's Apply Settings rebuilt the
@@ -2709,9 +2797,10 @@ def _gate_table(name):
 
 
 def _make_gate(table, key, limit):
+    """Fetch the gate for `key`, creating it once. The object is never replaced."""
     g = table.get(key)
     if g is None:
-        g = threading.BoundedSemaphore(max(1, int(limit)))
+        g = _Gate(limit)
         table[key] = g
     return g
 
@@ -2777,15 +2866,33 @@ def _subuser_gate(subuser):
 
 
 def _reset_gates():
-    """Rebuild THIS session's gates only."""
+    """Rebuild THIS session's gate LIMITS only - never the objects.
+
+    v13.51: the old body POPPED every key, so a worker that was already holding
+    a gate released a fresh one on the way out and raised
+    "Semaphore released too many times". Now the ceiling moves in place, the
+    object identity is stable, and live holders are unaffected.
+    """
     prefix = _gate_scope() + "|"
     with STATE["host_gate_lock"]:
-        for name in ("host_gates", "ip_gates", "subuser_gates"):
+        for name, cfg_key, dflt in (
+                ("host_gates", "HOST_CONCURRENCY", HOST_CONCURRENCY_DEFAULT),
+                ("ip_gates", "PROXY_IP_CONCURRENCY", PROXY_IP_CONCURRENCY_DEFAULT),
+                ("subuser_gates", "PROXY_SUBUSER_CONCURRENCY",
+                 PROXY_SUBUSER_CONCURRENCY_DEFAULT)):
             tbl = _gate_table(name)
             for k in [k for k in tbl if k.startswith(prefix)]:
-                tbl.pop(k, None)
-    _gate_table("proxy_gates").pop(_gate_scope(), None)
-    log_probe_event("concurrency gates rebuilt")
+                try:
+                    tbl[k].set_limit(_limit(cfg_key, dflt))
+                except Exception:
+                    pass
+    _pg = _gate_table("proxy_gates").get(_gate_scope())
+    if _pg is not None:
+        try:
+            _pg.set_limit(_limit("PROXY_CONCURRENCY", PROXY_CONCURRENCY_DEFAULT))
+        except Exception:
+            pass
+    log_probe_event("concurrency gate limits rebuilt in place (objects kept)")
 
 
 _refresh_gate_scope()
@@ -4218,6 +4325,18 @@ def _raw_http_connect(host, port, info, timeout):
 
     The status line is classified HERE, not left to a string match further up, so
     a 402 can never be mistaken for a 407.
+
+    v13.51 - THE SWALLOWED GREETING.  This used to recv() in 2048-byte chunks and
+    stop at the first CRLF, then return the socket.  Everything the chunk had
+    already swallowed past that CRLF - the rest of the proxy's headers AND the
+    first bytes of the tunnel - was dropped on the floor.  imaplib, poplib and
+    smtplib all read through sock.makefile(), a buffer on the RAW socket, so the
+    discarded bytes could not be recovered by any wrapper: they were simply gone.
+    IMAP, POP3 and SMTP all send a greeting immediately, so a healthy host
+    returned "The read operation timed out" whenever the greeting shared a
+    segment with the CONNECT reply.  Reading ONE BYTE AT A TIME and stopping
+    exactly on the header terminator leaves the remainder in the kernel buffer,
+    where makefile() finds it.
     """
     sk = socket.create_connection((info["host"], int(info["port"])), timeout=timeout)
     try:
@@ -4230,8 +4349,8 @@ def _raw_http_connect(host, port, info, timeout):
                f"Proxy-Authorization: Basic {tok}\r\n\r\n")
         sk.sendall(req.encode())
         buf = b""
-        while b"\r\n" not in buf and len(buf) < 2048:
-            ch = sk.recv(2048)
+        while not buf.endswith(b"\r\n\r\n") and len(buf) < 8192:
+            ch = sk.recv(1)
             if not ch:
                 break
             buf += ch
@@ -4263,7 +4382,15 @@ def _raw_http_connect(host, port, info, timeout):
 
 
 def proxy_connect(host, port, proxy_str, timeout=None, remote_dns=True):
-    """Open a tunnel.  This is ALWAYS a proxy hop."""
+    """Open a tunnel.  This is ALWAYS a proxy hop.
+
+    v13.51 - THE FLOORS WERE CEILINGS.  CONNECT_FLOOR_DEFAULT (10s) and
+    READ_FLOOR_DEFAULT (15s) were applied with max(), so a rung the sweep had
+    budgeted at ~3.7s still blocked for 10s on the connect and 15s on the read -
+    25s for a 3.7s rung.  A 33s phase window therefore died after ONE rung and
+    the ladder (sibling hosts, POP3, 143/110, the whole direct sweep) never ran.
+    Both are now capped by the caller's budget, with a small hard minimum.
+    """
     base_timeout = timeout or live_cfg()["PROXY_CONNECT_TIMEOUT"]
     try:
         with proxy_lock:
@@ -4271,14 +4398,14 @@ def proxy_connect(host, port, proxy_str, timeout=None, remote_dns=True):
     except Exception:
         fails = 0
     effective_timeout = max(3.0, base_timeout - (fails * 0.1))
-    leg_to = max(CONNECT_FLOOR_DEFAULT, effective_timeout * 0.6)
-    read_to = max(READ_FLOOR_DEFAULT, effective_timeout * 0.9)
+    leg_to = max(2.5, min(CONNECT_FLOOR_DEFAULT, effective_timeout * 0.6))
+    read_to = max(3.0, min(READ_FLOOR_DEFAULT, effective_timeout * 0.9))
 
     if not proxy_str or proxy_str == "direct":
         if not fast_fail_dns_check(host):
             raise RuntimeError(f"Fast-fail DNS check failed: Host '{host}' does not resolve locally")
-        s = socket.create_connection((host, port),
-                                     timeout=max(CONNECT_FLOOR_DEFAULT, effective_timeout * 0.6))
+        s = socket.create_connection(
+            (host, port), timeout=max(2.5, min(CONNECT_FLOOR_DEFAULT, effective_timeout * 0.6)))
         s.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
         s.settimeout(read_to)
         return s
@@ -4353,14 +4480,22 @@ def _tls_context(host: str, verify: bool):
 
 
 def _raw_socket(host, port, proxy_str=None, timeout=None):
+    """v13.51: the read/connect floors are CAPS now, not minimums.
+
+    READ_FLOOR_DEFAULT (15s) with max() meant a 3s rung blocked 15s on a read,
+    so a 33s phase window was spent by two rungs and the loop reported
+    "window reached; N rung(s) not attempted" on every account. max() is now
+    min() against the caller's budget, with a 3s / 2.5s hard minimum.
+    """
     t = timeout or live_cfg()["TIMEOUT"]
-    read_to = max(READ_FLOOR_DEFAULT, t * 0.9)
+    read_to = max(3.0, min(READ_FLOOR_DEFAULT, t * 0.9))
     if proxy_str and proxy_str != "direct":
         s = proxy_connect(host, port, proxy_str, timeout=t)
     else:
         if not fast_fail_dns_check(host):
             raise RuntimeError(f"Fast-fail DNS check failed: Host '{host}' does not resolve locally")
-        s = socket.create_connection((host, port), timeout=max(CONNECT_FLOOR_DEFAULT, t * 0.6))
+        s = socket.create_connection(
+            (host, port), timeout=max(2.5, min(CONNECT_FLOOR_DEFAULT, t * 0.6)))
     s.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
     s.settimeout(read_to)
     return s
@@ -5879,6 +6014,9 @@ def fetch_and_test_all_proxies(silent: bool = False):
 
 # @@BLOCK 078 CLEAN_VALID_IO deps=039
 CLEAN_VALID_FILE = user_file("clean_valid_accounts.txt")
+# v13.51: its own lock, so the read-merge-rewrite is atomic without nesting the
+# results file_write_lock (which block 107 already holds when it calls in).
+_clean_lock = STATE.setdefault("clean_lock", threading.Lock())
 
 
 def _read_clean_valid():
@@ -5901,25 +6039,34 @@ def _read_clean_valid():
 
 
 def _write_clean_valid(header, valids):
-    """Merge `valids` into clean_valid_accounts.txt and rewrite the file."""
-    merged = _read_clean_valid()
-    for v in valids or []:
-        if ":" not in v:
-            continue
-        em, rest = v.split(":", 1)
-        em = em.strip().lower()
-        if not em:
-            continue
-        merged[em] = rest.split("|")[0].strip()
-    try:
-        with file_write_lock:
-            with open(CLEAN_VALID_FILE, "w", encoding="utf-8") as f:
-                f.write(header)
-                for em in sorted(merged):
-                    f.write(f"{em}:{merged[em]}\n")
-    except Exception:
-        pass
-    return len(merged)
+    """Merge `valids` into clean_valid_accounts.txt and rewrite the file.
+
+    v13.51: returns (stored_total, this_run_count).  It used to return the
+    merged LIFETIME total only, and block 107 stored that as the run's
+    clean_valid_count - so the number the UI showed was every account ever
+    stored, not the ones this run found.
+    """
+    run_count = 0
+    with _clean_lock:
+        merged = _read_clean_valid()
+        for v in valids or []:
+            if ":" not in v:
+                continue
+            em, rest = v.split(":", 1)
+            em = em.strip().lower()
+            if not em:
+                continue
+            merged[em] = rest.split("|")[0].strip()
+            run_count += 1
+        try:
+            with file_write_lock:
+                with open(CLEAN_VALID_FILE, "w", encoding="utf-8") as f:
+                    f.write(header)
+                    for em in sorted(merged):
+                        f.write(f"{em}:{merged[em]}\n")
+        except Exception:
+            pass
+    return len(merged), run_count
 # @@END 078 CLEAN_VALID_IO
 
 # @@BLOCK 079 STARTUP_PANEL_UI deps=034,038
@@ -7662,7 +7809,9 @@ def read_mailbox_messages(email, password, server, proxy_str=None, limit=10):
         conf_hosts = get_servers(email).get("imap", []) or [server]
         verified, mail, _ = verify_and_connect(email, password, conf_hosts, proxy_str=proxy_str)
         if not verified or not mail:
-            return ["Error reading mailbox: True credential verification failed."]
+            # v13.51: the sentence read "True credential verification failed" -
+            # `True` is the bool, not part of the words.
+            return ["Error reading mailbox: credential verification failed."]
         mail.select("INBOX")
         typ, data = mail.search(None, "ALL")
         if typ != "OK":
@@ -7761,8 +7910,11 @@ def _check_account_core(email, password, conf, domain, proxy_pool, thread_state,
     dns_ok = True
 
     best_verdict = {"status": None, "detail": "", "host": ""}
+    # v13.51: saw_tls_refused is separate from saw_server.  A server that refuses
+    # STARTTLS on 143 never issued a LOGIN, so it must not be reported as a
+    # dropped LOGIN - that was the wrong sentence on every Frontier account.
     flags = {"saw_407": False, "saw_nonproxy": False, "saw_server": False,
-             "saw_login_drop": False}
+             "saw_login_drop": False, "saw_tls_refused": False}
     force_direct = {"flag": False}
     host_407 = {}
     net_failed_hosts = set()
@@ -7803,8 +7955,11 @@ def _check_account_core(email, password, conf, domain, proxy_pool, thread_state,
             force=True is for a DEFINITIVE answer that must not be suppressed by
             an earlier, vaguer one (Microsoft XOAUTH2 AADSTS50126).
             """
+            # v13.51: CONNECTION_FAILED is retained now.  It used to be dropped
+            # here, so a real transport answer could never be the retained
+            # verdict and every transport failure ended on the generic tail text.
             if st_val not in (VALID, WRONG, APP, RBL, LOGIN_DROPPED, UNKNOWN,
-                              DNS_FAILED, SMTP_FAILED):
+                              DNS_FAILED, SMTP_FAILED) and st_val != CONNECTION_FAILED:
                 return
             cur = best_verdict["status"]
             if force or cur is None or _VERDICT_RANK.get(st_val, 0) > _VERDICT_RANK.get(cur, 0):
@@ -8004,7 +8159,13 @@ def _check_account_core(email, password, conf, domain, proxy_pool, thread_state,
                                 port=port, attempt_timeout=attempt_to)
 
         def do_attempt(proto, server, port, tls_mode, user, px_used, attempt_to, deadline_ts=None):
-            """Serialised per destination host, per proxy IP, per sub-user, globally."""
+            """Serialised per destination host, per proxy IP, per sub-user, globally.
+
+            v13.51: the gate OBJECTS are bound once and every release is guarded.
+            Releasing through a fresh lookup and letting the release raise meant a
+            rebuilt gate turned "Semaphore released too many times" into the
+            attempt's result and ate the real one.
+            """
             gate = _host_gate(server)
             got_host = gate.acquire(timeout=max(2.0, attempt_to))
             try:
@@ -8014,7 +8175,8 @@ def _check_account_core(email, password, conf, domain, proxy_pool, thread_state,
                 if int(port) in LEGACY_PORTS:
                     attempt_to = min(attempt_to, LEGACY_RUNG_TIMEOUT)
                 if px_used:
-                    got_proxy = _proxy_gate().acquire(timeout=_gate_wait(attempt_to))
+                    pg = _proxy_gate()
+                    got_proxy = pg.acquire(timeout=_gate_wait(attempt_to))
                     try:
                         _pxinfo = parse_proxy(px_used)
                         ipg = _ip_gate(_pxinfo["host"] if _pxinfo else None)
@@ -8027,18 +8189,30 @@ def _check_account_core(email, password, conf, domain, proxy_pool, thread_state,
                                                 px_used, attempt_to)
                             finally:
                                 if got_sub:
-                                    sg.release()
+                                    try:
+                                        sg.release()
+                                    except Exception:
+                                        pass
                         finally:
                             if got_ip:
-                                ipg.release()
+                                try:
+                                    ipg.release()
+                                except Exception:
+                                    pass
                     finally:
                         if got_proxy:
-                            _proxy_gate().release()
+                            try:
+                                pg.release()
+                            except Exception:
+                                pass
                 else:
                     _do_attempt_raw(proto, server, port, tls_mode, user, px_used, attempt_to)
             finally:
                 if got_host:
-                    gate.release()
+                    try:
+                        gate.release()
+                    except Exception:
+                        pass
 
         err_text = ""
         attempt_to_ref = [configured_to]
@@ -8265,6 +8439,7 @@ def _check_account_core(email, password, conf, domain, proxy_pool, thread_state,
                     retry_same = False
                     retry_same_node = False
                     proxy_dead = False
+                    tls_refused = False
                     err_text = ""
 
                     for u_idx, user in enumerate(users):
@@ -8382,8 +8557,11 @@ def _check_account_core(email, password, conf, domain, proxy_pool, thread_state,
                         except ssl.SSLError as ssl_err:
                             err_text = str(ssl_err)
                             st_val = classify_error(ssl_err, domain)
+                            tls_refused = _is_tls_refused(err_text)
                             flags["saw_nonproxy"] = True
                             flags["saw_server"] = True
+                            if tls_refused:
+                                flags["saw_tls_refused"] = True
                             if st_val == CONNECTION_FAILED:
                                 had_net = True
                                 net_failed_hosts.add(server)
@@ -8394,7 +8572,8 @@ def _check_account_core(email, password, conf, domain, proxy_pool, thread_state,
                                               f"[Classified: {st_val}]")
                             note_verdict(st_val, f"{proto} {server}:{port} -> {st_val}", server)
                             server_level_fail = True
-                            rotate_now = _is_proxy_level_error(err_text) or st_val == CONNECTION_FAILED
+                            rotate_now = (_is_proxy_level_error(err_text)
+                                          or (st_val == CONNECTION_FAILED and not tls_refused))
 
                         except (socket.timeout, TimeoutError) as to_err:
                             err_text = str(to_err)
@@ -8441,12 +8620,23 @@ def _check_account_core(email, password, conf, domain, proxy_pool, thread_state,
                         except (imaplib.IMAP4.error, poplib.error_proto) as proto_err:
                             err_text = str(proto_err)
                             st_val = classify_error(proto_err, domain)
+                            # v13.51: "TLS not supported by server" is raised by
+                            # starttls() BEFORE any LOGIN is sent.  It was filed
+                            # as saw_server, so the tail claimed the server had
+                            # accepted LOGIN and dropped it.  It did not.
+                            tls_refused = _is_tls_refused(err_text)
                             flags["saw_nonproxy"] = True
-                            flags["saw_server"] = True
+                            if tls_refused:
+                                flags["saw_tls_refused"] = True
+                            else:
+                                flags["saw_server"] = True
                             record_proxy_attempt(px_used, success=False, is_network_error=False)
-                            trace_logs.append(f"{px_tag(px_used)} -> AUTH {proto} "
-                                              f"{server}:{port}: {err_text[:140]} "
-                                              f"[Classified: {st_val}]")
+                            trace_logs.append(
+                                f"{px_tag(px_used)} -> AUTH {proto} "
+                                f"{server}:{port}: {err_text[:140]} "
+                                f"[Classified: {st_val}]"
+                                + (" [TLS/STARTTLS refused - no LOGIN issued]"
+                                   if tls_refused else ""))
                             note_verdict(st_val, f"{proto} {server}:{port} -> {st_val}", server)
 
                             if st_val == LOGIN_DROPPED:
@@ -8497,7 +8687,9 @@ def _check_account_core(email, password, conf, domain, proxy_pool, thread_state,
                                     f"advancing the ladder (POP3 / other hosts still get a turn)")
                             else:
                                 server_level_fail = True
-                                if (st_val == CONNECTION_FAILED
+                                # v13.51: a refused STARTTLS answers identically on
+                                # every retry, so it does not earn one.
+                                if (st_val == CONNECTION_FAILED and not tls_refused
                                         and retries_by_host.get(server, 0) < same_host_retries
                                         and (deadline_ts - time.time()) > 7.0):
                                     retries_by_host[server] = retries_by_host.get(server, 0) + 1
@@ -8507,6 +8699,7 @@ def _check_account_core(email, password, conf, domain, proxy_pool, thread_state,
                             err_text = str(e)
                             st_val = classify_error(e, domain)
                             proxy_level = _is_proxy_level_error(err_text)
+                            tls_refused = _is_tls_refused(err_text)
                             if proxy_level:
                                 flags["saw_407"] = True
                                 record_proxy_attempt(px_used, success=False,
@@ -8516,7 +8709,9 @@ def _check_account_core(email, password, conf, domain, proxy_pool, thread_state,
                                 acct_407_total += 1
                             else:
                                 flags["saw_nonproxy"] = True
-                                if "Fast-fail DNS check" not in err_text:
+                                if tls_refused:
+                                    flags["saw_tls_refused"] = True
+                                if "Fast-fail DNS check" not in err_text and not tls_refused:
                                     flags["saw_server"] = True
                             if _is_timeout(e):
                                 had_net = True
@@ -8788,6 +8983,19 @@ def _check_account_core(email, password, conf, domain, proxy_pool, thread_state,
             "Mail host answered, accepted the LOGIN command, then closed the socket "
             "(* BYE) before returning a verdict - server-side drop, not a network fault.")
         return None, LOGIN_DROPPED, _login_dropped_detail(), None, trace_logs
+    # v13.51: a refused STARTTLS is its OWN answer.  The 143 rung was reaching
+    # this point and the saw_server branch below then claimed LOGIN had been
+    # issued and dropped, which was untrue - starttls() raises before LOGIN.
+    if flags.get("saw_tls_refused") and not flags.get("saw_auth"):
+        trace_logs.append(
+            "Host was reached but refused the TLS upgrade itself (STARTTLS not "
+            "supported) - no LOGIN was ever issued, so the password is untested. "
+            "The 993 rung is the one that matters on this host.")
+        return None, CONNECTION_FAILED, (
+            "host reachable but refused STARTTLS on 143 - no LOGIN was attempted, so the "
+            "password is untested. Only the implicit-TLS port (993) can answer here; if it "
+            "timed out, retry from a different egress or check the host's TLS listener"
+        ), None, trace_logs
     if retryable:
         return None, RETRY, "retryable (proxy / IP-block / rate-limit)", None, trace_logs
     if flags.get("saw_server"):
@@ -9100,9 +9308,16 @@ if start_engine_btn:
                 return {"line": f"{line} | Error: {ex}", "email": line, "password": "",
                         "status": FAILED, "detail": str(ex), "trace": [str(ex)]}
             finally:
+                # v13.51: the whole per-thread dict was cleared, so the
+                # `sticky_proxy` that PROXY_MODE = "sticky" stores in it died after
+                # ONE account and sticky was never sticky. Everything else is
+                # per-account and still goes; sticky is kept.
                 if hasattr(thread_local, "state"):
                     try:
+                        _keep = thread_local.state.get("sticky_proxy")
                         thread_local.state.clear()
+                        if _keep:
+                            thread_local.state["sticky_proxy"] = _keep
                     except Exception:
                         pass
 # @@END 105 RUN_TRIGGER_UI
@@ -9517,8 +9732,9 @@ if start_engine_btn:
                         f.write(hdr)
                         f.write("\n".join(str(i) for i in snap) + ("\n" if snap else ""))
 
-            clean_valid_path = CLEAN_VALID_FILE
-            temp_clean_count = _write_clean_valid(hdr, valid_snapshot)
+            # v13.51: _write_clean_valid returns (stored_total, this_run_count), so
+            # the UI shows THIS run's valid count instead of the lifetime total.
+            temp_stored, temp_run_count = _write_clean_valid(hdr, valid_snapshot)
 
             # v13.48: the bundle used to be written to the working directory as a
             # bare mail_results_<stamp>.zip, so two users finishing in the same
@@ -9531,8 +9747,11 @@ if start_engine_btn:
             import io as _io
             _zbuf = _io.BytesIO()
             with zipfile.ZipFile(_zbuf, "w", zipfile.ZIP_DEFLATED) as z:
-                if os.path.exists(clean_valid_path):
-                    z.write(clean_valid_path, arcname="valid_email_password.txt")
+                # v13.51: written from the in-memory snapshot, not re-read from the
+                # growing on-disk merge file.
+                z.writestr("valid_email_password.txt",
+                           hdr + "\n".join(str(i) for i in valid_snapshot)
+                           + ("\n" if valid_snapshot else ""))
                 for _arc, _snap in (
                         (os.path.basename(wrong_path), wrong_snapshot),
                         (os.path.basename(need_path), need_snapshot),
@@ -9549,8 +9768,16 @@ if start_engine_btn:
                                + ("\n" if _snap else ""))
             zip_bytes_data = _zbuf.getvalue()
 
+            # v13.51: tell the screen the write finished, because block 108's
+            # render is what the page sits on for the next while.
+            try:
+                status_text.text(f"Progress: complete - {temp_run_count} result(s) written. "
+                                 f"Building the summary...")
+            except Exception:
+                pass
+
             with session_state_lock:
-                str_lit.session_state.clean_valid_count = temp_clean_count
+                str_lit.session_state.clean_valid_count = temp_stored
                 str_lit.session_state.zip_name = zip_output_name
                 str_lit.session_state.zip_bytes = zip_bytes_data
         except Exception as ex:
@@ -9558,7 +9785,16 @@ if start_engine_btn:
 # @@END 107 RUN_EXPORT
 
 # @@BLOCK 108 RESULTS_SUMMARY deps=007,014,035,036,037,087,106
-if str_lit.session_state.engine_has_run or load_persistent_valid_results():
+# v13.51: THE 98-SECOND FREEZE.  Measured from the logs: the loop ends, the
+# page reports the run OK 98 seconds later.  Block 107 writes twelve small files
+# and a twelve-entry in-memory zip in one or two seconds - the rest was THIS
+# block, which built up to 480 separate st.code widgets (12 expanders x 40
+# lines), a 2000-row dataframe and a full log re-render on every rerun, and
+# called load_persistent_valid_results() inside its own `if` condition after
+# invalidate_valid_caches() had just zeroed the cache.
+_persisted_valid = load_persistent_valid_results()
+
+if str_lit.session_state.engine_has_run or _persisted_valid:
     section_title("📊", "Live Results Summary & ZIP Archive",
                   "persisted results, downloadable bundle, full under-the-hood traces")
 
@@ -9671,10 +9907,13 @@ if str_lit.session_state.engine_has_run or load_persistent_valid_results():
             "no candidate left to dial) before being accepted. Turn the sidebar guard OFF "
             "only if you need raw speed.")
 
-    # FIX SPEED-12: every line of every bucket was rendered as its own st.code
-    # widget, in twelve expanders, on every rerun - a 2000-line bucket meant 2000
-    # widgets before the page could finish. Cap the render; the download button
-    # above it still carries the whole list.
+    # FIX SPEED-12 / v13.51: one st.code per bucket instead of one per LINE. Up to
+    # 480 code widgets became 12, and the per-line widgets are behind a toggle.
+    _show_full = str_lit.toggle(
+        "Show full bucket contents inline (slower on a phone)", value=False,
+        key="bb_sum_full",
+        help="Off: 12 boxes with the first lines each. On: every line, still capped "
+             "at BUCKET_RENDER_TAIL. The download button above always carries all of it.")
     for title, items in summary_buckets.items():
         with str_lit.expander(f"{title} ({len(items)})", expanded=False):
             if not items:
@@ -9686,11 +9925,15 @@ if str_lit.session_state.engine_has_run or load_persistent_valid_results():
                 data="\n".join(str(i) for i in items).encode("utf-8"),
                 file_name=f"{_safe}_{len(items)}.txt",
                 mime="text/plain", key=f"sumdl_{_safe}")
-            for it in items[:BUCKET_RENDER_TAIL]:
-                str_lit.code(it, language="text")
-            if len(items) > BUCKET_RENDER_TAIL:
-                str_lit.caption(f"... and {len(items) - BUCKET_RENDER_TAIL} more - use the "
-                                f"download button above for the full list.")
+            if _show_full:
+                str_lit.code("\n".join(str(i) for i in items[:BUCKET_RENDER_TAIL]),
+                             language="text")
+                if len(items) > BUCKET_RENDER_TAIL:
+                    str_lit.caption(f"... and {len(items) - BUCKET_RENDER_TAIL} more - use the "
+                                    f"download button above for the full list.")
+            else:
+                str_lit.caption(f"{len(items)} line(s) - download above, or turn on "
+                                f"'Show full bucket contents inline'.")
 
     exec_tab1_p, exec_tab2_p = str_lit.tabs(["⚡ Live Execution Stream",
                                              "📊 Live Report Log & Analytics"])
