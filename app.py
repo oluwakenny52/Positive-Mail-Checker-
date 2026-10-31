@@ -497,6 +497,15 @@ import importlib
 import auth
 import runstate
 
+# v13.48: the click/outcome ledger. page() runs BEFORE the gate so even the
+# Unlock press is attributed; install() runs AFTER it so the file lands on the
+# unlocked prefix and not the anon placeholder. Both must be above the first
+# widget - a widget built before install() is invisible to it, which is why the
+# hook was previously recording buttons and no sliders at all.
+import audit_log
+
+audit_log.page("app.py")
+
 # A Streamlit rerun re-uses the SAME process, so a module imported before a
 # redeploy stays in sys.modules and keeps answering with the OLD shape.  BOTH
 # modules need the guard - it was applied to auth and not to runstate, which is
@@ -519,6 +528,8 @@ user_file = auth.user_file
 # script while locked, so fit() only runs once the gate has passed.
 auth.require(str_lit)
 auth.fit(str_lit)
+
+audit_log.install(str_lit, "app.py")
 
 # ---- teardown watchdog, and it MUST be after require() ---------------------
 # runstate._dir() resolves through auth.user_file(), which is a throwaway
@@ -3729,13 +3740,6 @@ render_hero(_theme)
 # Display Fit controls belong UNDER the header. fit() in block 007 injects the
 # CSS only; the panel is drawn here.
 auth.fit_panel(str_lit)
-
-# v13.48: the click/outcome ledger. MUST come after auth.require() (block 007),
-# because audit_log resolves its file through auth.user_file() - before the gate
-# that is a throwaway anon<hex> prefix the session then abandons.
-import audit_log
-
-audit_log.install(str_lit, "app.py")
 
 try:
     os.makedirs(CFG["RESULTS_DIR"], exist_ok=True)
