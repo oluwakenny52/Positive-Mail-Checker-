@@ -527,13 +527,34 @@ if _pending_preset:
         st.session_state["ex_name"] = _pp.get("name_pat", "export_{status}_{count}_{stamp}")
         st.session_state["_ex_active"] = _pending_preset
 
-# v13.48: these four used value="" with no key, so every rerun (a toggle, a
-# slider, pressing Save) wiped whatever had been typed. Seed the keys here,
-# before the widgets exist, then create the widgets key-only - the same rule
-# ex_tpl follows, so no "default value AND session state" warning.
-for _k in ("ex_inc", "ex_exc", "ex_hosts", "ex_pname"):
+# v13.50: EVERY widget on this page is now created key-only.  A widget that
+# carries a default (value= / index= / default=) AND a key that is already in
+# session_state raises Streamlit's "created with a default value but also had
+# its value set via the Session State API" warning on every single rerun - and
+# on the second run the key IS always in state.  Seeding the key here, before
+# any widget exists, is the only legal point to write it: it keeps the defaults
+# below, silences the warning, and lets the preset branch above still land.
+# v13.48's four blank keys are folded into the same table so there is one place
+# that knows the defaults.
+_EX_DEFAULTS = {
+    "ex_tpl": "",
+    "ex_delim": "none",
+    "ex_eol": "LF (unix)",
+    "ex_header": "",
+    "ex_prefix": "",
+    "ex_suffix": "",
+    "ex_sort": "none",
+    "ex_dedupe": True,
+    "ex_lower": True,
+    "ex_name": "export_{status}_{count}_{stamp}",
+    "ex_inc": "",
+    "ex_exc": "",
+    "ex_hosts": "",
+    "ex_pname": "",
+}
+for _k, _v in _EX_DEFAULTS.items():
     if _k not in st.session_state:
-        st.session_state[_k] = ""
+        st.session_state[_k] = _v
 
 with st.sidebar:
     st.markdown("### 1. What to download")
@@ -557,16 +578,12 @@ with st.sidebar:
     # format did nothing.  Re-seed the key when the format changes - legal here,
     # the text_input below does not exist yet this run.  A preset applied this
     # run wins (its marker is still in session_state).
-    # v13.47: the widget below carries no value= any more. Passing both a default
-    # and a key that is already in session_state raised Streamlit's
-    # "created with a default value but also had its value set via the Session
-    # State API" warning on every render. The key is always seeded here first.
     if st.session_state.get("_ex_fmt_seen") != fmt_name:
         st.session_state["_ex_fmt_seen"] = fmt_name
         if default_tpl and not st.session_state.get("_ex_active"):
             st.session_state["ex_tpl"] = default_tpl
-    if "ex_tpl" not in st.session_state:
-        st.session_state["ex_tpl"] = default_tpl or "{email}:{password}"
+    # The key is always seeded by _EX_DEFAULTS above, so no "not in
+    # session_state" backstop is needed here any more.
     template = st.text_input(
         "Template ({email} {password} {domain} {local} {status} {host} {port} {detail} {n})",
         key="ex_tpl",
@@ -575,24 +592,24 @@ with st.sidebar:
         template = "{email}:{password}"
 
     delim = st.selectbox("Separator inside a line", ["none", "tab", "comma", "semicolon", "pipe"],
-                         index=0, key="ex_delim",
+                         key="ex_delim",
                          help="'none' keeps the template exactly as written.")
     st.caption("Only affects templates that contain spaces — the default template has none, so this control does nothing for it.")
     _delim_map = {"none": " ", "tab": "\t", "comma": ",", "semicolon": ";", "pipe": "|"}
-    delim_ch = _delim_map[delim]
+    delim_ch = _delim_map.get(delim, " ")
 
     eol = st.radio("Line ending", ["LF (unix)", "CRLF (windows)"], horizontal=True, key="ex_eol")
     crlf = eol.startswith("CRLF")
 
-    header = st.text_input("Header line (optional)", value="", key="ex_header")
-    prefix = st.text_input("Prefix line (optional)", value="", key="ex_prefix")
-    suffix = st.text_input("Suffix line (optional)", value="", key="ex_suffix")
+    header = st.text_input("Header line (optional)", key="ex_header")
+    prefix = st.text_input("Prefix line (optional)", key="ex_prefix")
+    suffix = st.text_input("Suffix line (optional)", key="ex_suffix")
 
     st.markdown("---")
     st.markdown("### 3. Filter and order")
-    sort_key = st.selectbox("Sort by", ["none", "email", "domain", "status"], index=0, key="ex_sort")
-    dedupe = st.toggle("Dedupe by email (first wins)", value=True, key="ex_dedupe")
-    lower = st.toggle("Lowercase email", value=True, key="ex_lower")
+    sort_key = st.selectbox("Sort by", ["none", "email", "domain", "status"], key="ex_sort")
+    dedupe = st.toggle("Dedupe by email (first wins)", key="ex_dedupe")
+    lower = st.toggle("Lowercase email", key="ex_lower")
     regex_inc = st.text_input("Include regex", key="ex_inc")
     regex_exc = st.text_input("Exclude regex", key="ex_exc")
     host_filter = st.text_input("Only these hosts (comma)", key="ex_hosts")
@@ -600,7 +617,6 @@ with st.sidebar:
     st.markdown("---")
     st.markdown("### 4. File name")
     name_pat = st.text_input("Name pattern",
-                             value="export_{status}_{count}_{stamp}",
                              key="ex_name",
                              help="{status} {count} {stamp} {sources} are substituted.")
 
