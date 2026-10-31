@@ -1,4 +1,4 @@
-"""audit_log.py - per-user action & outcome ledger  (v13.49)
+"""audit_log.py - per-user action & outcome ledger  (v13.50)
 
 Records every press AND every state change with the page it came from, and
 records what the run then reports: OK / FAILED / WARN / ERROR / STOPPED. A press
@@ -45,6 +45,16 @@ Most presses here end in flash(...) + st.rerun(), and the flash is rendered on
 the NEXT run. st.rerun keeps the entry OPEN for one more run so that message can
 be attributed to it. A press still open after that closes as NO RESULT. State
 changes are not deferred at all - they have no flash to wait for.
+
+FIX AU-2 (v13.50) - THE DEFER WAS OFF BY ONE AND NOTHING EVER CLOSED AS OK
+-------------------------------------------------------------------------
+The rerun wrapper used to stamp p["age"] = max(1, ...) while _close_stale()
+closed at age >= 1. install() runs BEFORE the page body, so the entry was popped
+as NO RESULT by install() on the very next load - before the flash could render -
+and the flash then had nothing left to attach to. The whole ledger read NO RESULT
+and never OK. The wrapper now stamps 0, so that load increments to 1 and KEEPS
+the entry: the flash on the same load closes it as OK, and the load after closes
+it as NO RESULT if no flash ever arrived. Two selftest cases now cover it.
 
 st.info does NOT close an entry: it is page-render chrome ("Loaded Proxies..."),
 not a response, and it was claiming unrelated clicks. Only success / error /
@@ -276,7 +286,11 @@ def _record_state(st, widget: str, label: str, key: str, old: str, new: str) -> 
 
 
 def _close_stale(st) -> None:
-    """Close a press the previous run left open, or give it one more run."""
+    """Close a press the previous run left open, or give it one more run.
+
+    The threshold is >= 1 and the rerun wrapper stamps 0, so a press that asked
+    for a rerun gets exactly one load in which its flash can render. FIX AU-2.
+    """
     try:
         p = st.session_state.get(_PEND)
     except Exception:
@@ -388,7 +402,13 @@ def _wrap_messages(st) -> None:
             try:
                 p = st.session_state.get(_PEND)
                 if p and not p.get("outcome"):
-                    p["age"] = max(1, int(p.get("age", 0)))
+                    # FIX AU-2: 0, not max(1, ...). install() runs BEFORE the page
+                    # body, so stamping 1 let _close_stale() pop the entry as
+                    # NO RESULT on the very next load - before the flash could
+                    # render - and nothing ever closed as OK. 0 makes that load
+                    # increment to 1 and keep it: the flash closes it as OK on the
+                    # same load, and only the load AFTER falls back to NO RESULT.
+                    p["age"] = 0
                     st.session_state[_PEND] = p
             except Exception:
                 pass
@@ -528,6 +548,27 @@ def selftest() -> int:
         install(st, "p.py")
         check("a silent press closes as NO RESULT",
               any(e["label"] == "Silent press" and e["outcome"] == "NO RESULT"
+                  for e in entries()))
+
+        # FIX AU-2 regression pair. The press asks for a rerun, the rerun is what
+        # carries the flash, and the flash is rendered by the load AFTER it.
+        st.button("Rerun press")
+        st.rerun()
+        install(st, "p.py")
+        check("a rerun keeps the entry open for its flash",
+              not any(e["label"] == "Rerun press" and e["outcome"] == "NO RESULT"
+                      for e in entries()))
+        st.success("flashed")
+        check("the flash closes it as OK",
+              any(e["label"] == "Rerun press" and e["outcome"] == "OK"
+                  for e in entries()))
+
+        st.button("Rerun with no flash")
+        st.rerun()
+        install(st, "p.py")
+        install(st, "p.py")
+        check("a rerun with no flash still ends as NO RESULT",
+              any(e["label"] == "Rerun with no flash" and e["outcome"] == "NO RESULT"
                   for e in entries()))
 
         page("q.py")
