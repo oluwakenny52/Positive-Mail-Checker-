@@ -167,6 +167,13 @@ if not _CLI_FIX_CHECK:
     auth.require(st, "Unlock Block Inspector")
     auth.fit(st)                        # CSS only, before the first widget
     auth.fit_panel(st)                  # the controls; collapsed until tapped
+
+    # v13.48: click/outcome ledger. INSIDE the branch - audit_log needs the real
+    # st (the _BareSt stand-in has no working session_state for the pending
+    # entry), and the branch is what keeps --fix-check free of Streamlit.
+    import audit_log
+
+    audit_log.install(st, "pages/5_Blocks.py")
 # @@END 004 HERO
 
 
