@@ -166,14 +166,31 @@ from auth import user_file         # AFTER the reload, so it binds to the live m
 
 # v13.48: ledger. page() before the gate, install() after it, and install BEFORE
 # fit_panel so the Display Fit sliders are wrapped too.
-import audit_log
+#
+# FIX AU-1 (v13.49): a module imported before a redeploy stays in sys.modules and
+# keeps answering with the OLD shape. audit_log gained page() at 02:25, two hours
+# after this process had already imported it at 00:42, so this page died on the
+# next line with AttributeError - and install() below never ran, which is why the
+# ledger only ever held button presses and never a single slider. Same hasattr +
+# reload guard auth and runstate already use; both calls are optional, so a
+# reload that also fails degrades to "no ledger" instead of a dead page.
+import audit_log as _audit
 
-audit_log.page("pages/4_Downloads.py")
+if not (hasattr(_audit, "page") and hasattr(_audit, "install")):
+    try:
+        _audit = importlib.reload(_audit)
+    except Exception:
+        pass
+audit_log = _audit
+
+if hasattr(audit_log, "page"):
+    audit_log.page("pages/4_Downloads.py")
 
 auth.require(st, "Unlock Export Studio")
 auth.fit(st)                        # CSS only, before the first widget
 
-audit_log.install(st, "pages/4_Downloads.py")
+if hasattr(audit_log, "install"):
+    audit_log.install(st, "pages/4_Downloads.py")
 
 auth.fit_panel(st)                  # the controls; collapsed until tapped
 # @@END 005 HERO
