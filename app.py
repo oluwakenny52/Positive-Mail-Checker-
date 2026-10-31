@@ -604,10 +604,13 @@ DEADLINE_DEEP = 240.0
 WORKERS_NORMAL = 12
 WORKERS_FAST = 30
 WORKERS_DEEP = 8
-RUNG_COST_MIN = 8.0
+# FIX SPEED-1: 8.0 / 1.5 / 15.0 meant a 4-rung account carried a 63s floor and a
+# 7-rung one 99s - always. A rung that fails in 200ms does not need 8s of
+# headroom, so the floor was pure padding and the Deadline slider could not bite.
+RUNG_COST_MIN = 5.0
 RUNG_COST_MAX = 12.0
-WORK_FLOOR_FACTOR = 1.5
-WORK_FLOOR_PAD = 15.0
+WORK_FLOOR_FACTOR = 1.0
+WORK_FLOOR_PAD = 10.0
 ROTATE_SETTLE = 0.4
 SLOW_RETRY_BACKOFF = 1.2
 SAME_HOST_RETRIES_DEFAULT = 1
@@ -700,6 +703,11 @@ REPORT_DF_MIN_INTERVAL = 1.0
 # went stale and unfinished_live.json was never written, so Resume was empty and
 # the stop had no reason. 5s keeps counts, remaining and the reason real.
 CHECKPOINT_SECONDS = 5.0
+# FIX SPEED-4: the checkpoint also rewrote clean_valid_accounts.txt IN FULL - a
+# read of every existing line plus a rewrite - every 5 seconds, on the script
+# thread, whether or not anything new had been found. It gets its own slower
+# clock; the resume record above still runs every 5s.
+CLEAN_SYNC_SECONDS = 30.0
 # Consecutive transport-ish verdicts before the connection is called down.
 NET_STREAK_TRIP = 8
 # @@END 014 UI_RENDER_CONSTANTS
@@ -2699,16 +2707,20 @@ def _make_gate(table, key, limit):
 
 
 def _limit(cfg_key, default):
-    """CFG value, but never below `default`.
+    """CFG value, clamped to the SLIDER MINIMUM - never to the default.
 
-    The defaults were raised without a CFG_VERSION bump, so a config saved under
-    the old numbers must not pin a user back to 4.
+    The defaults were raised once without a CFG_VERSION bump, so a config saved
+    under the old numbers must not pin a user back. But flooring at the DEFAULT
+    also made every concurrency slider lie: HOST_CONCURRENCY could be dragged to
+    1 and the engine still used 2, PROXY_SUBUSER_CONCURRENCY could be dragged to
+    1 and still used 2. The minimum the slider offers is 1, so floor there and
+    let the widget mean what it says.
     """
     try:
-        got = int(CFG.get(cfg_key, default) or 0)
+        got = int(CFG.get(cfg_key, default))
     except Exception:
         got = int(default)
-    return max(int(default), got)
+    return max(1, got)
 
 
 def _proxy_gate():
@@ -3087,11 +3099,14 @@ str_lit.sidebar.markdown("---")
 str_lit.sidebar.markdown("### 🎛 Advanced Control Rules")
 dynamic_worker_scaling = str_lit.sidebar.toggle(
     "⚡ Thread Auto-Scaling / Dynamic Workers", value=True, key="ui_dynamic_scaling",
-    help="Let the engine scale worker threads with live network conditions.")
+    help="Let the engine scale worker threads with live network conditions. Scaling only "
+         "ever RAISES the count above your Workers Start, never caps it.")
 max_hosts_per_domain = str_lit.sidebar.slider(
     "Max Hosts Per Domain", 1, 8, default_hosts, 1, key="ui_max_hosts",
-    help="How many discovered IMAP hosts to try per account. STARTTLS / plain and POP "
-         "rungs are capped separately."
+    help="How many discovered IMAP hosts to try per account. 1 = primary host only. "
+         "Each extra host adds a rung and lengthens the per-account work floor, so LOWER "
+         "is FASTER - raise it only for domains whose sibling hosts actually answer. "
+         "STARTTLS / plain and POP rungs are capped separately."
 )
 try_alt_username_ui = str_lit.sidebar.toggle(
     "Try local-part username on auth failure", value=True, key="ui_alt_user",
@@ -7800,7 +7815,10 @@ def _check_account_core(email, password, conf, domain, proxy_pool, thread_state,
                 used_proxies.add(px)
 
         _all_imap = [h for h in (conf.get("imap") or []) if h]
-        _imap_cap = max(2, min(4, max_hosts))
+        # FIX SPEED-5: max(2, ...) meant the slider could not go below 2, so
+        # "Max Hosts Per Domain = 1" was a lie and every account paid a second
+        # host's worth of rungs whether it needed them or not.
+        _imap_cap = max(1, min(4, max_hosts))
         imap_hosts = _dedupe_hosts_by_ip(_all_imap, cap=_imap_cap)
         _all_pop = [h for h in (conf.get("pop") or conf.get("pop3") or []) if h]
         _pop_only = [h for h in _all_pop if h not in imap_hosts]
@@ -7918,13 +7936,18 @@ def _check_account_core(email, password, conf, domain, proxy_pool, thread_state,
         rung_cost = max(RUNG_COST_MIN, min(configured_to, RUNG_COST_MAX))
         work_floor = (len(primary_plan) * rung_cost * WORK_FLOOR_FACTOR) + WORK_FLOOR_PAD
         budget = max(12.0, float(CFG.get("ACCOUNT_DEADLINE", DEADLINE_NORMAL)) * 0.95)
+        # FIX SPEED-1: the floor exists so a slow ladder is not cut off mid-rung,
+        # but it was applied UNCONDITIONALLY - so the Deadline slider could never
+        # shorten an account, and a 45s deadline still ran a 63s account. The
+        # floor may lift the budget, but only to 1.6x what was asked for.
         if work_floor > budget:
+            _floor_used = min(work_floor, budget * 1.6)
             trace_logs.append(
-                f"Budget floored to fit the work: {work_floor:.0f}s "
+                f"Budget floored to fit the work: {_floor_used:.0f}s "
                 f"({len(primary_plan)} rung(s) x {rung_cost:.0f}s x {WORK_FLOOR_FACTOR} "
-                f"+ {WORK_FLOOR_PAD:.0f}s) instead of the {budget:.0f}s the Deadline "
-                f"slider allows.")
-            budget = work_floor
+                f"+ {WORK_FLOOR_PAD:.0f}s, capped at 1.6x the {budget:.0f}s the Deadline "
+                f"slider allows) instead of {budget:.0f}s.")
+            budget = max(12.0, _floor_used)
 
         proxy_deadline = t_start + (budget * PROXY_TOTAL_FRAC)
         proxy_primary_deadline = t_start + (budget * PROXY_PRIMARY_FRAC)
@@ -8899,16 +8922,25 @@ if start_engine_btn:
             _pool_warm = bool(alive_pool)
 
         if not _pool_warm:
-            with str_lit.spinner("Cold pool - waiting for the probe to finish..."):
+            # FIX SPEED-2: this used to wait up to PROBE_BUDGET_START + 10 (130s)
+            # for the probe lock and then run a FULL 120s forced probe before the
+            # first account was even submitted. On Resume Unfinished that is
+            # minutes of spinner with nothing happening. Wait briefly, then start
+            # on whatever exists - the per-account ladder falls through to DIRECT
+            # by itself when the pool is empty.
+            with str_lit.spinner("Cold pool - brief wait for the probe, then starting..."):
                 _t0 = time.time()
-                while _PROBE_OWNER_LOCK.locked() and (time.time() - _t0) < (PROBE_BUDGET_START + 10):
+                while _PROBE_OWNER_LOCK.locked() and (time.time() - _t0) < 20.0:
                     time.sleep(0.2)
                 with alive_pool_lock:
                     _pool_warm = bool(alive_pool)
                 if not _pool_warm:
-                    refresh_alive_pool(force=True, budget=PROBE_BUDGET_START)
+                    refresh_alive_pool(force=True, budget=45.0)
                     with alive_pool_lock:
                         _pool_warm = bool(alive_pool)
+                if not _pool_warm:
+                    status_text.info("⏳ Pool still cold - starting anyway; accounts will "
+                                     "fall through to DIRECT.")
         elif _targets_changed and CFG.get("PROBE_TARGET", PROBE_TARGET_DEFAULT) == PROBE_TARGET_AUTO:
             threading.Thread(
                 target=lambda: refresh_alive_pool(force=True, budget=PROBE_BATCH_BUDGET),
@@ -9009,6 +9041,7 @@ if start_engine_btn:
         _last_ui_ts = 0.0
         _last_df_ts = 0.0
         _last_ck_ts = 0.0
+        _last_clean_ts = 0.0
         _net_streak = 0
 
         def render_buckets(snapshot):
@@ -9069,11 +9102,18 @@ if start_engine_btn:
         try:
             current_workers = CFG["MAX_WORKERS_START"]
             if CFG.get("DYNAMIC_WORKER_SCALING", False):
+                # FIX SPEED-3: the small-queue branch CAPPED the count at 5, so a
+                # 10-line resume ran 5 workers even when the slider said 50 - the
+                # slider was ignored exactly where it looked most useful, and
+                # raising it appeared to do nothing. Scaling may only ever RAISE
+                # the count above what was asked, never clamp it below.
                 if total_accs > 500:
-                    current_workers = min(100 if CFG.get("FAST_MODE", True) else 35,
-                                          CFG["MAX_WORKERS_START"] * 2)
+                    current_workers = max(
+                        CFG["MAX_WORKERS_START"],
+                        min(100 if CFG.get("FAST_MODE", True) else 35,
+                            CFG["MAX_WORKERS_START"] * 2))
                 elif total_accs < 20:
-                    current_workers = max(2, min(5, total_accs))
+                    current_workers = max(2, min(CFG["MAX_WORKERS_START"], total_accs))
 
             # FIX LAG-2: the metric cells are built ONCE, here. Rebuilding 14
             # st.columns inside every 0.12s tick was the single biggest per-tick
@@ -9288,11 +9328,18 @@ if start_engine_btn:
                                 left.append(raw)
                         if left:
                             save_unfinished("In Progress (Running)", left, checked_count, total_accs)
-                        try:
-                            _write_clean_valid(f"# Live sync | this run valid {len(valids)}\n",
-                                               valids)
-                        except Exception:
-                            pass
+                        # FIX SPEED-4: clean_valid_accounts.txt is read and fully
+                        # rewritten by _write_clean_valid(). Doing that on the 5s
+                        # checkpoint put a whole-file read+write on the script
+                        # thread twelve times a minute for no new information.
+                        if ((checked_count >= total_accs)
+                                or ((_now_ck - _last_clean_ts) >= CLEAN_SYNC_SECONDS)):
+                            _last_clean_ts = _now_ck
+                            try:
+                                _write_clean_valid(
+                                    f"# Live sync | this run valid {len(valids)}\n", valids)
+                            except Exception:
+                                pass
 
                     if total_accs > 0:
                         pct = min(1.0, checked_count / total_accs)
