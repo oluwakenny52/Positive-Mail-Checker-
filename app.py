@@ -3989,6 +3989,22 @@ def get_filtered_active_proxies(quiet: bool = False):
             else:
                 filtered.append(p)
 
+        # FIX SCORE-2: when NOTHING ever passes the probe, every node's score
+        # decays with each cycle (0 success, N fails -> 100*(2/(N+3)) - 5N) and the
+        # score filter walks the pool down to zero. The UI then claims "every proxy
+        # was filtered out" and the run has no pool at all, while the nodes are
+        # still perfectly reachable. If no node has a SINGLE success, a uniformly
+        # broken pool is worth more than an empty one.
+        if not filtered and raw:
+            with proxy_lock:
+                any_ok = any(int((proxy_meta.get(p) or {}).get("success", 0)) > 0
+                             for p in raw)
+            if not any_ok:
+                log_startup("WARNING: no node has ever succeeded - score filter "
+                            "bypassed so the pool stays usable.", quiet=quiet)
+                log_probe_event("score filter bypassed: 0 nodes have any success")
+                return list(raw)
+
         log_startup(f"Proxy filtering complete. Active pool contains {len(filtered)} "
                     f"of {len(raw)} candidate(s) (score/geo filter).", quiet=quiet)
         if not filtered:
@@ -5618,10 +5634,12 @@ with str_lit.sidebar:
     # FIX ISO-4: _any_run_active(), not STATE["run_active"] - the bool used to be
     # cleared by whichever run ended first, so one user's exit hid another user's
     # live run and this banner claimed READY mid-run.
-    # FIX UI-4: "N validated node(s) armed" was a lie when NONE passed the probe.
+    # FIX UI-4: "N validated node(s) armed" was a lie when NONE passed the probe,
+    # and len(alive_pool) is not the same number as the nodes the engine may use -
+    # report the probe-pass count so the banner cannot overstate the pool.
     if _alive_now and not _any_run_active():
         if _p_ok:
-            _rtxt = (f"✅ READY - **{_alive_now}** validated node(s) armed. "
+            _rtxt = (f"✅ READY - **{_p_ok}** validated node(s) armed. "
                      f"Paste your combos and press 🔥 Start Live Checking Engine. "
                      f"Nothing else to set.")
             _rfunc = str_lit.caption if _steal else str_lit.success
