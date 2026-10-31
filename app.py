@@ -583,8 +583,8 @@ _rs_path = runstate.tick()
 
 # @@BLOCK 008 BUILD_IDENTITY deps=-
 # Bump CFG_VERSION whenever a DEFAULT changes in a way users should inherit.
-CFG_VERSION = 1349
-BUILD_TAG = "v13.49"
+CFG_VERSION = 1348
+BUILD_TAG = "v13.48"
 # @@END 008 BUILD_IDENTITY
 
 # @@BLOCK 009 TIMING_CONSTANTS deps=-
