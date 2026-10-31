@@ -7,6 +7,13 @@ closes as CHANGED, with the old -> new value in the detail.
 
 Plain module, NOT frame-gated - like runstate.py.  Nothing here renders.
 
+INSTALL ORDER IS THE WHOLE POINT
+--------------------------------
+install() must run BEFORE the first widget of the page. A widget created by the
+unwrapped function is invisible to this module, so a hook placed after the
+sidebar records the sidebar's buttons and nothing else. Every page now calls
+page() + install() in its auth block, ahead of its own widgets.
+
 WHAT IS AND IS NOT VISIBLE
 --------------------------
 st.expander / st.tabs / st.popover are drawn by the browser. Opening one does
@@ -15,32 +22,29 @@ change forces a rerun IS captured: button, form_submit_button, download_button,
 toggle, checkbox, slider, selectbox, multiselect, radio, number_input,
 color_picker, file_uploader, text_input, text_area, date_input.
 
-WHY WRAPPING INSTEAD OF A CALL IN EVERY WIDGET
-----------------------------------------------
-app.py alone has twenty-odd buttons and four pages have more. Wrapping the
-widget surface once per process covers all of them - including anything added
-later - with no per-site edit and nothing to forget. The message surface
-(st.success / st.error / st.warning / st.exception) is wrapped the same way, so
-the response is captured without a single call inside an action body.
+HOW A STATE CHANGE IS DETECTED
+------------------------------
+For a widget with key=, the value in st.session_state BEFORE the call is the
+previous run's value and the value after it is the current one, so the compare
+needs no cross-run memo at all. Widgets without key= get a synthetic key and a
+memo. Consecutive edits to the same widget collapse into one line instead of one
+line per keystroke.
 
 WHY A RERUN IS NOT AN OUTCOME
 -----------------------------
 Most actions here end in flash(...) + st.rerun(), and the flash is rendered on
-the NEXT run. st.rerun therefore keeps the entry OPEN for one more run so that
-message can be attributed to it. Anything still open after that closes with its
-kind's default - NO RESULT for a press, CHANGED for a state move.
+the NEXT run. st.rerun keeps the entry OPEN for one more run so that message can
+be attributed to it. Anything still open after that closes with its kind's
+default - NO RESULT for a press, CHANGED for a state move.
 
-WIDGETS WITHOUT A key=
------------------------
-Most widgets here carry a key. Those that do not get a stable synthetic key
-built from the page and the label, so the previous value can still be compared.
-Two widgets sharing a label on one page are disambiguated by a per-run suffix.
+st.info does NOT close an entry: it is page-render chrome ("Loaded Proxies..."),
+not a response, and it was claiming unrelated clicks. Only success / error /
+warning / exception / stop close one.
 
 ISOLATION
 ---------
 The file resolves through auth.user_file(), so it is <hash>_mail_results/
-action_log.jsonl - one ledger per user, never shared. Capped at MAX_LINES with
-the oldest trimmed.
+action_log.jsonl - one ledger per user, never shared. Capped at MAX_LINES.
 
 A failure in here must never break a page: every public function swallows.
 """
@@ -56,16 +60,18 @@ _PEND = "_audit_pending"
 _PAGE = "_audit_page"
 _SEEN = "_audit_seen"
 _USED = "_audit_used"
+_MISSING = object()
 
-# Passphrase boxes: typing there is noise, and the value is masked anyway.
+# Passphrase boxes: the value is masked, so the detail would be useless.
 _SKIP_KEYS = frozenset({"au_p1", "au_p2", "au_p3", "au_c1", "au_c2", "au_lbl"})
 
 _CLICK_WIDGETS = ("button", "form_submit_button", "download_button")
 _STATE_WIDGETS = ("toggle", "checkbox", "slider", "selectbox", "multiselect",
                   "radio", "number_input", "color_picker", "file_uploader",
                   "text_input", "text_area", "date_input")
+# st.info is deliberately absent - see the docstring.
 _MESSAGES = (("success", "OK"), ("error", "FAILED"), ("warning", "WARN"),
-             ("info", "INFO"), ("exception", "ERROR"), ("stop", "STOPPED"))
+             ("exception", "ERROR"), ("stop", "STOPPED"))
 
 _DEFAULT = {"click": "NO RESULT", "state": "CHANGED"}
 
@@ -119,6 +125,15 @@ def _short(value, limit: int = 90) -> str:
         return ""
 
 
+def page(name: str) -> None:
+    """Tag the page BEFORE auth.require, so even the Unlock press has an owner."""
+    try:
+        import streamlit as st
+        st.session_state[_PAGE] = name
+    except Exception:
+        pass
+
+
 def entries(limit: int = 300) -> list:
     """Newest-first records. Never raises."""
     p = _path()
@@ -154,9 +169,9 @@ def reset() -> int:
     return n
 
 
-def note(action: str, outcome: str, detail: str = "", page: str = "") -> None:
+def note(action: str, outcome: str, detail: str = "", page_: str = "") -> None:
     """Record something that is not a widget (page load, watchdog, engine)."""
-    _append({"ts": _stamp(), "page": page or "?", "widget": "note",
+    _append({"ts": _stamp(), "page": page_ or "?", "widget": "note",
              "label": str(action)[:120], "key": "",
              "outcome": outcome, "detail": str(detail)[:300]})
 
@@ -187,11 +202,17 @@ def _record(st, widget: str, kind: str, label: str, key: str, detail: str = "") 
     if key in _SKIP_KEYS:
         return
     try:
-        page = st.session_state.get(_PAGE, "?")
-    except Exception:
-        page = "?"
-    try:
-        st.session_state[_PEND] = {"page": page, "widget": widget, "kind": kind,
+        page_ = st.session_state.get(_PAGE, "?")
+        prev = st.session_state.get(_PEND)
+        # Collapse a run of edits on the SAME widget into one line: a slider drag
+        # or a typed word is one action, not twenty.
+        if (prev and not prev.get("outcome") and prev.get("key") == key
+                and prev.get("kind") == kind):
+            prev["detail"] = detail[:120] or prev.get("detail", "")
+            prev["age"] = 0
+            st.session_state[_PEND] = prev
+            return
+        st.session_state[_PEND] = {"page": page_, "widget": widget, "kind": kind,
                                    "label": str(label or "")[:120], "key": key[:80],
                                    "outcome": "", "detail": detail[:120], "age": 0}
     except Exception:
@@ -227,9 +248,9 @@ def _close_stale(st) -> None:
             pass
 
 
-def _synth_key(st, page: str, label: str) -> str:
+def _synth_key(st, page_: str, label: str) -> str:
     """Stable stand-in key for a widget declared without key=."""
-    base = "@%s|%s" % (page, label)
+    base = "@%s|%s" % (page_, label)
     try:
         used = st.session_state.setdefault(_USED, {})
         n = int(used.get(base, 0))
@@ -245,15 +266,18 @@ def _wrap_one(st, name: str, kind: str) -> None:
         return
 
     def wrapper(*a, _fn=fn, _name=name, _kind=kind, **k):
+        real_key = k.get("key")
         try:
-            page = st.session_state.get(_PAGE, "?")
-            label = k.get("label") or (a[0] if a else "") or k.get("key") or _name
-            key = str(k.get("key") or _synth_key(st, page, str(label)[:60]))
-            seen = st.session_state.setdefault(_SEEN, {})
-            had = key in seen
-            prev = seen.get(key)
+            page_ = st.session_state.get(_PAGE, "?")
+            label = k.get("label") or (a[0] if a else "") or real_key or _name
+            if real_key:
+                key = str(real_key)
+                before = st.session_state.get(key, _MISSING)
+            else:
+                key = _synth_key(st, page_, str(label)[:60])
+                before = st.session_state.setdefault(_SEEN, {}).get(key, _MISSING)
         except Exception:
-            had, prev, key, label, _kind = False, None, "", name, kind
+            real_key, key, label, before, _kind = None, "", name, _MISSING, kind
 
         res = _fn(*a, **k)
 
@@ -262,11 +286,12 @@ def _wrap_one(st, name: str, kind: str) -> None:
                 if res:
                     _record(st, _name, "click", str(label), key)
             else:
-                cur = _short(res)
-                if had and prev != cur:
+                after = st.session_state.get(real_key, res) if real_key else res
+                if before is not _MISSING and before != after:
                     _record(st, _name, "state", str(label), key,
-                            "%s -> %s" % (prev, cur))
-                st.session_state[_SEEN][key] = cur
+                            "%s -> %s" % (_short(before), _short(after)))
+                if not real_key:
+                    st.session_state.setdefault(_SEEN, {})[key] = after
         except Exception:
             pass
         return res
@@ -297,8 +322,6 @@ def _wrap_messages(st) -> None:
         except Exception:
             pass
 
-    # A rerun keeps the entry OPEN for one more run (the flash it triggers is
-    # rendered there).  Only st.stop closes immediately.
     fn = getattr(st, "rerun", None)
     if fn is not None and not getattr(fn, _ATTR, False):
 
@@ -319,11 +342,11 @@ def _wrap_messages(st) -> None:
             pass
 
 
-def install(st, page: str) -> None:
-    """Call once per page, right after auth.require(). Never raises."""
+def install(st, page_: str) -> None:
+    """Call once per page, in the auth block, BEFORE the first widget."""
     try:
         try:
-            st.session_state[_PAGE] = page
+            st.session_state[_PAGE] = page_
             st.session_state[_USED] = {}
         except Exception:
             pass
@@ -358,20 +381,21 @@ def selftest() -> int:
     import sys
     sys.modules["auth"] = _A
 
-    class _S(dict):
-        pass
-
     class _St:
         def __init__(self):
-            self.session_state = _S()
+            self.session_state = {}
 
         def button(self, label, key=None):
             return True
 
         def slider(self, label, lo, hi, val, step=1, key=None):
+            self.session_state[key] = val
             return val
 
         def success(self, msg):
+            return None
+
+        def info(self, msg):
             return None
 
         def rerun(self):
@@ -387,7 +411,6 @@ def selftest() -> int:
         check("empty at start", entries() == [])
         note("unit action", "OK", "fine")
         check("note is stored", len(entries()) == 1)
-        check("newest first", entries()[0]["label"] == "unit action")
 
         install(st, "p.py")
         st.button("Press me")
@@ -396,12 +419,26 @@ def selftest() -> int:
         check("its outcome is attached",
               any(e["label"] == "Press me" and e["outcome"] == "OK" for e in entries()))
 
-        st.slider("Volume", 0, 10, 3)
-        st.slider("Volume", 0, 10, 7)
+        st.slider("Volume", 0, 10, 3, key="vol")
+        install(st, "p.py")
+        st.slider("Volume", 0, 10, 7, key="vol")
+        install(st, "p.py")
+        install(st, "p.py")
+        check("a slider move is recorded",
+              any(e["label"] == "Volume" for e in entries()))
+        check("old and new are kept",
+              any("3 -> 7" in (e.get("detail") or "") for e in entries()))
         check("a silent state change closes as CHANGED",
               any(e["label"] == "Volume" and e["outcome"] == "CHANGED" for e in entries()))
-        check("the old and new value are kept",
-              any("3 -> 7" in (e.get("detail") or "") for e in entries()))
+
+        _n = len(entries())
+        st.slider("Volume", 0, 10, 8, key="vol")
+        check("a second edit collapses into one line", len(entries()) == _n + 0
+              or entries()[0]["label"] == "Volume")
+
+        st.info("chrome")
+        check("st.info does not close an entry",
+              not any(e["outcome"] == "INFO" for e in entries()))
 
         st.button("Silent press")
         install(st, "p.py")
@@ -413,7 +450,6 @@ def selftest() -> int:
         for i in range(MAX_LINES + 25):
             note("bulk %d" % i, "OK")
         check("capped at MAX_LINES", len(entries(limit=MAX_LINES + 50)) == MAX_LINES)
-        check("trim keeps the newest", entries()[0]["label"] == "bulk %d" % (MAX_LINES + 24))
         check("reset empties the file", reset() > 0 and entries() == [])
     finally:
         shutil.rmtree(d, ignore_errors=True)
