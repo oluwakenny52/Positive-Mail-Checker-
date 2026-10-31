@@ -583,8 +583,8 @@ _rs_path = runstate.tick()
 
 # @@BLOCK 008 BUILD_IDENTITY deps=-
 # Bump CFG_VERSION whenever a DEFAULT changes in a way users should inherit.
-CFG_VERSION = 1348
-BUILD_TAG = "v13.48"
+CFG_VERSION = 1349
+BUILD_TAG = "v13.49"
 # @@END 008 BUILD_IDENTITY
 
 # @@BLOCK 009 TIMING_CONSTANTS deps=-
@@ -656,7 +656,12 @@ SMTP_HOST_CAP = 1
 PROXY_CONCURRENCY_DEFAULT = 10
 HOST_CONCURRENCY_DEFAULT = 2
 PROXY_IP_CONCURRENCY_DEFAULT = 2
-PROXY_SUBUSER_CONCURRENCY_DEFAULT = 2
+# FIX SUB-1: this was 2, and _limit() floors every gate at its DEFAULT - so the
+# slider could be dragged to 1 and the engine still used 2, silently, while the
+# help text promised 1. The 407 a provider sends when a sub-user cap is exceeded
+# is the whole reason this gate exists, so the floor has to be the value the
+# slider offers.
+PROXY_SUBUSER_CONCURRENCY_DEFAULT = 1
 PROBE_WORKERS_DEFAULT = 4
 PROBE_WORKERS_BUSY = 3
 PROBE_WORKERS_BULK = 10
@@ -960,6 +965,18 @@ class ProxyPortBlocked(ProxyTransportError):
     """
 
 
+class ProxyPlanError(ProxyTransportError):
+    """The proxy is ALIVE and the credential was ACCEPTED, but the provider is
+    refusing SERVICE (402 Payment Required / 429 / 503).
+
+    Webshare answers 402 when the plan's bandwidth is spent. Nothing about the
+    node and nothing about the password is wrong, so this must not strike, not
+    quarantine, not arm the breaker and not decay the score - and above all it
+    must not be reported as a 407. Subclasses ProxyTransportError so existing
+    handlers still catch it, but it is always tested first.
+    """
+
+
 class SmtpAuthError(ConnectionError):
     """A CLEAN 535 from submission. A real credential answer. CONFIRM-ONLY."""
 
@@ -1010,6 +1027,22 @@ def _is_proxy_auth_fail(msg) -> bool:
             or "proxy authentication required" in m
             or "socks5 authentication failed" in m
             or "socks authentication failed" in m)
+
+
+def _is_proxy_plan_error(msg) -> bool:
+    """True when the provider is refusing SERVICE, not the credential or the node.
+
+    402 Payment Required is Webshare's bandwidth/plan answer; 429 and 503 are the
+    same family. It has to be tested BEFORE the auth test in callers, because a
+    SOCKS5 fallback onto an HTTP-only port always answers "authentication failed"
+    and would otherwise bury the real 402 under a fake 407.
+    """
+    m = (msg or "").lower()
+    if _is_proxy_auth_fail(m) or _is_proxy_port_block(m):
+        return False
+    return ("402" in m or "payment required" in m
+            or "429" in m or "too many requests" in m
+            or "503" in m or "service unavailable" in m)
 
 
 def _is_proxy_port_block(msg) -> bool:
@@ -1163,6 +1196,7 @@ _PROBE_REASON_LABEL = {
     "ok": "pass",
     "auth": "407 auth (node)",
     "auth_dest": "407 auth (dest only)",
+    "plan": "402 plan/bandwidth (node alive)",
     "transport": "transport reset",
     "timeout": "timeout",
     "dead": "dead",
@@ -1202,21 +1236,28 @@ def record_probe_result(proxy_str, ok, reason, latency_ms=0, target="",
 
 
 def probe_summary():
-    """(passed, auth, timeout, dead) over the most recent probe of each node.
+    """(passed, auth, plan, timeout, dead) over the most recent probe of each node.
 
     FIX 407-SCOPE: `auth_dest` counts as an AUTH answer in this breakdown - it is
     still a 407 - but the node also carries ok=True, so it lands in `passed` at
     the same time. `dead` must therefore exclude it or one node is counted twice.
+
+    FIX PLAN-1: 402 / 429 / 503 is neither an auth answer nor a dead node. The
+    proxy is alive and the credential was accepted; the provider is refusing
+    service. It gets its own column so `dead` stops absorbing it and the UI can
+    say which of the two a zero-success pool actually is.
     """
     with probe_stats_lock:
         snap = list(probe_stats.values())
     passed = sum(1 for v in snap if v.get("ok"))
     auth = sum(1 for v in snap if v.get("reason") in ("auth", "auth_dest"))
+    plan = sum(1 for v in snap if v.get("reason") == "plan")
     timeout = sum(1 for v in snap if not v.get("ok")
                   and v.get("reason") in ("timeout", "transport"))
     dead = sum(1 for v in snap if not v.get("ok")
-               and v.get("reason") not in ("auth", "auth_dest", "timeout", "transport"))
-    return passed, auth, timeout, dead
+               and v.get("reason") not in ("auth", "auth_dest", "plan",
+                                           "timeout", "transport"))
+    return passed, auth, plan, timeout, dead
 
 
 def probe_reason_histogram():
@@ -3086,9 +3127,15 @@ custom_blacklist_input = str_lit.sidebar.text_input(
 # @@BLOCK 049 SIDEBAR_POOL deps=016,017,018,046
 str_lit.sidebar.markdown("---")
 str_lit.sidebar.markdown("### 🌐 Proxy / Pool Configuration")
+# FIX SCORE-4: this slider was `step=10` against a default of 5, so it could not
+# SIT on 5 - it snapped to 0 or 10 and the default was never actually applied.
+# 0 means "no score filtering at all", which is the opposite of what the label
+# promises. Step 1.
 min_proxy_score = str_lit.sidebar.slider(
-    "Min Proxy Score", 0, 100, MIN_PROXY_SCORE_DEFAULT, 10, key="ui_min_proxy_score",
-    help="A node is dropped from the pool once its score falls below this."
+    "Min Proxy Score", 0, 100, MIN_PROXY_SCORE_DEFAULT, 1, key="ui_min_proxy_score",
+    help="A node is dropped from the pool once its score falls below this. A node that "
+         "has EVER passed the probe is never dropped by score, and a 402/407 no longer "
+         "counts as a fail - only real transport failures do."
 )
 proxy_precheck_timeout = str_lit.sidebar.slider(
     "Proxy Pre-Check Timeout (Sec)", 1, 10, PROXY_PRECHECK_TIMEOUT_DEFAULT, 1,
@@ -3106,7 +3153,7 @@ probe_target_ui = str_lit.sidebar.selectbox(
     help="DEFAULT '443 (HTTPS)': the probe dials api.ipify.org:443, which is not a "
          "mail server. Keep it - a 407 on 443 is unambiguously about the credential "
          "or the plan, while a 407 on 993 is not, so 443 is the only clean baseline. "
-         "The mail-destination spot check below is what tests 993, and it now proves "
+         "The mail-destination spot check below is what tests 993, and it proves "
          "itself against 443 before it blames the node."
 )
 probe_strict_ui = str_lit.sidebar.toggle(
@@ -3122,7 +3169,8 @@ probe_second_scheme_ui = str_lit.sidebar.toggle(
     "Probe: also try the second proxy scheme", value=PROBE_SECOND_SCHEME_DEFAULT,
     key="ui_probe_scheme2",
     help="OFF (default) = one CONNECT per probe when the first scheme PASSES. The alternate "
-         "scheme is ALWAYS tried after a FAILURE regardless of this switch."
+         "scheme is ALWAYS tried after a FAILURE regardless of this switch, except after a "
+         "402/407 where another scheme cannot change the answer."
 )
 prober_idle_ui = str_lit.sidebar.toggle(
     "Probe: keep probing in the background while idle",
@@ -3145,7 +3193,9 @@ probe_sample_ui = str_lit.sidebar.slider(
 )
 dedupe_proxies_ui = str_lit.sidebar.toggle(
     "Deduplicate proxy pool", value=True, key="ui_dedupe",
-    help="ON (default): collapse repeated host:port lines in proxies.txt."
+    help="ON (default): collapse repeated host:port lines in proxies.txt. The live pool is "
+         "ALWAYS collapsed to one line per host:port regardless, keeping whichever line "
+         "passed - eleven sub-users on one IP are one proxy, not eleven."
 )
 allow_blacklist_ips = str_lit.sidebar.toggle(
     "Allow Blacklisted / Flagged Proxy IPs", value=False, key="ui_allow_blacklist",
@@ -3156,7 +3206,8 @@ proxy_quarantine_ui = str_lit.sidebar.toggle(
     "🩹 Quarantine nodes that return 407", value=True, key="ui_quarantine",
     help="ON (default): a node that answers '407 Proxy Authentication Required' THREE "
          "times is pulled out of the pool for the rest of the run. A plain socket reset "
-         "is NOT a 407, and a 407 that passes the 443 control does not count at all."
+         "is NOT a 407, a 402 is NOT a 407, and a 407 that passes the 443 control does "
+         "not count at all."
 )
 # @@END 049 SIDEBAR_POOL
 
@@ -3169,15 +3220,15 @@ host_concurrency_ui = str_lit.sidebar.slider(
 )
 proxy_ip_concurrency_ui = str_lit.sidebar.slider(
     "Per-Proxy-IP Connection Cap", 1, 12, PROXY_IP_CONCURRENCY_DEFAULT, 1, key="ui_ip_conc",
-    help="Default 1. Max simultaneous tunnels through ONE proxy IP, for the CHECKER and "
+    help="Default 2. Max simultaneous tunnels through ONE proxy IP, for the CHECKER and "
          "the PROBER alike."
 )
 proxy_subuser_concurrency_ui = str_lit.sidebar.slider(
     "Per-Proxy-SUBUSER Connection Cap", 1, 12, PROXY_SUBUSER_CONCURRENCY_DEFAULT, 1,
     key="ui_subuser_conc",
     help="Default 1. Providers rate-limit PER SUB-USER - a 407 is what you get when that "
-         "cap is exceeded, NOT because the node is dead. The single most important 407 "
-         "control in the app."
+         "cap is exceeded, NOT because the node is dead. 1 is a real floor now; the gate "
+         "used to be silently pinned at 2 no matter what you dragged."
 )
 proxy_concurrency_ui = str_lit.sidebar.slider(
     "Global Proxy Connection Cap", 2, 60, PROXY_CONCURRENCY_DEFAULT, 1, key="ui_proxy_conc",
@@ -4038,12 +4089,22 @@ def get_filtered_active_proxies(quiet: bool = False):
             else:
                 filtered.append(p)
 
+        # FIX SCORE-3 (v13.49): a node that has EVER passed the probe is never
+        # dropped by SCORE. 0 success / N fail lands on 0, and the old rescue only
+        # fired when NOTHING had ever passed - so as soon as ONE node succeeded the
+        # filter happily kept eleven dead lines and threw away the ten working
+        # ones. A proven node is proof; the score is an estimate.
+        if raw:
+            with proxy_lock:
+                _ever = [p for p in raw
+                         if int((proxy_meta.get(p) or {}).get("success", 0)) > 0]
+            for p in _ever:
+                if p not in filtered and not proxy_is_blocked(p):
+                    filtered.append(p)
+
         # FIX SCORE-2: when NOTHING ever passes the probe, every node's score
-        # decays with each cycle (0 success, N fails -> 100*(2/(N+3)) - 5N) and the
-        # score filter walks the pool down to zero. The UI then claims "every proxy
-        # was filtered out" and the run has no pool at all, while the nodes are
-        # still perfectly reachable. If no node has a SINGLE success, a uniformly
-        # broken pool is worth more than an empty one.
+        # decays with each cycle and the score filter walks the pool down to zero.
+        # A uniformly broken pool is still worth more than an empty one.
         if not filtered and raw:
             with proxy_lock:
                 any_ok = any(int((proxy_meta.get(p) or {}).get("success", 0)) > 0
@@ -4129,6 +4190,9 @@ def _raw_http_connect(host, port, info, timeout):
     a build that drops the header silently is indistinguishable from a wrong
     password (407). Building the request here removes that dependency for the
     HTTP scheme - and it is the same exchange the Proxy Debug Console performs.
+
+    The status line is classified HERE, not left to a string match further up, so
+    a 402 can never be mistaken for a 407.
     """
     sk = socket.create_connection((info["host"], int(info["port"])), timeout=timeout)
     try:
@@ -4157,11 +4221,13 @@ def _raw_http_connect(host, port, info, timeout):
             pass
         if code == 407:
             raise ProxyAuthError(f"proxy rejected the credential (raw CONNECT 407): {line}")
+        if code in (402, 429, 503):
+            raise ProxyPlanError(f"provider refusing service (raw CONNECT {code}): {line[:140]}")
         if code == 403:
             raise ProxyPortBlocked(f"proxy refused the destination (raw CONNECT 403): {line}")
         raise ProxyTransportError(
             f"proxy answered {code or 'nothing'} to CONNECT: {line[:140]}")
-    except (ProxyAuthError, ProxyPortBlocked, ProxyTransportError):
+    except (ProxyAuthError, ProxyPlanError, ProxyPortBlocked, ProxyTransportError):
         raise
     except Exception:
         try:
@@ -4199,6 +4265,7 @@ def proxy_connect(host, port, proxy_str, timeout=None, remote_dns=True):
     last_err = None
     auth_schemes = set()
     port_blocked = False
+    plan_blocked = False
     for ptype in _scheme_order(proxy_str):
         try:
             # HTTP is dialled by hand - the auth header is ours, not PySocks'.
@@ -4217,6 +4284,11 @@ def proxy_connect(host, port, proxy_str, timeout=None, remote_dns=True):
             return s
         except Exception as proxy_ex:
             last_err = proxy_ex
+            if _is_proxy_plan_error(str(proxy_ex)):
+                # A 402 is provider-wide; SOCKS5 on an HTTP-only port answers
+                # "authentication failed" and would bury it under a fake 407.
+                plan_blocked = True
+                break
             if _is_proxy_auth_fail(str(proxy_ex)):
                 auth_schemes.add(ptype)
             elif _is_proxy_port_block(str(proxy_ex)):
@@ -4225,6 +4297,9 @@ def proxy_connect(host, port, proxy_str, timeout=None, remote_dns=True):
                 # own exception - rotating the proxy would burn a node for
                 # something no other node can fix either.
                 port_blocked = True
+
+    if plan_blocked:
+        raise ProxyPlanError(f"provider refusing service for {host}:{port}: {last_err}")
 
     if auth_schemes:
         raise ProxyAuthError(f"Proxy authentication required for {host}:{port}: {last_err}")
@@ -4680,7 +4755,8 @@ def _is_proxy_level_error(msg):
         return False
 
 
-def record_proxy_attempt(proxy_str, success, is_network_error=False, is_proxy_auth=False):
+def record_proxy_attempt(proxy_str, success, is_network_error=False, is_proxy_auth=False,
+                         is_plan=False):
     try:
         if not proxy_str:
             return
@@ -4702,6 +4778,10 @@ def record_proxy_attempt(proxy_str, success, is_network_error=False, is_proxy_au
                     quarantine_proxy(proxy_str, f"{strikes}x 407")
                 else:
                     _park_proxy_407(proxy_str)
+        elif is_plan:
+            # FIX PLAN-1: a 402 is the provider's bandwidth/plan, not the node.
+            # Park it so rotation prefers something usable, but never strike it.
+            _park_proxy_407(proxy_str)
         threshold = int(live_cfg().get("BLACKLIST_CF", BLACKLIST_CF_DEFAULT))
         with proxy_lock:
             if proxy_str not in proxy_meta:
@@ -4712,10 +4792,13 @@ def record_proxy_attempt(proxy_str, success, is_network_error=False, is_proxy_au
                 m["success"] = m.get("success", 0) + 1
                 consecutive_proxy_failures[proxy_str] = 0
             else:
-                m["fails"] = m.get("fails", 0) + 1
-                # FIX 407-SCOPE: a credential answer is not a network failure, so
-                # it no longer arms the 30s circuit breaker.
-                if is_network_error and not is_proxy_auth:
+                # FIX PLAN-1: a 402 and a 407 are both PROVIDER answers, not node
+                # failures. They used to add a fail each, and five fails is a
+                # score of zero - which is how ten working proxies ended up below
+                # the Min Proxy Score filter while eleven dead lines survived.
+                if not is_plan and not is_proxy_auth:
+                    m["fails"] = m.get("fails", 0) + 1
+                if is_network_error and not is_proxy_auth and not is_plan:
                     consecutive_proxy_failures[proxy_str] += 1
                     if consecutive_proxy_failures[proxy_str] >= threshold:
                         circuit_breaker_until[proxy_str] = time.time() + CIRCUIT_BREAKER_SECONDS
@@ -4974,17 +5057,22 @@ def tunnel_probe(proxy_str, targets=None, timeout=None):
     """Open a REAL CONNECT tunnel through the node and classify the outcome.
 
     reasons: ok | auth (node-wide credential) | auth_dest (credential accepted,
-    this DESTINATION refused) | timeout | transport | format | nosocks | dead
+    this DESTINATION refused) | plan (provider refusing service) | timeout |
+    transport | format | nosocks | dead
 
     A 407 arriving on ANY scheme is an auth refusal, decided AFTER the loops -
-    the node's scheme memory is driven by an actual SUCCESS only.  A FAILURE
-    always tries the alternate scheme, EXCEPT on auth.
+    the node's scheme memory is driven by an actual SUCCESS only.
 
     FIX 407-SCOPE: a 407 used to be charged to the NODE outright, so a pool that
     authenticated fine on 443 and 407'd on 993 quarantined and score-zeroed
     itself. Every 407 is now re-dialled against PROBE_CONTROL_TARGETS first; if
     the control passes the verdict is `auth_dest` (ok=True) and the node keeps
     its score, its strike count and its place in the pool.
+
+    FIX PLAN-1: a 402 / 429 / 503 short-circuits the scheme loop. It used to fall
+    through to SOCKS5, which answered "authentication failed" on an HTTP-only
+    port and re-labelled the whole node a 407 - so a bandwidth-refused pool read
+    as a credential failure.
     """
     out = {"ok": False, "reason": "dead", "latency_ms": 0, "target": "",
            "scheme": None, "error": "", "control": ""}
@@ -5028,7 +5116,7 @@ def tunnel_probe(proxy_str, targets=None, timeout=None):
     started_all = time.time()
 
     def _dial(host, port, label):
-        """One target across the scheme order. 'ok' | 'auth' | 'fail'."""
+        """One target across the scheme order. 'ok' | 'auth' | 'plan' | 'fail'."""
         for _s_idx, ptype in enumerate(_scheme_order(proxy_str)):
             if _s_idx and out["ok"] and not _second_scheme:
                 break
@@ -5059,6 +5147,9 @@ def tunnel_probe(proxy_str, targets=None, timeout=None):
                               f"{type(e).__name__}: {msg[:110]}")
                 out["target"] = label
                 out["latency_ms"] = int((time.time() - started) * 1000)
+                if _is_proxy_plan_error(msg):
+                    out["reason"] = "plan"
+                    return "plan"
                 if _is_proxy_auth_fail(msg):
                     auth_schemes.add(ptype)
                     return "auth"
@@ -5080,9 +5171,10 @@ def tunnel_probe(proxy_str, targets=None, timeout=None):
         if time.time() >= hard_deadline:
             errors.append(f"{label}: skipped (node budget spent)")
             break
-        if _dial(host, port, label) == "ok":
+        _v = _dial(host, port, label)
+        if _v == "ok":
             break
-        if auth_schemes:
+        if auth_schemes or _v == "plan":
             break
 
     # ---- the 407 is disambiguated BEFORE it is charged to the node ----------
@@ -5097,6 +5189,8 @@ def tunnel_probe(proxy_str, targets=None, timeout=None):
 
     if out["ok"] and out["reason"] != "auth_dest":
         out["reason"] = "ok"
+    elif out["reason"] == "plan":
+        pass
     elif auth_schemes and out["reason"] != "auth_dest":
         out["reason"] = "auth"
 
@@ -5168,6 +5262,14 @@ def precheck_proxy_fast(proxy_str):
             except Exception:
                 pass
             return True
+
+        # FIX PLAN-1: 402 is not a node failure. Record it, park it, keep the
+        # score, and report it as its own reason so "dead" stops absorbing it.
+        if res["reason"] == "plan":
+            record_proxy_attempt(proxy_str, success=False, is_plan=True)
+            log_probe_event(f"PLAN {info['host']}:{info['port']} -> provider refusing "
+                            f"service (bandwidth/plan); node kept: {res.get('error', '')[:180]}")
+            return False
 
         if res["reason"] == "auth":
             record_proxy_attempt(proxy_str, success=False, is_network_error=True,
@@ -5323,6 +5425,21 @@ def refresh_alive_pool(force: bool = False, budget: float = None):
             log_startup("Alive pool refreshed: proxies.txt is empty.", quiet=True)
             return
 
+        # FIX SCORE-5 (v13.49): a FORCED probe re-measures every node, so the
+        # accumulated `fails` is stale history from a different provider state.
+        # Without this, a 402 storm left every node on a score of 0 for ever and
+        # Min Proxy Score then filtered the whole pool - permanently, because the
+        # score only recovers by succeeding and nothing could get through.
+        if force:
+            with proxy_lock:
+                for _p in raw:
+                    _m = proxy_meta.setdefault(
+                        _p, {"fails": 0, "success": 0, "country": "Unknown",
+                             "region": "Unknown", "latency_ms": 0})
+                    _m["fails"] = 0
+                    _m["score"] = compute_real_score(_m.get("success", 0), 0)
+            log_probe_event("forced probe: node fail counts reset, scores recomputed")
+
         try:
             _sample = max(0, int(live_cfg().get("PROBE_SAMPLE_MAX", 0)))
         except Exception:
@@ -5374,6 +5491,24 @@ def refresh_alive_pool(force: bool = False, budget: float = None):
 
         live, batch_timed_out = _run_batch(precheck_proxy_fast, raw, probe_workers(), budget)
 
+        # FIX POOL-DUP (v13.49): eleven sub-user lines can point at the SAME
+        # host:port and only one of those sub-users may be alive - the rest 402.
+        # A random draw over 112 lines then spends ~90% of its attempts on dead
+        # sub-users while the ten working proxies sit in the same pool. Collapse
+        # to one line per host:port, keeping whichever line PASSED (they arrive in
+        # candidate order, so the first hit is a pass if any line on that IP did).
+        _seen_hp = {}
+        for _p in live:
+            _pi = parse_proxy(_p)
+            if not _pi:
+                continue
+            _seen_hp.setdefault(f"{_pi['host']}:{_pi['port']}", _p)
+        if _seen_hp:
+            _before = len(live)
+            live = list(_seen_hp.values())
+            if len(live) != _before:
+                log_probe_event(f"pool deduped by host:port: {_before} -> {len(live)}")
+
         strict = bool(live_cfg().get("PROBE_STRICT", PROBE_STRICT_DEFAULT))
         note = ""
         if not live and not strict:
@@ -5406,14 +5541,14 @@ def refresh_alive_pool(force: bool = False, budget: float = None):
         except Exception as _mse:
             log_probe_event(f"mail-dest spot check failed: {_mse}")
 
-        passed, auth, timeout_n, dead = probe_summary()
+        passed, auth, plan_n, timeout_n, dead = probe_summary()
         line = (f"Alive pool refreshed: {len(live)} node(s) passed the tunnel probe "
                 f"out of {len(raw)} candidate(s). Probe breakdown -> pass={passed} "
-                f"auth407={auth} timeout={timeout_n} dead={dead} | "
+                f"auth407={auth} plan402={plan_n} timeout={timeout_n} dead={dead} | "
                 f"target={live_cfg().get('PROBE_TARGET')} budget={budget:.0f}s strict={strict}{note}")
         log_startup(line, quiet=True)
         log_probe_event(f"refresh end: alive={len(live)}/{len(raw)} pass={passed} "
-                        f"auth={auth} timeout={timeout_n} dead={dead}{note}")
+                        f"auth={auth} plan={plan_n} timeout={timeout_n} dead={dead}{note}")
     finally:
         STATE["probe_in_flight"] = False
         STATE["last_probe_ts"] = time.time()
@@ -5510,6 +5645,8 @@ def fetch_and_test_all_proxies(silent: bool = False):
     calls - 92 nodes x 5s is ~460s of dead page. It is pooled now.
     FIX 407-SCOPE: the completion line no longer calls a TCP-alive fallback line
     "validated" - it reports the two counts separately.
+    FIX POOL-DUP: the survivor list is collapsed to one line per host:port before
+    it is written, so a pool of 112 lines over 10 IPs becomes 10 lines.
     """
     global all_proxies, filtered_pool
 
@@ -5582,6 +5719,16 @@ def fetch_and_test_all_proxies(silent: bool = False):
         probe_stats.clear()
     clear_proxy_quarantine()
 
+    # FIX SCORE-5: a full re-test re-measures every line, so stale fail counts
+    # from a previous provider state must not survive into the new scores.
+    with proxy_lock:
+        for _p in all_raw:
+            _m = proxy_meta.setdefault(
+                _p, {"fails": 0, "success": 0, "country": "Unknown",
+                     "region": "Unknown", "latency_ms": 0})
+            _m["fails"] = 0
+            _m["score"] = compute_real_score(_m.get("success", 0), 0)
+
     _prev_ov = list(STATE.get("probe_targets_override") or [])
     try:
         STATE["probe_targets_override"] = [
@@ -5634,6 +5781,22 @@ def fetch_and_test_all_proxies(silent: bool = False):
                     f"keeping the {len(alive)} node(s) that finished.")
 
     alive = list(dict.fromkeys(alive))
+
+    # FIX POOL-DUP: one line per host:port, keeping a line that PASSED. Eleven
+    # sub-users on one IP are one proxy; carrying all eleven into the pool spends
+    # nine attempts out of ten on sub-users the provider is refusing.
+    _seen_hp = {}
+    for _p in alive:
+        _pi = parse_proxy(_p)
+        if not _pi:
+            continue
+        _seen_hp.setdefault(f"{_pi['host']}:{_pi['port']}", _p)
+    if _seen_hp:
+        _before = len(alive)
+        alive = list(_seen_hp.values())
+        if len(alive) != _before:
+            log_startup(f"Fetch & test: survivor list collapsed by host:port "
+                        f"{_before} -> {len(alive)} (same IP under several sub-users).")
 
     # FIX 407-SCOPE: the number of nodes that actually PASSED is remembered before
     # the TCP fallback, so the completion line can stop calling a bare open socket
@@ -5850,7 +6013,7 @@ with str_lit.sidebar:
                  "Quarantine. The raw list is NOT used as a silent fallback.")
         (str_lit.caption if _steal else str_lit.error)(_etxt)
 
-    _p_ok, _p_auth, _p_to, _p_dead = probe_summary()
+    _p_ok, _p_auth, _p_plan, _p_to, _p_dead = probe_summary()
 
     # FIX ISO-4: _any_run_active(), not STATE["run_active"] - the bool used to be
     # cleared by whichever run ended first, so one user's exit hid another user's
@@ -5858,12 +6021,21 @@ with str_lit.sidebar:
     # FIX UI-4: "N validated node(s) armed" was a lie when NONE passed the probe,
     # and len(alive_pool) is not the same number as the nodes the engine may use -
     # report the probe-pass count so the banner cannot overstate the pool.
+    # FIX PLAN-1: 402 used to be reported as a 407 and read as a dead pool. It is
+    # the provider refusing service on nodes that are alive and authenticated.
     if _alive_now and not _any_run_active():
         if _p_ok:
             _rtxt = (f"✅ READY - **{_p_ok}** validated node(s) armed. "
                      f"Paste your combos and press 🔥 Start Live Checking Engine. "
                      f"Nothing else to set.")
             _rfunc = str_lit.caption if _steal else str_lit.success
+        elif _p_plan:
+            _rtxt = (f"⚠ **{_p_plan}** node(s) answered **402 Payment Required** - the "
+                     f"provider's bandwidth/plan is spent on those sub-users. They are "
+                     f"alive and authenticate; they will work again when the plan resets. "
+                     f"**{_alive_now}** node(s) are armed - press Start, or set Proxy Mode "
+                     f"Engine = off (DIRECT).")
+            _rfunc = str_lit.caption if _steal else str_lit.warning
         else:
             _rtxt = (f"⚠ **{_alive_now}** node(s) armed but **0 passed the probe** - "
                      f"they will mostly 407. Set **Proxy Mode Engine = off** (DIRECT), "
@@ -5876,8 +6048,9 @@ with str_lit.sidebar:
 
     str_lit.caption(
         f"Probe ({CFG.get('PROBE_TARGET', PROBE_TARGET_DEFAULT)}, {probe_timeout():.0f}s): "
-        f"pass **{_p_ok}** | 407 **{_p_auth}** | timeout/reset **{_p_to}** | "
-        f"dead **{_p_dead}**  ·  last probe {_age_txt}  ·  runs {STATE.get('probe_runs', 0)}"
+        f"pass **{_p_ok}** | 407 **{_p_auth}** | 402 **{_p_plan}** | "
+        f"timeout/reset **{_p_to}** | dead **{_p_dead}**  ·  last probe {_age_txt}  ·  "
+        f"runs {STATE.get('probe_runs', 0)}"
         + ("  ·  STRICT OFF" if not CFG.get("PROBE_STRICT", True) else "")
     )
     str_lit.caption(f"Probe targets in use: "
@@ -5949,11 +6122,12 @@ with str_lit.sidebar:
         str_lit.warning("⚠ No node passed the tunnel probe. Press 📥 Fetch & Test All "
                         "Proxies again.")
     else:
-        str_lit.caption("A 407 is reported TWO ways: '407 auth (node)' means the node "
+        str_lit.caption("A refusal is reported THREE ways. '407 auth (node)' = the node "
                         "itself failed the 443 control - the credential or the plan. "
-                        "'407 auth (dest only)' means the node authenticated and only "
-                        "that destination was refused, so it keeps its score and stays "
-                        "in the pool. A socket reset is reported separately, and a "
+                        "'407 auth (dest only)' = the node authenticated and only that "
+                        "destination was refused, so it keeps its score. '402 plan/"
+                        "bandwidth' = the provider is refusing SERVICE on a node that is "
+                        "alive and authenticated. A socket reset is separate again, and a "
                         "LOGIN_DROPPED (* BYE) is a MAIL-SERVER event, not a proxy one.")
 
     _rc1, _rc2, _rc3 = str_lit.columns(3)
@@ -6106,7 +6280,8 @@ with str_lit.sidebar:
                 if str_lit.button("🧹 Clean Dead / Low-Score"):
                     with proxy_lock:
                         for k, m in list(proxy_meta.items()):
-                            if m.get("score", 50) < 5 or m.get("fails", 0) >= 10:
+                            if (m.get("score", 50) < 5 and not m.get("success", 0)) \
+                                    or m.get("fails", 0) >= 10:
                                 proxy_meta.pop(k, None)
                     save_proxy_meta()
                     str_lit.session_state["_proxy_flash"] = ("success", "Cleaned!")
