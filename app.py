@@ -5896,7 +5896,7 @@ with str_lit.sidebar:
             str_lit.info("No proxy metadata recorded yet.")
 # @@END 080 PROXY_MGMT_UI
 
-# @@BLOCK 081 PROXY_DEBUG_CONSOLE deps=014,016,026,052,080
+# @@BLOCK 081 PROXY_DEBUG_AND_DIAG_UI deps=014,016,024,026,027,030,052,070,073,080
 with str_lit.sidebar:
     with str_lit.expander("🩺 Proxy Debug Console", expanded=False):
         str_lit.caption(
@@ -5920,8 +5920,12 @@ with str_lit.sidebar:
                 _tgt_def = f"{_tgt0[0]}:{_tgt0[1]}"
             except Exception:
                 _tgt_def = "imap.gmail.com:993"
-            _dbg_target = str_lit.text_input("CONNECT target (host:port)",
-                                             value=_tgt_def, key="_dbg_target")
+            # FIX W-2: seeded, not passed as value= - a keyed widget that also gets a
+            # default raises the "created with a default value but also had its value
+            # set via the Session State API" warning on every rerun.
+            if "_dbg_target" not in str_lit.session_state:
+                str_lit.session_state["_dbg_target"] = _tgt_def
+            _dbg_target = str_lit.text_input("CONNECT target (host:port)", key="_dbg_target")
 
             # ---- parse audit -------------------------------------------------
             _dp = parse_proxy(_dbg_line)
@@ -6096,9 +6100,7 @@ with str_lit.sidebar:
                     file_name=f"proxy_trace_{int(time.time())}.txt", mime="text/plain")
             else:
                 str_lit.caption("No trace yet. Start with **WITH credentials** on line #1.")
-# @@END 081 PROXY_DEBUG_CONSOLE
 
-# @@BLOCK 081 DIAG_UI deps=014,024,027,030,070,073
 with str_lit.expander("🔬 Deep Diagnostics - copy/paste this to debug", expanded=False):
     str_lit.caption(
         "Everything needed to diagnose the pool remotely. Copy the whole block "
@@ -6183,7 +6185,7 @@ with str_lit.expander("🔬 Deep Diagnostics - copy/paste this to debug", expand
         mime="text/plain", width="stretch",
     )
     str_lit.code(_diag, language="text")
-# @@END 081 DIAG_UI
+# @@END 081 PROXY_DEBUG_AND_DIAG_UI
 
 # @@BLOCK 082 PREFILTER_TABLES deps=002,021,043
 DISPOSABLE = {
