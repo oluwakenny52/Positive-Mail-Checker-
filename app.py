@@ -500,11 +500,27 @@ import runstate
 # v13.48: the click/outcome ledger. page() runs BEFORE the gate so even the
 # Unlock press is attributed; install() runs AFTER it so the file lands on the
 # unlocked prefix and not the anon placeholder. Both must be above the first
-# widget - a widget built before install() is invisible to it, which is why the
-# hook was previously recording buttons and no sliders at all.
+# widget - a widget built before install() is invisible to it.
 import audit_log
 
-audit_log.page("app.py")
+# FIX AU-1 (v13.49): audit_log gained page() at 02:25, two hours AFTER this
+# process had already imported it at 00:42, and the process was never restarted.
+# `import audit_log` therefore handed back the cached module without page() and
+# this line raised AttributeError on EVERY rerun - which also meant install()
+# below never ran, so nothing on the page was ever wrapped and the ledger could
+# only ever hold the presses left over from before 02:25.
+#
+# It is the identical sys.modules hazard the two guards below already cover for
+# auth and runstate; audit_log was simply the one module left unguarded. Same
+# hasattr + reload shape, and both calls are optional, so a reload that also
+# fails degrades to "no ledger" instead of a dead page.
+if not (hasattr(audit_log, "page") and hasattr(audit_log, "install")):
+    try:
+        audit_log = importlib.reload(audit_log)
+    except Exception:
+        pass
+if hasattr(audit_log, "page"):
+    audit_log.page("app.py")
 
 # A Streamlit rerun re-uses the SAME process, so a module imported before a
 # redeploy stays in sys.modules and keeps answering with the OLD shape.  BOTH
@@ -529,7 +545,8 @@ user_file = auth.user_file
 auth.require(str_lit)
 auth.fit(str_lit)
 
-audit_log.install(str_lit, "app.py")
+if hasattr(audit_log, "install"):
+    audit_log.install(str_lit, "app.py")
 
 # ---- teardown watchdog, and it MUST be after require() ---------------------
 # runstate._dir() resolves through auth.user_file(), which is a throwaway
@@ -1804,6 +1821,13 @@ if not os.path.exists(THEME_FILE):
 
 def _sync_theme_from_widgets():
     th = str_lit.session_state.theme
+    # FIX LAG-T (v13.49): this ran on EVERY rerun and ended in an unconditional
+    # save_theme(), so every keystroke in the Hero Title box rewrote theme.json
+    # to disk. Compare before and after and write only on a real change.
+    try:
+        _before = json.dumps(th, sort_keys=True)
+    except Exception:
+        _before = ""
     for k in ("g1", "g2", "accent", "accent2", "bg", "panel", "text"):
         wk = f"th_{k}"
         if wk in str_lit.session_state:
@@ -1817,6 +1841,11 @@ def _sync_theme_from_widgets():
         th["hero_title"] = str_lit.session_state["th_hero_title"]
     if "th_hero_sub" in str_lit.session_state:
         th["hero_sub"] = str_lit.session_state["th_hero_sub"]
+    try:
+        if json.dumps(th, sort_keys=True) == _before:
+            return
+    except Exception:
+        pass
     save_theme(th)
 
 
@@ -2789,37 +2818,51 @@ checker_mode = str_lit.sidebar.selectbox(
 # three branches, but each branch declares DIFFERENT ranges, so a mode switch
 # could leave a stored value outside the new slider's range.  Clamp to the mode
 # we are about to render - legal here, the widgets do not exist yet this run.
+#
+# FIX W-1 (v13.49): the clamp used to write the key AND each slider still passed
+# a positional `value=`, which raises
+#   "The widget with key "ui_workers" was created with a default value but also
+#    had its value set via the Session State API."
+# on every single run. The value is seeded here and the sliders pass only step=
+# and key= - the same shape block 056 already uses for th_radius.
 _bounds = {"Fast Mode": ((1, 100), (10, 300), (3, 40)),
            "Deep / Aggressive Mode": ((1, 50), (15, 400), (5, 60))}.get(
     checker_mode, ((1, 100), (10, 300), (3, 40)))
-for _k, (_lo, _hi) in zip(("ui_workers", "ui_deadline", "ui_timeout"), _bounds):
+_defaults = {"Fast Mode": (WORKERS_FAST, int(DEADLINE_FAST), ATTEMPT_TIMEOUT_FAST),
+             "Deep / Aggressive Mode": (WORKERS_DEEP, int(DEADLINE_DEEP),
+                                        ATTEMPT_TIMEOUT_DEEP)}.get(
+    checker_mode, (WORKERS_NORMAL, int(DEADLINE_NORMAL), ATTEMPT_TIMEOUT_NORMAL))
+for _k, (_lo, _hi), _dv in zip(("ui_workers", "ui_deadline", "ui_timeout"),
+                               _bounds, _defaults):
     _v = str_lit.session_state.get(_k)
-    if isinstance(_v, int) and not (_lo <= _v <= _hi):
-        str_lit.session_state[_k] = max(_lo, min(_hi, _v))
+    if not isinstance(_v, int):
+        _v = _dv
+    str_lit.session_state[_k] = max(_lo, min(_hi, _v))
+
 if checker_mode == "Fast Mode":
     engine_config = CheckerConfig(mode_name="Fast", fast_mode=True, max_concurrent_checks=100,
                                   connect_timeout=5.0, max_retries=1, failure_cooldown=60.0)
-    workers = str_lit.sidebar.slider("Workers Start", 1, 100, WORKERS_FAST, 1, key="ui_workers")
-    deadline = str_lit.sidebar.slider("Deadline (Seconds)", 10, 300, int(DEADLINE_FAST), 5,
+    workers = str_lit.sidebar.slider("Workers Start", 1, 100, step=1, key="ui_workers")
+    deadline = str_lit.sidebar.slider("Deadline (Seconds)", 10, 300, step=5,
                                       key="ui_deadline")
-    timeout = str_lit.sidebar.slider("Timeout", 3, 40, ATTEMPT_TIMEOUT_FAST, 1, key="ui_timeout")
+    timeout = str_lit.sidebar.slider("Timeout", 3, 40, step=1, key="ui_timeout")
     default_hosts = 2
 elif checker_mode == "Deep / Aggressive Mode":
     engine_config = CheckerConfig(mode_name="Deep", fast_mode=False, max_concurrent_checks=30,
                                   connect_timeout=12.0, max_retries=4, failure_cooldown=20.0)
-    workers = str_lit.sidebar.slider("Workers Start", 1, 50, WORKERS_DEEP, 1, key="ui_workers")
-    deadline = str_lit.sidebar.slider("Deadline (Seconds)", 15, 400, int(DEADLINE_DEEP), 5,
+    workers = str_lit.sidebar.slider("Workers Start", 1, 50, step=1, key="ui_workers")
+    deadline = str_lit.sidebar.slider("Deadline (Seconds)", 15, 400, step=5,
                                       key="ui_deadline")
-    timeout = str_lit.sidebar.slider("Timeout", 5, 60, ATTEMPT_TIMEOUT_DEEP, 1, key="ui_timeout")
+    timeout = str_lit.sidebar.slider("Timeout", 5, 60, step=1, key="ui_timeout")
     default_hosts = 4
 else:
     engine_config = CheckerConfig(mode_name="Normal", fast_mode=False, max_concurrent_checks=50,
                                   connect_timeout=8.0, max_retries=2,
                                   failure_cooldown=FAILURE_COOLDOWN_DEFAULT)
-    workers = str_lit.sidebar.slider("Workers Start", 1, 100, WORKERS_NORMAL, 1, key="ui_workers")
-    deadline = str_lit.sidebar.slider("Deadline (Seconds)", 10, 300, int(DEADLINE_NORMAL), 5,
+    workers = str_lit.sidebar.slider("Workers Start", 1, 100, step=1, key="ui_workers")
+    deadline = str_lit.sidebar.slider("Deadline (Seconds)", 10, 300, step=5,
                                       key="ui_deadline")
-    timeout = str_lit.sidebar.slider("Timeout", 3, 40, ATTEMPT_TIMEOUT_NORMAL, 1, key="ui_timeout")
+    timeout = str_lit.sidebar.slider("Timeout", 3, 40, step=1, key="ui_timeout")
     default_hosts = 3
 max_acc = str_lit.sidebar.slider("Max Accounts", 0, 5000, 5000, 100, key="ui_max_acc")
 blacklist_cf = str_lit.sidebar.slider(
@@ -5293,6 +5336,16 @@ with str_lit.sidebar:
     str_lit.markdown("---")
     str_lit.markdown("### 🌐 Proxy Management & Health")
 
+    # FIX FLASH-1 (v13.49): every branch below ended in success()/warning() and
+    # then str_lit.rerun(), and a rerun destroys the delta the message was drawn
+    # into - so "N node(s) validated", "Pool re-probed" and "Restored N line(s)"
+    # were never actually visible. The message is carried across the rerun and
+    # rendered here instead.
+    _flash = str_lit.session_state.pop("_proxy_flash", None)
+    if _flash:
+        _lvl, _msg = _flash
+        getattr(str_lit, _lvl, str_lit.info)(_msg)
+
     if (not all_proxies) and WEBSHARE_KEYS and not STATE.get("bootstrap_done"):
         STATE["bootstrap_done"] = True
         with str_lit.spinner("First run - fetching and validating your proxy pool..."):
@@ -5417,7 +5470,7 @@ with str_lit.sidebar:
         if str_lit.button("🔁 Re-probe pool now", width="stretch"):
             clear_tunnel_cache()
             refresh_alive_pool(force=True, budget=PROBE_BATCH_BUDGET)
-            str_lit.success("Pool re-probed.")
+            str_lit.session_state["_proxy_flash"] = ("success", "Pool re-probed.")
             str_lit.rerun()
     with _rc2:
         if str_lit.button("🧾 Show raw proxies.txt", width="stretch"):
@@ -5446,12 +5499,18 @@ with str_lit.sidebar:
                         clear_tunnel_cache()
                         log_startup(f"proxies.txt restored from proxies_all.txt "
                                     f"({len(_restore)} line(s)).")
-                        str_lit.success(f"Restored {len(_restore)} line(s) from proxies_all.txt.")
+                        str_lit.session_state["_proxy_flash"] = (
+                            "success",
+                            f"Restored {len(_restore)} line(s) from proxies_all.txt.")
                         str_lit.rerun()
                     else:
-                        str_lit.warning("proxies_all.txt is empty.")
+                        str_lit.session_state["_proxy_flash"] = (
+                            "warning", "proxies_all.txt is empty.")
+                        str_lit.rerun()
                 else:
-                    str_lit.warning("No proxies_all.txt yet - run Fetch & Test first.")
+                    str_lit.session_state["_proxy_flash"] = (
+                        "warning", "No proxies_all.txt yet - run Fetch & Test first.")
+                    str_lit.rerun()
             except Exception as _rex:
                 str_lit.error(f"Restore failed: {_rex}")
 
@@ -5470,7 +5529,8 @@ with str_lit.sidebar:
                             f.write("\n".join(combined) + "\n")
                     clear_tunnel_cache()
                     log_startup(f"Added {len(new_proxies)} custom proxies successfully.")
-                    str_lit.success(f"Added {len(new_proxies)} custom proxies successfully!")
+                    str_lit.session_state["_proxy_flash"] = (
+                        "success", f"Added {len(new_proxies)} custom proxies successfully!")
                     str_lit.rerun()
                 except Exception as ex:
                     str_lit.error(f"Error saving custom proxies: {ex}")
@@ -5480,19 +5540,17 @@ with str_lit.sidebar:
             _n_alive, _n_total = fetch_and_test_all_proxies()
         _msr = STATE.get("mail_spot") or {}
         if _n_alive:
-            str_lit.success(
-                f"✅ READY - **{_n_alive}** working node(s) from **{_n_total}** line(s) "
-                f"validated, saved and armed. Press 🔥 Start Live Checking Engine."
-            )
+            _msg = (f"✅ READY - **{_n_alive}** working node(s) from **{_n_total}** line(s) "
+                    f"validated, saved and armed. Press 🔥 Start Live Checking Engine.")
             if _msr.get("auth") and not _msr.get("ok"):
-                str_lit.error(
-                    f"🚨 ...but the MAIL-destination spot check 407'd on "
-                    f"{_msr['auth']}/{_msr['n']} sampled node(s) against "
-                    f"{_msr['host']}:{_msr['port']}. The provider is capping email-server "
-                    f"destinations - set **Proxy Mode Engine = off** until it resets."
-                )
+                _msg += (f"  🚨 ...but the MAIL-destination spot check 407'd on "
+                         f"{_msr['auth']}/{_msr['n']} sampled node(s) against "
+                         f"{_msr['host']}:{_msr['port']} - set **Proxy Mode Engine = off** "
+                         f"until it resets.")
+            str_lit.session_state["_proxy_flash"] = ("success", _msg)
         else:
-            str_lit.warning("No node passed validation. Check WEBSHARE_KEYS in secrets.")
+            str_lit.session_state["_proxy_flash"] = (
+                "warning", "No node passed validation. Check WEBSHARE_KEYS in secrets.")
         str_lit.rerun()
 
     with str_lit.expander("📊 Proxy Health & Geo Dashboard", expanded=False):
@@ -5544,7 +5602,7 @@ with str_lit.sidebar:
                 if str_lit.button("🔁 Re-probe All"):
                     clear_tunnel_cache()
                     refresh_alive_pool(force=True, budget=PROBE_BATCH_BUDGET)
-                    str_lit.success("Re-probed.")
+                    str_lit.session_state["_proxy_flash"] = ("success", "Re-probed.")
                     str_lit.rerun()
             with col_ref3:
                 if str_lit.button("🧹 Clean Dead / Low-Score"):
@@ -5553,12 +5611,12 @@ with str_lit.sidebar:
                             if m.get("score", 50) < 5 or m.get("fails", 0) >= 10:
                                 proxy_meta.pop(k, None)
                     save_proxy_meta()
-                    str_lit.success("Cleaned!")
+                    str_lit.session_state["_proxy_flash"] = ("success", "Cleaned!")
                     str_lit.rerun()
             with col_ref4:
                 if str_lit.button("♻️ Lift 407 Quarantine"):
                     clear_proxy_quarantine()
-                    str_lit.success("Quarantine lifted.")
+                    str_lit.session_state["_proxy_flash"] = ("success", "Quarantine lifted.")
                     str_lit.rerun()
         else:
             str_lit.info("No proxy metadata recorded yet.")
@@ -5694,7 +5752,29 @@ def load_disposable_set():
     return found
 
 
-DISPOSABLE_LIVE = load_disposable_set()
+# FIX LAG-D (v13.49): load_disposable_set() does a blocking HTTP GET with an 8s
+# timeout and it was called right here on the IMPORT path, so every cold deploy
+# sat on it before the first paint. The static set covers the gap and the fetch
+# now runs in the background; is_disposable() picks up the fuller set as soon as
+# it lands.
+DISPOSABLE_LIVE = set(DISPOSABLE) | set(DISPOSABLE_EXTRA)
+if os.path.exists(DISPOSABLE_FILE):
+    try:
+        with open(DISPOSABLE_FILE, encoding="utf-8", errors="ignore") as _df:
+            DISPOSABLE_LIVE.update(x.strip().lower() for x in _df
+                                   if x.strip() and not x.startswith("#"))
+    except Exception:
+        pass
+else:
+    def _fetch_disposables_bg():
+        global DISPOSABLE_LIVE
+        try:
+            DISPOSABLE_LIVE = set(load_disposable_set())
+        except Exception:
+            pass
+
+    threading.Thread(target=_fetch_disposables_bg, daemon=True,
+                     name="disposable-fetch").start()
 
 
 def is_disposable(email):
