@@ -1,7 +1,7 @@
-# @@FILE pages/6_User_Guide.py blocks=17 version=v13.47
+# @@FILE pages/6_User_Guide.py blocks=17 version=v13.48
 # @@BLOCK 000 FILE_HEADER deps=-
 """
-pages/6_User_Guide.py - User Guide  (v13.47)
+pages/6_User_Guide.py - User Guide  (v13.48)
 ============================================
 Everything the app can do, in one read-only page: every sidebar control, every
 button, every verdict the engine can return, every other page, and what each one
@@ -42,8 +42,8 @@ if APP_DIR not in sys.path:
     sys.path.insert(0, APP_DIR)
 
 # Mirrors app.py block 008. Keep the two identical - verify_v1337.py enforces it.
-BUILD_TAG = "v13.47"
-CFG_VERSION = 1347
+BUILD_TAG = "v13.48"
+CFG_VERSION = 1348
 # @@END 001 SYSPATH_AND_BUILD
 
 # @@BLOCK 002 PAGE_CONFIG deps=001
