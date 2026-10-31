@@ -696,7 +696,10 @@ LOG_CAP_DEBUG = 200
 LOG_CAP_QUIET = 120
 REPORT_ENTRIES_MAX = 2000
 # FIX P1-3 / P1-4: the two per-rerun and per-account hogs get their own clocks.
-DIAG_CACHE_TTL = 30.0
+# FIX SPEED-10: 30s was far too eager for build_diagnostics_text(), which reads
+# proxies.txt, walks every proxy_meta row, resolves the egress geo and calls
+# getfqdn() - inside a COLLAPSED expander nobody is looking at. 5 minutes.
+DIAG_CACHE_TTL = 300.0
 REPORT_DF_MIN_INTERVAL = 1.0
 # Checkpoint clock. The 100-account counter alone meant a 47-account run never
 # reached a checkpoint before a teardown: the record stayed at 0/N, the heartbeat
@@ -2522,7 +2525,14 @@ def _rehydrate_last_run(force: bool = False):
         return 0
 
 
-_rehydrate_last_run()
+# FIX SPEED-7: this globbed mail_results/*.txt and read a whole bucket group on
+# EVERY rerun - and every Streamlit interaction is a rerun. It exists to recover
+# from a session reset, which can happen at most once per session, so run it
+# once and remember that. A real reset clears session_state, which clears the
+# flag with it.
+if not str_lit.session_state.get("_rehydrated"):
+    str_lit.session_state["_rehydrated"] = True
+    _rehydrate_last_run()
 # @@END 037 SESSION_INIT
 
 # @@BLOCK 038 STARTUP_LOG deps=024,037
@@ -8824,7 +8834,10 @@ with col_action2:
         else:
             str_lit.caption("No interrupted run recorded.")
 
-active_proxy_pool = get_filtered_active_proxies()
+# FIX SPEED-8: this used to run at MODULE level on every rerun - a full read and
+# filter of proxies.txt for a value only the start path below ever consumes. The
+# sidebar (block 080) already computes its own filtered_pool for display.
+active_proxy_pool = []
 
 # The stop is a rerun with a reason attached: the click tears the loop down
 # before anything below executes, so the stamp has to happen here and the
@@ -8900,9 +8913,8 @@ if start_engine_btn:
                 f"reason={_rec.get('reason') or _rec.get('cause') or 'none'} | "
                 f"remaining file={'present' if runstate.remaining() else 'empty/absent'}")
     else:
-        # v13.48: active_proxy_pool a few lines up ALREADY holds the filtered pool
-        # for this rerun. Re-running get_filtered_active_proxies() re-read and
-        # re-filter all of proxies.txt for the same answer.
+        # The pool is filtered HERE, once, on the start path only.
+        active_proxy_pool = get_filtered_active_proxies()
         filtered_pool[:] = active_proxy_pool
 
         # FIX ISO-4 (v13.49): runs_active is the truth and run_active is derived,
@@ -9099,6 +9111,8 @@ if start_engine_btn:
         detected_stop_reason = "Interrupted / Stopped before completion"
         run_interrupted = False
         _orig_deadline = CFG.get("ACCOUNT_DEADLINE")
+        _orig_retries = CFG.get("SAME_HOST_RETRIES")
+        _orig_rot = CFG.get("MAX_ROTATIONS")
         try:
             current_workers = CFG["MAX_WORKERS_START"]
             if CFG.get("DYNAMIC_WORKER_SCALING", False):
@@ -9147,13 +9161,19 @@ if start_engine_btn:
                     checked_count += 1
                     # FIX LAG-4: the tail is the slowest work by construction -
                     # everything still queued has already exhausted most of its
-                    # ladder. Once only one worker-cohort is left, cap the budget
-                    # so the last few accounts cannot each spend the full slider.
+                    # ladder. Once only one worker-cohort is left, strip the tail.
+                    # FIX SPEED-9: capping ACCOUNT_DEADLINE alone did nothing,
+                    # because the per-account work floor lifted it straight back
+                    # up. The retries and the rotations are the other two pure
+                    # tail costs, so they go to zero for the tail only and all
+                    # three are restored in the finally.
                     _tail_left = total_accs - checked_count
                     if _tail_left and _tail_left <= current_workers:
                         try:
                             CFG["ACCOUNT_DEADLINE"] = min(
-                                int(CFG.get("ACCOUNT_DEADLINE", DEADLINE_NORMAL)), 45)
+                                int(CFG.get("ACCOUNT_DEADLINE", DEADLINE_NORMAL)), 30)
+                            CFG["SAME_HOST_RETRIES"] = 0
+                            CFG["MAX_ROTATIONS"] = 0
                         except Exception:
                             pass
                     try:
@@ -9396,10 +9416,14 @@ if start_engine_btn:
                     detected_stop_reason = f"Unexpected Error / Interruption: {be}"
             runstate.note(detected_stop_reason)
         finally:
-            # Restore the slider's own deadline so the sidebar does not report
-            # unapplied settings after a run that used the tail cap.
+            # Restore the slider's own values so the sidebar does not report
+            # unapplied settings after a run that used the tail caps.
             if _orig_deadline is not None:
                 CFG["ACCOUNT_DEADLINE"] = _orig_deadline
+            if _orig_retries is not None:
+                CFG["SAME_HOST_RETRIES"] = _orig_retries
+            if _orig_rot is not None:
+                CFG["MAX_ROTATIONS"] = _orig_rot
             # FIX ISO-4 (v13.49): decrement the count and DERIVE the bool, so a
             # second user's run is not told the deployment went idle when this one
             # ends. max(0, ...) keeps a double release from going negative.
@@ -9450,6 +9474,14 @@ if start_engine_btn:
 
 # @@BLOCK 107 RUN_EXPORT deps=078,106
         try:
+            # FIX SPEED-11: the bar hit 100% and then the page sat still while this
+            # block wrote twelve files. Say so instead of freezing silently.
+            try:
+                progress_bar.progress(1.0, text="Writing result files and bundle...")
+                status_text.text("Progress: complete - writing result files.")
+            except Exception:
+                pass
+
             stamp = datetime.now().strftime('%Y%m%d_%H%M%S')
             valid_path = os.path.join(CFG["RESULTS_DIR"], f"valid_{stamp}.txt")
             wrong_path = os.path.join(CFG["RESULTS_DIR"], f"wrong_{stamp}.txt")
@@ -9492,27 +9524,30 @@ if start_engine_btn:
             # bare mail_results_<stamp>.zip, so two users finishing in the same
             # second overwrote each other's file. Prefix it with the session's own
             # user prefix - the same prefix every other per-user file carries.
+            # FIX SPEED-6: it was then read straight back into memory, so the whole
+            # archive was serialised to disk and parsed again before the page could
+            # finish. It is built in memory now and never touches the disk.
             zip_output_name = f"{_cache_owner() or 'anon'}_mail_results_{stamp}.zip"
-            with zipfile.ZipFile(zip_output_name, "w", zipfile.ZIP_DEFLATED) as z:
-                for p, arc in ((clean_valid_path, "valid_email_password.txt"),
-                               (wrong_path, os.path.basename(wrong_path)),
-                               (need_path, os.path.basename(need_path)),
-                               (login_drop_path, os.path.basename(login_drop_path)),
-                               (failed_path, os.path.basename(failed_path)),
-                               (proxy_path, os.path.basename(proxy_path)),
-                               (retry_path, os.path.basename(retry_path)),
-                               (rbl_path, os.path.basename(rbl_path)),
-                               (smtp_path, os.path.basename(smtp_path)),
-                               (dns_path, os.path.basename(dns_path)),
-                               (skip_path, os.path.basename(skip_path)),
-                               (unknown_path, os.path.basename(unknown_path))):
-                    if os.path.exists(p):
-                        z.write(p, arcname=arc)
-
-            zip_bytes_data = b""
-            if os.path.exists(zip_output_name):
-                with open(zip_output_name, "rb") as fp:
-                    zip_bytes_data = fp.read()
+            import io as _io
+            _zbuf = _io.BytesIO()
+            with zipfile.ZipFile(_zbuf, "w", zipfile.ZIP_DEFLATED) as z:
+                if os.path.exists(clean_valid_path):
+                    z.write(clean_valid_path, arcname="valid_email_password.txt")
+                for _arc, _snap in (
+                        (os.path.basename(wrong_path), wrong_snapshot),
+                        (os.path.basename(need_path), need_snapshot),
+                        (os.path.basename(login_drop_path), login_drop_snapshot),
+                        (os.path.basename(failed_path), conn_snapshot),
+                        (os.path.basename(proxy_path), proxy_snapshot),
+                        (os.path.basename(retry_path), retry_snapshot),
+                        (os.path.basename(rbl_path), rbl_snapshot),
+                        (os.path.basename(smtp_path), smtp_snapshot),
+                        (os.path.basename(dns_path), dns_snapshot),
+                        (os.path.basename(skip_path), skip_snapshot),
+                        (os.path.basename(unknown_path), unknown_snapshot)):
+                    z.writestr(_arc, hdr + "\n".join(str(i) for i in _snap)
+                               + ("\n" if _snap else ""))
+            zip_bytes_data = _zbuf.getvalue()
 
             with session_state_lock:
                 str_lit.session_state.clean_valid_count = temp_clean_count
@@ -9522,7 +9557,7 @@ if start_engine_btn:
             str_lit.error(f"Error compiling results export files: {ex}")
 # @@END 107 RUN_EXPORT
 
-# @@BLOCK 108 RESULTS_SUMMARY deps=007,035,036,037,087,106
+# @@BLOCK 108 RESULTS_SUMMARY deps=007,014,035,036,037,087,106
 if str_lit.session_state.engine_has_run or load_persistent_valid_results():
     section_title("📊", "Live Results Summary & ZIP Archive",
                   "persisted results, downloadable bundle, full under-the-hood traces")
@@ -9636,6 +9671,10 @@ if str_lit.session_state.engine_has_run or load_persistent_valid_results():
             "no candidate left to dial) before being accepted. Turn the sidebar guard OFF "
             "only if you need raw speed.")
 
+    # FIX SPEED-12: every line of every bucket was rendered as its own st.code
+    # widget, in twelve expanders, on every rerun - a 2000-line bucket meant 2000
+    # widgets before the page could finish. Cap the render; the download button
+    # above it still carries the whole list.
     for title, items in summary_buckets.items():
         with str_lit.expander(f"{title} ({len(items)})", expanded=False):
             if not items:
@@ -9647,8 +9686,11 @@ if str_lit.session_state.engine_has_run or load_persistent_valid_results():
                 data="\n".join(str(i) for i in items).encode("utf-8"),
                 file_name=f"{_safe}_{len(items)}.txt",
                 mime="text/plain", key=f"sumdl_{_safe}")
-            for it in items:
+            for it in items[:BUCKET_RENDER_TAIL]:
                 str_lit.code(it, language="text")
+            if len(items) > BUCKET_RENDER_TAIL:
+                str_lit.caption(f"... and {len(items) - BUCKET_RENDER_TAIL} more - use the "
+                                f"download button above for the full list.")
 
     exec_tab1_p, exec_tab2_p = str_lit.tabs(["⚡ Live Execution Stream",
                                              "📊 Live Report Log & Analytics"])
