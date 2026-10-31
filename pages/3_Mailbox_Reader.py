@@ -103,10 +103,12 @@ from auth import user_file          # blocks 012, 019 and 032 resolve paths thro
 
 auth.require(st, "Unlock Mailbox Reader")
 auth.fit(st)                        # CSS only, before the first widget
-auth.fit_panel(st)                  # the controls; collapsed until tapped
 
 # v13.48: click/outcome ledger, after the gate so the file lands on the unlocked
 # prefix rather than the anon placeholder.
+#
+# fit_panel() is NOT called here any more: it renders the Display Fit expanders,
+# and those belong UNDER the hero, not above it. It is called in block 027.
 import audit_log
 
 audit_log.install(st, "pages/3_Mailbox_Reader.py")
@@ -2446,7 +2448,7 @@ def fetch_messages_paginated(mail, email_addr, password_val, host_val, target_fo
 # @@END 026 SEARCH_AND_FETCH
 
 
-# @@BLOCK 027 HERO_AND_VALID deps=026
+# @@BLOCK 027 HERO_AND_VALID deps=001,026
 # Header (theme-synced from app.py's Theme Studio)
 hero(
     "🚀📥 Bobito Mailbox Reader & Portal Hub Advanced IMAP Client",
@@ -2462,6 +2464,12 @@ st.caption(
     f"Credentials Scanner, Multi-Field Search, Telegram/Blacklist Filter, and Deep Diagnostic Instrumentation. "
     f"— Theme in use: **{THEME.get('preset', DEFAULT_PRESET)}** (synced from the checker)"
 )
+
+# v13.48: Display Fit sits UNDER the header. It used to be called from block 001,
+# which put both of its expanders above the hero and pushed the page title down -
+# the exact thing fit() and fit_panel() were split apart to avoid. Call it once,
+# here, and only here: a second call raises inside its own try/except.
+auth.fit_panel(st)
 
 valid = load_valid()
 # @@END 027 HERO_AND_VALID
