@@ -1,7 +1,7 @@
-# @@FILE app.py blocks=111 version=v13.47
+# @@FILE app.py blocks=111 version=v13.48
 # @@BLOCK 000 FILE_HEADER deps=-
 """
-Mega Ultimate Mail Checker - v13.47  (BLOCK EDITION)
+Mega Ultimate Mail Checker - v13.48  (BLOCK EDITION)
 ====================================================
 Full version history lives in CHANGELOG.md.
 
@@ -37,6 +37,13 @@ P0-3  status.py tested the greedy _APP_PASSWORD tokens (oauth / tenant /
 P0-4  the duplicate WRONG block after the first return in
       _handle_app_or_wrong was unreachable dead code and broke
       verify_v1337.py.                                     [101]
+P0-5  block 024 seeded both valid caches WITHOUT a "user" key, so block 037's
+      `"user": ""` defaults were dead code and a fresh process answered None
+      to every owner comparison.                           [024, 037]
+P0-6  the STATE-backed cache gate asserted a SINGLE-LINE substring, so wrapping
+      the alias turned verify_v1337.py red on a pure reflow - and
+      _PREV_VALID_CACHE was not gated at all. The gate is whitespace-blind
+      now.                                                 [verify_v1337.py]
 P1-1  only valid_results was rehydrated from disk, so a session reset wiped
       every other bucket and every log.                    [037]
 P1-2  the combos text_area and the file uploader had no key=, so a paste
@@ -545,8 +552,8 @@ _rs_path = runstate.tick()
 
 # @@BLOCK 008 BUILD_IDENTITY deps=-
 # Bump CFG_VERSION whenever a DEFAULT changes in a way users should inherit.
-CFG_VERSION = 1347
-BUILD_TAG = "v13.47"
+CFG_VERSION = 1348
+BUILD_TAG = "v13.48"
 # @@END 008 BUILD_IDENTITY
 
 # @@BLOCK 009 TIMING_CONSTANTS deps=-
@@ -1052,8 +1059,8 @@ def _engine_state():
         "startup_buffer": [],
         "startup_buffer_lock": threading.Lock(),
         "dns_cache": {},
-        "persistent_valid_cache": {"ts": 0.0, "data": []},
-        "prev_valid_cache": {"ts": 0.0, "data": set()},
+        "persistent_valid_cache": {"ts": 0.0, "data": [], "user": ""},
+        "prev_valid_cache": {"ts": 0.0, "data": set(), "user": ""},
         "geo_fail": {},
         "geo_last_call": {"ts": 0.0},
         "proxy_407_until": {},
