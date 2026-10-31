@@ -154,12 +154,37 @@ if not hasattr(auth, "fit_panel"):
 
 from auth import user_file         # AFTER the reload, so it binds to the live module
 
+# v13.48: ledger. page() before the gate so even the Unlock press is attributed;
+# install() after the gate and before the first widget. fit_panel() is called in
+# block 005, so install() lands ahead of it and its sliders are wrapped.
+#
+# FIX AU-1 (v13.49): audit_log gained page() at 02:25, two hours after this
+# process had already imported it at 00:42, and the process was never restarted -
+# so `import audit_log` handed back the cached module without it and every page
+# died with AttributeError. It is the same sys.modules hazard the auth guard above
+# already covers; audit_log was the one module left unguarded. Both calls are
+# optional, so a reload that also fails degrades to "no ledger", not a dead page.
+import audit_log as _audit
+
+if not (hasattr(_audit, "page") and hasattr(_audit, "install")):
+    try:
+        _audit = importlib.reload(_audit)
+    except Exception:
+        pass
+audit_log = _audit
+
+if hasattr(audit_log, "page"):
+    audit_log.page("pages/6_User_Guide.py")
+
 # require() first, fit() second - the order every page uses. fit() is CSS-only
 # and must land before the first widget. fit_panel() lands after the hero.
 # Call each EXACTLY once: a second fit() raises
 # StreamlitWidgetAlreadyInstantiatedError inside its own try/except.
 auth.require(st, "Unlock User Guide")
 auth.fit(st)
+
+if hasattr(audit_log, "install"):
+    audit_log.install(st, "pages/6_User_Guide.py")
 # @@END 004 AUTH
 
 # @@BLOCK 005 HERO deps=004
