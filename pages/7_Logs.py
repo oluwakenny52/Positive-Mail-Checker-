@@ -164,19 +164,38 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
+import importlib
+
 import auth
 
 # v13.48: ledger. page() before the gate, install() after it, install BEFORE
 # fit_panel so this page's own controls are recorded too.
-import audit_log
+#
+# FIX AU-1 (v13.49): a module imported before a redeploy stays in sys.modules and
+# keeps answering with the OLD shape. audit_log gained page() at 02:25, two hours
+# after this process had already imported it at 00:42, so this page died on the
+# next line with AttributeError - and install() below never ran, which is why the
+# ledger only ever held button presses and never a single slider. Same hasattr +
+# reload guard auth and runstate already use; both calls are optional, so a reload
+# that also fails degrades to "no ledger" instead of a dead page.
+import audit_log as _audit
 
-audit_log.page("pages/7_Logs.py")
+if not (hasattr(_audit, "page") and hasattr(_audit, "install")):
+    try:
+        _audit = importlib.reload(_audit)
+    except Exception:
+        pass
+audit_log = _audit
+
+if hasattr(audit_log, "page"):
+    audit_log.page("pages/7_Logs.py")
 
 auth.require(st, "Unlock Full Log")
 auth.fit(st)                        # CSS only, before the first widget
 from auth import user_file          # after the gate, so it binds the live module
 
-audit_log.install(st, "pages/7_Logs.py")
+if hasattr(audit_log, "install"):
+    audit_log.install(st, "pages/7_Logs.py")
 
 auth.fit_panel(st)                  # the controls; collapsed until tapped
 # @@END 005 HERO
@@ -345,8 +364,10 @@ with st.sidebar:
 
     st.markdown("---")
     st.caption("Action ledger filters")
-    _act_outcomes = ["OK", "FAILED", "WARN", "ERROR", "STOPPED", "NO RESULT",
-                     "CHANGED", "INFO"]
+    # v13.49: PAGE is new (a page visit is now a ledger record) and INFO is gone
+    # (st.info no longer closes an entry - it is page chrome, not a response).
+    _act_outcomes = ["PAGE", "OK", "FAILED", "WARN", "ERROR", "STOPPED",
+                     "NO RESULT", "CHANGED"]
     act_filter = st.multiselect("Only these outcomes", _act_outcomes, default=[])
     act_search = st.text_input("Search the ledger", value="", key="lg_act_search")
 
@@ -570,13 +591,16 @@ with _t_rec:
                                mime="text/csv", width="stretch")
 
 with _t_actions:
-    st.caption("Every press recorded for YOUR user, newest first, with the outcome the "
-               "run reported. NO RESULT means the action finished without saying anything "
-               "- that is the one worth looking at. The ledger is capped at "
+    st.caption("Every press and every control change recorded for YOUR user, newest "
+               "first, with the outcome the run reported. NO RESULT means the action "
+               "finished without saying anything - that is the one worth looking at. "
+               "PAGE is a page visit; CHANGED is a slider / toggle / checkbox / "
+               "selectbox move with the old -> new value. The ledger is capped at "
                f"{audit_log.MAX_LINES} lines; the oldest are trimmed.")
-    st.caption("A rerun is not an outcome: an action that ends in flash() + rerun is "
+    st.caption("A rerun is not an outcome: a press that ends in flash() + rerun is "
                "attributed to the message the NEXT run renders, and only closes as "
-               "NO RESULT if none arrives.")
+               "NO RESULT if none arrives. A control change is written immediately - "
+               "it has no flash to wait for.")
 
     _act_rows = audit_log.entries(limit=audit_log.MAX_LINES)
     if act_filter:
@@ -600,9 +624,10 @@ with _t_actions:
                 + (" matching the filter." if (act_filter or act_search.strip()) else
                    ". Use the app and they will appear here."))
     else:
-        _ACT_COLOUR = {"OK": "#22c55e", "FAILED": "#ef4444", "ERROR": "#fb7185",
-                       "WARN": "#facc15", "STOPPED": "#38bdf8",
-                       "NO RESULT": "#e879f9", "INFO": "#94a3b8"}
+        # v13.49: PAGE and CHANGED added, INFO removed.
+        _ACT_COLOUR = {"PAGE": "#8b5cf6", "OK": "#22c55e", "FAILED": "#ef4444",
+                       "ERROR": "#fb7185", "WARN": "#facc15", "STOPPED": "#38bdf8",
+                       "NO RESULT": "#e879f9", "CHANGED": "#22d3ee"}
         if wrap:
             _html = "".join(
                 '<div class="lg-line" style="color:%s">%s · <b>%s</b> · %s · %s%s</div>'
