@@ -1,4 +1,3 @@
-@@ -1,3888 +1,13 @@
 # @@FILE app.py blocks=111 version=v13.48
 # @@BLOCK 000 FILE_HEADER deps=-
 """
