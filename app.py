@@ -7859,11 +7859,13 @@ def verify_and_connect(target_email, target_pass, hosts, proxy_str=None):
 #
 # v13.54: the 20000-byte partial cut a multipart message mid-part, so the tail of
 # a base64 image arrived broken and no HTML renderer could use it. The whole
-# message is fetched now, capped in Python, and BOTH the text and the HTML part
-# are kept alongside the raw bytes. Still BODY.PEEK, so \Seen is untouched.
+# message is fetched now, capped in Python. Still BODY.PEEK, so \Seen is untouched.
+# v13.55: 700 KB cap, not 2 MB, and no duplicate "html" field - ten 2 MB messages
+# plus their HTML strings plus base64 image URIs was enough to segfault the free
+# container. The renderer splits text and HTML back out of "raw" itself.
 _BODY_FETCH_BYTES = 20000      # kept: legacy reference, no longer the fetch cut
 _BODY_SHOW_CHARS = 20000
-_RAW_CAP = 2 * 1024 * 1024
+_RAW_CAP = 700 * 1024
 
 
 def _hdr_text(raw):
@@ -7980,13 +7982,11 @@ def read_mailbox_messages(email, password, server, proxy_str=None, limit=10):
                     if isinstance(rp, tuple) and rp[1]:
                         raw_body = rp[1][:_RAW_CAP]
                         break
-            body_text, body_html = _body_parts(raw_body)
             out.append({"id": mid.decode() if isinstance(mid, bytes) else str(mid),
                         "subject": heads.get("subject") or "(no subject)",
                         "from": heads.get("from") or "(unknown sender)",
                         "date": heads.get("date") or "(no date)",
                         "body": _body_text(raw_body),
-                        "html": body_html,
                         "raw": raw_body})
         try:
             mail.logout()
@@ -10267,8 +10267,15 @@ else:
                 mailbox_proxy = (sample_alive_proxy(domain=acc_email.split("@")[-1])
                                  if use_proxy else None)
 
+                # v13.55: a new fetch replaces the old list outright, so two
+                # accounts cannot bleed into each other.
+                str_lit.session_state["bb_reader_msgs"] = []
+                str_lit.session_state["bb_reader_for"] = acc_email
+                str_lit.session_state["bb_reader_note"] = ""
+
                 if not imap_hosts:
-                    str_lit.error("No IMAP host available for this provider domain name.")
+                    str_lit.session_state["bb_reader_note"] = (
+                        "No IMAP host available for this provider domain name.")
                 else:
                     with str_lit.spinner(f"Connecting via [{px_tag(mailbox_proxy)}] and "
                                          f"fetching inbox for {acc_email}..."):
@@ -10284,37 +10291,49 @@ else:
                         if not ok_read:
                             fetched_msgs, success_read = [], False
                     if ok_read and fetched_msgs:
-                        str_lit.success(
-                            f"Retrieved {len(fetched_msgs)} recent message(s) from "
-                            f"{acc_email}. Tap a message to open its body.")
-                        # v13.53: one expander per message - the CLICK that was
-                        # missing. Only headers could ever appear, because the fetch
-                        # never asked the server for the body. Pre-open the first so
-                        # the behaviour is obvious on a phone.
-                        # v13.54: mailview renders the real message - text or HTML,
-                        # cid: inline images embedded, attachments listed. Falls back
-                        # to the escaped pre-wrap block when it cannot.
-                        for idx, m in enumerate(fetched_msgs, 1):
-                            _subj = (m.get("subject") or "(no subject)").strip()
-                            _from = (m.get("from") or "(unknown sender)").strip()
-                            _label = "%d. %s - %s" % (idx, _subj[:70], _from[:40])
-                            with str_lit.expander(_label, expanded=(idx == 1)):
-                                str_lit.caption(f"From: {_from}  ·  Date: {m.get('date')}")
-                                _mv_key = "bbbody_%d" % idx
-                                _mv_body = m.get("body") or "(no readable body)"
-                                if mailview is not None and hasattr(mailview, "render"):
-                                    mailview.render(str_lit, m.get("raw") or b"",
-                                                    _mv_key, allow_remote=allow_remote)
-                                    str_lit.session_state.setdefault(_mv_key, _mv_body)
-                                else:
-                                    str_lit.markdown(
-                                        "<div style='white-space:pre-wrap;"
-                                        "font-family:ui-monospace,monospace;font-size:12px'>"
-                                        + html.escape(_mv_body)
-                                        + "</div>",
-                                        unsafe_allow_html=True)
+                        # v13.55: THE LIST LIVES IN SESSION STATE. It used to be a
+                        # local inside this button branch, so tapping the View
+                        # radio (or any Move-to dropdown) reran the script, the
+                        # button was False, the branch was skipped and the whole
+                        # message list disappeared - the reader "reset" itself.
+                        str_lit.session_state["bb_reader_msgs"] = fetched_msgs
                     else:
-                        str_lit.warning(f"Could not read mailbox: {note or 'unknown reason'}")
+                        str_lit.session_state["bb_reader_note"] = note or "unknown reason"
+
+        # ---- render from state, OUTSIDE the button branch ----
+        _r_msgs = str_lit.session_state.get("bb_reader_msgs") or []
+        _r_for = str_lit.session_state.get("bb_reader_for") or ""
+        _r_note = str_lit.session_state.get("bb_reader_note") or ""
+
+        if _r_note:
+            str_lit.warning(f"Could not read mailbox: {_r_note}")
+        elif _r_msgs:
+            str_lit.success(
+                f"Retrieved {len(_r_msgs)} recent message(s) from {_r_for}. "
+                f"Tap a message to open its body.")
+            # v13.53: one expander per message - the CLICK that was missing. Only
+            # headers could ever appear, because the fetch never asked the server
+            # for the body. Pre-open the first so it is obvious on a phone.
+            # v13.54: mailview renders the real message - text or HTML, cid: inline
+            # images embedded, attachments listed.
+            for idx, m in enumerate(_r_msgs, 1):
+                _subj = (m.get("subject") or "(no subject)").strip()
+                _from = (m.get("from") or "(unknown sender)").strip()
+                _label = "%d. %s - %s" % (idx, _subj[:70], _from[:40])
+                with str_lit.expander(_label, expanded=(idx == 1)):
+                    str_lit.caption(f"From: {_from}  ·  Date: {m.get('date')}")
+                    _mv_key = "bbbody_%d" % idx
+                    if mailview is not None and hasattr(mailview, "render"):
+                        mailview.render(str_lit, m.get("raw") or b"", _mv_key,
+                                        m.get("body") or "(no readable body)",
+                                        allow_remote=allow_remote)
+                    else:
+                        str_lit.markdown(
+                            "<div style='white-space:pre-wrap;"
+                            "font-family:ui-monospace,monospace;font-size:12px'>"
+                            + html.escape(m.get("body") or "(no readable body)")
+                            + "</div>",
+                            unsafe_allow_html=True)
 # @@END 109 IN_APP_READER
 
 # @@BLOCK 110 FOOTER deps=008,034
