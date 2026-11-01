@@ -1032,6 +1032,10 @@ _VERDICT_RANK = {
     LOGIN_DROPPED: 50,
     SMTP_FAILED: 46,
     DNS_FAILED: 45,
+    # v13.53: RETRY had no rank, so it fell through .get(..., 0) and ranked
+    # below a bare UNKNOWN - and block 102 calls note_verdict() with RETRY
+    # before its own branch. A rate-limit answer could never be retained.
+    RETRY: 42,
     CONNECTION_FAILED: 40,
     UNKNOWN: 10,
 }
