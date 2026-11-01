@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""verify_v1337.py - regression harness for the v13.37 patch set (v13.52 revision).
+"""verify_v1337.py - regression harness for the v13.37 patch set (v13.53 revision).
 
 Run from the repo root:   python verify_v1337.py
 Exit code 0 = clean.
@@ -14,8 +14,21 @@ plus that no two files in pages/ share a page number, that the build identity in
 app.py, its @@FILE header and pages/6_User_Guide.py all agree, and that every
 auth.<name> a page CALLS is actually defined in auth.py.
 
-WHY THIS REVISION EXISTS (v13.52)
+WHY THIS REVISION EXISTS (v13.53)
 ---------------------------------
+  * THE WORKER PATH HAD NO GATE AT ALL.  current_workers, MAX_WORKERS_START,
+    DYNAMIC_WORKER_SCALING and the executor were unasserted, so the whole
+    concurrency contract could be edited away and thirteen gates stayed green.
+    The toggle is opt-in, the fixed branch runs unconditionally, the executor is
+    built from current_workers, and scaling may never clamp below the queue's
+    own length without the small-queue branch being present. All gated now.
+  * THE PROXY GATE WAS THE ONLY GATE WITHOUT A LOCK.  _host_gate, _ip_gate and
+    _subuser_gate all create under STATE["host_gate_lock"]; _proxy_gate did not,
+    so two workers could each build a gate for the same scope and the global
+    PROXY_CONCURRENCY ceiling doubled. The lock is asserted inside the function.
+
+WHY THE PREVIOUS REVISION EXISTED (v13.52)
+------------------------------------------
   * THE P1 DNS NEEDLE PINNED A WHOLE LINE.  It asserted
     'if "Fast-fail DNS check" not in err_text:' including the trailing colon, and
     v13.51 legitimately appended `and not tls_refused` to that same line. The
@@ -309,6 +322,48 @@ def build_identity(app, app_code, gui, gui_code):
                 "pages/6_User_Guide.py assigns BUILD_TAG once")
 
 
+def worker_contract(app, app_code):
+    """The concurrency path, which had no gate before v13.53.
+
+    The reported symptom was "it checks one account and moves to the next".  The
+    code was already parallel; what was missing was anything that would fail if
+    somebody broke it, plus the truth about what the toggle does.  Every part of
+    that contract is asserted here.
+    """
+    has(app, 'current_workers = CFG["MAX_WORKERS_START"]',
+        "worker count starts at the Workers Start slider, unconditionally")
+    has(app, 'if CFG.get("DYNAMIC_WORKER_SCALING", False):',
+        "auto-scaling is opt-in (toggle OFF skips the branch entirely)")
+    has(app, "ThreadPoolExecutor(max_workers=current_workers)",
+        "the executor is built from current_workers")
+    has(app, "executor.submit(check_task, line)",
+        "every account is submitted to the pool up front")
+    has(app, "elif total_accs < 20:", "the small-queue branch is present")
+    has(app, "current_workers = max(2, min(CFG[\"MAX_WORKERS_START\"], total_accs))",
+        "the small-queue branch is bounded by the queue length")
+    has(app, "if total_accs > 500:", "the large-queue branch is present")
+    # The help text promised live scaling and promised no cap. Both were false.
+    has(app, "OFF = FIXED WORKERS", "the toggle help documents the fixed mode")
+    has(app, "It is not re-tuned while", "the toggle help admits it is one-shot")
+    exactly(app_code, "current_workers = CFG[", 1,
+            "current_workers is seeded from the slider exactly once")
+    # _proxy_gate was the only gate created without the table lock.
+    _pg = app_code.split("def _proxy_gate(", 1)
+    if len(_pg) < 2:
+        FAILS.append("MISSING: def _proxy_gate(")
+    else:
+        body = _pg[1].split("def _host_gate(", 1)[0]
+        if 'STATE["host_gate_lock"]' in body:
+            PASSES.append("_proxy_gate creates its gate under host_gate_lock")
+        else:
+            FAILS.append("_proxy_gate does NOT take host_gate_lock - two workers "
+                         "can build two gates for one scope and double the cap")
+    # RETRY must be able to be the retained verdict (rank + whitelist).
+    has(app, "RETRY: 42,", "_VERDICT_RANK ranks RETRY")
+    has(app, "DNS_FAILED, SMTP_FAILED) and st_val != CONNECTION_FAILED",
+        "note_verdict whitelist is present")
+
+
 AUTH_CALLERS = ("app.py", "pages/3_Mailbox_Reader.py", "pages/4_Downloads.py",
                 "pages/5_Blocks.py", "pages/6_User_Guide.py")
 
@@ -548,6 +603,9 @@ def main():
         # ---- P3 ----
         has(app, 'return "VPN ? (lookup failed)"', "P3 VPN state admits a failed lookup")
 
+        # ---- v13.53: the worker contract, which had no gate at all ----
+        worker_contract(app, app_code)
+
         # ---- dead code that must be gone from the CODE (the docstring may name it)
         for dead in ("def _cached_probe(", "def test_single_proxy(",
                      "def proxy_tunnel_ok(", "def _pool_exhausted(",
@@ -557,6 +615,8 @@ def main():
                      "read_timeout", "_is_plain_domain_guess"):
             gone(app_code, dead, "dead code removed: " + dead)
         gone(app, 'STATE["tunnel_cache"]', "dead tunnel_cache state key removed")
+        # v13.53: MAX_WORKERS_MAX was published and read by nothing.
+        gone(app_code, '"MAX_WORKERS_MAX"', "dead MAX_WORKERS_MAX config key removed")
 
         # ---- kept on purpose ----
         has(app, "PROVIDER_MAP = {", "PROVIDER_MAP kept as the hosts.py fallback")
