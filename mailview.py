@@ -1,4 +1,4 @@
-"""mailview.py - safe mail body renderer  (v13.52)
+"""mailview.py - safe mail body renderer  (v13.55)
 
 Plain module, NOT frame-gated - same status as runstate.py. Adds no block, moves
 no TARGET_BLOCKS, renumbers nothing.
@@ -6,6 +6,12 @@ no TARGET_BLOCKS, renumbers nothing.
 Renders a message as text or as real HTML. cid: inline images are resolved from
 the message itself and embedded as data: URIs, so they display without a second
 mailbox round trip and without a browser ever seeing a cid: it cannot resolve.
+
+v13.55: render() takes the FALLBACK TEXT. It used to seed the box with "" so the
+text view was always blank; the text is now derived from the raw message and the
+caller's fallback is only a last resort. The markup handed to the widget is also
+capped, because a 2 MB HTML body re-sanitised on every rerun is what segfaulted
+the container.
 
 Nothing here raises: every public function swallows and the caller falls back to
 a text_area.
@@ -15,8 +21,9 @@ import base64
 import re
 
 _MAX_PART = 4 * 1024 * 1024        # one inline image
-_MAX_TOTAL = 24 * 1024 * 1024      # all inline images of one message
-_MAX_RAW = 6 * 1024 * 1024         # one whole message
+_MAX_TOTAL = 16 * 1024 * 1024      # all inline images of one message
+_MAX_RAW = 700 * 1024              # one whole message
+_MAX_MARKUP = 400 * 1024           # what is actually handed to the widget
 _TRUNC_HINT = 256000               # stored copy at/over this is probably cut
 
 _CID_RX = re.compile(r"cid:([^\"')\s>]+)", re.I)
@@ -146,10 +153,10 @@ def full_raw(mail, uid, cap=_MAX_RAW):
         return b""
 
 
-def _seed(st, key, fallback):
+def _seed(st, key, value):
     try:
         if key not in st.session_state:
-            st.session_state[key] = fallback
+            st.session_state[key] = value or ""
     except Exception:
         pass
 
@@ -161,11 +168,12 @@ def _mode(st, key):
         return "Text"
 
 
-def _paint(st, raw, key, allow_remote):
+def _paint(st, raw, key, markup, allow_remote):
     """Render the HTML. True when something was drawn."""
-    _text, markup = split_message(raw)
     if not markup:
         return False
+    if len(markup) > _MAX_MARKUP:
+        markup = markup[:_MAX_MARKUP] + "<p style='color:#666'>[... message truncated for display]</p>"
     shell = _SHELL % sanitize(markup, inline_images(raw), allow_remote)
     try:
         st.html(shell)
@@ -183,12 +191,13 @@ def _text_area(st, key):
         pass
 
 
-def render(st, raw, key, allow_remote=False):
+def render(st, raw, key, fallback="", allow_remote=False):
     """Text/HTML switch from an already-complete raw message."""
-    _seed(st, key, "")
+    text, markup = split_message(raw)
+    _seed(st, key, text.strip() or fallback)
     if _mode(st, key) == "HTML":
         try:
-            if _paint(st, raw, key, allow_remote):
+            if _paint(st, raw, key, markup, allow_remote):
                 return
         except Exception:
             pass
@@ -201,19 +210,20 @@ def render_auto(st, msg, key, mail_getter, allow_remote=False):
     `mail_getter` is a zero-arg callable returning an open mailbox. It is only
     called for messages that actually need it, and a failure is swallowed.
     """
-    _seed(st, key, msg.get("body", ""))
-    if _mode(st, key) == "HTML":
-        raw = msg.get("raw") or b""
-        _text, markup = split_message(raw)
-        if len(raw) >= _TRUNC_HINT or "cid:" in markup:
-            try:
-                full = full_raw(mail_getter(), msg.get("id"))
-                if full:
-                    raw = full
-            except Exception:
-                pass
+    raw = msg.get("raw") or b""
+    text, markup = split_message(raw)
+    if len(raw) >= _TRUNC_HINT or "cid:" in markup:
         try:
-            if _paint(st, raw, key, allow_remote):
+            full = full_raw(mail_getter(), msg.get("id"))
+            if full:
+                raw = full
+                text, markup = split_message(raw)
+        except Exception:
+            pass
+    _seed(st, key, text.strip() or msg.get("body", ""))
+    if _mode(st, key) == "HTML":
+        try:
+            if _paint(st, raw, key, markup, allow_remote):
                 return
         except Exception:
             pass
