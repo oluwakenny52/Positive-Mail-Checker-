@@ -414,7 +414,7 @@ with _t3:
 | **🔬 Deep Diagnostics → 🔁 Rebuild / 🧪 Direct self-test** | Rebuilds the bundle / runs a live classifier + tunnel + mail-destination self-test. |
 | **⬇️ Download bundle** | The full diagnostic text, credentials included. |
 | **🔄 Refresh Startup Screen / 🧹 Clear Startup Logs** | Startup ledger controls. |
-| **📖 Read Inbox Messages** | Reads the selected valid account's last N headers, through a proxy. |
+| **📖 Read Inbox Messages** | Reads the selected account's last N messages through a proxy. Headers list first; tap a message to open its body. Nothing is marked read. |
 | **📦 Download All Results (.zip Package)** | The whole run as one archive. |
 """
     )
@@ -506,8 +506,7 @@ with _t5:
     ug_h("Buckets, files and where to get them")
     st.markdown(
         "A run writes one file per bucket into `mail_results/`, stamped "
-        "`YYYYMMDD_HHMMSS`, plus `clean_valid_accounts.txt` (merged, de-duplicated) "
-        "and a `mail_results_<stamp>.zip`."
+        "`YYYYMMDD_HHMMSS`, plus `clean_valid_accounts.txt` (merged, de-duplicated) and a `<your-prefix>_mail_results_<stamp>.zip`."
     )
 
     st.markdown(
@@ -616,7 +615,7 @@ with _t8:
 | Lots of `LOGIN_DROPPED` | The mail server answered and hung up. Retry from a different IP, or use an app password. **Not** a wrong password. |
 | Lots of `APP` | Normal for Gmail / Yahoo / O365. Generate app passwords. |
 | `Every proxy was filtered out` | `Min Proxy Score`, pool mode or the circuit breaker emptied the pool. The raw list is **not** used as a silent fallback - by design. |
-| Run feels slow | Two separate things. (1) `Confirm a WRONG verdict across hosts` is ON, so a provisional WRONG keeps the ladder dialling - that is intended. (2) The **tail** is slow by construction: whatever is still queued has already exhausted most of its ladder. The last cohort gets its per-account budget capped at 45 s, so it no longer sits on the full slider value. Raise the mode to `Fast`, or narrow the protocol list. |
+| Run feels slow | Two separate things. (1) `Confirm a WRONG verdict across hosts` is ON, so a provisional WRONG keeps the ladder dialling - that is intended. (2) The **tail** is slow by construction: whatever is still queued has already exhausted most of its ladder. The last cohort gets its per-account budget capped at 30 s and its retries and rotations zeroed, so it no longer sits on the full slider value. Raise the mode to `Fast`, or narrow the protocol list. |
 | Settings do not change | Nothing applies until **💾 Apply Settings**. |
 | `⚠ You have UNAPPLIED settings changes` | Exactly that. Press Apply. |
 | `407` shown as a proxy failure, not a password failure | Correct. The mailbox was never reached. |
