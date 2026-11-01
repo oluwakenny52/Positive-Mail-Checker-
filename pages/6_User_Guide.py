@@ -296,7 +296,7 @@ with _t2:
 | Control | What it does |
 |---|---|
 | **Select Engine Mode** | `Normal` = balanced. `Fast` = fewer rungs, shorter deadline, 100 workers. `Deep` = 4 hosts/domain, 400 s deadline, strict. |
-| **Workers Start** | Parallel accounts. Auto-scales when *Thread Auto-Scaling* is on and the list is large. |
+| **Workers Start** | Parallel accounts, used verbatim. Auto-scaling only touches it when *Thread Auto-Scaling* is ON. |
 | **Deadline (Seconds)** | Wall-clock budget **per account**, split between the proxy phase and the direct phase. |
 | **Timeout** | Per-attempt socket timeout. |
 | **Max Accounts** | Truncates the queue. `0` = unlimited. |
@@ -319,7 +319,7 @@ with _t2:
         """
 | Control | What it does |
 |---|---|
-| **Thread Auto-Scaling** | Lets the engine grow/shrink workers with list size. |
+| **Thread Auto-Scaling** | OFF = fixed workers, exactly your Workers Start, nothing changes it. ON = tuned ONCE before the first account (raised 2x over 500, cut to the queue length under 20). Never re-tuned mid-run. |
 | **Max Hosts Per Domain** | How many discovered IMAP hosts to try. 143/110 and POP rungs are capped separately. |
 | **Try local-part username on auth failure** | On an auth rejection, retries the **same** host as `user` instead of `user@domain`. Fires on `* BYE` too. Not applied to SMTP. |
 | **Confirm a WRONG verdict across hosts** | The guard. ON = provisional WRONG until a second host or rung agrees. OFF = one-rung, faster, more false wrongs. |
