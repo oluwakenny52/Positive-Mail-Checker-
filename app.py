@@ -7857,13 +7857,13 @@ def verify_and_connect(target_email, target_pass, hosts, proxy_str=None):
 # BODY.PEEK[HEADER.FIELDS (SUBJECT FROM DATE)] - the body bytes were never
 # requested, so no amount of UI work could have revealed them.
 #
-# The body fetch is PARTIAL - BODY.PEEK[TEXT]<0.20000> - so a 40 MB newsletter
-# cannot stall a phone, and it is a PEEK so the mailbox's \Seen flags are left
-# exactly as they were. If a server ignores the partial spec, the full body is
-# fetched as a fallback. The body is MIME-parsed afterwards: text/plain wins,
-# HTML is stripped to text, and the result is capped again before the UI sees it.
-_BODY_FETCH_BYTES = 20000
-_BODY_SHOW_CHARS = 6000
+# v13.54: the 20000-byte partial cut a multipart message mid-part, so the tail of
+# a base64 image arrived broken and no HTML renderer could use it. The whole
+# message is fetched now, capped in Python, and BOTH the text and the HTML part
+# are kept alongside the raw bytes. Still BODY.PEEK, so \Seen is untouched.
+_BODY_FETCH_BYTES = 20000      # kept: legacy reference, no longer the fetch cut
+_BODY_SHOW_CHARS = 20000
+_RAW_CAP = 2 * 1024 * 1024
 
 
 def _hdr_text(raw):
@@ -7886,11 +7886,11 @@ def _hdr_text(raw):
         return {"subject": "", "from": "", "date": ""}
 
 
-def _body_text(raw):
-    """Raw MIME bytes -> readable, capped plain text. Never raises."""
-    if not raw:
-        return "(the server returned no body)"
+def _body_parts(raw):
+    """Raw MIME bytes -> (readable plain text, html). Never raises."""
     text, markup = "", ""
+    if not raw:
+        return text, markup
     try:
         from email import message_from_bytes as _mfb
         msg = _mfb(raw)
@@ -7915,8 +7915,15 @@ def _body_text(raw):
             elif ctype == "text/html" and not markup:
                 markup = decoded
     except Exception:
-        return raw.decode("utf-8", errors="replace")[:_BODY_SHOW_CHARS]
+        return raw.decode("utf-8", errors="replace")[:_BODY_SHOW_CHARS], ""
+    return text, markup
 
+
+def _body_text(raw):
+    """Raw MIME bytes -> readable, capped plain text. Never raises."""
+    if not raw:
+        return "(the server returned no body)"
+    text, markup = _body_parts(raw)
     if not text and markup:
         import html as _html
         stripped = re.sub(r"(?is)<(script|style)\b.*?</\1>", " ", markup)
@@ -7935,7 +7942,7 @@ def _body_text(raw):
 
 
 def read_mailbox_messages(email, password, server, proxy_str=None, limit=10):
-    """Return (ok, [message dict], note). Newest first; body included and capped."""
+    """Return (ok, [message dict], note). Newest first; body + raw included."""
     mail = None
     try:
         conf_hosts = get_servers(email).get("imap", []) or [server]
@@ -7959,18 +7966,28 @@ def read_mailbox_messages(email, password, server, proxy_str=None, limit=10):
                     if isinstance(rp, tuple) and rp[1]:
                         heads = _hdr_text(rp[1])
                         break
-            body = ""
-            typ, bdy = mail.fetch(mid, "(BODY.PEEK[TEXT]<0.%d>)" % _BODY_FETCH_BYTES)
-            if typ != "OK" or not bdy:
+            # v13.54: the WHOLE message, so multipart image parts survive intact.
+            raw_body = b""
+            typ, bdy = mail.fetch(mid, "(BODY.PEEK[])")
+            if typ == "OK" and bdy:
+                for rp in (bdy or []):
+                    if isinstance(rp, tuple) and rp[1]:
+                        raw_body = rp[1][:_RAW_CAP]
+                        break
+            if not raw_body:
                 typ, bdy = mail.fetch(mid, "(BODY.PEEK[TEXT])")
-            for rp in (bdy or []):
-                if isinstance(rp, tuple) and rp[1]:
-                    body = _body_text(rp[1])
-                    break
-            out.append({"subject": heads.get("subject") or "(no subject)",
+                for rp in (bdy or []):
+                    if isinstance(rp, tuple) and rp[1]:
+                        raw_body = rp[1][:_RAW_CAP]
+                        break
+            body_text, body_html = _body_parts(raw_body)
+            out.append({"id": mid.decode() if isinstance(mid, bytes) else str(mid),
+                        "subject": heads.get("subject") or "(no subject)",
                         "from": heads.get("from") or "(unknown sender)",
                         "date": heads.get("date") or "(no date)",
-                        "body": body or "(the server returned no body)"})
+                        "body": _body_text(raw_body),
+                        "html": body_html,
+                        "raw": raw_body})
         try:
             mail.logout()
         except Exception:
@@ -10207,6 +10224,12 @@ if str_lit.session_state.engine_has_run or _persisted_valid:
 section_title("📬", "Mailbox Reader (Interactive Inbox Inspection)",
               "read verified inboxes without leaving the app")
 
+# v13.54: body renderer. Optional - a failed import keeps the escaped text view.
+try:
+    import mailview
+except Exception:
+    mailview = None
+
 with session_state_lock:
     current_valid_set = list(str_lit.session_state.valid_results) or load_persistent_valid_results()
 
@@ -10228,6 +10251,13 @@ else:
                                            options=valid_combo_options, key="bb_reader_acct")
         max_msgs = str_lit.slider("Number of Recent Messages to Fetch", 1, 50, 10, 1,
                                   key="bb_reader_max")
+
+        if "bb_reader_remote" not in str_lit.session_state:
+            str_lit.session_state["bb_reader_remote"] = False
+        allow_remote = str_lit.checkbox(
+            "Load remote images in HTML view (tracking pixels fire)", key="bb_reader_remote",
+            help="Inline cid: images are always shown - they are embedded in the message. "
+                 "This switch is only about images hosted on the sender's server.")
 
         if str_lit.button("📖 Read Inbox Messages"):
             if selected_combo:
@@ -10261,18 +10291,28 @@ else:
                         # missing. Only headers could ever appear, because the fetch
                         # never asked the server for the body. Pre-open the first so
                         # the behaviour is obvious on a phone.
+                        # v13.54: mailview renders the real message - text or HTML,
+                        # cid: inline images embedded, attachments listed. Falls back
+                        # to the escaped pre-wrap block when it cannot.
                         for idx, m in enumerate(fetched_msgs, 1):
                             _subj = (m.get("subject") or "(no subject)").strip()
                             _from = (m.get("from") or "(unknown sender)").strip()
                             _label = "%d. %s - %s" % (idx, _subj[:70], _from[:40])
                             with str_lit.expander(_label, expanded=(idx == 1)):
                                 str_lit.caption(f"From: {_from}  ·  Date: {m.get('date')}")
-                                str_lit.markdown(
-                                    "<div style='white-space:pre-wrap;"
-                                    "font-family:ui-monospace,monospace;font-size:12px'>"
-                                    + html.escape(m.get("body") or "(no readable body)")
-                                    + "</div>",
-                                    unsafe_allow_html=True)
+                                _mv_key = "bbbody_%d" % idx
+                                _mv_body = m.get("body") or "(no readable body)"
+                                if mailview is not None and hasattr(mailview, "render"):
+                                    mailview.render(str_lit, m.get("raw") or b"",
+                                                    _mv_key, allow_remote=allow_remote)
+                                    str_lit.session_state.setdefault(_mv_key, _mv_body)
+                                else:
+                                    str_lit.markdown(
+                                        "<div style='white-space:pre-wrap;"
+                                        "font-family:ui-monospace,monospace;font-size:12px'>"
+                                        + html.escape(_mv_body)
+                                        + "</div>",
+                                        unsafe_allow_html=True)
                     else:
                         str_lit.warning(f"Could not read mailbox: {note or 'unknown reason'}")
 # @@END 109 IN_APP_READER
