@@ -8093,8 +8093,9 @@ def _check_account_core(email, password, conf, domain, proxy_pool, thread_state,
             # "all hosts unreachable".  RETRY: 42 in _VERDICT_RANK (block 023)
             # keeps it under VALID/WRONG/APP/RBL/LOGIN_DROPPED, so it can only
             # win where nothing better was found.
-            if st_val not in (VALID, WRONG, APP, RBL, LOGIN_DROPPED, RETRY, UNKNOWN,
-                              DNS_FAILED, SMTP_FAILED) and st_val != CONNECTION_FAILED:
+            if st_val not in (VALID, WRONG, APP, RBL, LOGIN_DROPPED, UNKNOWN,
+                              DNS_FAILED, SMTP_FAILED) and st_val != CONNECTION_FAILED \
+                    and st_val != RETRY:
                 return
             cur = best_verdict["status"]
             if force or cur is None or _VERDICT_RANK.get(st_val, 0) > _VERDICT_RANK.get(cur, 0):
@@ -10225,9 +10226,12 @@ else:
                         # host passed in. The old `for srv in imap_hosts:` loop re-ran
                         # that entire ladder once per host, so a 4-host domain could
                         # open 4x4 ladders and burn proxy credit before giving up.
-                        ok_read, fetched_msgs, note = read_mailbox_messages(
+                        ok_read, msgs, note = read_mailbox_messages(
                             acc_email, acc_pass, imap_hosts[0],
                             proxy_str=mailbox_proxy, limit=max_msgs)
+                        fetched_msgs, success_read = msgs, True
+                        if not ok_read:
+                            fetched_msgs, success_read = [], False
                     if ok_read and fetched_msgs:
                         str_lit.success(
                             f"Retrieved {len(fetched_msgs)} recent message(s) from "
