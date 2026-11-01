@@ -7913,8 +7913,12 @@ def _check_account_core(email, password, conf, domain, proxy_pool, thread_state,
     # v13.51: saw_tls_refused is separate from saw_server.  A server that refuses
     # STARTTLS on 143 never issued a LOGIN, so it must not be reported as a
     # dropped LOGIN - that was the wrong sentence on every Frontier account.
+    # v13.52: saw_auth is the missing counterpart.  Block 104 tests it, but nothing
+    # ever SET it, so the TLS-refused tail branch was always live and outranked a
+    # real RETRY / RBL answer from a later rung.  It is set wherever the server
+    # gave an auth-shaped answer.
     flags = {"saw_407": False, "saw_nonproxy": False, "saw_server": False,
-             "saw_login_drop": False, "saw_tls_refused": False}
+             "saw_login_drop": False, "saw_tls_refused": False, "saw_auth": False}
     force_direct = {"flag": False}
     host_407 = {}
     net_failed_hosts = set()
@@ -8165,9 +8169,22 @@ def _check_account_core(email, password, conf, domain, proxy_pool, thread_state,
             Releasing through a fresh lookup and letting the release raise meant a
             rebuilt gate turned "Semaphore released too many times" into the
             attempt's result and ate the real one.
+
+            v13.52: every gate WAIT is clamped to what is left of the account
+            window.  Each wait used to get the full _gate_wait(attempt_to) on its
+            own, so three contended gates in sequence could spend more than the
+            rung's whole slice before a single byte was dialled - which is what
+            the "N rung(s) not attempted" lines were reporting.
             """
             gate = _host_gate(server)
-            got_host = gate.acquire(timeout=max(2.0, attempt_to))
+
+            def _wait_cap():
+                base = _gate_wait(attempt_to)
+                if deadline_ts is None:
+                    return base
+                return max(1.0, min(base, deadline_ts - time.time()))
+
+            got_host = gate.acquire(timeout=_wait_cap())
             try:
                 if deadline_ts is not None:
                     _rem = deadline_ts - time.time()
@@ -8176,14 +8193,14 @@ def _check_account_core(email, password, conf, domain, proxy_pool, thread_state,
                     attempt_to = min(attempt_to, LEGACY_RUNG_TIMEOUT)
                 if px_used:
                     pg = _proxy_gate()
-                    got_proxy = pg.acquire(timeout=_gate_wait(attempt_to))
+                    got_proxy = pg.acquire(timeout=_wait_cap())
                     try:
                         _pxinfo = parse_proxy(px_used)
                         ipg = _ip_gate(_pxinfo["host"] if _pxinfo else None)
-                        got_ip = ipg.acquire(timeout=_gate_wait(attempt_to))
+                        got_ip = ipg.acquire(timeout=_wait_cap())
                         try:
                             sg = _subuser_gate((_pxinfo.get("user") or "").lower() if _pxinfo else "")
-                            got_sub = sg.acquire(timeout=_gate_wait(attempt_to))
+                            got_sub = sg.acquire(timeout=_wait_cap())
                             try:
                                 _do_attempt_raw(proto, server, port, tls_mode, user,
                                                 px_used, attempt_to)
@@ -8532,6 +8549,7 @@ def _check_account_core(email, password, conf, domain, proxy_pool, thread_state,
                             err_text = str(cnf)
                             flags["saw_nonproxy"] = True
                             flags["saw_server"] = True
+                            flags["saw_auth"] = True
                             record_proxy_attempt(px_used, success=False, is_network_error=False)
                             trace_logs.append(
                                 f"{px_tag(px_used)} -> CONFIRM {proto} {server}:{port}: "
@@ -8630,6 +8648,8 @@ def _check_account_core(email, password, conf, domain, proxy_pool, thread_state,
                                 flags["saw_tls_refused"] = True
                             else:
                                 flags["saw_server"] = True
+                            if st_val in (APP, WRONG, RBL, RETRY, LOGIN_DROPPED):
+                                flags["saw_auth"] = True
                             record_proxy_attempt(px_used, success=False, is_network_error=False)
                             trace_logs.append(
                                 f"{px_tag(px_used)} -> AUTH {proto} "
@@ -8713,6 +8733,8 @@ def _check_account_core(email, password, conf, domain, proxy_pool, thread_state,
                                     flags["saw_tls_refused"] = True
                                 if "Fast-fail DNS check" not in err_text and not tls_refused:
                                     flags["saw_server"] = True
+                            if st_val in (APP, WRONG, RBL, RETRY, LOGIN_DROPPED):
+                                flags["saw_auth"] = True
                             if _is_timeout(e):
                                 had_net = True
                                 net_failed_hosts.add(server)
@@ -8983,10 +9005,18 @@ def _check_account_core(email, password, conf, domain, proxy_pool, thread_state,
             "Mail host answered, accepted the LOGIN command, then closed the socket "
             "(* BYE) before returning a verdict - server-side drop, not a network fault.")
         return None, LOGIN_DROPPED, _login_dropped_detail(), None, trace_logs
+    # v13.52: `retryable` now comes BEFORE the TLS branch.  A refused STARTTLS is a
+    # real answer about the 143 rung, but it is not the whole story when a later
+    # rung gave RETRY or RBL - and the old order let one TLS refusal bury it.
+    # v13.52: the branch is also guarded by saw_auth, which nothing ever set
+    # before, so the guard could never fire.
+    if retryable and not flags.get("saw_auth"):
+        return None, RETRY, "retryable (proxy / IP-block / rate-limit)", None, trace_logs
     # v13.51: a refused STARTTLS is its OWN answer.  The 143 rung was reaching
     # this point and the saw_server branch below then claimed LOGIN had been
     # issued and dropped, which was untrue - starttls() raises before LOGIN.
-    if flags.get("saw_tls_refused") and not flags.get("saw_auth"):
+    if flags.get("saw_tls_refused") and not flags.get("saw_auth") \
+            and not flags.get("saw_login_drop"):
         trace_logs.append(
             "Host was reached but refused the TLS upgrade itself (STARTTLS not "
             "supported) - no LOGIN was ever issued, so the password is untested. "
@@ -9792,6 +9822,18 @@ if start_engine_btn:
 # lines), a 2000-row dataframe and a full log re-render on every rerun, and
 # called load_persistent_valid_results() inside its own `if` condition after
 # invalidate_valid_caches() had just zeroed the cache.
+#
+# v13.52: the remaining cost was the report dataframe - up to 2000 rows, each
+# carrying a multi-line trace string, handed to st.dataframe() in one call. That
+# is a DOM payload measured in megabytes. The table is now capped and the CSV /
+# ZIP still carry every row. The block also WRITES to status_text, because until
+# now nothing here touched it: the screen sat on block 107's "writing result
+# files" line for the entire render, which is exactly what was reported as a hang.
+try:
+    status_text.text("Progress: complete - building the results summary...")
+except Exception:
+    pass
+
 _persisted_valid = load_persistent_valid_results()
 
 if str_lit.session_state.engine_has_run or _persisted_valid:
@@ -9909,11 +9951,15 @@ if str_lit.session_state.engine_has_run or _persisted_valid:
 
     # FIX SPEED-12 / v13.51: one st.code per bucket instead of one per LINE. Up to
     # 480 code widgets became 12, and the per-line widgets are behind a toggle.
+    # v13.52: the toggle key is seeded and the widget is created key-only - passing
+    # value= AND key= raises Streamlit's duplicate-default warning from the second
+    # run onward.
+    if "bb_sum_full" not in str_lit.session_state:
+        str_lit.session_state["bb_sum_full"] = False
     _show_full = str_lit.toggle(
-        "Show full bucket contents inline (slower on a phone)", value=False,
-        key="bb_sum_full",
-        help="Off: 12 boxes with the first lines each. On: every line, still capped "
-             "at BUCKET_RENDER_TAIL. The download button above always carries all of it.")
+        "Show full bucket contents inline (slower on a phone)", key="bb_sum_full",
+        help="Off: 12 boxes with a count. On: every line, still capped at "
+             "BUCKET_RENDER_TAIL. The download button above always carries all of it.")
     for title, items in summary_buckets.items():
         with str_lit.expander(f"{title} ({len(items)})", expanded=False):
             if not items:
@@ -9943,15 +9989,29 @@ if str_lit.session_state.engine_has_run or _persisted_valid:
         else:
             str_lit.info("No logs available from previous run.")
     with exec_tab2_p:
+        # v13.52: the table is CAPPED. 2000 rows of multi-line traces is what the
+        # page was actually choking on; the CSV and the ZIP still carry all of it.
+        _DF_TAIL = 200
         if report_entries_copy:
-            str_lit.dataframe(pd.DataFrame(report_entries_copy[::-1]),
-                              width="stretch", height=320)
+            _rows = report_entries_copy[::-1]
+            if len(_rows) > _DF_TAIL:
+                str_lit.caption(
+                    f"Showing the newest **{_DF_TAIL}** of **{len(_rows)}** traced "
+                    f"account(s) - the ZIP and the Full Log page carry every row.")
+                _rows = _rows[:_DF_TAIL]
+            st_lit = None
+            str_lit.dataframe(pd.DataFrame(_rows), width="stretch", height=320)
         else:
             str_lit.info("No report logs available.")
 
     if zip_bytes_copy and zip_name_copy:
         str_lit.download_button("📦 Download All Results (.zip Package)", data=zip_bytes_copy,
                                 file_name=zip_name_copy, mime="application/zip")
+
+    try:
+        status_text.text("Progress: complete - summary ready.")
+    except Exception:
+        pass
 # @@END 108 RESULTS_SUMMARY
 
 # @@BLOCK 109 IN_APP_READER deps=034,053,062,069,093,098
