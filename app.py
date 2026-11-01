@@ -3953,47 +3953,144 @@ def verify_and_connect(target_email, target_pass, hosts, proxy_str=None):
 # @@END 097 VERIFY_AND_CONNECT
 
 # @@BLOCK 098 READ_MAILBOX deps=022,093,097
+# v13.53: the reader returns the MESSAGE BODY too, so block 109 can show it when
+# the message is clicked. It used to fetch only
+# BODY.PEEK[HEADER.FIELDS (SUBJECT FROM DATE)] - the body bytes were never
+# requested, so no amount of UI work could have revealed them.
+#
+# The body fetch is PARTIAL - BODY.PEEK[TEXT]<0.20000> - so a 40 MB newsletter
+# cannot stall a phone, and it is a PEEK so the mailbox's \Seen flags are left
+# exactly as they were. If a server ignores the partial spec, the full body is
+# fetched as a fallback. The body is MIME-parsed afterwards: text/plain wins,
+# HTML is stripped to text, and the result is capped again before the UI sees it.
+_BODY_FETCH_BYTES = 20000
+_BODY_SHOW_CHARS = 6000
+
+
+def _hdr_text(raw):
+    """Decode one raw header block into a dict. Never raises."""
+    try:
+        from email import message_from_bytes as _mfb
+        from email.header import decode_header as _dh, make_header as _mh
+        msg = _mfb(raw)
+        out = {}
+        for key in ("Subject", "From", "Date"):
+            value = msg.get(key) or ""
+            if value:
+                try:
+                    value = str(_mh(_dh(value)))
+                except Exception:
+                    pass
+            out[key.lower()] = value.replace("\r", " ").replace("\n", " ").strip()
+        return out
+    except Exception:
+        return {"subject": "", "from": "", "date": ""}
+
+
+def _body_text(raw):
+    """Raw MIME bytes -> readable, capped plain text. Never raises."""
+    if not raw:
+        return "(the server returned no body)"
+    text, markup = "", ""
+    try:
+        from email import message_from_bytes as _mfb
+        msg = _mfb(raw)
+        parts = list(msg.walk()) if msg.is_multipart() else [msg]
+        for part in parts:
+            if part.get_content_maintype() == "multipart":
+                continue
+            ctype = (part.get_content_type() or "").lower()
+            try:
+                payload = part.get_payload(decode=True) or b""
+            except Exception:
+                payload = b""
+            if not payload:
+                continue
+            charset = part.get_content_charset() or "utf-8"
+            try:
+                decoded = payload.decode(charset, errors="replace")
+            except Exception:
+                decoded = payload.decode("utf-8", errors="replace")
+            if ctype == "text/plain" and not text:
+                text = decoded
+            elif ctype == "text/html" and not markup:
+                markup = decoded
+    except Exception:
+        return raw.decode("utf-8", errors="replace")[:_BODY_SHOW_CHARS]
+
+    if not text and markup:
+        import html as _html
+        stripped = re.sub(r"(?is)<(script|style)\b.*?</\1>", " ", markup)
+        stripped = re.sub(r"(?is)<br\s*/?>|</p>|</div>|</tr>|</li>", "\n", stripped)
+        stripped = re.sub(r"(?s)<[^>]+>", " ", stripped)
+        text = _html.unescape(stripped)
+
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    text = re.sub(r"[ \t]+\n", "\n", text)
+    text = re.sub(r"\n{3,}", "\n\n", text).strip()
+    if not text:
+        return "(no readable text in this message)"
+    if len(text) > _BODY_SHOW_CHARS:
+        return text[:_BODY_SHOW_CHARS] + "\n\n[... truncated - open the full message elsewhere]"
+    return text
+
+
 def read_mailbox_messages(email, password, server, proxy_str=None, limit=10):
+    """Return (ok, [message dict], note). Newest first; body included and capped."""
     mail = None
     try:
         conf_hosts = get_servers(email).get("imap", []) or [server]
         verified, mail, _ = verify_and_connect(email, password, conf_hosts, proxy_str=proxy_str)
         if not verified or not mail:
-            # v13.51: the sentence read "True credential verification failed" -
-            # `True` is the bool, not part of the words.
-            return ["Error reading mailbox: credential verification failed."]
-        mail.select("INBOX")
+            return False, [], "credential verification failed"
+        mail.select("INBOX", readonly=True)
         typ, data = mail.search(None, "ALL")
         if typ != "OK":
-            return ["No messages or folder empty."]
+            return False, [], "the INBOX could not be searched"
         ids = data[0].split()
+        if not ids:
+            return False, [], "the inbox is empty"
         latest_ids = ids[-limit:] if len(ids) > limit else ids
-        messages = []
+        out = []
         for mid in reversed(latest_ids):
-            typ, msg_data = mail.fetch(mid, "(BODY.PEEK[HEADER.FIELDS (SUBJECT FROM DATE)])")
+            heads = {"subject": "", "from": "", "date": ""}
+            typ, hdr = mail.fetch(mid, "(BODY.PEEK[HEADER.FIELDS (SUBJECT FROM DATE)])")
             if typ == "OK":
-                for rp in msg_data:
-                    if isinstance(rp, tuple):
-                        messages.append(rp[1].decode("utf-8", errors="ignore"))
+                for rp in (hdr or []):
+                    if isinstance(rp, tuple) and rp[1]:
+                        heads = _hdr_text(rp[1])
+                        break
+            body = ""
+            typ, bdy = mail.fetch(mid, "(BODY.PEEK[TEXT]<0.%d>)" % _BODY_FETCH_BYTES)
+            if typ != "OK" or not bdy:
+                typ, bdy = mail.fetch(mid, "(BODY.PEEK[TEXT])")
+            for rp in (bdy or []):
+                if isinstance(rp, tuple) and rp[1]:
+                    body = _body_text(rp[1])
+                    break
+            out.append({"subject": heads.get("subject") or "(no subject)",
+                        "from": heads.get("from") or "(unknown sender)",
+                        "date": heads.get("date") or "(no date)",
+                        "body": body or "(the server returned no body)"})
         try:
             mail.logout()
         except Exception:
             pass
-        return messages if messages else ["No recent messages found."]
+        return True, out, ""
     except MsVerdict as mv:
         if mail:
             try:
                 mail.logout()
             except Exception:
                 pass
-        return [f"Error reading mailbox: Microsoft token verdict -> {mv.verdict} ({mv})"]
+        return False, [], f"Microsoft token verdict -> {mv.verdict} ({mv})"
     except Exception as e:
         if mail:
             try:
                 mail.logout()
             except Exception:
                 pass
-        return [f"Error reading mailbox: {str(e)}"]
+        return False, [], str(e)
 # @@END 098 READ_MAILBOX
 
 # @@BLOCK 099 CHECK_WRAPPER deps=009,023
@@ -4112,7 +4209,13 @@ def _check_account_core(email, password, conf, domain, proxy_pool, thread_state,
             # v13.51: CONNECTION_FAILED is retained now.  It used to be dropped
             # here, so a real transport answer could never be the retained
             # verdict and every transport failure ended on the generic tail text.
-            if st_val not in (VALID, WRONG, APP, RBL, LOGIN_DROPPED, UNKNOWN,
+            # v13.53: RETRY is retained too.  Block 102 calls note_verdict() with
+            # it BEFORE the `elif st_val == RETRY` branch, so every RETRY was
+            # discarded here and the tail could only ever answer the generic
+            # "all hosts unreachable".  RETRY: 42 in _VERDICT_RANK (block 023)
+            # keeps it under VALID/WRONG/APP/RBL/LOGIN_DROPPED, so it can only
+            # win where nothing better was found.
+            if st_val not in (VALID, WRONG, APP, RBL, LOGIN_DROPPED, RETRY, UNKNOWN,
                               DNS_FAILED, SMTP_FAILED) and st_val != CONNECTION_FAILED:
                 return
             cur = best_verdict["status"]
@@ -5216,6 +5319,39 @@ with col_action2:
 # sidebar (block 080) already computes its own filtered_pool for display.
 active_proxy_pool = []
 
+
+# v13.53: progress_bar / status_text are bound at MODULE scope behind a null shim.
+# They are only ever CREATED on the start path, yet block 107 writes to both and
+# block 108 runs on EVERY page load - so on any load that never entered the start
+# branch both names were unbound, every write raised NameError, and the surrounding
+# try/except swallowed it. That is exactly why the screen sat frozen on the last
+# line instead of reporting what it was doing. The shim absorbs the calls instead.
+class _NullUI:
+    def progress(self, *a, **k):
+        return self
+
+    def text(self, *a, **k):
+        return self
+
+    def info(self, *a, **k):
+        return self
+
+    def success(self, *a, **k):
+        return self
+
+    def error(self, *a, **k):
+        return self
+
+    def warning(self, *a, **k):
+        return self
+
+    def metric(self, *a, **k):
+        return self
+
+
+progress_bar = _NullUI()
+status_text = _NullUI()
+
 # The stop is a rerun with a reason attached: the click tears the loop down
 # before anything below executes, so the stamp has to happen here and the
 # interrupt itself is performed by block 007 on the next load.
@@ -5294,12 +5430,11 @@ if start_engine_btn:
         active_proxy_pool = get_filtered_active_proxies()
         filtered_pool[:] = active_proxy_pool
 
-        # FIX ISO-4 (v13.49): runs_active is the truth and run_active is derived,
-        # so one user's exit can no longer tell another user's prober that the
-        # deployment is idle.
-        STATE["runs_active"] = int(STATE.get("runs_active", 0)) + 1
-        STATE["run_active"] = True
-        str_lit.session_state["run_active"] = True
+        # FIX ISO-4 (v13.49) put the counter here; v13.53 moves it into block 106's
+        # try. Claimed here it sat OUTSIDE any finally, so a throw in the cold-pool
+        # wait, the tab build or the bucket placeholders below left runs_active
+        # permanently +1 and the deployment believed a run was live forever.
+        # Claimed inside the try it is always paired with the release.
 
         _prev_tg = list(STATE.get("probe_targets_override") or [])
         _tg = _set_probe_targets_from_queue(
@@ -5498,6 +5633,16 @@ if start_engine_btn:
         _orig_retries = CFG.get("SAME_HOST_RETRIES")
         _orig_rot = CFG.get("MAX_ROTATIONS")
         try:
+            # FIX ISO-5 (v13.53): the run counter is claimed HERE, as the first
+            # statement inside the try, and released in the finally. Block 105 used
+            # to claim it before the cold-pool wait, the tab build and the bucket
+            # placeholders - all outside any finally - so any throw in that stretch
+            # left runs_active permanently +1 and the deployment believed a run was
+            # live forever.
+            STATE["runs_active"] = int(STATE.get("runs_active", 0)) + 1
+            STATE["run_active"] = True
+            str_lit.session_state["run_active"] = True
+
             current_workers = CFG["MAX_WORKERS_START"]
             if CFG.get("DYNAMIC_WORKER_SCALING", False):
                 # FIX SPEED-3: the small-queue branch CAPPED the count at 5, so a
@@ -5782,22 +5927,30 @@ if start_engine_btn:
             runstate.note(detected_stop_reason)
             str_lit.error(f"⚠ Engine Stopped: {detected_stop_reason}")
         except BaseException as be:
-            if isinstance(be, (SystemExit, KeyboardInterrupt)):
-                run_interrupted = True
-                detected_stop_reason = "System Shutdown / Interruption"
-                raise be
             run_interrupted = True
-            _bn = type(be).__name__
-            if _bn in ("RerunException", "StopException", "ScriptStopped"):
-                detected_stop_reason = "User Interruption: UI interaction (Streamlit rerun)"
-                log_probe_event("run stopped by a Streamlit RerunException/StopException")
+            if isinstance(be, (SystemExit, KeyboardInterrupt)):
+                # v13.53: NOT re-raised any more. `raise be` here skipped blocks 107
+                # and 108 outright, so a shutdown wrote no result files and no
+                # bundle while the run record had already been stamped - the one
+                # case where the export matters most. The loop has already broken,
+                # so carrying on costs about a second and saves the results.
+                detected_stop_reason = "System Shutdown / Interruption"
+                log_probe_event("run stopped by SystemExit/KeyboardInterrupt - "
+                                "exporting what is already checked")
+                str_lit.error(f"⚠ Engine Stopped: {detected_stop_reason} - "
+                              f"writing the results that are already checked.")
             else:
-                be_str = str(be).lower()
-                if any(k in be_str for k in ["rerun", "stop", "scriptrunner", "websocket",
-                                             "closed", "connection lost"]):
-                    detected_stop_reason = "User Interruption: UI interaction"
+                _bn = type(be).__name__
+                if _bn in ("RerunException", "StopException", "ScriptStopped"):
+                    detected_stop_reason = "User Interruption: UI interaction (Streamlit rerun)"
+                    log_probe_event("run stopped by a Streamlit RerunException/StopException")
                 else:
-                    detected_stop_reason = f"Unexpected Error / Interruption: {be}"
+                    be_str = str(be).lower()
+                    if any(k in be_str for k in ["rerun", "stop", "scriptrunner", "websocket",
+                                                 "closed", "connection lost"]):
+                        detected_stop_reason = "User Interruption: UI interaction"
+                    else:
+                        detected_stop_reason = f"Unexpected Error / Interruption: {be}"
             runstate.note(detected_stop_reason)
         finally:
             # Restore the slider's own values so the sidebar does not report
@@ -6194,22 +6347,31 @@ else:
                         # host passed in. The old `for srv in imap_hosts:` loop re-ran
                         # that entire ladder once per host, so a 4-host domain could
                         # open 4x4 ladders and burn proxy credit before giving up.
-                        success_read, fetched_msgs = False, []
-                        msgs = read_mailbox_messages(acc_email, acc_pass, imap_hosts[0],
-                                                     proxy_str=mailbox_proxy,
-                                                     limit=max_msgs)
-                        if msgs and not any("Error reading mailbox" in m for m in msgs):
-                            fetched_msgs, success_read = msgs, True
-                        elif msgs:
-                            fetched_msgs = msgs
-                        if success_read:
-                            str_lit.success("Successfully retrieved recent messages "
-                                            "from mailbox!")
-                            for idx, m_content in enumerate(fetched_msgs, 1):
-                                str_lit.markdown(f"**Message {idx}:**")
-                                str_lit.code(m_content, language="text")
-                        else:
-                            str_lit.warning(f"Could not read mailbox: {fetched_msgs}")
+                        ok_read, fetched_msgs, note = read_mailbox_messages(
+                            acc_email, acc_pass, imap_hosts[0],
+                            proxy_str=mailbox_proxy, limit=max_msgs)
+                    if ok_read and fetched_msgs:
+                        str_lit.success(
+                            f"Retrieved {len(fetched_msgs)} recent message(s) from "
+                            f"{acc_email}. Tap a message to open its body.")
+                        # v13.53: one expander per message - the CLICK that was
+                        # missing. Only headers could ever appear, because the fetch
+                        # never asked the server for the body. Pre-open the first so
+                        # the behaviour is obvious on a phone.
+                        for idx, m in enumerate(fetched_msgs, 1):
+                            _subj = (m.get("subject") or "(no subject)").strip()
+                            _from = (m.get("from") or "(unknown sender)").strip()
+                            _label = "%d. %s - %s" % (idx, _subj[:70], _from[:40])
+                            with str_lit.expander(_label, expanded=(idx == 1)):
+                                str_lit.caption(f"From: {_from}  ·  Date: {m.get('date')}")
+                                str_lit.markdown(
+                                    "<div style='white-space:pre-wrap;"
+                                    "font-family:ui-monospace,monospace;font-size:12px'>"
+                                    + html.escape(m.get("body") or "(no readable body)")
+                                    + "</div>",
+                                    unsafe_allow_html=True)
+                    else:
+                        str_lit.warning(f"Could not read mailbox: {note or 'unknown reason'}")
 # @@END 109 IN_APP_READER
 
 # @@BLOCK 110 FOOTER deps=008,034
