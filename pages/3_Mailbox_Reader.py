@@ -140,6 +140,13 @@ except ImportError:
     def host_list(email: str) -> List[str]:
         domain = email.split("@")[-1].lower() if "@" in email else ""
         return [f"imap.{domain}"] if domain else ["imap.gmail.com"]
+
+# v13.52: body renderer. Optional - a failed import degrades to the plain
+# text_area, it must never blank the page.
+try:
+    import mailview
+except Exception:
+    mailview = None
 # @@END 002 HOSTS_IMPORT
 
 
