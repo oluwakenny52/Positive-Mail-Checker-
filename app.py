@@ -3227,8 +3227,15 @@ str_lit.sidebar.markdown("---")
 str_lit.sidebar.markdown("### 🎛 Advanced Control Rules")
 dynamic_worker_scaling = str_lit.sidebar.toggle(
     "⚡ Thread Auto-Scaling / Dynamic Workers", value=True, key="ui_dynamic_scaling",
-    help="Let the engine scale worker threads with live network conditions. Scaling only "
-         "ever RAISES the count above your Workers Start, never caps it.")
+    help="OFF = FIXED WORKERS. The run uses exactly your Workers Start for the "
+         "whole run, nothing changes it. This is the setting to use when you want "
+         "N accounts checked at once.\n\n"
+         "ON = the count is TUNED ONCE, before the first account: raised up to "
+         "2x for a queue over 500, and cut down to the queue length for a queue "
+         "under 20 (so a 5-line resume runs 5, not 12). It is not re-tuned while "
+         "the run is in progress.\n\n"
+         "Either way you must press 💾 Apply Settings - the engine reads the "
+         "applied config, not the slider.")
 max_hosts_per_domain = str_lit.sidebar.slider(
     "Max Hosts Per Domain", 1, 8, default_hosts, 1, key="ui_max_hosts",
     help="How many discovered IMAP hosts to try per account. 1 = primary host only. "
