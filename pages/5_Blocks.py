@@ -441,10 +441,27 @@ with st.expander("🛠 Canonicalise @@END names (no terminal needed)", expanded=
 # Behavioural companion to the frame scan. verify_blocks proves the @@BLOCK
 # frame; it cannot see whether a FIX is still in the code. These are the exact
 # strings the fix plan introduced, with the count each must appear at.
-# NB: three needles below point at THIS file, so each also matches its own
-# literal in this table - their want counts include that +1 self-reference.
-# ("importlib.reload(auth)" is NOT one of them: it also appears in block 004,
-# but its target is app.py, and the count is taken inside the target file.)
+#
+# v13.52 SELF-REFERENCE IS COMPUTED, NOT BAKED IN.  Three needles below point at
+# THIS file, so each one also matches its own literal in this table. The want
+# used to carry that +1 by hand, so editing this table silently moved the
+# expected count and the gate went red on a pure rename. They now sit in
+# _SELF_CHECKS with the CODE-only count, and run_fix_check() adds the 1 for the
+# literal at run time.
+#
+# v13.52 A FAIL NAMES ITS LINE.  "got 1 want 2" alone never said WHERE, so a
+# red gate could only be chased by eye. Every row now carries @line N of the
+# first hit. @line 0 = the string is gone entirely; @line with a number = it is
+# there but a second site was lost, or it is duplicated.
+#
+# v13.52 THE DNS/SMTP NEEDLE IS A STEM.  It used to be "DNS_FAILED, SMTP_FAILED):"
+# and block 100's retention gate gained `and st_val != CONNECTION_FAILED` in
+# v13.51, which dropped the colon and took the check red on a correct edit.
+# Both real sites still carry the stem, so the stem is what is counted.
+#
+# The order check is flattened on BOTH sides and uses index(), not rindex():
+# rindex() took the LAST occurrence of the first needle, so a second copy in a
+# comment decided the comparison and the real call site was never looked at.
 _FIX_CHECKS = (
     ("status.py", "_PROXY_BLOCKED", 2, "proxy-blocked classifies as CONNECTION_FAILED"),
     ("status.py", "best = None", 1, "worse_of no longer seeds with UNKNOWN"),
@@ -455,9 +472,6 @@ _FIX_CHECKS = (
     ("pages/3_Mailbox_Reader.py", "login_drop_count += 1", 1, "drop not double counted"),
     ("pages/4_Downloads.py", "template.format(**d)", 1, "delimiter honours spaced templates"),
     ("pages/4_Downloads.py", '_cut = raw.find("|", _colon + 1)', 1, "no pipe truncation"),
-    ("pages/5_Blocks.py", "out.insert(len(out) - 1, _end)", 3, "@@EOF stays last"),
-    ("pages/5_Blocks.py", "def run_fix_check():", 2, "one implementation, button and CLI"),
-    ("pages/5_Blocks.py", "if _CLI_FIX_CHECK:", 4, "CLI dispatch stays wired (000, 002, 011)"),
     ("engine.py", '_conf = getattr(_hosts, "conf", None)', 1, "engine reads hosts.conf"),
     ("engine.py", "state.cooldown_host(rung.host, 30.0)", 1, "cooldown table is armed"),
     ("engine.py", "def _local_to(domain, host):", 1, "pick_verdict checks locality"),
@@ -466,7 +480,7 @@ _FIX_CHECKS = (
     ("audit_frame.py", "TARGET_FILES as EXPECT_FILES", 1, "frame target is imported, not duplicated"),
     ("auth.py", "def require(", 1, "passkey gate exists"),
     ("auth.py", "def fit_css(", 1, "display fit exists"),
-    ("app.py", "DNS_FAILED, SMTP_FAILED):", 2, "DNS/SMTP verdicts retained"),
+    ("app.py", "DNS_FAILED, SMTP_FAILED)", 2, "DNS/SMTP verdicts retained"),
     ("auth.py", "_fit_reset", 2, "Display Fit reset flag survives"),
     ("app.py", 'str_lit.session_state["_fit_reset"] = True', 1,
      "Reset Defaults reaches Display Fit"),
@@ -501,6 +515,14 @@ _FIX_CHECKS = (
     ("pages/7_Logs.py", "Strict: only my own directory", 1, "strict mode refuses a shared dir"),
 )
 
+# Needles that point at THIS file. want is the CODE-only count; the literal in
+# this table is added at run time, so the number never has to be hand-edited.
+_SELF_CHECKS = (
+    ("pages/5_Blocks.py", "out.insert(len(out) - 1, _end)", 2, "@@EOF stays last"),
+    ("pages/5_Blocks.py", "def run_fix_check():", 1, "one implementation, button and CLI"),
+    ("pages/5_Blocks.py", "if _CLI_FIX_CHECK:", 3, "CLI dispatch stays wired (000, 002, 011)"),
+)
+
 # order matters in the verdict tail: a server answer must outrank retryable
 _ORDER_CHECKS = (
     ("app.py", 'if flags.get("saw_login_drop"):',
@@ -508,41 +530,75 @@ _ORDER_CHECKS = (
 )
 
 
+def _flat(s):
+    """Whitespace-free projection, so a wrapped or re-indented needle still matches."""
+    return "".join(str(s).split())
+
+
+def _read(path):
+    with open(os.path.join(ROOT, path), encoding="utf-8") as _fh:
+        return _fh.read()
+
+
+def _hit_line(path, needle):
+    """1-based line of the first hit, 0 when the string is gone entirely."""
+    try:
+        for _i, _ln in enumerate(_read(path).splitlines(), 1):
+            if needle in _ln:
+                return _i
+    except Exception:
+        pass
+    return 0
+
+
 def run_fix_check():
     """Run every fix check. Returns (rows, bad_count). No Streamlit calls, so the
     button and the CLI share one implementation."""
     _rows, _bad = [], 0
-    for _f, _needle, _want, _why in _FIX_CHECKS:
+
+    def _one(_f, _needle, _want, _why, _self=False):
+        nonlocal _bad
+        if _self:
+            _want += 1                      # the literal in the table above
         try:
-            with open(os.path.join(ROOT, _f), encoding="utf-8") as _fh:
-                _n = _fh.read().count(_needle)
+            _n = _read(_f).count(_needle)
         except Exception as _e:
             _rows.append("ERROR %-26s %r  (%s)" % (_f, _needle, _e))
             _bad += 1
-            continue
+            return
         _ok = (_n == _want)
-        _bad += 0 if _ok else 1
-        _rows.append("%s %-26s got %d want %d  %s  [%s]"
-                     % ("OK  " if _ok else "FAIL", _f, _n, _want, _needle, _why))
+        if not _ok:
+            _bad += 1
+        _rows.append("%s %-26s got %d want %d @line %d  %s  [%s]"
+                     % ("OK  " if _ok else "FAIL", _f, _n, _want,
+                        _hit_line(_f, _needle), _needle, _why))
+
+    for _f, _needle, _want, _why in _FIX_CHECKS:
+        _one(_f, _needle, _want, _why)
+    for _f, _needle, _want, _why in _SELF_CHECKS:
+        _one(_f, _needle, _want, _why, _self=True)
+
     for _f, _a, _b, _why in _ORDER_CHECKS:
         try:
-            with open(os.path.join(ROOT, _f), encoding="utf-8") as _fh:
-                _s = _fh.read()
-            _ok = (_a in _s) and (_b in _s) and (_s.rindex(_a) < _s.index(_b))
+            _fs = _flat(_read(_f))
+            _fa, _fb = _flat(_a), _flat(_b)
+            _ok = ((_fa in _fs) and (_fb in _fs)
+                   and (_fs.index(_fa) < _fs.index(_fb)))
         except Exception as _e:
             _rows.append("ERROR %-26s order check (%s)" % (_f, _e))
             _bad += 1
             continue
-        _bad += 0 if _ok else 1
-        _rows.append("%s %-26s order  [%s]"
-                     % ("OK  " if _ok else "FAIL", _f, _why))
+        if not _ok:
+            _bad += 1
+        _rows.append("%s %-26s order  [%s]" % ("OK  " if _ok else "FAIL", _f, _why))
     return _rows, _bad
 
 
 st.divider()
 with st.expander("🧪 Fix self-check (are the behavioural fixes still in?)", expanded=False):
     st.caption("Textual, like the gates: it proves the fix is still THERE, not that it "
-               "behaves. A FAIL means the fix was lost in an edit or a repair.")
+               "behaves. A FAIL names the line it came from - @line 0 means the "
+               "string is gone, a line number means a second site was lost.")
     if st.button("🧪 Run fix self-check", type="primary", key="fx_go"):
         _rows, _bad = run_fix_check()
         st.session_state["fx_out"] = "\n".join(_rows)
@@ -565,7 +621,9 @@ with st.expander("🧪 Fix self-check (are the behavioural fixes still in?)", ex
 # Exit 0 = every check OK, 1 = at least one check FAILED, 2 = could not run.
 if _CLI_FIX_CHECK:
     _rows, _bad = run_fix_check()
-    print("FIX-CHECK  pages/5_Blocks.py  (%d check(s))" % len(_rows))
+    _okn = sum(1 for _r in _rows if _r.startswith("OK"))
+    print("FIX-CHECK  pages/5_Blocks.py  (%d check(s): %d OK, %d FAIL/ERROR)"
+          % (len(_rows), _okn, _bad))
     for _r in _rows:
         print("  " + _r)
     if _bad:
