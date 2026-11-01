@@ -13,10 +13,6 @@ caller's fallback is only a last resort. The markup handed to the widget is also
 capped, because a 2 MB HTML body re-sanitised on every rerun is what segfaulted
 the container.
 
-BOTH render() and render_auto() are the v13.55 shape. A caller that guards on
-hasattr(mailview, "render_auto") can therefore never bind the body into the
-allow_remote slot on a stale copy.
-
 Nothing here raises: every public function swallows and the caller falls back to
 a text_area.
 """
