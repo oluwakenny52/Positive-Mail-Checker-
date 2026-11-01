@@ -348,12 +348,21 @@ def worker_contract(app, app_code):
     exactly(app_code, "current_workers = CFG[", 1,
             "current_workers is seeded from the slider exactly once")
     # _proxy_gate was the only gate created without the table lock.
+    #
+    # v13.53: the test was an exact match against a DERIVED view. code_view()
+    # either round-trips through ast.unparse (which re-emits every string with
+    # SINGLE quotes) or blanks string literals outright, so the double-quoted
+    # needle went red on a correct file no matter how the lock was written. The
+    # view is normalised here instead: quotes folded to double and all
+    # whitespace removed, so `STATE["host_gate_lock"]`, `STATE['host_gate_lock']`
+    # and `STATE[ "host_gate_lock" ]` all satisfy it.
     _pg = app_code.split("def _proxy_gate(", 1)
     if len(_pg) < 2:
         FAILS.append("MISSING: def _proxy_gate(")
     else:
         body = _pg[1].split("def _host_gate(", 1)[0]
-        if 'STATE["host_gate_lock"]' in body:
+        _flat_pg = "".join(body.split()).replace("'", '"')
+        if 'STATE["host_gate_lock"]' in _flat_pg:
             PASSES.append("_proxy_gate creates its gate under host_gate_lock")
         else:
             FAILS.append("_proxy_gate does NOT take host_gate_lock - two workers "
