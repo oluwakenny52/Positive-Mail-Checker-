@@ -471,7 +471,8 @@ st.markdown(
     % (_esc((_IDENT or "unknown")[:12]),
        _esc(os.path.basename(_RES_DIR)),
        "own directory" if _RES_IS_MINE else "NOT prefixed - may be shared"),
-    unsafe_allow_html=True)
+    unsafe_allow_html=True,
+)
 
 if strict and not _RES_IS_MINE:
     st.error(
@@ -497,9 +498,24 @@ else:
     st.caption("Showing your last run and your on-disk history. Nothing is truncated "
                "except the 2000-account report cap in app.py.")
 
+# v13.51: _as_text() builds the ENTIRE export - every log line, every trace,
+# every startup line, the whole action ledger - and st.download_button() was
+# handed the result on EVERY rerun, so every tap on this page re-serialised
+# megabytes before it could paint. The body is memoised on a cheap fingerprint;
+# the filter controls and the file list are part of it, so a change rebuilds.
+_lg_fp = (len(FILTERED_LOGS), len(FILTERED_REPORTS), len(STARTUP), len(FILES),
+          len(LIVE_REC.get("remaining") or []), search, order, bool(strict),
+          bool(hide_history), tuple(status_filter or ()),
+          bool(wrap), tuple(act_filter or ()), act_search,
+          len(audit_log.entries(limit=audit_log.MAX_LINES)))
+_lg_memo = st.session_state.get("_lg_export") or {}
+if _lg_memo.get("fp") != _lg_fp or not _lg_memo.get("text"):
+    _lg_memo = {"fp": _lg_fp, "text": _as_text()}
+    st.session_state["_lg_export"] = _lg_memo
+
 st.download_button(
     "⬇️ Download the whole filtered log as .txt",
-    data=_as_text().encode("utf-8"),
+    data=_lg_memo["text"].encode("utf-8"),
     file_name="full_log_%s.txt" % datetime.now().strftime("%Y%m%d_%H%M%S"),
     mime="text/plain", width="stretch")
 # @@END 009 SUMMARY
@@ -578,8 +594,26 @@ with _t_rec:
         st.markdown("**Your bucket files on disk**")
         if not FILES:
             st.caption("No stamped result files yet.")
+        # v13.51: every stamped file was read IN FULL on every rerun - twelve
+        # files per run, times every run, on each tap. Memoised on (mtime, size),
+        # so an unchanged file is not read twice and the list can grow.
+        _fcache = st.session_state.get("_lg_filecache")
+        if not isinstance(_fcache, dict):
+            _fcache = {}
+            st.session_state["_lg_filecache"] = _fcache
         for _p, _tag, _stamp in FILES:
-            _lines = _read_lines(_p)
+            try:
+                _stt = os.stat(_p)
+                _sig = (int(_stt.st_mtime_ns), _stt.st_size)
+            except Exception:
+                _sig = None
+            _hit = _fcache.get(_p)
+            if _sig is not None and _hit and _hit.get("sig") == _sig:
+                _lines = _hit["lines"]
+            else:
+                _lines = _read_lines(_p)
+                if _sig is not None:
+                    _fcache[_p] = {"sig": _sig, "lines": _lines}
             with st.expander("%s  ·  %s  ·  %d line(s)" % (_tag, _stamp, len(_lines)),
                              expanded=False):
                 st.download_button(
