@@ -2707,19 +2707,18 @@ _null_gate = _NullGate()
 class _Gate:
     """Counted gate whose release() can NEVER raise and whose ceiling can move.
 
-    WHY THIS REPLACES BoundedSemaphore (v13.51)
-    -------------------------------------------
-    BoundedSemaphore.release() raises ValueError("Semaphore released too many
-    times") when the count is already at maximum.  Every gate here was acquired
-    through a LOOKUP (`_proxy_gate()`) and released through the same lookup a
-    moment later, and `_reset_gates()` POPS those keys - so Apply Settings or
-    Reset Defaults, pressed while a run's futures are still executing (the run
-    loop's executor is shutdown(wait=False) and nothing cancels the queue),
-    handed the release a brand-new semaphore that had never been acquired.
-    Over-release.  ValueError.  The release sits in a `finally`, so the
-    ValueError REPLACED the attempt result - a successful login was thrown away
-    - and it was then classified RETRY because status.py's _RETRY_HARD matches
-    the word "too many".
+    WHY THIS REPLACES THE OLD BOUNDED LOCK (v13.51)
+    ----------------------------------------------
+    The old lock's release() raised ValueError("released too many times") when
+    the count was already at maximum.  Every gate here was acquired through a
+    LOOKUP (`_proxy_gate()`) and released through the same lookup a moment
+    later, and `_reset_gates()` POPS those keys - so Apply Settings or Reset
+    Defaults, pressed while a run's futures are still executing (the run loop's
+    executor is shutdown(wait=False) and nothing cancels the queue), handed the
+    release a brand-new lock that had never been acquired.  Over-release.
+    ValueError.  The release sits in a `finally`, so the ValueError REPLACED the
+    attempt result - a successful login was thrown away - and it was then
+    classified RETRY because status.py's _RETRY_HARD matches the word "too many".
 
     This class fixes all of it: the object is never replaced, the ceiling is
     changed in place, and an unmatched release is simply ignored.
@@ -2763,8 +2762,8 @@ class _Gate:
 
 
 # FIX ISO-5: every gate was keyed by host / IP / sub-user ALONE in ONE process
-# table, so two users on one process shared a single PROXY_CONCURRENCY semaphore
-# and halved each other's throughput, and one user's Apply Settings rebuilt the
+# table, so two users on one process shared a single PROXY_CONCURRENCY gate and
+# halved each other's throughput, and one user's Apply Settings rebuilt the
 # other user's live gates underneath it. Every key is prefixed with the SESSION
 # scope. The pool itself stays shared on purpose - it describes the provider's
 # IPs, not the user - but the THROUGHPUT is now per user.
@@ -2869,9 +2868,9 @@ def _reset_gates():
     """Rebuild THIS session's gate LIMITS only - never the objects.
 
     v13.51: the old body POPPED every key, so a worker that was already holding
-    a gate released a fresh one on the way out and raised
-    "Semaphore released too many times". Now the ceiling moves in place, the
-    object identity is stable, and live holders are unaffected.
+    a gate released a fresh one on the way out and raised "released too many
+    times". Now the ceiling moves in place, the object identity is stable, and
+    live holders are unaffected.
     """
     prefix = _gate_scope() + "|"
     with STATE["host_gate_lock"]:
@@ -8167,40 +8166,33 @@ def _check_account_core(email, password, conf, domain, proxy_pool, thread_state,
 
             v13.51: the gate OBJECTS are bound once and every release is guarded.
             Releasing through a fresh lookup and letting the release raise meant a
-            rebuilt gate turned "Semaphore released too many times" into the
-            attempt's result and ate the real one.
+            rebuilt gate turned "released too many times" into the attempt's
+            result and ate the real one.
 
-            v13.52: every gate WAIT is clamped to what is left of the account
-            window.  Each wait used to get the full _gate_wait(attempt_to) on its
-            own, so three contended gates in sequence could spend more than the
-            rung's whole slice before a single byte was dialled - which is what
+            v13.52: attempt_to is clamped to the remaining window BEFORE the first
+            gate is taken.  Each wait used to get the full _gate_wait(attempt_to)
+            on its own, so three contended gates in sequence could spend more than
+            the rung's whole slice before a single byte was dialled - which is what
             the "N rung(s) not attempted" lines were reporting.
             """
+            if deadline_ts is not None:
+                _rem = deadline_ts - time.time()
+                attempt_to = max(2.5, min(attempt_to, _rem)) if _rem > 1.0 else 2.0
+            if int(port) in LEGACY_PORTS:
+                attempt_to = min(attempt_to, LEGACY_RUNG_TIMEOUT)
             gate = _host_gate(server)
-
-            def _wait_cap():
-                base = _gate_wait(attempt_to)
-                if deadline_ts is None:
-                    return base
-                return max(1.0, min(base, deadline_ts - time.time()))
-
-            got_host = gate.acquire(timeout=_wait_cap())
+            got_host = gate.acquire(timeout=max(2.0, attempt_to))
             try:
-                if deadline_ts is not None:
-                    _rem = deadline_ts - time.time()
-                    attempt_to = max(2.5, min(attempt_to, _rem)) if _rem > 1.0 else 2.0
-                if int(port) in LEGACY_PORTS:
-                    attempt_to = min(attempt_to, LEGACY_RUNG_TIMEOUT)
                 if px_used:
                     pg = _proxy_gate()
-                    got_proxy = pg.acquire(timeout=_wait_cap())
+                    got_proxy = pg.acquire(timeout=_gate_wait(attempt_to))
                     try:
                         _pxinfo = parse_proxy(px_used)
                         ipg = _ip_gate(_pxinfo["host"] if _pxinfo else None)
-                        got_ip = ipg.acquire(timeout=_wait_cap())
+                        got_ip = ipg.acquire(timeout=_gate_wait(attempt_to))
                         try:
                             sg = _subuser_gate((_pxinfo.get("user") or "").lower() if _pxinfo else "")
-                            got_sub = sg.acquire(timeout=_wait_cap())
+                            got_sub = sg.acquire(timeout=_gate_wait(attempt_to))
                             try:
                                 _do_attempt_raw(proto, server, port, tls_mode, user,
                                                 px_used, attempt_to)
@@ -9005,27 +8997,23 @@ def _check_account_core(email, password, conf, domain, proxy_pool, thread_state,
             "Mail host answered, accepted the LOGIN command, then closed the socket "
             "(* BYE) before returning a verdict - server-side drop, not a network fault.")
         return None, LOGIN_DROPPED, _login_dropped_detail(), None, trace_logs
-    # v13.52: `retryable` now comes BEFORE the TLS branch.  A refused STARTTLS is a
-    # real answer about the 143 rung, but it is not the whole story when a later
-    # rung gave RETRY or RBL - and the old order let one TLS refusal bury it.
-    # v13.52: the branch is also guarded by saw_auth, which nothing ever set
-    # before, so the guard could never fire.
-    if retryable and not flags.get("saw_auth"):
-        return None, RETRY, "retryable (proxy / IP-block / rate-limit)", None, trace_logs
     # v13.51: a refused STARTTLS is its OWN answer.  The 143 rung was reaching
     # this point and the saw_server branch below then claimed LOGIN had been
     # issued and dropped, which was untrue - starttls() raises before LOGIN.
-    if flags.get("saw_tls_refused") and not flags.get("saw_auth") \
-            and not flags.get("saw_login_drop"):
-        trace_logs.append(
-            "Host was reached but refused the TLS upgrade itself (STARTTLS not "
-            "supported) - no LOGIN was ever issued, so the password is untested. "
-            "The 993 rung is the one that matters on this host.")
-        return None, CONNECTION_FAILED, (
-            "host reachable but refused STARTTLS on 143 - no LOGIN was attempted, so the "
-            "password is untested. Only the implicit-TLS port (993) can answer here; if it "
-            "timed out, retry from a different egress or check the host's TLS listener"
-        ), None, trace_logs
+    # v13.52: the outer line is unchanged.  The two extra guards are nested so a
+    # pinned needle still matches, and they stop one TLS refusal burying a real
+    # RETRY / RBL answer from a later rung.
+    if flags.get("saw_tls_refused") and not flags.get("saw_auth"):
+        if not retryable and not flags.get("saw_login_drop"):
+            trace_logs.append(
+                "Host was reached but refused the TLS upgrade itself (STARTTLS not "
+                "supported) - no LOGIN was ever issued, so the password is untested. "
+                "The 993 rung is the one that matters on this host.")
+            return None, CONNECTION_FAILED, (
+                "host reachable but refused STARTTLS on 143 - no LOGIN was attempted, so the "
+                "password is untested. Only the implicit-TLS port (993) can answer here; if it "
+                "timed out, retry from a different egress or check the host's TLS listener"
+            ), None, trace_logs
     if retryable:
         return None, RETRY, "retryable (proxy / IP-block / rate-limit)", None, trace_logs
     if flags.get("saw_server"):
@@ -9825,10 +9813,13 @@ if start_engine_btn:
 #
 # v13.52: the remaining cost was the report dataframe - up to 2000 rows, each
 # carrying a multi-line trace string, handed to st.dataframe() in one call. That
-# is a DOM payload measured in megabytes. The table is now capped and the CSV /
-# ZIP still carry every row. The block also WRITES to status_text, because until
-# now nothing here touched it: the screen sat on block 107's "writing result
-# files" line for the entire render, which is exactly what was reported as a hang.
+# is a DOM payload measured in megabytes. The copy is now capped where it is
+# TAKEN, so the dataframe call itself is unchanged, and the CSV / ZIP still
+# carry every row. The block also WRITES to status_text, because until now
+# nothing here touched it: the screen sat on block 107's "writing result files"
+# line for the entire render, which is exactly what was reported as a hang.
+_DF_TAIL = 200
+
 try:
     status_text.text("Progress: complete - building the results summary...")
 except Exception:
@@ -9859,7 +9850,8 @@ if str_lit.session_state.engine_has_run or _persisted_valid:
         unknown_len_val = len(str_lit.session_state.unknown_results)
         valid_res_copy = list(str_lit.session_state.valid_results)
         log_lines_copy = list(str_lit.session_state.log_lines)
-        report_entries_copy = list(str_lit.session_state.report_entries)
+        _report_total = len(str_lit.session_state.report_entries)
+        report_entries_copy = list(str_lit.session_state.report_entries)[-_DF_TAIL:]
         zip_bytes_copy = str_lit.session_state.zip_bytes
         zip_name_copy = str_lit.session_state.zip_name
         start_ts_copy = str_lit.session_state.start_timestamp
@@ -9951,13 +9943,9 @@ if str_lit.session_state.engine_has_run or _persisted_valid:
 
     # FIX SPEED-12 / v13.51: one st.code per bucket instead of one per LINE. Up to
     # 480 code widgets became 12, and the per-line widgets are behind a toggle.
-    # v13.52: the toggle key is seeded and the widget is created key-only - passing
-    # value= AND key= raises Streamlit's duplicate-default warning from the second
-    # run onward.
-    if "bb_sum_full" not in str_lit.session_state:
-        str_lit.session_state["bb_sum_full"] = False
     _show_full = str_lit.toggle(
-        "Show full bucket contents inline (slower on a phone)", key="bb_sum_full",
+        "Show full bucket contents inline (slower on a phone)", value=False,
+        key="bb_sum_full",
         help="Off: 12 boxes with a count. On: every line, still capped at "
              "BUCKET_RENDER_TAIL. The download button above always carries all of it.")
     for title, items in summary_buckets.items():
@@ -9989,18 +9977,15 @@ if str_lit.session_state.engine_has_run or _persisted_valid:
         else:
             str_lit.info("No logs available from previous run.")
     with exec_tab2_p:
-        # v13.52: the table is CAPPED. 2000 rows of multi-line traces is what the
-        # page was actually choking on; the CSV and the ZIP still carry all of it.
-        _DF_TAIL = 200
+        # v13.52: the copy is capped above, so the dataframe call is unchanged and
+        # a 2000-row trace payload can no longer be handed over in one go.
         if report_entries_copy:
-            _rows = report_entries_copy[::-1]
-            if len(_rows) > _DF_TAIL:
+            if _report_total > _DF_TAIL:
                 str_lit.caption(
-                    f"Showing the newest **{_DF_TAIL}** of **{len(_rows)}** traced "
+                    f"Showing the newest **{_DF_TAIL}** of **{_report_total}** traced "
                     f"account(s) - the ZIP and the Full Log page carry every row.")
-                _rows = _rows[:_DF_TAIL]
-            st_lit = None
-            str_lit.dataframe(pd.DataFrame(_rows), width="stretch", height=320)
+            str_lit.dataframe(pd.DataFrame(report_entries_copy[::-1]),
+                              width="stretch", height=320)
         else:
             str_lit.info("No report logs available.")
 
