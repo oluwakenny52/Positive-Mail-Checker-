@@ -10316,6 +10316,9 @@ else:
             # for the body. Pre-open the first so it is obvious on a phone.
             # v13.54: mailview renders the real message - text or HTML, cid: inline
             # images embedded, attachments listed.
+            # v13.55: the guard is render_auto, which only exists in v13.55, and
+            # every argument is named, so a stale mailview can never bind the body
+            # into allow_remote and raise TypeError.
             for idx, m in enumerate(_r_msgs, 1):
                 _subj = (m.get("subject") or "(no subject)").strip()
                 _from = (m.get("from") or "(unknown sender)").strip()
@@ -10323,15 +10326,18 @@ else:
                 with str_lit.expander(_label, expanded=(idx == 1)):
                     str_lit.caption(f"From: {_from}  ·  Date: {m.get('date')}")
                     _mv_key = "bbbody_%d" % idx
-                    if mailview is not None and hasattr(mailview, "render"):
-                        mailview.render(str_lit, m.get("raw") or b"", _mv_key,
-                                        m.get("body") or "(no readable body)",
+                    _mv_body = m.get("body") or "(no readable body)"
+                    if mailview is not None and hasattr(mailview, "render_auto"):
+                        mailview.render(str_lit,
+                                        raw=m.get("raw") or b"",
+                                        key=_mv_key,
+                                        fallback=_mv_body,
                                         allow_remote=allow_remote)
                     else:
                         str_lit.markdown(
                             "<div style='white-space:pre-wrap;"
                             "font-family:ui-monospace,monospace;font-size:12px'>"
-                            + html.escape(m.get("body") or "(no readable body)")
+                            + html.escape(_mv_body)
                             + "</div>",
                             unsafe_allow_html=True)
 # @@END 109 IN_APP_READER
