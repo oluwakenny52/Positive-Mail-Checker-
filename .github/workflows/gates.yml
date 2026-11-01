@@ -90,6 +90,31 @@ jobs:
         if: always()
         run: python3 test_resume_io.py
 
+      - name: 14. app block count
+        id: g14
+        if: always()
+        run: test "$(grep -c '^# @@BLOCK ' app.py)" -eq 111
+
+      - name: 15. app end marker count
+        id: g15
+        if: always()
+        run: test "$(grep -c '^# @@END ' app.py)" -eq 111
+
+      - name: 16. app eof sentinel
+        id: g16
+        if: always()
+        run: test "$(tail -n 1 app.py)" = "# @@EOF"
+
+      - name: 17. no read_timeout
+        id: g17
+        if: always()
+        run: "! grep -n 'read_timeout' app.py"
+
+      - name: 18. no conflict markers
+        id: g18
+        if: always()
+        run: "! grep -rn '^<<<<<<< ' --include='*.py' --exclude-dir=.git ."
+
       - name: Summary
         if: always()
         env:
@@ -106,6 +131,11 @@ jobs:
           R11: ${{ steps.g11.outcome }}
           R12: ${{ steps.g12.outcome }}
           R13: ${{ steps.g13.outcome }}
+          R14: ${{ steps.g14.outcome }}
+          R15: ${{ steps.g15.outcome }}
+          R16: ${{ steps.g16.outcome }}
+          R17: ${{ steps.g17.outcome }}
+          R18: ${{ steps.g18.outcome }}
         run: |
           fail=0
           {
@@ -113,12 +143,12 @@ jobs:
             echo ""
             echo "| gate | result |"
             echo "| --- | --- |"
-            for pair in "fix_end_names.py --check:$R1" "verify_blocks.py:$R2" "audit_frame.py:$R3" "verify_v1337.py:$R4" "test_verdicts.py:$R5" "engine.py --selftest:$R6" "status.py --selftest:$R7" "auth.py --selftest:$R8" "compileall -q .:$R9" "pip install -r requirements.txt:$R10" "pages/5_Blocks.py --fix-check:$R11" "runstate.py --selftest:$R12" "test_resume_io.py:$R13"; do
+            for pair in "fix_end_names.py --check:$R1" "verify_blocks.py:$R2" "audit_frame.py:$R3" "verify_v1337.py:$R4" "test_verdicts.py:$R5" "engine.py --selftest:$R6" "status.py --selftest:$R7" "auth.py --selftest:$R8" "compileall -q .:$R9" "pip install -r requirements.txt:$R10" "pages/5_Blocks.py --fix-check:$R11" "runstate.py --selftest:$R12" "test_resume_io.py:$R13" "app block count 111:$R14" "app end markers 111:$R15" "app eof sentinel:$R16" "no read_timeout:$R17" "no conflict markers:$R18"; do
               g="${pair%%:*}"; r="${pair##*:}"
               if [ "$r" = "success" ]; then echo "| \`$g\` | PASS |"; else echo "| \`$g\` | FAIL |"; fi
               if [ "$r" != "success" ]; then fail=1; fi
             done
             echo ""
-            if [ "$fail" -eq 0 ]; then echo "**All thirteen gates green.**"; else echo "**A gate is RED - do not ship.**"; fi
+            if [ "$fail" -eq 0 ]; then echo "**All eighteen gates green.**"; else echo "**A gate is RED - do not ship.**"; fi
           } >> "$GITHUB_STEP_SUMMARY"
           exit $fail
