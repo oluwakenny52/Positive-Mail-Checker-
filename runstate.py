@@ -1,4 +1,4 @@
-"""runstate.py - unfinished-run watchdog  (v13.47)
+"""runstate.py - unfinished-run watchdog  (v13.48)
 ================================================
 The run loop lives in app.py block 106. A Streamlit rerun (tab backgrounded,
 WebSocket drop, phone lock, redeploy) tears the script down and the loop never
