@@ -2828,11 +2828,12 @@ def _limit(cfg_key, default):
 def _proxy_gate():
     """Global cap on simultaneous proxy tunnels - PER SESSION.
 
-    v13.53: the gate is created under host_gate_lock like the other three.
-    _host_gate / _ip_gate / _subuser_gate all take that lock; this one did not,
-    so two workers starting at the same instant could each build a gate for the
-    same scope, one was stored and the other was handed to the caller - and the
-    global PROXY_CONCURRENCY ceiling briefly doubled, the opposite of the point.
+    v13.53: the gate is created under STATE["host_gate_lock"] like the other
+    three. _host_gate / _ip_gate / _subuser_gate all take that lock; this one
+    did not, so two workers starting at the same instant could each build a gate
+    for the same scope, one was stored and the other was handed to the caller -
+    and the global PROXY_CONCURRENCY ceiling briefly doubled, the opposite of
+    what the gate exists for.
     """
     with STATE["host_gate_lock"]:
         return _make_gate(_gate_table("proxy_gates"), _gate_scope(),
