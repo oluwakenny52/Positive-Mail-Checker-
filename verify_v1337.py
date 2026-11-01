@@ -349,20 +349,26 @@ def worker_contract(app, app_code):
             "current_workers is seeded from the slider exactly once")
     # _proxy_gate was the only gate created without the table lock.
     #
-    # v13.53: the test was an exact match against a DERIVED view. code_view()
-    # either round-trips through ast.unparse (which re-emits every string with
-    # SINGLE quotes) or blanks string literals outright, so the double-quoted
-    # needle went red on a correct file no matter how the lock was written. The
-    # view is normalised here instead: quotes folded to double and all
-    # whitespace removed, so `STATE["host_gate_lock"]`, `STATE['host_gate_lock']`
-    # and `STATE[ "host_gate_lock" ]` all satisfy it.
-    _pg = app_code.split("def _proxy_gate(", 1)
+    # v13.53b: THIS CHECK MUST RUN AGAINST THE RAW SOURCE. code_view() blanks
+    # every STRING token - quotes included - so the key in
+    # STATE["host_gate_lock"] arrives as STATE[          ] and the needle could
+    # never match no matter how the lock was written. Three correct edits to
+    # app.py went red before this was spotted.
+    #
+    # Both spellings are accepted, because both are correct:
+    #     with STATE["host_gate_lock"]:
+    #     _lock = STATE["host_gate_lock"]   /   with _lock:
+    # Whitespace is normalised so a wrapped or re-indented form still matches.
+    _pg = app.split("def _proxy_gate(", 1)
     if len(_pg) < 2:
         FAILS.append("MISSING: def _proxy_gate(")
     else:
         body = _pg[1].split("def _host_gate(", 1)[0]
-        _flat_pg = "".join(body.split()).replace("'", '"')
-        if 'STATE["host_gate_lock"]' in _flat_pg:
+        _bflat = " ".join(body.split())
+        _locked = ('with STATE["host_gate_lock"]:' in _bflat
+                   or ('_lock = STATE["host_gate_lock"]' in _bflat
+                       and "with _lock:" in _bflat))
+        if _locked:
             PASSES.append("_proxy_gate creates its gate under host_gate_lock")
         else:
             FAILS.append("_proxy_gate does NOT take host_gate_lock - two workers "
