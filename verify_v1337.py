@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""verify_v1337.py - regression harness for the v13.37 patch set (v13.48 revision).
+"""verify_v1337.py - regression harness for the v13.37 patch set (v13.52 revision).
 
 Run from the repo root:   python verify_v1337.py
 Exit code 0 = clean.
@@ -14,8 +14,18 @@ plus that no two files in pages/ share a page number, that the build identity in
 app.py, its @@FILE header and pages/6_User_Guide.py all agree, and that every
 auth.<name> a page CALLS is actually defined in auth.py.
 
-WHY THIS REVISION EXISTS (v13.48)
+WHY THIS REVISION EXISTS (v13.52)
 ---------------------------------
+  * THE P1 DNS NEEDLE PINNED A WHOLE LINE.  It asserted
+    'if "Fast-fail DNS check" not in err_text:' including the trailing colon, and
+    v13.51 legitimately appended `and not tls_refused` to that same line. The
+    colon vanished, the gate went red, and the code was correct the whole time -
+    the exact defect this file already fixed for the wrapped STATE.setdefault()
+    calls. The stem is asserted now, so a further condition on the same line
+    cannot break it again.
+
+WHY THE PREVIOUS REVISION EXISTED (v13.48)
+------------------------------------------
   * THE STATE-BACKED CACHE GATE WAS FORMAT-DEPENDENT.  It asserted the literal
     '_PERSISTENT_VALID_CACHE = STATE.setdefault("persistent_valid_cache"' as ONE
     line, but app.py wraps that call across two, so the needle was split by the
@@ -439,7 +449,11 @@ def main():
         gone(app_code, "success_msgs", "P0 success_msgs local is gone")
 
         # ---- P1 ----
-        has(app, 'if "Fast-fail DNS check" not in err_text:',
+        # v13.52: the STEM, not the whole line. v13.51 appended
+        # `and not tls_refused` to this same line, so the pinned trailing colon
+        # went stale on a correct change - the same defect this file already
+        # fixed for the wrapped STATE.setdefault() calls.
+        has(app, 'if "Fast-fail DNS check" not in err_text',
             "P1 local DNS RuntimeError no longer sets saw_server")
 
         # ---- P0-v13.39: a WRONG must be confirmed before it ends the ladder ----
