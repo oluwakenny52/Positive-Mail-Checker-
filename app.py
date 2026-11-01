@@ -10259,6 +10259,12 @@ else:
             help="Inline cid: images are always shown - they are embedded in the message. "
                  "This switch is only about images hosted on the sender's server.")
 
+        # v13.56: which mailview is actually deployed. Silent on v13.55+.
+        _mv_ver = getattr(mailview, "__version__", "unknown") if mailview else "missing"
+        if mailview is not None and _mv_ver != "v13.55":
+            str_lit.caption(f"body renderer: mailview.py {_mv_ver} - update it to v13.55 "
+                            f"to get the memory cap and attachment previews.")
+
         if str_lit.button("📖 Read Inbox Messages"):
             if selected_combo:
                 acc_email, acc_pass = selected_combo.split(":", 1)
@@ -10315,10 +10321,12 @@ else:
             # headers could ever appear, because the fetch never asked the server
             # for the body. Pre-open the first so it is obvious on a phone.
             # v13.54: mailview renders the real message - text or HTML, cid: inline
-            # images embedded, attachments listed.
-            # v13.55: the guard is render_auto, which only exists in v13.55, and
-            # every argument is named, so a stale mailview can never bind the body
-            # into allow_remote and raise TypeError.
+            # images embedded.
+            # v13.56: SIGNATURE-PROOF. Three positional args plus allow_remote= is
+            # valid on BOTH the v13.54 render(st, raw, key, allow_remote) and the
+            # v13.55 render(st, raw, key, fallback, allow_remote), and the body is
+            # seeded here so the text box fills either way. A TypeError from any
+            # future mismatch degrades to a plain text area instead of a red page.
             for idx, m in enumerate(_r_msgs, 1):
                 _subj = (m.get("subject") or "(no subject)").strip()
                 _from = (m.get("from") or "(unknown sender)").strip()
@@ -10327,12 +10335,15 @@ else:
                     str_lit.caption(f"From: {_from}  ·  Date: {m.get('date')}")
                     _mv_key = "bbbody_%d" % idx
                     _mv_body = m.get("body") or "(no readable body)"
-                    if mailview is not None and hasattr(mailview, "render_auto"):
-                        mailview.render(str_lit,
-                                        raw=m.get("raw") or b"",
-                                        key=_mv_key,
-                                        fallback=_mv_body,
-                                        allow_remote=allow_remote)
+                    if _mv_key not in str_lit.session_state:
+                        str_lit.session_state[_mv_key] = _mv_body
+                    if mailview is not None and hasattr(mailview, "render"):
+                        try:
+                            mailview.render(str_lit, m.get("raw") or b"", _mv_key,
+                                            allow_remote=allow_remote)
+                        except TypeError as _mv_err:
+                            str_lit.caption(f"renderer mismatch ({_mv_err}) - plain text shown")
+                            str_lit.text_area("Message Body", height=180, key=_mv_key)
                     else:
                         str_lit.markdown(
                             "<div style='white-space:pre-wrap;"
