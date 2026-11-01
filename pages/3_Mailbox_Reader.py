@@ -3314,6 +3314,22 @@ def _reader_reload_page(page_no, folders, mode, page_size, sort_order, log_targe
     st.rerun()
 
 
+# v13.52: one switch for the whole page. Off = no pixel ever calls home, which
+# is what you want while triaging someone else's mailbox.
+if "mv_remote" not in st.session_state:
+    st.session_state["mv_remote"] = False
+_mv_remote = st.checkbox(
+    "Load remote images in HTML view (tracking pixels fire)", key="mv_remote",
+    help="Inline cid: images are always shown - they are embedded in the message "
+         "itself. This switch is only about images hosted on the sender's server.")
+
+
+def _mv_mail():
+    """Open mailbox for mailview's on-demand full fetch."""
+    return get_active_mail(active_email, active_password,
+                           resolve_active_host(active_email))
+
+
 # Main Message Stream
 _bot_mode = bool(st.session_state.bot_filter_mode)
 if _bot_mode:
@@ -3378,10 +3394,17 @@ if len(active_msgs) > 0 or total_msgs > 0:
                 # every rerun raised "created with a default value but also had its
                 # value set via the Session State API". Seeded instead - the key
                 # still keeps an edit alive across a rerun.
+                # v13.52: mailview renders the real message (text or HTML, inline
+                # cid: images embedded, attachments listed) and falls back to this
+                # same seeded text box when it cannot.
                 _body_key = f"body_{msg['folder']}_{msg['id']}_{idx}"
                 if _body_key not in st.session_state:
                     st.session_state[_body_key] = msg["body"]
-                st.text_area("Cleaned Message Body", height=150, key=_body_key)
+                if mailview is not None and hasattr(mailview, "render_auto"):
+                    mailview.render_auto(st, msg, _body_key, _mv_mail,
+                                         allow_remote=_mv_remote)
+                else:
+                    st.text_area("Cleaned Message Body", height=150, key=_body_key)
 
                 op_col1, op_col2, op_col3, op_col4 = st.columns(4)
                 host = resolve_active_host(active_email)
@@ -3586,10 +3609,17 @@ with st.expander("🔑 Standalone OTP, Debit/Credit Cards & Sensitive Data Scann
                 # v13.40: both branches were msg["body"], so the toggle did nothing.
                 display_body = msg["body"] if otp_auto_clean_toggle else msg.get("body_raw", msg["body"])
                 # FIX W-2: seeded, not value= + key=.
+                # v13.52: mailview renders the real message and falls back to this
+                # same seeded box. Its text fallback shows the RAW body, matching
+                # the toggle, because the renderer reads the untouched source.
                 _ob_key = f"otp_b_{msg['folder']}_{msg['id']}_{idx}"
                 if _ob_key not in st.session_state:
                     st.session_state[_ob_key] = display_body
-                st.text_area("Message Payload Body", height=150, key=_ob_key)
+                if mailview is not None and hasattr(mailview, "render_auto"):
+                    mailview.render_auto(st, msg, _ob_key, _mv_mail,
+                                         allow_remote=st.session_state.get("mv_remote", False))
+                else:
+                    st.text_area("Message Payload Body", height=150, key=_ob_key)
 
                 o_col1, o_col2, o_col3, o_col4 = st.columns(4)
                 host = resolve_active_host(active_email)
@@ -3757,10 +3787,15 @@ with st.expander("🔍 Deep Keyword Search & Scope Filters", expanded=False):
 
                 st.markdown("---")
                 # FIX W-2: seeded, not value= + key=.
+                # v13.52: mailview renders the real message, falling back here.
                 _sb_key = f"s_body_{msg['folder']}_{msg['id']}_{idx}"
                 if _sb_key not in st.session_state:
                     st.session_state[_sb_key] = msg["body"]
-                st.text_area("Cleaned Message Body", height=150, key=_sb_key)
+                if mailview is not None and hasattr(mailview, "render_auto"):
+                    mailview.render_auto(st, msg, _sb_key, _mv_mail,
+                                         allow_remote=st.session_state.get("mv_remote", False))
+                else:
+                    st.text_area("Cleaned Message Body", height=150, key=_sb_key)
 
                 s_op1, s_op2, s_op3, s_op4 = st.columns(4)
                 host = resolve_active_host(active_email)
