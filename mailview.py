@@ -4,8 +4,8 @@ Plain module, NOT frame-gated - same status as runstate.py. Adds no block, moves
 no TARGET_BLOCKS, renumbers nothing.
 
 Renders a message as text or as real HTML. cid: inline images are resolved from
-the message itself and embedded as data: URIs, so they display without a mailbox
-round trip and without a browser ever seeing a cid: it cannot resolve.
+the message itself and embedded as data: URIs, so they display without a second
+mailbox round trip and without a browser ever seeing a cid: it cannot resolve.
 
 Nothing here raises: every public function swallows and the caller falls back to
 a text_area.
@@ -17,6 +17,7 @@ import re
 _MAX_PART = 4 * 1024 * 1024        # one inline image
 _MAX_TOTAL = 24 * 1024 * 1024      # all inline images of one message
 _MAX_RAW = 6 * 1024 * 1024         # one whole message
+_TRUNC_HINT = 256000               # stored copy at/over this is probably cut
 
 _CID_RX = re.compile(r"cid:([^\"')\s>]+)", re.I)
 _DROP = ("script", "iframe", "object", "embed", "form", "link", "meta", "base")
@@ -145,31 +146,78 @@ def full_raw(mail, uid, cap=_MAX_RAW):
         return b""
 
 
-def render(st, mail, uid, fallback_text, key, allow_remote=False, raw=None):
-    """Text/HTML switch for one message. Always leaves a body on screen."""
+def _seed(st, key, fallback):
     try:
-        mode = st.radio("View", ["Text", "HTML"], horizontal=True, key="mv_" + key)
+        if key not in st.session_state:
+            st.session_state[key] = fallback
     except Exception:
-        mode = "Text"
+        pass
 
-    if mode == "HTML":
+
+def _mode(st, key):
+    try:
+        return st.radio("View", ["Text", "HTML"], horizontal=True, key="mv_" + key)
+    except Exception:
+        return "Text"
+
+
+def _paint(st, raw, key, allow_remote):
+    """Render the HTML. True when something was drawn."""
+    _text, markup = split_message(raw)
+    if not markup:
+        return False
+    shell = _SHELL % sanitize(markup, inline_images(raw), allow_remote)
+    try:
+        st.html(shell)
+    except Exception:
+        import streamlit.components.v1 as components
+        components.html(shell, height=620, scrolling=True)
+    _render_attachments(st, raw, key)
+    return True
+
+
+def _text_area(st, key):
+    try:
+        st.text_area("Message Body", height=180, key=key)
+    except Exception:
+        pass
+
+
+def render(st, raw, key, allow_remote=False):
+    """Text/HTML switch from an already-complete raw message."""
+    _seed(st, key, "")
+    if _mode(st, key) == "HTML":
         try:
-            blob = raw if raw else full_raw(mail, uid)
-            text, markup = split_message(blob)
-            if markup:
-                doc = sanitize(markup, inline_images(blob), allow_remote)
-                shell = _SHELL % doc
-                try:
-                    st.html(shell)
-                except Exception:
-                    import streamlit.components.v1 as components
-                    components.html(shell, height=620, scrolling=True)
-                _render_attachments(st, blob, key)
+            if _paint(st, raw, key, allow_remote):
                 return
         except Exception:
             pass
+    _text_area(st, key)
 
-    st.text_area("Message Body", value=fallback_text, height=180, key="ta_" + key)
+
+def render_auto(st, msg, key, mail_getter, allow_remote=False):
+    """Same, but re-fetches when the stored copy is cut or carries cid: images.
+
+    `mail_getter` is a zero-arg callable returning an open mailbox. It is only
+    called for messages that actually need it, and a failure is swallowed.
+    """
+    _seed(st, key, msg.get("body", ""))
+    if _mode(st, key) == "HTML":
+        raw = msg.get("raw") or b""
+        _text, markup = split_message(raw)
+        if len(raw) >= _TRUNC_HINT or "cid:" in markup:
+            try:
+                full = full_raw(mail_getter(), msg.get("id"))
+                if full:
+                    raw = full
+            except Exception:
+                pass
+        try:
+            if _paint(st, raw, key, allow_remote):
+                return
+        except Exception:
+            pass
+    _text_area(st, key)
 
 
 def _render_attachments(st, raw, key):
