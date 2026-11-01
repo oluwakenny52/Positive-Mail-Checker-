@@ -631,7 +631,7 @@ def main():
             gone(app_code, dead, "dead code removed: " + dead)
         gone(app, 'STATE["tunnel_cache"]', "dead tunnel_cache state key removed")
         # v13.53: MAX_WORKERS_MAX was published and read by nothing.
-        gone(app_code, '"MAX_WORKERS_MAX"', "dead MAX_WORKERS_MAX config key removed")
+        gone(app_code, "MAX_WORKERS_MAX", "dead MAX_WORKERS_MAX config key removed")
 
         # ---- kept on purpose ----
         has(app, "PROVIDER_MAP = {", "PROVIDER_MAP kept as the hosts.py fallback")
