@@ -2,11 +2,17 @@ name: frame-gates
 
 on:
   push:
+  pull_request:
   workflow_dispatch:
 
+permissions:
+  contents: read
+
+# v13.51: no cancel-in-progress on push. A rapid second push CANCELLED the first
+# gate run, so a red commit could be masked by the next one.
 concurrency:
-  group: frame-gates-${{ github.ref }}
-  cancel-in-progress: true
+  group: frame-gates-${{ github.ref }}-${{ github.event_name }}
+  cancel-in-progress: false
 
 jobs:
   gates:
