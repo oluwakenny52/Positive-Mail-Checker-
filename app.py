@@ -3586,12 +3586,39 @@ def _remember_scheme(proxy_str, ptype):
         _proxy_scheme[proxy_str] = ptype
 
 
+# ---------------------------------------------------------------------------
+# v13.54 GEO FIX
+# ---------------------------------------------------------------------------
+# GEO_MAX_WAIT bounds one reservation so a queued caller cannot be parked for
+# ever, and the sleep below equals the wait so the reservation and the real gap
+# agree. GEO_TRIES_MAX stops a node that will never answer from being re-asked
+# on every single cycle.
+GEO_MAX_WAIT = 6.0
+GEO_TRIES_MAX = 3
+_GEO_TRIES = STATE.setdefault("geo_tries", {})
+
+
 def geo_lookup(ip):
     """Country/region for an IP.
 
-    The throttle RESERVES its slot under the lock and sleeps OUTSIDE it, and the
-    reservation is PAID - the sleep equals the gap.  A capped sleep let the
-    reservation grow without bound against ip-api's 45/min tier.
+    THREE DEFECTS FIXED HERE.
+
+    1. The throttle reserved the full interval but slept `min(wait, 3.0)`, so
+       the timestamp ran ahead of the real gap and a batch outran ip-api's
+       45/min tier - every lookup after the first few came back 429. The
+       reservation is bounded by GEO_MAX_WAIT and the sleep now equals it.
+    2. A 429 or a transient network error poisoned the IP for GEO_FAIL_TTL
+       (300s) across every session, because _GEO_FAIL is STATE-backed. A 429 is
+       now retried once inside the same call and only a real, repeated failure
+       is cached.
+    3. ip-api answers status=fail with "private range" / "reserved range" for
+       addresses that will never have geo. Those are a real answer, so they are
+       cached instead of being asked again for ever.
+
+    Returns ("Unknown", "Unknown") on failure, exactly as before, so every
+    existing caller keeps working unchanged. Whether an Unknown is allowed to
+    overwrite a known country is enrich_proxy_geo()'s decision, not this
+    function's.
     """
     if not ip or ip == "Unknown":
         return ("Unknown", "Unknown")
@@ -3603,28 +3630,54 @@ def geo_lookup(ip):
         failed = _GEO_FAIL.get(ip)
         if failed and (now - failed) < GEO_FAIL_TTL:
             return ("Unknown", "Unknown")
-        wait = max(0.0, _geo_last_call["ts"] + GEO_MIN_INTERVAL - now)
+        reserve = max(float(_geo_last_call.get("ts", 0.0)), now) + GEO_MIN_INTERVAL
+        wait = reserve - now
+        if wait < 0.0:
+            wait = 0.0
+        if wait > GEO_MAX_WAIT:
+            wait = GEO_MAX_WAIT
         _geo_last_call["ts"] = now + wait
-    if wait > 0:
-        time.sleep(min(wait, 3.0))
+    if wait > 0.0:
+        time.sleep(wait)
 
-    country, region, ok = "Unknown", "Unknown", False
-    try:
-        if requests is not None:
-            r = requests.get(f"http://ip-api.com/json/{ip}?fields=status,country,regionName",
-                             timeout=3)
-            if r.status_code == 200:
-                data = r.json()
-                if data.get("status") == "success":
-                    country = data.get("country") or "Unknown"
-                    region = data.get("regionName") or "Unknown"
-                    ok = True
-    except Exception:
-        ok = False
+    country, region = "Unknown", "Unknown"
+    ok = False
+    permanent = False
+    attempt = 0
+    while attempt < 2 and not ok:
+        attempt += 1
+        if requests is None:
+            break
+        try:
+            r = requests.get(
+                f"http://ip-api.com/json/{ip}?fields=status,country,regionName,message",
+                timeout=4)
+            if r.status_code == 429:
+                if attempt < 2:
+                    time.sleep(1.2)
+                continue
+            if r.status_code != 200:
+                break
+            data = r.json() or {}
+            if data.get("status") == "success":
+                country = data.get("country") or "Unknown"
+                region = data.get("regionName") or "Unknown"
+                ok = True
+                break
+            msg = str(data.get("message") or "").lower()
+            if "private" in msg or "reserved" in msg or "invalid" in msg:
+                permanent = True
+            break
+        except Exception:
+            if attempt < 2:
+                time.sleep(0.6)
 
     with _GEO_LOCK:
         if ok:
             _GEO_CACHE[ip] = (country, region)
+            _GEO_FAIL.pop(ip, None)
+        elif permanent:
+            _GEO_CACHE[ip] = ("Unknown", "Unknown")
             _GEO_FAIL.pop(ip, None)
         else:
             _GEO_FAIL[ip] = time.time()
@@ -3736,13 +3789,30 @@ def tld_country(domain):
 
 
 def enrich_proxy_geo(proxies, max_workers=8):
+    """Fill country/region for nodes that do not have a usable answer.
+
+    IT NEVER DOWNGRADES NOW. The old code assigned the lookup result
+    unconditionally, so a single failed lookup replaced a good country with
+    "Unknown". The node then matched its own "country is Unknown" retry filter,
+    failed again and was overwritten again - which is why only the first user in
+    a batch ever kept a country and every user after showed Unknown.
+
+    A known country is only ever replaced by another known country, a region is
+    only written when it is real, and a node that keeps failing gives up after
+    GEO_TRIES_MAX cycles instead of being asked for ever.
+    """
     todo = []
-    for p in proxies:
-        meta = proxy_meta.get(p)
-        if not meta or not meta.get("country") or meta.get("country") == "Unknown":
-            info = parse_proxy(p)
-            if info:
-                todo.append((p, info["host"]))
+    for p in (proxies or []):
+        meta = proxy_meta.get(p) or {}
+        country = str(meta.get("country") or "").strip()
+        region = str(meta.get("region") or "").strip()
+        if country and country != "Unknown" and region and region != "Unknown":
+            continue
+        if int(_GEO_TRIES.get(p, 0)) >= GEO_TRIES_MAX:
+            continue
+        info = parse_proxy(p)
+        if info and info.get("host"):
+            todo.append((p, info["host"]))
     if not todo:
         return
 
@@ -3750,15 +3820,27 @@ def enrich_proxy_geo(proxies, max_workers=8):
         p, host = item
         return p, host, geo_lookup(host)
 
+    fixed = 0
     try:
         with ThreadPoolExecutor(max_workers=max_workers) as ex:
             for p, host, (country, region) in ex.map(_one, todo):
+                if not country or country == "Unknown":
+                    with _GEO_LOCK:
+                        _GEO_TRIES[p] = int(_GEO_TRIES.get(p, 0)) + 1
+                    continue
                 with proxy_lock:
                     m = proxy_meta.setdefault(
                         p, {"fails": 0, "success": 0, "score": 60, "latency_ms": 0})
-                    m["country"], m["region"] = country, region
+                    m["country"] = country
+                    if region and region != "Unknown":
+                        m["region"] = region
+                with _GEO_LOCK:
+                    _GEO_TRIES.pop(p, None)
+                fixed += 1
     except Exception as e:
         log_startup(f"WARNING: proxy geo enrichment error: {e}", quiet=True)
+    if fixed:
+        log_startup(f"Proxy geo: resolved {fixed} of {len(todo)} node(s).", quiet=True)
 
 
 def get_available_countries_with_scores():
@@ -5392,6 +5474,28 @@ def tunnel_probe(proxy_str, targets=None, timeout=None):
 # @@END 070 TUNNEL_PROBE
 
 # @@BLOCK 071 PRECHECK_FAST deps=025,041,058,070
+def _precheck_tcp(host, port, timeout):
+    """Direct TCP reachability, with one retry. Returns (ok, last_error).
+
+    ONE ATTEMPT WAS TOO FEW. A single lost SYN dropped a healthy node for the
+    whole cycle, decayed its score through record_proxy_attempt() and took it
+    out of alive_pool, so the next cycle re-probed it, failed it again and
+    decayed it again. A node that is fine on the provider's own network reads
+    "tcp dead" here for ever. Two tries, 1s apart, is the cheap version of the
+    retry the tunnel probe already does.
+    """
+    last = ""
+    for i in range(2):
+        try:
+            with socket.create_connection((host, int(port)), timeout=timeout):
+                return True, ""
+        except Exception as e:
+            last = f"{type(e).__name__}: {e}"
+            if i == 0:
+                time.sleep(1.0)
+    return False, last
+
+
 def precheck_proxy_fast(proxy_str):
     try:
         if not proxy_str:
@@ -5408,13 +5512,14 @@ def precheck_proxy_fast(proxy_str):
         if not SOCKS_OK:
             record_probe_result(proxy_str, False, "nosocks", error="PySocks missing")
             return False
-        if not is_proxy_alive(info["host"], info["port"],
-                              timeout=float(live_cfg().get("PROXY_PRECHECK_TIMEOUT",
-                                                           PROXY_PRECHECK_TIMEOUT_DEFAULT))):
+        _tcp_to = float(live_cfg().get("PROXY_PRECHECK_TIMEOUT",
+                                       PROXY_PRECHECK_TIMEOUT_DEFAULT))
+        _tcp_ok, _tcp_err = _precheck_tcp(info["host"], info["port"], _tcp_to)
+        if not _tcp_ok:
             record_proxy_attempt(proxy_str, success=False, is_network_error=True)
             record_probe_result(proxy_str, False, "tcp",
-                                error=f"direct TCP to {info['host']}:{info['port']} failed")
-            log_probe_event(f"TCPDEAD {info['host']}:{info['port']}")
+                                error=f"direct TCP to {info['host']}:{info['port']} failed twice: {_tcp_err}")
+            log_probe_event(f"TCPDEAD {info['host']}:{info['port']} ({_tcp_err[:80]})")
             return False
 
         res = _gated_tunnel(proxy_str)
@@ -5458,11 +5563,18 @@ def precheck_proxy_fast(proxy_str):
 
         # FIX PLAN-1: 402 is not a node failure. Record it, park it, keep the
         # score, and report it as its own reason so "dead" stops absorbing it.
+        #
+        # v13.54: IT NOW RETURNS True. Returning False kept a perfectly alive,
+        # perfectly authenticated node OUT of alive_pool and left its success
+        # count on 0, so a bandwidth-refused pool probed as "alive, score 80,
+        # fails 0, successes 0" and could never be drawn from at all. A 402 is
+        # provider-wide: every node answers it identically, so holding the node
+        # costs nothing and an empty pool costs everything.
         if res["reason"] == "plan":
             record_proxy_attempt(proxy_str, success=False, is_plan=True)
             log_probe_event(f"PLAN {info['host']}:{info['port']} -> provider refusing "
-                            f"service (bandwidth/plan); node kept: {res.get('error', '')[:180]}")
-            return False
+                            f"service (bandwidth/plan); node kept in pool: {res.get('error', '')[:180]}")
+            return True
 
         if res["reason"] == "auth":
             record_proxy_attempt(proxy_str, success=False, is_network_error=True,
