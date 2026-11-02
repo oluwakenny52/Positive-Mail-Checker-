@@ -6570,13 +6570,9 @@ with str_lit.sidebar:
                           help="Fetch & Test writes only the SURVIVORS into proxies.txt. "
                                "This puts the full raw fetched pool back."):
             try:
-                # v13.55: derive from PROXY_FILE, not a hardcoded cwd name - the
-                # two lists must stay siblings or restore reads the wrong file.
-                _restore_path = os.path.join(os.path.dirname(CFG["PROXY_FILE"]) or ".",
-                                             "proxies_all.txt")
-                if os.path.exists(_restore_path):
-                    with open(_restore_path, encoding="utf-8", errors="ignore") as _rf:
-                        _restore = [l.strip() for l in _rf
+                if os.path.exists("proxies_all.txt"):
+                    with open("proxies_all.txt", encoding="utf-8", errors="ignore") as _rf:
+                                    _restore = [l.strip() for l in _rf
                                     if l.strip() and not l.strip().startswith("#")]
                     if _restore:
                         with file_write_lock:
