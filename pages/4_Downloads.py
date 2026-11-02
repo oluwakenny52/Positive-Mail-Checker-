@@ -1,7 +1,7 @@
-# @@FILE pages/4_Downloads.py blocks=16 version=v13.47
+# @@FILE pages/4_Downloads.py blocks=16 version=v13.55
 # @@BLOCK 000 FILE_HEADER deps=-
 """
-pages/4_Downloads.py — Bobito Export Studio  (v13.47)
+pages/4_Downloads.py — Bobito Export Studio  (v13.55)
 =====================================================
 Pick WHAT to download, pick HOW it is written, preview it, take it.
 
@@ -20,13 +20,26 @@ v13.47 fixes on this page
 * DISPLAY FIT PANEL: auth.fit_panel() is called in block 005. auth.fit() injects
   the CSS only, so without this call the Display Fit control was missing here.
   The expander stays collapsed until it is tapped.
-* LAST-ACCOUNT FILE: "last_account" is an IGNORE_TOKEN now. The live file is
-  <hash>_last_account.txt, and the IGNORE set only matched the bare basename, so
-  the account bookkeeping file was offered as an export source.
-* EX_TPL DEFAULT: the text_input supplied both value= and a pre-seeded key, which
-  raised Streamlit's "created with a default value but also had its value set via
-  the Session State API" warning on every render. value= is gone; the key is
-  still seeded by the preset branch and the format-change guard above it.
+* LAST-ACCOUNT FILE: "last_account" is an IGNORE_TOKEN now.
+* EX_TPL DEFAULT: value= is gone; the key is seeded by the preset branch.
+
+v13.55 fixes on this page
+-------------------------
+* DEDUPE KEPT THE WRONG ROW. "first wins" ran before any ordering, so the row
+  that survived was whichever file happened to be read first - a VALID address
+  could be thrown away in favour of the FAILED copy of the same email. Dedupe
+  is now rank-aware: the strongest status wins, order-independent.
+* EVERY FILE WAS RE-READ ON EVERY RERUN just to print its line count. The count
+  is cached against (mtime, size), so the Sources box no longer touches the disk
+  on a rerun.
+* RETIRED SOURCES ARE VISIBLE NOW. Each source shows its age, and a Hide-older-
+  than control defaults to 7 days so a file from an old pool cannot silently pad
+  an export. The count that was hidden is stated.
+* {status} in the file name was taken from picked[0], so a mixed export was
+  named after whichever source sorted first. It now reflects the strongest
+  status actually exported.
+* _delim_map[delim] raised KeyError on any preset carrying an unknown separator.
+* A 200k row cap with a visible note keeps a runaway export off the phone.
 """
 
 import os
@@ -35,6 +48,7 @@ import io
 import csv
 import json
 import glob
+import time
 import zipfile
 from datetime import datetime
 
@@ -54,6 +68,8 @@ st.set_page_config(
 
 # @@BLOCK 002 APP_PATHS deps=000
 APP_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
 def _preset_file() -> str:
     """v13.44: per-user export presets.
 
@@ -102,8 +118,6 @@ _CSS_TMPL = """
     }
     .ex-hero h1 { color: #fff !important; margin: 0; font-size: 1.45rem; font-weight: 800; }
     .ex-hero p { color: rgba(255,255,255,.93) !important; margin: 6px 0 0 0; font-size: .84rem; }
-    /* v13.48: `.stMarkdown span`, not a bare `span`. A bare selector repaints the
-       sidebar's own icons - the same defect P2-2 fixed in app.py block 032. */
     [data-testid="stSidebar"] p, [data-testid="stSidebar"] label,
     [data-testid="stSidebar"] .stMarkdown span { color: __TEXT__; }
     .ex-box {
@@ -154,26 +168,11 @@ import importlib
 
 import auth
 
-# hasattr(), not a bare `auth.fit_panel` expression. The bare form is
-# magic-written by Streamlit, which routes it through st.help -> ast.parse and
-# can raise IndentationError on the enclosing `try:` - and it dumps a help panel
-# onto the page above the hero. The reload is what makes a module cached from
-# before a redeploy safe.
 if not hasattr(auth, "fit_panel"):
     auth = importlib.reload(auth)
 
 from auth import user_file         # AFTER the reload, so it binds to the live module
 
-# v13.48: ledger. page() before the gate, install() after it, and install BEFORE
-# fit_panel so the Display Fit sliders are wrapped too.
-#
-# FIX AU-1 (v13.49): a module imported before a redeploy stays in sys.modules and
-# keeps answering with the OLD shape. audit_log gained page() at 02:25, two hours
-# after this process had already imported it at 00:42, so this page died on the
-# next line with AttributeError - and install() below never ran, which is why the
-# ledger only ever held button presses and never a single slider. Same hasattr +
-# reload guard auth and runstate already use; both calls are optional, so a
-# reload that also fails degrades to "no ledger" instead of a dead page.
 import audit_log as _audit
 
 if not (hasattr(_audit, "page") and hasattr(_audit, "install")):
@@ -201,23 +200,13 @@ auth.fit_panel(st)                  # the controls; collapsed until tapped
 # sources
 # --------------------------------------------------------------------------
 def _results_dir():
-    """v13.45: the SAME per-user prefix app.py writes with.
-
-    This used to re-implement user_file() inline, while _preset_file() in block
-    002 called user_file() directly and nothing in this file ever imported it -
-    so every preset save and load raised NameError inside a try/except and
-    Export Studio presets were dead in both directions.
-    """
+    """v13.45: the SAME per-user prefix app.py writes with."""
     return user_file("mail_results")
 
 
-# v13.48: PER-USER OWNERSHIP of a source file.
-#
-# _sources() globs the working directory as well as the per-user results dir, and
-# the working directory holds every user's <hash>_*.txt. Nothing filtered them,
-# so each user's Sources box listed - and could export, passwords included -
-# every other user's result files. The prefix is DERIVED from user_file(""), the
-# same function that names the files, so no second identity source can drift.
+# v13.48: PER-USER OWNERSHIP of a source file. The root glob reaches every
+# user's <hash>_*.txt. The prefix is DERIVED from user_file(""), the same
+# function that names the files, so no second identity source can drift.
 _HASH_RX = re.compile(r"^(?:anon)?[0-9a-f]{16}_")
 
 
@@ -229,11 +218,7 @@ def _prefix() -> str:
 
 
 def _own(path) -> bool:
-    """False only for a file that is prefixed to somebody else.
-
-    An UNPREFIXED file is legacy / shared and stays visible to everyone; a file
-    carrying another user's hash prefix is not yours.
-    """
+    """False only for a file that is prefixed to somebody else."""
     base = os.path.basename(path)
     if not _HASH_RX.match(base):
         return True
@@ -245,20 +230,28 @@ IGNORE = {
     "last_account.txt", "proxies.txt", "proxies_all.txt", "disposable_domains.txt",
     "clean_proxies.txt", "proxy_pool.txt", "download_presets.json",
 }
-# FIX DL-1: "proxy" used to be an IGNORE_TOKEN, so proxy_unhealthy_<stamp>.txt was
-# silently dropped from Sources. Match the real infrastructure filenames instead.
-# v13.47: "last_account" is a token - the live file is <hash>_last_account.txt, so
-# the bare basename in IGNORE never matched it and it showed up as a source.
 IGNORE_TOKENS = ("resume", "unfinished", "remaining", "input", "proxies", "config",
                  "last_account")
+
+# v13.55: STRONGEST STATUS WINS on dedupe. Without a rank the survivor of a
+# duplicate email was whichever file was read first, so a VALID address could be
+# exported as its FAILED copy. Higher number = stronger, and VALID must beat
+# everything or the export can only ever be pessimistic.
+_STATUS_RANK = {
+    "VALID": 90, "WRONG_PASSWORD": 80, "NEED_APP_PASSWORD": 78, "RBL_BLOCKED": 70,
+    "LOGIN_DROPPED": 60, "APP_PASSWORD": 58, "SMTP_FAILED": 50, "DNS_FAILED": 45,
+    "PROXY_UNHEALTHY": 40, "CONNECTION_FAILED": 35, "RETRY_LATER": 30,
+    "SKIPPED": 20, "UNKNOWN": 10, "MIXED": 5,
+}
+
+_COUNT_CACHE = {}
 
 
 def _status_of(path):
     n = os.path.basename(path).lower()
     if "clean_valid" in n or "manual_valid" in n or "valid_accounts" in n:
         return "VALID"
-    # FIX DL-3: most-specific token first. "failed" used to swallow smtp_failed_* and
-    # dns_failed_* and file both as CONNECTION_FAILED.
+    # FIX DL-3: most-specific token first.
     for tag, word in (("LOGIN_DROPPED", "login_dropped"), ("NEED_APP_PASSWORD", "need_app"),
                       ("PROXY_UNHEALTHY", "proxy_unhealthy"), ("RETRY_LATER", "retry_later"),
                       ("RBL_BLOCKED", "rbl_blocked"), ("SMTP_FAILED", "smtp_failed"),
@@ -270,6 +263,44 @@ def _status_of(path):
     return "MIXED"
 
 
+def _count_lines(path):
+    """v13.55: cached against (mtime, size).
+
+    This used to open and read every source file on EVERY rerun - with a hundred
+    result files on a phone that is a hundred disk reads per keystroke.
+    """
+    try:
+        s = os.stat(path)
+    except Exception:
+        return 0
+    sig = (s.st_mtime, s.st_size)
+    hit = _COUNT_CACHE.get(path)
+    if hit and hit[0] == sig:
+        return hit[1]
+    n = 0
+    try:
+        with open(path, encoding="utf-8", errors="ignore") as _fh:
+            n = sum(1 for l in _fh if l.strip() and not l.startswith("#"))
+    except Exception:
+        n = 0
+    _COUNT_CACHE[path] = (sig, n)
+    return n
+
+
+def _age_txt(path):
+    try:
+        d = max(0, int(time.time() - os.path.getmtime(path)))
+    except Exception:
+        return "?"
+    if d < 90:
+        return f"{d}s old"
+    if d < 5400:
+        return f"{d // 60}m old"
+    if d < 172800:
+        return f"{d // 3600}h old"
+    return f"{d // 86400}d old"
+
+
 def _sources():
     out = {}
     for pat in (os.path.join(_results_dir(), "*.txt"), "*.txt"):
@@ -277,16 +308,14 @@ def _sources():
             b = os.path.basename(p)
             if b in IGNORE or any(t in b.lower() for t in IGNORE_TOKENS):
                 continue
-            # v13.48: the root glob reaches every user's <hash>_*.txt.
             if not _own(p):
                 continue
-            try:
-                with open(p, encoding="utf-8", errors="ignore") as _fh:
-                    n = sum(1 for l in _fh if l.strip() and not l.startswith("#"))
-            except Exception:
-                n = 0
+            n = _count_lines(p)
             if n:
-                out[f"{os.path.basename(os.path.dirname(p))}/{b}  ({n})"] = p
+                # v13.55: the age is part of the label, so a retired file is
+                # visible as retired instead of looking like current output.
+                out[f"{os.path.basename(os.path.dirname(p))}/{b}  ({n})  ·  "
+                    f"{_age_txt(p)}"] = p
     return dict(sorted(out.items()))
 
 
@@ -340,8 +369,6 @@ def _parse(line, source, status_hint):
     if " | " in raw:
         combo, _, rest = raw.partition(" | ")
     elif "|" in raw:
-        # v13.42: anchor the cut to the FIRST colon, so a '|' before the colon
-        # cannot eat the email and the split is deterministic.
         _colon = raw.find(":")
         _cut = raw.find("|", _colon + 1) if _colon != -1 else -1
         combo, rest = (raw[:_cut], raw[_cut + 1:]) if _cut != -1 else (raw, "")
@@ -400,17 +427,12 @@ def _load(selection):
 
 
 # @@BLOCK 008 FORMATTERS deps=007
+MAX_ROWS = 200_000
+
+
 def _fmt(rows, template, delim, crlf, header, prefix, suffix,
          sort_key, dedupe, lower, regex_inc, regex_exc, host_filter):
     sel = rows
-    if dedupe:
-        seen, keep = set(), []
-        for r in sel:
-            if r["email"] in seen:
-                continue
-            seen.add(r["email"])
-            keep.append(r)
-        sel = keep
     if regex_inc:
         try:
             rx = re.compile(regex_inc)
@@ -427,12 +449,30 @@ def _fmt(rows, template, delim, crlf, header, prefix, suffix,
         want = {h.strip().lower() for h in host_filter.split(",") if h.strip()}
         sel = [r for r in sel if r["host"].lower() in want]
 
+    # v13.55: DEDUPE BY RANK, not by file order. The first row of a duplicate
+    # email used to win, so reading failed_ before valid_ exported the failure.
+    # The strongest status now wins regardless of which file it came from, and
+    # on a tie the earliest row is kept so the output stays deterministic.
+    if dedupe:
+        best = {}
+        for r in sel:
+            cur = best.get(r["email"])
+            if cur is None or _STATUS_RANK.get(r["status"], 0) > \
+                    _STATUS_RANK.get(cur["status"], 0):
+                best[r["email"]] = r
+        sel = list(best.values())
+
     if sort_key == "email":
         sel = sorted(sel, key=lambda r: r["email"])
     elif sort_key == "domain":
         sel = sorted(sel, key=lambda r: (r["domain"], r["email"]))
     elif sort_key == "status":
-        sel = sorted(sel, key=lambda r: (r["status"], r["email"]))
+        sel = sorted(sel, key=lambda r: (-_STATUS_RANK.get(r["status"], 0), r["email"]))
+
+    _truncated = 0
+    if len(sel) > MAX_ROWS:
+        _truncated = len(sel) - MAX_ROWS
+        sel = sel[:MAX_ROWS]
 
     out = []
     for i, r in enumerate(sel, 1):
@@ -456,6 +496,7 @@ def _fmt(rows, template, delim, crlf, header, prefix, suffix,
         text = prefix + ("\n" if not crlf else "\r\n") + text
     if suffix.strip():
         text = text + ("\n" if not crlf else "\r\n") + suffix
+    st.session_state["_fmt_truncated"] = _truncated
     return sel, text
 
 
@@ -507,10 +548,6 @@ def _save_presets(d):
 srcs = _sources()
 sess = _session_sources()
 
-# v13.40: consume a pending preset HERE, before a single widget exists.
-# SessionState.__setitem__ raises StreamlitWidgetAlreadyInstantiatedError if you
-# write a widget key AFTER that widget was created in the same run - which is
-# exactly what block 011 used to do, so Apply threw and the boxes never updated.
 _pending_preset = st.session_state.pop("_ex_apply", None)
 if _pending_preset:
     _pp = _presets().get(_pending_preset) or {}
@@ -527,15 +564,6 @@ if _pending_preset:
         st.session_state["ex_name"] = _pp.get("name_pat", "export_{status}_{count}_{stamp}")
         st.session_state["_ex_active"] = _pending_preset
 
-# v13.50: EVERY widget on this page is now created key-only.  A widget that
-# carries a default (value= / index= / default=) AND a key that is already in
-# session_state raises Streamlit's "created with a default value but also had
-# its value set via the Session State API" warning on every single rerun - and
-# on the second run the key IS always in state.  Seeding the key here, before
-# any widget exists, is the only legal point to write it: it keeps the defaults
-# below, silences the warning, and lets the preset branch above still land.
-# v13.48's four blank keys are folded into the same table so there is one place
-# that knows the defaults.
 _EX_DEFAULTS = {
     "ex_tpl": "",
     "ex_delim": "none",
@@ -551,6 +579,7 @@ _EX_DEFAULTS = {
     "ex_exc": "",
     "ex_hosts": "",
     "ex_pname": "",
+    "ex_age": "7 days",
 }
 for _k, _v in _EX_DEFAULTS.items():
     if _k not in st.session_state:
@@ -562,28 +591,45 @@ with st.sidebar:
     if not labels:
         st.info("No result files yet. Run the checker, or validate a batch in the Reader.")
         st.stop()
-    # FIX DL-4: default to ALL sources. default=labels[:1] preselected only
-    # "Session . valid_results", which is why the page looked valid-only.
+
+    # v13.55: RETIRED FILES ARE HIDEABLE. Every result file from every past run
+    # used to be preselected, so an export silently padded itself with accounts
+    # measured against a dead pool. Age is a filter now and the hidden count is
+    # stated; session buckets are always kept because they ARE this run.
+    age_win = st.selectbox("File age", ["24 hours", "7 days", "30 days", "all"],
+                           key="ex_age",
+                           help="Session buckets are always included - they are the "
+                                "live run. This only limits the FILES on disk.")
+    _age_cut = {"24 hours": 86400, "7 days": 604800,
+                "30 days": 2592000, "all": None}[age_win]
+    _fresh, _old = [], 0
+    for _lab in srcs:
+        _p = srcs[_lab]
+        try:
+            _ok_age = (_age_cut is None
+                       or (time.time() - os.path.getmtime(_p)) <= _age_cut)
+        except Exception:
+            _ok_age = True
+        if _ok_age:
+            _fresh.append(_lab)
+        else:
+            _old += 1
+    _def_labels = list(sess.keys()) + _fresh
+
     picked = st.multiselect(
-        "Sources", labels, default=labels,
-        help="Multi-select. Add ANY session bucket or any mail_results file - "
-             "nothing is filtered out.")
-    st.caption(f"{len(labels)} source(s) available, all selected. Deselect to narrow.")
+        "Sources", labels, default=_def_labels,
+        help="Multi-select. Add ANY session bucket or any mail_results file.")
+    st.caption(f"{len(labels)} source(s) available · {len(_def_labels)} preselected "
+               f"by the age filter · {_old} file(s) older than {age_win} hidden.")
 
     st.markdown("---")
     st.markdown("### 2. How to write it")
     fmt_name = st.selectbox("Format", list(FORMAT_PRESETS.keys()), index=0)
     default_tpl = FORMAT_PRESETS[fmt_name]
-    # v13.42: value= only applies on the FIRST render, so picking a different
-    # format did nothing.  Re-seed the key when the format changes - legal here,
-    # the text_input below does not exist yet this run.  A preset applied this
-    # run wins (its marker is still in session_state).
     if st.session_state.get("_ex_fmt_seen") != fmt_name:
         st.session_state["_ex_fmt_seen"] = fmt_name
         if default_tpl and not st.session_state.get("_ex_active"):
             st.session_state["ex_tpl"] = default_tpl
-    # The key is always seeded by _EX_DEFAULTS above, so no "not in
-    # session_state" backstop is needed here any more.
     template = st.text_input(
         "Template ({email} {password} {domain} {local} {status} {host} {port} {detail} {n})",
         key="ex_tpl",
@@ -608,7 +654,7 @@ with st.sidebar:
     st.markdown("---")
     st.markdown("### 3. Filter and order")
     sort_key = st.selectbox("Sort by", ["none", "email", "domain", "status"], key="ex_sort")
-    dedupe = st.toggle("Dedupe by email (first wins)", key="ex_dedupe")
+    dedupe = st.toggle("Dedupe by email (strongest status wins)", key="ex_dedupe")
     lower = st.toggle("Lowercase email", key="ex_lower")
     regex_inc = st.text_input("Include regex", key="ex_inc")
     regex_exc = st.text_input("Exclude regex", key="ex_exc")
@@ -644,15 +690,14 @@ with st.sidebar:
 
 # @@BLOCK 011 PRESET_APPLY deps=010
 # Block 010 already seeded every preset-backed widget key BEFORE those widgets
-# were created - the only point where writing a widget key is legal.  So the
-# values read out of the widgets above already carry the preset; this block just
-# mirrors the preset into the locals block 012 consumes, and consumes the
-# one-shot marker so a later rerun does not clobber your manual edits.
+# were created - the only point where writing a widget key is legal.
 _p = _presets().get(st.session_state.pop("_ex_active", None) or "") or {}
 if _p:
     template = _p.get("template", template)
     delim = _p.get("delim", delim)
-    delim_ch = _delim_map[delim]
+    # v13.55: .get, not []. A preset saved before a separator was renamed raised
+    # KeyError here and the whole page died on load.
+    delim_ch = _delim_map.get(delim, " ")
     crlf = str(_p.get("eol", eol)).startswith("CRLF")
     header = _p.get("header", header)
     prefix = _p.get("prefix", prefix)
@@ -673,10 +718,19 @@ rows = _load(picked)
 sel, text = _fmt(rows, template, delim_ch, crlf, header, prefix, suffix,
                  sort_key, dedupe, lower, regex_inc, regex_exc, host_filter)
 
+# v13.55: {status} came from picked[0], so a mixed export was named after
+# whichever source happened to sort first. It now reflects what is IN the file,
+# and only when every exported row agrees.
+_statuses = {r["status"] for r in sel}
+if len(_statuses) == 1:
+    _status_tag = _statuses.pop().lower()
+else:
+    _status_tag = "mixed"
+
 stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 fname = (name_pat.replace("{stamp}", stamp)
          .replace("{count}", str(len(sel)))
-         .replace("{status}", "mixed" if len(picked) != 1 else _status_of(picked[0]).lower())
+         .replace("{status}", _status_tag)
          .replace("{sources}", str(len(picked))))
 if "." not in os.path.basename(fname):
     fname += ".txt"
@@ -690,6 +744,11 @@ m4.metric("Bytes", f"{len(text.encode('utf-8')):,}")
 if st.session_state.get("_fmt_bad"):
     st.warning(f"Unknown placeholder in the template: {st.session_state.pop('_fmt_bad')} "
                f"- valid ones are {', '.join('{'+f+'}' for f in FIELDS)}")
+
+_tr = int(st.session_state.get("_fmt_truncated") or 0)
+if _tr:
+    st.warning(f"Row cap reached: {MAX_ROWS:,} exported, {_tr:,} dropped. Narrow the "
+               f"sources or a filter to take the rest.")
 
 if not sel:
     st.info("Nothing matched. Widen the sources or clear a filter.")
@@ -719,7 +778,8 @@ with tab_txt:
     st.code(text, language="text")
 
 with tab_csv:
-    sep_choice = st.radio("CSV separator", ["comma", "semicolon", "tab"], horizontal=True)
+    sep_choice = st.radio("CSV separator", ["comma", "semicolon", "tab"], horizontal=True,
+                          key="ex_csv_sep")
     _sep = {"comma": ",", "semicolon": ";", "tab": "\t"}[sep_choice]
     ctext = _csv_of(sel, _sep)
     st.download_button("⬇️ Download CSV", data=ctext.encode("utf-8"),
@@ -728,7 +788,7 @@ with tab_csv:
     st.code("\n".join(ctext.splitlines()[:30]), language="text")
 
 with tab_json:
-    jl = st.toggle("JSON Lines (one object per row)", value=True)
+    jl = st.toggle("JSON Lines (one object per row)", value=True, key="ex_jsonl")
     jtext = _json_of(sel, lines=jl)
     st.download_button("⬇️ Download JSON", data=jtext.encode("utf-8"),
                        file_name=fname.rsplit(".", 1)[0] + (".jsonl" if jl else ".json"),
@@ -757,7 +817,9 @@ with tab_break:
     by = {}
     for r in sel:
         by.setdefault(r["status"], []).append(r)
-    for tag in sorted(by):
+    # v13.55: strongest bucket first, so VALID is at the top instead of sorting
+    # alphabetically under CONNECTION_FAILED.
+    for tag in sorted(by, key=lambda t: -_STATUS_RANK.get(t, 0)):
         with st.expander(f"{tag} — {len(by[tag])} row(s)"):
             body = "\n".join(r["line"] for r in by[tag])
             st.download_button(f"⬇️ {tag}.txt", data=body.encode("utf-8"),
