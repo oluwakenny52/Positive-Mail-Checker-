@@ -701,12 +701,16 @@ PROBE_MAX_TARGETS_DEFAULT = 1
 
 # @@BLOCK 014 UI_RENDER_CONSTANTS deps=-
 PROBE_BATCH_BUDGET = 120.0
+# FIX NOLIMIT-1 (v13.59): a hard ceiling that a bigger pool could not grow past.
+# A 3000-line file gets 4s per line of budget, bounded only by this.
+PROBE_BATCH_MAX = 3600.0
 PROBE_BUDGET_START = 120.0
 UI_MIN_INTERVAL = 0.12
-BUCKET_RENDER_TAIL = 40
-LOG_CAP_DEBUG = 200
-LOG_CAP_QUIET = 120
-REPORT_ENTRIES_MAX = 2000
+# FIX NOLIMIT-1: 40 / 200 / 120 were display truncations on a pool of thousands.
+BUCKET_RENDER_TAIL = 200
+LOG_CAP_DEBUG = 500
+LOG_CAP_QUIET = 300
+REPORT_ENTRIES_MAX = 5000
 # FIX P1-3 / P1-4: the two per-rerun and per-account hogs get their own clocks.
 # FIX SPEED-10: 30s was far too eager for build_diagnostics_text(), which reads
 # proxies.txt, walks every proxy_meta row, resolves the egress geo and calls
@@ -758,12 +762,10 @@ PROBE_STRICT_DEFAULT = True
 MIN_PROXY_SCORE_DEFAULT = 5
 BLACKLIST_CF_DEFAULT = 15
 CIRCUIT_BREAKER_SECONDS = 30.0
-# FIX KEY-1 (v13.58): how many DIFFERENT sub-users one IP may contribute to the
-# live pool. The provider meters SUB-USERS, not IPs, so this is the number of
-# independent keys the rotation can fall back to on that IP - and 2 was too
-# tight: one 402 key took the whole IP out of the rotation. The per-IP gate
-# still caps real CONCURRENCY at PROXY_IP_CONCURRENCY; this only widens CHOICE.
-POOL_SUBUSER_PER_IP_MAX = 4
+# v13.58: there is NO per-IP line cap any more. The provider meters SUB-USERS and
+# you pay per API key, so every distinct key deserves its own line in the pool and
+# its own row on screen. The per-IP gate still caps real CONCURRENCY, so the extra
+# lines widen CHOICE without adding load. The collapse rule lives in block 074.
 # @@END 017 POOL_FILTER_CONSTANTS
 
 # @@BLOCK 018 PROBE_TARGET_TABLES deps=-
@@ -906,10 +908,18 @@ def default_cfg() -> dict:
         "DYNAMIC_WORKER_SCALING": True,
         "CUSTOM_WHITELIST": [],
         "CUSTOM_BLACKLIST": [],
-        "PROXY_FILE": "proxies.txt",
+        # FIX ISO-6 (v13.59): THE POOL FILES WERE SHARED. proxies.txt,
+        # proxies_all.txt, proxy_meta.json, proxy_key_map.json and
+        # domain_cache.json lived in the working directory, so every user on a
+        # deployment read, overwrote and rescued every other user's pool. They
+        # are per-user files now, named by the unlocked passkey prefix exactly
+        # like every result file.
+        "PROXY_FILE": user_file("proxies.txt"),
+        "PROXY_ALL_FILE": user_file("proxies_all.txt"),
+        "PROXY_KEYMAP_FILE": user_file("proxy_key_map.json"),
         "RESULTS_DIR": user_file("mail_results"),
-        "CACHE_FILE": "domain_cache.json",
-        "PROXY_META_FILE": "proxy_meta.json",
+        "CACHE_FILE": user_file("domain_cache.json"),
+        "PROXY_META_FILE": user_file("proxy_meta.json"),
         "MAX_PROXY_TRIES": 2,
         "PROXY_CONNECT_TIMEOUT": 8.0,
         "FAST_MODE": False,
@@ -1153,58 +1163,41 @@ def _login_dropped_detail() -> str:
 # @@BLOCK 024 ENGINE_STATE deps=-
 @str_lit.cache_resource(show_spinner=False)
 def _engine_state():
-    _meta = {}
-    try:
-        if os.path.exists("proxy_meta.json"):
-            with open("proxy_meta.json", encoding="utf-8") as _f:
-                _meta = json.load(_f) or {}
-    except Exception:
-        _meta = {}
     return {
-        # locks
+        # locks that are genuinely process-wide (they guard process-wide tables)
         "cache_lock": threading.Lock(),
         "proxy_lock": threading.Lock(),
+        # v13.59: process-wide guards. One lock is enough for the pair and keeps
+        # the module alias stable across reruns.
+        "alive_pool_lock": threading.Lock(),
+        "rr_lock": threading.Lock(),
+        "rr_index": 0,
+        "rr_last": None,
         # v13.51: RLock, not Lock.  _write_clean_valid() takes this lock itself,
         # and block 107 already holds it while writing the result files - so any
         # call site that nests the two deadlocked the SCRIPT THREAD for ever and
         # the page never returned.
         "file_write_lock": threading.RLock(),
         "session_state_lock": threading.Lock(),
-        "alive_pool_lock": threading.Lock(),
         "host_dns_lock": threading.Lock(),
-        "proxy_quarantine_lock": threading.Lock(),
-        "proxy_scheme_lock": threading.Lock(),
-        "probe_stats_lock": threading.Lock(),
-        "probe_log_lock": threading.Lock(),
-        "probe_owner_lock": threading.Lock(),
-        "rr_lock": threading.Lock(),
         "geo_lock": threading.Lock(),
         "public_ip_lock": threading.Lock(),
         "direct_geo_lock": threading.Lock(),
         "smtp_lock": threading.Lock(),
         "target_reach_lock": threading.Lock(),
         "helo_lock": threading.Lock(),
-        # concurrency gates (persistent so a rerun cannot orphan them)
+        # per-SESSION tables, keyed by the unlocked scope. See _user_state().
+        "per_user": {},
+        "per_user_lock": threading.Lock(),
+        # concurrency gates (process-wide, but every KEY is scope-prefixed)
         "host_gate_lock": threading.Lock(),
         "host_gates": {},
         "ip_gates": {},
         "subuser_gates": {},
         "proxy_gate": None,
-        # engine / proxy state
-        "alive_pool": [],
-        "consecutive_proxy_failures": defaultdict(int),
-        "circuit_breaker_until": {},
-        "failed_domain_cache": {},
+        # genuinely shared caches - the data describes the world, not a user
         "host_dns_cache": {},
-        "proxy_quarantine": set(),
-        "strikes_407": defaultdict(int),
-        "proxy_scheme": {},
-        "probe_stats": {},
-        "probe_log": [],
-        "meta": _meta,
-        "rr_index": 0,
-        "rr_last": None,
-        # caches that must not be rebuilt on every click
+        "meta": {},
         "geo_cache": {},
         "public_ip": {"ip": "", "ts": 0.0},
         "direct_geo": {"ts": 0.0, "ip": "", "country": "Unknown",
@@ -1212,47 +1205,116 @@ def _engine_state():
         "direct_isp": {"ts": 0.0, "isp": ""},
         "smtp_domain_cache": {},
         "target_reach": {"ts": 0.0, "rows": []},
-        "selftest": {"ts": 0.0, "text": "", "user": ""},
         "helo_name": {"name": "", "ts": 0.0},
-        "mail_spot": {"ts": 0.0, "host": "", "port": 0, "ok": 0, "auth": 0,
-                      "other": 0, "n": 0, "error": ""},
-        # probe bookkeeping
-        "probe_in_flight": False,
-        "last_probe_ts": 0.0,
-        "probe_runs": 0,
-        "run_active": False,
-        # FIX ISO-4 (v13.49): run_active is a single process bool, but more than
-        # one session can run at once. A plain bool cleared by whichever run
-        # finished FIRST put every other user's prober into idle cadence and made
-        # refresh_alive_pool drop its "keep the current pool" guard, so an empty
-        # probe wiped a live run's pool. runs_active is the real count;
-        # run_active is kept only as its derived bool.
-        "runs_active": 0,
-        "probe_targets_override": [],
-        "bootstrap_done": False,
-        "first_probe_kicked": False,
-        "process_start": time.time(),
-        # STATE-backed so a Streamlit rerun cannot rebuild them EMPTY
-        "startup_seen": set(),
-        "startup_buffer": [],
-        "startup_buffer_lock": threading.Lock(),
-        "dns_cache": {},
-        "persistent_valid_cache": {"ts": 0.0, "data": [], "user": ""},
-        "prev_valid_cache": {"ts": 0.0, "data": set(), "user": ""},
         "geo_fail": {},
         "geo_last_call": {"ts": 0.0},
-        "proxy_407_until": {},
-        "diag_cache": {"ts": 0.0, "text": "", "user": ""},
+        # process bookkeeping
+        "run_active": False,
+        "runs_active": 0,
+        "process_start": time.time(),
     }
 
 
 STATE = _engine_state()
 
-probe_stats = STATE["probe_stats"]
-probe_stats_lock = STATE["probe_stats_lock"]
-probe_log = STATE["probe_log"]
-probe_log_lock = STATE["probe_log_lock"]
-_PROBE_OWNER_LOCK = STATE["probe_owner_lock"]
+# FIX ISO-6 (v13.59): EVERYTHING THAT DESCRIBES A USER'S OWN POOL LIVES HERE.
+# These used to be single process tables keyed only by the proxy line, so two
+# users on one deployment shared one alive_pool, one quarantine set, one strike
+# counter, one probe log and one probe lock - and one user's Apply Settings or
+# quarantine lifted the other's nodes. Each scope now gets its own dict and
+# every module alias below is bound to the CURRENT scope's dict on each rerun.
+# Worker threads keep the binding from the run that spawned them, so a rerun in
+# another tab cannot retarget them.
+_DEFAULT_USER_STATE = {
+    "alive_pool": [],
+    "consecutive_proxy_failures": defaultdict(int),
+    "circuit_breaker_until": {},
+    "proxy_quarantine": set(),
+    "strikes_407": defaultdict(int),
+    "proxy_scheme": {},
+    "proxy_407_until": {},
+    "proxy_meta": {},
+    "probe_stats": {},
+    "probe_log": [],
+    "probe_in_flight": False,
+    "probe_owner_lock": threading.Lock(),
+    "probe_stats_lock": threading.Lock(),
+    "probe_log_lock": threading.Lock(),
+    "proxy_quarantine_lock": threading.Lock(),
+    "proxy_scheme_lock": threading.Lock(),
+    "last_probe_ts": 0.0,
+    "probe_runs": 0,
+    "bootstrap_done": False,
+    "first_probe_kicked": False,
+    "probe_targets_override": [],
+    "runs_active": 0,
+}
+
+
+def _session_scope() -> str:
+    """The session token, read straight from session_state.
+
+    Used before block 040 has defined _gate_scope(), and as its fallback.
+    """
+    try:
+        tok = (str_lit.session_state.get("user_key_hash")
+               or str_lit.session_state.get("_anon_hash")
+               or "anon")
+    except Exception:
+        tok = "anon"
+    return str(tok) or "anon"
+
+
+def _user_state(scope=None) -> dict:
+    """This session's own tables. Created once, then stable for the process."""
+    if scope:
+        who = str(scope)
+    else:
+        try:
+            who = _gate_scope()
+        except Exception:
+            who = _session_scope()
+    tbl = STATE.setdefault("per_user", {})
+    d = tbl.get(who)
+    if d is None:
+        with STATE["per_user_lock"]:
+            d = tbl.get(who)
+            if d is None:
+                d = dict(_DEFAULT_USER_STATE)
+                d["consecutive_proxy_failures"] = defaultdict(int)
+                d["circuit_breaker_until"] = {}
+                d["proxy_quarantine"] = set()
+                d["strikes_407"] = defaultdict(int)
+                d["proxy_scheme"] = {}
+                d["proxy_407_until"] = {}
+                d["proxy_meta"] = {}
+                d["probe_stats"] = {}
+                d["probe_log"] = []
+                d["probe_owner_lock"] = threading.Lock()
+                d["probe_stats_lock"] = threading.Lock()
+                d["probe_log_lock"] = threading.Lock()
+                d["proxy_quarantine_lock"] = threading.Lock()
+                d["proxy_scheme_lock"] = threading.Lock()
+                d["probe_targets_override"] = []
+                tbl[who] = d
+    return d
+
+
+def forget_user_state(scope):
+    """Drop a scope's tables entirely. Called on Forget passkey."""
+    try:
+        STATE.setdefault("per_user", {}).pop(str(scope), None)
+    except Exception:
+        pass
+
+
+_US = _user_state()
+
+probe_stats = _US["probe_stats"]
+probe_stats_lock = _US["probe_stats_lock"]
+probe_log = _US["probe_log"]
+probe_log_lock = _US["probe_log_lock"]
+_PROBE_OWNER_LOCK = _US["probe_owner_lock"]
 
 _PROBE_REASON_LABEL = {
     "ok": "pass",
@@ -1273,8 +1335,8 @@ _PROBE_REASON_LABEL = {
 def log_probe_event(msg):
     with probe_log_lock:
         probe_log.append(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}")
-        if len(probe_log) > 300:
-            del probe_log[:-300]
+        if len(probe_log) > 600:
+            del probe_log[:-600]
 
 
 def record_probe_result(proxy_str, ok, reason, latency_ms=0, target="",
@@ -1294,11 +1356,11 @@ def record_probe_result(proxy_str, ok, reason, latency_ms=0, target="",
             "attempts": int(prev.get("attempts", 0)) + 1,
             "first_seen": prev.get("first_seen") or time.time(),
         }
-    STATE["last_probe_ts"] = time.time()
+    _user_state()["last_probe_ts"] = time.time()
 
 
 def _probe_snapshot():
-    """(key, record) pairs, RESTRICTED to lines that are still in proxies.txt.
+    """(key, record) pairs, RESTRICTED to lines that are still in this user's file.
 
     v13.54: NOTHING PRUNES probe_stats while idle. refresh_alive_pool returns at
     its first line when no run is active and idle probing is off, and the prune
@@ -1306,6 +1368,8 @@ def _probe_snapshot():
     The sidebar read "16 validated node(s) armed" over a 9-line file, and the
     breakdown counted 122 entries for 9 nodes. Filtering on read fixes the
     display without touching the prune.
+
+    v13.59: probe_stats is per-scope now, so this is the user's own history only.
     """
     with probe_stats_lock:
         snap = list(probe_stats.items())
@@ -1692,14 +1756,19 @@ def _detect_line_format(line):
 
 
 def _analyze_proxy_file():
-    out = {"exists": False, "total": 0, "unique": 0, "with_creds": 0,
+    out = {"exists": False, "path": "", "total": 0, "unique": 0, "with_creds": 0,
            "unparsable": 0, "formats": {}, "dupe_map": {}, "sample": [],
            "distinct_ips": 0, "distinct_users": 0}
     try:
-        if not os.path.exists("proxies.txt"):
+        path = live_cfg().get("PROXY_FILE", "proxies.txt")
+    except Exception:
+        path = "proxies.txt"
+    out["path"] = path
+    try:
+        if not os.path.exists(path):
             return out
         out["exists"] = True
-        with open("proxies.txt", encoding="utf-8", errors="ignore") as f:
+        with open(path, encoding="utf-8", errors="ignore") as f:
             raw = [l.rstrip("\n") for l in f]
         lines = [l.strip() for l in raw if l.strip() and not l.startswith("#")]
         out["total"] = len(lines)
@@ -2759,22 +2828,31 @@ cache_lock = STATE["cache_lock"]
 proxy_lock = STATE["proxy_lock"]
 file_write_lock = STATE["file_write_lock"]
 session_state_lock = STATE["session_state_lock"]
-alive_pool = STATE["alive_pool"]
+
+# FIX ISO-6 (v13.59): these six are bound to THIS SESSION's tables, not to one
+# shared process table. Every block below uses the bare name, and the name is
+# rebound per rerun - so two users cannot see, quarantine, strike or rotate each
+# other's nodes. A worker thread keeps the binding from its own run.
+_US = _user_state()
+alive_pool = _US["alive_pool"]
 alive_pool_lock = STATE["alive_pool_lock"]
-consecutive_proxy_failures = STATE["consecutive_proxy_failures"]
-circuit_breaker_until = STATE["circuit_breaker_until"]
-failed_domain_cache = STATE["failed_domain_cache"]
+consecutive_proxy_failures = _US["consecutive_proxy_failures"]
+circuit_breaker_until = _US["circuit_breaker_until"]
+proxy_quarantine = _US["proxy_quarantine"]
+proxy_quarantine_lock = _US["proxy_quarantine_lock"]
+_proxy_407 = _US["strikes_407"]
+_proxy_scheme = _US["proxy_scheme"]
+_proxy_scheme_lock = _US["proxy_scheme_lock"]
+proxy_407_until = _US["proxy_407_until"]
+
+failed_domain_cache = STATE.setdefault("failed_domain_cache", {})
 _host_dns_cache = STATE["host_dns_cache"]
 _host_dns_lock = STATE["host_dns_lock"]
 
-proxy_quarantine = STATE["proxy_quarantine"]
-proxy_quarantine_lock = STATE["proxy_quarantine_lock"]
-_proxy_407 = STATE["strikes_407"]
-_proxy_scheme = STATE["proxy_scheme"]
-_proxy_scheme_lock = STATE["proxy_scheme_lock"]
-
 _rr_lock = STATE["rr_lock"]
 
+# geo, public-ip and the reachability probe describe the WORLD, not a user, so
+# they stay shared - a resolved country is the same answer for everybody.
 _GEO_CACHE = STATE["geo_cache"]
 _GEO_LOCK = STATE["geo_lock"]
 _GEO_FAIL = STATE.setdefault("geo_fail", {})
@@ -2792,8 +2870,6 @@ _SMTP_CACHE_TTL = 900
 _SMTP_PRECHECK_BUDGET = 45.0
 _SMTP_PRECHECK_WORKERS = 32
 
-STATE.setdefault("proxy_407_until", {})
-
 # FIX ISO-4 (v13.49): a teardown never reaches block 106's finally, so the
 # runs_active increment it made has to be repaid by somebody. Block 007 is the
 # only place that ever PROVES the loop is gone (run_active is process state, so it
@@ -2802,9 +2878,10 @@ STATE.setdefault("proxy_407_until", {})
 # and it is settled here. max(0, ...) means a double repayment cannot go negative
 # and strand the prober in busy cadence for ever.
 if str_lit.session_state.pop("_run_owed", False):
+    _US["runs_active"] = max(0, int(_US.get("runs_active", 0)) - 1)
     STATE["runs_active"] = max(0, int(STATE.get("runs_active", 0)) - 1)
     STATE["run_active"] = STATE["runs_active"] > 0
-    log_probe_event(f"teardown repaid: runs_active now {STATE['runs_active']}")
+    log_probe_event(f"teardown repaid: runs_active now {_US['runs_active']}")
 
 log_startup("Application process started. Initializing session state and loading configurations...")
 log_startup(f"hosts.py status -> loaded={HOSTS_OK} has_ranking={HOSTS_HAS_RANKING} "
@@ -2812,6 +2889,32 @@ log_startup(f"hosts.py status -> loaded={HOSTS_OK} has_ranking={HOSTS_HAS_RANKIN
 log_startup(f"status.py status -> {STATUS_IMPORT_NOTE}")
 log_startup(f"ms_oauth.py status -> loaded={MS_OAUTH_OK} "
             f"(Microsoft XOAUTH2 {'active' if MS_OAUTH_OK else 'INACTIVE'})")
+
+_REBIND_KEYS = (
+    "alive_pool", "consecutive_proxy_failures", "circuit_breaker_until",
+    "proxy_quarantine", "proxy_quarantine_lock", "strikes_407", "proxy_scheme",
+    "proxy_scheme_lock", "proxy_407_until", "proxy_meta", "probe_stats",
+    "probe_stats_lock", "probe_log", "probe_log_lock", "probe_owner_lock",
+)
+_REBIND_ALIAS = {"strikes_407": "_proxy_407", "proxy_scheme": "_proxy_scheme",
+                 "proxy_scheme_lock": "_proxy_scheme_lock",
+                 "probe_owner_lock": "_PROBE_OWNER_LOCK"}
+
+
+def _rebind_scope(scope=None):
+    """Re-point every per-user module alias at the CALLING thread's tables.
+
+    Module globals are ONE namespace for the whole process, and a rerun in
+    another tab rebinds all of them. A pinned thread therefore has to re-assert
+    its own binding before it touches them, or it writes into the other user's
+    pool. Cost is a thread-local read plus a dict fetch.
+    """
+    _d = _user_state(scope)
+    _g = globals()
+    for _k in _REBIND_KEYS:
+        _g[_REBIND_ALIAS.get(_k, _k)] = _d[_k]
+    _g["_US"] = _d
+    return _d
 # @@END 039 STATE_ALIASES
 
 # @@BLOCK 040 GATES deps=012,024,025,039
@@ -3067,7 +3170,7 @@ _refresh_gate_scope()
 def _proxy_407_parked(proxy_str) -> bool:
     if not proxy_str:
         return False
-    until = (STATE.get("proxy_407_until") or {}).get(proxy_str, 0.0)
+    until = (proxy_407_until or {}).get(proxy_str, 0.0)
     return until > time.time()
 
 
@@ -3076,7 +3179,7 @@ def _park_proxy_407(proxy_str):
     if not proxy_str:
         return
     try:
-        STATE.setdefault("proxy_407_until", {})[proxy_str] = time.time() + PROXY_407_COOLDOWN
+        proxy_407_until[proxy_str] = time.time() + PROXY_407_COOLDOWN
     except Exception:
         pass
 
@@ -3084,6 +3187,7 @@ def _park_proxy_407(proxy_str):
 def _gated_tunnel(proxy_str, timeout=None, targets=None):
     """Run tunnel_probe() behind the proxy gate, the per-IP gate and the
     per-SUB-USER gate."""
+    _rebind_scope()
     info = parse_proxy(proxy_str)
     base_wait = max(3.0, float(timeout if timeout is not None else probe_timeout()) + 2.0)
     wait = _gate_wait(base_wait)
@@ -3605,24 +3709,33 @@ def load_json(path, default=None):
     return default
 
 
-domain_cache = load_json("domain_cache.json", {})
-proxy_meta = STATE["meta"]
+# FIX ISO-6: this user's own domain cache file, and their own proxy meta table.
+domain_cache = load_json(live_cfg().get("CACHE_FILE", "domain_cache.json"), {})
+proxy_meta = _user_state()["proxy_meta"]
+
+
+def _proxy_path() -> str:
+    try:
+        return live_cfg().get("PROXY_FILE") or "proxies.txt"
+    except Exception:
+        return "proxies.txt"
 
 
 def load_proxies(quiet: bool = False):
-    """Proxies come from proxies.txt only."""
-    if not os.path.exists("proxies.txt"):
+    """Proxies come from THIS USER's proxies.txt only."""
+    _path = _proxy_path()
+    if not os.path.exists(_path):
         try:
             with file_write_lock:
-                with open("proxies.txt", "w", encoding="utf-8") as f:
+                with open(_path, "w", encoding="utf-8") as f:
                     if OXYLABS_PROXIES:
                         f.write("\n".join(OXYLABS_PROXIES) + "\n")
-            log_startup(f"Created proxies.txt (seeded from secrets: "
+            log_startup(f"Created {_path} (seeded from secrets: "
                         f"{len(OXYLABS_PROXIES)}).", quiet=quiet)
         except Exception as e:
-            log_startup(f"WARNING: Failed to initialize proxies.txt: {e}", quiet=quiet)
+            log_startup(f"WARNING: Failed to initialize {_path}: {e}", quiet=quiet)
     try:
-        with open("proxies.txt", encoding="utf-8", errors="ignore") as f:
+        with open(_path, encoding="utf-8", errors="ignore") as f:
             raw_list = [l.strip() for l in f if l.strip() and not l.startswith("#")]
         try:
             dedupe = bool(CFG.get("DEDUPE_PROXIES", DEDUPE_PROXIES_DEFAULT))
@@ -3631,14 +3744,14 @@ def load_proxies(quiet: bool = False):
         if dedupe:
             uniq = list(dict.fromkeys(raw_list))
             if len(uniq) != len(raw_list):
-                log_startup(f"Loaded {len(raw_list)} proxies from proxies.txt "
+                log_startup(f"Loaded {len(raw_list)} proxies from {_path} "
                             f"({len(uniq)} unique after dedupe).", quiet=quiet)
             raw_list = uniq
         else:
-            log_startup(f"Loaded {len(raw_list)} proxies from proxies.txt.", quiet=quiet)
+            log_startup(f"Loaded {len(raw_list)} proxies from {_path}.", quiet=quiet)
         return raw_list
     except Exception as e:
-        log_startup(f"WARNING: Failed to read proxies.txt: {e}", quiet=quiet)
+        log_startup(f"WARNING: Failed to read {_path}: {e}", quiet=quiet)
         return []
 
 
@@ -3718,7 +3831,7 @@ def clear_proxy_quarantine():
         proxy_quarantine.clear()
     _proxy_407.clear()
     try:
-        STATE.setdefault("proxy_407_until", {}).clear()
+        proxy_407_until.clear()
     except Exception:
         pass
     log_probe_event("quarantine cleared by user")
@@ -4184,10 +4297,12 @@ def build_cfg():
         "DYNAMIC_WORKER_SCALING": dynamic_worker_scaling,
         "CUSTOM_WHITELIST": [d.strip().lower() for d in custom_whitelist_input.split(",") if d.strip()],
         "CUSTOM_BLACKLIST": [d.strip().lower() for d in custom_blacklist_input.split(",") if d.strip()],
-        "PROXY_FILE": "proxies.txt",
+        "PROXY_FILE": user_file("proxies.txt"),
+        "PROXY_ALL_FILE": user_file("proxies_all.txt"),
+        "PROXY_KEYMAP_FILE": user_file("proxy_key_map.json"),
         "RESULTS_DIR": user_file("mail_results"),
-        "CACHE_FILE": "domain_cache.json",
-        "PROXY_META_FILE": "proxy_meta.json",
+        "CACHE_FILE": user_file("domain_cache.json"),
+        "PROXY_META_FILE": user_file("proxy_meta.json"),
         "MAX_PROXY_TRIES": engine_config.max_retries,
         "PROXY_CONNECT_TIMEOUT": engine_config.connect_timeout,
         "FAST_MODE": engine_config.fast_mode,
@@ -4299,11 +4414,19 @@ for _k, _v in (
 ):
     CFG.setdefault(_k, _v)
 
-# The path is re-asserted every run, so an applied_cfg inherited from a previous
-# user can never outlive the switch even if a branch above was skipped.
+# The paths are re-asserted every run, so an applied_cfg inherited from a
+# previous user can never outlive the switch even if a branch above was skipped.
 CFG["RESULTS_DIR"] = user_file("mail_results")
+CFG["PROXY_FILE"] = user_file("proxies.txt")
+CFG["PROXY_ALL_FILE"] = user_file("proxies_all.txt")
+CFG["PROXY_KEYMAP_FILE"] = user_file("proxy_key_map.json")
+CFG["CACHE_FILE"] = user_file("domain_cache.json")
+CFG["PROXY_META_FILE"] = user_file("proxy_meta.json")
 
 STATE["cfg"] = CFG
+# FIX ISO-6 (v13.59): seed the SCRIPT thread too. Without this live_cfg() fell
+# straight through to STATE["cfg"], which any other session's rerun overwrites.
+seed_task_cfg(CFG)
 
 log_startup(
     f"ACTIVE CONFIG -> protocols={CFG.get('PROTOCOLS')} mode={CFG.get('MODE_NAME')} "
@@ -5393,6 +5516,7 @@ def _smtp_hosts_for(domain, cap=SMTP_HOST_CAP):
 # @@BLOCK 069 POOL_SAMPLE deps=052
 def sample_alive_proxy(exclude=None, domain=None, avoid=None):
     """RANDOM ROTATION with an account-level avoid set."""
+    _rebind_scope()
     exclude = set(exclude or ())
     avoid = set(avoid or ())
     with alive_pool_lock:
@@ -5412,7 +5536,7 @@ def sample_alive_proxy(exclude=None, domain=None, avoid=None):
                     proxy_quarantine.clear()
                 _proxy_407.clear()
                 try:
-                    STATE.setdefault("proxy_407_until", {}).clear()
+                    proxy_407_until.clear()
                 except Exception:
                     pass
                 log_startup("Quarantine lifted: every pool node had 407'd - retrying them all.",
@@ -5445,11 +5569,11 @@ def sample_alive_proxy(exclude=None, domain=None, avoid=None):
         # FIX RR-1 (v13.50): index into cand, not pool. The avoid-set was built
         # and then thrown away, so round-robin re-served a node the account had
         # just failed through - the one thing the avoid-set exists to stop.
-        with STATE["rr_lock"]:
+        with _rr_lock:
             STATE["rr_index"] = (STATE["rr_index"] + 1) % len(cand)
             return cand[STATE["rr_index"]]
 
-    with STATE["rr_lock"]:
+    with _rr_lock:
         last = STATE.get("rr_last")
         if len(cand) > 1 and last in cand:
             cand = [p for p in cand if p != last]
@@ -5856,67 +5980,58 @@ def mail_dest_spot_check(force: bool = False):
 
 # @@BLOCK 074 REFRESH_POOL deps=013,014,025,058,069,071,073
 def _collapse_by_hostport(lines, reasons):
-    """One entry per host:port, PLUS up to POOL_SUBUSER_PER_IP_MAX distinct sub-users.
+    """One entry per (host:port, SUB-USER) pair. No per-IP cap.
 
     v13.55: THE COLLAPSE WAS TOO STRONG. 122 fetched lines are ~12 sub-users
     stacked on 9 IPs. Pass-first kept ONE line per IP, and because the provider
     lists the first sub-user's lines first, that sub-user claimed every IP - the
     pool became 9 nodes on one sub-user while PROXY_SUBUSER_CONCURRENCY is 1, so
-    nine nodes allowed exactly one concurrent tunnel. The IP gate already caps
-    concurrency per IP, so the pool is allowed to carry that many lines per IP -
-    each from a DIFFERENT sub-user, and only ones that actually passed.
+    nine nodes allowed exactly one concurrent tunnel.
 
-    v13.58: the allowance was 2, which is one spare key per IP. A key that 402s
-    then removed the whole IP from the rotation on its second line, and the other
-    seven keys you pay for were never reachable. It follows
-    PROXY_IP_CONCURRENCY plus two, ceiling POOL_SUBUSER_PER_IP_MAX.
+    v13.58: THE CAP IS GONE. It went to 2, then 4, and each time a key you pay for
+    was collapsed away before you could see it - 18 keys produced a 32-line pool
+    and a 5-row health table. You are billed per API KEY, so every key keeps its
+    own line and its own row. The per-IP gate still caps CONCURRENCY at
+    PROXY_IP_CONCURRENCY; the extra lines only widen ROTATION.
 
-    Pass 1: one PASSING line claims each IP.
-    Pass 2: extra PASSING lines for that IP from sub-users not already used,
-            up to the per-IP allowance.
-    Pass 3: only an IP with nothing at all falls back to a 402 / other line.
+    Pass 1: the pair PASSED.
+    Pass 2: the pair answered 402 - alive, authenticates, out of bandwidth.
+    Pass 3: anything else, so a dead endpoint stays visible instead of vanishing.
     """
-    try:
-        _conc = max(1, int(live_cfg().get("PROXY_IP_CONCURRENCY",
-                                          PROXY_IP_CONCURRENCY_DEFAULT)))
-    except Exception:
-        _conc = 1
-    _per_ip = max(2, min(POOL_SUBUSER_PER_IP_MAX, _conc + 2))
+    _kept, _seen = {}, set()
 
-    _kept, _users = {}, {}
-
-    def _hp_of(p):
+    def _pair(p):
         _i = parse_proxy(p)
-        return (f"{_i['host']}:{_i['port']}", (_i.get("user") or "").lower()) if _i else (None, "")
+        if not _i:
+            return None
+        return (f"{_i['host']}:{_i['port']}", (_i.get("user") or "").lower())
 
     for _p in lines:
-        _hp, _u = _hp_of(_p)
-        if not _hp or reasons.get(_p) != "ok" or _hp in _kept:
+        _k = _pair(_p)
+        if not _k or _k in _seen or reasons.get(_p) != "ok":
             continue
-        _kept[_hp] = [_p]
-        _users[_hp] = {_u}
-
-    if _per_ip > 1:
-        for _p in lines:
-            _hp, _u = _hp_of(_p)
-            if not _hp or reasons.get(_p) != "ok" or _hp not in _kept:
-                continue
-            if len(_kept[_hp]) >= _per_ip or not _u or _u in _users.get(_hp, set()):
-                continue
-            _kept[_hp].append(_p)
-            _users.setdefault(_hp, set()).add(_u)
+        _seen.add(_k)
+        _kept[_k] = _p
 
     for _p in lines:
-        _hp, _u = _hp_of(_p)
-        if not _hp or _hp in _kept:
+        _k = _pair(_p)
+        if not _k or _k in _seen or reasons.get(_p) != "plan":
             continue
-        _kept[_hp] = [_p]
-        _users[_hp] = {_u}
+        _seen.add(_k)
+        _kept[_k] = _p
 
-    return [p for _lst in _kept.values() for p in _lst]
+    for _p in lines:
+        _k = _pair(_p)
+        if not _k or _k in _seen:
+            continue
+        _seen.add(_k)
+        _kept[_k] = _p
+
+    return list(_kept.values())
 
 
 def refresh_alive_pool(force: bool = False, budget: float = None):
+    _rebind_scope()
     budget = float(budget if budget is not None else PROBE_BATCH_BUDGET)
 
     if (not force) and (not _any_run_active()) \
@@ -5933,7 +6048,7 @@ def refresh_alive_pool(force: bool = False, budget: float = None):
             return
 
     if (not force) and _any_run_active():
-        last = STATE.get("last_probe_ts", 0.0)
+        last = _US.get("last_probe_ts", 0.0)
         if last and (time.time() - last) < PROBER_STALE_WHILE_RUNNING:
             try:
                 _PROBE_OWNER_LOCK.release()
@@ -5941,7 +6056,7 @@ def refresh_alive_pool(force: bool = False, budget: float = None):
                 pass
             return
 
-    STATE["probe_in_flight"] = True
+    _US["probe_in_flight"] = True
     try:
         try:
             raw = get_filtered_active_proxies(quiet=True)
@@ -5952,6 +6067,19 @@ def refresh_alive_pool(force: bool = False, budget: float = None):
                 alive_pool[:] = []
             log_startup("Alive pool refreshed: proxies.txt is empty.", quiet=True)
             return
+
+        # FIX NOLIMIT-1 (v13.59): the caller's budget was a fixed 120s, so a
+        # 2000-line file kept only the first few hundred lines that finished and
+        # silently abandoned the rest. The budget now scales with the file at 4s
+        # per line and is bounded only by PROBE_BATCH_MAX.
+        try:
+            _scaled = min(PROBE_BATCH_MAX, max(budget, len(raw) * 4.0))
+        except Exception:
+            _scaled = budget
+        if _scaled > budget:
+            log_probe_event(f"probe budget scaled for {len(raw)} line(s): "
+                            f"{budget:.0f}s -> {_scaled:.0f}s")
+            budget = _scaled
 
         # FIX SCORE-5 (v13.49): a FORCED probe re-measures every node, so the
         # accumulated `fails` is stale history from a different provider state.
@@ -6012,11 +6140,11 @@ def refresh_alive_pool(force: bool = False, budget: float = None):
         _tgts = probe_targets()
         log_probe_event(f"refresh start: {len(raw)} candidate(s), target={live_cfg().get('PROBE_TARGET')} "
                         f"({[t[0] for t in _tgts]}), budget={budget:.0f}s, "
-                        f"workers={probe_workers()}, runs_active={STATE.get('runs_active', 0)}")
+                        f"workers={probe_workers()}, runs_active={_US.get('runs_active', 0)}")
 
         live, batch_timed_out = _run_batch(precheck_proxy_fast, raw, probe_workers(), budget)
 
-        # FIX POOL-DUP (v13.49) + v13.55/v13.58 per-IP allowance.
+        # FIX POOL-DUP (v13.49) + v13.58 per-credential collapse.
         try:
             with probe_stats_lock:
                 _psnap = {k: (v.get("reason") or "") for k, v in probe_stats.items()}
@@ -6029,10 +6157,9 @@ def refresh_alive_pool(force: bool = False, budget: float = None):
                 _ips_seen = len({(parse_proxy(p) or {}).get("host") for p in live})
                 _keys_seen = len({((parse_proxy(p) or {}).get("user") or "").lower()
                                   for p in live})
-                log_probe_event(f"pool collapsed by host:port, pass-first, "
-                                f"up to {POOL_SUBUSER_PER_IP_MAX} sub-users per IP: "
-                                f"{_before} -> {len(live)} line(s) over {_ips_seen} "
-                                f"IP(s) and {_keys_seen} key(s)")
+                log_probe_event(f"pool collapsed by host:port+sub-user: {_before} -> "
+                                f"{len(live)} line(s) over {_ips_seen} IP(s) and "
+                                f"{_keys_seen} sub-user(s)")
 
         strict = bool(live_cfg().get("PROBE_STRICT", PROBE_STRICT_DEFAULT))
         note = ""
@@ -6058,8 +6185,8 @@ def refresh_alive_pool(force: bool = False, budget: float = None):
             alive_pool[:] = live
         enrich_proxy_geo(live)
         save_proxy_meta()
-        STATE["last_probe_ts"] = time.time()
-        STATE["probe_runs"] = int(STATE.get("probe_runs", 0)) + 1
+        _US["last_probe_ts"] = time.time()
+        _US["probe_runs"] = int(_US.get("probe_runs", 0)) + 1
 
         try:
             mail_dest_spot_check()
@@ -6075,8 +6202,8 @@ def refresh_alive_pool(force: bool = False, budget: float = None):
         log_probe_event(f"refresh end: alive={len(live)}/{len(raw)} pass={passed} "
                         f"auth={auth} plan={plan_n} timeout={timeout_n} dead={dead}{note}")
     finally:
-        STATE["probe_in_flight"] = False
-        STATE["last_probe_ts"] = time.time()
+        _US["probe_in_flight"] = False
+        _US["last_probe_ts"] = time.time()
         try:
             _PROBE_OWNER_LOCK.release()
         except Exception:
@@ -6085,13 +6212,24 @@ def refresh_alive_pool(force: bool = False, budget: float = None):
 
 # @@BLOCK 075 ALIVE_THREAD deps=013,074
 def start_alive_refresher():
-    if any(t.name == "alive-pool" for t in threading.enumerate()):
+    """One prober thread PER SCOPE.
+
+    FIX ISO-6 (v13.59): there was one global "alive-pool" thread. Its tables are
+    per-user now, so it would only ever have refreshed whoever happened to start
+    it, and the `any(t.name == "alive-pool")` guard made every later user a
+    no-op. The scope is pinned on the thread so _gate_scope(), _user_state() and
+    every gate resolve to the right owner for its whole life.
+    """
+    _who = _gate_scope()
+    _name = "alive-pool-" + _who
+    if any(t.name == _name for t in threading.enumerate()):
         return
 
     def loop():
+        _pin_gate_scope(_who)
         while True:
             try:
-                if STATE.get("run_active"):
+                if _any_run_active():
                     refresh_alive_pool()
                     time.sleep(PROBER_BUSY_SLEEP)
                 else:
@@ -6100,7 +6238,7 @@ def start_alive_refresher():
             except Exception:
                 time.sleep(PROBER_BUSY_SLEEP)
 
-    threading.Thread(target=loop, daemon=True, name="alive-pool").start()
+    threading.Thread(target=loop, daemon=True, name=_name).start()
 
 
 start_alive_refresher()
@@ -6129,7 +6267,7 @@ def _probe_pair_for(email, domain, flags):
 
 
 def _set_probe_targets_from_queue(accounts, cap=1):
-    """Resolve the AUTO probe target from the ACTUAL queue."""
+    """Resolve the AUTO probe target from the ACTUAL queue. Per user."""
     flags = protocol_flags()
     out, seen_domains, seen_pairs = [], set(), set()
     for raw in accounts or []:
@@ -6170,7 +6308,17 @@ def fetch_and_test_all_proxies(silent: bool = False):
     calls - 92 nodes x 5s is ~460s of dead page. It is pooled now.
     FIX 407-SCOPE: the completion line no longer calls a TCP-alive fallback line
     "validated" - it reports the two counts separately.
-    FIX POOL-DUP: the survivor list is collapsed to one entry per host:port.
+    FIX POOL-DUP: the survivor list is collapsed to one entry per credential pair.
+
+    FIX KEY-1 (v13.58): THE LINE-TO-KEY ASSOCIATION WAS THROWN AWAY. fetch_ws()
+    was mapped over WEBSHARE_KEYS and the returned lines were flattened into one
+    list on the next line, so nothing downstream could say WHICH API key a bad
+    node belonged to - and you cannot delete a key you cannot identify. Each line
+    now carries the index of the key that produced it, the map is kept in STATE
+    and written to proxy_key_map.json, and every table names the key.
+
+    FIX ISO-6 (v13.59): the map, the raw backup and the probe budget are per user
+    now - they follow the same unlocked prefix as proxies.txt.
     """
     global all_proxies, filtered_pool
 
@@ -6181,9 +6329,11 @@ def fetch_and_test_all_proxies(silent: bool = False):
 
     log_startup("Bulk fetch & test of Webshare / Oxylabs proxies started.")
     all_raw = []
+    keymap = {}
 
-    def fetch_ws(key):
+    def fetch_ws(item):
         """PAGINATE.  Reading page 1 and stopping loses every later line."""
+        idx, key = item
         proxies = []
         try:
             page = 1
@@ -6193,33 +6343,52 @@ def fetch_and_test_all_proxies(silent: bool = False):
                     params={"mode": "direct", "page": page, "page_size": 250},
                     headers={"Authorization": f"Token {key}"}, timeout=8)
                 if r.status_code != 200:
+                    log_startup(f"Fetch: key #{idx + 1} answered HTTP {r.status_code} "
+                                f"on page {page} - stopping that key.", quiet=True)
                     break
                 data = r.json() or {}
                 results = data.get("results") or []
-                for item in results:
-                    ip, port = item.get("proxy_address"), item.get("port")
-                    user, pwd = item.get("username"), item.get("password")
+                for item2 in results:
+                    ip, port = item2.get("proxy_address"), item2.get("port")
+                    user, pwd = item2.get("username"), item2.get("password")
                     if ip and port:
-                        proxies.append(f"{user}:{pwd}@{ip}:{port}" if user and pwd
-                                       else f"{ip}:{port}")
+                        line = (f"{user}:{pwd}@{ip}:{port}" if user and pwd
+                                else f"{ip}:{port}")
+                        proxies.append((line, idx))
                 nxt = data.get("next")
                 if not nxt or not results or len(results) < 250:
                     break
                 page += 1
         except Exception as e:
-            warnings.warn(f"Failed fetching Webshare proxy key: {e}")
+            warnings.warn(f"Failed fetching Webshare proxy key #{idx + 1}: {e}")
+        if not proxies:
+            log_startup(f"Fetch: key #{idx + 1} returned NO proxy lines - it is dead, "
+                        f"revoked, or has no sub-users.", quiet=True)
         return proxies
 
     try:
         with ThreadPoolExecutor(max_workers=5) as executor:
-            for res in executor.map(fetch_ws, WEBSHARE_KEYS):
-                all_raw.extend(res)
+            for res in executor.map(fetch_ws, list(enumerate(WEBSHARE_KEYS))):
+                for _line, _idx in res:
+                    keymap.setdefault(_line, _idx)
+                    all_raw.append(_line)
     except Exception as e:
         warnings.warn(f"ThreadPool Webshare fetch error: {e}")
 
+    for _ol in OXYLABS_PROXIES:
+        keymap.setdefault(_ol, -1)
     all_raw.extend(OXYLABS_PROXIES)
     all_raw = list(dict.fromkeys(all_raw))
     total = len(all_raw)
+
+    # Keep the association. _US survives a rerun; the JSON survives a restart.
+    _US["proxy_key_map"] = keymap
+    try:
+        with file_write_lock:
+            with open(CFG["PROXY_KEYMAP_FILE"], "w", encoding="utf-8") as _kmf:
+                json.dump(keymap, _kmf, indent=1)
+    except Exception as _kme:
+        log_startup(f"WARNING: could not write proxy_key_map.json: {_kme}")
 
     if not all_raw:
         log_startup("Fetch & test: no proxy line returned.")
@@ -6232,7 +6401,7 @@ def fetch_and_test_all_proxies(silent: bool = False):
     # is the way back - and there is a Restore button.
     try:
         with file_write_lock:
-            with open("proxies_all.txt", "w", encoding="utf-8") as _bf:
+            with open(CFG["PROXY_ALL_FILE"], "w", encoding="utf-8") as _bf:
                 _bf.write("\n".join(str(i) for i in all_raw) + ("\n" if all_raw else ""))
         log_startup(f"Backed up the raw fetched pool to proxies_all.txt ({len(all_raw)} line(s)).")
     except Exception as _bex:
@@ -6262,7 +6431,7 @@ def fetch_and_test_all_proxies(silent: bool = False):
 
     alive = []
     _ft_timed_out = False
-    batch_timeout = max(60.0, min(PROBE_BATCH_BUDGET * 3.0, len(all_raw) * 3.0))
+    batch_timeout = max(60.0, min(PROBE_BATCH_MAX * 3.0, len(all_raw) * 3.0))
     _chunk = 24
     _started = time.time()
     _pbar = None
@@ -6306,11 +6475,8 @@ def fetch_and_test_all_proxies(silent: bool = False):
 
     alive = list(dict.fromkeys(alive))
 
-    # FIX POOL-DUP + v13.55: one entry per host:port, plus up to 2 distinct
-    # PASSING sub-users per IP (see _collapse_by_hostport in block 074). The
-    # sub-user is what the provider meters and the per-SUBUSER gate is 1, so a
-    # pool that keeps only one sub-user per IP runs at one concurrent tunnel
-    # however many nodes it appears to hold.
+    # FIX POOL-DUP + v13.58: one entry per (host:port, SUB-USER) pair, so every
+    # API key you pay for keeps its own line. See _collapse_by_hostport in block 074.
     try:
         with probe_stats_lock:
             _psnap = {k: (v.get("reason") or "") for k, v in probe_stats.items()}
@@ -6323,10 +6489,9 @@ def fetch_and_test_all_proxies(silent: bool = False):
             _ips_seen = len({(parse_proxy(p) or {}).get("host") for p in alive})
             _subs_seen = len({((parse_proxy(p) or {}).get("user") or "").lower()
                               for p in alive})
-            log_startup(f"Fetch & test: {_before} passing line(s) collapsed to "
-                        f"{len(alive)} line(s) over {_ips_seen} IP(s) and "
-                        f"{_subs_seen} sub-user(s) - one entry per IP, up to 2 "
-                        f"sub-users each.")
+            log_startup(f"Fetch & test: {_before} line(s) collapsed to {len(alive)} "
+                        f"line(s) over {_ips_seen} IP(s) and {_subs_seen} sub-user(s) "
+                        f"- one entry per credential pair, no per-IP cap.")
 
     # FIX 407-SCOPE: the number of nodes that actually PASSED is remembered before
     # the TCP fallback, so the completion line can stop calling a bare open socket
@@ -6363,9 +6528,9 @@ def fetch_and_test_all_proxies(silent: bool = False):
     except Exception:
         pass
     save_proxy_meta()
-    STATE["last_probe_ts"] = time.time()
-    STATE["probe_runs"] = int(STATE.get("probe_runs", 0)) + 1
-    STATE["bootstrap_done"] = True
+    _US["last_probe_ts"] = time.time()
+    _US["probe_runs"] = int(_US.get("probe_runs", 0)) + 1
+    _US["bootstrap_done"] = True
 
     try:
         mail_dest_spot_check(force=True)
@@ -6489,8 +6654,8 @@ with str_lit.sidebar:
         _lvl, _msg = _flash
         getattr(str_lit, _lvl, str_lit.info)(_msg)
 
-    if (not all_proxies) and WEBSHARE_KEYS and not STATE.get("bootstrap_done"):
-        STATE["bootstrap_done"] = True
+    if (not all_proxies) and WEBSHARE_KEYS and not _US.get("bootstrap_done"):
+        _US["bootstrap_done"] = True
         with str_lit.spinner("First run - fetching and validating your proxy pool..."):
             try:
                 fetch_and_test_all_proxies(silent=True)
@@ -6499,19 +6664,44 @@ with str_lit.sidebar:
         all_proxies = load_proxies()
         filtered_pool = get_filtered_active_proxies(quiet=True)
 
-    if (STATE.get("last_probe_ts", 0.0) == 0.0 and all_proxies
-            and not STATE.get("probe_in_flight")
-            and not STATE.get("first_probe_kicked")):
-        STATE["first_probe_kicked"] = True
+    if (_US.get("last_probe_ts", 0.0) == 0.0 and all_proxies
+            and not _US.get("probe_in_flight")
+            and not _US.get("first_probe_kicked")):
+        _US["first_probe_kicked"] = True
         log_probe_event("first-load probe kicked to a background thread (UI not blocked)")
-        threading.Thread(
-            target=lambda: refresh_alive_pool(force=True, budget=PROBE_BATCH_BUDGET),
-            daemon=True, name="first-probe").start()
+        _pwho = _gate_scope()
+
+        def _first_probe(_scope=_pwho):
+            _pin_gate_scope(_scope)
+            refresh_alive_pool(force=True, budget=PROBE_BATCH_BUDGET)
+
+        threading.Thread(target=_first_probe, daemon=True,
+                         name="first-probe-" + _pwho).start()
         str_lit.caption("⏳ First probe running in the background - the page is already usable.")
+
+    # FIX KEY-1 (v13.58): THE KEY LABEL. A node is only actionable if you can name
+    # the API key behind it. The map is written by block 077; _US first (cheap),
+    # the per-user JSON as the restart-safe fallback.
+    _keymap = _US.get("proxy_key_map")
+    if not isinstance(_keymap, dict) or not _keymap:
+        _keymap = load_json(live_cfg().get("PROXY_KEYMAP_FILE", "proxy_key_map.json"), {}) or {}
+
+    def _key_of(proxy_line):
+        return _keymap.get(proxy_line, -2)
+
+    def _key_label(idx):
+        if idx == -1:
+            return "oxylabs"
+        if idx is None or idx < 0:
+            return "? (pre-restart)"
+        try:
+            return f"#{idx + 1} {WEBSHARE_KEYS[idx][:6]}…"
+        except Exception:
+            return f"#{idx + 1}"
 
     _q_now = quarantine_size()
     _alive_now = len(alive_pool)
-    _last_ts = STATE.get("last_probe_ts", 0.0)
+    _last_ts = _US.get("last_probe_ts", 0.0)
     _age = int(time.time() - _last_ts) if _last_ts else -1
     _age_txt = f"{_age}s ago" if _age >= 0 else "never"
 
@@ -6546,8 +6736,8 @@ with str_lit.sidebar:
     _steal = bool(_pend) and not _pend.get("outcome")
 
     str_lit.info(f"Loaded Proxies: **{len(all_proxies)}** lines / **{len(_ips)}** IPs / "
-                 f"**{len(_subs)}** sub-users | Filtered: **{len(filtered_pool)}** | "
-                 f"Alive: **{_alive_now}**")
+                 f"**{len(_subs)}** sub-users / **{len(WEBSHARE_KEYS)}** keys | "
+                 f"Filtered: **{len(filtered_pool)}** | Alive: **{_alive_now}**")
 
     if all_proxies and not filtered_pool:
         _etxt = ("⚠ **Every proxy was filtered out** by Min Proxy Score / pool mode / "
@@ -6592,7 +6782,7 @@ with str_lit.sidebar:
         f"Probe ({CFG.get('PROBE_TARGET', PROBE_TARGET_DEFAULT)}, {probe_timeout():.0f}s): "
         f"pass **{_p_ok}** | 407 **{_p_auth}** | 402 **{_p_plan}** | "
         f"timeout/reset **{_p_to}** | dead **{_p_dead}**  ·  last probe {_age_txt}  ·  "
-        f"runs {STATE.get('probe_runs', 0)}"
+        f"runs {_US.get('probe_runs', 0)}"
         + ("  ·  STRICT OFF" if not CFG.get("PROBE_STRICT", True) else "")
     )
     str_lit.caption(f"Probe targets in use: "
@@ -6704,7 +6894,7 @@ with str_lit.sidebar:
                 _uniq = list(dict.fromkeys(_lines))
                 str_lit.caption(f"{len(_lines)} line(s), {len(_uniq)} unique, "
                                 f"{'CREDS present' if any('@' in l for l in _lines) else 'NO CREDS (@ absent)'}")
-                str_lit.code("\n".join(_lines[:60]), language="text")
+                str_lit.code("\n".join(_lines), language="text")
             except Exception as _pf_err:
                 str_lit.error(f"Could not read proxies.txt: {_pf_err}")
     with _rc3:
@@ -6712,8 +6902,9 @@ with str_lit.sidebar:
                           help="Fetch & Test writes only the SURVIVORS into proxies.txt. "
                                "This puts the full raw fetched pool back."):
             try:
-                if os.path.exists("proxies_all.txt"):
-                    with open("proxies_all.txt", encoding="utf-8", errors="ignore") as _rf:
+                _allp = CFG.get("PROXY_ALL_FILE") or "proxies_all.txt"
+                if os.path.exists(_allp):
+                    with open(_allp, encoding="utf-8", errors="ignore") as _rf:
                         _restore = [l.strip() for l in _rf
                                     if l.strip() and not l.strip().startswith("#")]
                     if _restore:
@@ -6794,13 +6985,6 @@ with str_lit.sidebar:
             _file_keys = set(all_proxies)
         except Exception:
             _file_keys = set()
-        # v13.54: AND SHOW ONLY THE NODES THAT EXIST. proxy_meta accumulates every
-        # line from every past pool, so the table read 122 rows over a 9-line file
-        # and every retired node showed its old reason and an Unknown country.
-        # FIX KEY-1 (v13.58): they are no longer merely HIDDEN - the retired set is
-        # kept aside and rendered in its own table below, because a key you just
-        # added is not in proxies.txt until it survives a fetch, so its lines live
-        # here and used to be invisible.
         _meta_snap = dict(_meta_all)
         _hidden_snap = {}
         if _file_keys:
@@ -6808,24 +6992,19 @@ with str_lit.sidebar:
             _meta_snap = {k: v for k, v in _meta_all.items() if k in _file_keys}
         _hidden = len(_hidden_snap)
 
-        # The rollups read probe stats, restricted to the lines that are actually
-        # in proxies.txt, so a retired pool cannot pad the numbers.
-        _roll_src = {k: v for k, v in _pstats.items()
-                     if not _file_keys or k in _file_keys}
-
-        # ---- FIX KEY-1: PER-KEY (SUB-USER) ROLLUP, worst first --------------
-        # The provider meters a SUB-USER. One bad API key is therefore a whole key
-        # of IDENTICAL verdicts, and it was invisible: the node table shows one
-        # row per line and the collapse only surfaces a few of them. This rolls
-        # every probed line up by key so a key that 402s or tcp-dies on all of its
-        # lines is ONE row with an explicit action, instead of twenty scattered.
+        # ---- FIX KEY-1: PER-KEY ROLLUP, worst first ------------------------
+        # Rolled up by API KEY, over EVERY probed line - not just the ones that
+        # survived into proxies.txt, because a key whose whole output was dropped
+        # is exactly the key you are looking for and it used to leave no trace
+        # here at all.
         _key_roll = {}
-        for _kp, _kv in _roll_src.items():
+        for _kp, _kv in _pstats.items():
             _ki = parse_proxy(_kp)
-            _ku = ((_ki.get("user") if _ki else "") or "(no user)").lower()
+            _kid = _keymap.get(_kp, -2)
             _kr = (_kv.get("reason") or "?")
-            _b = _key_roll.setdefault(_ku, {"n": 0, "pass": 0, "plan": 0,
-                                            "auth": 0, "dead": 0, "ips": set()})
+            _b = _key_roll.setdefault(_kid, {"n": 0, "pass": 0, "plan": 0,
+                                             "auth": 0, "dead": 0,
+                                             "ips": set(), "users": set()})
             _b["n"] += 1
             if _kv.get("ok"):
                 _b["pass"] += 1
@@ -6837,9 +7016,10 @@ with str_lit.sidebar:
                 _b["dead"] += 1
             if _ki:
                 _b["ips"].add(_ki["host"])
+                _b["users"].add((_ki.get("user") or "").lower())
         if _key_roll:
             _rows_k = []
-            for _ku, _b in _key_roll.items():
+            for _kid, _b in _key_roll.items():
                 if _b["pass"]:
                     _verdict, _act = "OK", ""
                 elif _b["plan"] and not _b["dead"]:
@@ -6847,38 +7027,48 @@ with str_lit.sidebar:
                     _act = "keep - bandwidth, recovers on reset"
                 elif _b["auth"] and not _b["dead"] and not _b["plan"]:
                     _verdict = "REJECTED - 407 on every line"
-                    _act = "fix the key's user:pass, or delete it"
+                    _act = f"fix the key's user:pass, or delete key {_key_label(_kid)}"
                 elif _b["dead"] and not _b["plan"] and not _b["auth"]:
                     _verdict = "DEAD - never answered on any line"
-                    _act = "DELETE this key"
+                    _act = f"DELETE key {_key_label(_kid)} in Secrets"
+                elif not _b["n"]:
+                    _verdict, _act = "NO LINES - key returned nothing", "DELETE this key"
                 else:
                     _verdict, _act = "MIXED - see the node table", "inspect below"
                 _rows_k.append({
-                    "Key (sub-user)": _ku,
+                    "Key #": _key_label(_kid),
                     "Lines": _b["n"],
                     "Passed": _b["pass"],
                     "402 spent": _b["plan"],
                     "407 auth": _b["auth"],
                     "Dead/timeout": _b["dead"],
                     "IPs": len(_b["ips"]),
+                    "Sub-users": ", ".join(sorted(u for u in _b["users"] if u)) or "-",
                     "Verdict": _verdict,
                     "Action": _act,
                 })
+            for _kid in range(len(WEBSHARE_KEYS)):
+                if _kid not in _key_roll:
+                    _rows_k.append({
+                        "Key #": _key_label(_kid), "Lines": 0, "Passed": 0,
+                        "402 spent": 0, "407 auth": 0, "Dead/timeout": 0, "IPs": 0,
+                        "Sub-users": "-",
+                        "Verdict": "NO LINES - key returned nothing",
+                        "Action": "DELETE this key in Secrets",
+                    })
             _rows_k.sort(key=lambda r: (r["Passed"], -r["Dead/timeout"], -r["Lines"]))
             str_lit.markdown("**Per-key health - worst first**")
             str_lit.caption(
-                "The provider meters a SUB-USER, so one bad API key is a whole key of "
-                "identical verdicts. A key with **0 passed** and a Dead/timeout count is "
-                "the one to delete in the Webshare dashboard. A key that is 402 on every "
-                "line is only out of bandwidth and will come back on its own.")
+                "One row per API key in WEBSHARE_KEYS. The provider meters a SUB-USER, "
+                "so a bad key is a whole key of identical verdicts. A key with **0 "
+                "passed** and a Dead/timeout count, or one that returned no lines at "
+                "all, is the one to delete from Secrets. A key that is 402 on every "
+                "line is only out of bandwidth and comes back on its own.")
             str_lit.dataframe(pd.DataFrame(_rows_k), width="stretch")
 
         # ---- FIX KEY-1: DEAD ENDPOINTS --------------------------------------
-        # A key can be perfect and the IP still dead. Roll the same data up by IP
-        # so a host that timed out for EVERY key is named separately and is not
-        # mistaken for nine broken keys.
         _ip_roll = {}
-        for _ipk, _ipv in _roll_src.items():
+        for _ipk, _ipv in _pstats.items():
             _ipi = parse_proxy(_ipk)
             if not _ipi:
                 continue
@@ -6889,7 +7079,7 @@ with str_lit.sidebar:
                 _b["pass"] += 1
             if (_ipv.get("reason") or "") in ("timeout", "transport", "tcp", "dead"):
                 _b["dead"] += 1
-            _b["keys"].add((_ipi.get("user") or "").lower())
+            _b["keys"].add(_keymap.get(_ipk, -2))
         _dead_ips = {h: b for h, b in _ip_roll.items()
                      if b["pass"] == 0 and b["dead"] >= 1}
         if _dead_ips:
@@ -6903,7 +7093,7 @@ with str_lit.sidebar:
             str_lit.markdown("**Dead endpoints - 0 passed, every key**")
             str_lit.caption(
                 "These hosts failed on EVERY key, so the key is not the problem - the "
-                "IP:port is. Removing the key would only lose good keys.")
+                "IP:port is. Deleting a key would only lose good keys.")
             str_lit.dataframe(pd.DataFrame(_rows_i), width="stretch")
 
         if _meta_snap:
@@ -6923,6 +7113,7 @@ with str_lit.sidebar:
                 # probe records latency on failure too; read that first.
                 _lat = _ps.get("latency_ms", meta.get("latency_ms", 0))
                 rows.append({
+                    "Key #": _key_label(_key_of(p_str)),
                     "Key": (info.get("user") if info else "") or "",
                     "Proxy": f"{info['host']}:{info['port']}" if info else "Unknown",
                     "Latency": f"{_lat} ms",
@@ -6980,43 +7171,33 @@ with str_lit.sidebar:
         else:
             str_lit.info("No proxy metadata recorded yet.")
 
-        # ---- FIX KEY-1: THE RETIRED TABLE -----------------------------------
-        # The collapse keeps a bounded number of lines per IP, so a key you have
-        # just added is fetched, probed and then NOT written to proxies.txt until
-        # it wins a slot. Its verdict lived only in the hidden half of proxy_meta
-        # and was unreachable. It is a table now, key first.
+        # ---- FIX KEY-1: THE RETIRED TABLE (no row cap) -----------------------
         if _hidden_snap:
             with str_lit.expander(f"🗄 Retired / not-in-pool nodes — {_hidden} line(s) "
                                   f"(probed, not written to proxies.txt)",
                                   expanded=False):
                 str_lit.caption(
-                    "Every fetched line that did not make the pool: collapsed away by "
-                    "the per-IP allowance, filtered by score, or held back by the "
-                    "verdict. Read the Key column - a key that appears here on every "
-                    "line and never in the node table is the key to delete.")
+                    "Fetched lines that did not make the pool: filtered by score or held "
+                    "back by the verdict. Read the Key # column - a key that appears here "
+                    "on every line and never in the node table is the key to delete.")
                 _rows_h = []
                 for _hk, _hm in _hidden_snap.items():
                     _hi = parse_proxy(_hk)
                     _hr = (_pstats.get(_hk) or {}).get("reason") or "not probed"
                     _rows_h.append({
+                        "Key #": _key_label(_key_of(_hk)),
                         "Key": (_hi.get("user") if _hi else "") or "",
                         "Proxy": f"{_hi['host']}:{_hi['port']}" if _hi else "?",
                         "Verdict": _PROBE_REASON_LABEL.get(_hr, _hr),
                         "Error": ((_pstats.get(_hk) or {}).get("error", "") or "")[:160],
                     })
-                _rows_h.sort(key=lambda r: (r["Key"], r["Proxy"]))
-                str_lit.dataframe(pd.DataFrame(_rows_h[:200]), width="stretch")
-                if _hidden > 200:
-                    str_lit.caption(f"...and {_hidden - 200} more.")
+                _rows_h.sort(key=lambda r: (r["Key #"], r["Proxy"]))
+                str_lit.dataframe(pd.DataFrame(_rows_h), width="stretch")
 
         # v13.55: A DROPPED LINE MUST NOT VANISH SILENTLY. proxies_all.txt
         # holds every fetched line; anything in it that is not in proxies.txt
         # was judged and left out. Read-only: nothing is re-tested.
-        # Hoisted OUT of `if _meta_snap:`: that branch is gated on the filtered
-        # snapshot, so an emptied pool fell into the else and hid the very
-        # section that explains the emptying.
-        _all_path = os.path.join(os.path.dirname(CFG["PROXY_FILE"]) or ".",
-                                 "proxies_all.txt")
+        _all_path = CFG.get("PROXY_ALL_FILE") or "proxies_all.txt"
         try:
             _all_keys = set()
             if os.path.exists(_all_path):
@@ -7024,7 +7205,6 @@ with str_lit.sidebar:
                     _all_keys = {l.strip() for l in _af
                                  if l.strip() and not l.strip().startswith("#")}
         except Exception as _all_err:
-            # Don't collapse an unreadable file into "nothing dropped" silently.
             _all_keys = set()
             log_startup(f"WARNING: could not read proxies_all.txt: {_all_err}")
             str_lit.caption(f"⚠ Could not read proxies_all.txt: {_all_err}")
@@ -7034,7 +7214,6 @@ with str_lit.sidebar:
             for _d in _dropped:
                 _r = (_pstats.get(_d) or {}).get("reason") or "not probed"
                 _why[_r] = _why.get(_r, 0) + 1
-            # Cap the label: a wide spread of verdict strings otherwise truncates.
             _why_items = sorted(_why.items(), key=lambda kv: -kv[1])
             _why_txt = " · ".join(f"{k} {v}" for k, v in _why_items[:3])
             if len(_why_items) > 3:
@@ -7046,24 +7225,21 @@ with str_lit.sidebar:
                     "Judged and left out at the last Fetch & Test. 402 / 407 lines "
                     "are ALIVE and authenticate — they were only set aside because "
                     "another line on the same IP passed. 'Restore from "
-                    "proxies_all.txt' puts every one of them back. A 407 line whose "
-                    "credential you fix will be re-probed and re-admitted on the "
-                    "next Fetch & Test. **Read the Key column** — a key that fills "
-                    "this table is the key to delete.")
+                    "proxies_all.txt' puts every one of them back. **Read the Key # "
+                    "column** — a key that fills this table is the key to delete.")
                 _rows_d = []
-                for _d in _dropped[:60]:
+                for _d in _dropped:
                     _di = parse_proxy(_d)
                     _dr = (_pstats.get(_d) or {}).get("reason") or "not probed"
                     _rows_d.append({
+                        "Key #": _key_label(_key_of(_d)),
                         "Key": (_di.get("user") if _di else "") or "",
                         "Proxy": f"{_di['host']}:{_di['port']}" if _di else "?",
                         "Verdict": _PROBE_REASON_LABEL.get(_dr, _dr),
                         "Error": ((_pstats.get(_d) or {}).get("error", "") or "")[:160],
                     })
-                _rows_d.sort(key=lambda r: (r["Key"], r["Proxy"]))
+                _rows_d.sort(key=lambda r: (r["Key #"], r["Proxy"]))
                 str_lit.dataframe(pd.DataFrame(_rows_d), width="stretch")
-                if len(_dropped) > 60:
-                    str_lit.caption(f"...and {len(_dropped) - 60} more.")
 # @@END 080 PROXY_MGMT_UI
 
 # @@BLOCK 081 PROXY_DEBUG_AND_DIAG_UI deps=014,016,024,026,027,030,052,070,073,080
@@ -7084,7 +7260,9 @@ with str_lit.sidebar:
         if not all_proxies:
             str_lit.info("No proxy lines loaded - run Fetch & Test first.")
         else:
-            _dbg_opts = [f"#{i + 1}  {p[:64]}" for i, p in enumerate(all_proxies[:200])]
+            # FIX NOLIMIT-1 (v13.59): this was all_proxies[:200], so line 201 of a
+            # 3000-line pool could not even be selected.
+            _dbg_opts = [f"#{i + 1}  {p[:64]}" for i, p in enumerate(all_proxies)]
             _dbg_sel = str_lit.selectbox(
                 "Line to trace", range(len(_dbg_opts)),
                 format_func=lambda i: _dbg_opts[i], key="_dbg_sel")
@@ -7300,7 +7478,7 @@ with str_lit.sidebar:
                 _add = _dbg_run(_kind)
                 _log = str_lit.session_state.setdefault("_dbg_log", [])
                 _log.extend(_add)
-                str_lit.session_state["_dbg_log"] = _log[-400:]
+                str_lit.session_state["_dbg_log"] = _log[-600:]
 
             _show = str_lit.session_state.get("_dbg_log") or []
             if _show:
@@ -10226,6 +10404,13 @@ if start_engine_btn:
             # placeholders - all outside any finally - so any throw in that stretch
             # left runs_active permanently +1 and the deployment believed a run was
             # live forever.
+            # FIX ISO-6 (v13.59): the count is PER USER now. One shared count meant
+            # user B's page could not tell whether user A's run was live, so the
+            # READY banner and the prober cadence were decided for the wrong person.
+            # It is resolved through _user_state() rather than the bare _US alias,
+            # because a prober thread in another tab rebinds _US.
+            _us_run = _user_state()
+            _us_run["runs_active"] = int(_us_run.get("runs_active", 0)) + 1
             STATE["runs_active"] = int(STATE.get("runs_active", 0)) + 1
             STATE["run_active"] = True
             str_lit.session_state["run_active"] = True
@@ -10551,6 +10736,10 @@ if start_engine_btn:
             # FIX ISO-4 (v13.49): decrement the count and DERIVE the bool, so a
             # second user's run is not told the deployment went idle when this one
             # ends. max(0, ...) keeps a double release from going negative.
+            # FIX ISO-6 (v13.59): the count is per user; the process counter is
+            # only a mirror for anything that needs "any run anywhere".
+            _us_run = _user_state()
+            _us_run["runs_active"] = max(0, int(_us_run.get("runs_active", 0)) - 1)
             STATE["runs_active"] = max(0, int(STATE.get("runs_active", 0)) - 1)
             STATE["run_active"] = STATE["runs_active"] > 0
             str_lit.session_state["run_active"] = False
