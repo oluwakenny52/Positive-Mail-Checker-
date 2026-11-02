@@ -758,6 +758,12 @@ PROBE_STRICT_DEFAULT = True
 MIN_PROXY_SCORE_DEFAULT = 5
 BLACKLIST_CF_DEFAULT = 15
 CIRCUIT_BREAKER_SECONDS = 30.0
+# FIX KEY-1 (v13.58): how many DIFFERENT sub-users one IP may contribute to the
+# live pool. The provider meters SUB-USERS, not IPs, so this is the number of
+# independent keys the rotation can fall back to on that IP - and 2 was too
+# tight: one 402 key took the whole IP out of the rotation. The per-IP gate
+# still caps real CONCURRENCY at PROXY_IP_CONCURRENCY; this only widens CHOICE.
+POOL_SUBUSER_PER_IP_MAX = 4
 # @@END 017 POOL_FILTER_CONSTANTS
 
 # @@BLOCK 018 PROBE_TARGET_TABLES deps=-
@@ -5850,7 +5856,7 @@ def mail_dest_spot_check(force: bool = False):
 
 # @@BLOCK 074 REFRESH_POOL deps=013,014,025,058,069,071,073
 def _collapse_by_hostport(lines, reasons):
-    """One entry per host:port, PLUS up to PROXY_IP_CONCURRENCY distinct sub-users.
+    """One entry per host:port, PLUS up to POOL_SUBUSER_PER_IP_MAX distinct sub-users.
 
     v13.55: THE COLLAPSE WAS TOO STRONG. 122 fetched lines are ~12 sub-users
     stacked on 9 IPs. Pass-first kept ONE line per IP, and because the provider
@@ -5860,17 +5866,22 @@ def _collapse_by_hostport(lines, reasons):
     concurrency per IP, so the pool is allowed to carry that many lines per IP -
     each from a DIFFERENT sub-user, and only ones that actually passed.
 
+    v13.58: the allowance was 2, which is one spare key per IP. A key that 402s
+    then removed the whole IP from the rotation on its second line, and the other
+    seven keys you pay for were never reachable. It follows
+    PROXY_IP_CONCURRENCY plus two, ceiling POOL_SUBUSER_PER_IP_MAX.
+
     Pass 1: one PASSING line claims each IP.
     Pass 2: extra PASSING lines for that IP from sub-users not already used,
             up to the per-IP allowance.
     Pass 3: only an IP with nothing at all falls back to a 402 / other line.
     """
     try:
-        _per_ip = max(1, int(live_cfg().get("PROXY_IP_CONCURRENCY",
-                                            PROXY_IP_CONCURRENCY_DEFAULT)))
+        _conc = max(1, int(live_cfg().get("PROXY_IP_CONCURRENCY",
+                                          PROXY_IP_CONCURRENCY_DEFAULT)))
     except Exception:
-        _per_ip = 1
-    _per_ip = max(1, min(2, _per_ip))
+        _conc = 1
+    _per_ip = max(2, min(POOL_SUBUSER_PER_IP_MAX, _conc + 2))
 
     _kept, _users = {}, {}
 
@@ -6005,7 +6016,7 @@ def refresh_alive_pool(force: bool = False, budget: float = None):
 
         live, batch_timed_out = _run_batch(precheck_proxy_fast, raw, probe_workers(), budget)
 
-        # FIX POOL-DUP (v13.49) + v13.55 per-IP allowance. See _collapse_by_hostport.
+        # FIX POOL-DUP (v13.49) + v13.55/v13.58 per-IP allowance.
         try:
             with probe_stats_lock:
                 _psnap = {k: (v.get("reason") or "") for k, v in probe_stats.items()}
@@ -6016,9 +6027,12 @@ def refresh_alive_pool(force: bool = False, budget: float = None):
             live = _collapse_by_hostport(live, _psnap)
             if len(live) != _before:
                 _ips_seen = len({(parse_proxy(p) or {}).get("host") for p in live})
+                _keys_seen = len({((parse_proxy(p) or {}).get("user") or "").lower()
+                                  for p in live})
                 log_probe_event(f"pool collapsed by host:port, pass-first, "
-                                f"up to 2 sub-users per IP: {_before} -> {len(live)} "
-                                f"line(s) over {_ips_seen} IP(s)")
+                                f"up to {POOL_SUBUSER_PER_IP_MAX} sub-users per IP: "
+                                f"{_before} -> {len(live)} line(s) over {_ips_seen} "
+                                f"IP(s) and {_keys_seen} key(s)")
 
         strict = bool(live_cfg().get("PROBE_STRICT", PROBE_STRICT_DEFAULT))
         note = ""
@@ -6775,18 +6789,123 @@ with str_lit.sidebar:
         # RuntimeError: dictionary changed size during iteration whenever the probe
         # thread inserted a node mid-render.
         with proxy_lock:
-            _meta_snap = dict(proxy_meta)
-        # v13.54: AND SHOW ONLY THE NODES THAT EXIST. proxy_meta accumulates every
-        # line from every past pool, so the table read 122 rows over a 9-line file
-        # and every retired node showed its old reason and an Unknown country.
+            _meta_all = dict(proxy_meta)
         try:
             _file_keys = set(all_proxies)
         except Exception:
             _file_keys = set()
-        _hidden = 0
+        # v13.54: AND SHOW ONLY THE NODES THAT EXIST. proxy_meta accumulates every
+        # line from every past pool, so the table read 122 rows over a 9-line file
+        # and every retired node showed its old reason and an Unknown country.
+        # FIX KEY-1 (v13.58): they are no longer merely HIDDEN - the retired set is
+        # kept aside and rendered in its own table below, because a key you just
+        # added is not in proxies.txt until it survives a fetch, so its lines live
+        # here and used to be invisible.
+        _meta_snap = dict(_meta_all)
+        _hidden_snap = {}
         if _file_keys:
-            _hidden = sum(1 for k in _meta_snap if k not in _file_keys)
-            _meta_snap = {k: v for k, v in _meta_snap.items() if k in _file_keys}
+            _hidden_snap = {k: v for k, v in _meta_all.items() if k not in _file_keys}
+            _meta_snap = {k: v for k, v in _meta_all.items() if k in _file_keys}
+        _hidden = len(_hidden_snap)
+
+        # The rollups read probe stats, restricted to the lines that are actually
+        # in proxies.txt, so a retired pool cannot pad the numbers.
+        _roll_src = {k: v for k, v in _pstats.items()
+                     if not _file_keys or k in _file_keys}
+
+        # ---- FIX KEY-1: PER-KEY (SUB-USER) ROLLUP, worst first --------------
+        # The provider meters a SUB-USER. One bad API key is therefore a whole key
+        # of IDENTICAL verdicts, and it was invisible: the node table shows one
+        # row per line and the collapse only surfaces a few of them. This rolls
+        # every probed line up by key so a key that 402s or tcp-dies on all of its
+        # lines is ONE row with an explicit action, instead of twenty scattered.
+        _key_roll = {}
+        for _kp, _kv in _roll_src.items():
+            _ki = parse_proxy(_kp)
+            _ku = ((_ki.get("user") if _ki else "") or "(no user)").lower()
+            _kr = (_kv.get("reason") or "?")
+            _b = _key_roll.setdefault(_ku, {"n": 0, "pass": 0, "plan": 0,
+                                            "auth": 0, "dead": 0, "ips": set()})
+            _b["n"] += 1
+            if _kv.get("ok"):
+                _b["pass"] += 1
+            if _kr in ("auth", "auth_dest"):
+                _b["auth"] += 1
+            elif _kr == "plan":
+                _b["plan"] += 1
+            elif _kr in ("timeout", "transport", "tcp", "dead", "format"):
+                _b["dead"] += 1
+            if _ki:
+                _b["ips"].add(_ki["host"])
+        if _key_roll:
+            _rows_k = []
+            for _ku, _b in _key_roll.items():
+                if _b["pass"]:
+                    _verdict, _act = "OK", ""
+                elif _b["plan"] and not _b["dead"]:
+                    _verdict = "SPENT - 402 on every line"
+                    _act = "keep - bandwidth, recovers on reset"
+                elif _b["auth"] and not _b["dead"] and not _b["plan"]:
+                    _verdict = "REJECTED - 407 on every line"
+                    _act = "fix the key's user:pass, or delete it"
+                elif _b["dead"] and not _b["plan"] and not _b["auth"]:
+                    _verdict = "DEAD - never answered on any line"
+                    _act = "DELETE this key"
+                else:
+                    _verdict, _act = "MIXED - see the node table", "inspect below"
+                _rows_k.append({
+                    "Key (sub-user)": _ku,
+                    "Lines": _b["n"],
+                    "Passed": _b["pass"],
+                    "402 spent": _b["plan"],
+                    "407 auth": _b["auth"],
+                    "Dead/timeout": _b["dead"],
+                    "IPs": len(_b["ips"]),
+                    "Verdict": _verdict,
+                    "Action": _act,
+                })
+            _rows_k.sort(key=lambda r: (r["Passed"], -r["Dead/timeout"], -r["Lines"]))
+            str_lit.markdown("**Per-key health - worst first**")
+            str_lit.caption(
+                "The provider meters a SUB-USER, so one bad API key is a whole key of "
+                "identical verdicts. A key with **0 passed** and a Dead/timeout count is "
+                "the one to delete in the Webshare dashboard. A key that is 402 on every "
+                "line is only out of bandwidth and will come back on its own.")
+            str_lit.dataframe(pd.DataFrame(_rows_k), width="stretch")
+
+        # ---- FIX KEY-1: DEAD ENDPOINTS --------------------------------------
+        # A key can be perfect and the IP still dead. Roll the same data up by IP
+        # so a host that timed out for EVERY key is named separately and is not
+        # mistaken for nine broken keys.
+        _ip_roll = {}
+        for _ipk, _ipv in _roll_src.items():
+            _ipi = parse_proxy(_ipk)
+            if not _ipi:
+                continue
+            _b = _ip_roll.setdefault(_ipi["host"], {"n": 0, "pass": 0, "dead": 0,
+                                                    "keys": set()})
+            _b["n"] += 1
+            if _ipv.get("ok"):
+                _b["pass"] += 1
+            if (_ipv.get("reason") or "") in ("timeout", "transport", "tcp", "dead"):
+                _b["dead"] += 1
+            _b["keys"].add((_ipi.get("user") or "").lower())
+        _dead_ips = {h: b for h, b in _ip_roll.items()
+                     if b["pass"] == 0 and b["dead"] >= 1}
+        if _dead_ips:
+            _rows_i = [{
+                "Dead endpoint": _h,
+                "Lines": _b["n"],
+                "Keys tried": len(_b["keys"]),
+                "Never answered": _b["dead"],
+                "Action": "remove the host:port line, not the key",
+            } for _h, _b in sorted(_dead_ips.items(), key=lambda kv: -kv[1]["dead"])]
+            str_lit.markdown("**Dead endpoints - 0 passed, every key**")
+            str_lit.caption(
+                "These hosts failed on EVERY key, so the key is not the problem - the "
+                "IP:port is. Removing the key would only lose good keys.")
+            str_lit.dataframe(pd.DataFrame(_rows_i), width="stretch")
+
         if _meta_snap:
             rows = []
             for p_str, meta in _meta_snap.items():
@@ -6804,8 +6923,8 @@ with str_lit.sidebar:
                 # probe records latency on failure too; read that first.
                 _lat = _ps.get("latency_ms", meta.get("latency_ms", 0))
                 rows.append({
+                    "Key": (info.get("user") if info else "") or "",
                     "Proxy": f"{info['host']}:{info['port']}" if info else "Unknown",
-                    "User": (info.get("user") if info else "") or "",
                     "Latency": f"{_lat} ms",
                     "Country": meta.get("country", "Unknown"),
                     "Region": meta.get("region", "Unknown"),
@@ -6821,8 +6940,8 @@ with str_lit.sidebar:
                 })
             if _hidden:
                 str_lit.caption(f"{len(_meta_snap)} row(s) for the {len(_file_keys)} "
-                                f"line(s) in proxies.txt. {_hidden} retired node(s) from "
-                                f"earlier pools are hidden.")
+                                f"line(s) in proxies.txt. The other {_hidden} line(s) are "
+                                f"in the retired table below.")
             str_lit.caption(
                 f"Probe target {CFG.get('PROBE_TARGET', PROBE_TARGET_DEFAULT)} · "
                 f"budget {probe_timeout():.0f}s · strict={CFG.get('PROBE_STRICT', True)} · "
@@ -6861,16 +6980,41 @@ with str_lit.sidebar:
         else:
             str_lit.info("No proxy metadata recorded yet.")
 
+        # ---- FIX KEY-1: THE RETIRED TABLE -----------------------------------
+        # The collapse keeps a bounded number of lines per IP, so a key you have
+        # just added is fetched, probed and then NOT written to proxies.txt until
+        # it wins a slot. Its verdict lived only in the hidden half of proxy_meta
+        # and was unreachable. It is a table now, key first.
+        if _hidden_snap:
+            with str_lit.expander(f"🗄 Retired / not-in-pool nodes — {_hidden} line(s) "
+                                  f"(probed, not written to proxies.txt)",
+                                  expanded=False):
+                str_lit.caption(
+                    "Every fetched line that did not make the pool: collapsed away by "
+                    "the per-IP allowance, filtered by score, or held back by the "
+                    "verdict. Read the Key column - a key that appears here on every "
+                    "line and never in the node table is the key to delete.")
+                _rows_h = []
+                for _hk, _hm in _hidden_snap.items():
+                    _hi = parse_proxy(_hk)
+                    _hr = (_pstats.get(_hk) or {}).get("reason") or "not probed"
+                    _rows_h.append({
+                        "Key": (_hi.get("user") if _hi else "") or "",
+                        "Proxy": f"{_hi['host']}:{_hi['port']}" if _hi else "?",
+                        "Verdict": _PROBE_REASON_LABEL.get(_hr, _hr),
+                        "Error": ((_pstats.get(_hk) or {}).get("error", "") or "")[:160],
+                    })
+                _rows_h.sort(key=lambda r: (r["Key"], r["Proxy"]))
+                str_lit.dataframe(pd.DataFrame(_rows_h[:200]), width="stretch")
+                if _hidden > 200:
+                    str_lit.caption(f"...and {_hidden - 200} more.")
+
         # v13.55: A DROPPED LINE MUST NOT VANISH SILENTLY. proxies_all.txt
         # holds every fetched line; anything in it that is not in proxies.txt
-        # was judged and left out. Without this the pool just looked smaller
-        # than the fetch, and there was no record of the engine's verdict on
-        # a node - which is what makes an Oxylabs line look "lost" rather
-        # than "judged 407 and set aside". Read-only: nothing is re-tested.
+        # was judged and left out. Read-only: nothing is re-tested.
         # Hoisted OUT of `if _meta_snap:`: that branch is gated on the filtered
         # snapshot, so an emptied pool fell into the else and hid the very
-        # section that explains the emptying. Here _file_keys is still in scope
-        # (assigned above), and when it is empty _dropped lists everything.
+        # section that explains the emptying.
         _all_path = os.path.join(os.path.dirname(CFG["PROXY_FILE"]) or ".",
                                  "proxies_all.txt")
         try:
@@ -6904,17 +7048,19 @@ with str_lit.sidebar:
                     "another line on the same IP passed. 'Restore from "
                     "proxies_all.txt' puts every one of them back. A 407 line whose "
                     "credential you fix will be re-probed and re-admitted on the "
-                    "next Fetch & Test.")
+                    "next Fetch & Test. **Read the Key column** — a key that fills "
+                    "this table is the key to delete.")
                 _rows_d = []
                 for _d in _dropped[:60]:
                     _di = parse_proxy(_d)
                     _dr = (_pstats.get(_d) or {}).get("reason") or "not probed"
                     _rows_d.append({
+                        "Key": (_di.get("user") if _di else "") or "",
                         "Proxy": f"{_di['host']}:{_di['port']}" if _di else "?",
-                        "User": (_di.get("user") if _di else "") or "",
                         "Verdict": _PROBE_REASON_LABEL.get(_dr, _dr),
                         "Error": ((_pstats.get(_d) or {}).get("error", "") or "")[:160],
                     })
+                _rows_d.sort(key=lambda r: (r["Key"], r["Proxy"]))
                 str_lit.dataframe(pd.DataFrame(_rows_d), width="stretch")
                 if len(_dropped) > 60:
                     str_lit.caption(f"...and {len(_dropped) - 60} more.")
