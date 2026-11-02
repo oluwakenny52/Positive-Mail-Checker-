@@ -1291,6 +1291,27 @@ def record_probe_result(proxy_str, ok, reason, latency_ms=0, target="",
     STATE["last_probe_ts"] = time.time()
 
 
+def _probe_snapshot():
+    """(key, record) pairs, RESTRICTED to lines that are still in proxies.txt.
+
+    v13.54: NOTHING PRUNES probe_stats while idle. refresh_alive_pool returns at
+    its first line when no run is active and idle probing is off, and the prune
+    sits far below that - so every entry from an earlier, larger pool survived.
+    The sidebar read "16 validated node(s) armed" over a 9-line file, and the
+    breakdown counted 122 entries for 9 nodes. Filtering on read fixes the
+    display without touching the prune.
+    """
+    with probe_stats_lock:
+        snap = list(probe_stats.items())
+    try:
+        live_keys = set(globals().get("all_proxies") or ())
+    except Exception:
+        live_keys = set()
+    if live_keys:
+        snap = [(k, v) for k, v in snap if k in live_keys]
+    return snap
+
+
 def probe_summary():
     """(passed, auth, plan, timeout, dead) over the most recent probe of each node.
 
@@ -1303,24 +1324,21 @@ def probe_summary():
     service. It gets its own column so `dead` stops absorbing it and the UI can
     say which of the two a zero-success pool actually is.
     """
-    with probe_stats_lock:
-        snap = list(probe_stats.values())
-    passed = sum(1 for v in snap if v.get("ok"))
-    auth = sum(1 for v in snap if v.get("reason") in ("auth", "auth_dest"))
-    plan = sum(1 for v in snap if v.get("reason") == "plan")
-    timeout = sum(1 for v in snap if not v.get("ok")
+    vals = [v for _k, v in _probe_snapshot()]
+    passed = sum(1 for v in vals if v.get("ok"))
+    auth = sum(1 for v in vals if v.get("reason") in ("auth", "auth_dest"))
+    plan = sum(1 for v in vals if v.get("reason") == "plan")
+    timeout = sum(1 for v in vals if not v.get("ok")
                   and v.get("reason") in ("timeout", "transport"))
-    dead = sum(1 for v in snap if not v.get("ok")
+    dead = sum(1 for v in vals if not v.get("ok")
                and v.get("reason") not in ("auth", "auth_dest", "plan",
                                            "timeout", "transport"))
     return passed, auth, plan, timeout, dead
 
 
 def probe_reason_histogram():
-    with probe_stats_lock:
-        snap = list(probe_stats.values())
     hist = defaultdict(int)
-    for v in snap:
+    for _k, v in _probe_snapshot():
         hist[v.get("reason") or "?"] += 1
     return dict(sorted(hist.items(), key=lambda kv: -kv[1]))
 
@@ -5819,22 +5837,36 @@ def refresh_alive_pool(force: bool = False, budget: float = None):
         live, batch_timed_out = _run_batch(precheck_proxy_fast, raw, probe_workers(), budget)
 
         # FIX POOL-DUP (v13.49): eleven sub-user lines can point at the SAME
-        # host:port and only one of those sub-users may be alive - the rest 402.
-        # A random draw over 112 lines then spends ~90% of its attempts on dead
-        # sub-users while the ten working proxies sit in the same pool. Collapse
-        # to one line per host:port, keeping whichever line PASSED (they arrive in
-        # candidate order, so the first hit is a pass if any line on that IP did).
+        # host:port. A random draw over 112 lines then spends ~90% of its
+        # attempts on sub-users the provider is refusing.
+        #
+        # v13.54: THE SURVIVOR MUST BE A PASS, NOT A 402. The collapse used to
+        # keep whichever line came first, and since block 071 now keeps a 402 node
+        # in the pool, a spent sub-user could claim an IP over a working one. On
+        # this plan 402 is PER SUB-USER (the same IP passes for one sub-user and
+        # 402s for another in the same second), so a bad pick cost the whole IP.
+        # Pass 1 lets `ok` lines claim their host:port; pass 2 only fills IPs that
+        # no passing line claimed.
+        try:
+            with probe_stats_lock:
+                _psnap = {k: (v.get("reason") or "") for k, v in probe_stats.items()}
+        except Exception:
+            _psnap = {}
         _seen_hp = {}
         for _p in live:
             _pi = parse_proxy(_p)
-            if not _pi:
-                continue
-            _seen_hp.setdefault(f"{_pi['host']}:{_pi['port']}", _p)
+            if _pi and _psnap.get(_p) == "ok":
+                _seen_hp.setdefault(f"{_pi['host']}:{_pi['port']}", _p)
+        for _p in live:
+            _pi = parse_proxy(_p)
+            if _pi:
+                _seen_hp.setdefault(f"{_pi['host']}:{_pi['port']}", _p)
         if _seen_hp:
             _before = len(live)
             live = list(_seen_hp.values())
             if len(live) != _before:
-                log_probe_event(f"pool deduped by host:port: {_before} -> {len(live)}")
+                log_probe_event(f"pool deduped by host:port, pass-first: "
+                                f"{_before} -> {len(live)}")
 
         strict = bool(live_cfg().get("PROBE_STRICT", PROBE_STRICT_DEFAULT))
         note = ""
@@ -5973,7 +6005,7 @@ def fetch_and_test_all_proxies(silent: bool = False):
     FIX 407-SCOPE: the completion line no longer calls a TCP-alive fallback line
     "validated" - it reports the two counts separately.
     FIX POOL-DUP: the survivor list is collapsed to one line per host:port before
-    it is written, so a pool of 112 lines over 10 IPs becomes 10 lines.
+    it is written.
     """
     global all_proxies, filtered_pool
 
@@ -6109,21 +6141,31 @@ def fetch_and_test_all_proxies(silent: bool = False):
 
     alive = list(dict.fromkeys(alive))
 
-    # FIX POOL-DUP: one line per host:port, keeping a line that PASSED. Eleven
-    # sub-users on one IP are one proxy; carrying all eleven into the pool spends
-    # nine attempts out of ten on sub-users the provider is refusing.
+    # FIX POOL-DUP: one line per host:port.
+    # v13.54: THE SURVIVOR MUST BE A PASS, NOT A 402. 402 is metered PER SUB-USER
+    # on this provider - the same IP passes for one sub-user and 402s for another
+    # in the same second - so a bad pick throws away a whole working IP. Pass 1
+    # lets `ok` lines claim their host:port, pass 2 only fills unclaimed IPs.
+    try:
+        with probe_stats_lock:
+            _psnap = {k: (v.get("reason") or "") for k, v in probe_stats.items()}
+    except Exception:
+        _psnap = {}
     _seen_hp = {}
     for _p in alive:
         _pi = parse_proxy(_p)
-        if not _pi:
-            continue
-        _seen_hp.setdefault(f"{_pi['host']}:{_pi['port']}", _p)
+        if _pi and _psnap.get(_p) == "ok":
+            _seen_hp.setdefault(f"{_pi['host']}:{_pi['port']}", _p)
+    for _p in alive:
+        _pi = parse_proxy(_p)
+        if _pi:
+            _seen_hp.setdefault(f"{_pi['host']}:{_pi['port']}", _p)
     if _seen_hp:
         _before = len(alive)
         alive = list(_seen_hp.values())
         if len(alive) != _before:
-            log_startup(f"Fetch & test: survivor list collapsed by host:port "
-                        f"{_before} -> {len(alive)} (same IP under several sub-users).")
+            log_startup(f"Fetch & test: survivor list collapsed by host:port, pass-first "
+                        f"{_before} -> {len(alive)}.")
 
     # FIX 407-SCOPE: the number of nodes that actually PASSED is remembered before
     # the TCP fallback, so the completion line can stop calling a bare open socket
@@ -6572,10 +6614,20 @@ with str_lit.sidebar:
             _pstats = dict(probe_stats)
         # v13.54: SNAPSHOT UNDER THE LOCK. Iterating proxy_meta directly raised
         # RuntimeError: dictionary changed size during iteration whenever the probe
-        # thread inserted a node mid-render - which killed this whole expander and
-        # everything after it on the page.
+        # thread inserted a node mid-render.
         with proxy_lock:
             _meta_snap = dict(proxy_meta)
+        # v13.54: AND SHOW ONLY THE NODES THAT EXIST. proxy_meta accumulates every
+        # line from every past pool, so the table read 122 rows over a 9-line file
+        # and every retired node showed its old reason and an Unknown country.
+        try:
+            _file_keys = set(all_proxies)
+        except Exception:
+            _file_keys = set()
+        _hidden = 0
+        if _file_keys:
+            _hidden = sum(1 for k in _meta_snap if k not in _file_keys)
+            _meta_snap = {k: v for k, v in _meta_snap.items() if k in _file_keys}
         if _meta_snap:
             rows = []
             for p_str, meta in _meta_snap.items():
@@ -6608,6 +6660,10 @@ with str_lit.sidebar:
                     "Last Error": (_ps.get("error", "") or "")[:200],
                     "Quarantined": "yes" if proxy_is_quarantined(p_str) else "",
                 })
+            if _hidden:
+                str_lit.caption(f"{len(_meta_snap)} row(s) for the {len(_file_keys)} "
+                                f"line(s) in proxies.txt. {_hidden} retired node(s) from "
+                                f"earlier pools are hidden.")
             str_lit.caption(
                 f"Probe target {CFG.get('PROBE_TARGET', PROBE_TARGET_DEFAULT)} · "
                 f"budget {probe_timeout():.0f}s · strict={CFG.get('PROBE_STRICT', True)} · "
@@ -8227,8 +8283,12 @@ def _check_account_core(email, password, conf, domain, proxy_pool, thread_state,
     # ever SET it, so the TLS-refused tail branch was always live and outranked a
     # real RETRY / RBL answer from a later rung.  It is set wherever the server
     # gave an auth-shaped answer.
+    # v13.54: saw_plan is new.  A 402 never reached a mailbox and sets none of the
+    # other flags, so a wholly 402 proxy phase looked like a clean run with no
+    # answer - the direct sweep was skipped and the account landed on FAILED.
     flags = {"saw_407": False, "saw_nonproxy": False, "saw_server": False,
-             "saw_login_drop": False, "saw_tls_refused": False, "saw_auth": False}
+             "saw_login_drop": False, "saw_tls_refused": False, "saw_auth": False,
+             "saw_plan": False}
     force_direct = {"flag": False}
     host_407 = {}
     net_failed_hosts = set()
@@ -8812,8 +8872,15 @@ def _check_account_core(email, password, conf, domain, proxy_pool, thread_state,
                             # node that is alive and authenticated. It is not the
                             # node, not the password, and not a network fault, so it
                             # advances the rung without rotating or striking.
+                            #
+                            # v13.54: IT ALSO SETS saw_plan. Nothing else here was
+                            # set by a 402, so a wholly 402 proxy phase looked like a
+                            # clean run with no answer: block 103's direct_reason
+                            # stayed false, the DIRECT sweep was skipped, and the
+                            # account fell through to the generic tail as FAILED.
                             err_text = str(pln)
                             flags["saw_nonproxy"] = True
+                            flags["saw_plan"] = True
                             record_proxy_attempt(px_used, success=False, is_plan=True)
                             trace_logs.append(
                                 f"{px_tag(px_used)} -> PROVIDER REFUSING SERVICE {proto} "
@@ -9163,7 +9230,7 @@ def _check_account_core(email, password, conf, domain, proxy_pool, thread_state,
             return None, had_net, saw_retry
 # @@END 102 CORE_SWEEP
 
-# @@BLOCK 103 CORE_PHASES deps=010,016,100,102
+# @@BLOCK 103 CORE_PHASES deps=010,016,025,100,102
         def run_phase(px_used, plan_used, deadline_ts, tag):
             if not plan_used:
                 return None, False, False
@@ -9192,6 +9259,21 @@ def _check_account_core(email, password, conf, domain, proxy_pool, thread_state,
                     direct_first = True
                     trace_logs.append(f"Pool {quarantine_size()}/{len(proxy_pool)} quarantined "
                                       f"-> auto Direct-First.")
+            except Exception:
+                pass
+        # v13.54: A 402-DOMINANT POOL GOES DIRECT FIRST. The provider is refusing
+        # service on nodes that are alive, so spending the proxy phase on them
+        # before trying the direct egress is pure waste - and with the node now
+        # kept in the pool (block 071) the phase can be wholly 402 and yield
+        # nothing. This mirrors the quarantine rule above.
+        if not direct_first and proxy_pool:
+            try:
+                _ds_ok, _ds_auth, _ds_plan, _ds_to, _ds_dead = probe_summary()
+                if _ds_plan and not _ds_ok and _ds_plan >= max(3, int(len(proxy_pool) * 0.5)):
+                    direct_first = True
+                    trace_logs.append(
+                        f"Pool is 402-dominant ({_ds_plan}/{len(proxy_pool)} refused service, "
+                        f"0 passed) -> auto Direct-First.")
             except Exception:
                 pass
 
@@ -9259,10 +9341,13 @@ def _check_account_core(email, password, conf, domain, proxy_pool, thread_state,
             # could never fall through to DIRECT - the direct_reason fix was
             # defeated one line later by the frozen gate.  Recompute it now that
             # we know what actually happened.
+            # v13.54: saw_plan joins the reasons. A 402 sets none of the others, so
+            # a wholly 402 proxy phase produced no verdict AND no direct sweep.
             allow_direct = (allow_direct or force_direct["flag"] or flags["saw_407"]
-                            or acct_407_total > 0 or net_fail or retryable)
+                            or flags.get("saw_plan") or acct_407_total > 0
+                            or net_fail or retryable)
             direct_reason = (px is None) or net_fail or retryable or force_direct["flag"] \
-                or flags["saw_407"] or acct_407_total > 0
+                or flags["saw_407"] or flags.get("saw_plan") or acct_407_total > 0
             if allow_direct and direct_reason:
                 res = _run_direct(direct_primary_deadline, hard_deadline)
                 if res:
@@ -9332,6 +9417,20 @@ def _check_account_core(email, password, conf, domain, proxy_pool, thread_state,
                 "password is untested. Only the implicit-TLS port (993) can answer here; if it "
                 "timed out, retry from a different egress or check the host's TLS listener"
             ), None, trace_logs
+    # v13.54: THE 402 TAIL. Without this a wholly 402 run ended on the generic
+    # "all hosts unreachable" text, which blames the mail host for a provider
+    # bandwidth/plan refusal and tells the user nothing they can act on.
+    if flags.get("saw_plan") and not flags.get("saw_server") and not retryable:
+        trace_logs.append(
+            "Every rung answered 402 Payment Required in the PROXY hop and no host ever "
+            "answered - the mailbox was never reached, so the password is untested. "
+            "The provider is refusing SERVICE on nodes that are alive and authenticated.")
+        return None, PROXY_UNHEALTHY, (
+            "the provider returned 402 Payment Required on every proxy attempt - the plan's "
+            "bandwidth or concurrency is spent. Those nodes are alive and authenticate, so "
+            "the password is untested and NOT wrong. Set Proxy Mode Engine = off (DIRECT), "
+            "or wait for the plan to reset, then re-run these accounts."
+        ), None, trace_logs
     if retryable:
         return None, RETRY, "retryable (proxy / IP-block / rate-limit)", None, trace_logs
     if flags.get("saw_server"):
