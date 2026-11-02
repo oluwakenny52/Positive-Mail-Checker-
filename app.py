@@ -5733,6 +5733,62 @@ def mail_dest_spot_check(force: bool = False):
 # @@END 073 MAIL_SPOT_CHECK
 
 # @@BLOCK 074 REFRESH_POOL deps=013,014,025,058,069,071,073
+def _collapse_by_hostport(lines, reasons):
+    """One entry per host:port, PLUS up to PROXY_IP_CONCURRENCY distinct sub-users.
+
+    v13.55: THE COLLAPSE WAS TOO STRONG. 122 fetched lines are ~12 sub-users
+    stacked on 9 IPs. Pass-first kept ONE line per IP, and because the provider
+    lists the first sub-user's lines first, that sub-user claimed every IP - the
+    pool became 9 nodes on one sub-user while PROXY_SUBUSER_CONCURRENCY is 1, so
+    nine nodes allowed exactly one concurrent tunnel. The IP gate already caps
+    concurrency per IP, so the pool is allowed to carry that many lines per IP -
+    each from a DIFFERENT sub-user, and only ones that actually passed.
+
+    Pass 1: one PASSING line claims each IP.
+    Pass 2: extra PASSING lines for that IP from sub-users not already used,
+            up to the per-IP allowance.
+    Pass 3: only an IP with nothing at all falls back to a 402 / other line.
+    """
+    try:
+        _per_ip = max(1, int(live_cfg().get("PROXY_IP_CONCURRENCY",
+                                            PROXY_IP_CONCURRENCY_DEFAULT)))
+    except Exception:
+        _per_ip = 1
+    _per_ip = max(1, min(2, _per_ip))
+
+    _kept, _users = {}, {}
+
+    def _hp_of(p):
+        _i = parse_proxy(p)
+        return (f"{_i['host']}:{_i['port']}", (_i.get("user") or "").lower()) if _i else (None, "")
+
+    for _p in lines:
+        _hp, _u = _hp_of(_p)
+        if not _hp or reasons.get(_p) != "ok" or _hp in _kept:
+            continue
+        _kept[_hp] = [_p]
+        _users[_hp] = {_u}
+
+    if _per_ip > 1:
+        for _p in lines:
+            _hp, _u = _hp_of(_p)
+            if not _hp or reasons.get(_p) != "ok" or _hp not in _kept:
+                continue
+            if len(_kept[_hp]) >= _per_ip or not _u or _u in _users.get(_hp, set()):
+                continue
+            _kept[_hp].append(_p)
+            _users.setdefault(_hp, set()).add(_u)
+
+    for _p in lines:
+        _hp, _u = _hp_of(_p)
+        if not _hp or _hp in _kept:
+            continue
+        _kept[_hp] = [_p]
+        _users[_hp] = {_u}
+
+    return [p for _lst in _kept.values() for p in _lst]
+
+
 def refresh_alive_pool(force: bool = False, budget: float = None):
     budget = float(budget if budget is not None else PROBE_BATCH_BUDGET)
 
@@ -5772,9 +5828,6 @@ def refresh_alive_pool(force: bool = False, budget: float = None):
 
         # FIX SCORE-5 (v13.49): a FORCED probe re-measures every node, so the
         # accumulated `fails` is stale history from a different provider state.
-        # Without this, a 402 storm left every node on a score of 0 for ever and
-        # Min Proxy Score then filtered the whole pool - permanently, because the
-        # score only recovers by succeeding and nothing could get through.
         if force:
             with proxy_lock:
                 for _p in raw:
@@ -5836,37 +5889,20 @@ def refresh_alive_pool(force: bool = False, budget: float = None):
 
         live, batch_timed_out = _run_batch(precheck_proxy_fast, raw, probe_workers(), budget)
 
-        # FIX POOL-DUP (v13.49): eleven sub-user lines can point at the SAME
-        # host:port. A random draw over 112 lines then spends ~90% of its
-        # attempts on sub-users the provider is refusing.
-        #
-        # v13.54: THE SURVIVOR MUST BE A PASS, NOT A 402. The collapse used to
-        # keep whichever line came first, and since block 071 now keeps a 402 node
-        # in the pool, a spent sub-user could claim an IP over a working one. On
-        # this plan 402 is PER SUB-USER (the same IP passes for one sub-user and
-        # 402s for another in the same second), so a bad pick cost the whole IP.
-        # Pass 1 lets `ok` lines claim their host:port; pass 2 only fills IPs that
-        # no passing line claimed.
+        # FIX POOL-DUP (v13.49) + v13.55 per-IP allowance. See _collapse_by_hostport.
         try:
             with probe_stats_lock:
                 _psnap = {k: (v.get("reason") or "") for k, v in probe_stats.items()}
         except Exception:
             _psnap = {}
-        _seen_hp = {}
-        for _p in live:
-            _pi = parse_proxy(_p)
-            if _pi and _psnap.get(_p) == "ok":
-                _seen_hp.setdefault(f"{_pi['host']}:{_pi['port']}", _p)
-        for _p in live:
-            _pi = parse_proxy(_p)
-            if _pi:
-                _seen_hp.setdefault(f"{_pi['host']}:{_pi['port']}", _p)
-        if _seen_hp:
+        if live:
             _before = len(live)
-            live = list(_seen_hp.values())
+            live = _collapse_by_hostport(live, _psnap)
             if len(live) != _before:
-                log_probe_event(f"pool deduped by host:port, pass-first: "
-                                f"{_before} -> {len(live)}")
+                _ips_seen = len({(parse_proxy(p) or {}).get("host") for p in live})
+                log_probe_event(f"pool collapsed by host:port, pass-first, "
+                                f"up to 2 sub-users per IP: {_before} -> {len(live)} "
+                                f"line(s) over {_ips_seen} IP(s)")
 
         strict = bool(live_cfg().get("PROBE_STRICT", PROBE_STRICT_DEFAULT))
         note = ""
@@ -5990,7 +6026,7 @@ def _set_probe_targets_from_queue(accounts, cap=1):
     return out
 # @@END 076 QUEUE_PROBE_TARGETS
 
-# @@BLOCK 077 FETCH_AND_TEST deps=012,014,015,025,026,052,058,067,070,071,072,073
+# @@BLOCK 077 FETCH_AND_TEST deps=012,014,015,025,026,052,058,067,070,071,072,073,074
 def fetch_and_test_all_proxies(silent: bool = False):
     """Fetch every configured provider's lines, validate them, write proxies.txt
     and ARM the live pool.  Returns (alive_count, total_count).
@@ -6004,8 +6040,7 @@ def fetch_and_test_all_proxies(silent: bool = False):
     calls - 92 nodes x 5s is ~460s of dead page. It is pooled now.
     FIX 407-SCOPE: the completion line no longer calls a TCP-alive fallback line
     "validated" - it reports the two counts separately.
-    FIX POOL-DUP: the survivor list is collapsed to one line per host:port before
-    it is written.
+    FIX POOL-DUP: the survivor list is collapsed to one entry per host:port.
     """
     global all_proxies, filtered_pool
 
@@ -6121,7 +6156,7 @@ def fetch_and_test_all_proxies(silent: bool = False):
                 try:
                     _pbar.progress(_done_n / max(1, len(all_raw)),
                                    text=f"Validating {_done_n}/{len(all_raw)} - "
-                                        f"{len(alive)} alive")
+                                        f"{len(alive)} passed")
                 except Exception:
                     pass
     finally:
@@ -6141,31 +6176,27 @@ def fetch_and_test_all_proxies(silent: bool = False):
 
     alive = list(dict.fromkeys(alive))
 
-    # FIX POOL-DUP: one line per host:port.
-    # v13.54: THE SURVIVOR MUST BE A PASS, NOT A 402. 402 is metered PER SUB-USER
-    # on this provider - the same IP passes for one sub-user and 402s for another
-    # in the same second - so a bad pick throws away a whole working IP. Pass 1
-    # lets `ok` lines claim their host:port, pass 2 only fills unclaimed IPs.
+    # FIX POOL-DUP + v13.55: one entry per host:port, plus up to 2 distinct
+    # PASSING sub-users per IP (see _collapse_by_hostport in block 074). The
+    # sub-user is what the provider meters and the per-SUBUSER gate is 1, so a
+    # pool that keeps only one sub-user per IP runs at one concurrent tunnel
+    # however many nodes it appears to hold.
     try:
         with probe_stats_lock:
             _psnap = {k: (v.get("reason") or "") for k, v in probe_stats.items()}
     except Exception:
         _psnap = {}
-    _seen_hp = {}
-    for _p in alive:
-        _pi = parse_proxy(_p)
-        if _pi and _psnap.get(_p) == "ok":
-            _seen_hp.setdefault(f"{_pi['host']}:{_pi['port']}", _p)
-    for _p in alive:
-        _pi = parse_proxy(_p)
-        if _pi:
-            _seen_hp.setdefault(f"{_pi['host']}:{_pi['port']}", _p)
-    if _seen_hp:
+    if alive:
         _before = len(alive)
-        alive = list(_seen_hp.values())
+        alive = _collapse_by_hostport(alive, _psnap)
         if len(alive) != _before:
-            log_startup(f"Fetch & test: survivor list collapsed by host:port, pass-first "
-                        f"{_before} -> {len(alive)}.")
+            _ips_seen = len({(parse_proxy(p) or {}).get("host") for p in alive})
+            _subs_seen = len({((parse_proxy(p) or {}).get("user") or "").lower()
+                              for p in alive})
+            log_startup(f"Fetch & test: {_before} passing line(s) collapsed to "
+                        f"{len(alive)} line(s) over {_ips_seen} IP(s) and "
+                        f"{_subs_seen} sub-user(s) - one entry per IP, up to 2 "
+                        f"sub-users each.")
 
     # FIX 407-SCOPE: the number of nodes that actually PASSED is remembered before
     # the TCP fallback, so the completion line can stop calling a bare open socket
