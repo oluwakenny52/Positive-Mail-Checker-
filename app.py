@@ -8276,12 +8276,88 @@ def host_resolves(host):
 # @@END 090 CANDIDATE_GEN
 
 # @@BLOCK 091 HOST_RANK deps=003,090
+# v13.60: LIVENESS NOW OUTRANKS TIER.
+#
+# This was a bare delegate to the ranker. Both rankers (hosts.py's and the block
+# 003 fallback) sort on the TIER first and put the 993/143 probe SECOND, so a
+# tier-0 service host that has been decommissioned still holds a rung ahead of a
+# live tier-3 apex. The ladder spends its first rung - and on a short window its
+# whole window - on a box that answers [Errno 111] on both mail ports, and the
+# apex that would have answered is never reached.
+#
+# The probe already happens; only the ORDER ignored its answer. This wrapper
+# re-orders the head of the ranked list so anything that opened 993 or 143 comes
+# first, and anything that opened neither is demoted to the tail. Tier order is
+# preserved INSIDE each group, the apex leads the demoted group (a dead apex is
+# still a likelier catch-all listener than a dead service host), and the probe is
+# cached for ten minutes because get_servers() runs once per account.
+_RANK_PROBE_TTL = 600.0
+_RANK_PROBE_LOCK = threading.Lock()
+_RANK_PROBE_CACHE = {}
+_RANK_PROBE_HEAD = 6
+
+
+def _host_answers_mail(host, timeout=1.2):
+    """True when the host opens 993 or 143. Cached, and never raises."""
+    h = (host or "").lower().strip()
+    if not h:
+        return False
+    now = time.time()
+    with _RANK_PROBE_LOCK:
+        hit = _RANK_PROBE_CACHE.get(h)
+        if hit and (now - hit[0]) < _RANK_PROBE_TTL:
+            return hit[1]
+    ok = False
+    for port in (993, 143):
+        try:
+            _s = socket.create_connection((h, port), timeout=timeout)
+            _s.close()
+            ok = True
+            break
+        except Exception:
+            continue
+    with _RANK_PROBE_LOCK:
+        _RANK_PROBE_CACHE[h] = (now, ok)
+    return ok
+
+
 def _is_junk_host(host, domain):
     return host_is_junk(host, domain)
 
 
 def _rank_hosts(hosts, domain):
-    return host_rank_hosts(hosts, domain)
+    ranked = [h for h in (host_rank_hosts(hosts, domain) or []) if h]
+    if len(ranked) < 2:
+        return ranked
+
+    head = ranked[:_RANK_PROBE_HEAD]
+    alive = {}
+    try:
+        with ThreadPoolExecutor(max_workers=min(6, len(head))) as ex:
+            futs = {ex.submit(_host_answers_mail, h): h for h in head}
+            for fut in as_completed(futs, timeout=8):
+                h = futs[fut]
+                try:
+                    alive[h] = bool(fut.result())
+                except Exception:
+                    alive[h] = False
+    except Exception:
+        pass
+    if not alive:
+        return ranked
+
+    dead = {h for h, ok in alive.items() if not ok}
+    if not dead:
+        return ranked
+
+    d = (domain or "").lower().strip()
+    live_part = [h for h in ranked if h not in dead]
+    dead_part = [h for h in ranked if h in dead]
+    # A dead apex still beats a dead service host as a last resort.
+    dead_part.sort(key=lambda h: 0 if (h or "").lower().strip() == d else 1)
+    if live_part:
+        return live_part + dead_part
+    return dead_part
 # @@END 091 HOST_RANK
 
 # @@BLOCK 092 DOMAIN_ROOTS deps=003,090,091
@@ -8374,7 +8450,59 @@ def _merge_domain_guesses(servers, domain):
 # @@END 092 DOMAIN_ROOTS
 
 # @@BLOCK 093 GET_SERVERS deps=002,088,090,091,092
-def get_servers(email):
+# v13.60: A BORROWED POP HOST IS NOW ONLY A FALLBACK.
+#
+# When a domain's mail is hosted by somebody else, detect_parent_provider() hands
+# back that provider's GLOBAL endpoint - and the POP side of it is returned as
+# pop.gmail.com for every Google-hosted domain, office365 for every Microsoft
+# one. The global POP endpoint only accepts the provider's OWN mailboxes, so for
+# a custom domain it answers [AUTH] Username and password not accepted on 995,
+# and answers it for a correct password too. Because block 100 keeps only ONE
+# POP host, that one bad answer also deleted the 995 and 110 rungs the account
+# actually had.
+#
+# The body is unchanged and is now _get_servers_raw(); get_servers() wraps it and
+# puts the domain's own pop.<domain> / pop3.<domain> in front when it resolves.
+# The borrowed host is KEPT behind it, so a Workspace domain whose own pop front
+# does not resolve still gets the global one exactly as before. Nothing is
+# prepended when the current head is already local to the domain.
+_GLOBAL_POP_HEADS = {
+    "pop.gmail.com",
+    "outlook.office365.com",
+    "pop.mail.yahoo.com",
+    "pop.aol.com",
+    "pop.mail.me.com",
+    "pop.zoho.com",
+    "pop.gmx.net",
+    "pop3.web.de",
+    "pop.qq.com",
+    "pop.naver.com",
+}
+
+
+def _prefer_local_pop(servers, domain):
+    """Put the domain's OWN pop front ahead of a borrowed global one."""
+    if not isinstance(servers, dict) or servers.get("type") == "zero_access":
+        return servers
+    d = (domain or "").lower().strip()
+    if not d:
+        return servers
+    for key in ("pop", "pop3"):
+        cur = [h for h in (servers.get(key) or []) if h]
+        if not cur:
+            continue
+        head = cur[0].lower().strip()
+        if _is_local_domain_host(head, d):
+            continue
+        if head not in _GLOBAL_POP_HEADS:
+            continue
+        local = [h for h in (f"pop.{d}", f"pop3.{d}") if host_resolves(h)]
+        if local:
+            servers[key] = list(dict.fromkeys(local + cur))
+    return servers
+
+
+def _get_servers_raw(email):
     try:
         domain = email.split("@")[-1].lower().strip()
         if domain in ZERO_ACCESS_PROVIDERS:
@@ -8431,6 +8559,14 @@ def get_servers(email):
         d = email.split('@')[-1] if '@' in email else 'localhost'
         fp = generate_candidate_hosts(d, [])
         return _merge_domain_guesses({"imap": fp, "pop": fp, "pop3": fp}, d)
+
+
+def get_servers(email):
+    try:
+        domain = email.split("@")[-1].lower().strip()
+    except Exception:
+        domain = ""
+    return _prefer_local_pop(_get_servers_raw(email), domain)
 # @@END 093 GET_SERVERS
 
 # @@BLOCK 094 USERNAME_CANDIDATES deps=-
@@ -9376,7 +9512,11 @@ def _check_account_core(email, password, conf, domain, proxy_pool, thread_state,
 
             left = deadline_ts - time.time()
             if left <= 1.5:
-                trace_logs.append(f"{label}: no window left ({left:.1f}s).")
+                # v13.60: a deadline already in the past printed a NEGATIVE
+                # window ("no window left (-4.0s)"), which reads like the clock
+                # went backwards. Clamped at zero; `left` itself is left alone
+                # because the per-rung share below is computed from it.
+                trace_logs.append(f"{label}: no window left ({max(0.0, left):.1f}s).")
                 return None, had_net, saw_retry
 
             per_to = max(3.0, min(configured_to, left / max(1, len(rungs))))
