@@ -3561,10 +3561,24 @@ if str_lit.session_state.get("_settings_owner") != _settings_owner:
 
 if not str_lit.session_state.get("_settings_seeded"):
     str_lit.session_state["_settings_seeded"] = True
+    _fit_before = (str_lit.session_state.get("ui_font_size"),
+                   str_lit.session_state.get("ui_content_scale"))
     _n_seeded = _seed_settings_from_disk()
     if _n_seeded:
         log_startup(f"Settings restored from this user's settings.json "
                     f"({_n_seeded} value(s)).")
+    # v13.61: auth.fit() at block 007 has ALREADY painted the CSS from the
+    # PRE-seed values, and a seeded Display Fit pair would otherwise only reach
+    # the CSS on the next rerun - so the slider would read the saved size while
+    # the page still rendered the default one. Repaint here so the first paint
+    # agrees with the widget. A second fit() is safe: it only assigns the two
+    # keys (fit_panel has not created the sliders yet) and re-injects the sheet.
+    if (str_lit.session_state.get("ui_font_size"),
+            str_lit.session_state.get("ui_content_scale")) != _fit_before:
+        try:
+            auth.fit(str_lit)
+        except Exception:
+            pass
 
 
 def _apply_settings_reset(reason: str = "Reset Defaults"):
