@@ -6570,8 +6570,12 @@ with str_lit.sidebar:
                           help="Fetch & Test writes only the SURVIVORS into proxies.txt. "
                                "This puts the full raw fetched pool back."):
             try:
-                if os.path.exists("proxies_all.txt"):
-                    with open("proxies_all.txt", encoding="utf-8", errors="ignore") as _rf:
+                # v13.55: derive from PROXY_FILE, not a hardcoded cwd name - the
+                # two lists must stay siblings or restore reads the wrong file.
+                _restore_path = os.path.join(os.path.dirname(CFG["PROXY_FILE"]) or ".",
+                                             "proxies_all.txt")
+                if os.path.exists(_restore_path):
+                    with open(_restore_path, encoding="utf-8", errors="ignore") as _rf:
                         _restore = [l.strip() for l in _rf
                                     if l.strip() and not l.strip().startswith("#")]
                     if _restore:
@@ -6732,6 +6736,64 @@ with str_lit.sidebar:
                     str_lit.rerun()
         else:
             str_lit.info("No proxy metadata recorded yet.")
+
+        # v13.55: A DROPPED LINE MUST NOT VANISH SILENTLY. proxies_all.txt
+        # holds every fetched line; anything in it that is not in proxies.txt
+        # was judged and left out. Without this the pool just looked smaller
+        # than the fetch, and there was no record of the engine's verdict on
+        # a node - which is what makes an Oxylabs line look "lost" rather
+        # than "judged 407 and set aside". Read-only: nothing is re-tested.
+        # Hoisted OUT of `if _meta_snap:`: that branch is gated on the filtered
+        # snapshot, so an emptied pool fell into the else and hid the very
+        # section that explains the emptying. Here _file_keys is still in scope
+        # (assigned above), and when it is empty _dropped lists everything.
+        _all_path = os.path.join(os.path.dirname(CFG["PROXY_FILE"]) or ".",
+                                 "proxies_all.txt")
+        try:
+            _all_keys = set()
+            if os.path.exists(_all_path):
+                with open(_all_path, encoding="utf-8", errors="ignore") as _af:
+                    _all_keys = {l.strip() for l in _af
+                                 if l.strip() and not l.strip().startswith("#")}
+        except Exception as _all_err:
+            # Don't collapse an unreadable file into "nothing dropped" silently.
+            _all_keys = set()
+            log_startup(f"WARNING: could not read proxies_all.txt: {_all_err}")
+            str_lit.caption(f"⚠ Could not read proxies_all.txt: {_all_err}")
+        _dropped = sorted(_all_keys - _file_keys)
+        if _dropped:
+            _why = {}
+            for _d in _dropped:
+                _r = (_pstats.get(_d) or {}).get("reason") or "not probed"
+                _why[_r] = _why.get(_r, 0) + 1
+            # Cap the label: a wide spread of verdict strings otherwise truncates.
+            _why_items = sorted(_why.items(), key=lambda kv: -kv[1])
+            _why_txt = " · ".join(f"{k} {v}" for k, v in _why_items[:3])
+            if len(_why_items) > 3:
+                _why_txt += f" · +{len(_why_items) - 3} more"
+            with str_lit.expander(f"🚫 Dropped candidates — {len(_dropped)} line(s) "
+                                  f"fetched but not in the pool  ({_why_txt})",
+                                  expanded=False):
+                str_lit.caption(
+                    "Judged and left out at the last Fetch & Test. 402 / 407 lines "
+                    "are ALIVE and authenticate — they were only set aside because "
+                    "another line on the same IP passed. 'Restore from "
+                    "proxies_all.txt' puts every one of them back. A 407 line whose "
+                    "credential you fix will be re-probed and re-admitted on the "
+                    "next Fetch & Test.")
+                _rows_d = []
+                for _d in _dropped[:60]:
+                    _di = parse_proxy(_d)
+                    _dr = (_pstats.get(_d) or {}).get("reason") or "not probed"
+                    _rows_d.append({
+                        "Proxy": f"{_di['host']}:{_di['port']}" if _di else "?",
+                        "User": (_di.get("user") if _di else "") or "",
+                        "Verdict": _PROBE_REASON_LABEL.get(_dr, _dr),
+                        "Error": ((_pstats.get(_d) or {}).get("error", "") or "")[:160],
+                    })
+                str_lit.dataframe(pd.DataFrame(_rows_d), width="stretch")
+                if len(_dropped) > 60:
+                    str_lit.caption(f"...and {len(_dropped) - 60} more.")
 # @@END 080 PROXY_MGMT_UI
 
 # @@BLOCK 081 PROXY_DEBUG_AND_DIAG_UI deps=014,016,024,026,027,030,052,070,073,080
