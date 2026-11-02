@@ -9,15 +9,15 @@ NAMED, NUMBERED, REPLACEABLE block.
     ...
     # @@END 016 PROXY_407_CONTRACT
 
-* Replace a WHOLE block - never edit inside one.
-* Keep the id and the NAME byte-for-byte; keep ids ascending from 000.
-* Nothing but blanks and comments between an `@@END` and the next `@@BLOCK`.
-* Every `@@END` MUST carry its block name. A bare `# @@END 016` is a fault.
-* The last line of every block file is `# @@EOF`.
-* The frame size is deliberately NOT written down here. `verify_blocks.py` owns
-  `TARGET_FILES`/`TARGET_BLOCKS`, `audit_frame.py` imports them, and the Scan tab
-  prints target against found and warns on drift - so a stale number cannot hide
-  in a doc. A frame move is one edit, in `verify_blocks.py`.
+- Replace a WHOLE block - never edit inside one.
+- Keep the id and the NAME byte-for-byte; keep ids ascending from 000.
+- Nothing but blanks and comments between an `@@END` and the next `@@BLOCK`.
+- Every `@@END` MUST carry its block name. A bare `# @@END 016` is a fault.
+- The last line of every block file is `# @@EOF`.
+- The frame size is deliberately NOT written down here. `verify_blocks.py` owns
+`TARGET_FILES`/`TARGET_BLOCKS`, `audit_frame.py` imports them, and the Scan tab
+prints target against found and warns on drift - so a stale number cannot hide
+in a doc. A frame move is one edit, in `verify_blocks.py`.
 
 ## Gates - all thirteen must be green before every commit
 
@@ -53,35 +53,36 @@ header is line 1, so it has no usable shebang.
 `auth.py` gates every page. First visit: choose a passphrase (optionally
 "Remember on this device", which writes a salted hash to `passkey.json`). Every
 per-user file - results directory, clean-valid list, last account, session
-cache, export presets, the results ZIP, the resume record - is prefixed with the
-unlocked hash, so two people on one deployment stay separate. It is a lock, not
-encryption.
+cache, export presets, the results ZIP, the resume record, the proxy pool, the
+proxy metadata, the domain cache, the probe key map, the theme and the applied
+settings - is prefixed with the unlocked hash, so two people on one deployment
+stay separate. It is a lock, not encryption.
 
 "Remember on this device" is a convenience for a private phone. On a shared
 deployment, "Forget this passkey" removes only the key you are signed in with;
-"Forget all passkeys" deletes `passkey.json` and locks out everybody. `passkey.json`
-is per-deployment and resets on redeploy; `theme.json` and `proxies.txt` stay
-shared on purpose.
+"Forget all passkeys" deletes `passkey.json` and locks out everybody.
+`passkey.json` is per-deployment and resets on redeploy.
 
-**What is shared, and what that costs you.** `proxies.txt`, `proxies_all.txt`,
-`proxy_meta.json`, `domain_cache.json`, `theme.json`, `disposable_domains.txt`
-and `passkey.json` are deployment infrastructure, not user data. The
-consequences, stated plainly, because they are not free:
+**What is shared, and what that costs you.** Two files only: `passkey.json` (the
+keyring) and `disposable_domains.txt` (a downloaded blocklist, identical for
+everybody). Everything else is yours. The consequences, stated plainly, because
+they are not free:
 
-* **Fetch & Test All Proxies** rewrites `proxies.txt` for everyone, including a
-  run someone else has in flight. The pool is re-read per attempt, so that run
-  starts drawing from the new list.
-* **Apply Settings** rebuilds the process-wide concurrency semaphores. If another
-  run holds one, that run's later release lands on a replaced object.
-* **Start** clears the 407 quarantine for the whole process, and rewrites the
-  shared AUTO probe target.
-* `STATE["cfg"]` is last-writer-wins, so a running check picks up the most
-  recently applied settings for proxy mode, timeouts and pool mode.
-* The background startup ledger is process-wide, so a second user's panel shows
-  the first user's background-thread lines.
+- `passkey.json` is the keyring itself, so `Forget all passkeys` is
+  deployment-wide by definition.
+- `disposable_domains.txt` is rewritten by whichever session fetched it last. Two
+  sessions fetching at once can race the write; the content is the same either
+  way.
 
-Everything that is *yours* is keyed to your unlocked hash: results, buckets,
-resume records, presets, the ZIP, and both valid-account caches.
+`proxies.txt`, `proxies_all.txt`, `proxy_meta.json`, `proxy_key_map.json`,
+`domain_cache.json`, `theme.json` and `settings.json` are all per-user. So is
+every `ui_*` / `chk_*` value: they are written to `settings.json` on Apply
+Settings and re-read before the sidebar is built, so a refresh, a tab close or a
+redeploy restores the owner's own panel instead of the factory defaults.
+
+`STATE["cfg"]` is still a process value, and block 105 pins a per-task snapshot
+over it for workers, so a running check does not start following another
+session's settings mid-account.
 
 The identity is always DERIVED from `auth.user_file("")`, never from a second
 source. That matters: `pages/7_Logs.py` used to probe with `auth._anon_id()`,
