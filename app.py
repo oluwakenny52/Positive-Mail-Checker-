@@ -583,7 +583,8 @@ _rs_path = runstate.tick()
 
 # @@BLOCK 008 BUILD_IDENTITY deps=-
 # Bump CFG_VERSION whenever a DEFAULT changes in a way users should inherit.
-CFG_VERSION = 1348
+# v13.54: 1349 - block 012's probe/proxy concurrency defaults changed.
+CFG_VERSION = 1349
 BUILD_TAG = "v13.48"
 # @@END 008 BUILD_IDENTITY
 
@@ -656,7 +657,13 @@ SMTP_HOST_CAP = 1
 # FIX PERF-1: 4 / 1 / 1 meant a 92-line fetch ran in 23 SERIAL waves. The global
 # gate is the real ceiling; the per-IP and per-sub-user gates exist only to stop a
 # single node being hammered, so they never needed to be 1.
-PROXY_CONCURRENCY_DEFAULT = 10
+#
+# v13.54: THE PROBE WAS 402-ING ITS OWN POOL. PROBE_WORKERS_BULK was 10 and the
+# bulk path ignores the sub-user gate's intent - ten tunnels on one plan is over
+# the concurrency cap, and 402 is the answer. A 402 storm then read as a dead pool
+# and every account after the first ran on nothing. The probe is now 4 wide
+# (bulk) / 3 / 2, and the global tunnel cap is 6. Slower on paper, far fewer 402s.
+PROXY_CONCURRENCY_DEFAULT = 6
 HOST_CONCURRENCY_DEFAULT = 2
 PROXY_IP_CONCURRENCY_DEFAULT = 2
 # FIX SUB-1: this was 2, and _limit() floors every gate at its DEFAULT - so the
@@ -665,9 +672,9 @@ PROXY_IP_CONCURRENCY_DEFAULT = 2
 # is the whole reason this gate exists, so the floor has to be the value the
 # slider offers.
 PROXY_SUBUSER_CONCURRENCY_DEFAULT = 1
-PROBE_WORKERS_DEFAULT = 4
-PROBE_WORKERS_BUSY = 3
-PROBE_WORKERS_BULK = 10
+PROBE_WORKERS_DEFAULT = 3
+PROBE_WORKERS_BUSY = 2
+PROBE_WORKERS_BULK = 4
 
 
 def _gate_wait(attempt_to: float) -> float:
@@ -5647,14 +5654,24 @@ def _mail_spot_target():
 
 
 def mail_dest_spot_check(force: bool = False):
-    """CONNECT a few nodes to a MAIL destination and report it."""
+    """CONNECT a few nodes to a MAIL destination and report it.
+
+    v13.54: THE RESULT IS OWNER-STAMPED. STATE["mail_spot"] is process state, so
+    without a stamp one user's "the pool cannot reach MAIL ports" banner rendered
+    in every other user's sidebar as if it were theirs. The stamp is _gate_scope()
+    (block 040), not _cache_owner(): this function also runs on the alive-pool
+    daemon thread, where session_state is unreliable, and _gate_scope() is a
+    plain string refreshed on the script thread. Readers (blocks 077, 080, 105)
+    drop a record whose stamp is not their own.
+    """
     if not force and not live_cfg().get("MAIL_SPOT_CHECK", MAIL_SPOT_CHECK_DEFAULT):
         return
     with alive_pool_lock:
         pool = [p for p in alive_pool if p]
     if not pool:
         STATE["mail_spot"] = {"ts": time.time(), "host": "", "port": 0, "ok": 0,
-                              "auth": 0, "other": 0, "n": 0, "error": "empty pool"}
+                              "auth": 0, "other": 0, "n": 0, "error": "empty pool",
+                              "user": _gate_scope()}
         return
     host, port = _mail_spot_target()
     sample = random.sample(pool, min(MAIL_SPOT_NODES, len(pool)))
@@ -5682,7 +5699,7 @@ def mail_dest_spot_check(force: bool = False):
             err = err or (res.get("error", "") or "")
     STATE["mail_spot"] = {"ts": time.time(), "host": host, "port": int(port), "ok": ok,
                           "auth": auth, "other": other, "n": len(sample),
-                          "error": (err or "")[:300]}
+                          "error": (err or "")[:300], "user": _gate_scope()}
     line = (f"mail-dest spot check {host}:{port} -> pass={ok} 407={auth} "
             f"other={other} of {len(sample)} node(s)")
     log_probe_event(line)
@@ -6375,6 +6392,11 @@ with str_lit.sidebar:
     str_lit.caption(f"Protocols dialled: **{' + '.join(active_protocols())}**")
 
     _ms = STATE.get("mail_spot") or {}
+    # v13.54: STATE["mail_spot"] is process state. Only show it when it belongs to
+    # THIS session, or one user's mail-port failure banner renders in everyone
+    # else's sidebar as though it were theirs.
+    if _ms.get("user") and _ms.get("user") != _gate_scope():
+        _ms = {}
     if _ms.get("n"):
         _ms_age = int(time.time() - _ms.get("ts", 0))
         _ms_txt = (f"Mail-destination spot check ({_ms['host']}:{_ms['port']}): "
@@ -6524,6 +6546,8 @@ with str_lit.sidebar:
         str_lit.caption("Validating in 24-line chunks - the bar below moves.")
         _n_alive, _n_total = fetch_and_test_all_proxies()
         _msr = STATE.get("mail_spot") or {}
+        if _msr.get("user") and _msr.get("user") != _gate_scope():
+            _msr = {}
         if _n_alive:
             _msg = (f"✅ **{_n_alive}** node(s) kept from **{_n_total}** line(s), saved "
                     f"and armed. Press 🔥 Start Live Checking Engine.")
@@ -6541,9 +6565,15 @@ with str_lit.sidebar:
     with str_lit.expander("📊 Proxy Health & Geo Dashboard", expanded=False):
         with probe_stats_lock:
             _pstats = dict(probe_stats)
-        if proxy_meta:
+        # v13.54: SNAPSHOT UNDER THE LOCK. Iterating proxy_meta directly raised
+        # RuntimeError: dictionary changed size during iteration whenever the probe
+        # thread inserted a node mid-render - which killed this whole expander and
+        # everything after it on the page.
+        with proxy_lock:
+            _meta_snap = dict(proxy_meta)
+        if _meta_snap:
             rows = []
-            for p_str, meta in proxy_meta.items():
+            for p_str, meta in _meta_snap.items():
                 info = parse_proxy(p_str)
                 _ps = _pstats.get(p_str) or {}
                 if _ps:
@@ -9513,6 +9543,9 @@ if start_engine_btn:
             f"alive={len(alive_pool)} quarantined={quarantine_size()}"
         )
         _msr = STATE.get("mail_spot") or {}
+        # v13.54: only my own spot check - see block 073.
+        if _msr.get("user") and _msr.get("user") != _gate_scope():
+            _msr = {}
         if _msr.get("auth") and not _msr.get("ok") and _msr.get("n"):
             str_lit.error(
                 f"🚨 **The mail-destination spot check says the pool cannot reach MAIL "
