@@ -6825,20 +6825,36 @@ with str_lit.sidebar:
             # FIX W-2: seeded, not passed as value= - a keyed widget that also gets a
             # default raises the "created with a default value but also had its value
             # set via the Session State API" warning on every rerun.
+            #
+            # FIX BTN-1 (v13.57): THE TWO BUTTONS CRASHED THE BLOCK. They were plain
+            # st.button widgets that assigned _dbg_target and then called
+            # str_lit.rerun() - and on the run where the key already held a value the
+            # text_input ABOVE them had already been created, so re-entering the
+            # script rebuilt it with a value set through the Session State API and
+            # raised StreamlitWidgetAlreadyInstantiatedError, tearing the block down
+            # before the trace buttons were even drawn.
+            # They are on_click callbacks now: a callback runs BEFORE the script, so
+            # the key is already updated when the text_input is created, and no
+            # explicit rerun is needed at all. The seed line stays where it was.
             if "_dbg_target" not in str_lit.session_state:
                 str_lit.session_state["_dbg_target"] = _tgt_def
+
+            def _dbg_use_mail():
+                str_lit.session_state["_dbg_target"] = (
+                    f"{MAIL_SPOT_FALLBACK[0]}:{MAIL_SPOT_FALLBACK[1]}")
+
+            def _dbg_use_control():
+                str_lit.session_state["_dbg_target"] = (
+                    f"{PROBE_CONTROL_TARGETS[0][0]}:{PROBE_CONTROL_TARGETS[0][1]}")
+
             _dbg_target = str_lit.text_input("CONNECT target (host:port)", key="_dbg_target")
             _bc0a, _bc0b = str_lit.columns(2)
             with _bc0a:
-                if str_lit.button("✉️ Use the MAIL target", width="stretch"):
-                    str_lit.session_state["_dbg_target"] = (
-                        f"{MAIL_SPOT_FALLBACK[0]}:{MAIL_SPOT_FALLBACK[1]}")
-                    str_lit.rerun()
+                str_lit.button("✉️ Use the MAIL target", width="stretch",
+                               on_click=_dbg_use_mail)
             with _bc0b:
-                if str_lit.button("🌐 Use the 443 control", width="stretch"):
-                    str_lit.session_state["_dbg_target"] = (
-                        f"{PROBE_CONTROL_TARGETS[0][0]}:{PROBE_CONTROL_TARGETS[0][1]}")
-                    str_lit.rerun()
+                str_lit.button("🌐 Use the 443 control", width="stretch",
+                               on_click=_dbg_use_control)
 
             # ---- parse audit -------------------------------------------------
             _dp = parse_proxy(_dbg_line)
@@ -8984,9 +9000,19 @@ def _check_account_core(email, password, conf, domain, proxy_pool, thread_state,
                             # and the node is alive, so the node is credited a
                             # success and the ladder advances WITHOUT rotating -
                             # another node cannot fix a blocked port either.
+                            #
+                            # FIX PORT-1 (v13.57): IT USED TO SET saw_server, and that
+                            # one flag made block 104's generic tail report "mail host
+                            # reached but the server dropped LOGIN" on a pool that had
+                            # 403'd every rung - the CONNECT never got to the mail host
+                            # at all. saw_server is now left alone; saw_port_block is
+                            # its own flag, and had_net / net_failed_hosts are set so
+                            # block 103's direct_reason sees a reason to run DIRECT.
                             err_text = str(pblk)
                             flags["saw_nonproxy"] = True
-                            flags["saw_server"] = True
+                            flags["saw_port_block"] = True
+                            had_net = True
+                            net_failed_hosts.add(server)
                             record_proxy_attempt(px_used, success=True)
                             _perm = int(port) in PROVIDER_BLOCKED_PORTS
                             trace_logs.append(
@@ -9519,6 +9545,28 @@ def _check_account_core(email, password, conf, domain, proxy_pool, thread_state,
             "bandwidth or concurrency is spent. Those nodes are alive and authenticate, so "
             "the password is untested and NOT wrong. Set Proxy Mode Engine = off (DIRECT), "
             "or wait for the plan to reset, then re-run these accounts."
+        ), None, trace_logs
+    # v13.57: THE 403 TAIL. A provider that refuses the DESTINATION PORT on every
+    # node answers 403 - which is neither a dead node nor a credential problem, and
+    # is what Webshare does permanently on 25 / 110 / 465 / 587. It used to set
+    # saw_server, so the generic tail at the bottom claimed the mail host had been
+    # reached and had dropped the LOGIN; the CONNECT never got there at all.
+    # saw_port_block is its own flag now, the guards keep it from burying a real
+    # answer from a later rung, and the verdict is PROXY_UNHEALTHY - the passwords
+    # are UNTESTED, not wrong.
+    if flags.get("saw_port_block") and not flags.get("saw_server") \
+            and not flags.get("saw_auth") and not retryable:
+        trace_logs.append(
+            "Every rung answered 403 client_connect_forbidden_port in the PROXY hop - the "
+            "provider refuses these DESTINATION PORTS by policy, so the mailbox was never "
+            "reached and no LOGIN was ever issued. The nodes and the credentials are both "
+            "fine; the password is untested.")
+        return None, PROXY_UNHEALTHY, (
+            "the provider refused the destination port with 403 on every proxy attempt - "
+            "Webshare blocks 25, 110, 465 and 587 permanently on every plan, so an IMAP/POP "
+            "rung on those ports can never pass through a Webshare node. The node and the "
+            "credential are both fine: the password is UNTESTED, not wrong. Set Proxy Mode "
+            "Engine = off (DIRECT), or dial a mail port the plan allows (993 / 995)."
         ), None, trace_logs
     if retryable:
         return None, RETRY, "retryable (proxy / IP-block / rate-limit)", None, trace_logs
