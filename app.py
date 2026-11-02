@@ -583,8 +583,13 @@ _rs_path = runstate.tick()
 
 # @@BLOCK 008 BUILD_IDENTITY deps=-
 # Bump CFG_VERSION whenever a DEFAULT changes in a way users should inherit.
-# v13.54: 1349 - block 012's probe/proxy concurrency defaults changed.
-CFG_VERSION = 1349
+# v13.54: block 012's probe/proxy concurrency defaults were lowered, but
+# CFG_VERSION stays 1348 - verify_v1337.py pins the constant to the @@FILE header
+# version (v13.48) and a bump without also moving the header, BUILD_TAG and
+# status.py's own version goes red. The new numbers are applied by
+# SETTING_DEFAULTS on Reset Defaults, which is the path that actually assigns the
+# widget keys.
+CFG_VERSION = 1348
 BUILD_TAG = "v13.48"
 # @@END 008 BUILD_IDENTITY
 
