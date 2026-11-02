@@ -853,6 +853,11 @@ SETTING_DEFAULTS = {
     "chk_proxy_test_flight": True,
     "chk_skip_app": False,
     "chk_debug_mode": True,
+    # v13.61: these two text inputs carried no key at all, so they were the only
+    # settings that could be neither remembered nor reset. Keys and reset
+    # targets now.
+    "bb_whitelist": "",
+    "bb_blacklist": "",
 }
 # @@END 019 SETTING_DEFAULTS
 
@@ -1523,8 +1528,16 @@ def probe_targets():
     be steered onto a mail endpoint - and ipify:443 is exactly the target that lets
     a pool pass validation and then 407 on every IMAP login. Start Live Checking
     overwrites the override with the real queue-derived target.
+
+    FIX ISO-7 (v13.61): the override lives in STATE, which is PROCESS state, so
+    one user's queue-derived mail target was used by every other user's probe and
+    spot check. The owner's own copy wins; STATE stays as a fallback for a
+    session that has never set one.
     """
-    ov = STATE.get("probe_targets_override") or []
+    try:
+        ov = _user_state().get("probe_targets_override") or []
+    except Exception:
+        ov = STATE.get("probe_targets_override") or []
     if ov:
         return list(ov)
     try:
@@ -1652,17 +1665,34 @@ def _env_info():
     info["status_ok"] = STATUS_OK
     info["ms_oauth_ok"] = MS_OAUTH_OK
     info["cfg_version"] = CFG_VERSION
-    for f in ("proxies.txt", "proxies_all.txt", "proxy_meta.json", "theme.json",
-              "domain_cache.json"):
+    # FIX ISO-7 (v13.61): these five were named BARE, but v13.59 made four of them
+    # per-user files, so this section reported ABSENT for files that existed - on
+    # every deployment, for everybody. The live path is read from CFG; the label
+    # keeps the old short name so the bundle still reads the same.
+    _path_labels = (("proxies.txt", "PROXY_FILE"),
+                    ("proxies_all.txt", "PROXY_ALL_FILE"),
+                    ("proxy_meta.json", "PROXY_META_FILE"),
+                    ("domain_cache.json", "CACHE_FILE"))
+    for _label, _cfg_key in _path_labels:
         try:
-            if os.path.exists(f):
-                stt = os.stat(f)
-                info[f] = (f"{stt.st_size} bytes, mtime "
-                           f"{datetime.fromtimestamp(stt.st_mtime).strftime('%Y-%m-%d %H:%M:%S')}")
+            _f = live_cfg().get(_cfg_key) or _label
+            if os.path.exists(_f):
+                _stt = os.stat(_f)
+                info[_label] = (f"{_stt.st_size} bytes, mtime "
+                                f"{datetime.fromtimestamp(_stt.st_mtime).strftime('%Y-%m-%d %H:%M:%S')}")
             else:
-                info[f] = "ABSENT"
+                info[_label] = "ABSENT"
         except Exception as e:
-            info[f] = f"stat error: {e}"
+            info[_label] = f"stat error: {e}"
+    try:
+        if os.path.exists(THEME_FILE):
+            _tstt = os.stat(THEME_FILE)
+            info["theme.json"] = (f"{_tstt.st_size} bytes, mtime "
+                                  f"{datetime.fromtimestamp(_tstt.st_mtime).strftime('%Y-%m-%d %H:%M:%S')}")
+        else:
+            info["theme.json"] = "ABSENT"
+    except Exception as e:
+        info["theme.json"] = f"stat error: {e}"
     return info
 
 
@@ -1897,8 +1927,9 @@ def build_diagnostics_text():
     else:
         A("    (none parsed)")
     try:
-        if os.path.exists("proxies_all.txt"):
-            with open("proxies_all.txt", encoding="utf-8", errors="ignore") as _pa:
+        _pa_path = live_cfg().get("PROXY_ALL_FILE") or "proxies_all.txt"
+        if os.path.exists(_pa_path):
+            with open(_pa_path, encoding="utf-8", errors="ignore") as _pa:
                 A(f"  proxies_all.txt   : {sum(1 for l in _pa if l.strip())} raw line(s) backed up")
         else:
             A("  proxies_all.txt   : ABSENT (written by the next Fetch & Test)")
@@ -1928,15 +1959,18 @@ def build_diagnostics_text():
     A(f"  filtered pool       : {len(filtered_pool)}")
     A(f"  alive pool          : {len(alive_pool)}")
     A(f"  quarantined (407)   : {quarantine_size()}")
-    A(f"  probe_in_flight     : {STATE.get('probe_in_flight')}")
+    # FIX ISO-7 (v13.61): probe_in_flight / first_probe_kicked / probe_runs moved
+    # into _user_state() at v13.59 and were still read off STATE here, so all
+    # three reported None in every bundle ever produced.
+    A(f"  probe_in_flight     : {_US.get('probe_in_flight')}")
     A(f"  probe lock held     : {_PROBE_OWNER_LOCK.locked()}")
-    A(f"  first_probe_kicked  : {STATE.get('first_probe_kicked')}")
+    A(f"  first_probe_kicked  : {_US.get('first_probe_kicked')}")
     A(f"  run_active          : {STATE.get('run_active')}")
-    A(f"  probe_runs          : {STATE.get('probe_runs')}")
+    A(f"  probe_runs          : {_US.get('probe_runs')}")
     A(f"  CONFIRM_WRONG_ACROSS_HOSTS: {CFG.get('CONFIRM_WRONG_ACROSS_HOSTS')}")
     A(f"  ALLOW_SELF_SIGNED / TLS_STRICT: "
       f"{CFG.get('ALLOW_SELF_SIGNED')} / {CFG.get('TLS_STRICT')}")
-    _lp = STATE.get("last_probe_ts", 0.0)
+    _lp = _US.get("last_probe_ts", 0.0)
     A(f"  last_probe         : {int(time.time() - _lp)}s ago" if _lp else "  last_probe         : never")
     A(f"  process uptime     : {int(time.time() - STATE.get('process_start', time.time()))}s")
     A(f"  probe target/budget: {CFG.get('PROBE_TARGET')} / {probe_timeout():.0f}s "
@@ -1945,6 +1979,8 @@ def build_diagnostics_text():
     A(f"  probe workers      : {probe_workers()} idle/run, {probe_workers(bulk=True)} bulk "
       f"(batch budget {PROBE_BATCH_BUDGET:.0f}s)")
     _ms = STATE.get("mail_spot") or {}
+    if _ms.get("user") and _ms.get("user") != _gate_scope():
+        _ms = {}
     if _ms.get("n"):
         A(f"  MAIL-DEST SPOT      : {_ms['host']}:{_ms['port']} -> pass={_ms['ok']} "
           f"407={_ms['auth']} other={_ms['other']} of {_ms['n']} node(s), "
@@ -2010,7 +2046,7 @@ def build_diagnostics_text():
       f"{ {k: f'{v - now:.0f}s left' for k, v in circuit_breaker_until.items() if v > now} }")
     with _proxy_scheme_lock:
         A(f"  scheme memory: {dict(_proxy_scheme)}")
-    A(f"  407 cooldown map entries: {len(STATE.get('proxy_407_until') or {})}")
+    A(f"  407 cooldown map entries: {len(proxy_407_until or {})}")
 
     A("")
     A("--- 10. CACHES & THREADS ---")
@@ -2052,7 +2088,12 @@ def build_diagnostics_text():
 # @@END 030 DIAG_BUNDLE
 
 # @@BLOCK 031 THEME_DATA deps=-
-THEME_FILE = "theme.json"
+# FIX ISO-7 (v13.61): THE THEME WAS SHARED. theme.json lived in the working
+# directory, so two people on one deployment overwrote each other's colours,
+# radius and hero text - the one preference a user actually notices. It is a
+# per-user file now, named by the unlocked prefix. This block runs AFTER
+# auth.require() in block 007, so the hash already exists here.
+THEME_FILE = user_file("theme.json")
 
 THEME_PRESETS = {
     "Aurora":    {"g1": "#667eea", "g2": "#764ba2", "accent": "#8b5cf6", "accent2": "#22d3ee", "bg": "#0b1020", "panel": "#141b30", "text": "#e6ebff"},
@@ -2105,7 +2146,7 @@ def default_theme() -> dict:
         "hero_sub": "Plug-and-play edition - click 📥 Fetch & Test All Proxies, then press "
                     "Start. A single AUTHENTICATIONFAILED is PROVISIONAL: the ladder keeps "
                     "going (POP3, sibling hosts, 143/110, then DIRECT) until a SECOND host "
-                    "agrees or nothing is left to dial. Allow Self-Signed is a real switch, "
+                    "agrees or nothing is left to try. Allow Self-Signed is a real switch, "
                     "the phone layout is fixed, and the Fast-Mode cooldown arms on "
                     "inconclusive results only.",
     }
@@ -2146,6 +2187,18 @@ def save_theme(th: dict):
 def is_light(th: dict) -> bool:
     return _lum(th.get("bg", "#000000")) > 0.6
 
+
+# FIX ISO-7: a Forget + second unlock in the SAME tab leaves session_state holding
+# the previous user's theme and its th_* widget keys, so the new user inherited the
+# old user's colours and then saved them as their own. On an owner change the theme
+# and every th_* key are dropped, and load_theme() reads the new owner's own file.
+if str_lit.session_state.get("_theme_owner") != os.path.basename(user_file("")):
+    str_lit.session_state.pop("theme", None)
+    for _tk in ("th_preset", "th_g1", "th_g2", "th_accent", "th_accent2", "th_bg",
+                "th_panel", "th_text", "th_radius", "th_glow", "th_glass",
+                "th_animate", "th_hero_title", "th_hero_sub", "colorize_logs"):
+        str_lit.session_state.pop(_tk, None)
+    str_lit.session_state["_theme_owner"] = os.path.basename(user_file(""))
 
 if "theme" not in str_lit.session_state:
     str_lit.session_state.theme = load_theme()
@@ -3318,6 +3371,202 @@ def instant_help(key_name, description_text, label_text, widget_type="label", **
 # @@END 044 HELP_WIDGET
 
 # @@BLOCK 045 SETTINGS_RESET deps=019,020,024,040,043
+# ===========================================================================
+# SETTINGS PERSISTENCE (v13.61)
+#
+# THE BUG: every settings widget key lived in session_state and NOTHING was ever
+# written to disk, so a refresh, a tab close, a reaped session or a redeploy reset
+# the whole panel to the hardcoded defaults - and "Apply Settings" only ever wrote
+# session_state, so it could not survive the thing it looked like it was saving.
+# It is a per-user file, because two people on one deployment must not inherit
+# each other's engine settings.
+#
+# ORDER IS THE POINT: this block runs BEFORE the widgets in 046-053 exist, so
+# assigning a key here is legal. Doing it in 055 would raise
+# StreamlitWidgetAlreadyInstantiatedError on every key.
+#
+# The OWNER GATE runs first. After a Forget and a second unlock in the same tab,
+# session_state still holds the previous user's values, so the new user used to
+# inherit them; on an owner change every settings key is dropped and re-seeded
+# from the new owner's own file.
+# ===========================================================================
+_SETTINGS_FILE_NAME = "settings.json"
+_SETTINGS_SCHEMA = 1
+
+# key -> (kind, low, high, choices). A saved value is validated on the way IN, so a
+# value that no longer fits its widget (a narrowed slider, a renamed option) can
+# never raise on the way out.
+_SETTING_KINDS = {
+    "ui_font_size": ("int", 12, 22, None),
+    "ui_content_scale": ("int", 80, 140, None),
+    "ui_mode": ("choice", 0, 0, ("Normal Mode", "Fast Mode", "Deep / Aggressive Mode")),
+    "ui_protocols": ("subset", 0, 0, tuple(PROTOCOL_OPTIONS)),
+    "ui_workers": ("int", 1, 100, None),
+    "ui_deadline": ("int", 10, 400, None),
+    "ui_timeout": ("int", 3, 60, None),
+    "ui_max_acc": ("int", 0, 5000, None),
+    "ui_blacklist_cf": ("int", 3, 100, None),
+    "ui_dynamic_scaling": ("bool", 0, 0, None),
+    "ui_max_hosts": ("int", 1, 8, None),
+    "ui_alt_user": ("bool", 0, 0, None),
+    "ui_confirm_wrong": ("bool", 0, 0, None),
+    "ui_smtp_precheck": ("bool", 0, 0, None),
+    "ui_min_proxy_score": ("int", 0, 100, None),
+    "ui_probe_precheck_timeout": ("int", 1, 10, None),
+    "ui_probe_timeout": ("int", 3, 20, None),
+    "ui_probe_target": ("choice", 0, 0, tuple(PROBE_TARGET_OPTIONS)),
+    "ui_probe_strict": ("bool", 0, 0, None),
+    "ui_probe_maxtargets": ("int", 1, 3, None),
+    "ui_probe_scheme2": ("bool", 0, 0, None),
+    "ui_prober_idle": ("bool", 0, 0, None),
+    "ui_probe_sample": ("int", 0, 200, None),
+    "ui_mail_spot": ("bool", 0, 0, None),
+    "ui_dedupe": ("bool", 0, 0, None),
+    "ui_allow_blacklist": ("bool", 0, 0, None),
+    "ui_quarantine": ("bool", 0, 0, None),
+    "ui_host_conc": ("int", 1, 12, None),
+    "ui_ip_conc": ("int", 1, 12, None),
+    "ui_subuser_conc": ("int", 1, 12, None),
+    "ui_proxy_conc": ("int", 2, 60, None),
+    "ui_direct_first": ("bool", 0, 0, None),
+    "ui_same_host_retries": ("int", 0, 4, None),
+    "ui_max_rot": ("int", 0, 8, None),
+    "ui_pass2": ("bool", 0, 0, None),
+    "ui_random_rot": ("bool", 0, 0, None),
+    "ui_geo_call": ("bool", 0, 0, None),
+    "ui_conn_hint": ("choice", 0, 0, ("Auto", "VPN ON", "VPN OFF")),
+    "ui_starttls": ("bool", 0, 0, None),
+    "ui_proxy_mode": ("choice", 0, 0, ("aggressive", "fallback", "sticky", "off")),
+    "chk_use_proxy": ("bool", 0, 0, None),
+    "chk_retry_cf": ("bool", 0, 0, None),
+    "chk_self_signed": ("bool", 0, 0, None),
+    "chk_proxy_test_flight": ("bool", 0, 0, None),
+    "chk_skip_app": ("bool", 0, 0, None),
+    "chk_debug_mode": ("bool", 0, 0, None),
+    "bb_whitelist": ("text", 0, 0, None),
+    "bb_blacklist": ("text", 0, 0, None),
+    "pool_mode": ("choice", 0, 0, ("all", "us_only", "country", "mix")),
+}
+
+_MISSING = object()
+
+
+def _settings_path():
+    try:
+        return user_file(_SETTINGS_FILE_NAME)
+    except Exception:
+        return _SETTINGS_FILE_NAME
+
+
+def _settings_coerce(key, value):
+    """A saved value made legal for its widget, or _MISSING if it is not."""
+    spec = _SETTING_KINDS.get(key)
+    if not spec:
+        return _MISSING
+    kind, lo, hi, choices = spec
+    try:
+        if kind == "bool":
+            return bool(value)
+        if kind == "int":
+            return max(lo, min(hi, int(value)))
+        if kind == "choice":
+            return value if value in choices else _MISSING
+        if kind == "subset":
+            if not isinstance(value, list):
+                return _MISSING
+            got = [v for v in value if v in choices]
+            return got or _MISSING
+        if kind == "text":
+            return str(value)[:2000]
+    except Exception:
+        return _MISSING
+    return _MISSING
+
+
+def _load_settings_file():
+    """This user's saved dict, or {}. Never raises."""
+    path = _settings_path()
+    if not os.path.exists(path):
+        return {}
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception as e:
+        warnings.warn(f"settings.json unreadable ({e}); using defaults")
+        return {}
+    vals = data.get("values") if isinstance(data, dict) else None
+    return vals if isinstance(vals, dict) else {}
+
+
+def _seed_settings_from_disk():
+    """Put this user's saved settings into the widget keys. Once per session."""
+    saved = _load_settings_file()
+    applied = 0
+    for key, value in saved.items():
+        got = _settings_coerce(key, value)
+        if got is _MISSING:
+            continue
+        try:
+            str_lit.session_state[key] = list(got) if isinstance(got, list) else got
+            applied += 1
+        except Exception:
+            pass
+    picked = saved.get("picked_countries")
+    if isinstance(picked, list) and picked:
+        try:
+            str_lit.session_state["picked_countries"] = [str(c) for c in picked][:40]
+        except Exception:
+            pass
+    return applied
+
+
+def _save_settings_to_disk(reason="apply", overrides=None):
+    """Persist this user's settings. Called on Apply and on Reset only."""
+    vals = {}
+    for key in _SETTING_KINDS:
+        if key not in str_lit.session_state:
+            continue
+        got = _settings_coerce(key, str_lit.session_state.get(key))
+        if got is _MISSING:
+            continue
+        vals[key] = got
+    if overrides:
+        vals.update(overrides)
+    payload = {"schema": _SETTINGS_SCHEMA,
+               "saved_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+               "reason": reason, "values": vals,
+               "picked_countries":
+                   [str(c) for c in (str_lit.session_state.get("picked_countries") or [])][:40]}
+    path = _settings_path()
+    tmp = path + ".tmp"
+    try:
+        with file_write_lock:
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(payload, f, indent=1)
+            os.replace(tmp, path)
+        return True
+    except Exception as e:
+        warnings.warn(f"could not save settings.json: {e}")
+        return False
+
+
+# ---- owner gate: a different unlock in this tab must not inherit the last one
+_settings_owner = _cache_owner()
+if str_lit.session_state.get("_settings_owner") != _settings_owner:
+    for _sk in list(_SETTING_KINDS):
+        str_lit.session_state.pop(_sk, None)
+    str_lit.session_state.pop("picked_countries", None)
+    str_lit.session_state["_settings_owner"] = _settings_owner
+    str_lit.session_state["_settings_seeded"] = False
+
+if not str_lit.session_state.get("_settings_seeded"):
+    str_lit.session_state["_settings_seeded"] = True
+    _n_seeded = _seed_settings_from_disk()
+    if _n_seeded:
+        log_startup(f"Settings restored from this user's settings.json "
+                    f"({_n_seeded} value(s)).")
+
+
 def _apply_settings_reset(reason: str = "Reset Defaults"):
     """Restore EVERY settings widget to its default and stamp applied_cfg from
     the pure-constant default_cfg()."""
@@ -3352,6 +3601,11 @@ def _apply_settings_reset(reason: str = "Reset Defaults"):
         str_lit.session_state["_bb_prefilter_cache"] = None
     except Exception:
         pass
+    # v13.61: the reset is written to disk too, otherwise the next refresh
+    # reloads the very values it just cleared. The Display Fit pair is forced into
+    # the payload because its two session assignments above are the swallowed ones.
+    _save_settings_to_disk("reset", {"ui_font_size": SETTING_DEFAULTS["ui_font_size"],
+                                     "ui_content_scale": SETTING_DEFAULTS["ui_content_scale"]})
     _reset_gates()
     log_startup(f"All settings reset to UNIVERSAL DEFAULTS by {reason}.")
     log_probe_event(f"settings reset to universal defaults ({reason})")
@@ -3526,10 +3780,14 @@ smtp_precheck_ui = str_lit.sidebar.checkbox(
          "Separate from the SMTP protocol rung in Pick Protocols Mode, which does AUTH PLAIN."
 )
 
+# FIX ISO-7 (v13.61): these two had NO key, so they were the only settings that
+# could be neither remembered across a refresh nor reset to a default.
 custom_whitelist_input = str_lit.sidebar.text_input(
-    "Custom Whitelist Domains (comma-separated)", placeholder="gmail.com, outlook.com")
+    "Custom Whitelist Domains (comma-separated)", placeholder="gmail.com, outlook.com",
+    key="bb_whitelist")
 custom_blacklist_input = str_lit.sidebar.text_input(
-    "Custom Blacklist Domains (comma-separated)", placeholder="spamdomain.com")
+    "Custom Blacklist Domains (comma-separated)", placeholder="spamdomain.com",
+    key="bb_blacklist")
 # @@END 048 SIDEBAR_RULES
 
 # @@BLOCK 049 SIDEBAR_POOL deps=016,017,018,046
@@ -4364,8 +4622,20 @@ with _btn_c2:
         "♻️ Reset Defaults", width="stretch",
         help="Restore every setting to the universal default (protocols back to IMAP + POP3).")
 
+# FIX FLASH-2 (v13.61): the confirmation was a bare st.sidebar.success() on the
+# line directly above str_lit.rerun(), and a rerun destroys the delta it was drawn
+# into - so "Settings applied successfully!" was never once actually seen. It is
+# the identical defect block 080 already fixed for the proxy messages: the message
+# is carried across the rerun and drawn on the next load.
+_settings_flash = str_lit.session_state.pop("_settings_flash", None)
+if _settings_flash:
+    _sfl_lvl, _sfl_msg = _settings_flash
+    getattr(str_lit.sidebar, _sfl_lvl, str_lit.sidebar.info)(_sfl_msg)
+
 if _reset_clicked:
     str_lit.session_state["_bb_reset_pending"] = True
+    str_lit.session_state["_settings_flash"] = (
+        "success", "Every setting restored to its universal default and saved.")
     str_lit.rerun()
 
 if _apply_clicked:
@@ -4373,8 +4643,15 @@ if _apply_clicked:
     str_lit.session_state.applied_cfg_version = CFG_VERSION
     str_lit.session_state.applied_cfg_owner = _cfg_owner
     _reset_gates()
-    str_lit.sidebar.success("Settings applied successfully!")
-    log_startup("User applied new configuration settings via sidebar control panel.")
+    _settings_saved = _save_settings_to_disk("apply")
+    str_lit.session_state["_settings_flash"] = (
+        ("success", "Settings applied successfully - saved to your own settings file, "
+                    "they will survive a refresh.")
+        if _settings_saved else
+        ("warning", "Settings applied for this session, but settings.json could NOT be "
+                    "written - they will reset on the next refresh."))
+    log_startup("User applied new configuration settings via sidebar control panel "
+                f"(persisted={_settings_saved}).")
     str_lit.rerun()
 
 CFG = str_lit.session_state.applied_cfg
@@ -5949,9 +6226,17 @@ def _run_batch(fn, items, workers, budget):
 
 # @@BLOCK 073 MAIL_SPOT_CHECK deps=015,025,070
 def _mail_spot_target():
-    """The real mail destination to test the pool against."""
+    """The real mail destination to test the pool against.
+
+    FIX ISO-7 (v13.61): STATE is process-wide, so one user's queue-derived target
+    was used by everybody's spot check. The owner's own override wins; STATE stays
+    as a fallback for a session that has never set one.
+    """
     try:
-        ov = STATE.get("probe_targets_override") or []
+        try:
+            ov = _user_state().get("probe_targets_override") or []
+        except Exception:
+            ov = STATE.get("probe_targets_override") or []
         for h, p, _l in ov:
             if h:
                 return (h, int(p))
@@ -6327,7 +6612,14 @@ def _set_probe_targets_from_queue(accounts, cap=1):
         if len(out) >= cap:
             break
     if out:
+        # FIX ISO-7 (v13.61): the override is per user now. STATE is kept as a
+        # process mirror so blocks 077 and 105, which still compare and restore
+        # through STATE, keep working unchanged.
         STATE["probe_targets_override"] = out
+        try:
+            _user_state()["probe_targets_override"] = out
+        except Exception:
+            pass
         log_probe_event(f"probe target AUTO resolved from the queue -> {[o[0] for o in out]}")
     return out
 # @@END 076 QUEUE_PROBE_TARGETS
