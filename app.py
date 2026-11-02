@@ -1350,8 +1350,67 @@ def clear_tunnel_cache():
 # @@END 025 PROBE_TELEMETRY
 
 # @@BLOCK 026 RUNTIME_HELPERS deps=024
+# FIX CFG-SCOPE (v13.57): THE CONFIG A WORKER READ WAS NOT THE CONFIG ITS RUN STARTED
+# WITH. STATE["cfg"] is PROCESS state and block 055 reassigns it on every rerun of
+# EVERY session, so the moment a second user loaded the page - or the first user
+# clicked anything - the workers of the live run started reading someone else's
+# settings mid-account: another user's protocols, another user's timeouts, another
+# user's concurrency ceilings. Block 106's tail trim then wrote the capped deadline
+# into a dict the next rerun replaced again.
+#
+# The fix is a per-TASK snapshot: block 105 seeds one on the worker thread before
+# any attempt, live_cfg() reads it first, and the process value is only the
+# fallback for the script thread. The core's own direct CFG reads are deliberately
+# left on the live dict so the tail cap still bites.
+_CFG_TLS = threading.local()
+
+
+def _cfg_snapshot():
+    """A private COPY of the current config, safe to hand to a worker."""
+    try:
+        base = STATE.get("cfg") or globals().get("CFG") or {}
+    except Exception:
+        base = {}
+    out = {}
+    try:
+        for k, v in dict(base).items():
+            out[k] = list(v) if isinstance(v, list) else v
+    except Exception:
+        try:
+            out = dict(base)
+        except Exception:
+            out = {}
+    return out
+
+
+def seed_task_cfg(snap=None):
+    """Pin the config for THIS worker thread. One call per account."""
+    try:
+        _CFG_TLS.cfg = snap if isinstance(snap, dict) else _cfg_snapshot()
+        return _CFG_TLS.cfg
+    except Exception:
+        return {}
+
+
+def clear_task_cfg():
+    try:
+        _CFG_TLS.cfg = None
+    except Exception:
+        pass
+
+
 def live_cfg():
-    """The CURRENT run's config, readable from the long-lived daemon thread."""
+    """The config THIS thread is working under.
+
+    The task snapshot wins. STATE["cfg"] is only correct on the script thread,
+    where the run has not been handed off yet.
+    """
+    try:
+        c = getattr(_CFG_TLS, "cfg", None)
+        if c:
+            return c
+    except Exception:
+        pass
     c = STATE.get("cfg")
     if c:
         return c
@@ -1360,7 +1419,7 @@ def live_cfg():
 
 def probe_timeout() -> float:
     try:
-        return float(CFG.get("PROBE_TIMEOUT", PROBE_TIMEOUT_DEFAULT))
+        return float(live_cfg().get("PROBE_TIMEOUT", PROBE_TIMEOUT_DEFAULT))
     except Exception:
         return PROBE_TIMEOUT_DEFAULT
 
@@ -1368,7 +1427,7 @@ def probe_timeout() -> float:
 def active_protocols():
     """The selected protocols, always non-empty, IMAP-first."""
     try:
-        picked = [p for p in (CFG.get("PROTOCOLS") or []) if p in PROTOCOL_OPTIONS]
+        picked = [p for p in (live_cfg().get("PROTOCOLS") or []) if p in PROTOCOL_OPTIONS]
     except Exception:
         picked = []
     if not picked:
@@ -1399,7 +1458,7 @@ def probe_targets():
     if ov:
         return list(ov)
     try:
-        name = CFG.get("PROBE_TARGET", PROBE_TARGET_DEFAULT)
+        name = live_cfg().get("PROBE_TARGET", PROBE_TARGET_DEFAULT)
     except Exception:
         name = PROBE_TARGET_DEFAULT
     return PROBE_TARGET_PORTS.get(name) or PROBE_TARGET_PORTS[PROBE_TARGET_AUTO]
@@ -1460,24 +1519,25 @@ def request_budget():
         nodes = len(all_proxies)
     except Exception:
         nodes = 0
-    per_node = 1 + (1 if CFG.get("PROBE_SECOND_SCHEME",
-                                 PROBE_SECOND_SCHEME_DEFAULT) else 0)
-    per_node *= max(1, int(CFG.get("PROBE_MAX_TARGETS", PROBE_MAX_TARGETS_DEFAULT)))
+    _c = live_cfg()
+    per_node = 1 + (1 if _c.get("PROBE_SECOND_SCHEME",
+                                PROBE_SECOND_SCHEME_DEFAULT) else 0)
+    per_node *= max(1, int(_c.get("PROBE_MAX_TARGETS", PROBE_MAX_TARGETS_DEFAULT)))
     try:
-        sample = max(0, int(CFG.get("PROBE_SAMPLE_MAX", 0)))
+        sample = max(0, int(_c.get("PROBE_SAMPLE_MAX", 0)))
     except Exception:
         sample = 0
     probed = min(nodes, sample) if sample else nodes
     cycle = probed * per_node
-    if CFG.get("MAIL_SPOT_CHECK", MAIL_SPOT_CHECK_DEFAULT):
+    if _c.get("MAIL_SPOT_CHECK", MAIL_SPOT_CHECK_DEFAULT):
         cycle += min(MAIL_SPOT_NODES, probed)
-    if CFG.get("PROBER_IDLE_ENABLED", PROBER_IDLE_ENABLED_DEFAULT):
+    if _c.get("PROBER_IDLE_ENABLED", PROBER_IDLE_ENABLED_DEFAULT):
         idle_per_min = cycle / max(1.0, PROBER_IDLE_SLEEP) * 60.0
     else:
         idle_per_min = 0.0
     rungs = _estimated_rung_count()
-    rot = max(1, int(CFG.get("MAX_ROTATIONS", MAX_ROTATIONS_DEFAULT)) + 1)
-    passes = 2 if CFG.get("CHECK_PASS2", CHECK_PASS2_DEFAULT) else 1
+    rot = max(1, int(_c.get("MAX_ROTATIONS", MAX_ROTATIONS_DEFAULT)) + 1)
+    passes = 2 if _c.get("CHECK_PASS2", CHECK_PASS2_DEFAULT) else 1
     return {"cycle": cycle, "idle_per_min": idle_per_min,
             "per_account": rungs * passes * rot * per_node}
 # @@END 026 RUNTIME_HELPERS
@@ -2606,9 +2666,31 @@ _STARTUP_MAX = 400
 
 
 def _startup_who() -> str:
-    """The owner stamp for a shared-buffer line (block 037's cache owner)."""
+    """The owner stamp for a shared-buffer line.
+
+    FIX OWN-1 (v13.57): this called _cache_owner() and nothing else. _cache_owner()
+    resolves through user_file() -> auth -> session_state, and session_state is not
+    reliable off the script thread - yet every quiet line is logged from the
+    alive-pool daemon, the first-probe thread and quarantine_proxy(). Those lines
+    were stamped with whatever the worker happened to get, so they could land in
+    the wrong user's panel or vanish entirely.
+    _gate_scope() is the plain string block 040 keeps refreshed on the script
+    thread and is what block 073 already uses for this exact reason, so it is
+    preferred. _cache_owner() is the fallback for the import-time calls in block
+    039, which run before block 040 has defined _gate_scope at all.
+    """
     try:
-        return _cache_owner()
+        who = _gate_scope()
+        if who and who != "anon":
+            return who
+    except Exception:
+        pass
+    try:
+        return _cache_owner() or _gate_scope()
+    except Exception:
+        pass
+    try:
+        return _gate_scope()
     except Exception:
         return ""
 
@@ -2801,7 +2883,15 @@ class _Gate:
 # other user's live gates underneath it. Every key is prefixed with the SESSION
 # scope. The pool itself stays shared on purpose - it describes the provider's
 # IPs, not the user - but the THROUGHPUT is now per user.
+#
+# FIX SCOPE-1 (v13.57): THE SCOPE ITSELF WAS SHARED TOO. _GATE_SCOPE was a plain
+# dict refreshed on the script thread and read straight from every worker, so a
+# rerun could change the scope underneath a live account: the gate it ACQUIRED and
+# the gate it RELEASED were then different objects, and the ceiling it believed in
+# doubled or collapsed mid-rung. The value is pinned per thread on first read, the
+# script thread owns the refresh, and block 105 pins it explicitly per task.
 _GATE_SCOPE = {"id": "anon"}
+_GATE_TLS = threading.local()
 
 
 def _refresh_gate_scope():
@@ -2813,12 +2903,38 @@ def _refresh_gate_scope():
                or "anon")
     except Exception:
         tok = "anon"
-    _GATE_SCOPE["id"] = str(tok) or "anon"
-    return _GATE_SCOPE["id"]
+    tok = str(tok) or "anon"
+    _GATE_SCOPE["id"] = tok
+    try:
+        _GATE_TLS.id = tok
+    except Exception:
+        pass
+    return tok
+
+
+def _pin_gate_scope(tok):
+    """Pin the scope on the CALLING thread. Block 105 calls this per task."""
+    try:
+        _GATE_TLS.id = str(tok) or "anon"
+    except Exception:
+        pass
+    return _gate_scope()
 
 
 def _gate_scope() -> str:
-    return _GATE_SCOPE.get("id") or "anon"
+    """The scope for the CALLING thread - pinned once, then stable for its life."""
+    try:
+        who = getattr(_GATE_TLS, "id", None)
+        if who:
+            return who
+    except Exception:
+        pass
+    who = _GATE_SCOPE.get("id") or "anon"
+    try:
+        _GATE_TLS.id = who
+    except Exception:
+        pass
+    return who
 
 
 def _gate_table(name):
@@ -6530,14 +6646,26 @@ with str_lit.sidebar:
         f"(strict={CFG.get('TLS_STRICT')})"
     )
 
+    # FIX UI-7 (v13.57): these two were unconditional st.warning calls, so they
+    # closed the pending press on every load and stamped FAILED onto unrelated
+    # buttons - the exact fault UI-2 fixed for the banner above. They route
+    # through _steal now, and the zero-alive text stops blaming the pool when the
+    # real reason is a 402 that the pool cannot do anything about.
     if _q_now:
-        str_lit.warning(f"🩹 Quarantined for 407: **{_q_now}** node(s)")
+        (str_lit.caption if _steal else str_lit.warning)(
+            f"🩹 Quarantined for 407: **{_q_now}** node(s)")
     if not all_proxies:
         str_lit.caption("No proxies configured - the engine will run fully DIRECT until "
                         "you add some.")
     elif _alive_now == 0:
-        str_lit.warning("⚠ No node passed the tunnel probe. Press 📥 Fetch & Test All "
-                        "Proxies again.")
+        if _p_plan:
+            _ztxt = (f"⚠ **{_p_plan}** node(s) answered **402** - the pool is alive and "
+                     f"authenticates; the provider's plan is refusing service. They stay "
+                     f"in the pool and every account runs DIRECT until it resets.")
+        else:
+            _ztxt = ("⚠ No node passed the tunnel probe. Press 📥 Fetch & Test All "
+                     "Proxies again - every account will run DIRECT until one does.")
+        (str_lit.caption if _steal else str_lit.warning)(_ztxt)
     else:
         str_lit.caption("A refusal is reported THREE ways. '407 auth (node)' = the node "
                         "itself failed the 443 control - the credential or the plan. "
@@ -6572,7 +6700,7 @@ with str_lit.sidebar:
             try:
                 if os.path.exists("proxies_all.txt"):
                     with open("proxies_all.txt", encoding="utf-8", errors="ignore") as _rf:
-                                    _restore = [l.strip() for l in _rf
+                        _restore = [l.strip() for l in _rf
                                     if l.strip() and not l.strip().startswith("#")]
                     if _restore:
                         with file_write_lock:
@@ -9864,6 +9992,12 @@ if start_engine_btn:
         # The queue is final and counted - open the run record here.
         _rs_path = runstate.begin(total_accs)
         thread_local = threading.local()
+        # FIX SCOPE-1 (v13.57): the run's gate scope and its config are captured
+        # HERE, on the script thread, before a single future exists. Every task pins
+        # both on its own worker, so a rerun in another tab (or this one) can no
+        # longer swap the scope under a live account or hand it another user's CFG.
+        _run_scope = _gate_scope()
+        _run_cfg = _cfg_snapshot()
         log_cap = LOG_CAP_DEBUG if CFG.get("DEBUG", False) else LOG_CAP_QUIET
         _last_ui_ts = 0.0
         _last_df_ts = 0.0
@@ -9892,6 +10026,9 @@ if start_engine_btn:
 
         def check_task(line):
             try:
+                # Pin BEFORE anything reads live_cfg() or asks for a gate.
+                seed_task_cfg(_run_cfg)
+                _pin_gate_scope(_run_scope)
                 if ":" not in line:
                     return {"line": f"{line} | Error: Invalid format", "status": FAILED,
                             "trace": ["Invalid format"]}
@@ -9927,6 +10064,7 @@ if start_engine_btn:
                             thread_local.state["sticky_proxy"] = _keep
                     except Exception:
                         pass
+                clear_task_cfg()
 # @@END 105 RUN_TRIGGER_UI
 
 # @@BLOCK 106 RUN_LOOP deps=009,014,083,105
@@ -10703,6 +10841,25 @@ else:
             str_lit.success(
                 f"Retrieved {len(_r_msgs)} recent message(s) from {_r_for}. "
                 f"Tap a message to open its body.")
+            # FIX BODY-KEY (v13.57): the body key was "bbbody_%d" - POSITIONAL. Open
+            # account A, switch to account B, read: message 1 of B reused key
+            # "bbbody_1", the seed below found the key already present and skipped,
+            # and the box showed account A's message 1 body. The key carries the
+            # account and the message id now, so it cannot collide across accounts
+            # or across a re-fetch of the same account.
+            _acct_slug = re.sub(r"[^a-z0-9]+", "_", (_r_for or "").lower()).strip("_")[:48]
+            if not _acct_slug:
+                _acct_slug = "acct"
+            _keep_prefix = "bbbody_%s_" % _acct_slug
+            # Drop the bodies of any OTHER account, so the keyspace cannot grow for
+            # ever and a widget key from a previous account is never left dangling.
+            for _stale in [k for k in list(str_lit.session_state.keys())
+                           if str(k).startswith("bbbody_")
+                           and not str(k).startswith(_keep_prefix)]:
+                try:
+                    del str_lit.session_state[_stale]
+                except Exception:
+                    pass
             # v13.53: one expander per message - the CLICK that was missing. Only
             # headers could ever appear, because the fetch never asked the server
             # for the body. Pre-open the first so it is obvious on a phone.
@@ -10719,7 +10876,8 @@ else:
                 _label = "%d. %s - %s" % (idx, _subj[:70], _from[:40])
                 with str_lit.expander(_label, expanded=(idx == 1)):
                     str_lit.caption(f"From: {_from}  ·  Date: {m.get('date')}")
-                    _mv_key = "bbbody_%d" % idx
+                    _mid = re.sub(r"[^A-Za-z0-9]+", "_", str(m.get("id") or idx)).strip("_")[:24]
+                    _mv_key = "%s%s" % (_keep_prefix, _mid or idx)
                     _mv_body = m.get("body") or "(no readable body)"
                     if _mv_key not in str_lit.session_state:
                         str_lit.session_state[_mv_key] = _mv_body
