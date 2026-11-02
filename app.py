@@ -5269,11 +5269,49 @@ _CANON_STATUS = {
     SMTP_FAILED: SMTP_FAILED,
 }
 
+# v13.60: THE POP3 TWINS.
+#
+# Gmail's POP3 daemon answers the same two facts its IMAP daemon does, in
+# slightly different words, and status.py owns only the IMAP wording:
+#
+#   IMAP  "Invalid credentials (Failure)"            -> WRONG
+#   POP3  "[AUTH] Username and password not accepted" -> UNKNOWN
+#
+#   IMAP  "IMAP access is disabled"                  -> APP
+#   POP3  "Please enable POP3 access in your account
+#          settings first"                            -> UNKNOWN
+#
+# The same evidence therefore landed in two different buckets depending only on
+# which protocol happened to answer, and a POP3-rejected password sat in the
+# Unclassified pile. These two tables are answered BEFORE the delegate, so the
+# result is identical to the IMAP path and does not depend on status.py being
+# current. WRONG is tested first: Gmail's disabled-POP text does not contain the
+# credential phrase, but ordering it this way keeps a wrong password out of the
+# app-password bucket even if the two ever overlap.
+_POP_STRONG_WRONG = (
+    "username and password not accepted",
+    "invalid credentials (failure)",
+    "invalid credentials (no auth)",
+)
+_POP_APP = (
+    "please enable pop3 access",
+    "enable pop3 access in your account settings",
+    "pop3 access is disabled",
+    "pop access is disabled",
+    "enable pop3",
+    "enable pop",
+)
+
 
 def classify_error(err, domain=""):
     try:
         err_str = str(err)
         if domain in ZERO_ACCESS_PROVIDERS:
+            return APP
+        _low = err_str.lower()
+        if any(t in _low for t in _POP_STRONG_WRONG):
+            return WRONG
+        if any(t in _low for t in _POP_APP):
             return APP
         st_val = st_classify(err_str, domain)
         return _CANON_STATUS.get(st_val, st_val)
