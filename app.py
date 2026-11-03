@@ -7239,7 +7239,7 @@ with str_lit.expander("🔍 View All Startup Entries & What Is Going On In The H
             str_lit.rerun()
 
 # ==========================================================================
-# v13.63 - RESOURCE MONITOR (RAM / DISK), PER-USER HISTORY, PER-USER RELEASE
+# v13.63 - RESOURCE MONITOR (RAM / DISK), FILE BROWSER, PER-USER HISTORY
 #
 # NOTE FOR THIS FILE: streamlit is imported as str_lit (block 001), so every
 # call here is str_lit.<x>. A bare st.<x> is a NameError at import time.
@@ -7255,11 +7255,13 @@ with str_lit.expander("🔍 View All Startup Entries & What Is Going On In The H
 #     "Free my RAM" touches, and it touches nothing on disk.
 #   * "ROM" is disk, and on Streamlit Cloud it is EPHEMERAL. Free space is
 #     container-wide; the FILES are per user because they carry the unlocked
-#     prefix, so yours are measurable and deletable and nobody else's are.
+#     prefix, so yours are viewable and deletable and nobody else's are.
 #
-# EVERY DISK TOUCH IS SCOPED TO os.path.basename(user_file("")) - the unlocked
-# prefix. _res_own_files() is the ONLY source of paths any delete can see, so a
-# delete physically cannot reach another user's file.
+# ISOLATION CONTRACT FOR EVERY DELETE AND EVERY DOWNLOAD:
+#   _res_own_files() is the ONLY source of paths. It is a listdir filtered on
+#   os.path.basename(user_file("")) - the unlocked prefix. The selection
+#   callbacks then INTERSECT that list again before acting, so even a stale
+#   widget-key map cannot reach a file outside this user's prefix.
 #
 # THE HISTORY IS STORED, one JSON object per line, in this user's own file.
 # Streamlit has no background scheduler, so a sample is taken when the script
@@ -7278,7 +7280,7 @@ _RES_SESSION_KEYS = (
     "conn_results", "proxy_results", "retry_results", "rbl_results",
     "smtp_results", "dns_results", "skip_results", "unknown_results",
     "log_lines", "report_entries", "startup_entries", "pre_dns_failed",
-    "pre_smtp_failed", "bb_reader_msgs", "_dbg_log",
+    "pre_smtp_failed", "bb_reader_msgs", "_dbg_log", "_res_dl",
 )
 # Never deleted by the cache sweep: the working pool, the stored history, and
 # everything that is a preference rather than a rebuildable artefact.
@@ -7292,6 +7294,7 @@ _MEM_FILE = user_file("mem_history.jsonl")
 _MEM_MAX_LINES = 1500
 _MEM_SAMPLE_SECONDS = 60.0
 _MEM_CHART_POINTS = 120
+_PREVIEW_BYTES = 200000
 # v13.63: the results directory is <hash>_mail_results, NOT mail_results - the
 # basename is prefixed like every other per-user path. Testing for the bare name
 # meant "Delete my cache files" skipped nothing and took the results with it,
@@ -7299,13 +7302,14 @@ _MEM_CHART_POINTS = 120
 _RES_DIR_NAME = os.path.basename(user_file("mail_results"))
 
 # v13.63: OWNER GATE. After Forget passkey and a second unlock in this tab,
-# session_state still holds the previous user's snapshot and throttle stamp - so
-# the new user saw the previous user's FILENAMES in "my files" and had their
-# first sample suppressed for up to a minute. Cleared before any widget exists.
+# session_state still holds the previous user's snapshot, throttle stamp, ticks
+# and staged download - so the new user saw the previous user's FILENAMES and
+# could have downloaded the previous user's bytes. Cleared before any widget.
 _RES_OWNER_KEY = "_res_owner"
 _res_owner = _cache_owner()
 if str_lit.session_state.get(_RES_OWNER_KEY) != _res_owner:
-    for _k in ("_res_snap", "_mem_last", "_res_flash", "res_confirm"):
+    for _k in ("_res_snap", "_mem_last", "_res_flash", "res_confirm",
+               "_res_uids", "_res_prev", "_res_dl"):
         str_lit.session_state.pop(_k, None)
     str_lit.session_state[_RES_OWNER_KEY] = _res_owner
 
@@ -7322,6 +7326,11 @@ def _res_fmt(n):
     if n < 1024 ** 3:
         return f"{n / (1024 ** 2):.1f} MB"
     return f"{n / (1024 ** 3):.2f} GB"
+
+
+def _res_uid(path):
+    """A stable, filesystem-independent widget-key fragment for one path."""
+    return re.sub(r"[^A-Za-z0-9]+", "_", str(path))[-70:]
 
 
 def _res_proc_mem():
@@ -7386,6 +7395,8 @@ def _res_session_bytes():
             continue
         try:
             if isinstance(_v, str):
+                _total += len(_v)
+            elif isinstance(_v, (bytes, bytearray)):
                 _total += len(_v)
             elif isinstance(_v, dict):
                 for _kk, _vv in _v.items():
@@ -7480,6 +7491,67 @@ def _res_delete(paths):
     return _gone
 
 
+def _res_preview(path):
+    """(text, note). 200 KB cap, cached on (mtime, size). Never raises.
+
+    ANY file type is viewable: a binary file is decoded with errors=replace and
+    labelled, so a zip still shows its header bytes instead of an error.
+    """
+    _cache = str_lit.session_state.get("_res_prev")
+    if not isinstance(_cache, dict):
+        _cache = {}
+    try:
+        _st = os.stat(path)
+        _sig = (_st.st_mtime, _st.st_size)
+        _size = _st.st_size
+    except Exception:
+        return None, "unreadable (stat failed)"
+    _hit = _cache.get(path)
+    if _hit and _hit[0] == _sig:
+        return _hit[1], _hit[2]
+    try:
+        with open(path, "rb") as _fh:
+            _head = _fh.read(_PREVIEW_BYTES)
+    except Exception as _e:
+        return None, f"read failed: {_e}"
+    _binary = b"\x00" in _head[:4096]
+    _text = _head.decode("utf-8", errors="replace")
+    if _binary:
+        _note = (f"binary - first {len(_head):,} of {_size:,} bytes decoded as text; "
+                 f"download it for the real bytes")
+    elif _size > len(_head):
+        _note = f"first {len(_head):,} of {_size:,} bytes"
+    else:
+        _note = f"{_size:,} bytes"
+    _cache[path] = (_sig, _text, _note)
+    if len(_cache) > 300:
+        _cache = dict(list(_cache.items())[-300:])
+    str_lit.session_state["_res_prev"] = _cache
+    return _text, _note
+
+
+def _res_selected_paths():
+    """Ticked paths, INTERSECTED with this user's own files again."""
+    _map = str_lit.session_state.get("_res_uids") or {}
+    _own = set(_res_own_files())
+    _out = []
+    for _uid, _p in _map.items():
+        try:
+            if _p in _own and str_lit.session_state.get("reschk_" + _uid):
+                _out.append(_p)
+        except Exception:
+            continue
+    return _out
+
+
+def _res_forget_ticks(paths):
+    for _p in paths:
+        try:
+            str_lit.session_state.pop("reschk_" + _res_uid(_p), None)
+        except Exception:
+            pass
+
+
 # --------------------------------------------------------------------------
 # stored history
 # --------------------------------------------------------------------------
@@ -7519,9 +7591,9 @@ def _mem_write(rows):
 def _mem_sample(force=False):
     """Append one sample. Throttled, so a fast rerun loop cannot flood the file.
 
-    v13.63: read and append are under file_write_lock, so two tabs of the SAME
-    user sampling at the same instant cannot lose one another's line. It is an
-    RLock, so re-entering from a callback that already holds it is safe.
+    Read and append are under file_write_lock, so two tabs of the SAME user
+    sampling at the same instant cannot lose one another's line. It is an RLock,
+    so re-entering from a callback that already holds it is safe.
     """
     _now = time.time()
     _last = float(str_lit.session_state.get("_mem_last") or 0.0)
@@ -7573,7 +7645,87 @@ def _on_clear_mem_history():
 
 
 # --------------------------------------------------------------------------
-# release actions
+# file browser actions
+# --------------------------------------------------------------------------
+def _on_clear_ticks():
+    _map = str_lit.session_state.get("_res_uids") or {}
+    for _uid in list(_map.keys()):
+        try:
+            str_lit.session_state.pop("reschk_" + _uid, None)
+        except Exception:
+            pass
+    str_lit.session_state["_res_flash"] = ("success", "Ticks cleared.")
+
+
+def _on_delete_selected():
+    _paths = _res_selected_paths()
+    if not _paths:
+        str_lit.session_state["_res_flash"] = ("warning", "Nothing ticked.")
+        return
+    _n = _res_delete(_paths)
+    _res_forget_ticks(_paths)
+    _prev = str_lit.session_state.get("_res_prev")
+    if isinstance(_prev, dict):
+        for _p in _paths:
+            _prev.pop(_p, None)
+    str_lit.session_state.pop("_res_snap", None)
+    _msg = f"Deleted {_n} file(s)."
+    if any(_res_is_result_file(_p) for _p in _paths):
+        _msg += (" Session buckets still hold their rows - use 'Delete my RESULT "
+                 "files' to empty those too.")
+    str_lit.session_state["_res_flash"] = ("success", _msg)
+
+
+def _on_download_selected():
+    _paths = _res_selected_paths()
+    if not _paths:
+        str_lit.session_state["_res_flash"] = ("warning", "Nothing ticked.")
+        return
+    _stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    try:
+        if len(_paths) == 1:
+            _p = _paths[0]
+            with open(_p, "rb") as _fh:
+                _data = _fh.read()
+            _name = os.path.basename(_p)
+            _mime = ("text/plain"
+                     if _name.endswith((".txt", ".json", ".jsonl", ".py", ".csv"))
+                     else "application/octet-stream")
+        else:
+            import io as _io
+            _buf = _io.BytesIO()
+            _seen = {}
+            with zipfile.ZipFile(_buf, "w", zipfile.ZIP_DEFLATED) as _z:
+                for _p in _paths:
+                    _bn = os.path.basename(_p)
+                    if _bn in _seen:
+                        _seen[_bn] += 1
+                        _stem, _dot, _ext = _bn.rpartition(".")
+                        _bn = (f"{_stem or _bn}_{_seen[_bn]}.{_ext}" if _dot
+                               else f"{_bn}_{_seen[_bn]}")
+                    else:
+                        _seen[_bn] = 1
+                    try:
+                        _z.write(_p, _bn)
+                    except Exception:
+                        continue
+            _data = _buf.getvalue()
+            _name = f"my_files_{len(_paths)}_{_stamp}.zip"
+            _mime = "application/zip"
+    except Exception as _e:
+        str_lit.session_state["_res_flash"] = ("warning", f"Could not stage: {_e}")
+        return
+    str_lit.session_state["_res_dl"] = (_data, _name, _mime)
+    str_lit.session_state["_res_flash"] = (
+        "success", f"Staged {len(_paths)} file(s) - press the Download button below.")
+
+
+def _on_clear_staged():
+    str_lit.session_state.pop("_res_dl", None)
+
+
+# --------------------------------------------------------------------------
+# bulk release actions
 # --------------------------------------------------------------------------
 def _on_free_ram():
     """Trim MY session payload. Nothing on disk is touched, no result is lost."""
@@ -7587,7 +7739,8 @@ def _on_free_ram():
         except Exception:
             pass
     for _k in ("_bb_prefilter_cache", "bb_reader_msgs", "bb_reader_note",
-               "_ex_zip", "_fmt_bad", "_fmt_truncated", "_res_snap"):
+               "_ex_zip", "_fmt_bad", "_fmt_truncated", "_res_snap",
+               "_res_dl", "_res_prev"):
         try:
             _ss.pop(_k, None)
         except Exception:
@@ -7625,6 +7778,7 @@ def _on_clear_cache_files():
             continue
         _victims.append(_p)
     _n = _res_delete(_victims)
+    _res_forget_ticks(_victims)
     str_lit.session_state.pop("_res_snap", None)
     str_lit.session_state["_res_flash"] = ("success", f"Removed {_n} cache file(s).")
 
@@ -7638,6 +7792,7 @@ def _on_clear_result_files():
         if _res_is_result_file(_p) or _base.endswith("_clean_valid_accounts.txt"):
             _victims.append(_p)
     _n = _res_delete(_victims)
+    _res_forget_ticks(_victims)
     _ss = str_lit.session_state
     for _k in ("valid_results", "wrong_results", "need_app_results",
                "login_drop_results", "conn_results", "proxy_results",
@@ -7651,7 +7806,8 @@ def _on_clear_result_files():
     for _k, _v in (("checked_emails_set", set()), ("zip_bytes", None),
                    ("zip_name", ""), ("engine_has_run", False),
                    ("clean_valid_count", 0), ("run_valid_count", 0),
-                   ("_bb_prefilter_cache", None), ("_res_snap", None)):
+                   ("_bb_prefilter_cache", None), ("_res_snap", None),
+                   ("_res_prev", None)):
         try:
             _ss[_k] = _v
         except Exception:
@@ -7666,7 +7822,7 @@ def _on_clear_result_files():
 
 
 section_title("🧮", "Resources (RAM / Disk)",
-              "live readings, my stored history, and the buttons that give it back")
+              "live readings, my files, my stored history, and the buttons that give it back")
 
 _res_flash = str_lit.session_state.pop("_res_flash", None)
 if _res_flash:
@@ -7700,16 +7856,16 @@ with str_lit.expander("🧮 Open the resource monitor", expanded=False):
     _rm4.metric("Disk total", _res_fmt(_rs.get("d_total") or 0))
 
     _res_ok = str_lit.toggle(
-        "Confirm the two delete buttons", value=False, key="res_confirm",
-        help="They stay disabled until this is on, so a stray tap on a phone cannot "
-             "wipe a result set.")
+        "Confirm the delete buttons", value=False, key="res_confirm",
+        help="Every delete stays disabled until this is on, so a stray tap on a "
+             "phone cannot wipe a result set.")
 
     _rb1, _rb2, _rb3 = str_lit.columns(3)
     with _rb1:
         str_lit.button("♻️ Free my RAM", width="stretch", on_click=_on_free_ram,
-                       help="Trims my log and report tails, drops my caches and my "
-                            "built ZIP, collects garbage. Nothing on disk is deleted "
-                            "and no result is lost.")
+                       help="Trims my log and report tails, drops my caches, my built "
+                            "ZIP and any staged download, collects garbage. Nothing on "
+                            "disk is deleted and no result is lost.")
     with _rb2:
         str_lit.button("🧹 Delete my cache files", width="stretch",
                        on_click=_on_clear_cache_files, disabled=not _res_ok,
@@ -7739,13 +7895,64 @@ with str_lit.expander("🧮 Open the resource monitor", expanded=False):
     else:
         str_lit.caption("My session payload is empty.")
 
-    _top = _rs.get("top") or []
-    if _top:
-        str_lit.caption(f"My {_rs.get('own_n', 0)} file(s), largest first:")
-        str_lit.code("\n".join(f"{_res_fmt(_s):>9}  {os.path.basename(_p)}"
-                               for _s, _p in _top), language="text")
+    # ----------------------------------------------------------------------
+    # MY FILES - view, tick, download, delete
+    # ----------------------------------------------------------------------
+    str_lit.markdown("---")
+    str_lit.markdown("#### 🗂 My files (view, download, delete)")
+
+    _files = sorted(_res_own_files())
+    _uids = {}
+    for _p in _files:
+        _uids[_res_uid(_p)] = _p
+    str_lit.session_state["_res_uids"] = _uids
+
+    if not _files:
+        str_lit.caption("No files of mine on disk yet.")
     else:
-        str_lit.caption("No files of mine on disk.")
+        str_lit.caption(f"{len(_files)} file(s), all carrying my own prefix. Tick a row "
+                        f"to select it, open a row to read it. Nothing here can reach "
+                        f"another user's file.")
+        _fb1, _fb2, _fb3 = str_lit.columns(3)
+        with _fb1:
+            str_lit.button("⬇️ Download ticked", width="stretch",
+                           on_click=_on_download_selected,
+                           help="One file downloads as itself; two or more download as "
+                                "a ZIP.")
+        with _fb2:
+            str_lit.button("🗑 Delete ticked", width="stretch",
+                           on_click=_on_delete_selected, disabled=not _res_ok)
+        with _fb3:
+            str_lit.button("☑️ Clear ticks", width="stretch", on_click=_on_clear_ticks)
+
+        _staged = str_lit.session_state.get("_res_dl")
+        if _staged:
+            str_lit.download_button(f"⬇️ Download {_staged[1]}", data=_staged[0],
+                                    file_name=_staged[1], mime=_staged[2],
+                                    width="stretch", key="res_dl_btn")
+            str_lit.button("✖️ Discard staged download", key="res_dl_clear",
+                           on_click=_on_clear_staged)
+
+        for _p in _files:
+            _uid = _res_uid(_p)
+            try:
+                _sz = os.path.getsize(_p)
+            except Exception:
+                _sz = 0
+            _rel = os.path.relpath(_p, os.getcwd())
+            _cchk, _cbody = str_lit.columns([0.10, 0.90])
+            with _cchk:
+                str_lit.checkbox("sel", key="reschk_" + _uid,
+                                 label_visibility="collapsed")
+            with _cbody:
+                with str_lit.expander(f"{_rel}  ·  {_res_fmt(_sz)}", expanded=False):
+                    _txt, _note = _res_preview(_p)
+                    str_lit.caption(_note)
+                    if _txt:
+                        with str_lit.container(height=260):
+                            str_lit.code(_txt, language="text")
+                    else:
+                        str_lit.caption("no preview available - download it instead")
 
     str_lit.caption("Readings refresh at most every 3 seconds. Off Linux (no /proc, no "
                     "cgroup) the memory figures read 0 and everything else still works.")
