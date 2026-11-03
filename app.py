@@ -7211,6 +7211,9 @@ with str_lit.expander("🔍 View All Startup Entries & What Is Going On In The H
 # ==========================================================================
 # v13.63 - RESOURCE MONITOR (RAM / DISK), PER-USER HISTORY, PER-USER RELEASE
 #
+# NOTE FOR THIS FILE: streamlit is imported as str_lit (block 001), so every
+# call here is str_lit.<x>. A bare st.<x> is a NameError at import time.
+#
 # WHAT IS AND IS NOT PER USER - stated here because the numbers are easy to
 # misread:
 #
@@ -7608,51 +7611,53 @@ with str_lit.expander("🧮 Open the resource monitor", expanded=False):
     _rs = _res_snapshot()
     _mem_sample()
 
-    st.caption("The container figures are shared by EVERY session on this deployment - "
-               "RAM belongs to the process, not to a person. Only the two 'mine' "
-               "figures are yours, and only those can be given back from here.")
+    str_lit.caption("The container figures are shared by EVERY session on this "
+                    "deployment - RAM belongs to the process, not to a person. Only "
+                    "the two 'mine' figures are yours, and only those can be given "
+                    "back from here.")
 
     _lim = _rs.get("lim") or 0
     _used = _rs.get("used") or _rs.get("rss") or 0
-    _rp1, _rp2, _rp3 = st.columns(3)
+    _rp1, _rp2, _rp3 = str_lit.columns(3)
     _rp1.metric("Container RAM used", _res_fmt(_used))
     _rp2.metric("Container RAM limit", _res_fmt(_lim) if _lim else "no limit file")
     _rp3.metric("Process peak", _res_fmt(_rs.get("peak") or 0))
     if _lim:
         _pct = min(1.0, _used / _lim)
-        st.progress(_pct, text=f"{_pct * 100:.0f}% of the container limit "
-                               f"(Streamlit Cloud is usually 1 GB)")
+        str_lit.progress(_pct, text=f"{_pct * 100:.0f}% of the container limit "
+                                    f"(Streamlit Cloud is usually 1 GB)")
 
-    _rm1, _rm2, _rm3, _rm4 = st.columns(4)
+    _rm1, _rm2, _rm3, _rm4 = str_lit.columns(4)
     _rm1.metric("My session payload", _res_fmt(_rs.get("sess") or 0))
     _rm2.metric("My files on disk", _res_fmt(_rs.get("own_b") or 0),
                 help=f"{_rs.get('own_n', 0)} file(s)")
     _rm3.metric("Disk free", _res_fmt(_rs.get("d_free") or 0))
     _rm4.metric("Disk total", _res_fmt(_rs.get("d_total") or 0))
 
-    _res_ok = st.toggle(
+    _res_ok = str_lit.toggle(
         "Confirm the two delete buttons", value=False, key="res_confirm",
         help="They stay disabled until this is on, so a stray tap on a phone cannot "
              "wipe a result set.")
 
-    _rb1, _rb2, _rb3 = st.columns(3)
+    _rb1, _rb2, _rb3 = str_lit.columns(3)
     with _rb1:
-        st.button("♻️ Free my RAM", width="stretch", on_click=_on_free_ram,
-                  help="Trims my log and report tails, drops my caches and my built "
-                       "ZIP, collects garbage. Nothing on disk is deleted and no "
-                       "result is lost.")
+        str_lit.button("♻️ Free my RAM", width="stretch", on_click=_on_free_ram,
+                       help="Trims my log and report tails, drops my caches and my "
+                            "built ZIP, collects garbage. Nothing on disk is deleted "
+                            "and no result is lost.")
     with _rb2:
-        st.button("🧹 Delete my cache files", width="stretch",
-                  on_click=_on_clear_cache_files, disabled=not _res_ok,
-                  help="Domain cache, proxy metadata, key map, proxies_all backup and "
-                       "my data/ scratch directory. Keeps results, settings, theme, "
-                       "presets, proxies.txt and my history.")
+        str_lit.button("🧹 Delete my cache files", width="stretch",
+                       on_click=_on_clear_cache_files, disabled=not _res_ok,
+                       help="Domain cache, proxy metadata, key map, proxies_all "
+                            "backup and my data/ scratch directory. Keeps results, "
+                            "settings, theme, presets, proxies.txt and my history.")
     with _rb3:
-        st.button("🗑 Delete my RESULT files", width="stretch",
-                  on_click=_on_clear_result_files, disabled=not _res_ok,
-                  help="mail_results/* and clean_valid_accounts.txt, plus the buckets "
-                       "in this session. Keeps settings, theme, presets, the paste box "
-                       "and my history. 'Skip previously valid' starts from empty after.")
+        str_lit.button("🗑 Delete my RESULT files", width="stretch",
+                       on_click=_on_clear_result_files, disabled=not _res_ok,
+                       help="mail_results/* and clean_valid_accounts.txt, plus the "
+                            "buckets in this session. Keeps settings, theme, presets, "
+                            "the paste box and my history. 'Skip previously valid' "
+                            "starts from empty after.")
 
     _brk = []
     for _k in _RES_SESSION_KEYS:
@@ -7664,38 +7669,38 @@ with str_lit.expander("🧮 Open the resource monitor", expanded=False):
             _brk.append((_n, _k))
     if _brk:
         _brk.sort(reverse=True)
-        st.caption("My payload by entry count - this is what 'Free my RAM' trims: "
-                   + ", ".join(f"{_k}={_n}" for _n, _k in _brk[:6]))
+        str_lit.caption("My payload by entry count - this is what 'Free my RAM' trims: "
+                        + ", ".join(f"{_k}={_n}" for _n, _k in _brk[:6]))
     else:
-        st.caption("My session payload is empty.")
+        str_lit.caption("My session payload is empty.")
 
     _top = _rs.get("top") or []
     if _top:
-        st.caption(f"My {_rs.get('own_n', 0)} file(s), largest first:")
-        st.code("\n".join(f"{_res_fmt(_s):>9}  {os.path.basename(_p)}"
-                          for _s, _p in _top), language="text")
+        str_lit.caption(f"My {_rs.get('own_n', 0)} file(s), largest first:")
+        str_lit.code("\n".join(f"{_res_fmt(_s):>9}  {os.path.basename(_p)}"
+                               for _s, _p in _top), language="text")
     else:
-        st.caption("No files of mine on disk.")
+        str_lit.caption("No files of mine on disk.")
 
-    st.caption("Readings refresh at most every 3 seconds. Off Linux (no /proc, no "
-               "cgroup) the memory figures read 0 and everything else still works.")
+    str_lit.caption("Readings refresh at most every 3 seconds. Off Linux (no /proc, no "
+                    "cgroup) the memory figures read 0 and everything else still works.")
 
     # ----------------------------------------------------------------------
     # MY STORED HISTORY
     # ----------------------------------------------------------------------
-    st.markdown("---")
-    st.markdown("#### 📈 My memory history (stored on my own file)")
-    st.caption("One sample a minute at most, only while this tab is being used - "
-               "Streamlit has no background scheduler here. Capped at "
-               f"{_MEM_MAX_LINES} samples; the oldest is dropped first.")
+    str_lit.markdown("---")
+    str_lit.markdown("#### 📈 My memory history (stored on my own file)")
+    str_lit.caption("One sample a minute at most, only while this tab is being used - "
+                    "Streamlit has no background scheduler here. Capped at "
+                    f"{_MEM_MAX_LINES} samples; the oldest is dropped first.")
 
     _mrows = _mem_read()
     if _mrows:
         _mst = _mem_stats(_mrows)
         _span = max(0.0, float(_mst["last"] or 0) - float(_mst["first"] or 0))
-        st.caption(f"{_mst['n']} sample(s) stored over {_span / 3600:.1f}h.")
+        str_lit.caption(f"{_mst['n']} sample(s) stored over {_span / 3600:.1f}h.")
 
-        _mc1, _mc2, _mc3 = st.columns(3)
+        _mc1, _mc2, _mc3 = str_lit.columns(3)
         _mc1.metric("Peak my payload", _res_fmt(_mst["peak_sess"]))
         _mc2.metric("Average my payload", _res_fmt(_mst["avg_sess"]))
         _mc3.metric("Peak process RSS", _res_fmt(_mst["peak_rss"]))
@@ -7712,11 +7717,11 @@ with str_lit.expander("🧮 Open the resource monitor", expanded=False):
                 },
                 index=pd.to_datetime([_r.get("t") or 0 for _r in _tail], unit="s"),
             )
-            st.line_chart(_mdf, height=220)
+            str_lit.line_chart(_mdf, height=220)
         except Exception as _chart_err:
-            st.caption(f"chart unavailable: {_chart_err}")
+            str_lit.caption(f"chart unavailable: {_chart_err}")
 
-        st.code("\n".join(
+        str_lit.code("\n".join(
             f"{datetime.fromtimestamp(float(_r.get('t') or 0)).strftime('%m-%d %H:%M:%S')}  "
             f"mine={_res_fmt(_r.get('sess') or 0):>9}  "
             f"ram={_res_fmt(_r.get('used') or 0):>9}  "
@@ -7724,20 +7729,20 @@ with str_lit.expander("🧮 Open the resource monitor", expanded=False):
             f"free={_res_fmt(_r.get('dfree') or 0):>9}"
             for _r in reversed(_mrows[-40:])), language="text")
     else:
-        st.caption("No samples stored yet - one is taken automatically within a minute "
-                   "of use, or press the button.")
+        str_lit.caption("No samples stored yet - one is taken automatically within a "
+                        "minute of use, or press the button.")
 
-    _mb1, _mb2 = st.columns(2)
+    _mb1, _mb2 = str_lit.columns(2)
     with _mb1:
-        st.button("📌 Take a sample now", width="stretch",
-                  on_click=_on_mem_sample_now,
-                  help="Records one reading immediately instead of waiting for the "
-                       "next interval.")
+        str_lit.button("📌 Take a sample now", width="stretch",
+                       on_click=_on_mem_sample_now,
+                       help="Records one reading immediately instead of waiting for "
+                            "the next interval.")
     with _mb2:
-        st.button("🧽 Clear my memory history", width="stretch",
-                  on_click=_on_clear_mem_history,
-                  help="Deletes only my history file. The live readings above keep "
-                       "working, and nothing else is touched.")
+        str_lit.button("🧽 Clear my memory history", width="stretch",
+                       on_click=_on_clear_mem_history,
+                       help="Deletes only my history file. The live readings above "
+                            "keep working, and nothing else is touched.")
 # @@END 079 STARTUP_PANEL_UI
 
 # @@BLOCK 080 PROXY_MGMT_UI deps=014,016,024,043,052,058,068,070,073,074,077
