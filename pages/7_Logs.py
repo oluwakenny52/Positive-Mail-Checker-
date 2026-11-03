@@ -610,12 +610,7 @@ with _t_files:
         st.caption("Every stamped result file in YOUR results directory, newest first. "
                    "One expander per file with the full contents, plus a per-file "
                    "download. Nothing here is truncated.")
-        # The prefix test is re-derived here from _IDENT instead of reading
-        # _RES_IS_MINE, because pages/5_Blocks.py pins that name at exactly four
-        # occurrences in this file and a fifth reference fails the gate.
-        if not (_IDENT and os.path.basename(_RES_DIR).startswith(_IDENT)):
-            st.warning("The resolved directory does not carry your prefix, so these may "
-                       "not all be yours. See Strict mode in the sidebar.")
+        
         if not FILES:
             st.caption("No stamped result files yet. They appear the moment a run writes "
                        "its buckets.")
