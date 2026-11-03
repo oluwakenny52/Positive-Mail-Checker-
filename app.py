@@ -706,11 +706,18 @@ PROBE_BATCH_BUDGET = 120.0
 PROBE_BATCH_MAX = 3600.0
 PROBE_BUDGET_START = 120.0
 UI_MIN_INTERVAL = 0.12
-# FIX NOLIMIT-1: 40 / 200 / 120 were display truncations on a pool of thousands.
-BUCKET_RENDER_TAIL = 200
-LOG_CAP_DEBUG = 500
-LOG_CAP_QUIET = 300
-REPORT_ENTRIES_MAX = 5000
+# FIX NOLIMIT-2 (v13.63): 40 / 200 / 120 / 5000 were display and retention caps on
+# a pool and a queue of thousands, and every one of them was hit by a real run.
+#   BUCKET_RENDER_TAIL  200 -> 2000  inline bucket lines
+#   LOG_CAP_QUIET       300 -> 2000  execution log kept in session
+#   LOG_CAP_DEBUG       500 -> 5000  the same, in Debug Mode
+#   REPORT_ENTRIES_MAX 5000 -> 20000 traced accounts
+# A cap that silently eats the record is worse than a slower render; the full text
+# still leaves by the ZIP, the .txt export and the Full Log page.
+BUCKET_RENDER_TAIL = 2000
+LOG_CAP_DEBUG = 5000
+LOG_CAP_QUIET = 2000
+REPORT_ENTRIES_MAX = 20000
 # FIX P1-3 / P1-4: the two per-rerun and per-account hogs get their own clocks.
 # FIX SPEED-10: 30s was far too eager for build_diagnostics_text(), which reads
 # proxies.txt, walks every proxy_meta row, resolves the egress geo and calls
@@ -6646,10 +6653,18 @@ def _burst_probe(proxy_str):
     behind it, so gating it just serialises the whole file behind
     PROXY_SUBUSER_CONCURRENCY and a 182-line file takes half an hour.
 
-    Nothing here is final: a pass is credited, but a failure is only RECORDED (in
-    probe_stats) and never struck. Phase 2 re-tests every non-pass through
-    precheck_proxy_fast(), under the real gates, where the accounting happens. So
-    a 407 caused by our own burst is corrected rather than believed.
+    A pass is credited immediately. A failure is only RECORDED (probe_stats) and
+    never struck - phase 2 re-tests it through precheck_proxy_fast() under the real
+    gates, where the accounting happens, so a 407 caused by our own burst is
+    corrected rather than believed.
+
+    FIX FETCH-3: A 402 IS A PASS HERE. precheck_proxy_fast() has returned True on
+    plan since v13.54 - a spent key is alive and authenticating - but this returned
+    bool(res["ok"]) and ok is False for a 402, so every 402 line was dropped in
+    phase 1 and, because "plan" was not in the phase-2 filter, was never re-tested.
+    Ninety live nodes were deleted before _collapse_by_hostport, whose second pass
+    exists precisely to keep them. Also: a cheap single-attempt TCP precheck first,
+    so a dead IP fails in ~3s instead of burning the whole 8s probe budget.
     """
     try:
         _rebind_scope()
@@ -6667,20 +6682,73 @@ def _burst_probe(proxy_str):
         if not SOCKS_OK:
             record_probe_result(proxy_str, False, "nosocks", error="PySocks missing")
             return False
+        try:
+            _tcp_to = min(3.0, float(live_cfg().get(
+                "PROXY_PRECHECK_TIMEOUT", PROXY_PRECHECK_TIMEOUT_DEFAULT)))
+        except Exception:
+            _tcp_to = 3.0
+        try:
+            _s = socket.create_connection((info["host"], int(info["port"])),
+                                          timeout=_tcp_to)
+            _s.close()
+        except Exception as _tcpe:
+            record_probe_result(proxy_str, False, "tcp",
+                                error=f"direct TCP to {info['host']}:{info['port']} "
+                                      f"failed: {_tcpe}")
+            return False
         res = tunnel_probe(proxy_str)
         record_probe_result(proxy_str, res["ok"], res["reason"],
                             latency_ms=res.get("latency_ms", 0),
                             target=res.get("target", ""), scheme=res.get("scheme"),
                             error=res.get("error", ""))
         if res["ok"]:
-            # A pass is real whatever the width, so it is credited immediately -
-            # that also marks the node ever_ok, which later stops it being struck
-            # for a 407 it was never at fault for.
             record_proxy_attempt(proxy_str, success=True)
+            return True
+        if res["reason"] == "plan":
+            # Alive, authenticating, out of bandwidth. KEPT, exactly as
+            # precheck_proxy_fast keeps it - never struck, never rotated away.
+            record_proxy_attempt(proxy_str, success=False, is_plan=True)
             return True
         return False
     except Exception:
         return False
+
+
+def _fetch_targets(prev_override):
+    """The target the FETCH validates against - and only if it answers.
+
+    FIX FETCH-4: THE FETCH PROBED A HOST NOBODY HAD CONFIRMED. It used to swap in
+    imap.gmail.com:993 for the duration, but it wrote STATE["probe_targets_override"]
+    while probe_targets() prefers the PER-USER copy that a previous Start had
+    already filled with the queue domain - so the swap was invisible and every line
+    was dialled against a guessed apex on 993. All 80 timeouts in the last run were
+    the full 8025 ms budget against a host with no listener, and the whole file
+    read dead.
+
+    The queue target is used only if a direct 3s TCP dial from this host succeeds.
+    Otherwise the fetch falls back to the 443 control, which is the clean baseline
+    the probe is designed around. One dial, and the log says which way it went.
+    """
+    fallback = [(PROBE_CONTROL_TARGETS[0][0], PROBE_CONTROL_TARGETS[0][1], "443 control")]
+    cand = None
+    for _h, _p, _l in (prev_override or []):
+        if _h:
+            try:
+                cand = (str(_h), int(_p), "queue:" + str(_h))
+            except Exception:
+                cand = None
+            break
+    if not cand:
+        return fallback, "no queue target set - validating on the 443 control"
+    try:
+        _s = socket.create_connection((cand[0], cand[1]), timeout=3.0)
+        _s.close()
+        return [cand], (f"queue target {cand[0]}:{cand[1]} answers from this host "
+                        f"- validating against it")
+    except Exception as _e:
+        return fallback, (f"queue target {cand[0]}:{cand[1]} does NOT answer from this "
+                          f"host ({type(_e).__name__}) - validating on the 443 control "
+                          f"instead, so a dead destination cannot read as a dead pool")
 
 
 def fetch_and_test_all_proxies(silent: bool = False):
@@ -6690,12 +6758,10 @@ def fetch_and_test_all_proxies(silent: bool = False):
     FIX PERF-3: the batch was ONE as_completed() call under a 276s budget on the
     Streamlit script thread, so the page was dead for minutes with a spinner and
     no numbers. It now runs in chunks with a progress bar.
-    FIX PERF-4: the probe target is pointed at a MAIL endpoint for the duration of
-    the fetch, so validation exercises the port that actually matters.
     FIX PERF-5: the 0-alive TCP fallback was a SERIAL loop of is_proxy_alive()
     calls - 92 nodes x 5s is ~460s of dead page. It is pooled now.
     FIX 407-SCOPE: the completion line no longer calls a TCP-alive fallback line
-    "validated" - it reports the two counts separately.
+    "validated" - it reports the counts separately.
     FIX POOL-DUP: the survivor list is collapsed to one entry per credential pair.
 
     FIX KEY-1 (v13.58): THE LINE-TO-KEY ASSOCIATION WAS THROWN AWAY. fetch_ws()
@@ -6708,20 +6774,17 @@ def fetch_and_test_all_proxies(silent: bool = False):
     FIX ISO-6 (v13.59): the map, the raw backup and the probe budget are per user
     now - they follow the same unlocked prefix as proxies.txt.
 
-    FIX FETCH-2 (v13.62): THE CHUNK WAS BIGGER THAN THE BUDGET, AND THE BUDGET WAS
-    A GUESS. 24-line chunks against a 144s chunk budget, on a pool whose real
-    concurrency is the PER-SUB-USER gate (1 per sub-user, so 2 tunnels for a
-    2-sub-user pool): 24 lines at 2 at a time cost ~230s, so every chunk timed out
-    first, the bar sat on "0/182" for two and a half minutes, and _run_batch handed
-    back only the lines that happened to finish - the rest were abandoned, counted
-    dead and dropped. The whole-fetch budget was len(raw)*3.0 = 546s for ~1700s of
-    real work, so it cut off a third of the way in and then "fell back" to a bare
-    TCP probe, writing a pool of sockets nothing had validated.
+    FIX FETCH-2 (v13.62): 24-line chunks against a 144s chunk budget, on a pool
+    whose real concurrency is the per-sub-user gate, meant every chunk timed out
+    and _run_batch returned only what happened to finish - the rest were abandoned
+    and counted dead. The whole budget was len(raw)*3.0 for ~1700s of real work.
+    Now: width from the pool's own sub-user count, chunk = one wave, budget from
+    real concurrency, nothing abandoned, and every non-pass gets a second gated
+    pass. Speed from phase 1; truth from phase 2.
 
-    Now: width is derived from the pool's own sub-user count, the chunk is one
-    wave, the budget is computed from real concurrency, a chunk timeout no longer
-    abandons anything, and every non-pass gets a second gated pass. Speed comes
-    from phase 1; truth comes from phase 2.
+    FIX FETCH-3 / FETCH-4: a 402 is kept, the target must actually answer, the
+    override goes to the OWNER copy, dead IPs fail fast, and phase 2 uses the real
+    gate width instead of a hardcoded 3.
     """
     global all_proxies, filtered_pool
 
@@ -6825,10 +6888,16 @@ def fetch_and_test_all_proxies(silent: bool = False):
             _m["fails"] = 0
             _m["score"] = compute_real_score(_m.get("success", 0), 0)
 
-    _prev_ov = list(STATE.get("probe_targets_override") or [])
+    # ---- the target swap, on the OWNER copy AND the process mirror -------------
+    _us_ov = _user_state()
+    _prev_owner_ov = list(_us_ov.get("probe_targets_override") or [])
+    _prev_state_ov = list(STATE.get("probe_targets_override") or [])
+    _targets, _target_why = _fetch_targets(_prev_owner_ov or _prev_state_ov)
+    log_startup(f"Fetch & test target: {_target_why}")
+    log_probe_event(f"fetch target -> {[t[0] + ':' + str(t[1]) for t in _targets]} ({_target_why})")
     try:
-        STATE["probe_targets_override"] = [
-            (MAIL_SPOT_FALLBACK[0], MAIL_SPOT_FALLBACK[1], "fetch:mail")]
+        _us_ov["probe_targets_override"] = _targets
+        STATE["probe_targets_override"] = _targets
     except Exception:
         pass
 
@@ -6836,37 +6905,48 @@ def fetch_and_test_all_proxies(silent: bool = False):
     _ft_timed_out = False
 
     # ---- the width: 3 in flight per SUB-USER, never below 4, never above 24 ----
-    # The provider meters sub-users, so the pool's own shape is the honest ceiling
-    # to burst against. A 2-sub-user pool gets 6; an 8-sub-user pool gets 24.
     _subs = set()
+    _ips = set()
     for _bp in all_raw:
         _bi = parse_proxy(_bp)
-        _bu = (_bi.get("user") or "").strip().lower() if _bi else ""
+        if not _bi:
+            continue
+        _bu = (_bi.get("user") or "").strip().lower()
         if _bu:
             _subs.add(_bu)
+        if _bi.get("host"):
+            _ips.add(_bi["host"])
     _n_sub = max(1, len(_subs))
+    _n_ip = max(1, len(_ips))
     _burst = max(4, min(24, _n_sub * 3))
+    # Phase 2 is GATE-limited, so it is budgeted on the gate width, not on 3.
+    try:
+        _p2_width = max(4, min(int(live_cfg().get("PROXY_CONCURRENCY",
+                                                  PROXY_CONCURRENCY_DEFAULT)),
+                               _n_ip * int(live_cfg().get("PROXY_IP_CONCURRENCY",
+                                                          PROXY_IP_CONCURRENCY_DEFAULT)),
+                               _n_sub * int(live_cfg().get("PROXY_SUBUSER_CONCURRENCY",
+                                                           PROXY_SUBUSER_CONCURRENCY_DEFAULT))))
+    except Exception:
+        _p2_width = 4
     try:
         _per_line = max(6.0, float(probe_timeout()) + 2.0)
     except Exception:
         _per_line = 10.0
-    # The budget is now CONCURRENCY-AWARE: width lanes, per_line each, 1.5x slack.
-    # The old len(raw)*3.0 assumed 6s per line with unlimited lanes.
     batch_timeout = max(
         90.0, min(PROBE_BATCH_MAX * 3.0, (total / _burst) * _per_line * 1.5))
     log_startup(
-        f"Fetch & test plan: {total} line(s) over {_n_sub} sub-user(s) -> phase-1 burst "
-        f"width {_burst} (~{total / _burst * _per_line:.0f}s), then a gated re-test of "
-        f"only the ambiguous answers. Total budget {batch_timeout:.0f}s.")
+        f"Fetch & test plan: {total} line(s) over {_n_sub} sub-user(s) / {_n_ip} IP(s) "
+        f"-> phase-1 burst {_burst} (~{total / _burst * _per_line:.0f}s), then phase 2 "
+        f"at gate width {_p2_width} on the ambiguous answers only. Budget {batch_timeout:.0f}s.")
     log_probe_event(
-        f"fetch plan: total={total} subusers={_n_sub} burst={_burst} "
-        f"budget={batch_timeout:.0f}s per_line={_per_line:.0f}s")
+        f"fetch plan: total={total} subusers={_n_sub} ips={_n_ip} burst={_burst} "
+        f"p2={_p2_width} budget={batch_timeout:.0f}s")
 
     _started = time.time()
     _pbar = None
     try:
-        _pbar = str_lit.progress(
-            0.0, text=f"Phase 1 - burst validating 0/{total} ...")
+        _pbar = str_lit.progress(0.0, text=f"Phase 1 - burst validating 0/{total} ...")
     except Exception:
         _pbar = None
 
@@ -6894,11 +6974,9 @@ def fetch_and_test_all_proxies(silent: bool = False):
                     pass
 
         # ---- PHASE 2: truth. Every non-pass, under the REAL gates. -----------
-        # Only the reasons a burst can CAUSE are re-tested. A format error, a
-        # blocked line, a TCP-dead host or a 402 plan answer is not ambiguous -
-        # re-dialling those is pure waste. auth and timeout are the two our own
-        # concurrency can manufacture, so those are the two that get a second,
-        # unhurried look at one-per-sub-user.
+        # Only what a burst can CAUSE is re-tested: auth and timeout. A format
+        # error, a blocked line, a TCP-dead host and a 402 are not ambiguous -
+        # 402 is already kept by phase 1, and re-dialling the rest is waste.
         try:
             with probe_stats_lock:
                 _snap_reason = {_k: (_v.get("reason") or "")
@@ -6910,14 +6988,15 @@ def fetch_and_test_all_proxies(silent: bool = False):
                       if _p not in _alive_set
                       and _snap_reason.get(_p) in ("auth", "timeout")]
         if _ambiguous:
-            _p2_budget = max(60.0, min(PROBE_BATCH_MAX, len(_ambiguous) * _per_line))
+            _p2_budget = max(
+                60.0, min(PROBE_BATCH_MAX, (len(_ambiguous) / _p2_width) * _per_line * 1.5))
             log_startup(
                 f"Phase 2: {len(_ambiguous)} line(s) answered 407 or timed out under the "
-                f"burst - re-testing them at gate-limited width (budget {_p2_budget:.0f}s). "
+                f"burst - re-testing at gate width {_p2_width} (budget {_p2_budget:.0f}s). "
                 f"These are the only ones a burst can get wrong.")
-            log_probe_event(f"phase 2: re-testing {len(_ambiguous)} ambiguous line(s)")
+            log_probe_event(f"phase 2: re-testing {len(_ambiguous)} ambiguous line(s) "
+                            f"at width {_p2_width}")
             _p2_started = time.time()
-            _p2_width = max(3, probe_workers())
             for _j in range(0, len(_ambiguous), _p2_width):
                 _p2_left = _p2_budget - (time.time() - _p2_started)
                 if _p2_left <= 1.0:
@@ -6938,12 +7017,18 @@ def fetch_and_test_all_proxies(silent: bool = False):
                         _pbar.progress(
                             0.7 + 0.3 * (_p2_done / max(1, len(_ambiguous))),
                             text=f"Phase 2 - confirming {_p2_done}/{len(_ambiguous)} "
-                                 f"ambiguous line(s) - {len(alive)} passed in total")
+                                 f"ambiguous line(s) - {len(alive)} kept in total")
                     except Exception:
                         pass
     finally:
+        # Restore BOTH copies - the owner one is what probe_targets() actually
+        # reads, and the process mirror is what blocks 077/105 compare through.
         try:
-            STATE["probe_targets_override"] = _prev_ov
+            _user_state()["probe_targets_override"] = _prev_owner_ov
+        except Exception:
+            pass
+        try:
+            STATE["probe_targets_override"] = _prev_state_ov
         except Exception:
             pass
         if _pbar is not None:
@@ -6953,9 +7038,8 @@ def fetch_and_test_all_proxies(silent: bool = False):
                 pass
 
     if _ft_timed_out:
-        log_startup(f"Fetch & test: total budget {batch_timeout:.0f}s spent; "
-                    f"keeping the {len(alive)} node(s) that finished and confirming "
-                    f"the ambiguous ones below.")
+        log_startup(f"Fetch & test: total budget {batch_timeout:.0f}s spent; keeping "
+                    f"the {len(alive)} node(s) that finished.")
 
     alive = list(dict.fromkeys(alive))
 
@@ -6977,10 +7061,12 @@ def fetch_and_test_all_proxies(silent: bool = False):
                         f"line(s) over {_ips_seen} IP(s) and {_subs_seen} sub-user(s) "
                         f"- one entry per credential pair, no per-IP cap.")
 
-    # FIX 407-SCOPE: the number of nodes that actually PASSED is remembered before
-    # the TCP fallback, so the completion line can stop calling a bare open socket
-    # "validated".
+    # FIX FETCH-3: report the 402-kept count apart from the real passes, because
+    # the completion line used to call every kept line "PASSED".
+    _n_plan = sum(1 for _p in alive if _psnap.get(_p) == "plan")
+    _n_passed = len(alive) - _n_plan
     validated = len(alive)
+
     if not alive:
         _pt = float(CFG.get("PROXY_PRECHECK_TIMEOUT", PROXY_PRECHECK_TIMEOUT_DEFAULT))
 
@@ -7025,9 +7111,9 @@ def fetch_and_test_all_proxies(silent: bool = False):
     filtered_pool = get_filtered_active_proxies(quiet=True)
 
     _unval = max(0, len(alive) - validated)
-    log_startup(f"Fetch & test complete: {validated}/{total} node(s) PASSED the tunnel "
-                f"probe, {_unval} unvalidated TCP-alive line(s) kept, "
-                f"{len(alive)} written and ARMED.")
+    log_startup(f"Fetch & test complete: {_n_passed} node(s) PASSED, {_n_plan} kept on a "
+                f"402 (alive, out of bandwidth), {_unval} unvalidated TCP-alive kept, "
+                f"{len(alive)} written and ARMED from {total} line(s).")
     return (len(alive), total)
 # @@END 077 FETCH_AND_TEST
 
@@ -7438,7 +7524,8 @@ with str_lit.sidebar:
     # progress bar in 24-line chunks, so the sidebar keeps painting instead of
     # freezing for the whole batch budget.
     if str_lit.button("📥 Fetch & Test All Proxies"):
-        str_lit.caption("Validating in 24-line chunks - the bar below moves.")
+        str_lit.caption("Phase 1 validates at burst width, then phase 2 confirms only "
+                        "the ambiguous answers. Both bars move.")
         _n_alive, _n_total = fetch_and_test_all_proxies()
         _msr = STATE.get("mail_spot") or {}
         if _msr.get("user") and _msr.get("user") != _gate_scope():
@@ -11219,10 +11306,10 @@ if start_engine_btn:
                             if _tick:
                                 _last_ui_ts = _now_ui
                                 if str_lit.session_state.get("colorize_logs", True):
-                                    log_container.markdown(colorize_logs(current_logs[-120:]),
+                                    log_container.markdown(colorize_logs(current_logs[-300:]),
                                                            unsafe_allow_html=True)
                                 else:
-                                    log_container.code("\n".join(current_logs[-120:]), language="text")
+                                    log_container.code("\n".join(current_logs[-300:]), language="text")
 
                                 _vals = [valid_len, wrong_len, need_len, login_drop_len,
                                          conn_len, proxy_len, retry_len, rbl_len,
@@ -11246,10 +11333,10 @@ if start_engine_btn:
                             str_lit.session_state.log_lines.append(err_msg)
                             current_logs = list(str_lit.session_state.log_lines)
                         if str_lit.session_state.get("colorize_logs", True):
-                            log_container.markdown(colorize_logs(current_logs[-120:]),
+                            log_container.markdown(colorize_logs(current_logs[-300:]),
                                                    unsafe_allow_html=True)
                         else:
-                            log_container.code("\n".join(current_logs[-120:]), language="text")
+                            log_container.code("\n".join(current_logs[-300:]), language="text")
 
                     # Checkpoint on TIME as well as on count. The counter alone
                     # meant a 47-account run never reached a checkpoint before a
@@ -11522,7 +11609,7 @@ if start_engine_btn:
 # carry every row. The block also WRITES to status_text, because until now
 # nothing here touched it: the screen sat on block 107's "writing result files"
 # line for the entire render, which is exactly what was reported as a hang.
-_DF_TAIL = 200
+_DF_TAIL = 1000
 
 try:
     status_text.text("Progress: complete - building the results summary...")
