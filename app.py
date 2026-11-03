@@ -7244,6 +7244,23 @@ with str_lit.expander("🔍 View All Startup Entries & What Is Going On In The H
 # NOTE FOR THIS FILE: streamlit is imported as str_lit (block 001), so every
 # call here is str_lit.<x>. A bare st.<x> is a NameError at import time.
 #
+# v13.63b - FOUR DEFECTS IN THE FIRST DRAFT, ALL FIXED HERE
+# ---------------------------------------------------------
+#  1. _res_own_files() only collected FILES in the working directory plus files
+#     under data/<prefix>/. Results live in <prefix>_mail_results/, which is a
+#     DIRECTORY, so os.path.isfile() rejected it and nothing inside was ever
+#     listed - no valid_ / wrong_ / failed_ / unfinished_live.json - and both
+#     result deletes were silent no-ops. A prefixed DIRECTORY is walked now.
+#  2. THE PANEL SLAMMED SHUT ON EVERY CLICK. The body sat inside an expander,
+#     which keeps no state, so each rerun collapsed it. The gate is a CHECKBOX
+#     with a key: it persists, so the body stays open while you work.
+#  3. "Clear ticks" popped widget keys. Popping a key whose widget is re-created
+#     in the same run is unreliable; it ASSIGNS False now, which is
+#     deterministic. Orphaned keys are swept on an owner change.
+#  4. "Delete ticked" looked broken because it is disabled until the confirm
+#     toggle is on, and nothing said so. A caption says so.
+#  Also removed: _res_snapshot() built a "top" list nothing read any more.
+#
 # WHAT IS AND IS NOT PER USER - stated here because the numbers are easy to
 # misread:
 #
@@ -7271,9 +7288,9 @@ with str_lit.expander("🔍 View All Startup Entries & What Is Going On In The H
 # Everything degrades to "?" rather than raising: /proc and the cgroup files do
 # not exist off Linux, and a monitor must never be the reason a page dies.
 #
-# Readings are cached for 3s. The expander body runs on EVERY rerun, and a
-# listdir plus a data/ walk per keystroke is exactly the kind of per-rerun cost
-# this file has already been bitten by.
+# Readings are cached for 3s. The body runs on EVERY rerun, and a listdir plus a
+# walk per keystroke is exactly the kind of per-rerun cost this file has already
+# been bitten by.
 # ==========================================================================
 _RES_SESSION_KEYS = (
     "valid_results", "wrong_results", "need_app_results", "login_drop_results",
@@ -7308,10 +7325,20 @@ _RES_DIR_NAME = os.path.basename(user_file("mail_results"))
 _RES_OWNER_KEY = "_res_owner"
 _res_owner = _cache_owner()
 if str_lit.session_state.get(_RES_OWNER_KEY) != _res_owner:
-    for _k in ("_res_snap", "_mem_last", "_res_flash", "res_confirm",
-               "_res_uids", "_res_prev", "_res_dl"):
+    for _k in ("_res_snap", "_mem_last", "_res_flash", "_res_uids",
+               "_res_prev", "_res_dl"):
+        str_lit.session_state.pop(_k, None)
+    for _k in [k for k in list(str_lit.session_state.keys())
+               if str(k).startswith("reschk_")]:
         str_lit.session_state.pop(_k, None)
     str_lit.session_state[_RES_OWNER_KEY] = _res_owner
+
+# Seeded, not defaulted: a keyed widget given a default AND a session value is
+# the "created with a default value but also had its value set via the Session
+# State API" warning.
+for _k in ("res_open", "res_confirm"):
+    if _k not in str_lit.session_state:
+        str_lit.session_state[_k] = False
 
 
 def _res_fmt(n):
@@ -7416,7 +7443,13 @@ def _res_session_bytes():
 
 
 def _res_own_files():
-    """Every file on disk carrying THIS user's prefix. Never another user's."""
+    """Every file on disk carrying THIS user's prefix. Never another user's.
+
+    v13.63b: a prefixed DIRECTORY is walked. It was files-only, so
+    <prefix>_mail_results - where every result, the resume record and the
+    clean-valid merge file actually live - was rejected by os.path.isfile() and
+    never listed at all.
+    """
     _pfx = os.path.basename(user_file("")) or ""
     _out = []
     if not _pfx:
@@ -7424,10 +7457,15 @@ def _res_own_files():
     _root = os.getcwd()
     try:
         for _name in os.listdir(_root):
-            if _name.startswith(_pfx + "_"):
-                _full = os.path.join(_root, _name)
-                if os.path.isfile(_full):
-                    _out.append(_full)
+            if not _name.startswith(_pfx + "_"):
+                continue
+            _full = os.path.join(_root, _name)
+            if os.path.isfile(_full):
+                _out.append(_full)
+            elif os.path.isdir(_full):
+                for _walk_root, _dirs, _files in os.walk(_full):
+                    for _fn in _files:
+                        _out.append(os.path.join(_walk_root, _fn))
     except Exception:
         pass
     try:
@@ -7446,16 +7484,6 @@ def _res_is_result_file(path):
     return os.path.basename(os.path.dirname(path)) == _RES_DIR_NAME
 
 
-def _res_total_bytes(paths):
-    _total = 0
-    for _p in paths:
-        try:
-            _total += os.path.getsize(_p)
-        except Exception:
-            pass
-    return _total
-
-
 def _res_snapshot():
     _now = time.time()
     _cached = str_lit.session_state.get("_res_snap") or {}
@@ -7463,6 +7491,12 @@ def _res_snapshot():
         return _cached
     _rss, _peak = _res_proc_mem()
     _own = _res_own_files()
+    _own_b = 0
+    for _p in _own:
+        try:
+            _own_b += os.path.getsize(_p)
+        except Exception:
+            pass
     _snap = {
         "ts": _now,
         "rss": _rss,
@@ -7473,8 +7507,7 @@ def _res_snapshot():
         "d_free": _res_disk()[1],
         "sess": _res_session_bytes(),
         "own_n": len(_own),
-        "own_b": _res_total_bytes(_own),
-        "top": sorted(((_res_total_bytes([_p]), _p) for _p in _own), reverse=True)[:10],
+        "own_b": _own_b,
     }
     str_lit.session_state["_res_snap"] = _snap
     return _snap
@@ -7545,9 +7578,10 @@ def _res_selected_paths():
 
 
 def _res_forget_ticks(paths):
+    """v13.63b: ASSIGN False. Popping a live widget key is unreliable."""
     for _p in paths:
         try:
-            str_lit.session_state.pop("reschk_" + _res_uid(_p), None)
+            str_lit.session_state["reschk_" + _res_uid(_p)] = False
         except Exception:
             pass
 
@@ -7651,7 +7685,7 @@ def _on_clear_ticks():
     _map = str_lit.session_state.get("_res_uids") or {}
     for _uid in list(_map.keys()):
         try:
-            str_lit.session_state.pop("reschk_" + _uid, None)
+            str_lit.session_state["reschk_" + _uid] = False
         except Exception:
             pass
     str_lit.session_state["_res_flash"] = ("success", "Ticks cleared.")
@@ -7828,9 +7862,17 @@ _res_flash = str_lit.session_state.pop("_res_flash", None)
 if _res_flash:
     getattr(str_lit, _res_flash[0], str_lit.info)(_res_flash[1])
 
-with str_lit.expander("🧮 Open the resource monitor", expanded=False):
+# Sampling happens OUTSIDE the gate, so history keeps filling while the panel is
+# shut. It is throttled, so this is one cheap call per minute.
+_mem_sample()
+
+# v13.63b: A CHECKBOX, not an expander. An expander keeps no state, so every
+# click collapsed it - which is what made the buttons look dead. The checkbox
+# persists, so the panel stays open while you work in it.
+_res_open = str_lit.checkbox("🧮 Open the resource monitor", key="res_open")
+
+if _res_open:
     _rs = _res_snapshot()
-    _mem_sample()
 
     str_lit.caption("The container figures are shared by EVERY session on this "
                     "deployment - RAM belongs to the process, not to a person. Only "
@@ -7855,10 +7897,12 @@ with str_lit.expander("🧮 Open the resource monitor", expanded=False):
     _rm3.metric("Disk free", _res_fmt(_rs.get("d_free") or 0))
     _rm4.metric("Disk total", _res_fmt(_rs.get("d_total") or 0))
 
-    _res_ok = str_lit.toggle(
-        "Confirm the delete buttons", value=False, key="res_confirm",
-        help="Every delete stays disabled until this is on, so a stray tap on a "
-             "phone cannot wipe a result set.")
+    _res_ok = str_lit.toggle("Confirm the delete buttons", key="res_confirm",
+                             help="Every delete stays disabled until this is on, so a "
+                                  "stray tap on a phone cannot wipe a result set.")
+    if not _res_ok:
+        str_lit.caption("⬆ Turn that on first - every delete button is disabled while "
+                        "it is off.")
 
     _rb1, _rb2, _rb3 = str_lit.columns(3)
     with _rb1:
@@ -7921,7 +7965,8 @@ with str_lit.expander("🧮 Open the resource monitor", expanded=False):
                                 "a ZIP.")
         with _fb2:
             str_lit.button("🗑 Delete ticked", width="stretch",
-                           on_click=_on_delete_selected, disabled=not _res_ok)
+                           on_click=_on_delete_selected, disabled=not _res_ok,
+                           help="Disabled until 'Confirm the delete buttons' is on.")
         with _fb3:
             str_lit.button("☑️ Clear ticks", width="stretch", on_click=_on_clear_ticks)
 
