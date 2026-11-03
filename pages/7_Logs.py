@@ -496,7 +496,9 @@ elif st.session_state.get("run_active"):
                "down by the page switch - the record is still on disk.")
 else:
     st.caption("Showing your last run and your on-disk history. Nothing is truncated "
-               "except the 2000-account report cap in app.py.")
+               "here: no line cap on the log, no row cap on the traces and no line cap "
+               "on a file. The only caps that still exist are the session retention "
+               "limits in app.py block 014, and they are 2000 / 5000 / 20000 lines.")
 
 # v13.51: _as_text() builds the ENTIRE export - every log line, every trace,
 # every startup line, the whole action ledger - and st.download_button() was
@@ -530,8 +532,8 @@ with _t_log:
     _render_log(FILTERED_LOGS)
     if not FILTERED_LOGS:
         st.caption("The session log is empty. It is cleared at every run start and "
-                   "capped at 120 lines (400 in Debug Mode). It is per session, so it "
-                   "is yours alone.")
+                   "retained at 2000 lines (5000 in Debug Mode). It is per session, so "
+                   "it is yours alone.")
 # @@END 010 TAB_EXEC_LOG
 
 # @@BLOCK 011 TAB_TRACE deps=008
@@ -568,7 +570,7 @@ with _t_boot:
         st.caption("Empty. It is cleared by 🧹 Clear Startup Logs and capped at 400.")
 # @@END 012 TAB_BOOT
 
-# @@BLOCK 013 TAB_RECORD deps=008
+# @@BLOCK 013 TAB_RECORD_FILES deps=008
 with _t_rec:
     _c1, _c2 = st.columns(2)
     with _c1:
@@ -589,19 +591,41 @@ with _t_rec:
     elif RUN_REC.get("state") == "finished":
         st.success("This run finished cleanly.")
 
-    if not hide_history:
+    if LIVE_REC:
         st.markdown("---")
-        st.markdown("**Your bucket files on disk**")
+        st.caption("The full resumable queue is on the File history tab and in the .txt "
+                   "export.")
+
+# FIX LOG-TAB-1 (v13.63): THE FILE HISTORY TAB WAS CREATED AND NEVER DRAWN INTO.
+# st.tabs() in block 010 makes six containers and block 013 used five of them, so
+# _t_files was a live tab with nothing inside it - the file list sat under Run
+# record instead and the tab read blank while the "My bucket files" metric happily
+# counted twelve. This block owns it now. The 400-line display cap is gone too: a
+# result file is small, and truncating it made the download the only way to reach
+# the end of one.
+with _t_files:
+    if hide_history:
+        st.caption("Hidden - untick 'Hide the file history tab' in the sidebar.")
+    else:
+        st.caption("Every stamped result file in YOUR results directory, newest first. "
+                   "One expander per file with the full contents, plus a per-file "
+                   "download. Nothing here is truncated.")
+        if not _RES_IS_MINE:
+            st.warning("The resolved directory does not carry your prefix, so these may "
+                       "not all be yours. See Strict mode in the sidebar.")
         if not FILES:
-            st.caption("No stamped result files yet.")
-        # v13.51: every stamped file was read IN FULL on every rerun - twelve
-        # files per run, times every run, on each tap. Memoised on (mtime, size),
-        # so an unchanged file is not read twice and the list can grow.
+            st.caption("No stamped result files yet. They appear the moment a run writes "
+                       "its buckets.")
+        # v13.51: every stamped file was read IN FULL on every rerun - twelve files
+        # per run, times every run, on each tap. Memoised on (mtime, size), so an
+        # unchanged file is not read twice and the list can grow.
         _fcache = st.session_state.get("_lg_filecache")
         if not isinstance(_fcache, dict):
             _fcache = {}
             st.session_state["_lg_filecache"] = _fcache
+        _live_paths = set()
         for _p, _tag, _stamp in FILES:
+            _live_paths.add(_p)
             try:
                 _stt = os.stat(_p)
                 _sig = (int(_stt.st_mtime_ns), _stt.st_size)
@@ -620,19 +644,23 @@ with _t_rec:
                     "⬇️ Download", data="\n".join(_lines).encode("utf-8"),
                     file_name=os.path.basename(_p), mime="text/plain",
                     key="lg_dl_%s" % os.path.basename(_p))
-                st.code("\n".join(_lines[:400]), language="text")
+                st.code("\n".join(_lines), language="text")
+        # prune cache entries for files that are gone, so it cannot grow for ever
+        for _old in [k for k in list(_fcache) if k not in _live_paths]:
+            _fcache.pop(_old, None)
 
-        if REPORTS:
-            st.markdown("---")
-            st.markdown("**Traces as CSV**")
-            _buf = __import__("io").StringIO()
-            _w = csv.writer(_buf)
-            _w.writerow(["time", "combo", "status", "trace"])
-            for r in FILTERED_REPORTS:
-                _w.writerow([r["Time"], r["Combo"], r["Status"], r["Trace"]])
-            st.download_button("⬇️ Download traces .csv", data=_buf.getvalue().encode("utf-8"),
-                               file_name="traces_%s.csv" % datetime.now().strftime("%Y%m%d_%H%M%S"),
-                               mime="text/csv", width="stretch")
+    if REPORTS:
+        st.markdown("---")
+        st.markdown("**Traces as CSV**")
+        _buf = __import__("io").StringIO()
+        _w = csv.writer(_buf)
+        _w.writerow(["time", "combo", "status", "trace"])
+        for r in FILTERED_REPORTS:
+            _w.writerow([r["Time"], r["Combo"], r["Status"], r["Trace"]])
+        st.download_button(
+            "⬇️ Download traces .csv", data=_buf.getvalue().encode("utf-8"),
+            file_name="traces_%s.csv" % datetime.now().strftime("%Y%m%d_%H%M%S"),
+            mime="text/csv", width="stretch")
 
 with _t_actions:
     st.caption("Every press and every control change recorded for YOUR user, newest "
@@ -693,5 +721,5 @@ with _t_actions:
             data="\n".join(json.dumps(a, ensure_ascii=False) for a in _act_rows).encode("utf-8"),
             file_name="action_log_%s.jsonl" % datetime.now().strftime("%Y%m%d_%H%M%S"),
             mime="application/json", width="stretch")
-# @@END 013 TAB_RECORD
+# @@END 013 TAB_RECORD_FILES
 # @@EOF
