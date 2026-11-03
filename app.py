@@ -8476,7 +8476,7 @@ def process_accounts(text, previous_valid):
             dns_fail_list, smtp_fail_list)
 # @@END 086 PROCESS_ACCOUNTS
 
-# @@BLOCK 087 INPUT_UI deps=034,035,055,082,083,085,086
+# @@BLOCK 087 INPUT_UI deps=034,035,039,055,082,083,085,086
 # ---- single BUCKET table (was RESULT_INSPECT + RESULT_ACTION_MODES duplicated) ----
 PREFILTER_LABELS = [
     "Ready to Check", "Resume Unfinished", "Disposables", "Typos",
@@ -8504,16 +8504,102 @@ BUCKET_TAGS = {
     "skip_results": "SKIPPED", "unknown_results": "UNCLASSIFIED",
 }
 
+# ==========================================================================
+# v13.63 - THE PASTE BOX AND THE INSPECTOR CHOICE NOW SURVIVE A REFRESH
+#
+# key="bb_raw_text" / key="bb_inspect_cat" only ever made the two widgets
+# survive a RERUN. A refresh, a tab close, a reaped session or a redeploy handed
+# both back at their defaults, and a 3000-line paste is the most expensive thing
+# on this page to retype.
+#
+# Both are per-user FILES now (the unlocked prefix, exactly like every other
+# per-user file), seeded BEFORE the widget is created and rewritten from an
+# on_change callback - a callback runs BEFORE the script body, so no widget key
+# is ever touched after the widget has been instantiated.
+# ==========================================================================
+_PASTE_FILE = user_file("paste_accounts.txt")
+_INSPECT_FILE = user_file("inspect_cat.txt")
+_PASTE_MAX = 8 * 1024 * 1024
+_INPUT_OWNER_KEY = "_input_owner"
+_PASTE_LIMIT_NOTE = ""
+
+
+def _read_text_file(path, cap=4096):
+    try:
+        if os.path.exists(path):
+            with open(path, encoding="utf-8", errors="ignore") as f:
+                return f.read(cap)
+    except Exception as e:
+        warnings.warn(f"could not read {path}: {e}")
+    return ""
+
+
+def _write_text_file(path, text):
+    tmp = path + ".tmp"
+    try:
+        with file_write_lock:
+            with open(tmp, "w", encoding="utf-8") as f:
+                f.write(text or "")
+            os.replace(tmp, path)
+    except Exception as e:
+        warnings.warn(f"could not write {path}: {e}")
+
+
+def _read_paste():
+    global _PASTE_LIMIT_NOTE
+    try:
+        if os.path.exists(_PASTE_FILE):
+            _sz = os.path.getsize(_PASTE_FILE)
+            if _sz > _PASTE_MAX:
+                _PASTE_LIMIT_NOTE = (f"Only the first {_PASTE_MAX // 1024} KB of a "
+                                     f"{_sz // 1024} KB paste was restored.")
+    except Exception:
+        pass
+    return _read_text_file(_PASTE_FILE, _PASTE_MAX)
+
+
+def _on_paste_change():
+    _write_text_file(_PASTE_FILE, str_lit.session_state.get("bb_raw_text", ""))
+
+
+def _on_paste_clear():
+    str_lit.session_state["bb_raw_text"] = ""
+    _write_text_file(_PASTE_FILE, "")
+
+
+def _on_inspect_change():
+    _write_text_file(_INSPECT_FILE,
+                     str(str_lit.session_state.get("bb_inspect_cat", ""))[:200])
+
+
+# ---- owner gate: a second unlock in this tab must not inherit the last one ----
+_input_owner = _cache_owner()
+if str_lit.session_state.get(_INPUT_OWNER_KEY) != _input_owner:
+    str_lit.session_state.pop("bb_raw_text", None)
+    str_lit.session_state.pop("bb_inspect_cat", None)
+    str_lit.session_state[_INPUT_OWNER_KEY] = _input_owner
+if "bb_raw_text" not in str_lit.session_state:
+    str_lit.session_state["bb_raw_text"] = _read_paste()
+
 section_title("📥", "Accounts Input & Pre-Filtering",
               "paste combos or upload a file - junk is filtered before the engine runs")
 
 input_tab1, input_tab2 = str_lit.tabs(["📝 Paste Combos", "📁 Upload Combo File"])
 raw_text = ""
 with input_tab1:
+    _ph1, _ph2 = str_lit.columns([0.62, 0.38])
+    with _ph1:
+        str_lit.caption("Saved to your own paste file - it survives a refresh, a tab "
+                        "close and a redeploy.")
+    with _ph2:
+        str_lit.button("🧹 Clear paste", width="stretch", on_click=_on_paste_clear,
+                       help="Empties the box AND the saved copy.")
     raw_text = str_lit.text_area(
         "Paste accounts here (email:password format):",
-        placeholder="user@example.com:password123", height=150,
-        key="bb_raw_text")          # FIX P1-2: a key stops the paste vanishing
+        placeholder="user@example.com:password123", height=260,
+        key="bb_raw_text", on_change=_on_paste_change)
+    if _PASTE_LIMIT_NOTE:
+        str_lit.caption(_PASTE_LIMIT_NOTE)
 with input_tab2:
     uploaded_file = str_lit.file_uploader("Upload .txt combo file", type=["txt"],
                                           key="bb_upload")   # FIX P1-2
@@ -8528,10 +8614,20 @@ with input_tab2:
                     raw_text = file_bytes.decode("utf-8", errors="ignore")
                 except Exception:
                     raw_text = file_bytes.decode("latin-1", errors="ignore")
-                str_lit.success("File uploaded successfully!")
+                # v13.63: the upload is written to the paste file too, so the
+                # numbers do not vanish on the next refresh. Guarded by a
+                # signature so a 3000-line file is not rewritten on every rerun.
+                _up_sig = (len(raw_text), hash(raw_text))
+                if str_lit.session_state.get("_paste_saved_sig") != _up_sig:
+                    _write_text_file(_PASTE_FILE, raw_text)
+                    str_lit.session_state["_paste_saved_sig"] = _up_sig
+                str_lit.success("File uploaded successfully - and saved, so it "
+                                "survives a refresh.")
         except Exception as e:
             str_lit.error(f"Failed decoding uploaded file: {e}")
             raw_text = ""
+    elif str_lit.session_state.get("bb_raw_text"):
+        str_lit.caption("Nothing uploaded - the paste box is driving the counts.")
 
 clean_lines = []
 disp, typo, resume, app_skip, custom_skipped, dns_skipped, smtp_skipped = [], [], [], [], [], [], []
@@ -8589,51 +8685,81 @@ if raw_text:
     for _pc, (_pl, _pv) in zip(metric_grid(_pf_metrics, per_row=3), _pf_metrics):
         _pc.metric(_pl, _pv)
 
-    section_title("🔍", "Filter & Result Categories Inspector",
-                  "inspect any bucket, including DNS Failed and SMTP Failed")
+# --------------------------------------------------------------------------
+# INSPECTOR - v13.63
+#
+# Three separate faults, all fixed here:
+#   * it lived inside `if raw_text:`, so with an empty paste box the result
+#     buckets could not be inspected at all. It is module level now.
+#   * the list was an uncapped st.code, so 3445 rows pushed the selectbox off
+#     the top of the screen and you had to drag the whole page to reach it. It
+#     is a fixed-height scroller (420px) inside an expander now: the page stops
+#     growing and the box can be opened and closed.
+#   * the choice was session-only. It is a per-user file now, validated against
+#     the CURRENT option list so a retired value can never raise.
+# --------------------------------------------------------------------------
+inspect_options = list(PREFILTER_LABELS) + [label for label, _ in BUCKETS]
 
-    inspect_options = list(PREFILTER_LABELS) + [label for label, _ in BUCKETS]
+if "bb_inspect_cat" not in str_lit.session_state:
+    str_lit.session_state["bb_inspect_cat"] = _read_text_file(_INSPECT_FILE, 200).strip()
+if str_lit.session_state.get("bb_inspect_cat") not in inspect_options:
+    str_lit.session_state["bb_inspect_cat"] = inspect_options[0]
 
+section_title("🔍", "Filter & Result Categories Inspector",
+              "open the box, pick ONE category - the list scrolls in place")
+
+# FIX RS-3: the preview used to append a metadata line per run into the SAME
+# list as the account lines, so "Showing N items" counted headers too. The
+# metadata is a caption now and the list holds account lines only.
+unfinished_runs = list_unfinished_runs()
+unfinished_preview = []
+for run in unfinished_runs:
+    unfinished_preview.extend(run.get("remaining") or [])
+
+category_map = {
+    "Ready to Check": clean_lines,
+    "Resume Unfinished": unfinished_preview,
+    "Disposables": disp,
+    "Typos": typo,
+    "Skip previously valid": resume,
+    "App-Skipped": app_skip,
+    "Custom Filtered": custom_skipped,
+    "DNS Failed": dns_skipped,
+    "SMTP Failed": smtp_skipped,
+}
+for _b_lbl, _b_key in BUCKETS:
+    category_map[_b_lbl] = list(str_lit.session_state.get(_b_key, []))
+
+with str_lit.expander("🔎 Inspect the contents of one category", expanded=False):
     filter_category_choice = str_lit.selectbox(
         "Select category to inspect contents:", options=inspect_options,
-        key="bb_inspect_cat")
+        key="bb_inspect_cat", on_change=_on_inspect_change)
 
-    # FIX RS-3: the preview used to append a metadata line per run into the SAME
-    # list as the account lines, so "Showing N items" counted headers too. The
-    # metadata is a caption now and the list holds account lines only.
-    unfinished_runs = list_unfinished_runs()
-    unfinished_preview = []
-    for run in unfinished_runs:
-        unfinished_preview.extend(run.get("remaining") or [])
     if unfinished_runs:
         _r0 = unfinished_runs[0]
         str_lit.caption(
             f"Record: {_r0.get('saved_at', '?')} | reason: {_r0.get('reason', '?')} | "
             f"{_r0.get('checked', 0)}/{_r0.get('total', 0)} checked at stop")
 
-    category_map = {
-        "Ready to Check": clean_lines,
-        "Resume Unfinished": unfinished_preview,
-        "Disposables": disp,
-        "Typos": typo,
-        "Skip previously valid": resume,
-        "App-Skipped": app_skip,
-        "Custom Filtered": custom_skipped,
-        "DNS Failed": dns_skipped,
-        "SMTP Failed": smtp_skipped,
-    }
-    _inspect_to_key = dict(BUCKETS)
-    if filter_category_choice in _inspect_to_key:
-        category_map[filter_category_choice] = list(
-            str_lit.session_state.get(_inspect_to_key[filter_category_choice], []))
-
     selected_list_items = category_map.get(filter_category_choice, [])
-    if selected_list_items:
-        str_lit.info(f"Showing **{len(selected_list_items)}** items for "
-                     f"**{filter_category_choice}**:")
-        str_lit.code("\n".join(str(i) for i in selected_list_items), language="text")
-    else:
+    if not selected_list_items:
         str_lit.info(f"No items in **{filter_category_choice}**.")
+    else:
+        _ih1, _ih2 = str_lit.columns([0.6, 0.4])
+        with _ih1:
+            str_lit.info(f"Showing **{len(selected_list_items)}** items for "
+                         f"**{filter_category_choice}** - the box scrolls, the page "
+                         f"does not grow.")
+        with _ih2:
+            _safe_cat = re.sub(r"[^a-z0-9]+", "_",
+                               filter_category_choice.lower()).strip("_") or "items"
+            str_lit.download_button(
+                f"⬇️ Download all {len(selected_list_items)}",
+                data="\n".join(str(i) for i in selected_list_items).encode("utf-8"),
+                file_name=f"{_safe_cat}_{len(selected_list_items)}.txt",
+                mime="text/plain", width="stretch", key=f"inspdl_{_safe_cat}")
+        with str_lit.container(height=420):
+            str_lit.code("\n".join(str(i) for i in selected_list_items), language="text")
 # @@END 087 INPUT_UI
 
 # @@BLOCK 088 PROVIDER_TABLES deps=002,052
