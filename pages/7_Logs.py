@@ -716,7 +716,7 @@ with _t_actions:
             st.code("\n".join("%s | %-9s | %s | %s%s"
                               % (a.get("ts", ""), a.get("outcome", ""), a.get("page", ""),
                                  a.get("label", ""),
-                                 (" | " + a.get("detail", ""))) if a.get("detail") else "")
+                                 (" | " + a.get("detail", "")) if a.get("detail") else "")
                               for a in _act_rows), language="text")
 
         st.download_button(
