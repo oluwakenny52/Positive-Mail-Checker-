@@ -7174,7 +7174,7 @@ def _write_clean_valid(header, valids):
     return len(merged), run_count
 # @@END 078 CLEAN_VALID_IO
 
-# @@BLOCK 079 STARTUP_PANEL_UI deps=034,038
+# @@BLOCK 079 STARTUP_PANEL_UI deps=007,034,037,038,039
 section_title("🖥️", "Startup & Under-The-Hood Display Panel",
               "system boot, config injection, proxy health, engine state transitions")
 
@@ -7207,6 +7207,537 @@ with str_lit.expander("🔍 View All Startup Entries & What Is Going On In The H
                 _STARTUP_SEEN.clear()
             log_startup("Startup logs cleared by user.")
             str_lit.rerun()
+
+# ==========================================================================
+# v13.63 - RESOURCE MONITOR (RAM / DISK), PER-USER HISTORY, PER-USER RELEASE
+#
+# WHAT IS AND IS NOT PER USER - stated here because the numbers are easy to
+# misread:
+#
+#   * RAM is NOT per user. Every session on this deployment shares ONE process
+#     and ONE container, so VmRSS and the cgroup figure belong to everybody.
+#     The part that IS attributable to one user is their SESSION PAYLOAD - their
+#     result lists, report entries, logs, paste buffer, cached prefilter - and
+#     that is the part that actually drives the OOM kills. It is the only part
+#     "Free my RAM" touches, and it touches nothing on disk.
+#   * "ROM" is disk, and on Streamlit Cloud it is EPHEMERAL. Free space is
+#     container-wide; the FILES are per user because they carry the unlocked
+#     prefix, so yours are measurable and deletable and nobody else's are.
+#
+# THE HISTORY IS STORED, one JSON object per line, in this user's own file.
+# Streamlit has no background scheduler, so a sample is taken when the script
+# runs - throttled to one per minute, forced by the button, capped at
+# _MEM_MAX_LINES. It grows only while the tab is in use and says so on screen.
+#
+# Everything degrades to "?" rather than raising: /proc and the cgroup files do
+# not exist off Linux, and a monitor must never be the reason a page dies.
+#
+# Readings are cached for 3s. The expander body runs on EVERY rerun, and a
+# listdir plus a data/ walk per keystroke is exactly the kind of per-rerun cost
+# this file has already been bitten by.
+# ==========================================================================
+_RES_SESSION_KEYS = (
+    "valid_results", "wrong_results", "need_app_results", "login_drop_results",
+    "conn_results", "proxy_results", "retry_results", "rbl_results",
+    "smtp_results", "dns_results", "skip_results", "unknown_results",
+    "log_lines", "report_entries", "startup_entries", "pre_dns_failed",
+    "pre_smtp_failed", "bb_reader_msgs", "_dbg_log",
+)
+# Never deleted by the cache sweep: the working pool, the stored history, and
+# everything that is a preference rather than a rebuildable artefact.
+_RES_KEEP_SUFFIX = (
+    "clean_valid_accounts.txt", "settings.json", "paste_accounts.txt",
+    "inspect_cat.txt", "theme.json", "download_presets.json", "proxies.txt",
+    "mem_history.jsonl",
+)
+
+_MEM_FILE = user_file("mem_history.jsonl")
+_MEM_MAX_LINES = 1500
+_MEM_SAMPLE_SECONDS = 60.0
+_MEM_CHART_POINTS = 120
+
+
+def _res_fmt(n):
+    try:
+        n = float(n)
+    except Exception:
+        return "?"
+    if n < 1024:
+        return f"{int(n)} B"
+    if n < 1024 ** 2:
+        return f"{n / 1024:.0f} KB"
+    if n < 1024 ** 3:
+        return f"{n / (1024 ** 2):.1f} MB"
+    return f"{n / (1024 ** 3):.2f} GB"
+
+
+def _res_proc_mem():
+    """(rss_bytes, peak_bytes) for THIS PROCESS. (0, 0) off Linux."""
+    rss = peak = 0
+    try:
+        with open("/proc/self/status", encoding="utf-8", errors="ignore") as _fh:
+            for _line in _fh:
+                if _line.startswith("VmRSS:"):
+                    rss = int(_line.split()[1]) * 1024
+                elif _line.startswith("VmHWM:"):
+                    peak = int(_line.split()[1]) * 1024
+                if rss and peak:
+                    break
+    except Exception:
+        pass
+    return rss, peak
+
+
+def _res_cgroup_read(paths):
+    for _p in paths:
+        try:
+            with open(_p, encoding="utf-8", errors="ignore") as _fh:
+                _raw = _fh.read().strip()
+            if not _raw:
+                continue
+            if _raw == "max":
+                return 0
+            _n = int(_raw)
+            if 0 < _n < (1 << 62):
+                return _n
+        except Exception:
+            continue
+    return 0
+
+
+def _res_cgroup_limit():
+    return _res_cgroup_read(("/sys/fs/cgroup/memory.max",
+                             "/sys/fs/cgroup/memory/memory.limit_in_bytes"))
+
+
+def _res_cgroup_used():
+    return _res_cgroup_read(("/sys/fs/cgroup/memory.current",
+                             "/sys/fs/cgroup/memory/memory.usage_in_bytes"))
+
+
+def _res_disk():
+    try:
+        _v = os.statvfs(os.getcwd())
+        return _v.f_blocks * _v.f_frsize, _v.f_bavail * _v.f_frsize
+    except Exception:
+        return 0, 0
+
+
+def _res_session_bytes():
+    """Approximate bytes this session is holding in session_state."""
+    _ss = str_lit.session_state
+    _total = 0
+    for _k in _RES_SESSION_KEYS:
+        _v = _ss.get(_k)
+        if not _v:
+            continue
+        try:
+            if isinstance(_v, str):
+                _total += len(_v)
+            elif isinstance(_v, dict):
+                for _kk, _vv in _v.items():
+                    _total += len(str(_kk)) + len(repr(_vv))
+            elif isinstance(_v, (list, tuple, set)):
+                for _item in _v:
+                    _total += len(_item) if isinstance(_item, str) else len(repr(_item))
+            else:
+                _total += len(repr(_v))
+        except Exception:
+            continue
+    try:
+        _total += len(_ss.get("bb_raw_text") or "")
+    except Exception:
+        pass
+    return _total
+
+
+def _res_own_files():
+    """Every file on disk carrying THIS user's prefix. Never another user's."""
+    _pfx = os.path.basename(user_file("")) or ""
+    _out = []
+    if not _pfx:
+        return _out
+    _root = os.getcwd()
+    try:
+        for _name in os.listdir(_root):
+            if _name.startswith(_pfx + "_"):
+                _full = os.path.join(_root, _name)
+                if os.path.isfile(_full):
+                    _out.append(_full)
+    except Exception:
+        pass
+    try:
+        for _walk_root, _dirs, _files in os.walk(os.path.join(_root, "data", _pfx)):
+            for _fn in _files:
+                _out.append(os.path.join(_walk_root, _fn))
+    except Exception:
+        pass
+    return _out
+
+
+def _res_total_bytes(paths):
+    _total = 0
+    for _p in paths:
+        try:
+            _total += os.path.getsize(_p)
+        except Exception:
+            pass
+    return _total
+
+
+def _res_snapshot():
+    _now = time.time()
+    _cached = str_lit.session_state.get("_res_snap") or {}
+    if _cached and (_now - _cached.get("ts", 0.0)) < 3.0:
+        return _cached
+    _rss, _peak = _res_proc_mem()
+    _own = _res_own_files()
+    _snap = {
+        "ts": _now,
+        "rss": _rss,
+        "peak": _peak,
+        "lim": _res_cgroup_limit(),
+        "used": _res_cgroup_used(),
+        "d_total": _res_disk()[0],
+        "d_free": _res_disk()[1],
+        "sess": _res_session_bytes(),
+        "own_n": len(_own),
+        "own_b": _res_total_bytes(_own),
+        "top": sorted(((_res_total_bytes([_p]), _p) for _p in _own), reverse=True)[:10],
+    }
+    str_lit.session_state["_res_snap"] = _snap
+    return _snap
+
+
+def _res_delete(paths):
+    _gone = 0
+    for _p in paths:
+        try:
+            os.remove(_p)
+            _gone += 1
+        except Exception:
+            pass
+    return _gone
+
+
+# --------------------------------------------------------------------------
+# stored history
+# --------------------------------------------------------------------------
+def _mem_read():
+    """Stored samples for THIS user, oldest first. Bad lines are skipped."""
+    _out = []
+    try:
+        if os.path.exists(_MEM_FILE):
+            with open(_MEM_FILE, encoding="utf-8", errors="ignore") as _fh:
+                for _line in _fh:
+                    _line = _line.strip()
+                    if not _line:
+                        continue
+                    try:
+                        _rec = json.loads(_line)
+                    except Exception:
+                        continue
+                    if isinstance(_rec, dict) and isinstance(_rec.get("t"), (int, float)):
+                        _out.append(_rec)
+    except Exception:
+        pass
+    return _out
+
+
+def _mem_write(rows):
+    try:
+        rows = list(rows)[-_MEM_MAX_LINES:]
+        _tmp = _MEM_FILE + ".tmp"
+        with open(_tmp, "w", encoding="utf-8") as _fh:
+            for _rec in rows:
+                _fh.write(json.dumps(_rec, separators=(",", ":")) + "\n")
+        os.replace(_tmp, _MEM_FILE)
+    except Exception as e:
+        warnings.warn(f"could not write memory history: {e}")
+
+
+def _mem_sample(force=False):
+    """Append one sample. Throttled, so a fast rerun loop cannot flood the file."""
+    _now = time.time()
+    _last = float(str_lit.session_state.get("_mem_last") or 0.0)
+    if not force and (_now - _last) < _MEM_SAMPLE_SECONDS:
+        return False
+    str_lit.session_state["_mem_last"] = _now
+    _snap = _res_snapshot()
+    _rec = {"t": round(_now, 1),
+            "rss": int(_snap.get("rss") or 0),
+            "used": int(_snap.get("used") or 0),
+            "lim": int(_snap.get("lim") or 0),
+            "sess": int(_snap.get("sess") or 0),
+            "own": int(_snap.get("own_b") or 0),
+            "dfree": int(_snap.get("d_free") or 0)}
+    _rows = _mem_read()
+    _rows.append(_rec)
+    _mem_write(_rows)
+    return True
+
+
+def _mem_stats(rows):
+    def _mx(key):
+        _vals = [int(r.get(key) or 0) for r in rows]
+        return max(_vals) if _vals else 0
+
+    def _av(key):
+        _vals = [int(r.get(key) or 0) for r in rows]
+        return int(sum(_vals) / len(_vals)) if _vals else 0
+
+    return {"n": len(rows), "peak_sess": _mx("sess"), "avg_sess": _av("sess"),
+            "peak_rss": _mx("rss"),
+            "first": rows[0].get("t") if rows else 0,
+            "last": rows[-1].get("t") if rows else 0}
+
+
+def _on_mem_sample_now():
+    _mem_sample(force=True)
+    str_lit.session_state["_res_flash"] = ("success", "Sample recorded.")
+
+
+def _on_clear_mem_history():
+    _mem_write([])
+    str_lit.session_state["_mem_last"] = 0.0
+    str_lit.session_state["_res_flash"] = ("success", "My memory history is cleared.")
+
+
+# --------------------------------------------------------------------------
+# release actions
+# --------------------------------------------------------------------------
+def _on_free_ram():
+    """Trim MY session payload. Nothing on disk is touched, no result is lost."""
+    _ss = str_lit.session_state
+    for _k, _keep in (("report_entries", 300), ("log_lines", 200),
+                      ("startup_entries", 200), ("_dbg_log", 100)):
+        try:
+            _v = _ss.get(_k) or []
+            if len(_v) > _keep:
+                _ss[_k] = list(_v)[-_keep:]
+        except Exception:
+            pass
+    for _k in ("_bb_prefilter_cache", "bb_reader_msgs", "bb_reader_note",
+               "_ex_zip", "_fmt_bad", "_fmt_truncated", "_res_snap"):
+        try:
+            _ss.pop(_k, None)
+        except Exception:
+            pass
+    # The diagnostic bundle and the self-test text are big strings cached in
+    # process STATE; drop them only when they are MINE.
+    try:
+        if (STATE.get("diag_cache") or {}).get("user") == _cache_owner():
+            STATE["diag_cache"] = {"ts": 0.0, "text": "", "user": ""}
+        if (STATE.get("selftest") or {}).get("user") == _cache_owner():
+            STATE.pop("selftest", None)
+    except Exception:
+        pass
+    try:
+        import gc
+        gc.collect()
+    except Exception:
+        pass
+    _mem_sample(force=True)
+    str_lit.session_state["_res_flash"] = (
+        "success", "Trimmed my session payload and collected garbage. No file deleted.")
+
+
+def _on_clear_cache_files():
+    """Delete MY rebuildable files. Keeps results, settings, theme, presets, pool."""
+    _pfx = os.path.basename(user_file("")) or ""
+    _victims = []
+    for _p in _res_own_files():
+        _base = os.path.basename(_p)
+        if _pfx and _base.startswith(_pfx + "_"):
+            _base = _base[len(_pfx) + 1:]
+        if _base in _RES_KEEP_SUFFIX:
+            continue
+        if os.path.basename(os.path.dirname(_p)) == "mail_results":
+            continue
+        _victims.append(_p)
+    _n = _res_delete(_victims)
+    str_lit.session_state.pop("_res_snap", None)
+    str_lit.session_state["_res_flash"] = ("success", f"Removed {_n} cache file(s).")
+
+
+def _on_clear_result_files():
+    """Delete MY result files AND the buckets holding them. Keeps the paste box."""
+    _pfx = os.path.basename(user_file("")) or ""
+    _victims = []
+    for _p in _res_own_files():
+        _base = os.path.basename(_p)
+        if os.path.basename(os.path.dirname(_p)) == "mail_results" \
+                or _base.endswith("_clean_valid_accounts.txt"):
+            _victims.append(_p)
+    _n = _res_delete(_victims)
+    _ss = str_lit.session_state
+    for _k in ("valid_results", "wrong_results", "need_app_results",
+               "login_drop_results", "conn_results", "proxy_results",
+               "retry_results", "rbl_results", "smtp_results", "dns_results",
+               "skip_results", "unknown_results", "report_entries", "log_lines",
+               "pre_dns_failed", "pre_smtp_failed"):
+        try:
+            _ss[_k] = []
+        except Exception:
+            pass
+    for _k, _v in (("checked_emails_set", set()), ("zip_bytes", None),
+                   ("zip_name", ""), ("engine_has_run", False),
+                   ("clean_valid_count", 0), ("run_valid_count", 0),
+                   ("_bb_prefilter_cache", None), ("_res_snap", None)):
+        try:
+            _ss[_k] = _v
+        except Exception:
+            pass
+    try:
+        invalidate_valid_caches()
+    except Exception:
+        pass
+    _mem_sample(force=True)
+    str_lit.session_state["_res_flash"] = (
+        "success", f"Removed {_n} result file(s) and emptied my buckets.")
+
+
+section_title("🧮", "Resources (RAM / Disk)",
+              "live readings, my stored history, and the buttons that give it back")
+
+_res_flash = str_lit.session_state.pop("_res_flash", None)
+if _res_flash:
+    getattr(str_lit, _res_flash[0], str_lit.info)(_res_flash[1])
+
+with str_lit.expander("🧮 Open the resource monitor", expanded=False):
+    _rs = _res_snapshot()
+    _mem_sample()
+
+    st.caption("The container figures are shared by EVERY session on this deployment - "
+               "RAM belongs to the process, not to a person. Only the two 'mine' "
+               "figures are yours, and only those can be given back from here.")
+
+    _lim = _rs.get("lim") or 0
+    _used = _rs.get("used") or _rs.get("rss") or 0
+    _rp1, _rp2, _rp3 = st.columns(3)
+    _rp1.metric("Container RAM used", _res_fmt(_used))
+    _rp2.metric("Container RAM limit", _res_fmt(_lim) if _lim else "no limit file")
+    _rp3.metric("Process peak", _res_fmt(_rs.get("peak") or 0))
+    if _lim:
+        _pct = min(1.0, _used / _lim)
+        st.progress(_pct, text=f"{_pct * 100:.0f}% of the container limit "
+                               f"(Streamlit Cloud is usually 1 GB)")
+
+    _rm1, _rm2, _rm3, _rm4 = st.columns(4)
+    _rm1.metric("My session payload", _res_fmt(_rs.get("sess") or 0))
+    _rm2.metric("My files on disk", _res_fmt(_rs.get("own_b") or 0),
+                help=f"{_rs.get('own_n', 0)} file(s)")
+    _rm3.metric("Disk free", _res_fmt(_rs.get("d_free") or 0))
+    _rm4.metric("Disk total", _res_fmt(_rs.get("d_total") or 0))
+
+    _res_ok = st.toggle(
+        "Confirm the two delete buttons", value=False, key="res_confirm",
+        help="They stay disabled until this is on, so a stray tap on a phone cannot "
+             "wipe a result set.")
+
+    _rb1, _rb2, _rb3 = st.columns(3)
+    with _rb1:
+        st.button("♻️ Free my RAM", width="stretch", on_click=_on_free_ram,
+                  help="Trims my log and report tails, drops my caches and my built "
+                       "ZIP, collects garbage. Nothing on disk is deleted and no "
+                       "result is lost.")
+    with _rb2:
+        st.button("🧹 Delete my cache files", width="stretch",
+                  on_click=_on_clear_cache_files, disabled=not _res_ok,
+                  help="Domain cache, proxy metadata, key map, proxies_all backup and "
+                       "my data/ scratch directory. Keeps results, settings, theme, "
+                       "presets, proxies.txt and my history.")
+    with _rb3:
+        st.button("🗑 Delete my RESULT files", width="stretch",
+                  on_click=_on_clear_result_files, disabled=not _res_ok,
+                  help="mail_results/* and clean_valid_accounts.txt, plus the buckets "
+                       "in this session. Keeps settings, theme, presets, the paste box "
+                       "and my history. 'Skip previously valid' starts from empty after.")
+
+    _brk = []
+    for _k in _RES_SESSION_KEYS:
+        try:
+            _n = len(str_lit.session_state.get(_k) or ())
+        except Exception:
+            _n = 0
+        if _n:
+            _brk.append((_n, _k))
+    if _brk:
+        _brk.sort(reverse=True)
+        st.caption("My payload by entry count - this is what 'Free my RAM' trims: "
+                   + ", ".join(f"{_k}={_n}" for _n, _k in _brk[:6]))
+    else:
+        st.caption("My session payload is empty.")
+
+    _top = _rs.get("top") or []
+    if _top:
+        st.caption(f"My {_rs.get('own_n', 0)} file(s), largest first:")
+        st.code("\n".join(f"{_res_fmt(_s):>9}  {os.path.basename(_p)}"
+                          for _s, _p in _top), language="text")
+    else:
+        st.caption("No files of mine on disk.")
+
+    st.caption("Readings refresh at most every 3 seconds. Off Linux (no /proc, no "
+               "cgroup) the memory figures read 0 and everything else still works.")
+
+    # ----------------------------------------------------------------------
+    # MY STORED HISTORY
+    # ----------------------------------------------------------------------
+    st.markdown("---")
+    st.markdown("#### 📈 My memory history (stored on my own file)")
+    st.caption("One sample a minute at most, only while this tab is being used - "
+               "Streamlit has no background scheduler here. Capped at "
+               f"{_MEM_MAX_LINES} samples; the oldest is dropped first.")
+
+    _mrows = _mem_read()
+    if _mrows:
+        _mst = _mem_stats(_mrows)
+        _span = max(0.0, float(_mst["last"] or 0) - float(_mst["first"] or 0))
+        st.caption(f"{_mst['n']} sample(s) stored over {_span / 3600:.1f}h.")
+
+        _mc1, _mc2, _mc3 = st.columns(3)
+        _mc1.metric("Peak my payload", _res_fmt(_mst["peak_sess"]))
+        _mc2.metric("Average my payload", _res_fmt(_mst["avg_sess"]))
+        _mc3.metric("Peak process RSS", _res_fmt(_mst["peak_rss"]))
+
+        _tail = _mrows[-_MEM_CHART_POINTS:]
+        try:
+            _mdf = pd.DataFrame(
+                {
+                    "my payload (MB)": [round(int(_r.get("sess") or 0) / 1048576, 2)
+                                        for _r in _tail],
+                    "container RAM (MB)": [round(int(_r.get("used")
+                                                    or _r.get("rss") or 0) / 1048576, 2)
+                                           for _r in _tail],
+                },
+                index=pd.to_datetime([_r.get("t") or 0 for _r in _tail], unit="s"),
+            )
+            st.line_chart(_mdf, height=220)
+        except Exception as _chart_err:
+            st.caption(f"chart unavailable: {_chart_err}")
+
+        st.code("\n".join(
+            f"{datetime.fromtimestamp(float(_r.get('t') or 0)).strftime('%m-%d %H:%M:%S')}  "
+            f"mine={_res_fmt(_r.get('sess') or 0):>9}  "
+            f"ram={_res_fmt(_r.get('used') or 0):>9}  "
+            f"files={_res_fmt(_r.get('own') or 0):>9}  "
+            f"free={_res_fmt(_r.get('dfree') or 0):>9}"
+            for _r in reversed(_mrows[-40:])), language="text")
+    else:
+        st.caption("No samples stored yet - one is taken automatically within a minute "
+                   "of use, or press the button.")
+
+    _mb1, _mb2 = st.columns(2)
+    with _mb1:
+        st.button("📌 Take a sample now", width="stretch",
+                  on_click=_on_mem_sample_now,
+                  help="Records one reading immediately instead of waiting for the "
+                       "next interval.")
+    with _mb2:
+        st.button("🧽 Clear my memory history", width="stretch",
+                  on_click=_on_clear_mem_history,
+                  help="Deletes only my history file. The live readings above keep "
+                       "working, and nothing else is touched.")
 # @@END 079 STARTUP_PANEL_UI
 
 # @@BLOCK 080 PROXY_MGMT_UI deps=014,016,024,043,052,058,068,070,073,074,077
