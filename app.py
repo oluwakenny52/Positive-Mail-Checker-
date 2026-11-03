@@ -3642,7 +3642,7 @@ if str_lit.session_state.pop("_bb_reset_pending", False):
     str_lit.rerun()
 # @@END 045 SETTINGS_RESET
 
-# @@BLOCK 046 SIDEBAR_MODE deps=009,042,043,044
+# @@BLOCK 046 SIDEBAR_MODE deps=009,017,019,042,043,044
 str_lit.sidebar.header("⚙ Engine Control Panel")
 str_lit.sidebar.caption(
     "Universal defaults are pre-set for ANY mix of combos (Gmail / O365 / Yahoo / "
@@ -3664,10 +3664,40 @@ str_lit.sidebar.caption("The sliders live in the Display Fit box at the top of t
 
 str_lit.sidebar.markdown("---")
 
+_MODE_OPTIONS = ("Normal Mode", "Fast Mode", "Deep / Aggressive Mode")
+
+# v13.63: THE LAST THREE "default value but also Session State API" WARNINGS IN
+# THIS BLOCK. ui_mode, ui_max_acc and ui_blacklist_cf were the remaining widgets
+# here created with a default AND a key=, while block 045 has already written
+# that same key from this user's settings.json - so every single load warned
+#
+#   "The widget with key 'ui_max_acc' was created with a default value but also
+#    had its value set via the Session State API."
+#
+# The positional default is dropped below and the key is SEEDED AND CLAMPED here
+# instead - the identical shape the three sliders further down already use, and
+# the shape that keeps ui_workers / ui_deadline / ui_timeout silent.
+#
+# THE SEED IS NOT OPTIONAL. Block 045 only seeds keys that are SAVED on disk, so
+# a fresh user has none at all; without this loop the sliders would fall back to
+# their MINIMUM (0 accounts, 3 fails) instead of the documented defaults. The
+# clamp also matters: a value saved under an older, wider range would otherwise
+# sit outside the slider and Streamlit would refuse to draw it.
+if str_lit.session_state.get("ui_mode") not in _MODE_OPTIONS:
+    str_lit.session_state["ui_mode"] = SETTING_DEFAULTS.get("ui_mode", "Normal Mode")
+for _k, _lo, _hi in (("ui_max_acc", 0, 5000), ("ui_blacklist_cf", 3, 100)):
+    _dv = int(SETTING_DEFAULTS.get(_k, _lo))
+    _v = str_lit.session_state.get(_k)
+    if not isinstance(_v, int):
+        try:
+            _v = int(_v)
+        except Exception:
+            _v = _dv
+    str_lit.session_state[_k] = max(_lo, min(_hi, _v))
+
 checker_mode = str_lit.sidebar.selectbox(
     "⚡ Select Engine Mode:",
-    options=["Normal Mode", "Fast Mode", "Deep / Aggressive Mode"],
-    index=0,
+    options=list(_MODE_OPTIONS),
     key="ui_mode",
     help="Normal: balanced and safe for legacy ISP IMAP. Fast: syntax + MX pre-filter, "
          "rapid ports. Deep: maximum depth, multiple fallbacks, strict validation."
@@ -3722,9 +3752,9 @@ else:
                                       key="ui_deadline")
     timeout = str_lit.sidebar.slider("Timeout", 3, 40, step=1, key="ui_timeout")
     default_hosts = 3
-max_acc = str_lit.sidebar.slider("Max Accounts", 0, 5000, 5000, 100, key="ui_max_acc")
+max_acc = str_lit.sidebar.slider("Max Accounts", 0, 5000, step=100, key="ui_max_acc")
 blacklist_cf = str_lit.sidebar.slider(
-    "Blacklist CF (consecutive proxy fails)", 3, 100, BLACKLIST_CF_DEFAULT, 1,
+    "Blacklist CF (consecutive proxy fails)", 3, 100, step=1,
     key="ui_blacklist_cf",
     help="A proxy is circuit-broken for 30s after this many consecutive network failures."
 )
@@ -7227,6 +7257,10 @@ with str_lit.expander("🔍 View All Startup Entries & What Is Going On In The H
 #     container-wide; the FILES are per user because they carry the unlocked
 #     prefix, so yours are measurable and deletable and nobody else's are.
 #
+# EVERY DISK TOUCH IS SCOPED TO os.path.basename(user_file("")) - the unlocked
+# prefix. _res_own_files() is the ONLY source of paths any delete can see, so a
+# delete physically cannot reach another user's file.
+#
 # THE HISTORY IS STORED, one JSON object per line, in this user's own file.
 # Streamlit has no background scheduler, so a sample is taken when the script
 # runs - throttled to one per minute, forced by the button, capped at
@@ -7258,6 +7292,22 @@ _MEM_FILE = user_file("mem_history.jsonl")
 _MEM_MAX_LINES = 1500
 _MEM_SAMPLE_SECONDS = 60.0
 _MEM_CHART_POINTS = 120
+# v13.63: the results directory is <hash>_mail_results, NOT mail_results - the
+# basename is prefixed like every other per-user path. Testing for the bare name
+# meant "Delete my cache files" skipped nothing and took the results with it,
+# while "Delete my RESULT files" only ever matched clean_valid.
+_RES_DIR_NAME = os.path.basename(user_file("mail_results"))
+
+# v13.63: OWNER GATE. After Forget passkey and a second unlock in this tab,
+# session_state still holds the previous user's snapshot and throttle stamp - so
+# the new user saw the previous user's FILENAMES in "my files" and had their
+# first sample suppressed for up to a minute. Cleared before any widget exists.
+_RES_OWNER_KEY = "_res_owner"
+_res_owner = _cache_owner()
+if str_lit.session_state.get(_RES_OWNER_KEY) != _res_owner:
+    for _k in ("_res_snap", "_mem_last", "_res_flash", "res_confirm"):
+        str_lit.session_state.pop(_k, None)
+    str_lit.session_state[_RES_OWNER_KEY] = _res_owner
 
 
 def _res_fmt(n):
@@ -7378,6 +7428,13 @@ def _res_own_files():
     return _out
 
 
+def _res_is_result_file(path):
+    """True for a file inside THIS user's results directory."""
+    if not _RES_DIR_NAME:
+        return False
+    return os.path.basename(os.path.dirname(path)) == _RES_DIR_NAME
+
+
 def _res_total_bytes(paths):
     _total = 0
     for _p in paths:
@@ -7460,7 +7517,12 @@ def _mem_write(rows):
 
 
 def _mem_sample(force=False):
-    """Append one sample. Throttled, so a fast rerun loop cannot flood the file."""
+    """Append one sample. Throttled, so a fast rerun loop cannot flood the file.
+
+    v13.63: read and append are under file_write_lock, so two tabs of the SAME
+    user sampling at the same instant cannot lose one another's line. It is an
+    RLock, so re-entering from a callback that already holds it is safe.
+    """
     _now = time.time()
     _last = float(str_lit.session_state.get("_mem_last") or 0.0)
     if not force and (_now - _last) < _MEM_SAMPLE_SECONDS:
@@ -7474,9 +7536,13 @@ def _mem_sample(force=False):
             "sess": int(_snap.get("sess") or 0),
             "own": int(_snap.get("own_b") or 0),
             "dfree": int(_snap.get("d_free") or 0)}
-    _rows = _mem_read()
-    _rows.append(_rec)
-    _mem_write(_rows)
+    try:
+        with file_write_lock:
+            _rows = _mem_read()
+            _rows.append(_rec)
+            _mem_write(_rows)
+    except Exception:
+        pass
     return True
 
 
@@ -7555,7 +7621,7 @@ def _on_clear_cache_files():
             _base = _base[len(_pfx) + 1:]
         if _base in _RES_KEEP_SUFFIX:
             continue
-        if os.path.basename(os.path.dirname(_p)) == "mail_results":
+        if _res_is_result_file(_p):
             continue
         _victims.append(_p)
     _n = _res_delete(_victims)
@@ -7569,8 +7635,7 @@ def _on_clear_result_files():
     _victims = []
     for _p in _res_own_files():
         _base = os.path.basename(_p)
-        if os.path.basename(os.path.dirname(_p)) == "mail_results" \
-                or _base.endswith("_clean_valid_accounts.txt"):
+        if _res_is_result_file(_p) or _base.endswith("_clean_valid_accounts.txt"):
             _victims.append(_p)
     _n = _res_delete(_victims)
     _ss = str_lit.session_state
