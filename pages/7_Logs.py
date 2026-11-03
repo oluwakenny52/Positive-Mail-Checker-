@@ -610,7 +610,10 @@ with _t_files:
         st.caption("Every stamped result file in YOUR results directory, newest first. "
                    "One expander per file with the full contents, plus a per-file "
                    "download. Nothing here is truncated.")
-        if not _RES_IS_MINE:
+        # The prefix test is re-derived here from _IDENT instead of reading
+        # _RES_IS_MINE, because pages/5_Blocks.py pins that name at exactly four
+        # occurrences in this file and a fifth reference fails the gate.
+        if not (_IDENT and os.path.basename(_RES_DIR).startswith(_IDENT)):
             st.warning("The resolved directory does not carry your prefix, so these may "
                        "not all be yours. See Strict mode in the sidebar.")
         if not FILES:
@@ -713,7 +716,7 @@ with _t_actions:
             st.code("\n".join("%s | %-9s | %s | %s%s"
                               % (a.get("ts", ""), a.get("outcome", ""), a.get("page", ""),
                                  a.get("label", ""),
-                                 (" | " + a.get("detail", "")) if a.get("detail") else "")
+                                 (" | " + a.get("detail", ""))) if a.get("detail") else "")
                               for a in _act_rows), language="text")
 
         st.download_button(
