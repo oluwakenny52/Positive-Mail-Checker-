@@ -230,8 +230,11 @@ IGNORE = {
     "last_account.txt", "proxies.txt", "proxies_all.txt", "disposable_domains.txt",
     "clean_proxies.txt", "proxy_pool.txt", "download_presets.json",
 }
+# v13.63: paste_accounts.txt and inspect_cat.txt are app.py's own input and
+# viewer state. They are .txt in the same directory, so without these two tokens
+# they were offered as exportable sources with a MIXED status.
 IGNORE_TOKENS = ("resume", "unfinished", "remaining", "input", "proxies", "config",
-                 "last_account")
+                 "last_account", "paste_accounts", "inspect_cat")
 
 # v13.55: STRONGEST STATUS WINS on dedupe. Without a rank the survivor of a
 # duplicate email was whichever file was read first, so a VALID address could be
@@ -302,6 +305,18 @@ def _age_txt(path):
 
 
 def _sources():
+    """PATH -> LABEL.  The PATH is the option key because it is STABLE.
+
+    v13.63 - WHY "SELECTING ONE SOURCE SELECTED THEM ALL".  _age_txt() was
+    interpolated INTO the label and the label WAS the option string, so every
+    option changed on almost every rerun ("3m old" -> "4m old"). st.multiselect
+    had no key= either, so its widget identity was derived from its parameters
+    and changed with the options - and it fell back to default=_def_labels,
+    which is every source. A selection could never survive one rerun.
+
+    The path is the key now, the label is only what format_func draws, and the
+    widget carries key="ex_sources" of its own.
+    """
     out = {}
     for pat in (os.path.join(_results_dir(), "*.txt"), "*.txt"):
         for p in glob.glob(os.path.join(APP_DIR, pat)):
@@ -312,11 +327,11 @@ def _sources():
                 continue
             n = _count_lines(p)
             if n:
-                # v13.55: the age is part of the label, so a retired file is
+                # v13.55: the age stays in the LABEL, so a retired file is
                 # visible as retired instead of looking like current output.
-                out[f"{os.path.basename(os.path.dirname(p))}/{b}  ({n})  ·  "
-                    f"{_age_txt(p)}"] = p
-    return dict(sorted(out.items()))
+                out[p] = (f"{os.path.basename(os.path.dirname(p))}/{b}  ({n})  ·  "
+                          f"{_age_txt(p)}")
+    return dict(sorted(out.items(), key=lambda kv: kv[1]))
 
 
 SESSION_BUCKETS = [
@@ -331,14 +346,16 @@ SESSION_BUCKETS = [
     ("Session · skip_results", "skip_results", "SKIPPED"),
     ("Session · unknown_results", "unknown_results", "UNKNOWN"),
 ]
+_BUCKET_TAG = {key: tag for _label, key, tag in SESSION_BUCKETS}
 
 
 def _session_sources():
+    """BUCKET KEY -> LABEL.  Same stability reason as _sources()."""
     out = {}
     for label, key, _tag in SESSION_BUCKETS:
         items = st.session_state.get(key) or []
         if items:
-            out[f"{label}  ({len(items)})"] = key
+            out[key] = f"{label}  ({len(items)})"
     return out
 
 
@@ -400,28 +417,27 @@ def _parse(line, source, status_hint):
 
 
 def _load(selection):
+    """v13.63: `selection` holds KEYS - a result-file path or a bucket key."""
     rows = []
     srcs = _sources()
     sess = _session_sources()
-    for label in selection:
-        if label in sess:
-            key = sess[label]
-            tag = dict((l, t) for l, _k, t in SESSION_BUCKETS).get(label, "MIXED")
+    for key in selection:
+        if key in sess:
+            tag = _BUCKET_TAG.get(key, "MIXED")
             for ln in st.session_state.get(key) or []:
-                r = _parse(str(ln), label, tag)
+                r = _parse(str(ln), sess[key], tag)
                 if r:
                     rows.append(r)
-        elif label in srcs:
-            p = srcs[label]
-            tag = _status_of(p)
+        elif key in srcs:
+            tag = _status_of(key)
             try:
-                with open(p, encoding="utf-8", errors="ignore") as fh:
+                with open(key, encoding="utf-8", errors="ignore") as fh:
                     for ln in fh:
-                        r = _parse(ln, os.path.basename(p), tag)
+                        r = _parse(ln, os.path.basename(key), tag)
                         if r:
                             rows.append(r)
             except Exception as ex:
-                st.warning(f"{label}: {ex}")
+                st.warning(f"{srcs.get(key, key)}: {ex}")
     return rows
 # @@END 007 PARSERS
 
@@ -562,6 +578,12 @@ if _pending_preset:
         st.session_state["ex_dedupe"] = bool(_pp.get("dedupe", True))
         st.session_state["ex_lower"] = bool(_pp.get("lower", True))
         st.session_state["ex_name"] = _pp.get("name_pat", "export_{status}_{count}_{stamp}")
+        # v13.63: the preset carries the SOURCES too. It used to reach a local in
+        # block 011 only, so the box on screen kept the old selection while the
+        # export used the preset's. Legal here: no widget exists yet this run.
+        _avail_now = set(sess) | set(srcs)
+        st.session_state["ex_sources"] = [s for s in (_pp.get("sources") or [])
+                                          if s in _avail_now]
         st.session_state["_ex_active"] = _pending_preset
 
 _EX_DEFAULTS = {
@@ -588,6 +610,8 @@ for _k, _v in _EX_DEFAULTS.items():
 with st.sidebar:
     st.markdown("### 1. What to download")
     labels = list(sess.keys()) + list(srcs.keys())
+    _label_of = dict(sess)
+    _label_of.update(srcs)
     if not labels:
         st.info("No result files yet. Run the checker, or validate a batch in the Reader.")
         st.stop()
@@ -604,10 +628,9 @@ with st.sidebar:
                 "30 days": 2592000, "all": None}[age_win]
     _fresh, _old = [], 0
     for _lab in srcs:
-        _p = srcs[_lab]
         try:
             _ok_age = (_age_cut is None
-                       or (time.time() - os.path.getmtime(_p)) <= _age_cut)
+                       or (time.time() - os.path.getmtime(_lab)) <= _age_cut)
         except Exception:
             _ok_age = True
         if _ok_age:
@@ -616,9 +639,44 @@ with st.sidebar:
             _old += 1
     _def_labels = list(sess.keys()) + _fresh
 
+    # v13.63: two one-click helpers, on_click so no widget key is written after
+    # its widget exists.
+    st.session_state["_ex_all_opts"] = list(labels)
+
+    def _ex_pick_all():
+        st.session_state["ex_sources"] = list(st.session_state.get("_ex_all_opts") or [])
+
+    def _ex_pick_none():
+        st.session_state["ex_sources"] = []
+
+    _sel_a, _sel_b = st.columns(2)
+    with _sel_a:
+        st.button("Select all", width="stretch", on_click=_ex_pick_all)
+    with _sel_b:
+        st.button("Clear selection", width="stretch", on_click=_ex_pick_none)
+
+    # v13.63: THE SELECTION IS SEEDED, NOT DEFAULTED. default= plus key= raises
+    # the "created with a default value but also had its value set via the
+    # Session State API" warning, so the seed is written here and the widget
+    # passes key= only. A remembered value is filtered against the CURRENT
+    # options so a retired file cannot linger; an empty remembered value stays
+    # empty, and only a value whose every entry retired falls back to the
+    # age-filtered default.
+    _stored_pick = st.session_state.get("ex_sources")
+    if _stored_pick is None:
+        _seed_pick = [k for k in _def_labels if k in labels]
+    else:
+        _seed_pick = [k for k in _stored_pick if k in labels]
+        if not _seed_pick and _stored_pick:
+            _seed_pick = [k for k in _def_labels if k in labels]
+    st.session_state["ex_sources"] = _seed_pick
+
     picked = st.multiselect(
-        "Sources", labels, default=_def_labels,
-        help="Multi-select. Add ANY session bucket or any mail_results file.")
+        "Sources", labels, key="ex_sources",
+        format_func=lambda k: _label_of.get(k, str(k)),
+        help="Multi-select. Add ANY session bucket or any mail_results file. The "
+             "selection survives a rerun and a refresh now, and the age shown in "
+             "a label can no longer reset it.")
     st.caption(f"{len(labels)} source(s) available · {len(_def_labels)} preselected "
                f"by the age filter · {_old} file(s) older than {age_win} hidden.")
 
@@ -718,6 +776,16 @@ rows = _load(picked)
 sel, text = _fmt(rows, template, delim_ch, crlf, header, prefix, suffix,
                  sort_key, dedupe, lower, regex_inc, regex_exc, host_filter)
 
+# v13.63: a built ZIP is discarded the moment any input that fed it changes, so
+# it can never be downloaded against a different row set than the one on screen.
+# The signature is built from the INPUTS, not from fname - fname carries a
+# seconds-resolution {stamp} and would invalidate it every second.
+_zip_sig = (tuple(picked), template, delim, crlf, header, prefix, suffix, sort_key,
+            dedupe, lower, regex_inc, regex_exc, host_filter)
+if st.session_state.get("_ex_zip_sig") != _zip_sig:
+    st.session_state["_ex_zip_sig"] = _zip_sig
+    st.session_state.pop("_ex_zip", None)
+
 # v13.55: {status} came from picked[0], so a mixed export was named after
 # whichever source happened to sort first. It now reflects what is IN the file,
 # and only when every exported row agrees.
@@ -774,8 +842,10 @@ tab_txt, tab_csv, tab_json, tab_zip, tab_break = st.tabs(
 )
 
 with tab_txt:
-    st.caption("Exactly what the download button produces. The copy icon is top-right.")
-    st.code(text, language="text")
+    st.caption("Exactly what the download button produces. The copy icon is top-right. "
+               "The box scrolls - the page does not grow to 200k lines.")
+    with st.container(height=420):
+        st.code(text, language="text")
 
 with tab_csv:
     sep_choice = st.radio("CSV separator", ["comma", "semicolon", "tab"], horizontal=True,
@@ -797,6 +867,12 @@ with tab_json:
 
 with tab_zip:
     st.caption("One archive containing the template file, CSV, JSON and a per-status split.")
+    # v13.63: THE ZIP DOWNLOAD BUTTON WAS DEAD. Clicking a download_button fires
+    # a rerun; on that rerun st.button("Build ZIP") is False, the body was
+    # skipped, the download_button was never rendered, and the click resolved
+    # against nothing. The bytes are held in session_state now and the button is
+    # drawn unconditionally while they exist; block 012 drops them when any
+    # input changes.
     if st.button("Build ZIP", type="primary"):
         buf = io.BytesIO()
         with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
@@ -809,9 +885,14 @@ with tab_zip:
             for tag, group in by.items():
                 z.writestr(f"{tag}_{len(group)}.txt",
                            "\n".join(g["line"] for g in group))
-        st.download_button("⬇️ Download ZIP", data=buf.getvalue(),
-                           file_name=fname.rsplit(".", 1)[0] + ".zip",
+        st.session_state["_ex_zip"] = (buf.getvalue(), fname.rsplit(".", 1)[0] + ".zip")
+    _z = st.session_state.get("_ex_zip")
+    if _z:
+        st.download_button("⬇️ Download ZIP", data=_z[0], file_name=_z[1],
                            mime="application/zip", width="stretch")
+        st.caption(f"{len(_z[0]):,} bytes ready - built from the rows currently on screen.")
+    else:
+        st.caption("Press Build ZIP. It stays built until you change a setting.")
 
 with tab_break:
     by = {}
@@ -825,7 +906,8 @@ with tab_break:
             st.download_button(f"⬇️ {tag}.txt", data=body.encode("utf-8"),
                                file_name=f"{tag}_{len(by[tag])}.txt",
                                mime="text/plain", key=f"dl_{tag}")
-            st.code(body, language="text")
+            with st.container(height=320):
+                st.code(body, language="text")
 # @@END 013 TABS
 
 
