@@ -986,14 +986,6 @@ def default_cfg() -> dict:
         "CONNECTION_HINT": "Auto",
         "SMTP_CHECK": False,
     }
-
-
-def _safe_index(options, value, fallback=0):
-    """Never let an absent default raise ValueError on a selectbox."""
-    try:
-        return list(options).index(value)
-    except Exception:
-        return fallback
 # @@END 020 DEFAULT_CFG
 
 # @@BLOCK 021 DOMAIN_TABLES deps=-
@@ -4272,9 +4264,18 @@ def _load_proxy_meta_file() -> int:
     # v13.65: THIS LINE WAS ALWAYS EMPTY. The call used to sit ABOVE
     # def load_proxies, so it raised NameError, the bare except swallowed it and
     # `known` was set() on every run - rule 2 above never applied and a deleted
-    # node came back from the file. The call is at the end of this block now.
+    # node came back from the file.
+    # v13.66: and it is read from THIS user's file directly, not through
+    # load_proxies() -> live_cfg(), which can still be answering with the
+    # previous run's CFG on a second unlock in the same process.
     try:
-        known = set(load_proxies(quiet=True))
+        _kp = user_file("proxies.txt")
+        if os.path.exists(_kp):
+            with open(_kp, encoding="utf-8", errors="ignore") as _kf:
+                known = {l.strip() for l in _kf
+                         if l.strip() and not l.strip().startswith("#")}
+        else:
+            known = set()
     except Exception:
         known = set()
 
@@ -9504,7 +9505,11 @@ STRICT_APP_PROVIDERS = STRICT_APP
 ZERO_ACCESS_PROVIDERS = ZERO_ACCESS
 EMAIL_REGEX = re.compile(r"^[\w\.-]+@[\w\.-]+\.\w+$")
 DISPOSABLE_EXTRA = {"rerttymail.com", "tmpmail.org", "tmpmail.net", "tempmailo.com"}
-DISPOSABLE_FILE = "disposable_domains.txt"
+# v13.66: THIS WAS A BARE NAME, so every user on the deployment shared one
+# blocklist file in the working directory. It is this user's own file now, the
+# same rule every other path in the app follows. Block 082 runs after
+# auth.require(), so the unlocked prefix already exists here.
+DISPOSABLE_FILE = user_file("disposable_domains.txt")
 
 
 def load_disposable_set():
@@ -9825,7 +9830,7 @@ def process_accounts(text, previous_valid):
             dns_fail_list, smtp_fail_list)
 # @@END 086 PROCESS_ACCOUNTS
 
-# @@BLOCK 087 INPUT_UI deps=034,035,039,055,082,083,085,086
+# @@BLOCK 087 INPUT_UI deps=019,034,035,039,055,082,083,085,086
 # ---- single BUCKET table (was RESULT_INSPECT + RESULT_ACTION_MODES duplicated) ----
 PREFILTER_LABELS = [
     "Ready to Check", "Resume Unfinished", "Disposables", "Typos",
@@ -9980,8 +9985,12 @@ with input_tab2:
 
 clean_lines = []
 disp, typo, resume, app_skip, custom_skipped, dns_skipped, smtp_skipped = [], [], [], [], [], [], []
+# v13.66: this checkbox had NO key, so it was re-created with value=True on
+# every rerun and unticking it was undone by the next click anywhere. Seeded,
+# then created with key= only.
+_seed_widget("bb_skip_prev", dflt=True)
 skip_previous = str_lit.checkbox(
-    "Skip previously valid", value=True,
+    "Skip previously valid", key="bb_skip_prev",
     help="On: lines already in old valid files are not checked again.")
 
 if raw_text:
@@ -12713,8 +12722,18 @@ if start_engine_btn:
                     # up. The retries and the rotations are the other two pure
                     # tail costs, so they go to zero for the tail only and all
                     # three are restored in the finally.
+                    #
+                    # v13.66: IT BIT FROM ACCOUNT 1 ON EVERY SHORT QUEUE. The test
+                    # is against the WORKER COUNT, so a 15-account list on 50
+                    # workers satisfied it at once (14 <= 50) and the WHOLE run got
+                    # a 30s deadline with retries and rotations zeroed - not just
+                    # the last cohort. With auto-scaling ON the count can equal the
+                    # queue length, so it fired every single time. The extra guard
+                    # keeps the optimisation for what it was written for: the last
+                    # cohort of a queue that actually has more than one cohort.
                     _tail_left = total_accs - checked_count
-                    if _tail_left and _tail_left <= current_workers:
+                    if (_tail_left and _tail_left <= current_workers
+                            and total_accs > current_workers):
                         try:
                             CFG["ACCOUNT_DEADLINE"] = min(
                                 int(CFG.get("ACCOUNT_DEADLINE", DEADLINE_NORMAL)), 30)
