@@ -755,6 +755,13 @@ PROXY_407_BACKOFF = 0.8
 PROXY_407_COOLDOWN = 90.0
 # A same-node 407 retry only makes sense if a REAL attempt still fits.
 PROXY_407_RETRY_WINDOW_FACTOR = 1.6
+# v13.64: A 402 IS A PLAN STATE, NOT A NINETY-SECOND BLIP. Parking it for the 407
+# cooldown put every spent node back in rotation ninety seconds after the probe
+# that found it, so a pool silently degraded to half spent nodes mid-run. A 402
+# node is parked for ten minutes instead, and block 069 tiers it BELOW a node
+# that has actually opened a tunnel, so it is only drawn when nothing better is
+# left.
+PROXY_PLAN_PARK = 600.0
 # @@END 016 PROXY_407_CONTRACT
 
 # @@BLOCK 017 POOL_FILTER_CONSTANTS deps=-
@@ -1260,6 +1267,11 @@ _DEFAULT_USER_STATE = {
     "first_probe_kicked": False,
     "probe_targets_override": [],
     "runs_active": 0,
+    # v13.64: THE FAST-MODE COOLDOWN WAS SHARED. It was a process dict keyed on
+    # the DOMAIN alone, so user A failing a domain put user B's accounts on that
+    # same domain into cooldown for 45s - user B's run then reported them SKIP
+    # for a reason that happened in someone else's tab. Per user now.
+    "failed_domain_cache": {},
 }
 
 
@@ -1308,6 +1320,7 @@ def _user_state(scope=None) -> dict:
                 d["proxy_quarantine_lock"] = threading.Lock()
                 d["proxy_scheme_lock"] = threading.Lock()
                 d["probe_targets_override"] = []
+                d["failed_domain_cache"] = {}
                 tbl[who] = d
     return d
 
@@ -1345,6 +1358,7 @@ _PROBE_REASON_LABEL = {
 
 # @@BLOCK 025 PROBE_TELEMETRY deps=024
 def log_probe_event(msg):
+    _rebind_scope()
     with probe_log_lock:
         probe_log.append(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}")
         if len(probe_log) > 600:
@@ -1353,6 +1367,7 @@ def log_probe_event(msg):
 
 def record_probe_result(proxy_str, ok, reason, latency_ms=0, target="",
                         scheme=None, error=""):
+    _rebind_scope()
     if not proxy_str:
         return
     with probe_stats_lock:
@@ -1383,6 +1398,7 @@ def _probe_snapshot():
 
     v13.59: probe_stats is per-scope now, so this is the user's own history only.
     """
+    _rebind_scope()
     with probe_stats_lock:
         snap = list(probe_stats.items())
     try:
@@ -1427,6 +1443,7 @@ def probe_reason_histogram():
 
 def clear_tunnel_cache():
     """Clearing the probe stats is what a re-probe actually needs."""
+    _rebind_scope()
     with probe_stats_lock:
         probe_stats.clear()
 # @@END 025 PROBE_TELEMETRY
@@ -1527,6 +1544,49 @@ def protocol_flags():
     }
 
 
+# v13.64: THE PROBE TARGET WAS NEVER CHECKED FOR REACHABILITY.
+# probe_targets() hands back the per-user override unconditionally, and the
+# override is the queue-derived MAIL host restored after every fetch. When that
+# host does not answer from the app host - excelsiorcarsandcourier.co.uk:993 did
+# not, three full 8025 ms timeouts in the last bundle - every node is dialled at a
+# destination with no listener and the whole pool reads `timeout`. _fetch_targets
+# guards only the fetch itself; the ordinary probe, the Re-probe button and the
+# first-load probe all walked straight into it.
+#
+# One direct TCP dial, cached for five minutes, is the whole guard. If the
+# override does not answer, the 443 control is used instead - which is the clean
+# baseline the probe is designed around - and the log says so once per TTL.
+_TARGET_REACH = STATE.setdefault("probe_target_reach", {})
+_TARGET_REACH_TTL = 300.0
+
+
+def _target_answers(pairs):
+    """True when at least one of `pairs` answers a direct TCP dial from this host."""
+    now = time.time()
+    for host, port, _label in (pairs or []):
+        if not host:
+            continue
+        key = "%s:%s" % (host, port)
+        hit = _TARGET_REACH.get(key)
+        if hit and (now - hit[0]) < _TARGET_REACH_TTL:
+            if hit[1]:
+                return True
+            continue
+        ok = False
+        try:
+            _s = socket.create_connection((host, int(port)), timeout=3.0)
+            _s.close()
+            ok = True
+        except Exception:
+            ok = False
+        _TARGET_REACH[key] = (now, ok)
+        if ok:
+            return True
+        log_probe_event("probe target %s does not answer from this host - using the "
+                        "443 control instead" % key)
+    return False
+
+
 def probe_targets():
     """Targets for the tunnel probe.
 
@@ -1540,13 +1600,19 @@ def probe_targets():
     one user's queue-derived mail target was used by every other user's probe and
     spot check. The owner's own copy wins; STATE stays as a fallback for a
     session that has never set one.
+
+    v13.64: and it must ANSWER. See _target_answers() above.
     """
     try:
         ov = _user_state().get("probe_targets_override") or []
     except Exception:
         ov = STATE.get("probe_targets_override") or []
     if ov:
-        return list(ov)
+        _ov = [t for t in ov if t and t[0]]
+        if _ov and _target_answers(_ov):
+            return _ov
+        if _ov:
+            return list(PROBE_CONTROL_TARGETS)
     try:
         name = live_cfg().get("PROBE_TARGET", PROBE_TARGET_DEFAULT)
     except Exception:
@@ -2904,8 +2970,10 @@ _proxy_407 = _US["strikes_407"]
 _proxy_scheme = _US["proxy_scheme"]
 _proxy_scheme_lock = _US["proxy_scheme_lock"]
 proxy_407_until = _US["proxy_407_until"]
+# v13.64: per user, and rebindable, because block 099 reads it at the top of a
+# worker thread before anything else in that account has re-asserted a scope.
+failed_domain_cache = _US["failed_domain_cache"]
 
-failed_domain_cache = STATE.setdefault("failed_domain_cache", {})
 _host_dns_cache = STATE["host_dns_cache"]
 _host_dns_lock = STATE["host_dns_lock"]
 
@@ -2943,18 +3011,31 @@ if str_lit.session_state.pop("_run_owed", False):
     STATE["run_active"] = STATE["runs_active"] > 0
     log_probe_event(f"teardown repaid: runs_active now {_US['runs_active']}")
 
+# v13.64: FORGET PASSKEY LEFT THE FORGOTTEN USER'S TABLES ALIVE.
+# forget_user_state() existed since v13.59 and was called from nowhere, so a
+# forgotten key kept its pool, quarantine, scores and its alive-pool thread for
+# the life of the process. auth.py now drops the hash it just forgot on the
+# session and this is the only place that can act on it. The inequality guard
+# means re-unlocking with the SAME passphrase keeps your pool instead of wiping
+# it.
+_fh = str_lit.session_state.pop("_forgotten_hash", "")
+if _fh and _fh != (str_lit.session_state.get("user_key_hash") or ""):
+    forget_user_state(_fh)
+    log_probe_event(f"per-user tables dropped for forgotten key {str(_fh)[:8]}")
+
 log_startup("Application process started. Initializing session state and loading configurations...")
 log_startup(f"hosts.py status -> loaded={HOSTS_OK} has_ranking={HOSTS_HAS_RANKING} "
             f"merge={_HAVE_HOSTS_MERGE} {HOSTS_IMPORT_NOTE}".strip())
 log_startup(f"status.py status -> {STATUS_IMPORT_NOTE}")
 log_startup(f"ms_oauth.py status -> loaded={MS_OAUTH_OK} "
-            f"(Microsoft XOAUTH2 {'active' if MS_OAUTH_OK else 'INACTIVE'})")
+            f"(Microsoft XOAUTH2 {'active' if MS_OAUTH_OK else 'inactive'})")
 
 _REBIND_KEYS = (
     "alive_pool", "consecutive_proxy_failures", "circuit_breaker_until",
     "proxy_quarantine", "proxy_quarantine_lock", "strikes_407", "proxy_scheme",
     "proxy_scheme_lock", "proxy_407_until", "proxy_meta", "probe_stats",
     "probe_stats_lock", "probe_log", "probe_log_lock", "probe_owner_lock",
+    "failed_domain_cache",
 )
 _REBIND_ALIAS = {"strikes_407": "_proxy_407", "proxy_scheme": "_proxy_scheme",
                  "proxy_scheme_lock": "_proxy_scheme_lock",
@@ -3230,18 +3311,25 @@ _refresh_gate_scope()
 def _proxy_407_parked(proxy_str) -> bool:
     if not proxy_str:
         return False
+    _rebind_scope()
     until = (proxy_407_until or {}).get(proxy_str, 0.0)
     return until > time.time()
 
 
-def _park_proxy_407(proxy_str):
-    """Park a 407'd node briefly instead of killing it for the run."""
+def _park_proxy(proxy_str, seconds=None):
+    """Park a node briefly. A 407 gets the 407 cooldown, a 402 gets the plan one."""
     if not proxy_str:
         return
     try:
-        proxy_407_until[proxy_str] = time.time() + PROXY_407_COOLDOWN
+        _rebind_scope()
+        proxy_407_until[proxy_str] = time.time() + float(
+            seconds if seconds is not None else PROXY_407_COOLDOWN)
     except Exception:
         pass
+
+
+def _park_proxy_407(proxy_str):
+    _park_proxy(proxy_str, PROXY_407_COOLDOWN)
 
 
 def _gated_tunnel(proxy_str, timeout=None, targets=None):
@@ -5673,6 +5761,10 @@ def _is_proxy_level_error(msg):
 
 def record_proxy_attempt(proxy_str, success, is_network_error=False, is_proxy_auth=False,
                          is_plan=False):
+    # v13.64: SCOPE. This is called from worker threads in the middle of an
+    # account, long after anything re-asserted a scope, so a rerun in another tab
+    # could point every write below at the other user's tables.
+    _rebind_scope()
     try:
         if not proxy_str:
             return
@@ -5697,15 +5789,19 @@ def record_proxy_attempt(proxy_str, success, is_network_error=False, is_proxy_au
         elif is_plan:
             # FIX PLAN-1: a 402 is the provider's bandwidth/plan, not the node.
             # Park it so rotation prefers something usable, but never strike it.
-            _park_proxy_407(proxy_str)
+            # v13.64: parked for the PLAN horizon - a spent plan does not recover
+            # in ninety seconds.
+            _park_proxy(proxy_str, PROXY_PLAN_PARK)
         threshold = int(live_cfg().get("BLACKLIST_CF", BLACKLIST_CF_DEFAULT))
         with proxy_lock:
             if proxy_str not in proxy_meta:
-                proxy_meta[proxy_str] = {"fails": 0, "success": 0, "country": "Unknown",
+                proxy_meta[proxy_str] = {"fails": 0, "success": 0, "plan": 0,
+                                         "country": "Unknown",
                                          "region": "Unknown", "latency_ms": 0}
             m = proxy_meta[proxy_str]
             if success:
                 m["success"] = m.get("success", 0) + 1
+                m["plan"] = 0
                 consecutive_proxy_failures[proxy_str] = 0
             else:
                 # FIX PLAN-1: a 402 and a 407 are both PROVIDER answers, not node
@@ -5714,12 +5810,23 @@ def record_proxy_attempt(proxy_str, success, is_network_error=False, is_proxy_au
                 # the Min Proxy Score filter while eleven dead lines survived.
                 if not is_plan and not is_proxy_auth:
                     m["fails"] = m.get("fails", 0) + 1
+                if is_plan:
+                    m["plan"] = m.get("plan", 0) + 1
                 if is_network_error and not is_proxy_auth and not is_plan:
                     consecutive_proxy_failures[proxy_str] += 1
                     if consecutive_proxy_failures[proxy_str] >= threshold:
                         circuit_breaker_until[proxy_str] = time.time() + CIRCUIT_BREAKER_SECONDS
                         consecutive_proxy_failures[proxy_str] = 0
-            m["score"] = compute_real_score(m.get("success", 0), m.get("fails", 0))
+            # v13.64: THE SCORE WAS INVERTED. compute_real_score(0, 0) answers the
+            # 80 default and compute_real_score(1, 0) answers 75, so a node that had
+            # never opened a tunnel outranked one that had just proved it worked -
+            # on a live pool the 100 spent nodes sat ABOVE the 80 working ones, and
+            # the "a node that ever passed is never dropped by score" rescue in
+            # block 058 could not help because the spent nodes never fell below the
+            # filter in the first place. Each unanswered 402 costs 6, which puts a
+            # plan-only node strictly below a proven one without failing it.
+            _base = compute_real_score(m.get("success", 0), m.get("fails", 0))
+            m["score"] = max(0, int(_base) - min(60, 6 * int(m.get("plan", 0))))
     except Exception as e:
         warnings.warn(f"Error recording proxy attempt: {e}")
 # @@END 067 ERROR_CLASSIFY
@@ -5880,8 +5987,46 @@ def _smtp_hosts_for(domain, cap=SMTP_HOST_CAP):
 # @@END 068 SMTP_PRECHECK
 
 # @@BLOCK 069 POOL_SAMPLE deps=052
+def _pool_tiers(pool):
+    """Split a pool into (passed, plan-refused, everything else).
+
+    Derived from probe_stats, which is THIS user's own table, so a refresh, a
+    re-probe or another user's rerun cannot scramble the ranking.
+    """
+    try:
+        with probe_stats_lock:
+            snap = dict(probe_stats)
+    except Exception:
+        snap = {}
+    a, b, c = [], [], []
+    for p in pool:
+        r = (snap.get(p) or {}).get("reason") or ""
+        if r == "ok":
+            a.append(p)
+        elif r == "plan":
+            b.append(p)
+        else:
+            c.append(p)
+    return a, b, c
+
+
 def sample_alive_proxy(exclude=None, domain=None, avoid=None):
-    """RANDOM ROTATION with an account-level avoid set."""
+    """RANDOM ROTATION, an account avoid-set, and a QUALITY TIER.
+
+    v13.64: THE POOL WAS FLAT. A node whose last probe answered 402 Payment
+    Required was handed to the checker exactly like a node that had just opened a
+    real tunnel - 100 of 180 nodes in a real pool - so roughly 55% of every
+    account's attempts were spent on a node the provider was refusing service on.
+    The pool is three tiers now and a tier is only used when every tier above it
+    is empty:
+
+        A  the node's LAST probe PASSED          (it has just worked)
+        B  the node's last probe was 402 / plan  (alive, authenticates, no service)
+        C  anything else                         (untested, or failed)
+
+    A 402 node is therefore only ever drawn when nothing better is left, which is
+    the correct role for it: a fallback, not a peer.
+    """
     _rebind_scope()
     exclude = set(exclude or ())
     avoid = set(avoid or ())
@@ -5925,11 +6070,23 @@ def sample_alive_proxy(exclude=None, domain=None, avoid=None):
         if unparked:
             pool = unparked
 
-    cand = [p for p in pool if p not in exclude and p not in avoid]
-    if not cand:
-        cand = [p for p in pool if p not in exclude]
-    if not cand:
-        cand = pool
+    # ---- QUALITY TIER: the best tier that still has a usable node ------------
+    cand = None
+    for _tier in _pool_tiers(pool):
+        if not _tier:
+            continue
+        _c = [p for p in _tier if p not in exclude and p not in avoid]
+        if _c:
+            cand = _c
+            break
+    if cand is None:
+        for _tier in _pool_tiers(pool):
+            _c = [p for p in _tier if p not in exclude]
+            if _c:
+                cand = _c
+                break
+    if cand is None:
+        cand = [p for p in pool if p not in exclude] or pool
 
     if not live_cfg().get("RANDOM_ROTATION", True):
         # FIX RR-1 (v13.50): index into cand, not pool. The avoid-set was built
@@ -6306,6 +6463,10 @@ def mail_dest_spot_check(force: bool = False):
     daemon thread, where session_state is unreliable, and _gate_scope() is a
     plain string refreshed on the script thread. Readers (blocks 077, 080, 105)
     drop a record whose stamp is not their own.
+
+    v13.64: a 402 gets its OWN column. It used to land in `other`, so a pool whose
+    whole plan was spent produced pass=0 / 407=0 / other=3 and every banner in the
+    app looked at `auth` only - the spot check was shouting and nothing listened.
     """
     if not force and not live_cfg().get("MAIL_SPOT_CHECK", MAIL_SPOT_CHECK_DEFAULT):
         return
@@ -6313,12 +6474,12 @@ def mail_dest_spot_check(force: bool = False):
         pool = [p for p in alive_pool if p]
     if not pool:
         STATE["mail_spot"] = {"ts": time.time(), "host": "", "port": 0, "ok": 0,
-                              "auth": 0, "other": 0, "n": 0, "error": "empty pool",
-                              "user": _gate_scope()}
+                              "auth": 0, "plan": 0, "other": 0, "n": 0,
+                              "error": "empty pool", "user": _gate_scope()}
         return
     host, port = _mail_spot_target()
     sample = random.sample(pool, min(MAIL_SPOT_NODES, len(pool)))
-    ok = auth = other = 0
+    ok = auth = other = plan_n = 0
     err = ""
     for p in sample:
         try:
@@ -6337,19 +6498,27 @@ def mail_dest_spot_check(force: bool = False):
         elif res.get("reason") in ("auth", "auth_dest"):
             auth += 1
             err = err or (res.get("error", "") or "")
+        elif res.get("reason") == "plan":
+            plan_n += 1
+            err = err or (res.get("error", "") or "")
         else:
             other += 1
             err = err or (res.get("error", "") or "")
     STATE["mail_spot"] = {"ts": time.time(), "host": host, "port": int(port), "ok": ok,
-                          "auth": auth, "other": other, "n": len(sample),
-                          "error": (err or "")[:300], "user": _gate_scope()}
+                          "auth": auth, "plan": plan_n, "other": other,
+                          "n": len(sample), "error": (err or "")[:300],
+                          "user": _gate_scope()}
     line = (f"mail-dest spot check {host}:{port} -> pass={ok} 407={auth} "
-            f"other={other} of {len(sample)} node(s)")
+            f"402={plan_n} other={other} of {len(sample)} node(s)")
     log_probe_event(line)
     if auth and not ok:
         log_probe_event("*** MAIL destination refused on every sampled node. Each node "
                         "was re-tested on 443 first - see 'auth' (node-wide) vs "
                         "'auth_dest' (destination only) in the histogram ***")
+    if plan_n and not ok:
+        log_probe_event("*** every sampled node answered 402 Payment Required on the MAIL "
+                        "destination - the plan is refusing service; those nodes "
+                        "authenticate and are alive ***")
 # @@END 073 MAIL_SPOT_CHECK
 
 # @@BLOCK 074 REFRESH_POOL deps=013,014,025,058,069,071,073
@@ -10455,14 +10624,18 @@ def read_mailbox_messages(email, password, server, proxy_str=None, limit=10):
         return False, [], str(e)
 # @@END 098 READ_MAILBOX
 
-# @@BLOCK 099 CHECK_WRAPPER deps=009,023
+# @@BLOCK 099 CHECK_WRAPPER deps=009,023,039
 def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, trace_logs=None):
     """Thin FAST_MODE cooldown wrapper around _check_account_core().
 
     Stamping in ONE place, for INCONCLUSIVE outcomes only, makes it predictable:
     a domain is backed off when it told us NOTHING, and never when it gave a real
     answer (VALID / WRONG / NEED_APP_PASSWORD / LOGIN_DROPPED / RBL).
+
+    v13.64: the cooldown table is per user now and this is the FIRST thing a
+    worker touches, before any other call has re-asserted a scope.
     """
+    _rebind_scope()
     if trace_logs is None:
         trace_logs = []
 
