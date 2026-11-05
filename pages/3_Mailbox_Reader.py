@@ -250,7 +250,14 @@ def username_candidates(email_addr: str) -> List[str]:
 
 _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
 APP_DIR = os.path.dirname(_THIS_DIR)                      # repo root
-THEME_FILE = os.path.join(APP_DIR, "theme.json")
+
+# v13.65: THE THEME FILE WAS THE BARE ONE. theme.json became per-user
+# (<hash>_theme.json) at v13.61, so APP_DIR/theme.json no longer exists and this
+# page always painted the factory palette - and save_theme() wrote the bare path,
+# so a colour change made here was invisible to the checker as well. Block 001
+# has already run the gate and imported user_file, so the owner's real path is
+# available HERE, at module level, with nothing lazy needed.
+THEME_FILE = user_file("theme.json")
 
 THEME_PRESETS = {
     "Aurora":    {"g1": "#667eea", "g2": "#764ba2", "accent": "#8b5cf6", "accent2": "#22d3ee", "bg": "#0b1020", "panel": "#141b30", "text": "#e6ebff"},
@@ -288,7 +295,8 @@ def default_theme() -> dict:
     }
 
 def _theme_candidates() -> List[str]:
-    cands = [THEME_FILE, os.path.abspath("theme.json")]
+    """The owner's file first, then the two legacy bare paths."""
+    cands = [THEME_FILE, os.path.join(APP_DIR, "theme.json"), os.path.abspath("theme.json")]
     out, seen = [], set()
     for c in cands:
         try:
@@ -301,10 +309,10 @@ def _theme_candidates() -> List[str]:
     return out
 
 def load_theme() -> dict:
-    """Same file app.py writes. Falls back to defaults if absent/unreadable."""
+    """The owner's theme when it parses, else the defaults."""
     base = default_theme()
     for path in _theme_candidates():
-        if not os.path.exists(path):
+        if not path or not os.path.exists(path):
             continue
         try:
             with open(path, encoding="utf-8") as f:
@@ -317,8 +325,8 @@ def load_theme() -> dict:
     return base
 
 def save_theme(th: dict) -> None:
-    """Writes back to the shared file so the checker picks the change up too."""
-    for path in (_theme_candidates()[:1] or ["theme.json"]):
+    """Writes back to the OWNER's file so the checker picks the change up too."""
+    for path in (_theme_candidates()[:1] or [THEME_FILE]):
         try:
             with open(path, "w", encoding="utf-8") as f:
                 json.dump(th, f, indent=2)
