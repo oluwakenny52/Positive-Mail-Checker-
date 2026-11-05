@@ -229,10 +229,16 @@ def require(st, title="Unlock Positive Mail-Checker"):
             if st.button("Forget selected passkey", key="au_forget_one"):
                 forget_current(pick.get(choice, ""))
                 st.session_state.pop("user_key_hash", None)
+                # v13.64: the forgotten key's per-user tables live in app.py's
+                # process STATE and used to survive for the life of the process -
+                # pool, quarantine, scores and its alive-pool thread. app.py block
+                # 039 drops them; this is the only place that knows WHICH key.
+                st.session_state["_forgotten_hash"] = pick.get(choice, "")
                 st.rerun()
             st.caption("Or remove every key, for everyone.")
             if st.button("Forget all passkeys", key="au_forget_all"):
                 forget_all()
+                st.session_state["_forgotten_hash"] = st.session_state.get("user_key_hash", "")
                 st.session_state.pop("user_key_hash", None)
                 st.rerun()
         st.stop()
