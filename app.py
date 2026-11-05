@@ -3488,8 +3488,16 @@ def instant_help(key_name, description_text, label_text, widget_type="label", **
                 str_lit.markdown(f"**{label_text}**")
             elif widget_type == "checkbox":
                 try:
-                    val = str_lit.checkbox(label_text, value=kwargs.get("value", False),
-                                           key=f"chk_{key_name}")
+                    # v13.65: block 045 seeds chk_* from this user's settings.json,
+                    # so passing value= as well raises "created with a default value
+                    # but also had its value set via the Session State API" on every
+                    # rerun. The default is only needed the first time, when the key
+                    # does not exist yet.
+                    if f"chk_{key_name}" in str_lit.session_state:
+                        val = str_lit.checkbox(label_text, key=f"chk_{key_name}")
+                    else:
+                        val = str_lit.checkbox(label_text, value=kwargs.get("value", False),
+                                               key=f"chk_{key_name}")
                 except Exception as widget_err:
                     str_lit.error(f"Widget payload/input error: {widget_err}")
                     val = kwargs.get("value", False)
@@ -3899,11 +3907,11 @@ blacklist_cf = str_lit.sidebar.slider(
 )
 # @@END 046 SIDEBAR_MODE
 
-# @@BLOCK 047 SIDEBAR_PROTOCOLS deps=011,046
+# @@BLOCK 047 SIDEBAR_PROTOCOLS deps=011,019,046
+_seed_widget("ui_protocols", choices=PROTOCOL_OPTIONS)
 protocol_pick = str_lit.sidebar.multiselect(
     "🧩 Pick Protocols Mode",
     options=PROTOCOL_OPTIONS,
-    default=PROTOCOL_SELECTION_DEFAULT,
     key="ui_protocols",
     help="Which protocols the engine is allowed to DIAL. DEFAULT IS IMAP + POP3 - POP3 is "
          "the only independent path when a legacy IMAP front answers LOGIN with '* BYE' "
@@ -3924,11 +3932,12 @@ else:
            if any(p in ("SMTP", "ManageSieve") for p in protocol_pick) else ""))
 # @@END 047 SIDEBAR_PROTOCOLS
 
-# @@BLOCK 048 SIDEBAR_RULES deps=046
+# @@BLOCK 048 SIDEBAR_RULES deps=019,046
 str_lit.sidebar.markdown("---")
 str_lit.sidebar.markdown("### 🎛 Advanced Control Rules")
+_seed_widget("ui_dynamic_scaling")
 dynamic_worker_scaling = str_lit.sidebar.toggle(
-    "⚡ Thread Auto-Scaling / Dynamic Workers", value=True, key="ui_dynamic_scaling",
+    "⚡ Thread Auto-Scaling / Dynamic Workers", key="ui_dynamic_scaling",
     help="OFF = FIXED WORKERS. The run uses exactly your Workers Start for the "
          "whole run, nothing changes it. This is the setting to use when you want "
          "N accounts checked at once.\n\n"
@@ -3938,22 +3947,25 @@ dynamic_worker_scaling = str_lit.sidebar.toggle(
          "the run is in progress.\n\n"
          "Either way you must press 💾 Apply Settings - the engine reads the "
          "applied config, not the slider.")
+_seed_widget("ui_max_hosts", lo=1, hi=8, dflt=default_hosts)
 max_hosts_per_domain = str_lit.sidebar.slider(
-    "Max Hosts Per Domain", 1, 8, default_hosts, 1, key="ui_max_hosts",
+    "Max Hosts Per Domain", 1, 8, 1, key="ui_max_hosts",
     help="How many discovered IMAP hosts to try per account. 1 = primary host only. "
          "Each extra host adds a rung and lengthens the per-account work floor, so LOWER "
          "is FASTER - raise it only for domains whose sibling hosts actually answer. "
          "STARTTLS / plain and POP rungs are capped separately."
 )
+_seed_widget("ui_alt_user")
 try_alt_username_ui = str_lit.sidebar.toggle(
-    "Try local-part username on auth failure", value=True, key="ui_alt_user",
+    "Try local-part username on auth failure", key="ui_alt_user",
     help="Many legacy ISP servers (Zimbra / cPanel / Dovecot) expect 'user' rather than "
          "'user@domain'. On an auth rejection the engine holds the node and retries the "
          "SAME host with the local part. This also fires on a LOGIN_DROPPED (* BYE), not "
          "just WRONG. Not applied to SMTP."
 )
+_seed_widget("ui_confirm_wrong")
 confirm_wrong_ui = str_lit.sidebar.toggle(
-    "✅ Confirm a WRONG verdict across hosts before accepting it", value=True,
+    "✅ Confirm a WRONG verdict across hosts before accepting it",
     key="ui_confirm_wrong",
     help="GUARD. ON (default): a single AUTHENTICATIONFAILED is PROVISIONAL - the ladder "
          "keeps going (POP3, the sibling hosts, 143/110, then DIRECT) until a SECOND host "
@@ -3963,9 +3975,10 @@ confirm_wrong_ui = str_lit.sidebar.toggle(
          "the one-rung behaviour (faster on huge lists, more false wrong_password)."
 )
 
+_seed_widget("ui_smtp_precheck")
 smtp_precheck_ui = str_lit.sidebar.checkbox(
     "📮 Enable SMTP pre-check  (OFF by default)",
-    value=False, key="ui_smtp_precheck",
+    key="ui_smtp_precheck",
     help="A REACHABILITY banner probe only (220 on 587/465/25) - it never authenticates. "
          "Separate from the SMTP protocol rung in Pick Protocols Mode, which does AUTH PLAIN."
 )
@@ -3980,31 +3993,34 @@ custom_blacklist_input = str_lit.sidebar.text_input(
     key="bb_blacklist")
 # @@END 048 SIDEBAR_RULES
 
-# @@BLOCK 049 SIDEBAR_POOL deps=016,017,018,046
+# @@BLOCK 049 SIDEBAR_POOL deps=016,017,018,019,046
 str_lit.sidebar.markdown("---")
 str_lit.sidebar.markdown("### 🌐 Proxy / Pool Configuration")
 # FIX SCORE-4: this slider was `step=10` against a default of 5, so it could not
 # SIT on 5 - it snapped to 0 or 10 and the default was never actually applied.
 # 0 means "no score filtering at all", which is the opposite of what the label
 # promises. Step 1.
+_seed_widget("ui_min_proxy_score", lo=0, hi=100)
 min_proxy_score = str_lit.sidebar.slider(
-    "Min Proxy Score", 0, 100, MIN_PROXY_SCORE_DEFAULT, 1, key="ui_min_proxy_score",
+    "Min Proxy Score", 0, 100, 1, key="ui_min_proxy_score",
     help="A node is dropped from the pool once its score falls below this. A node that "
          "has EVER passed the probe is never dropped by score, and a 402/407 no longer "
          "counts as a fail - only real transport failures do."
 )
+_seed_widget("ui_probe_precheck_timeout", lo=1, hi=10)
 proxy_precheck_timeout = str_lit.sidebar.slider(
-    "Proxy Pre-Check Timeout (Sec)", 1, 10, PROXY_PRECHECK_TIMEOUT_DEFAULT, 1,
+    "Proxy Pre-Check Timeout (Sec)", 1, 10, 1,
     key="ui_probe_precheck_timeout"
 )
+_seed_widget("ui_probe_timeout", lo=3, hi=20)
 probe_timeout_ui = str_lit.sidebar.slider(
-    "Tunnel Probe Timeout (Sec)", 3, 20, int(PROBE_TIMEOUT_DEFAULT), 1, key="ui_probe_timeout",
+    "Tunnel Probe Timeout (Sec)", 3, 20, 1, key="ui_probe_timeout",
     help="How long a node gets IN TOTAL to open a real CONNECT tunnel to any probe target."
 )
+_seed_widget("ui_probe_target", choices=PROBE_TARGET_OPTIONS)
 probe_target_ui = str_lit.sidebar.selectbox(
     "Tunnel Probe Target",
     PROBE_TARGET_OPTIONS,
-    index=_safe_index(PROBE_TARGET_OPTIONS, PROBE_TARGET_DEFAULT),
     key="ui_probe_target",
     help="DEFAULT '443 (HTTPS)': the probe dials api.ipify.org:443, which is not a "
          "mail server. Keep it - a 407 on 443 is unambiguously about the credential "
@@ -4012,8 +4028,9 @@ probe_target_ui = str_lit.sidebar.selectbox(
          "The mail-destination spot check below is what tests 993, and it proves "
          "itself against 443 before it blames the node."
 )
+_seed_widget("ui_probe_strict")
 probe_strict_ui = str_lit.sidebar.toggle(
-    "Strict tunnel probe", value=True, key="ui_probe_strict",
+    "Strict tunnel probe", key="ui_probe_strict",
     help="ON (default): only nodes that PASS the tunnel probe enter the live pool, so "
          "'Alive: 0' means it. ONE exception, and it is deliberate: a node that answers "
          "402 Payment Required is ALIVE and authenticated - the provider is only refusing "
@@ -4021,49 +4038,57 @@ probe_strict_ui = str_lit.sidebar.toggle(
          "node is left. OFF: a failed probe is not fatal and the raw filtered pool is "
          "armed unvalidated instead."
 )
+_seed_widget("ui_probe_maxtargets", lo=1, hi=3)
 probe_max_targets_ui = str_lit.sidebar.slider(
-    "Probe: max targets per node", 1, 3, PROBE_MAX_TARGETS_DEFAULT, 1, key="ui_probe_maxtargets",
+    "Probe: max targets per node", 1, 3, 1, key="ui_probe_maxtargets",
     help="1 (default) = AUTO resolves the SINGLE dominant mail host in your queue."
 )
+_seed_widget("ui_probe_scheme2")
 probe_second_scheme_ui = str_lit.sidebar.toggle(
-    "Probe: also try the second proxy scheme", value=PROBE_SECOND_SCHEME_DEFAULT,
+    "Probe: also try the second proxy scheme",
     key="ui_probe_scheme2",
     help="OFF (default) = one CONNECT per probe when the first scheme PASSES. The alternate "
          "scheme is ALWAYS tried after a FAILURE regardless of this switch, except after a "
          "402/407 where another scheme cannot change the answer."
 )
+_seed_widget("ui_prober_idle")
 prober_idle_ui = str_lit.sidebar.toggle(
     "Probe: keep probing in the background while idle",
-    value=PROBER_IDLE_ENABLED_DEFAULT, key="ui_prober_idle",
+    key="ui_prober_idle",
     help="OFF (default) = the pool is probed once when the page loads, then only when you "
          "click Start or Re-probe."
 )
+_seed_widget("ui_mail_spot")
 mail_spot_ui = str_lit.sidebar.toggle(
-    "✉️ Spot-check the pool against a MAIL destination", value=MAIL_SPOT_CHECK_DEFAULT,
+    "✉️ Spot-check the pool against a MAIL destination",
     key="ui_mail_spot",
     help="After every probe cycle, CONNECT 3 random nodes to your first queued mail host "
          "(fallback imap.gmail.com:993) and report it. Each 407 is re-tested against 443 "
          "before it is blamed on the node, so a healthy node is never quarantined for a "
          "destination-scoped 407."
 )
+_seed_widget("ui_probe_sample", lo=0, hi=200)
 probe_sample_ui = str_lit.sidebar.slider(
-    "Probe: max nodes per cycle (0 = all)", 0, 200, 0, 5, key="ui_probe_sample",
+    "Probe: max nodes per cycle (0 = all)", 0, 200, 5, key="ui_probe_sample",
     help="Randomly sample this many nodes per cycle instead of probing the whole file. "
          "Cheapest is 20."
 )
+_seed_widget("ui_dedupe")
 dedupe_proxies_ui = str_lit.sidebar.toggle(
-    "Deduplicate proxy pool", value=True, key="ui_dedupe",
+    "Deduplicate proxy pool", key="ui_dedupe",
     help="ON (default): collapse repeated host:port lines in proxies.txt. The live pool is "
          "ALWAYS collapsed to one line per host:port regardless, keeping whichever line "
          "passed - eleven sub-users on one IP are one proxy, not eleven."
 )
+_seed_widget("ui_allow_blacklist")
 allow_blacklist_ips = str_lit.sidebar.toggle(
-    "Allow Blacklisted / Flagged Proxy IPs", value=False, key="ui_allow_blacklist",
+    "Allow Blacklisted / Flagged Proxy IPs", key="ui_allow_blacklist",
     help="When disabled (default), circuit-broken proxies are excluded from BOTH the pool "
          "AND the live ladder."
 )
+_seed_widget("ui_quarantine")
 proxy_quarantine_ui = str_lit.sidebar.toggle(
-    "🩹 Quarantine nodes that return 407", value=True, key="ui_quarantine",
+    "🩹 Quarantine nodes that return 407", key="ui_quarantine",
     help="ON (default): a node that answers '407 Proxy Authentication Required' THREE "
          "times is pulled out of the pool for the rest of the run. A plain socket reset "
          "is NOT a 407, a 402 is NOT a 407, and a 407 that passes the 443 control does "
@@ -4071,72 +4096,82 @@ proxy_quarantine_ui = str_lit.sidebar.toggle(
 )
 # @@END 049 SIDEBAR_POOL
 
-# @@BLOCK 050 SIDEBAR_CONCURRENCY deps=012,017,046
+# @@BLOCK 050 SIDEBAR_CONCURRENCY deps=012,017,019,046
 str_lit.sidebar.markdown("---")
 str_lit.sidebar.markdown("### 🚦 Concurrency Governors")
+_seed_widget("ui_host_conc", lo=1, hi=12)
 host_concurrency_ui = str_lit.sidebar.slider(
-    "Per-Host Connection Cap", 1, 12, HOST_CONCURRENCY_DEFAULT, 1, key="ui_host_conc",
+    "Per-Host Connection Cap", 1, 12, 1, key="ui_host_conc",
     help="Max simultaneous connections to ONE mail hostname. 2 is right for legacy ISP IMAP."
 )
+_seed_widget("ui_ip_conc", lo=1, hi=12)
 proxy_ip_concurrency_ui = str_lit.sidebar.slider(
-    "Per-Proxy-IP Connection Cap", 1, 12, PROXY_IP_CONCURRENCY_DEFAULT, 1, key="ui_ip_conc",
+    "Per-Proxy-IP Connection Cap", 1, 12, 1, key="ui_ip_conc",
     help="Default 2. Max simultaneous tunnels through ONE proxy IP, for the CHECKER and "
          "the PROBER alike."
 )
+_seed_widget("ui_subuser_conc", lo=1, hi=12)
 proxy_subuser_concurrency_ui = str_lit.sidebar.slider(
-    "Per-Proxy-SUBUSER Connection Cap", 1, 12, PROXY_SUBUSER_CONCURRENCY_DEFAULT, 1,
+    "Per-Proxy-SUBUSER Connection Cap", 1, 12, 1,
     key="ui_subuser_conc",
     help="Default 1. Providers rate-limit PER SUB-USER - a 407 is what you get when that "
          "cap is exceeded, NOT because the node is dead. 1 is a real floor now; the gate "
          "used to be silently pinned at 2 no matter what you dragged."
 )
+_seed_widget("ui_proxy_conc", lo=2, hi=60)
 proxy_concurrency_ui = str_lit.sidebar.slider(
-    "Global Proxy Connection Cap", 2, 60, PROXY_CONCURRENCY_DEFAULT, 1, key="ui_proxy_conc",
+    "Global Proxy Connection Cap", 2, 60, 1, key="ui_proxy_conc",
     help="Max simultaneous proxy tunnels across the whole run (the prober shares this)."
 )
+_seed_widget("ui_direct_first")
 direct_first_ui = str_lit.sidebar.toggle(
-    "⚡ Direct-First (try the direct egress before the proxy)", value=False,
+    "⚡ Direct-First (try the direct egress before the proxy)",
     key="ui_direct_first",
     help="ON: run the DIRECT sweep first and only fall back to the proxy. Also auto-engages "
          "per account when >50% of the pool is quarantined."
 )
+_seed_widget("ui_same_host_retries", lo=0, hi=4)
 same_host_retries_ui = str_lit.sidebar.slider(
-    "Same-Host Retries on a SLOW answer", 0, 4, SAME_HOST_RETRIES_DEFAULT, 1,
+    "Same-Host Retries on a SLOW answer", 0, 4, 1,
     key="ui_same_host_retries",
     help="Only applies to READ-level slowness."
 )
+_seed_widget("ui_max_rot", lo=0, hi=8)
 max_rotations_ui = str_lit.sidebar.slider(
-    "Max proxy rotations per rung", 0, 8, MAX_ROTATIONS_DEFAULT, 1, key="ui_max_rot",
+    "Max proxy rotations per rung", 0, 8, 1, key="ui_max_rot",
     help="Every rotation is another proxy request. 5 -> 2 is roughly a 60% cut in the "
          "worst case."
 )
+_seed_widget("ui_pass2")
 pass2_ui = str_lit.sidebar.toggle(
-    "Second pass over network-failed hosts", value=CHECK_PASS2_DEFAULT, key="ui_pass2",
+    "Second pass over network-failed hosts", key="ui_pass2",
     help="OFF (default) = one pass over the ladder. ON = re-dial every host that failed "
          "with a NETWORK error."
 )
 # @@END 050 SIDEBAR_CONCURRENCY
 
-# @@BLOCK 051 SIDEBAR_ROUTING deps=046
+# @@BLOCK 051 SIDEBAR_ROUTING deps=019,046
 str_lit.sidebar.markdown("---")
 str_lit.sidebar.markdown("### 🔀 Proxy Routing Intelligence")
+_seed_widget("ui_random_rot")
 proxy_random_rotation = str_lit.sidebar.toggle(
-    "🔀 Proxy Random Rotation", value=True, key="ui_random_rot",
+    "🔀 Proxy Random Rotation", key="ui_random_rot",
     help="ON (default): a DIFFERENT random node is used for every attempt, with a "
          "per-account avoid-set."
 )
+_seed_widget("ui_geo_call")
 geo_call_proxy = str_lit.sidebar.toggle(
-    "🌍 Geo-Call Proxy", value=False, key="ui_geo_call",
+    "🌍 Geo-Call Proxy", key="ui_geo_call",
     help="Prefer a node whose geo matches the email's country/region. Falls back to the "
          "general pool on failure."
 )
+_seed_widget("ui_conn_hint", choices=("Auto", "VPN ON", "VPN OFF"))
 my_connection = str_lit.sidebar.selectbox(
     "📶 My own connection (stamped on direct fallbacks)", ["Auto", "VPN ON", "VPN OFF"],
-    index=0, key="ui_conn_hint", help="Diagnostic only."
-)
+    key="ui_conn_hint", help="Diagnostic only.")
 # @@END 051 SIDEBAR_ROUTING
 
-# @@BLOCK 052 CACHE_PROXY_PARSE_PICKER deps=024,039,051
+# @@BLOCK 052 CACHE_PROXY_PARSE_PICKER deps=007,024,039,051
 if "pool_mode" not in str_lit.session_state:
     str_lit.session_state.pool_mode = "all"
 if "pool_locked" not in str_lit.session_state:
@@ -4162,7 +4197,12 @@ def load_json(path, default=None):
 
 
 # FIX ISO-6: this user's own domain cache file, and their own proxy meta table.
-domain_cache = load_json(live_cfg().get("CACHE_FILE", "domain_cache.json"), {})
+# v13.65: IT WAS READING THE SHARED FILE. This block runs at import, BEFORE block
+# 055 defines CFG, and the module namespace is rebuilt on every rerun - so
+# live_cfg() is {} here, .get("CACHE_FILE") is None, and the BARE
+# domain_cache.json was loaded on every single load while save_domain_cache()
+# wrote the per-user one. The path is resolved through user_file() directly now.
+domain_cache = load_json(user_file("domain_cache.json"), {})
 proxy_meta = _user_state()["proxy_meta"]
 
 # ==========================================================================
@@ -4229,6 +4269,10 @@ def _load_proxy_meta_file() -> int:
     else:
         meta_in, probe_in, park_in = data, {}, {}
 
+    # v13.65: THIS LINE WAS ALWAYS EMPTY. The call used to sit ABOVE
+    # def load_proxies, so it raised NameError, the bare except swallowed it and
+    # `known` was set() on every run - rule 2 above never applied and a deleted
+    # node came back from the file. The call is at the end of this block now.
     try:
         known = set(load_proxies(quiet=True))
     except Exception:
@@ -4284,14 +4328,14 @@ def _load_proxy_meta_file() -> int:
     return restored
 
 
-_load_proxy_meta_file()
-
-
 def _proxy_path() -> str:
+    # v13.65: the fallback is the USER's file, not a bare name. This is called
+    # before CFG exists (import time) as well as after it, and a bare fallback
+    # made load_proxies() create a shared proxies.txt in the working directory.
     try:
-        return live_cfg().get("PROXY_FILE") or "proxies.txt"
+        return live_cfg().get("PROXY_FILE") or user_file("proxies.txt")
     except Exception:
-        return "proxies.txt"
+        return user_file("proxies.txt")
 
 
 def load_proxies(quiet: bool = False):
@@ -4369,6 +4413,11 @@ def parse_proxy(proxy_str):
     except Exception:
         pass
     return None
+
+
+# The restore now has load_proxies() AND parse_proxy() above it, so its
+# "only lines still in proxies.txt" filter is real.
+_load_proxy_meta_file()
 
 
 # v13.64: BOTH OF THESE ARE CALLED FROM WORKER THREADS - quarantine_proxy() from
@@ -4761,7 +4810,7 @@ else:
                     str_lit.rerun()
 # @@END 052 CACHE_PROXY_PARSE_PICKER
 
-# @@BLOCK 053 SIDEBAR_SWITCHES deps=043,044,051
+# @@BLOCK 053 SIDEBAR_SWITCHES deps=019,043,044,051
 str_lit.sidebar.markdown("---")
 
 use_proxy = instant_help(
@@ -4809,15 +4858,17 @@ proxy_test_flight = True if proxy_test_flight is None else proxy_test_flight
 skip_app = False if skip_app is None else skip_app
 debug_mode = True if debug_mode is None else debug_mode
 
+_seed_widget("ui_starttls")
 try_starttls_ui = str_lit.sidebar.toggle(
-    "Enable STARTTLS + plaintext fallback (143 / 110)", value=True, key="ui_starttls",
+    "Enable STARTTLS + plaintext fallback (143 / 110)", key="ui_starttls",
     help="If implicit TLS on 993/995 fails, retry the host over STARTTLS, then over "
          "plaintext. These rungs get a shorter leash (LEGACY_RUNG_TIMEOUT) because "
          "143/110 are often firewalled from cloud egress."
 )
 
+_seed_widget("ui_proxy_mode", choices=("aggressive", "fallback", "sticky", "off"))
 resolved_proxy_mode = str_lit.sidebar.selectbox(
-    "Proxy Mode Engine:", options=["aggressive", "fallback", "sticky", "off"], index=1,
+    "Proxy Mode Engine:", options=["aggressive", "fallback", "sticky", "off"],
     key="ui_proxy_mode",
     help="aggressive: proxy only. fallback: proxy then direct (default, universal). "
          "sticky: one proxy per worker thread. off: never use proxies. With a "
@@ -6513,6 +6564,11 @@ def _precheck_tcp(host, port, timeout):
 
 def precheck_proxy_fast(proxy_str):
     try:
+        # v13.65: THIS RUNS ON PHASE-2 WORKER THREADS and touches the per-user
+        # quarantine, circuit-breaker and score tables. Without the rebind a rerun
+        # in another tab retargets every module alias and the writes land in the
+        # other user's tables. _burst_probe() already rebinds; this one did not.
+        _rebind_scope()
         if not proxy_str:
             return True
         if proxy_is_blocked(proxy_str):
@@ -6791,6 +6847,11 @@ def _collapse_by_hostport(lines, reasons):
 
 def refresh_alive_pool(force: bool = False, budget: float = None):
     _rebind_scope()
+    # v13.65: PINNED. _US is a module global and a rerun in another tab rebinds
+    # it, so the closing `finally` used to clear probe_in_flight and stamp
+    # last_probe_ts on whoever reran last - leaving the real owner marked
+    # "probe in flight" for ever.
+    _us = _US
     budget = float(budget if budget is not None else PROBE_BATCH_BUDGET)
 
     if (not force) and (not _any_run_active()) \
@@ -6807,7 +6868,7 @@ def refresh_alive_pool(force: bool = False, budget: float = None):
             return
 
     if (not force) and _any_run_active():
-        last = _US.get("last_probe_ts", 0.0)
+        last = _us.get("last_probe_ts", 0.0)
         if last and (time.time() - last) < PROBER_STALE_WHILE_RUNNING:
             try:
                 _PROBE_OWNER_LOCK.release()
@@ -6815,7 +6876,7 @@ def refresh_alive_pool(force: bool = False, budget: float = None):
                 pass
             return
 
-    _US["probe_in_flight"] = True
+    _us["probe_in_flight"] = True
     try:
         try:
             raw = get_filtered_active_proxies(quiet=True)
@@ -6899,7 +6960,7 @@ def refresh_alive_pool(force: bool = False, budget: float = None):
         _tgts = probe_targets()
         log_probe_event(f"refresh start: {len(raw)} candidate(s), target={live_cfg().get('PROBE_TARGET')} "
                         f"({[t[0] for t in _tgts]}), budget={budget:.0f}s, "
-                        f"workers={probe_workers()}, runs_active={_US.get('runs_active', 0)}")
+                        f"workers={probe_workers()}, runs_active={_us.get('runs_active', 0)}")
 
         live, batch_timed_out = _run_batch(precheck_proxy_fast, raw, probe_workers(), budget)
 
@@ -6944,8 +7005,8 @@ def refresh_alive_pool(force: bool = False, budget: float = None):
             alive_pool[:] = live
         enrich_proxy_geo(live)
         save_proxy_meta()
-        _US["last_probe_ts"] = time.time()
-        _US["probe_runs"] = int(_US.get("probe_runs", 0)) + 1
+        _us["last_probe_ts"] = time.time()
+        _us["probe_runs"] = int(_us.get("probe_runs", 0)) + 1
 
         try:
             mail_dest_spot_check()
@@ -6961,8 +7022,8 @@ def refresh_alive_pool(force: bool = False, budget: float = None):
         log_probe_event(f"refresh end: alive={len(live)}/{len(raw)} pass={passed} "
                         f"auth={auth} plan={plan_n} timeout={timeout_n} dead={dead}{note}")
     finally:
-        _US["probe_in_flight"] = False
-        _US["last_probe_ts"] = time.time()
+        _us["probe_in_flight"] = False
+        _us["last_probe_ts"] = time.time()
         try:
             _PROBE_OWNER_LOCK.release()
         except Exception:
@@ -8463,12 +8524,20 @@ with str_lit.sidebar:
         getattr(str_lit, _lvl, str_lit.info)(_msg)
 
     if (not all_proxies) and WEBSHARE_KEYS and not _US.get("bootstrap_done"):
-        _US["bootstrap_done"] = True
         with str_lit.spinner("First run - fetching and validating your proxy pool..."):
             try:
-                fetch_and_test_all_proxies(silent=True)
+                _boot_n, _boot_total = fetch_and_test_all_proxies(silent=True)
             except Exception as _be:
+                _boot_n = 0
                 log_startup(f"WARNING: auto-bootstrap failed: {_be}")
+        # v13.65: THE FLAG WAS LATCHED BEFORE THE FETCH. One failed first fetch
+        # disabled the auto-bootstrap for the life of the process. It is set only
+        # on a real result now.
+        if _boot_n:
+            _US["bootstrap_done"] = True
+        else:
+            log_startup("Auto-bootstrap produced no node - it will retry on the "
+                        "next load.")
         all_proxies = load_proxies()
         filtered_pool = get_filtered_active_proxies(quiet=True)
 
@@ -9485,8 +9554,25 @@ else:
         except Exception:
             pass
 
-    threading.Thread(target=_fetch_disposables_bg, daemon=True,
-                     name="disposable-fetch").start()
+    # v13.65: THE THREAD CARRIED NO SCRIPT-RUN CONTEXT, so every log_startup()
+    # inside load_disposable_set() warned "missing ScriptRunContext" and its lines
+    # were dropped instead of reaching the panel. The caller's context is attached
+    # to the thread before it starts, so the log lands normally.
+    _disp_thread = threading.Thread(target=_fetch_disposables_bg, daemon=True,
+                                    name="disposable-fetch")
+    try:
+        from streamlit.runtime.scriptrunner import (
+            add_script_run_ctx as _add_src, get_script_run_ctx as _get_src)
+        _disp_ctx = _get_src()
+    except Exception:
+        _add_src = None
+        _disp_ctx = None
+    if _add_src is not None and _disp_ctx is not None:
+        try:
+            _add_src(_disp_thread, _disp_ctx)
+        except Exception:
+            pass
+    _disp_thread.start()
 
 
 def is_disposable(email):
@@ -10719,7 +10805,7 @@ def verify_and_connect(target_email, target_pass, hosts, proxy_str=None):
 # v13.55: 700 KB cap, not 2 MB, and no duplicate "html" field - ten 2 MB messages
 # plus their HTML strings plus base64 image URIs was enough to segfault the free
 # container. The renderer splits text and HTML back out of "raw" itself.
-_BODY_FETCH_BYTES = 20000      # kept: legacy reference, no longer the fetch cut
+# v13.65: the unused _BODY_FETCH_BYTES constant is gone; the fetch cut is _RAW_CAP.
 _BODY_SHOW_CHARS = 20000
 _RAW_CAP = 700 * 1024
 
@@ -12150,7 +12236,7 @@ def _check_account_core(email, password, conf, domain, proxy_pool, thread_state,
                           "be tested"), None, trace_logs
 # @@END 104 CORE_TAIL
 
-# @@BLOCK 105 RUN_TRIGGER_UI deps=034,055,083,087
+# @@BLOCK 105 RUN_TRIGGER_UI deps=019,034,055,083,087
 section_title("🚀", "Execute Live Checking Engine",
               "proxy-backed, post-auth verified, resumable")
 
@@ -12166,8 +12252,9 @@ with col_action1:
              "reason on the run record FIRST, then reruns, so the next page load "
              "reports 'Stopped by user' and leaves the queue resumable.")
 with col_action2:
+    _seed_widget("bb_action_mode", choices=ACTION_OPTIONS, dflt=ACTION_OPTIONS[0])
     engine_action_mode = str_lit.selectbox(
-        "Engine Action Mode:", options=ACTION_OPTIONS, index=0,
+        "Engine Action Mode:", options=ACTION_OPTIONS,
         key="bb_action_mode",
         help="Pick a pre-filter bucket (SMTP Failed sits right after DNS Failed) or a "
              "previous result bucket to re-run."
@@ -13040,7 +13127,7 @@ if start_engine_btn:
             str_lit.error(f"Error compiling results export files: {ex}")
 # @@END 107 RUN_EXPORT
 
-# @@BLOCK 108 RESULTS_SUMMARY deps=007,014,035,036,037,087,106
+# @@BLOCK 108 RESULTS_SUMMARY deps=007,014,019,035,036,037,087,106
 # v13.51: THE 98-SECOND FREEZE.  Measured from the logs: the loop ends, the
 # page reports the run OK 98 seconds later.  Block 107 writes twelve small files
 # and a twelve-entry in-memory zip in one or two seconds - the rest was THIS
@@ -13181,8 +13268,9 @@ if str_lit.session_state.engine_has_run or _persisted_valid:
 
     # FIX SPEED-12 / v13.51: one st.code per bucket instead of one per LINE. Up to
     # 480 code widgets became 12, and the per-line widgets are behind a toggle.
+    _seed_widget("bb_sum_full", dflt=False)
     _show_full = str_lit.toggle(
-        "Show full bucket contents inline (slower on a phone)", value=False,
+        "Show full bucket contents inline (slower on a phone)",
         key="bb_sum_full",
         help="Off: 12 boxes with a count. On: every line, still capped at "
              "BUCKET_RENDER_TAIL. The download button above always carries all of it.")
@@ -13237,7 +13325,7 @@ if str_lit.session_state.engine_has_run or _persisted_valid:
         pass
 # @@END 108 RESULTS_SUMMARY
 
-# @@BLOCK 109 IN_APP_READER deps=034,053,062,069,093,098
+# @@BLOCK 109 IN_APP_READER deps=019,034,053,062,069,093,098
 section_title("📬", "Mailbox Reader (Interactive Inbox Inspection)",
               "read verified inboxes without leaving the app")
 
@@ -13266,7 +13354,8 @@ else:
     if valid_combo_options:
         selected_combo = str_lit.selectbox("Select Valid Account to Read:",
                                            options=valid_combo_options, key="bb_reader_acct")
-        max_msgs = str_lit.slider("Number of Recent Messages to Fetch", 1, 50, 10, 1,
+        _seed_widget("bb_reader_max", lo=1, hi=50, dflt=10)
+        max_msgs = str_lit.slider("Number of Recent Messages to Fetch", 1, 50, 1,
                                   key="bb_reader_max")
 
         if "bb_reader_remote" not in str_lit.session_state:
