@@ -32,8 +32,17 @@ boundaries, and every one of them is enforced here, not assumed:
   4. ACTION LEDGER is <hash>_mail_results/action_log.jsonl - one file per user,
      written by audit_log.py. Reset removes only YOUR ledger.
 
-theme.json, proxies.txt and proxy_meta.json stay SHARED on purpose - they are
-deployment infrastructure, not user data.
+WHAT IS SHARED, AND WHAT THAT COSTS YOU
+---------------------------------------
+Two files only: passkey.json (the keyring) and disposable_domains.txt (a
+downloaded blocklist, identical for everybody). theme.json, settings.json,
+proxies.txt, proxies_all.txt, proxy_meta.json, proxy_key_map.json and
+domain_cache.json are all per-user since v13.61.
+
+v13.64: this header used to say theme.json, proxies.txt and proxy_meta.json stay
+SHARED on purpose. They stopped being shared three versions earlier, and block
+003 kept reading the bare APP_DIR/theme.json that no longer exists - so this page
+always painted the factory palette regardless of the owner's colours.
 
 WHY THE ACTION LEDGER EXISTS (v13.48)
 -------------------------------------
@@ -87,12 +96,37 @@ _TH_DEFAULTS = {
 }
 
 
+def _theme_candidates():
+    """This user's own theme file first, then the legacy bare ones.
+
+    v13.64: THE THEME WAS NEVER LOADED. theme.json became a per-user file
+    (<hash>_theme.json) at v13.61, but this function only ever looked at
+    APP_DIR/theme.json and "theme.json", neither of which exists any more - so
+    every user's Logs page rendered in the factory palette and the silent
+    except made it look like a design choice.
+
+    user_file() is read through a lazy import because this block runs before the
+    gate in block 005; on the very first load it answers with the anonymous
+    prefix, which simply does not exist and falls through to the defaults. Block
+    005 re-runs this after the gate and repaints.
+    """
+    out = []
+    try:
+        import auth as _a
+        out.append(_a.user_file("theme.json"))
+    except Exception:
+        pass
+    out.append(os.path.join(APP_DIR, "theme.json"))
+    out.append("theme.json")
+    return out
+
+
 def _load_theme():
-    """theme.json when it parses, else the defaults. Never raises."""
+    """The owner's theme when it parses, else the defaults. Never raises."""
     base = dict(_TH_DEFAULTS)
-    for cand in (os.path.join(APP_DIR, "theme.json"), "theme.json"):
+    for cand in _theme_candidates():
         try:
-            if not os.path.exists(cand):
+            if not cand or not os.path.exists(cand):
                 continue
             with open(cand, encoding="utf-8") as fh:
                 data = json.load(fh)
@@ -198,6 +232,18 @@ if hasattr(audit_log, "install"):
     audit_log.install(st, "pages/7_Logs.py")
 
 auth.fit_panel(st)                  # the controls; collapsed until tapped
+
+# v13.64: THE FIRST THEME READ IS ALWAYS ANONYMOUS. Block 003 runs before the
+# gate, so on a cold load user_file("theme.json") answered with the throwaway
+# anon prefix and fell back to the defaults. Now that the passphrase is unlocked
+# the owner's real file exists, so re-read it and repaint. A second identical
+# <style> emission is harmless; the last one wins.
+_TH = _load_theme()
+_CSS = (_CSS_TMPL
+        .replace("__G1__", _TH["g1"])
+        .replace("__G2__", _TH["g2"])
+        .replace("__BG__", _TH["bg"]))
+st.markdown(_CSS, unsafe_allow_html=True)
 # @@END 005 HERO
 
 # @@BLOCK 006 SOURCES deps=005
