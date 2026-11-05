@@ -13325,7 +13325,7 @@ if str_lit.session_state.engine_has_run or _persisted_valid:
         pass
 # @@END 108 RESULTS_SUMMARY
 
-# @@BLOCK 109 IN_APP_READER deps=019,034,053,062,069,093,098
+# @@BLOCK 109 IN_APP_READER deps=019,034,037,039,053,062,069,093,098
 section_title("📬", "Mailbox Reader (Interactive Inbox Inspection)",
               "read verified inboxes without leaving the app")
 
@@ -13334,6 +13334,105 @@ try:
     import mailview
 except Exception:
     mailview = None
+
+# ==========================================================================
+# v13.66 - THE READER NOW SURVIVES A REFRESH
+#
+# The chosen account, the message count and the remote-image switch lived in
+# session_state ONLY, so a refresh (or a backgrounded phone tab being reaped)
+# dropped all three and the picker snapped back to the first valid account.
+# They are a per-user file now, exactly like the paste box, the settings and the
+# theme - and the picker is re-mapped by MAILBOX, so a run that rewrote the
+# password on that line still lands on the same inbox instead of resetting.
+#
+# The inbox re-opens itself ONCE after a restore (never on a plain rerun and
+# never on an account switch), so a refresh costs one fetch and not a connection
+# per rerun. _reader_tried is the guard.
+#
+# The stored account is validated against the CURRENT option list BEFORE the
+# selectbox is created. With key= and no index, a stored value that is not in
+# options is a StreamlitAPIException - which is what a stale account did.
+# ==========================================================================
+_READER_STATE_NAME = "reader_state.json"
+_READER_OWNER_KEY = "_reader_owner"
+_READER_DEFAULTS = {"acct": "", "max": 10, "remote": False}
+
+
+def _reader_path() -> str:
+    try:
+        return user_file(_READER_STATE_NAME)
+    except Exception:
+        return _READER_STATE_NAME
+
+
+def _reader_load() -> dict:
+    """This user's remembered reader state. Never raises."""
+    out = dict(_READER_DEFAULTS)
+    p = _reader_path()
+    if not os.path.exists(p):
+        return out
+    try:
+        with open(p, encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception as e:
+        warnings.warn(f"reader state unreadable ({e}); starting from defaults")
+        return out
+    if isinstance(data, dict):
+        for k in out:
+            if k in data:
+                out[k] = data[k]
+    return out
+
+
+def _reader_save(vals) -> dict:
+    """Merge `vals` into this user's reader state and rewrite it atomically.
+
+    Self-contained on purpose: an on_change callback runs BEFORE the script
+    body, so it has no module globals from the previous run to lean on.
+    """
+    p = _reader_path()
+    cur = _reader_load()
+    cur.update(vals or {})
+    tmp = p + ".tmp"
+    try:
+        with file_write_lock:
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(cur, f, indent=1)
+            os.replace(tmp, p)
+    except Exception as e:
+        warnings.warn(f"could not save reader state: {e}")
+    return cur
+
+
+def _on_reader_change():
+    """Persist the picker, the count and the image switch as they change."""
+    try:
+        _reader_save({"acct": str(str_lit.session_state.get("bb_reader_acct") or ""),
+                      "max": int(str_lit.session_state.get("bb_reader_max") or 10),
+                      "remote": bool(str_lit.session_state.get("bb_reader_remote"))})
+    except Exception:
+        pass
+
+
+# ---- owner gate: a second unlock in this tab must not inherit the last one ----
+_reader_owner = _cache_owner()
+if str_lit.session_state.get(_READER_OWNER_KEY) != _reader_owner:
+    for _k in ("bb_reader_acct", "bb_reader_max", "bb_reader_remote",
+               "bb_reader_msgs", "bb_reader_for", "bb_reader_note",
+               "_reader_tried", "_rdr_state"):
+        str_lit.session_state.pop(_k, None)
+    str_lit.session_state[_READER_OWNER_KEY] = _reader_owner
+if "_rdr_state" not in str_lit.session_state:
+    str_lit.session_state["_rdr_state"] = _reader_load()
+_rdr_state = str_lit.session_state["_rdr_state"]
+if "bb_reader_remote" not in str_lit.session_state:
+    str_lit.session_state["bb_reader_remote"] = bool(_rdr_state.get("remote"))
+if "bb_reader_max" not in str_lit.session_state:
+    try:
+        str_lit.session_state["bb_reader_max"] = max(
+            1, min(50, int(_rdr_state.get("max") or 10)))
+    except Exception:
+        str_lit.session_state["bb_reader_max"] = 10
 
 with session_state_lock:
     current_valid_set = list(str_lit.session_state.valid_results) or load_persistent_valid_results()
@@ -13352,16 +13451,45 @@ else:
             continue
 
     if valid_combo_options:
+        # ---- resolve the picker value BEFORE the widget exists -----------------
+        # The session value wins while it is still offered; the remembered one is
+        # next; then the same mailbox under a re-quoted line; then option 1.
+        _cur_acct = str_lit.session_state.get("bb_reader_acct") or ""
+        _mem_acct = str(_rdr_state.get("acct") or "")
+        # A refresh is exactly this: nothing in the session, something remembered.
+        _restored = (not _cur_acct) and bool(_mem_acct)
+        if _cur_acct in valid_combo_options:
+            _pick = _cur_acct
+        elif _mem_acct in valid_combo_options:
+            _pick = _mem_acct
+        else:
+            _pick = ""
+            _mem_email = _mem_acct.split(":", 1)[0].strip().lower()
+            if _mem_email:
+                for _opt in valid_combo_options:
+                    if _opt.split(":", 1)[0].strip().lower() == _mem_email:
+                        _pick = _opt
+                        break
+            if not _pick:
+                _pick = valid_combo_options[0]
+        str_lit.session_state["bb_reader_acct"] = _pick
+        if _mem_acct != _pick:
+            try:
+                _reader_save({"acct": _pick})
+            except Exception:
+                pass
+            _rdr_state["acct"] = _pick
+
         selected_combo = str_lit.selectbox("Select Valid Account to Read:",
-                                           options=valid_combo_options, key="bb_reader_acct")
+                                           options=valid_combo_options, key="bb_reader_acct",
+                                           on_change=_on_reader_change)
         _seed_widget("bb_reader_max", lo=1, hi=50, dflt=10)
         max_msgs = str_lit.slider("Number of Recent Messages to Fetch", 1, 50, 1,
-                                  key="bb_reader_max")
+                                  key="bb_reader_max", on_change=_on_reader_change)
 
-        if "bb_reader_remote" not in str_lit.session_state:
-            str_lit.session_state["bb_reader_remote"] = False
         allow_remote = str_lit.checkbox(
             "Load remote images in HTML view (tracking pixels fire)", key="bb_reader_remote",
+            on_change=_on_reader_change,
             help="Inline cid: images are always shown - they are embedded in the message. "
                  "This switch is only about images hosted on the sender's server.")
 
@@ -13371,46 +13499,68 @@ else:
             str_lit.caption(f"body renderer: mailview.py {_mv_ver} - update it to v13.55 "
                             f"to get the memory cap and attachment previews.")
 
+        _r_msgs = str_lit.session_state.get("bb_reader_msgs") or []
+        _r_for = str_lit.session_state.get("bb_reader_for") or ""
+        _r_note = str_lit.session_state.get("bb_reader_note") or ""
+
+        def _reader_do_fetch(combo, limit):
+            """Fetch one inbox into session state. Never raises."""
+            str_lit.session_state["_reader_tried"] = True
+            try:
+                acc_email, acc_pass = combo.split(":", 1)
+            except Exception:
+                str_lit.session_state["bb_reader_note"] = "the selected line has no password"
+                return
+            acc_email, acc_pass = acc_email.strip(), acc_pass.strip()
+            imap_hosts = get_servers(acc_email).get("imap", [])
+            mailbox_proxy = (sample_alive_proxy(domain=acc_email.split("@")[-1])
+                             if use_proxy else None)
+
+            # v13.55: a new fetch replaces the old list outright, so two
+            # accounts cannot bleed into each other.
+            str_lit.session_state["bb_reader_msgs"] = []
+            str_lit.session_state["bb_reader_for"] = acc_email
+            str_lit.session_state["bb_reader_note"] = ""
+
+            if not imap_hosts:
+                str_lit.session_state["bb_reader_note"] = (
+                    "No IMAP host available for this provider domain name.")
+                return
+            try:
+                with str_lit.spinner(f"Connecting via [{px_tag(mailbox_proxy)}] and "
+                                     f"fetching inbox for {acc_email}..."):
+                    # v13.48: read_mailbox_messages() already resolves the whole
+                    # host ladder itself via get_servers() and falls back to the
+                    # host passed in. The old `for srv in imap_hosts:` loop re-ran
+                    # that entire ladder once per host, so a 4-host domain could
+                    # open 4x4 ladders and burn proxy credit before giving up.
+                    ok_read, msgs, note = read_mailbox_messages(
+                        acc_email, acc_pass, imap_hosts[0],
+                        proxy_str=mailbox_proxy, limit=limit)
+                    fetched_msgs, success_read = msgs, True
+                    if not ok_read:
+                        fetched_msgs, success_read = [], False
+                if ok_read and fetched_msgs:
+                    # v13.55: THE LIST LIVES IN SESSION STATE. It used to be a
+                    # local inside this button branch, so tapping the View
+                    # radio (or any Move-to dropdown) reran the script, the
+                    # button was False, the branch was skipped and the whole
+                    # message list disappeared - the reader "reset" itself.
+                    str_lit.session_state["bb_reader_msgs"] = fetched_msgs
+                else:
+                    str_lit.session_state["bb_reader_note"] = note or "unknown reason"
+            except Exception as _rf_err:
+                str_lit.session_state["bb_reader_msgs"] = []
+                str_lit.session_state["bb_reader_note"] = f"{type(_rf_err).__name__}: {_rf_err}"
+
         if str_lit.button("📖 Read Inbox Messages"):
             if selected_combo:
-                acc_email, acc_pass = selected_combo.split(":", 1)
-                acc_email, acc_pass = acc_email.strip(), acc_pass.strip()
-                imap_hosts = get_servers(acc_email).get("imap", [])
-                mailbox_proxy = (sample_alive_proxy(domain=acc_email.split("@")[-1])
-                                 if use_proxy else None)
-
-                # v13.55: a new fetch replaces the old list outright, so two
-                # accounts cannot bleed into each other.
-                str_lit.session_state["bb_reader_msgs"] = []
-                str_lit.session_state["bb_reader_for"] = acc_email
-                str_lit.session_state["bb_reader_note"] = ""
-
-                if not imap_hosts:
-                    str_lit.session_state["bb_reader_note"] = (
-                        "No IMAP host available for this provider domain name.")
-                else:
-                    with str_lit.spinner(f"Connecting via [{px_tag(mailbox_proxy)}] and "
-                                         f"fetching inbox for {acc_email}..."):
-                        # v13.48: read_mailbox_messages() already resolves the whole
-                        # host ladder itself via get_servers() and falls back to the
-                        # host passed in. The old `for srv in imap_hosts:` loop re-ran
-                        # that entire ladder once per host, so a 4-host domain could
-                        # open 4x4 ladders and burn proxy credit before giving up.
-                        ok_read, msgs, note = read_mailbox_messages(
-                            acc_email, acc_pass, imap_hosts[0],
-                            proxy_str=mailbox_proxy, limit=max_msgs)
-                        fetched_msgs, success_read = msgs, True
-                        if not ok_read:
-                            fetched_msgs, success_read = [], False
-                    if ok_read and fetched_msgs:
-                        # v13.55: THE LIST LIVES IN SESSION STATE. It used to be a
-                        # local inside this button branch, so tapping the View
-                        # radio (or any Move-to dropdown) reran the script, the
-                        # button was False, the branch was skipped and the whole
-                        # message list disappeared - the reader "reset" itself.
-                        str_lit.session_state["bb_reader_msgs"] = fetched_msgs
-                    else:
-                        str_lit.session_state["bb_reader_note"] = note or "unknown reason"
+                _reader_do_fetch(selected_combo, max_msgs)
+        elif _restored and _pick and not _r_msgs and not _r_note:
+            # ONE attempt, only on a restore - a refresh re-opens the inbox the
+            # user was in instead of showing an empty page.
+            str_lit.caption(f"↩ Restored your last account - re-opening its inbox...")
+            _reader_do_fetch(_pick, max_msgs)
 
         # ---- render from state, OUTSIDE the button branch ----
         _r_msgs = str_lit.session_state.get("bb_reader_msgs") or []
