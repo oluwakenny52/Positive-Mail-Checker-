@@ -61,11 +61,19 @@ for p in ("engine.py", "app.py"):
     if os.path.exists(p):
         src += io.open(p, encoding="utf-8").read() + "\n"
 
+# v13.65: THE WHITELIST NEEDLE WAS PINNED TO A CLOSING "):" THAT IS NO LONGER
+# THERE. note_verdict() grew `and st_val != CONNECTION_FAILED` and
+# `and st_val != RETRY` after the tuple (v13.51 / v13.53 - both are retained
+# verdicts now), so the tuple no longer ends the line and "DNS_FAILED,
+# SMTP_FAILED):" matched nothing. The needle is the tuple's TAIL without the
+# bracket, so a further reflow or a widened whitelist cannot break it again.
+# The membership itself is proved properly below by FOLD and by the
+# "already survives note_verdict" block.
 NEEDLES = (
     "def note_verdict(st_val, detail, host=\"\", force=False):",
     "if st_val not in (VALID, WRONG, APP, RBL, LOGIN_DROPPED, UNKNOWN,",
     "_VERDICT_RANK.get(st_val, 0) > _VERDICT_RANK.get(cur, 0)",
-    "DNS_FAILED, SMTP_FAILED):",
+    "DNS_FAILED, SMTP_FAILED)",
     "CONNECTION_FAILED, PROXY_UNHEALTHY, RETRY, RETRY_LATER",
 )
 for n in NEEDLES:
