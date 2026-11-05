@@ -13366,7 +13366,12 @@ except Exception:
 #
 # The inbox re-opens itself ONCE after a restore (never on a plain rerun and
 # never on an account switch), so a refresh costs one fetch and not a connection
-# per rerun. _reader_tried is the guard.
+# per rerun.
+#
+# v13.67: that re-open is a SWITCH now, persisted with the rest. Off means the
+# account is still remembered and the picker still restores, but the inbox waits
+# for the button - for anyone whose provider counts an IMAP connect against the
+# mailbox, or who does not want a login every time the page is reloaded.
 #
 # The stored account is validated against the CURRENT option list BEFORE the
 # selectbox is created. With key= and no index, a stored value that is not in
@@ -13374,7 +13379,7 @@ except Exception:
 # ==========================================================================
 _READER_STATE_NAME = "reader_state.json"
 _READER_OWNER_KEY = "_reader_owner"
-_READER_DEFAULTS = {"acct": "", "max": 10, "remote": False}
+_READER_DEFAULTS = {"acct": "", "max": 10, "remote": False, "auto": True}
 
 
 def _reader_path() -> str:
@@ -13424,11 +13429,12 @@ def _reader_save(vals) -> dict:
 
 
 def _on_reader_change():
-    """Persist the picker, the count and the image switch as they change."""
+    """Persist the picker, the count, the image switch and the re-open switch."""
     try:
         _reader_save({"acct": str(str_lit.session_state.get("bb_reader_acct") or ""),
                       "max": int(str_lit.session_state.get("bb_reader_max") or 10),
-                      "remote": bool(str_lit.session_state.get("bb_reader_remote"))})
+                      "remote": bool(str_lit.session_state.get("bb_reader_remote")),
+                      "auto": bool(str_lit.session_state.get("bb_reader_auto", True))})
     except Exception:
         pass
 
@@ -13436,7 +13442,7 @@ def _on_reader_change():
 # ---- owner gate: a second unlock in this tab must not inherit the last one ----
 _reader_owner = _cache_owner()
 if str_lit.session_state.get(_READER_OWNER_KEY) != _reader_owner:
-    for _k in ("bb_reader_acct", "bb_reader_max", "bb_reader_remote",
+    for _k in ("bb_reader_acct", "bb_reader_max", "bb_reader_remote", "bb_reader_auto",
                "bb_reader_msgs", "bb_reader_for", "bb_reader_note",
                "_reader_tried", "_rdr_state"):
         str_lit.session_state.pop(_k, None)
@@ -13446,6 +13452,8 @@ if "_rdr_state" not in str_lit.session_state:
 _rdr_state = str_lit.session_state["_rdr_state"]
 if "bb_reader_remote" not in str_lit.session_state:
     str_lit.session_state["bb_reader_remote"] = bool(_rdr_state.get("remote"))
+if "bb_reader_auto" not in str_lit.session_state:
+    str_lit.session_state["bb_reader_auto"] = bool(_rdr_state.get("auto", True))
 if "bb_reader_max" not in str_lit.session_state:
     try:
         str_lit.session_state["bb_reader_max"] = max(
@@ -13512,6 +13520,17 @@ else:
             help="Inline cid: images are always shown - they are embedded in the message. "
                  "This switch is only about images hosted on the sender's server.")
 
+        # v13.67: the re-open switch. Off does NOT forget the account - the picker
+        # still restores, the inbox just waits for the button. It is saved with
+        # everything else, so it survives the reload it is about.
+        allow_auto = str_lit.checkbox(
+            "Re-open this inbox automatically after a reload", key="bb_reader_auto",
+            on_change=_on_reader_change,
+            help="On: reloading the page restores the account AND re-fetches its inbox "
+                 "once. Off: the account is still remembered, but nothing connects "
+                 "until you press Read Inbox Messages. Off saves one IMAP login per "
+                 "reload and keeps provider connect counters quiet.")
+
         # v13.56: which mailview is actually deployed. Silent on v13.55+.
         _mv_ver = getattr(mailview, "__version__", "unknown") if mailview else "missing"
         if mailview is not None and _mv_ver != "v13.55":
@@ -13576,10 +13595,16 @@ else:
             if selected_combo:
                 _reader_do_fetch(selected_combo, max_msgs)
         elif _restored and _pick and not _r_msgs and not _r_note:
-            # ONE attempt, only on a restore - a refresh re-opens the inbox the
-            # user was in instead of showing an empty page.
-            str_lit.caption(f"↩ Restored your last account - re-opening its inbox...")
-            _reader_do_fetch(_pick, max_msgs)
+            # ONE attempt, only on a restore, and only when the switch is on. A
+            # refresh re-opens the inbox the user was in instead of showing an
+            # empty page - unless they turned that off.
+            if allow_auto:
+                str_lit.caption("↩ Restored your last account - re-opening its inbox...")
+                _reader_do_fetch(_pick, max_msgs)
+            else:
+                str_lit.caption("↩ Restored your last account - auto re-open is off, so "
+                                "nothing was fetched. Press Read Inbox Messages when you "
+                                "want this inbox.")
 
         # ---- render from state, OUTSIDE the button branch ----
         _r_msgs = str_lit.session_state.get("bb_reader_msgs") or []
