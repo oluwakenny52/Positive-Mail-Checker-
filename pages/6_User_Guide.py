@@ -65,12 +65,37 @@ _TH_DEFAULTS = {
 }
 
 
+def _theme_candidates():
+    """The owner's file first, then the two legacy bare paths.
+
+    v13.65: THE THEME WAS NEVER LOADED. theme.json became a per-user file
+    (<hash>_theme.json) at v13.61 and this function only ever looked at
+    APP_DIR/theme.json and "theme.json", neither of which exists any more - so
+    every user's Guide rendered in the factory palette and the silent except made
+    it look like a design choice.
+
+    user_file() is read through a lazy import because this block runs before the
+    gate in block 005; on the very first load it answers with the anonymous
+    prefix, which simply does not exist and falls through to the defaults. Block
+    005 re-runs this after the gate and repaints.
+    """
+    out = []
+    try:
+        import auth as _a
+        out.append(_a.user_file("theme.json"))
+    except Exception:
+        pass
+    out.append(os.path.join(APP_DIR, "theme.json"))
+    out.append("theme.json")
+    return out
+
+
 def _load_theme():
-    """theme.json when it parses, else the defaults. Never raises."""
+    """The owner's theme when it parses, else the defaults. Never raises."""
     base = dict(_TH_DEFAULTS)
-    for cand in (os.path.join(APP_DIR, "theme.json"), "theme.json"):
+    for cand in _theme_candidates():
         try:
-            if not os.path.exists(cand):
+            if not cand or not os.path.exists(cand):
                 continue
             with open(cand, encoding="utf-8") as fh:
                 data = json.load(fh)
@@ -201,6 +226,20 @@ st.markdown(
 )
 
 auth.fit_panel(st)          # the controls; collapsed until tapped
+
+# v13.65: THE FIRST THEME READ IS ALWAYS ANONYMOUS. Block 003 runs before the
+# gate, so on a cold load user_file("theme.json") answered with the throwaway
+# anon prefix and fell through to the defaults. Now that the passphrase is
+# unlocked the owner's real file exists, so re-read it and repaint. A second
+# identical <style> emission is harmless; the last one wins.
+_TH = _load_theme()
+_CSS = (_CSS_TMPL
+        .replace("__G1__", _TH["g1"])
+        .replace("__G2__", _TH["g2"])
+        .replace("__PANEL__", _TH["panel"])
+        .replace("__ACCENT__", _TH["accent"])
+        .replace("__ACCENT2__", _TH["accent2"]))
+st.markdown(_CSS, unsafe_allow_html=True)
 # @@END 005 HERO
 
 # @@BLOCK 006 TABS deps=005
