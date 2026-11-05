@@ -873,6 +873,44 @@ SETTING_DEFAULTS = {
     "bb_whitelist": "",
     "bb_blacklist": "",
 }
+
+
+def _seed_widget(key, lo=None, hi=None, choices=None, dflt=None):
+    """Put a legal value on `key` and return it, so the widget needs key= ONLY.
+
+    A keyed widget that ALSO receives value= / index= / a positional default
+    raises "The widget with key 'x' was created with a default value but also had
+    its value set via the Session State API" on every rerun once block 045 has
+    seeded that key from this user's settings.json - which is exactly what the
+    deployed log shows for 'ui_protocols'. Seeding here and passing only key= is
+    the shape block 046 already uses for its three sliders.
+
+    Every value is clamped to the widget's own range or option list, so a value
+    saved under an older, wider widget can never make Streamlit refuse to draw.
+    """
+    base = SETTING_DEFAULTS.get(key) if dflt is None else dflt
+    cur = str_lit.session_state.get(key)
+    if isinstance(base, bool):
+        val = cur if isinstance(cur, bool) else bool(base)
+    elif isinstance(base, list):
+        ok = isinstance(cur, list) and all(c in (choices or ()) for c in cur)
+        val = list(cur) if ok else list(base)
+    elif isinstance(base, int):
+        try:
+            cur = int(cur)
+        except Exception:
+            cur = int(base)
+        if lo is not None:
+            cur = max(int(lo), cur)
+        if hi is not None:
+            cur = min(int(hi), cur)
+        val = cur
+    elif choices:
+        val = cur if cur in choices else (base if base in choices else choices[0])
+    else:
+        val = cur if cur is not None else base
+    str_lit.session_state[key] = val
+    return val
 # @@END 019 SETTING_DEFAULTS
 
 # @@BLOCK 020 DEFAULT_CFG deps=019
@@ -1244,35 +1282,46 @@ STATE = _engine_state()
 # every module alias below is bound to the CURRENT scope's dict on each rerun.
 # Worker threads keep the binding from the run that spawned them, so a rerun in
 # another tab cannot retarget them.
-_DEFAULT_USER_STATE = {
-    "alive_pool": [],
-    "consecutive_proxy_failures": defaultdict(int),
-    "circuit_breaker_until": {},
-    "proxy_quarantine": set(),
-    "strikes_407": defaultdict(int),
-    "proxy_scheme": {},
-    "proxy_407_until": {},
-    "proxy_meta": {},
-    "probe_stats": {},
-    "probe_log": [],
-    "probe_in_flight": False,
-    "probe_owner_lock": threading.Lock(),
-    "probe_stats_lock": threading.Lock(),
-    "probe_log_lock": threading.Lock(),
-    "proxy_quarantine_lock": threading.Lock(),
-    "proxy_scheme_lock": threading.Lock(),
-    "last_probe_ts": 0.0,
-    "probe_runs": 0,
-    "bootstrap_done": False,
-    "first_probe_kicked": False,
-    "probe_targets_override": [],
-    "runs_active": 0,
-    # v13.64: THE FAST-MODE COOLDOWN WAS SHARED. It was a process dict keyed on
-    # the DOMAIN alone, so user A failing a domain put user B's accounts on that
-    # same domain into cooldown for 45s - user B's run then reported them SKIP
-    # for a reason that happened in someone else's tab. Per user now.
-    "failed_domain_cache": {},
-}
+#
+# v13.65: THE TEMPLATE WAS A SHALLOW COPY. `dict(_DEFAULT_USER_STATE)` copies the
+# mapping but NOT the values, so alive_pool (a list) was the SAME object in every
+# scope - one user's probe overwrote the other's armed pool. Every mutable value
+# is allocated by _new_user_state() now and alive_pool is per user like the rest.
+def _new_user_state() -> dict:
+    """A COMPLETE, freshly allocated set of per-user tables."""
+    return {
+        "alive_pool": [],
+        "consecutive_proxy_failures": defaultdict(int),
+        "circuit_breaker_until": {},
+        "proxy_quarantine": set(),
+        "strikes_407": defaultdict(int),
+        "proxy_scheme": {},
+        "proxy_407_until": {},
+        "proxy_meta": {},
+        "probe_stats": {},
+        "probe_log": [],
+        "probe_in_flight": False,
+        "probe_owner_lock": threading.Lock(),
+        "probe_stats_lock": threading.Lock(),
+        "probe_log_lock": threading.Lock(),
+        "proxy_quarantine_lock": threading.Lock(),
+        "proxy_scheme_lock": threading.Lock(),
+        "last_probe_ts": 0.0,
+        "probe_runs": 0,
+        "bootstrap_done": False,
+        "first_probe_kicked": False,
+        "probe_targets_override": [],
+        "runs_active": 0,
+        # v13.64: THE FAST-MODE COOLDOWN WAS SHARED. It was a process dict keyed on
+        # the DOMAIN alone, so user A failing a domain put user B's accounts on that
+        # same domain into cooldown for 45s - user B's run then reported them SKIP
+        # for a reason that happened in someone else's tab. Per user now.
+        "failed_domain_cache": {},
+    }
+
+
+# Derived from the factory, so the two can never drift apart.
+_USER_STATE_KEYS = tuple(_new_user_state())
 
 
 def _session_scope() -> str:
@@ -1290,7 +1339,16 @@ def _session_scope() -> str:
 
 
 def _user_state(scope=None) -> dict:
-    """This session's own tables. Created once, then stable for the process."""
+    """This session's own tables, HEALED to the current key set.
+
+    v13.65: STATE is a cache_resource, and a cache_resource survives a rerun AND
+    a redeploy - Streamlit only invalidates it when this function's own source
+    changes, and the v13.64 edit changed _user_state(), not _engine_state(). The
+    process therefore kept handing back a per_user dict built by v13.63 code,
+    which has no "failed_domain_cache", and block 039 died on
+    KeyError: 'failed_domain_cache'. A missing table is now created on read, so a
+    key added by any future build can never be absent.
+    """
     if scope:
         who = str(scope)
     else:
@@ -1304,24 +1362,15 @@ def _user_state(scope=None) -> dict:
         with STATE["per_user_lock"]:
             d = tbl.get(who)
             if d is None:
-                d = dict(_DEFAULT_USER_STATE)
-                d["consecutive_proxy_failures"] = defaultdict(int)
-                d["circuit_breaker_until"] = {}
-                d["proxy_quarantine"] = set()
-                d["strikes_407"] = defaultdict(int)
-                d["proxy_scheme"] = {}
-                d["proxy_407_until"] = {}
-                d["proxy_meta"] = {}
-                d["probe_stats"] = {}
-                d["probe_log"] = []
-                d["probe_owner_lock"] = threading.Lock()
-                d["probe_stats_lock"] = threading.Lock()
-                d["probe_log_lock"] = threading.Lock()
-                d["proxy_quarantine_lock"] = threading.Lock()
-                d["proxy_scheme_lock"] = threading.Lock()
-                d["probe_targets_override"] = []
-                d["failed_domain_cache"] = {}
+                d = _new_user_state()
                 tbl[who] = d
+        return d
+    if any(k not in d for k in _USER_STATE_KEYS):
+        with STATE["per_user_lock"]:
+            _fresh = _new_user_state()
+            for _k in _USER_STATE_KEYS:
+                if _k not in d:
+                    d[_k] = _fresh[_k]
     return d
 
 
@@ -2972,7 +3021,9 @@ _proxy_scheme_lock = _US["proxy_scheme_lock"]
 proxy_407_until = _US["proxy_407_until"]
 # v13.64: per user, and rebindable, because block 099 reads it at the top of a
 # worker thread before anything else in that account has re-asserted a scope.
-failed_domain_cache = _US["failed_domain_cache"]
+# v13.65: setdefault as well as the heal in _user_state(), because this alias is
+# read by block 099 on EVERY account and a missing key here is the crash.
+failed_domain_cache = _US.setdefault("failed_domain_cache", {})
 
 _host_dns_cache = STATE["host_dns_cache"]
 _host_dns_lock = STATE["host_dns_lock"]
