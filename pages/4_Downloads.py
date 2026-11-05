@@ -84,19 +84,40 @@ def _preset_file() -> str:
 # @@BLOCK 003 THEME deps=002
 # --------------------------------------------------------------------------
 # theme mirror
+#
+# v13.65: THE THEME WAS NEVER LOADED. theme.json became a per-user file
+# (<hash>_theme.json) at v13.61 and this block only ever looked at
+# APP_DIR/theme.json and "theme.json", neither of which exists any more - so the
+# page painted the factory palette for every user and the silent except made it
+# look deliberate. user_file("theme.json") is tried FIRST, through a lazy import
+# because this block runs before the gate in block 005; block 005 re-reads it and
+# repaints once the passphrase is unlocked.
 # --------------------------------------------------------------------------
+def _theme_candidates():
+    out = []
+    try:
+        import auth as _a
+        out.append(_a.user_file("theme.json"))
+    except Exception:
+        pass
+    out.append(os.path.join(APP_DIR, "theme.json"))
+    out.append("theme.json")
+    return out
+
+
 def _load_theme():
     base = {"bg": "#0b1020", "panel": "#141b30", "text": "#e6ebff",
             "accent": "#8b5cf6", "accent2": "#22d3ee", "g1": "#667eea", "g2": "#764ba2"}
-    for cand in (os.path.join(APP_DIR, "theme.json"), "theme.json"):
+    for cand in _theme_candidates():
         try:
-            if os.path.exists(cand):
-                with open(cand, encoding="utf-8") as f:
-                    data = json.load(f)
-                if isinstance(data, dict):
-                    base.update({k: v for k, v in data.items()
-                                 if k in base and isinstance(v, str)})
-                break
+            if not cand or not os.path.exists(cand):
+                continue
+            with open(cand, encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                base.update({k: v for k, v in data.items()
+                             if k in base and isinstance(v, str)})
+            break
         except Exception:
             continue
     return base
@@ -192,6 +213,19 @@ if hasattr(audit_log, "install"):
     audit_log.install(st, "pages/4_Downloads.py")
 
 auth.fit_panel(st)                  # the controls; collapsed until tapped
+
+# v13.65: THE FIRST THEME READ IS ALWAYS ANONYMOUS. Block 003 runs before the
+# gate, so on a cold load user_file("theme.json") answered with the throwaway
+# anon prefix and fell through to the defaults. Now that the passphrase is
+# unlocked the owner's real file exists, so re-read it and repaint. A second
+# identical <style> emission is harmless; the last one wins.
+_TH = _load_theme()
+_CSS = (_CSS_TMPL
+        .replace("__G1__", _TH["g1"])
+        .replace("__G2__", _TH["g2"])
+        .replace("__BG__", _TH["bg"])
+        .replace("__TEXT__", _TH["text"]))
+st.markdown(_CSS, unsafe_allow_html=True)
 # @@END 005 HERO
 
 
