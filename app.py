@@ -3963,8 +3963,12 @@ probe_target_ui = str_lit.sidebar.selectbox(
 )
 probe_strict_ui = str_lit.sidebar.toggle(
     "Strict tunnel probe", value=True, key="ui_probe_strict",
-    help="ON (default): only nodes that pass the probe enter the live pool, so 'Alive: 0' "
-         "means what it says."
+    help="ON (default): only nodes that PASS the tunnel probe enter the live pool, so "
+         "'Alive: 0' means it. ONE exception, and it is deliberate: a node that answers "
+         "402 Payment Required is ALIVE and authenticated - the provider is only refusing "
+         "service - so it is kept, parked for ten minutes and drawn only when no passing "
+         "node is left. OFF: a failed probe is not fatal and the raw filtered pool is "
+         "armed unvalidated instead."
 )
 probe_max_targets_ui = str_lit.sidebar.slider(
     "Probe: max targets per node", 1, 3, PROBE_MAX_TARGETS_DEFAULT, 1, key="ui_probe_maxtargets",
