@@ -27,6 +27,7 @@ Error contract
   MsTokenRejected  -> a real answer from Microsoft, carrying an AADSTS code:
                         AADSTS50126 / AADSTS50034            -> wrong_password
                         AADSTS50076 / 50079 / 50074          -> need_app_password
+                        AADSTS7000218 / 70002                -> need_app_password
                         AADSTS65001 / 700016 / 500011        -> unknown
 """
 
@@ -95,9 +96,10 @@ class MsTokenRejected(Exception):
 
     @property
     def verdict(self):
-        if self.code == "AADSTS50126":
+        if self.code in ("AADSTS50126", "AADSTS50034"):
             return "wrong_password"
-        if self.code in ("AADSTS50076", "AADSTS50079", "AADSTS50074"):
+        if self.code in ("AADSTS50076", "AADSTS50079", "AADSTS50074",
+                         "AADSTS7000218", "AADSTS70002"):
             return "need_app_password"
         return "unknown"
 
@@ -121,9 +123,12 @@ def _jwt_claims(token):
 def _classify_token_error(description):
     upper = (description or "").upper()
     for code in ("AADSTS50126", "AADSTS50076", "AADSTS50079", "AADSTS50074",
-                 "AADSTS50034", "AADSTS65001", "AADSTS700016", "AADSTS500011"):
+                 "AADSTS50034", "AADSTS65001", "AADSTS700016", "AADSTS500011",
+                 "AADSTS7000218", "AADSTS70002"):
         if code in upper:
             return code
+    if "UNSUPPORTED_GRANT_TYPE" in upper:
+        return "AADSTS7000218"
     if "INVALID_GRANT" in upper:
         return "AADSTS50126"
     return ""
@@ -184,6 +189,11 @@ def ms_access_token(email, password, timeout=10, force_refresh=False):
     code = _classify_token_error(description)
 
     if resp.status_code != 200:
+        upper = (description or "").upper()
+        # ROPC is rejected by this client or tenant. That is a real account
+        # answer: the password grant is not allowed, so an app password is required.
+        if "UNSUPPORTED_GRANT_TYPE" in upper or "AADSTS7000218" in upper or "AADSTS70002" in upper:
+            raise MsTokenRejected("AADSTS7000218", description)
         if code:
             raise MsTokenRejected(code, description)
         raise MsTokenTransport(f"token endpoint HTTP {resp.status_code}: {resp.text[:140]}")
