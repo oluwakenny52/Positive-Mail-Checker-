@@ -260,7 +260,11 @@ _WRONG_STRONG = re.compile(
     r"invalid login or password|bad credentials|loginfailed|login failed|"
     r"auth(?:entication)? failed|authenticate error|realmless(?: login)? not allowed|"
     r"login incorrect|wrong password|password incorrect|incorrect password|"
-    r"credentials invalid",
+    r"credentials invalid|"
+    r"logowanie nie powiodlo sie|logowanie nie powiodło się|"
+    r"nieprawidlowe haslo|nieprawidłowe hasło|"
+    r"bledne haslo|błędne hasło|"
+    r"sprawdz dane logowania|sprawdź dane logowania",
     re.I,
 )
 _WRONG_USER = re.compile(
@@ -273,7 +277,10 @@ _APP = re.compile(
     r"application[- ]specific password|app[- ]specific password|app password|"
     r"needs app password|application password|xoauth2|ms_oauth|oauth|"
     r"basic authentication (?:is )?disabled|"
-    r"log in via your web browser|web browser to log in",
+    r"log in via your web browser|web browser to log in|"
+    r"required new password|"
+    r"aktywuj dostep przez imap|aktywuj dostęp przez imap|"
+    r"activate imap|enable imap",
     re.I,
 )
 # v13.50: rbl is BOUNDED. As a bare substring it fired inside unrelated words,
@@ -606,6 +613,11 @@ def alias_selftest(verbose=False):
                    classify_error("high resolution image attached") == STATUS_UNKNOWN))
     checks.append(("classify:ip_blocked_is_rbl",
                    classify_error("IP blocked by provider") == STATUS_RBL_BLOCKED))
+    checks.append(("classify:polish_login_failed",
+                   classify_error("Logowanie nie powiodlo sie. Sprawdz dane logowania lub aktywuj dostep przez IMAP")
+                   == STATUS_WRONG_PASSWORD))
+    checks.append(("classify:required_new_password",
+                   classify_error("Required new password") == STATUS_APP))
     checks.append(("proxy_level", is_proxy_level_error(STATUS_DNS_FAILED) is True))
     checks.append(("priority_order", PRIORITY[STATUS_WRONG] > PRIORITY[STATUS_VALID] > PRIORITY[STATUS_RETRY_LATER]))
     checks.append(("worse_of:skip", worse_of(STATUS_SKIP) == STATUS_SKIP))
