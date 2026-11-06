@@ -11512,7 +11512,11 @@ def _check_account_core(email, password, conf, domain, proxy_pool, thread_state,
                                 if r[1] == server
                                 and (r[1], r[0], r[2]) not in wrong_rungs
                                 and (r[1], r[0], r[2]) not in app_rungs]
-            _confirmed = ((len(wrong_hosts) >= 2) or (len(wrong_rungs) >= 2)
+            # Only LOCAL hosts count toward confirmation. A foreign/public host
+            # (imap.gmail.com for a non-Gmail domain) must not make the account WRONG.
+            _local_wrong = [h for h in wrong_hosts if _is_local_host(h)]
+            _local_wrong_rungs = [r for r in wrong_rungs if _is_local_host(r[0])]
+            _confirmed = ((len(_local_wrong) >= 2) or (len(_local_wrong_rungs) >= 2)
                           or (not _conf_pool and not _rungs_left_here))
 
             if (not confirm_wrong) or _confirmed:
