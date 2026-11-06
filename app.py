@@ -1405,7 +1405,8 @@ _PROBE_REASON_LABEL = {
 
 # @@BLOCK 025 PROBE_TELEMETRY deps=024
 def log_probe_event(msg):
-    _rebind_scope()
+    if '_rebind_scope' in globals():
+        _rebind_scope()
     with probe_log_lock:
         probe_log.append(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}")
         if len(probe_log) > 600:
@@ -1414,7 +1415,8 @@ def log_probe_event(msg):
 
 def record_probe_result(proxy_str, ok, reason, latency_ms=0, target="",
                         scheme=None, error=""):
-    _rebind_scope()
+    if '_rebind_scope' in globals():
+        _rebind_scope()
     if not proxy_str:
         return
     with probe_stats_lock:
@@ -1445,7 +1447,8 @@ def _probe_snapshot():
 
     v13.59: probe_stats is per-scope now, so this is the user's own history only.
     """
-    _rebind_scope()
+    if '_rebind_scope' in globals():
+        _rebind_scope()
     with probe_stats_lock:
         snap = list(probe_stats.items())
     try:
@@ -1490,7 +1493,8 @@ def probe_reason_histogram():
 
 def clear_tunnel_cache():
     """Clearing the probe stats is what a re-probe actually needs."""
-    _rebind_scope()
+    if '_rebind_scope' in globals():
+        _rebind_scope()
     with probe_stats_lock:
         probe_stats.clear()
 # @@END 025 PROBE_TELEMETRY
