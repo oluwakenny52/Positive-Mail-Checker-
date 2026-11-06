@@ -352,7 +352,11 @@ except Exception as _status_err:
                         "authentication failed", "invalid credentials",
                         "invalid user name or password", "login incorrect",
                         "wrong password", "authenticate error",
-                        "invalid login or password")
+                        "invalid login or password",
+                        "logowanie nie powiodlo sie",
+                        "sprawdz dane logowania",
+                        "nieprawidlowe haslo",
+                        "bledne haslo")
     _FB_APP = ("app password", "application specific password",
                "application-specific password", "app-specific password",
                "basic authentication is disabled", "basic auth is disabled",
@@ -364,7 +368,9 @@ except Exception as _status_err:
                "2fa", "2-step", "2 step", "mfa", "multi-factor", "multi factor",
                "two-factor", "two factor", "modern authentication",
                "sign in with", "log in with your browser", "consent", "tenant",
-               "aadsts50076", "aadsts50079", "aadsts50074", "strongauth")
+               "aadsts50076", "aadsts50079", "aadsts50074", "strongauth",
+               "required new password",
+               "aktywuj dostep przez imap")
     _FB_RBL = ("rbl restriction", "rbl", "abusix", "dnsbl", "spamhaus",
                "blacklist", "blacklisted", "ip blocked")
     _FB_DNS = ("does not resolve", "failed to resolve", "name or service not known",
