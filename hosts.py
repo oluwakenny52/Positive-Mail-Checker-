@@ -1188,11 +1188,36 @@ def discover_hosts(domain, email=None, use_cache=True, force_refresh=False):
                     if h not in smtp:
                         smtp.append(h)
 
-    # 6. Universal fallbacks
+    # 6. Universal fallbacks - ONLY for the matching provider.
+    # A non-Gmail domain must not get imap.gmail.com / pop.gmail.com.
+    # A non-Microsoft domain must not get outlook.office365.com.
+    # A non-Yahoo domain must not get imap.mail.yahoo.com.
+    _dom = domain.lower().strip()
+    _gmail_ok = _dom in GMAIL_DOMAINS or _dom.endswith(".gmail.com") or _dom.endswith(".googlemail.com")
+    _ms_ok = _dom in MS_DOMAINS or _dom.endswith(".outlook.com") or _dom.endswith(".hotmail.com") or _dom.endswith(".live.com")
+    _yahoo_ok = _dom in YAHOO_DOMAINS or _dom.endswith(".yahoo.com")
+    _aol_ok = _dom in {"aol.com"} or _dom.endswith(".aol.com")
+
     for fb in UNIVERSAL_IMAP_FALLBACKS:
+        if fb == "imap.gmail.com" and not _gmail_ok:
+            continue
+        if fb == "outlook.office365.com" and not _ms_ok:
+            continue
+        if fb == "imap.mail.yahoo.com" and not _yahoo_ok:
+            continue
+        if fb == "imap.aol.com" and not _aol_ok:
+            continue
         if fb not in imap:
             imap.append(fb)
     for fb in UNIVERSAL_POP_FALLBACKS:
+        if fb == "pop.gmail.com" and not _gmail_ok:
+            continue
+        if fb == "outlook.office365.com" and not _ms_ok:
+            continue
+        if fb == "pop.mail.yahoo.com" and not _yahoo_ok:
+            continue
+        if fb == "pop.aol.com" and not _aol_ok:
+            continue
         if fb not in pop:
             pop.append(fb)
 
