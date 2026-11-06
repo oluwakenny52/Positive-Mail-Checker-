@@ -12143,20 +12143,25 @@ def _check_account_core(email, password, conf, domain, proxy_pool, thread_state,
     if best_verdict["status"] is not None:
         _bh = best_verdict.get("host") or ""
         _foreign = bool(_bh) and not _is_local_host(_bh)
-        detail = best_verdict["detail"] or "retained verdict"
         if _foreign:
-            detail = f"{detail} [retained via FOREIGN host {_bh}]"
-            trace_logs.append(f"NOTE: the retained verdict came from {_bh}, which is not a "
-                              f"local host for {domain}. It may belong to a different provider.")
-        if best_verdict["status"] == WRONG:
-            _wn = _wrong_detail_note(domain, password)
-            if _wn and _wn not in detail:
-                detail = detail + _wn
-        if best_verdict["status"] == LOGIN_DROPPED:
-            detail = f"{detail} | " + _login_dropped_detail()
-        trace_logs.append("Ladder exhausted with no live answer -> returning retained "
-                          f"verdict [{best_verdict['status']}].")
-        return None, best_verdict["status"], detail, None, trace_logs
+            trace_logs.append(
+                f"NOTE: retained [{best_verdict['status']}] came from FOREIGN host {_bh} "
+                f"(not local for {domain}). Discarded - a public host does not decide the account."
+            )
+            best_verdict["status"] = None
+            best_verdict["detail"] = ""
+            best_verdict["host"] = ""
+        else:
+            detail = best_verdict["detail"] or "retained verdict"
+            if best_verdict["status"] == WRONG:
+                _wn = _wrong_detail_note(domain, password)
+                if _wn and _wn not in detail:
+                    detail = detail + _wn
+            if best_verdict["status"] == LOGIN_DROPPED:
+                detail = f"{detail} | " + _login_dropped_detail()
+            trace_logs.append("Ladder exhausted with no live answer -> returning retained "
+                              f"verdict [{best_verdict['status']}].")
+            return None, best_verdict["status"], detail, None, trace_logs
 
     if flags["saw_407"] and not flags.get("saw_server") \
             and acct_407_total >= PROXY_407_FORCE_DIRECT:
