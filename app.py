@@ -5320,6 +5320,11 @@ def save_proxy_meta():
     block 052 a half file. Only keys that are IN the table are written, so the
     payload cannot grow past the pool. Block 052 reads both this shape and the
     old flat dict.
+
+    v13.70 MEM-3: THE INDENT WAS 10x THE FILE. indent=1 spreads every node over
+    about twelve lines, so a 3000-node payload was ~700 KB of text and the
+    json.dump of it held a second full copy while it serialised - on the script
+    thread, after every refresh. Separators only: same data, one line per node.
     """
     _path = _proxy_meta_path()
     _tmp = _path + ".tmp"
@@ -5339,7 +5344,7 @@ def save_proxy_meta():
                        "saved_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                        "meta": _meta, "probe": _probe, "parked": _parked}
             with open(_tmp, "w", encoding="utf-8") as f:
-                json.dump(payload, f, indent=1)
+                json.dump(payload, f, separators=(",", ":"))
             os.replace(_tmp, _path)
     except Exception as e:
         warnings.warn(f"Failed to save proxy meta: {e}")
