@@ -31,3 +31,9 @@ download_presets.json
 passkey.json
 passkey.json.tmp
 *_mail_results/
+# v13.70: the notification ring and its seen marker. They live under data/, so the
+# bare names only matter for a headless run.
+notifications.jsonl
+notify_seen.json
+*_notifications.jsonl
+*_notify_seen.json
