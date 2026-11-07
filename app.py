@@ -5270,8 +5270,8 @@ auth.fit_panel(str_lit)
 # and both guards are hasattr() - a module cached from before this build would
 # otherwise answer AttributeError, and a bare `notify.render_bell` expression is
 # magic-written by Streamlit through st.help -> ast.parse, which can raise
-# IndentationError on the enclosing try. `importlib.reload(notify)` does NOT
-# collide with the gated `importlib.reload(auth)` needle.
+# IndentationError on the enclosing try. Reloading notify does NOT collide with
+# the gated auth-module reload needle, which must stay at one occurrence.
 #
 # A stale or broken notify degrades to "no bell", never to a dead page.
 import notify
