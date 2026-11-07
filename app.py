@@ -7812,10 +7812,16 @@ _RES_SESSION_KEYS = (
 )
 # Never deleted by the cache sweep: the working pool, the stored history, and
 # everything that is a preference rather than a rebuildable artefact.
+# FIX KEEP-LIST (v13.69): reader_state.json and disposable_domains.txt were
+# missing, so "Delete my cache files" wiped the Mailbox Reader's remembered
+# account (the picker fell back to the first valid combo) and deleted the
+# fetched disposable blocklist, which then had to be re-downloaded from GitHub.
+# reader_state is a preference like theme.json; the disposable list is
+# REBUILDABLE but only over the network, so it belongs on the keep side too.
 _RES_KEEP_SUFFIX = (
     "clean_valid_accounts.txt", "settings.json", "paste_accounts.txt",
     "inspect_cat.txt", "theme.json", "download_presets.json", "proxies.txt",
-    "mem_history.jsonl",
+    "mem_history.jsonl", "reader_state.json", "disposable_domains.txt",
 )
 
 _MEM_FILE = user_file("mem_history.jsonl")
@@ -7823,6 +7829,12 @@ _MEM_MAX_LINES = 1500
 _MEM_SAMPLE_SECONDS = 60.0
 _MEM_CHART_POINTS = 120
 _PREVIEW_BYTES = 200000
+# FIX PREVIEW-CAP (v13.69): _res_prev is trimmed to the newest N entries AND to
+# a byte budget. The entry cap alone allowed 300 x 200 KB, i.e. tens of MB of
+# strings living in session_state - which is the payload that causes the OOM
+# kills, not the entry count.
+_PREVIEW_CACHE_ENTRIES = 300
+_PREVIEW_CACHE_BYTES = 8000000
 # v13.63: the results directory is <hash>_mail_results, NOT mail_results - the
 # basename is prefixed like every other per-user path. Testing for the bare name
 # meant "Delete my cache files" skipped nothing and took the results with it,
@@ -7950,6 +7962,25 @@ def _res_session_bytes():
         _total += len(_ss.get("bb_raw_text") or "")
     except Exception:
         pass
+    # FIX SESS-BYTES (v13.69): the preview cache and the tick map were never
+    # counted, so "My session payload" under-reported exactly the two things
+    # that grow largest - and the preview cache is what FIX PREVIEW-CAP above
+    # now bounds. Counted here the same rough way as the rest: the preview text
+    # and note only, never the whole tuple.
+    try:
+        _prev = _ss.get("_res_prev")
+        if isinstance(_prev, dict):
+            for _pv in _prev.values():
+                _total += len(_pv[1] or "") + len(_pv[2] or "")
+    except Exception:
+        pass
+    try:
+        _uids = _ss.get("_res_uids")
+        if isinstance(_uids, dict):
+            for _uk, _uv in _uids.items():
+                _total += len(str(_uk)) + len(str(_uv))
+    except Exception:
+        pass
     return _total
 
 
@@ -8068,8 +8099,22 @@ def _res_preview(path):
     else:
         _note = f"{_size:,} bytes"
     _cache[path] = (_sig, _text, _note)
-    if len(_cache) > 300:
-        _cache = dict(list(_cache.items())[-300:])
+    # FIX PREVIEW-CAP (v13.69): the entry ceiling is kept, and a byte ceiling is
+    # added beside it. 300 entries x up to _PREVIEW_BYTES is tens of MB of
+    # strings in session_state, which is the payload that drives the OOM kills -
+    # so the count alone was never the real bound. Oldest goes first, and at
+    # least the entry just added always survives.
+    if len(_cache) > _PREVIEW_CACHE_ENTRIES:
+        _cache = dict(list(_cache.items())[-_PREVIEW_CACHE_ENTRIES:])
+    if len(_cache) > 1:
+        try:
+            _held = sum(len(_pv[1] or "") for _pv in _cache.values())
+            while _held > _PREVIEW_CACHE_BYTES and len(_cache) > 1:
+                _oldest = next(iter(_cache))
+                _held -= len(_cache[_oldest][1] or "")
+                _cache.pop(_oldest, None)
+        except Exception:
+            pass
     str_lit.session_state["_res_prev"] = _cache
     return _text, _note
 
@@ -8426,7 +8471,8 @@ if _res_open:
                        on_click=_on_clear_cache_files, disabled=not _res_ok,
                        help="Domain cache, proxy metadata, key map, proxies_all "
                             "backup and my data/ scratch directory. Keeps results, "
-                            "settings, theme, presets, proxies.txt and my history.")
+                            "settings, theme, presets, proxies.txt, my history, my "
+                            "reader's remembered account and the disposable blocklist.")
     with _rb3:
         str_lit.button("🗑 Delete my RESULT files", width="stretch",
                        on_click=_on_clear_result_files, disabled=not _res_ok,
@@ -10707,7 +10753,12 @@ def _get_servers_raw(email):
         if domain in ZERO_ACCESS_PROVIDERS:
             return {"imap": [], "pop": [], "pop3": [], "type": "zero_access"}
 
-        known = known_provider_conf(domain)
+        # FIX HOSTS-COPY (v13.69): known_provider_conf() returns a dict that is
+        # written to two lines down. It builds a fresh one per call today, so this
+        # copy is a no-op right now - but the day it starts returning a cached
+        # object, the ranked list of one account would leak into the next. Copy
+        # first, rank into the copy. `or {}` keeps a None return falsy.
+        known = dict(known_provider_conf(domain) or {})
         if known:
             if known.get("imap"):
                 known["imap"] = _rank_hosts(known["imap"], domain)
@@ -13132,38 +13183,54 @@ if start_engine_btn:
 
                             if _tick:
                                 _last_ui_ts = _now_ui
-                                # FIX DELTA-1: the log tail is 150 lines, not 300,
-                                # and a torn-down delta can no longer kill the loop.
+                                # FIX UI-GUARD (v13.69): THE REPAINT IS GUARDED ON
+                                # ITS OWN NOW. Everything below draws into a delta
+                                # the teardown may already have destroyed, and it
+                                # used to sit directly in the per-account try - so a
+                                # paint failure on account 7 was caught by the
+                                # handler meant for the CHECK, was appended to
+                                # conn_results as "[EXCEPTION] ...", and cost that
+                                # account its metrics and its bucket repaint even
+                                # though the result itself was fine. The result is
+                                # already recorded and journalled above this line,
+                                # so a repaint fault is now only a log line. Both
+                                # stamps are set before the try so a broken paint
+                                # backs off instead of retrying every account.
                                 try:
-                                    if str_lit.session_state.get("colorize_logs", True):
-                                        log_container.markdown(
-                                            colorize_logs(current_logs[-150:]),
-                                            unsafe_allow_html=True)
-                                    else:
-                                        log_container.code("\n".join(current_logs[-150:]),
-                                                           language="text")
-                                except Exception:
-                                    pass
-
-                                _vals = [valid_len, wrong_len, need_len, login_drop_len,
-                                         conn_len, proxy_len, retry_len, rbl_len,
-                                         smtp_len, skip_len, unknown_len,
-                                         checked_count, total_accs]
-                                for _ph, _ml, _mv in zip(_metric_phs, _metric_labels, _vals):
+                                    # FIX DELTA-1: the log tail is 150 lines, not 300,
+                                    # and a torn-down delta can no longer kill the loop.
                                     try:
-                                        _ph.metric(_ml, _mv)
+                                        if str_lit.session_state.get("colorize_logs", True):
+                                            log_container.markdown(
+                                                colorize_logs(current_logs[-150:]),
+                                                unsafe_allow_html=True)
+                                        else:
+                                            log_container.code("\n".join(current_logs[-150:]),
+                                                               language="text")
                                     except Exception:
                                         pass
 
-                                if _bucket_tick:
-                                    _last_bucket_ts = _now_ui
-                                    render_buckets(bucket_snapshot)
+                                    _vals = [valid_len, wrong_len, need_len, login_drop_len,
+                                             conn_len, proxy_len, retry_len, rbl_len,
+                                             smtp_len, skip_len, unknown_len,
+                                             checked_count, total_accs]
+                                    for _ph, _ml, _mv in zip(_metric_phs, _metric_labels, _vals):
+                                        try:
+                                            _ph.metric(_ml, _mv)
+                                        except Exception:
+                                            pass
 
-                                if _df_tick:
-                                    _last_df_ts = _now_ui
-                                    report_log_container.dataframe(
-                                        pd.DataFrame(current_reports[::-1]),
-                                        width="stretch", height=320)
+                                    if _bucket_tick:
+                                        _last_bucket_ts = _now_ui
+                                        render_buckets(bucket_snapshot)
+
+                                    if _df_tick:
+                                        _last_df_ts = _now_ui
+                                        report_log_container.dataframe(
+                                            pd.DataFrame(current_reports[::-1]),
+                                            width="stretch", height=320)
+                                except Exception as _ui_err:
+                                    log_probe_event(f"live repaint skipped: {_ui_err}")
 
                     except Exception as ex:
                         err_msg = f"[EXCEPTION] {str(ex)}"
