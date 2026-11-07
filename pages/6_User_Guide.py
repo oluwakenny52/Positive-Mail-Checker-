@@ -435,22 +435,48 @@ with _t2:
 with _t3:
     st.markdown("Every button in the app, in the order you will meet it.")
 
+    ug_h("Top of the page")
+    st.markdown(
+        """
+| Button | What it does |
+|---|---|
+| **🔔 (with a red number)** | Notifications. The number is the **unread** count; opening the dropdown marks them read. It carries resource alerts (RAM, disk, session payload) with the fix beside each one, and the run events worth knowing about. Yours only. The same list, in full, is the **Notifications** page in the nav. |
+| **❓ (next to each switch)** | Toggles that switch's help text for 10 s. Free. |
+"""
+    )
+
+    ug_h("Resource monitor (under the header)")
+    st.markdown(
+        """
+| Button | What it does |
+|---|---|
+| **🧮 Open the resource monitor** | RAM and disk with the exact figures the platform kills on, my own files, my stored history, and the buttons that give memory back. A checkbox, not a disclosure - it stays open while you work in it, and closed means closed. |
+| **♻️ Free my RAM** | Trims my log and report tails, drops my caches, my built ZIP and any staged download, collects garbage. Deletes nothing on disk and loses no result. |
+| **🧹 Delete my cache files** | Domain cache, proxy metadata, key map and my scratch directory. Keeps results, settings, theme, presets, my history, my reader's remembered account, the disposable blocklist and my notifications. |
+| **🗑 Delete my RESULT files** | `mail_results/*` and `clean_valid_accounts.txt`, plus the buckets in this session. Keeps the paste box. Needs **Confirm the delete buttons** on. |
+| **⬇️ Download ticked** / **🗑 Delete ticked** / **☑️ Clear ticks** | Act on the ticked rows of my file list. One file downloads as itself, two or more as a ZIP. |
+| **📌 Take a sample now** | Records one RAM/disk reading immediately instead of waiting for the next minute. |
+| **🧽 Clear my memory history** | Deletes only my history file. The live readings keep working. |
+"""
+    )
+
     ug_h("Main page")
     st.markdown(
         """
 | Button | What it does |
 |---|---|
-| **❓ (next to each switch)** | Toggles that switch's help text for 10 s. Free. |
 | **🔥 Start Live Checking Engine** | Starts the run on the selected category. Clears the 407 quarantine first. |
 | **📥 Fetch & Test All Proxies** | Fetches, validates, writes `proxies.txt`, arms the pool, geo-tags, and runs a mail-destination spot check. |
 | **🔁 Re-probe pool now** | Clears probe stats and re-runs the tunnel probe. |
 | **🧾 Show raw proxies.txt** | Prints the first 60 lines and whether credentials are present. |
 | **↩️ Restore from proxies_all.txt** | Puts the full raw fetched pool back - the way back from a shrunk pool. |
 | **➕ Add Custom Proxies → Save Custom Proxies** | Appends pasted lines to `proxies.txt` and de-duplicates. |
-| **🔄 Refresh Dashboard / 🔁 Re-probe All** | Proxy Health dashboard refresh / full re-probe. |
+| **📊 Open the Proxy Health & Geo Dashboard** | The per-key and per-endpoint health tables. A checkbox, so the four dataframes behind it are only built while it is open. |
+| **🔄 Refresh Dashboard / 🔁 Re-probe All** | Dashboard refresh / full re-probe. |
 | **🧹 Clean Dead / Low-Score** | Removes nodes with score < 5 or ≥ 10 fails from `proxy_meta.json`. |
 | **♻️ Lift 407 Quarantine** | Clears the quarantine and all 407 strike counters. |
-| **🔬 Deep Diagnostics → 🔁 Rebuild / 🧪 Direct self-test** | Rebuilds the bundle / runs a live classifier + tunnel + mail-destination self-test. |
+| **🩺 Open the Proxy Debug Console** | One line traced through a raw CONNECT, with the parsed credential fields and a verdict. |
+| **🔬 Open Deep Diagnostics → 🔁 Rebuild / 🧪 Direct self-test** | Rebuilds the bundle / runs a live classifier + tunnel + mail-destination self-test. |
 | **⬇️ Download bundle** | The full diagnostic text, credentials included. |
 | **🔄 Refresh Startup Screen / 🧹 Clear Startup Logs** | Startup ledger controls. |
 | **📖 Read Inbox Messages** | Reads the selected account's last N messages through a proxy. Headers list first; tap a message to open its body. Nothing is marked read. |
@@ -583,7 +609,8 @@ with _t6:
         """
 | Page | What it is | Costs |
 |---|---|---|
-| **Main** (`app.py`) | The checker: settings, input, run, results, in-app reader. | proxy credit |
+| **`pages/1_Notifications.py`** | Everything raised for you: resource alerts with the fix beside each one, and run events. Mark read, dismiss one, dismiss all, download the lot. Yours only. | zero |
+| **Main** (`app.py`) | The checker: settings, input, run, results, in-app reader, resource monitor and the bell. | proxy credit |
 | **`pages/2_Diagnostics.py`** | Read-only. Shows the **exact rung order** the engine will dial for a domain, live TCP probes on 993/143/995/110, MX/SRV discovery, SMTP candidates, a `proxies.txt` audit, and cache tools. | zero |
 | **`pages/3_Mailbox_Reader.py`** | Bulk inbox reader: folders, OTP scanner, card/credential scanner, bot purge, per-message actions. | proxy credit |
 | **`pages/4_Downloads.py`** | Export Studio. Text / CSV / JSON / ZIP / per-status split, with filters, sorting, dedupe and presets. | zero |
@@ -648,6 +675,8 @@ with _t8:
         """
 | Symptom | What it usually is |
 |---|---|
+| The app is replaced by a platform page saying it went over its resource limits | The **kernel** killed the container for RAM - not a Python exception, so the app's own out-of-memory handler never gets to run and nothing is logged. Reboot the app, then set **Workers Start** ≤ 20, **Max Accounts** ≤ 2000, **Proxy Mode Engine = off**, Debug off, and keep the dashboard, the debug console and Deep Diagnostics closed. The bell raises a warning at 72 % of the container limit and a critical at 86 % - **act on the warning, not the critical**. |
+| The bell count never moves | Alerts are per user and throttled (30 s minimum, 10 minutes before a repeat of the same one). If the container is genuinely calm there is nothing to raise. Press **📌 Take a sample now** in the resource monitor to force a reading. |
 | `TypeError: Importing a module script failed.` in red | **Not a Python error.** Your browser is holding a stale JS chunk after a redeploy. Hard-refresh (`Ctrl`/`Cmd`+`Shift`+`R`). |
 | `Alive: 0` after Fetch & Test | The pool genuinely failed the tunnel probe. Press it again, or lower `Min Proxy Score`. |
 | Every account `PROXY_UNHEALTHY` | The pool passes the web probe but your provider is capping **email-server** destinations. Set `Proxy Mode Engine = off`, or wait for the cap to reset. |
@@ -683,7 +712,7 @@ means the resume read path is broken - run the Block Inspector fix self-check.
 
     ug_h("Getting help")
     st.markdown(
-        "Sidebar → `🔬 Deep Diagnostics` → `⬇️ Download bundle`. It contains the "
+        "Sidebar → `🔬 Open Deep Diagnostics` → `⬇️ Download bundle`. It contains the "
         "environment, the live config, the raw `proxies.txt` lines, the probe histogram, "
         "the quarantine state and the last 60 probe events. Proxy credentials are "
         "visible in it - rotate them if you paste it publicly."
