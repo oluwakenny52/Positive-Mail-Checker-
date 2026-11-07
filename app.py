@@ -3659,6 +3659,13 @@ _SETTING_KINDS = {
     "chk_debug_mode": ("bool", 0, 0, None),
     "bb_whitelist": ("text", 0, 0, None),
     "bb_blacklist": ("text", 0, 0, None),
+    # v13.70: these two carried keys but no persistence entry, so a refresh put
+    # them back to their seed every single time - "Skip previously valid" was
+    # undone by any reload, which silently re-checked accounts the user had
+    # deliberately excluded. A bool entry is enough: the seed in 087/108 supplies
+    # the default, this supplies the memory.
+    "bb_skip_prev": ("bool", 0, 0, None),
+    "bb_sum_full": ("bool", 0, 0, None),
     "pool_mode": ("choice", 0, 0, ("all", "us_only", "country", "mix")),
 }
 
@@ -7821,6 +7828,26 @@ with str_lit.expander("🔍 View All Startup Entries & What Is Going On In The H
 #     toggle is on, and nothing said so. A caption says so.
 #  Also removed: _res_snapshot() built a "top" list nothing read any more.
 #
+# v13.70 - FIVE MORE, ALL FIXED HERE
+# ----------------------------------
+#  5. _res_disk() was called TWICE per snapshot, once for each figure, so the
+#     two halves of one row could describe two different instants - and statvfs
+#     is a syscall on a shared filesystem. One call, both figures.
+#  6. "Disk total" was the HOST overlay presented as if it were the app's own
+#     quota. It is relabelled "Filesystem total (shared host disk)", the free
+#     figure is the actionable one and gets its own used bar.
+#  7. The RAM bar divided memory.current by the limit and called the result
+#     "RAM used", hiding the RSS the process can actually give back. The bar
+#     still uses the killer's own figure - but it says so - and RSS, peak and
+#     the headroom in bytes are printed beside it.
+#  8. _RES_KEEP_SUFFIX did not list notifications.jsonl or notify_seen.json, so
+#     "Delete my cache files" wiped the whole notification history and reset the
+#     badge. Both filenames are on the keep list now.
+#  9. _res_forget_ticks only ASSIGNED False, so every deleted file left a dead
+#     reschk_* key and a dead entry in the uid map behind for the life of the
+#     session. Both are POPPED now - safe, because these are callbacks and run
+#     before the checkboxes are re-created.
+#
 # WHAT IS AND IS NOT PER USER - stated here because the numbers are easy to
 # misread:
 #
@@ -7867,10 +7894,14 @@ _RES_SESSION_KEYS = (
 # fetched disposable blocklist, which then had to be re-downloaded from GitHub.
 # reader_state is a preference like theme.json; the disposable list is
 # REBUILDABLE but only over the network, so it belongs on the keep side too.
+# v13.70: notifications.jsonl and notify_seen.json were the same story - the
+# sweep took the entire alert history and the seen marker with it, so the badge
+# reset to zero and every past RAM/disk warning vanished on the next load.
 _RES_KEEP_SUFFIX = (
     "clean_valid_accounts.txt", "settings.json", "paste_accounts.txt",
     "inspect_cat.txt", "theme.json", "download_presets.json", "proxies.txt",
     "mem_history.jsonl", "reader_state.json", "disposable_domains.txt",
+    "notifications.jsonl", "notify_seen.json",
 )
 
 _MEM_FILE = user_file("mem_history.jsonl")
@@ -7882,8 +7913,10 @@ _PREVIEW_BYTES = 200000
 # a byte budget. The entry cap alone allowed 300 x 200 KB, i.e. tens of MB of
 # strings living in session_state - which is the payload that causes the OOM
 # kills, not the entry count.
-_PREVIEW_CACHE_ENTRIES = 300
-_PREVIEW_CACHE_BYTES = 8000000
+# v13.70: 300 entries / 8 MB was still a 8 MB ceiling held in a 1 GB container
+# for a preview nobody scrolls back to. 80 / 3 MB.
+_PREVIEW_CACHE_ENTRIES = 80
+_PREVIEW_CACHE_BYTES = 3000000
 # v13.63: the results directory is <hash>_mail_results, NOT mail_results - the
 # basename is prefixed like every other per-user path. Testing for the bare name
 # meant "Delete my cache files" skipped nothing and took the results with it,
@@ -7914,6 +7947,12 @@ for _k in ("res_open", "res_confirm"):
 
 
 def _res_fmt(n):
+    """Human bytes, or "?" when the reading is genuinely unavailable.
+
+    v13.70: a missing reading used to arrive here as 0 and render "0 B", which
+    reads as a real zero - "no RAM in use". Anything that is not a number is
+    "?" now, and 0 renders "0 B" only when it really is zero.
+    """
     try:
         n = float(n)
     except Exception:
@@ -8088,14 +8127,17 @@ def _res_snapshot():
             _own_b += os.path.getsize(_p)
         except Exception:
             pass
+    # v13.70: ONE statvfs. It used to be called twice, once per figure, so the
+    # total and the free value in one row could be measured at two instants.
+    _d_total, _d_free = _res_disk()
     _snap = {
         "ts": _now,
         "rss": _rss,
         "peak": _peak,
         "lim": _res_cgroup_limit(),
         "used": _res_cgroup_used(),
-        "d_total": _res_disk()[0],
-        "d_free": _res_disk()[1],
+        "d_total": _d_total,
+        "d_free": _d_free,
         "sess": _res_session_bytes(),
         "own_n": len(_own),
         "own_b": _own_b,
@@ -8149,10 +8191,8 @@ def _res_preview(path):
         _note = f"{_size:,} bytes"
     _cache[path] = (_sig, _text, _note)
     # FIX PREVIEW-CAP (v13.69): the entry ceiling is kept, and a byte ceiling is
-    # added beside it. 300 entries x up to _PREVIEW_BYTES is tens of MB of
-    # strings in session_state, which is the payload that drives the OOM kills -
-    # so the count alone was never the real bound. Oldest goes first, and at
-    # least the entry just added always survives.
+    # added beside it. Oldest goes first, and at least the entry just added
+    # always survives.
     if len(_cache) > _PREVIEW_CACHE_ENTRIES:
         _cache = dict(list(_cache.items())[-_PREVIEW_CACHE_ENTRIES:])
     if len(_cache) > 1:
@@ -8183,12 +8223,28 @@ def _res_selected_paths():
 
 
 def _res_forget_ticks(paths):
-    """v13.63b: ASSIGN False. Popping a live widget key is unreliable."""
+    """Drop the tick keys AND the uid-map entries for `paths`.
+
+    v13.63b: this ASSIGNED False, because popping a live widget key was thought
+    unreliable. v13.70: it is not unreliable HERE - every caller is an on_click
+    callback, and a callback runs BEFORE the script body, so the checkbox it
+    names does not exist yet at pop time and is re-created with its default on
+    the next render. Assigning False left a dead reschk_* key and a dead map
+    entry behind for the life of the session, so a few hundred deleted files
+    meant a few hundred keys nothing would ever clean up.
+    """
+    _map = str_lit.session_state.get("_res_uids")
     for _p in paths:
+        _uid = _res_uid(_p)
         try:
-            str_lit.session_state["reschk_" + _res_uid(_p)] = False
+            str_lit.session_state.pop("reschk_" + _uid, None)
         except Exception:
             pass
+        if isinstance(_map, dict):
+            try:
+                _map.pop(_uid, None)
+            except Exception:
+                pass
 
 
 # --------------------------------------------------------------------------
@@ -8290,7 +8346,7 @@ def _on_clear_ticks():
     _map = str_lit.session_state.get("_res_uids") or {}
     for _uid in list(_map.keys()):
         try:
-            str_lit.session_state["reschk_" + _uid] = False
+            str_lit.session_state.pop("reschk_" + _uid, None)
         except Exception:
             pass
     str_lit.session_state["_res_flash"] = ("success", "Ticks cleared.")
@@ -8423,8 +8479,12 @@ def _on_clear_cache_files():
 
 
 def _on_clear_result_files():
-    """Delete MY result files AND the buckets holding them. Keeps the paste box."""
-    _pfx = os.path.basename(user_file("")) or ""
+    """Delete MY result files AND the buckets holding them. Keeps the paste box.
+
+    v13.70: the _pfx assignment here was dead - it was computed and then never
+    read, because the filter below matches on the DIRECTORY name and on the
+    clean-valid suffix, both of which already carry the prefix.
+    """
     _victims = []
     for _p in _res_own_files():
         _base = os.path.basename(_p)
@@ -8485,22 +8545,53 @@ if _res_open:
                     "back from here.")
 
     _lim = _rs.get("lim") or 0
-    _used = _rs.get("used") or _rs.get("rss") or 0
-    _rp1, _rp2, _rp3 = str_lit.columns(3)
-    _rp1.metric("Container RAM used", _res_fmt(_used))
+    _used = _rs.get("used") or 0
+    _bar = _used or (_rs.get("rss") or 0)
+    _rp1, _rp2, _rp3, _rp4 = str_lit.columns(4)
+    _rp1.metric("Container RAM used", _res_fmt(_rs.get("used")),
+                help="cgroup memory.current. Page cache included, every session "
+                     "counted, and the exact figure the kernel's OOM killer acts on.")
     _rp2.metric("Container RAM limit", _res_fmt(_lim) if _lim else "no limit file")
-    _rp3.metric("Process peak", _res_fmt(_rs.get("peak") or 0))
-    if _lim:
-        _pct = min(1.0, _used / _lim)
-        str_lit.progress(_pct, text=f"{_pct * 100:.0f}% of the container limit "
-                                    f"(Streamlit Cloud is usually 1 GB)")
+    _rp3.metric("This process RSS", _res_fmt(_rs.get("rss")),
+                help="VmRSS from /proc/self/status - what the interpreter is really "
+                     "holding. The gap up to 'Container RAM used' is reclaimable "
+                     "cache, so it is headroom, not a leak.")
+    _rp4.metric("This process peak", _res_fmt(_rs.get("peak")),
+                help="VmHWM - the high-water mark since the process started. A peak "
+                     "far above the current RSS is a spike, not a standing cost.")
+    if _lim and _bar:
+        _pct = min(1.0, float(_bar) / float(_lim))
+        str_lit.progress(
+            _pct, text=f"{_pct * 100:.0f}% of the {_res_fmt(_lim)} container limit"
+                       + ("" if _used else "  (limit file unreadable - the bar is on RSS)"))
+    if _lim and _used:
+        str_lit.caption(
+            f"Headroom to the limit: **{_res_fmt(max(0, _lim - _used))}**. Streamlit "
+            f"Cloud kills the container when that reaches zero, and the kill lands "
+            f"before any handler in this file can run - which is why this panel "
+            f"exists and why the run keeps its payload small.")
 
     _rm1, _rm2, _rm3, _rm4 = str_lit.columns(4)
-    _rm1.metric("My session payload", _res_fmt(_rs.get("sess") or 0))
-    _rm2.metric("My files on disk", _res_fmt(_rs.get("own_b") or 0),
-                help=f"{_rs.get('own_n', 0)} file(s)")
-    _rm3.metric("Disk free", _res_fmt(_rs.get("d_free") or 0))
-    _rm4.metric("Disk total", _res_fmt(_rs.get("d_total") or 0))
+    _rm1.metric("My session payload", _res_fmt(_rs.get("sess")),
+                help="My result lists, report entries, logs, paste buffer and preview "
+                     "cache. This is the part that drives the OOM kills, and the only "
+                     "part 'Free my RAM' touches.")
+    _rm2.metric("My files on disk", _res_fmt(_rs.get("own_b")),
+                help=f"{_rs.get('own_n', 0)} file(s) carrying my own prefix.")
+    _rm3.metric("Filesystem free", _res_fmt(_rs.get("d_free")),
+                help="Free space where the app writes - the number an out-of-disk "
+                     "error turns on.")
+    _rm4.metric("Filesystem total (shared host disk)",
+                _res_fmt(_rs.get("d_total")),
+                help="The host overlay, not a per-app quota. Read the free figure "
+                     "above it, not this one.")
+    _dtot = _rs.get("d_total") or 0
+    _dfree = _rs.get("d_free") or 0
+    if _dtot and _dfree:
+        _fpct = min(1.0, float(max(0, _dtot - _dfree)) / float(_dtot))
+        str_lit.progress(_fpct, text=f"Filesystem {_fpct * 100:.0f}% used overall "
+                                     f"({_res_fmt(_dfree)} free) - container-wide, "
+                                     f"shared with every session")
 
     _res_ok = str_lit.toggle("Confirm the delete buttons", key="res_confirm",
                              help="Every delete stays disabled until this is on, so a "
@@ -8521,7 +8612,8 @@ if _res_open:
                        help="Domain cache, proxy metadata, key map, proxies_all "
                             "backup and my data/ scratch directory. Keeps results, "
                             "settings, theme, presets, proxies.txt, my history, my "
-                            "reader's remembered account and the disposable blocklist.")
+                            "reader's remembered account, the disposable blocklist and "
+                            "my notifications.")
     with _rb3:
         str_lit.button("🗑 Delete my RESULT files", width="stretch",
                        on_click=_on_clear_result_files, disabled=not _res_ok,
@@ -8606,7 +8698,7 @@ if _res_open:
                         str_lit.caption("no preview available - download it instead")
 
     str_lit.caption("Readings refresh at most every 3 seconds. Off Linux (no /proc, no "
-                    "cgroup) the memory figures read 0 and everything else still works.")
+                    "cgroup) the memory figures read ? and everything else still works.")
 
     # ----------------------------------------------------------------------
     # MY STORED HISTORY
@@ -9035,7 +9127,12 @@ with str_lit.sidebar:
                 "warning", "No node passed validation. Check WEBSHARE_KEYS in secrets.")
         str_lit.rerun()
 
-    with str_lit.expander("📊 Proxy Health & Geo Dashboard", expanded=False):
+    # v13.70: A KEYED CHECKBOX, NOT AN EXPANDER. An expander keeps no state, so
+    # its body runs on EVERY rerun whether it is open or not - and this body
+    # builds four dataframes over the whole pool, from four full dict copies.
+    # A checkbox persists, so closed means closed and the cost is only paid
+    # while the panel is actually on screen.
+    if str_lit.checkbox("📊 Open the Proxy Health & Geo Dashboard", key="ph_open"):
         with probe_stats_lock:
             _pstats = dict(probe_stats)
         # v13.54: SNAPSHOT UNDER THE LOCK. Iterating proxy_meta directly raised
@@ -9307,7 +9404,9 @@ with str_lit.sidebar:
 
 # @@BLOCK 081 PROXY_DEBUG_AND_DIAG_UI deps=014,016,024,026,027,030,052,070,073,080
 with str_lit.sidebar:
-    with str_lit.expander("🩺 Proxy Debug Console", expanded=False):
+    # v13.70: keyed checkbox, not an expander - an expander body runs while it is
+    # closed, and this one builds the whole diagnostic bundle.
+    if str_lit.checkbox("🩺 Open the Proxy Debug Console", key="dbg_open"):
         str_lit.caption(
             "Runs ONE line through a raw CONNECT trace and prints the exact bytes the "
             "proxy sends back, plus the parsed credential fields. Read-only - it does "
@@ -9552,7 +9651,9 @@ with str_lit.sidebar:
             else:
                 str_lit.caption("No trace yet. Start with **WITH credentials** on line #1.")
 
-with str_lit.expander("🔬 Deep Diagnostics - copy/paste this to debug", expanded=False):
+# v13.70: keyed checkbox, not an expander. This body builds a bundle of several
+# hundred KB and renders it as st.code - on EVERY rerun, while collapsed.
+if str_lit.checkbox("🔬 Open Deep Diagnostics (builds the whole bundle)", key="diag_open"):
     str_lit.caption(
         "Everything needed to diagnose the pool remotely. Copy the whole block "
         "(hover it, copy icon) and paste it back. It includes raw proxies.txt lines, "
@@ -10150,7 +10251,11 @@ BUCKET_TAGS = {
 # ==========================================================================
 _PASTE_FILE = user_file("paste_accounts.txt")
 _INSPECT_FILE = user_file("inspect_cat.txt")
-_PASTE_MAX = 8 * 1024 * 1024
+# v13.70: 8 MB was ~260,000 lines of restored text held as ONE string in
+# session_state, and MAX_ACCOUNTS caps a run at 5000 - so seven eighths of it
+# was text nothing would ever dial. 2 MB is ~65,000 lines and still far past any
+# single run.
+_PASTE_MAX = 2 * 1024 * 1024
 _INPUT_OWNER_KEY = "_input_owner"
 _PASTE_LIMIT_NOTE = ""
 
@@ -12886,7 +12991,7 @@ if start_engine_btn:
         _net_streak = 0
 
         def render_buckets(snapshot):
-            """ONE markdown call per bucket, not one per account line.
+            """ONE markdown call per bucket, from a (count, tail) pair.
 
             FIX DELTA-1 (v13.67): this opened a fresh `.container()` on the
             placeholder and then emitted a separate widget for every line, on
@@ -12896,25 +13001,35 @@ if start_engine_btn:
             RangeError: index out of range", after which it stopped applying
             deltas and the page looked hung while the run carried on.
 
-            The bucket is a single HTML block now, capped at BUCKET_LIVE_TAIL.
-            The summary block still shows the full set.
+            v13.70 MEM-2: AND IT STILL TOOK A FULL COPY. The snapshot handed in
+            used to be twelve complete `list()` copies, then this drew the last
+            BUCKET_LIVE_TAIL of each - so a 12 x 1000-line pool was copied in
+            full every 0.6 s to draw 12 x 250. The caller now passes
+            (true_count, tail) and nothing is copied here at all: the true count
+            keeps the "+N more" line honest and the download button still carries
+            every line.
             """
             for key, _title in BUCKET_SPEC:
                 ph = bucket_placeholders.get(key)
                 if ph is None:
                     continue
-                items = snapshot.get(key) or []
-                if not items:
+                _entry = snapshot.get(key)
+                if not _entry:
+                    continue
+                try:
+                    _count, tail = _entry
+                except Exception:
+                    _count, tail = len(_entry), _entry
+                if not tail:
                     continue
                 col = TAG_COLORS.get(BUCKET_TAGS.get(key, ""), "#cbd5e1")
-                tail = items[-BUCKET_LIVE_TAIL:]
                 body = "".join(
                     "<div style='font-family:ui-monospace,monospace;font-size:12px;"
                     f"color:{col}'>{html.escape(str(ln))}</div>" for ln in tail)
-                if len(items) > len(tail):
+                if _count > len(tail):
                     body += ("<div style='font-size:11px;opacity:.7'>+"
-                             f"{len(items) - len(tail)} more - see the summary below"
-                             "</div>")
+                             f"{_count - len(tail)} more - the download button carries "
+                             "every line</div>")
                 try:
                     ph.markdown(body, unsafe_allow_html=True)
                 except Exception:
@@ -13179,8 +13294,16 @@ if start_engine_btn:
                                     except AttributeError:
                                         str_lit.session_state.log_lines.pop(0)
 
+                                # v13.70 MEM-4: THE TRACE WAS UNBOUNDED. A deep
+                                # ladder on a 7-host domain can emit a hundred
+                                # lines, and that string was stored once per report
+                                # row - so 3000 rows could hold tens of MB of text
+                                # that only ever gets read for the newest handful.
+                                # 1500 characters is ~15 steps: plenty to see why an
+                                # account ended where it did, and the FULL trace is
+                                # still in the ZIP and the Full Log page.
                                 trace_text = "\n  ↳ ".join(
-                                    res.get("trace", ["No trace recorded"]))
+                                    res.get("trace", ["No trace recorded"]))[:1500]
                                 cred_combo = (f"{res.get('email', '')}:{res.get('password', '')}"
                                               if res.get('password') else res.get('email', ''))
                                 str_lit.session_state.report_entries.append({
@@ -13209,26 +13332,33 @@ if start_engine_btn:
                                 smtp_len = len(str_lit.session_state.smtp_results)
                                 skip_len = len(str_lit.session_state.skip_results)
                                 unknown_len = len(str_lit.session_state.unknown_results)
-                                current_logs = (list(str_lit.session_state.log_lines)
-                                                if _tick else [])
                                 # FIX LAG-5: up to 2000 entries were copied on every
-                                # tick; they are only needed when the table redraws.
+                                # tick; they are only needed when the table redraws,
+                                # and only the tail is ever drawn - so the copy is
+                                # the log tail and _DF_TAIL_LIVE report rows.
+                                current_logs = (list(str_lit.session_state.log_lines)[-150:]
+                                                if _tick else [])
                                 current_reports = (list(str_lit.session_state.report_entries)
-                                                   if _df_tick else [])
-                                bucket_snapshot = ({
-                                    "valid_results": list(str_lit.session_state.valid_results),
-                                    "wrong_results": list(str_lit.session_state.wrong_results),
-                                    "conn_results": list(str_lit.session_state.conn_results),
-                                    "proxy_results": list(str_lit.session_state.proxy_results),
-                                    "login_drop_results": list(str_lit.session_state.login_drop_results),
-                                    "need_app_results": list(str_lit.session_state.need_app_results),
-                                    "retry_results": list(str_lit.session_state.retry_results),
-                                    "rbl_results": list(str_lit.session_state.rbl_results),
-                                    "smtp_results": list(str_lit.session_state.smtp_results),
-                                    "dns_results": list(str_lit.session_state.dns_results),
-                                    "skip_results": list(str_lit.session_state.skip_results),
-                                    "unknown_results": list(str_lit.session_state.unknown_results),
-                                } if _bucket_tick else {})
+                                                   [-_DF_TAIL_LIVE:] if _df_tick else [])
+                                # v13.70 MEM-2: a (true_count, tail) pair per bucket,
+                                # never the whole list. render_buckets draws the tail
+                                # and the count keeps the "+N more" line honest.
+                                bucket_snapshot = {}
+                                if _bucket_tick:
+                                    _ss_b = str_lit.session_state
+                                    for _bk in ("valid_results", "wrong_results",
+                                                "conn_results", "proxy_results",
+                                                "login_drop_results", "need_app_results",
+                                                "retry_results", "rbl_results",
+                                                "smtp_results", "dns_results",
+                                                "skip_results", "unknown_results"):
+                                        _bq = _ss_b.get(_bk) or ()
+                                        _bn = len(_bq)
+                                        bucket_snapshot[_bk] = (
+                                            _bn,
+                                            [_bq[_bi] for _bi in
+                                             range(max(0, _bn - BUCKET_SNAPSHOT_TAIL),
+                                                   _bn)] if _bn else [])
 
                             if _tick:
                                 _last_ui_ts = _now_ui
@@ -13251,10 +13381,10 @@ if start_engine_btn:
                                     try:
                                         if str_lit.session_state.get("colorize_logs", True):
                                             log_container.markdown(
-                                                colorize_logs(current_logs[-150:]),
+                                                colorize_logs(current_logs),
                                                 unsafe_allow_html=True)
                                         else:
-                                            log_container.code("\n".join(current_logs[-150:]),
+                                            log_container.code("\n".join(current_logs),
                                                                language="text")
                                     except Exception:
                                         pass
@@ -13286,13 +13416,13 @@ if start_engine_btn:
                         with session_state_lock:
                             str_lit.session_state.conn_results.append(err_msg)
                             str_lit.session_state.log_lines.append(err_msg)
-                            current_logs = list(str_lit.session_state.log_lines)
+                            current_logs = list(str_lit.session_state.log_lines)[-150:]
                         try:
                             if str_lit.session_state.get("colorize_logs", True):
-                                log_container.markdown(colorize_logs(current_logs[-150:]),
+                                log_container.markdown(colorize_logs(current_logs),
                                                        unsafe_allow_html=True)
                             else:
-                                log_container.code("\n".join(current_logs[-150:]),
+                                log_container.code("\n".join(current_logs),
                                                    language="text")
                         except Exception:
                             pass
@@ -13317,6 +13447,16 @@ if start_engine_btn:
                             # from calling a healthy long run interrupted on the
                             # next load.
                             runstate.progress(checked_count, total_accs)
+                            # v13.70 MEM-5: AND THE RESOURCE THRESHOLDS ARE
+                            # SAMPLED HERE. The script does not rerun while a run
+                            # works, so the 1 Hz page load cannot notice a squeeze
+                            # mid-run - this checkpoint is the only thing that can.
+                            # notify throttles itself per user and swallows every
+                            # error, so it cannot cost the loop.
+                            try:
+                                notify.system_tick()
+                            except Exception:
+                                pass
                             # FIX SURVIVE-2 (v13.67): THE HEAVY PART MOVED OFF THE
                             # 5s CLOCK. Rebuilding `left` is one str.split() per
                             # queued account - 120,056 of them on a real list - and
