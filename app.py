@@ -723,7 +723,15 @@ UI_MIN_INTERVAL = 0.12
 #   REPORT_ENTRIES_MAX 5000 -> 20000 traced accounts
 # A cap that silently eats the record is worse than a slower render; the full text
 # still leaves by the ZIP, the .txt export and the Full Log page.
-BUCKET_RENDER_TAIL = 2000
+#
+# v13.70 MEM-1: AND THE RENDER COULD NOT KEEP THE PROMISE. The live report table
+# copied the WHOLE deque - list() over 20000 entries, then a dataframe of it, then
+# Arrow - once every REPORT_DF_MIN_INTERVAL second, each row carrying a multi-line
+# trace. That is ~40 MB of strings plus a ~40 MB Arrow buffer, rebuilt, for the
+# whole run, on a 1 GB container. The ring is 3000 now and the TABLE copies only
+# _DF_TAIL_LIVE of it. The ZIP, the .txt export and the Full Log page still carry
+# every row, so nothing is lost - only the part held in RAM changes.
+BUCKET_RENDER_TAIL = 1000
 # FIX DELTA-1 (v13.67): THE LIVE LOOP DREW A SEPARATE WIDGET PER LINE, up to
 # BUCKET_RENDER_TAIL of them, for twelve buckets, on every UI tick. At
 # UI_MIN_INTERVAL that is up to ~200,000 deltas a second at the tail of a run -
@@ -733,11 +741,18 @@ BUCKET_RENDER_TAIL = 2000
 # The live bucket render is one HTML block per bucket, capped here; the summary
 # block still shows the full set and the download buttons carry every line.
 BUCKET_LIVE_TAIL = 250
+# v13.70 MEM-2: the live snapshot copies exactly this many lines per bucket per
+# tick - it used to copy all of them and then draw BUCKET_LIVE_TAIL of each. The
+# true count is passed alongside the tail, so the "+N more" line stays honest.
+BUCKET_SNAPSHOT_TAIL = 250
 # Buckets get their own, slower clock than the log stream.
 BUCKET_MIN_INTERVAL = 0.6
-LOG_CAP_DEBUG = 5000
-LOG_CAP_QUIET = 2000
-REPORT_ENTRIES_MAX = 20000
+LOG_CAP_DEBUG = 3000
+LOG_CAP_QUIET = 1200
+REPORT_ENTRIES_MAX = 3000
+# v13.70 MEM-1: how many rows the live report table holds at once. The full set
+# is still exported; this is only what is serialised per second.
+_DF_TAIL_LIVE = 250
 # FIX P1-3 / P1-4: the two per-rerun and per-account hogs get their own clocks.
 # FIX SPEED-10: 30s was far too eager for build_diagnostics_text(), which reads
 # proxies.txt, walks every proxy_meta row, resolves the egress geo and calls
@@ -5240,6 +5255,35 @@ render_hero(_theme)
 # Display Fit controls belong UNDER the header. fit() in block 007 injects the
 # CSS only; the panel is drawn here.
 auth.fit_panel(str_lit)
+
+# v13.70: THE BELL. Under the header and ahead of every other control, so it is
+# the first thing reachable on a phone.
+#
+# notify.py is a plain module (like runstate.py), every call in it is optional,
+# and both guards are hasattr() - a module cached from before this build would
+# otherwise answer AttributeError, and a bare `notify.render_bell` expression is
+# magic-written by Streamlit through st.help -> ast.parse, which can raise
+# IndentationError on the enclosing try. `importlib.reload(notify)` does NOT
+# collide with the gated `importlib.reload(auth)` needle.
+#
+# A stale or broken notify degrades to "no bell", never to a dead page.
+import notify
+
+if not (hasattr(notify, "render_bell") and hasattr(notify, "system_tick")):
+    notify = importlib.reload(notify)
+
+_nb_l, _nb_r = str_lit.columns([0.24, 0.76])
+with _nb_l:
+    notify.render_bell(str_lit)
+
+# The thresholds are sampled here on every rerun, and again from the run
+# checkpoint (block 106) - the script does not rerun while a run works, so the
+# checkpoint is the only thing that can notice a squeeze mid-run. notify throttles
+# both per user and swallows everything, so neither call can cost the page.
+try:
+    notify.system_tick()
+except Exception:
+    pass
 
 try:
     os.makedirs(CFG["RESULTS_DIR"], exist_ok=True)
