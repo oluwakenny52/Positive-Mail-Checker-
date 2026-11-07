@@ -83,7 +83,7 @@ import threading
 import time
 import warnings
 import zipfile
-from collections import defaultdict
+from collections import defaultdict, deque
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -724,6 +724,17 @@ UI_MIN_INTERVAL = 0.12
 # A cap that silently eats the record is worse than a slower render; the full text
 # still leaves by the ZIP, the .txt export and the Full Log page.
 BUCKET_RENDER_TAIL = 2000
+# FIX DELTA-1 (v13.67): THE LIVE LOOP DREW A SEPARATE WIDGET PER LINE, up to
+# BUCKET_RENDER_TAIL of them, for twelve buckets, on every UI tick. At
+# UI_MIN_INTERVAL that is up to ~200,000 deltas a second at the tail of a run -
+# the socket cannot keep up and the browser answers
+#   "Failed to process a Websocket message. RangeError: index out of range"
+# after which it stops applying deltas: the run continues, the screen freezes.
+# The live bucket render is one HTML block per bucket, capped here; the summary
+# block still shows the full set and the download buttons carry every line.
+BUCKET_LIVE_TAIL = 250
+# Buckets get their own, slower clock than the log stream.
+BUCKET_MIN_INTERVAL = 0.6
 LOG_CAP_DEBUG = 5000
 LOG_CAP_QUIET = 2000
 REPORT_ENTRIES_MAX = 20000
@@ -738,10 +749,17 @@ REPORT_DF_MIN_INTERVAL = 1.0
 # went stale and unfinished_live.json was never written, so Resume was empty and
 # the stop had no reason. 5s keeps counts, remaining and the reason real.
 CHECKPOINT_SECONDS = 5.0
+# FIX SURVIVE-2 (v13.67): THE 5s CHECKPOINT DID THREE THINGS OF WILDLY DIFFERENT
+# COST - one small heartbeat JSON, a rebuild of the entire remaining queue (one
+# str.split() per queued account, 120,056 of them on a real list) and a ~5 MB
+# JSON write of that queue - twelve times a minute, on the script thread, for a
+# file only the stop path ever reads. The heartbeat stays on
+# CHECKPOINT_SECONDS; the queue rebuild and its write get this clock instead.
+HEAVY_CHECKPOINT_SECONDS = 30.0
 # FIX SPEED-4: the checkpoint also rewrote clean_valid_accounts.txt IN FULL - a
 # read of every existing line plus a rewrite - every 5 seconds, on the script
 # thread, whether or not anything new had been found. It gets its own slower
-# clock; the resume record above still runs every 5s.
+# clock, and it now hangs off the heavy checkpoint above.
 CLEAN_SYNC_SECONDS = 30.0
 # Consecutive transport-ish verdicts before the connection is called down.
 NET_STREAK_TRIP = 8
@@ -2896,7 +2914,29 @@ def _rehydrate_last_run(force: bool = False):
                 loaded += len(items)
         if loaded:
             str_lit.session_state.engine_has_run = True
-            if str_lit.session_state.get("run_completion_status") == "Unfinished":
+            # FIX SURVIVE-3 (v13.67): run_valid_count is seeded from the LIFETIME
+            # valid list at the top of this block, so the summary printed the
+            # lifetime total as "Clean Valid" and folded it into "Accounts In
+            # Buckets" - 84 in buckets after 668 accounts checked. The newest
+            # stamp's OWN valid file is the truth for the run being shown.
+            _vp = os.path.join(user_file("mail_results"), f"valid_{stamp}.txt")
+            if os.path.exists(_vp):
+                try:
+                    with open(_vp, encoding="utf-8", errors="ignore") as _vf:
+                        _run_n = sum(1 for _l in _vf
+                                     if _l.strip() and not _l.startswith("#"))
+                    str_lit.session_state.run_valid_count = _run_n
+                    str_lit.session_state.clean_valid_count = _run_n
+                except Exception:
+                    pass
+            # An unfinished record means the run really WAS interrupted - leave
+            # "Unfinished" so the Resume banner still fires. Only a run with no
+            # open record is relabelled as loaded-from-disk.
+            try:
+                _open_rec = bool(runstate.load())
+            except Exception:
+                _open_rec = False
+            if not _open_rec:
                 str_lit.session_state.run_completion_status = "Loaded from disk"
         return loaded
     except Exception:
@@ -3953,8 +3993,15 @@ dynamic_worker_scaling = str_lit.sidebar.toggle(
          "Either way you must press 💾 Apply Settings - the engine reads the "
          "applied config, not the slider.")
 _seed_widget("ui_max_hosts", lo=1, hi=8, dflt=default_hosts)
+# FIX W-3 (v13.67): the positional default `1` was still here while
+# _seed_widget() had already written the key from this user's settings.json, so
+# EVERY load logged
+#   The widget with key "ui_max_hosts" was created with a default value but also
+#   had its value set via the Session State API.
+# (app.py:3956 in the deployed traceback). The seed carries the mode default, so
+# the positional value was doing nothing but warning.
 max_hosts_per_domain = str_lit.sidebar.slider(
-    "Max Hosts Per Domain", 1, 8, 1, key="ui_max_hosts",
+    "Max Hosts Per Domain", 1, 8, key="ui_max_hosts",
     help="How many discovered IMAP hosts to try per account. 1 = primary host only. "
          "Each extra host adds a rung and lengthens the per-account work floor, so LOWER "
          "is FASTER - raise it only for domains whose sibling hosts actually answer. "
@@ -4005,21 +4052,23 @@ str_lit.sidebar.markdown("### 🌐 Proxy / Pool Configuration")
 # SIT on 5 - it snapped to 0 or 10 and the default was never actually applied.
 # 0 means "no score filtering at all", which is the opposite of what the label
 # promises. Step 1.
+# FIX W-3 (v13.67): and the positional default is gone for the same reason as
+# block 048 - _seed_widget() already wrote the key.
 _seed_widget("ui_min_proxy_score", lo=0, hi=100)
 min_proxy_score = str_lit.sidebar.slider(
-    "Min Proxy Score", 0, 100, 1, key="ui_min_proxy_score",
+    "Min Proxy Score", 0, 100, key="ui_min_proxy_score",
     help="A node is dropped from the pool once its score falls below this. A node that "
          "has EVER passed the probe is never dropped by score, and a 402/407 no longer "
          "counts as a fail - only real transport failures do."
 )
 _seed_widget("ui_probe_precheck_timeout", lo=1, hi=10)
 proxy_precheck_timeout = str_lit.sidebar.slider(
-    "Proxy Pre-Check Timeout (Sec)", 1, 10, 1,
+    "Proxy Pre-Check Timeout (Sec)", 1, 10,
     key="ui_probe_precheck_timeout"
 )
 _seed_widget("ui_probe_timeout", lo=3, hi=20)
 probe_timeout_ui = str_lit.sidebar.slider(
-    "Tunnel Probe Timeout (Sec)", 3, 20, 1, key="ui_probe_timeout",
+    "Tunnel Probe Timeout (Sec)", 3, 20, key="ui_probe_timeout",
     help="How long a node gets IN TOTAL to open a real CONNECT tunnel to any probe target."
 )
 _seed_widget("ui_probe_target", choices=PROBE_TARGET_OPTIONS)
@@ -4045,7 +4094,7 @@ probe_strict_ui = str_lit.sidebar.toggle(
 )
 _seed_widget("ui_probe_maxtargets", lo=1, hi=3)
 probe_max_targets_ui = str_lit.sidebar.slider(
-    "Probe: max targets per node", 1, 3, 1, key="ui_probe_maxtargets",
+    "Probe: max targets per node", 1, 3, key="ui_probe_maxtargets",
     help="1 (default) = AUTO resolves the SINGLE dominant mail host in your queue."
 )
 _seed_widget("ui_probe_scheme2")
@@ -4074,7 +4123,7 @@ mail_spot_ui = str_lit.sidebar.toggle(
 )
 _seed_widget("ui_probe_sample", lo=0, hi=200)
 probe_sample_ui = str_lit.sidebar.slider(
-    "Probe: max nodes per cycle (0 = all)", 0, 200, 5, key="ui_probe_sample",
+    "Probe: max nodes per cycle (0 = all)", 0, 200, key="ui_probe_sample",
     help="Randomly sample this many nodes per cycle instead of probing the whole file. "
          "Cheapest is 20."
 )
@@ -4104,20 +4153,22 @@ proxy_quarantine_ui = str_lit.sidebar.toggle(
 # @@BLOCK 050 SIDEBAR_CONCURRENCY deps=012,017,019,046
 str_lit.sidebar.markdown("---")
 str_lit.sidebar.markdown("### 🚦 Concurrency Governors")
+# FIX W-3 (v13.67): every slider below had a positional default next to a key=
+# that block 045 has already seeded, so each one warned on every load. Removed.
 _seed_widget("ui_host_conc", lo=1, hi=12)
 host_concurrency_ui = str_lit.sidebar.slider(
-    "Per-Host Connection Cap", 1, 12, 1, key="ui_host_conc",
+    "Per-Host Connection Cap", 1, 12, key="ui_host_conc",
     help="Max simultaneous connections to ONE mail hostname. 2 is right for legacy ISP IMAP."
 )
 _seed_widget("ui_ip_conc", lo=1, hi=12)
 proxy_ip_concurrency_ui = str_lit.sidebar.slider(
-    "Per-Proxy-IP Connection Cap", 1, 12, 1, key="ui_ip_conc",
+    "Per-Proxy-IP Connection Cap", 1, 12, key="ui_ip_conc",
     help="Default 2. Max simultaneous tunnels through ONE proxy IP, for the CHECKER and "
-         "the PROBER alike."
+    "the PROBER alike."
 )
 _seed_widget("ui_subuser_conc", lo=1, hi=12)
 proxy_subuser_concurrency_ui = str_lit.sidebar.slider(
-    "Per-Proxy-SUBUSER Connection Cap", 1, 12, 1,
+    "Per-Proxy-SUBUSER Connection Cap", 1, 12,
     key="ui_subuser_conc",
     help="Default 1. Providers rate-limit PER SUB-USER - a 407 is what you get when that "
          "cap is exceeded, NOT because the node is dead. 1 is a real floor now; the gate "
@@ -4125,7 +4176,7 @@ proxy_subuser_concurrency_ui = str_lit.sidebar.slider(
 )
 _seed_widget("ui_proxy_conc", lo=2, hi=60)
 proxy_concurrency_ui = str_lit.sidebar.slider(
-    "Global Proxy Connection Cap", 2, 60, 1, key="ui_proxy_conc",
+    "Global Proxy Connection Cap", 2, 60, key="ui_proxy_conc",
     help="Max simultaneous proxy tunnels across the whole run (the prober shares this)."
 )
 _seed_widget("ui_direct_first")
@@ -4137,13 +4188,13 @@ direct_first_ui = str_lit.sidebar.toggle(
 )
 _seed_widget("ui_same_host_retries", lo=0, hi=4)
 same_host_retries_ui = str_lit.sidebar.slider(
-    "Same-Host Retries on a SLOW answer", 0, 4, 1,
+    "Same-Host Retries on a SLOW answer", 0, 4,
     key="ui_same_host_retries",
     help="Only applies to READ-level slowness."
 )
 _seed_widget("ui_max_rot", lo=0, hi=8)
 max_rotations_ui = str_lit.sidebar.slider(
-    "Max proxy rotations per rung", 0, 8, 1, key="ui_max_rot",
+    "Max proxy rotations per rung", 0, 8, key="ui_max_rot",
     help="Every rotation is another proxy request. 5 -> 2 is roughly a 60% cut in the "
          "worst case."
 )
@@ -9605,7 +9656,7 @@ def is_disposable(email):
         return False
 # @@END 082 PREFILTER_TABLES
 
-# @@BLOCK 083 UNFINISHED_IO deps=007,082
+# @@BLOCK 083 UNFINISHED_IO deps=004,007,040,082
 def list_unfinished_runs():
     """Every unfinished record on disk, newest first.
 
@@ -9677,6 +9728,124 @@ def clear_unfinished():
             os.remove(path)
         except Exception:
             pass
+
+
+# ==========================================================================
+# v13.67 - THE LIVE BUCKET JOURNAL
+#
+# THE BUG THIS CLOSES
+# -------------------
+# The twelve bucket files were written by ONE block only: the export block,
+# which sits BELOW the run loop and runs only after the loop has ended. Any
+# teardown - a rerun, a phone backgrounding the tab, a websocket drop, a
+# redeploy - killed the script before it, so an interrupted run left NO bucket
+# file at all.
+#
+# The only incremental writer in the whole file was _write_clean_valid(), which
+# lands in clean_valid_accounts.txt and is re-read by
+# load_persistent_valid_results(). So after a teardown the VALID bucket came
+# back on reload and EVERY OTHER BUCKET came back empty - the reported symptom
+# exactly, and it was never a crash.
+#
+# HOW IT WORKS
+# ------------
+# Each bucket gets an append handle for the life of the run, flushed per line,
+# on the SAME filename the export block already uses (<tag>_<stamp>.txt), so
+# _rehydrate_last_run() picks a live or interrupted run up with no change at
+# all. The stamp is opened once, in the run-trigger block, and the export block
+# re-uses it, so the live files and the exported files are the same files.
+#
+# ISOLATION
+# ---------
+# The directory comes from user_file("mail_results"), so the prefix is the
+# unlocked hash. The handle table is keyed by _gate_scope(), so two people
+# running at once hold separate handle sets and neither close() can shut the
+# other's files. Every append and every close is given the scope explicitly by
+# the caller, so nothing depends on a thread-local guess.
+# ==========================================================================
+_RUN_JOURNAL_TAGS = ("valid", "wrong", "need_app", "login_dropped", "failed",
+                     "proxy_unhealthy", "retry_later", "rbl_blocked",
+                     "smtp_failed", "dns_failed", "skipped", "unclassified")
+
+# Status -> bucket tag. Both transport names land in `failed`, because the run
+# loop routes FAILED and CONNECTION_FAILED to the same bucket.
+_BUCKET_TAG_BY_STATUS = {
+    VALID: "valid",
+    WRONG: "wrong",
+    APP: "need_app",
+    LOGIN_DROPPED: "login_dropped",
+    RETRY: "retry_later",
+    RBL: "rbl_blocked",
+    SMTP_FAILED: "smtp_failed",
+    DNS_FAILED: "dns_failed",
+    PROXY_UNHEALTHY: "proxy_unhealthy",
+    SKIP: "skipped",
+    UNKNOWN: "unclassified",
+    FAILED: "failed",
+    CONNECTION_FAILED: "failed",
+}
+
+_JOURNAL_LOCK = threading.Lock()
+# scope -> {"stamp": str, "handles": {tag: file handle}}
+_JOURNAL = {}
+
+
+def live_journal_open(stamp, scope=None):
+    """Open one append handle per bucket for THIS run stamp and scope."""
+    who = str(scope or _gate_scope())
+    live_journal_close(who)
+    _dir = user_file("mail_results")
+    try:
+        os.makedirs(_dir, exist_ok=True)
+    except Exception:
+        pass
+    _h = {}
+    for _tag in _RUN_JOURNAL_TAGS:
+        try:
+            _h[_tag] = open(os.path.join(_dir, f"{_tag}_{stamp}.txt"), "a",
+                            encoding="utf-8", errors="ignore")
+        except Exception:
+            pass
+    with _JOURNAL_LOCK:
+        _JOURNAL[who] = {"stamp": str(stamp or ""), "handles": _h}
+
+
+def live_journal_append(tag, line, scope=None):
+    """Append one result line to its bucket file and flush it.
+
+    Flushed per line, so a teardown loses at most the single line in flight and
+    never a whole run.
+    """
+    if not tag or not line:
+        return
+    who = str(scope or _gate_scope())
+    with _JOURNAL_LOCK:
+        _h = (_JOURNAL.get(who) or {}).get("handles") or {}
+        fh = _h.get(tag)
+    if fh is None:
+        return
+    try:
+        fh.write(str(line).rstrip("\n") + "\n")
+        fh.flush()
+    except Exception:
+        pass
+
+
+def live_journal_close(scope=None):
+    """Close handles. With no scope, every scope. Safe to call twice."""
+    if scope is None:
+        with _JOURNAL_LOCK:
+            keys = list(_JOURNAL)
+    else:
+        keys = [str(scope)]
+    with _JOURNAL_LOCK:
+        for _k in keys:
+            for _fh in list((_JOURNAL.get(_k) or {}).get("handles", {}).values()):
+                try:
+                    _fh.close()
+                except Exception:
+                    pass
+            _JOURNAL.pop(_k, None)
 # @@END 083 UNFINISHED_IO
 
 # @@BLOCK 084 DOMAIN_RESOLVE deps=039,052,058
@@ -12547,14 +12716,26 @@ if start_engine_btn:
             str_lit.session_state.dns_results = list(str_lit.session_state.get("pre_dns_failed", []))
             str_lit.session_state.skip_results = []
             str_lit.session_state.unknown_results = []
-            str_lit.session_state.report_entries = []
-            str_lit.session_state.log_lines = []
+            # FIX LAG-7 (v13.67): both of these were plain lists and the run loop
+            # trimmed them with pop(0) / del[:-N] on EVERY result. After the cap
+            # was reached that is a 5,000-element shift and a 20,000-element slice
+            # copy per account - roughly 2.4 billion element moves across a
+            # 120,000-account run, on the same thread that feeds the UI. A deque
+            # with maxlen trims in O(1).
+            log_cap = LOG_CAP_DEBUG if CFG.get("DEBUG", False) else LOG_CAP_QUIET
+            str_lit.session_state.report_entries = deque(maxlen=REPORT_ENTRIES_MAX)
+            str_lit.session_state.log_lines = deque(maxlen=log_cap)
             str_lit.session_state.checked_emails_set = set()
             str_lit.session_state.last_checked_index = 0
             str_lit.session_state.engine_has_run = True
             str_lit.session_state.run_completion_status = "Unfinished"
 
             start_dt = datetime.now()
+            # FIX SURVIVE-1 (v13.67): ONE stamp for the whole run. The bucket
+            # journal opens on it here and the export block re-uses it, so the live
+            # files and the exported files are the same files - a fresh stamp at
+            # export time would orphan every line written during the run.
+            _run_stamp = start_dt.strftime("%Y%m%d_%H%M%S")
             str_lit.session_state.start_timestamp = start_dt.strftime("%Y-%m-%d %H:%M:%S")
             str_lit.session_state.end_timestamp = None
             str_lit.session_state.total_duration = None
@@ -12598,7 +12779,6 @@ if start_engine_btn:
         # longer swap the scope under a live account or hand it another user's CFG.
         _run_scope = _gate_scope()
         _run_cfg = _cfg_snapshot()
-        log_cap = LOG_CAP_DEBUG if CFG.get("DEBUG", False) else LOG_CAP_QUIET
         _last_ui_ts = 0.0
         _last_df_ts = 0.0
         _last_ck_ts = 0.0
@@ -12606,23 +12786,39 @@ if start_engine_btn:
         _net_streak = 0
 
         def render_buckets(snapshot):
-            for key, title in BUCKET_SPEC:
+            """ONE markdown call per bucket, not one per account line.
+
+            FIX DELTA-1 (v13.67): this opened a fresh `.container()` on the
+            placeholder and then emitted a separate widget for every line, on
+            every tick. Twelve buckets x up to 2000 lines is up to 24,000 widgets
+            per tick at 8.3 ticks a second - the delta stream outran the socket
+            and the browser answered "Failed to process a Websocket message.
+            RangeError: index out of range", after which it stopped applying
+            deltas and the page looked hung while the run carried on.
+
+            The bucket is a single HTML block now, capped at BUCKET_LIVE_TAIL.
+            The summary block still shows the full set.
+            """
+            for key, _title in BUCKET_SPEC:
                 ph = bucket_placeholders.get(key)
                 if ph is None:
                     continue
                 items = snapshot.get(key) or []
-                with ph.container():
-                    if not items:
-                        str_lit.caption("nothing here yet")
-                        continue
-                    str_lit.caption(f"{len(items)} account(s)")
-                    col = TAG_COLORS.get(BUCKET_TAGS.get(key, ""), "#cbd5e1")
-                    for ln in items[-BUCKET_RENDER_TAIL:]:
-                        str_lit.markdown(
-                            f"<div style='font-family:ui-monospace,monospace;font-size:12px;"
-                            f"color:{col}'>{html.escape(str(ln))}</div>",
-                            unsafe_allow_html=True,
-                        )
+                if not items:
+                    continue
+                col = TAG_COLORS.get(BUCKET_TAGS.get(key, ""), "#cbd5e1")
+                tail = items[-BUCKET_LIVE_TAIL:]
+                body = "".join(
+                    "<div style='font-family:ui-monospace,monospace;font-size:12px;"
+                    f"color:{col}'>{html.escape(str(ln))}</div>" for ln in tail)
+                if len(items) > len(tail):
+                    body += ("<div style='font-size:11px;opacity:.7'>+"
+                             f"{len(items) - len(tail)} more - see the summary below"
+                             "</div>")
+                try:
+                    ph.markdown(body, unsafe_allow_html=True)
+                except Exception:
+                    pass
 
         def check_task(line):
             try:
@@ -12673,6 +12869,10 @@ if start_engine_btn:
         _orig_deadline = CFG.get("ACCOUNT_DEADLINE")
         _orig_retries = CFG.get("SAME_HOST_RETRIES")
         _orig_rot = CFG.get("MAX_ROTATIONS")
+        # FIX SURVIVE-1: the journal scope is captured here, beside the originals,
+        # so the finally below can always close the right handles even if the try
+        # throws before the journal is opened.
+        _journal_scope = _gate_scope()
         try:
             # FIX ISO-5 (v13.53): the run counter is claimed HERE, as the first
             # statement inside the try, and released in the finally. Block 105 used
@@ -12690,6 +12890,12 @@ if start_engine_btn:
             STATE["runs_active"] = int(STATE.get("runs_active", 0)) + 1
             STATE["run_active"] = True
             str_lit.session_state["run_active"] = True
+            # FIX SURVIVE-1 (v13.67): every bucket gets a live file from here, so a
+            # teardown at ANY point leaves the run on disk and the reload restores
+            # it. Before this, the twelve bucket files were written only by the
+            # export block, which sits below this loop - so a teardown left nothing
+            # but the valid list, which has its own incremental writer.
+            live_journal_open(_run_stamp, _journal_scope)
 
             current_workers = CFG["MAX_WORKERS_START"]
             if CFG.get("DYNAMIC_WORKER_SCALING", False):
@@ -12792,6 +12998,11 @@ if start_engine_btn:
                                     ((_now_ui - _last_ui_ts) >= UI_MIN_INTERVAL)
                             _df_tick = ((checked_count >= total_accs)
                                         or ((_now_ui - _last_df_ts) >= REPORT_DF_MIN_INTERVAL))
+                            # FIX DELTA-1 (v13.67): buckets redraw on their own,
+                            # slower clock - they are the expensive part.
+                            _bucket_tick = ((checked_count >= total_accs)
+                                            or ((_now_ui - _last_bucket_ts)
+                                                >= BUCKET_MIN_INTERVAL))
 
                             with session_state_lock:
                                 if em_val:
@@ -12825,11 +13036,25 @@ if start_engine_btn:
                                 else:
                                     str_lit.session_state.conn_results.append(res["line"])
 
+                                # FIX SURVIVE-1 (v13.67): the result lands on disk
+                                # HERE, not at export time.
+                                _jtag = _BUCKET_TAG_BY_STATUS.get(st_val)
+                                if _jtag:
+                                    live_journal_append(_jtag, res["line"],
+                                                        _journal_scope)
+
                                 str_lit.session_state.log_lines.append(
                                     f"[{st_val.upper()}] {res.get('email', '')} -> "
                                     f"{res.get('detail', '')}")
+                                # FIX LAG-7: O(1) trim. popleft() covers the deque;
+                                # the pop(0) fallback covers a plain list, which is
+                                # what "Free my RAM" leaves behind if it is pressed
+                                # mid-run - the cap must not stop applying then.
                                 if len(str_lit.session_state.log_lines) > log_cap:
-                                    str_lit.session_state.log_lines.pop(0)
+                                    try:
+                                        str_lit.session_state.log_lines.popleft()
+                                    except AttributeError:
+                                        str_lit.session_state.log_lines.pop(0)
 
                                 trace_text = "\n  ↳ ".join(
                                     res.get("trace", ["No trace recorded"]))
@@ -12844,7 +13069,11 @@ if start_engine_btn:
                                         f"Steps Executed:\n  ↳ {trace_text}",
                                 })
                                 if len(str_lit.session_state.report_entries) > REPORT_ENTRIES_MAX:
-                                    del str_lit.session_state.report_entries[:-REPORT_ENTRIES_MAX]
+                                    try:
+                                        str_lit.session_state.report_entries.popleft()
+                                    except AttributeError:
+                                        del str_lit.session_state.report_entries[
+                                            :-REPORT_ENTRIES_MAX]
 
                                 valid_len = len(str_lit.session_state.valid_results)
                                 wrong_len = len(str_lit.session_state.wrong_results)
@@ -12876,24 +13105,36 @@ if start_engine_btn:
                                     "dns_results": list(str_lit.session_state.dns_results),
                                     "skip_results": list(str_lit.session_state.skip_results),
                                     "unknown_results": list(str_lit.session_state.unknown_results),
-                                } if _tick else {})
+                                } if _bucket_tick else {})
 
                             if _tick:
                                 _last_ui_ts = _now_ui
-                                if str_lit.session_state.get("colorize_logs", True):
-                                    log_container.markdown(colorize_logs(current_logs[-300:]),
-                                                           unsafe_allow_html=True)
-                                else:
-                                    log_container.code("\n".join(current_logs[-300:]), language="text")
+                                # FIX DELTA-1: the log tail is 150 lines, not 300,
+                                # and a torn-down delta can no longer kill the loop.
+                                try:
+                                    if str_lit.session_state.get("colorize_logs", True):
+                                        log_container.markdown(
+                                            colorize_logs(current_logs[-150:]),
+                                            unsafe_allow_html=True)
+                                    else:
+                                        log_container.code("\n".join(current_logs[-150:]),
+                                                           language="text")
+                                except Exception:
+                                    pass
 
                                 _vals = [valid_len, wrong_len, need_len, login_drop_len,
                                          conn_len, proxy_len, retry_len, rbl_len,
                                          smtp_len, skip_len, unknown_len,
                                          checked_count, total_accs]
                                 for _ph, _ml, _mv in zip(_metric_phs, _metric_labels, _vals):
-                                    _ph.metric(_ml, _mv)
+                                    try:
+                                        _ph.metric(_ml, _mv)
+                                    except Exception:
+                                        pass
 
-                                render_buckets(bucket_snapshot)
+                                if _bucket_tick:
+                                    _last_bucket_ts = _now_ui
+                                    render_buckets(bucket_snapshot)
 
                                 if _df_tick:
                                     _last_df_ts = _now_ui
@@ -12907,11 +13148,15 @@ if start_engine_btn:
                             str_lit.session_state.conn_results.append(err_msg)
                             str_lit.session_state.log_lines.append(err_msg)
                             current_logs = list(str_lit.session_state.log_lines)
-                        if str_lit.session_state.get("colorize_logs", True):
-                            log_container.markdown(colorize_logs(current_logs[-300:]),
-                                                   unsafe_allow_html=True)
-                        else:
-                            log_container.code("\n".join(current_logs[-300:]), language="text")
+                        try:
+                            if str_lit.session_state.get("colorize_logs", True):
+                                log_container.markdown(colorize_logs(current_logs[-150:]),
+                                                       unsafe_allow_html=True)
+                            else:
+                                log_container.code("\n".join(current_logs[-150:]),
+                                                   language="text")
+                        except Exception:
+                            pass
 
                     # Checkpoint on TIME as well as on count. The counter alone
                     # meant a 47-account run never reached a checkpoint before a
@@ -12922,47 +13167,67 @@ if start_engine_btn:
                     if ((checked_count % 100 == 0) or (checked_count == total_accs)
                             or (_now_ck - _last_ck_ts) >= CHECKPOINT_SECONDS):
                         _last_ck_ts = _now_ck
-                        # Heartbeat first: this is what stops tick() from calling a
-                        # healthy long run interrupted on the next page load.
+                        # Heartbeat first and cheap: this is what stops tick() from
+                        # calling a healthy long run interrupted on the next load.
                         runstate.progress(checked_count, total_accs)
-                        with session_state_lock:
-                            done = set(str_lit.session_state.checked_emails_set)
-                            valids = list(str_lit.session_state.valid_results)
-                        left = []
-                        for raw in all_target_accounts:
-                            em = raw.split(":", 1)[0].strip().lower() if ":" in raw else raw
-                            if em not in done:
-                                left.append(raw)
-                        if left:
-                            save_unfinished("In Progress (Running)", left, checked_count, total_accs)
-                        # FIX SPEED-4: clean_valid_accounts.txt is read and fully
-                        # rewritten by _write_clean_valid(). Doing that on the 5s
-                        # checkpoint put a whole-file read+write on the script
-                        # thread twelve times a minute for no new information.
+                        # FIX SURVIVE-2 (v13.67): THE HEAVY PART MOVED OFF THE 5s
+                        # CLOCK. Rebuilding `left` is one str.split() per queued
+                        # account - 120,056 of them on a real list - and
+                        # save_unfinished() then writes a ~5 MB JSON of the whole
+                        # remaining queue: twelve times a minute, on the script
+                        # thread, for a file only the stop path ever reads. The
+                        # heartbeat above keeps the watchdog honest; a queue
+                        # snapshot every 30s is still far finer than any teardown.
                         if ((checked_count >= total_accs)
-                                or ((_now_ck - _last_clean_ts) >= CLEAN_SYNC_SECONDS)):
-                            _last_clean_ts = _now_ck
-                            try:
-                                _write_clean_valid(
-                                    f"# Live sync | this run valid {len(valids)}\n", valids)
-                            except Exception:
-                                pass
+                                or (_now_ck - _last_heavy_ck_ts) >= HEAVY_CHECKPOINT_SECONDS):
+                            _last_heavy_ck_ts = _now_ck
+                            with session_state_lock:
+                                done = set(str_lit.session_state.checked_emails_set)
+                                valids = list(str_lit.session_state.valid_results)
+                            left = []
+                            for raw in all_target_accounts:
+                                em = (raw.split(":", 1)[0].strip().lower()
+                                      if ":" in raw else raw)
+                                if em not in done:
+                                    left.append(raw)
+                            if left:
+                                save_unfinished("In Progress (Running)", left,
+                                                checked_count, total_accs)
+                            # FIX SPEED-4: clean_valid_accounts.txt is read and fully
+                            # rewritten by _write_clean_valid(). Doing that on the 5s
+                            # checkpoint put a whole-file read+write on the script
+                            # thread twelve times a minute for no new information.
+                            if ((checked_count >= total_accs)
+                                    or ((_now_ck - _last_clean_ts) >= CLEAN_SYNC_SECONDS)):
+                                _last_clean_ts = _now_ck
+                                try:
+                                    _write_clean_valid(
+                                        f"# Live sync | this run valid {len(valids)}\n",
+                                        valids)
+                                except Exception:
+                                    pass
 
                     if total_accs > 0:
                         pct = min(1.0, checked_count / total_accs)
-                        progress_bar.progress(
-                            pct, text=f"Checking accounts [{engine_action_mode}]: "
-                                      f"{checked_count}/{total_accs} ({int(pct * 100)}%)")
+                        try:
+                            progress_bar.progress(
+                                pct, text=f"Checking accounts [{engine_action_mode}]: "
+                                          f"{checked_count}/{total_accs} ({int(pct * 100)}%)")
+                        except Exception:
+                            pass
                     with session_state_lock:
                         v_len = len(str_lit.session_state.valid_results)
                         w_len = len(str_lit.session_state.wrong_results)
                         rt_len = len(str_lit.session_state.retry_results)
                         px_len = len(str_lit.session_state.proxy_results)
                         ld_len = len(str_lit.session_state.login_drop_results)
-                    status_text.text(
-                        f"Progress: {checked_count}/{total_accs} | Valid: {v_len} | "
-                        f"Wrong: {w_len} | Login Dropped: {ld_len} | Proxy Dead: {px_len} | "
-                        f"RETRY_LATER: {rt_len}")
+                    try:
+                        status_text.text(
+                            f"Progress: {checked_count}/{total_accs} | Valid: {v_len} | "
+                            f"Wrong: {w_len} | Login Dropped: {ld_len} | Proxy Dead: {px_len} | "
+                            f"RETRY_LATER: {rt_len}")
+                    except Exception:
+                        pass
 
             finally:
                 executor.shutdown(wait=False)
@@ -13011,6 +13276,9 @@ if start_engine_btn:
                         detected_stop_reason = f"Unexpected Error / Interruption: {be}"
             runstate.note(detected_stop_reason)
         finally:
+            # FIX SURVIVE-1 (v13.67): flush and close THIS run's bucket handles
+            # before anything else can touch those files.
+            live_journal_close(_journal_scope)
             # Restore the slider's own values so the sidebar does not report
             # unapplied settings after a run that used the tail caps.
             if _orig_deadline is not None:
@@ -13064,11 +13332,14 @@ if start_engine_btn:
 
         invalidate_valid_caches()
 
-        progress_bar.progress(1.0, text="Checking complete!")
-        status_text.success(
-            f"🎉 Check Complete! Started: {str_lit.session_state.start_timestamp} | "
-            f"Ended: {str_lit.session_state.end_timestamp} | "
-            f"Duration: {str_lit.session_state.total_duration}")
+        try:
+            progress_bar.progress(1.0, text="Checking complete!")
+            status_text.success(
+                f"🎉 Check Complete! Started: {str_lit.session_state.start_timestamp} | "
+                f"Ended: {str_lit.session_state.end_timestamp} | "
+                f"Duration: {str_lit.session_state.total_duration}")
+        except Exception:
+            pass
 # @@END 106 RUN_LOOP
 
 # @@BLOCK 107 RUN_EXPORT deps=078,106
@@ -13081,7 +13352,11 @@ if start_engine_btn:
             except Exception:
                 pass
 
-            stamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+            # FIX SURVIVE-1 (v13.67): the journal already wrote these exact files
+            # during the run, so the export must land on the SAME stamp. A fresh
+            # stamp here would leave the live files orphaned and this export empty.
+            live_journal_close(_journal_scope)
+            stamp = _run_stamp
             valid_path = os.path.join(CFG["RESULTS_DIR"], f"valid_{stamp}.txt")
             wrong_path = os.path.join(CFG["RESULTS_DIR"], f"wrong_{stamp}.txt")
             need_path = os.path.join(CFG["RESULTS_DIR"], f"need_app_{stamp}.txt")
@@ -13277,10 +13552,12 @@ if str_lit.session_state.engine_has_run or _persisted_valid:
         ("📮 SMTP Failed", smtp_len_val),
         ("⏭ Skipped", skip_len_val),
         ("❓ Unclassified", unknown_len_val),
+        # v13.67: smtp/dns were missing from this sum while both rows are printed
+        # above it, so the total never matched the table.
         ("📚 Accounts In Buckets",
          clean_count_val + wrong_len_val + need_len_val + login_drop_len_val
          + conn_len_val + proxy_len_val + rbl_len_val + retry_len_val + skip_len_val
-         + unknown_len_val),
+         + unknown_len_val + smtp_len_val + dns_len_val),
     ]
     for _sc, (_sl, _sv) in zip(metric_grid(_s_pairs, per_row=3), _s_pairs):
         _sc.metric(_sl, _sv)
@@ -13532,8 +13809,10 @@ else:
         selected_combo = str_lit.selectbox("Select Valid Account to Read:",
                                            options=valid_combo_options, key="bb_reader_acct",
                                            on_change=_on_reader_change)
+        # FIX W-3 (v13.67): positional default removed - _seed_widget() has
+        # already written the key, and passing both warned on every load.
         _seed_widget("bb_reader_max", lo=1, hi=50, dflt=10)
-        max_msgs = str_lit.slider("Number of Recent Messages to Fetch", 1, 50, 1,
+        max_msgs = str_lit.slider("Number of Recent Messages to Fetch", 1, 50,
                                   key="bb_reader_max", on_change=_on_reader_change)
 
         allow_remote = str_lit.checkbox(
