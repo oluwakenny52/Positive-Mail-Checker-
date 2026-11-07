@@ -12869,6 +12869,29 @@ if start_engine_btn:
         _orig_deadline = CFG.get("ACCOUNT_DEADLINE")
         _orig_retries = CFG.get("SAME_HOST_RETRIES")
         _orig_rot = CFG.get("MAX_ROTATIONS")
+        # FIX CLOCK-SEED (v13.68) - THIS IS THE CRASH THAT LEFT checked=1/15.
+        #
+        # Block 105 seeds five clocks (_last_ui_ts, _last_df_ts, _last_ck_ts,
+        # _last_clean_ts, _net_streak) but this block reads SEVEN. It also reads
+        # _last_bucket_ts and _last_heavy_ck_ts, and both were only ever ASSIGNED
+        # further down inside the loop - so on the first completed account they
+        # were still unbound.
+        #
+        # The damage was two-stage:
+        #   * _last_bucket_ts is read in the UI-tick block, which sits INSIDE the
+        #     per-account try/except -> NameError swallowed, logged as
+        #     "[EXCEPTION] name '_last_bucket_ts' is not defined", tick aborted.
+        #   * _last_heavy_ck_ts is read in the CHECKPOINT, which sits OUTSIDE
+        #     that try -> the NameError escaped to `except BaseException` and
+        #     ENDED THE RUN on account 1, leaving checked=1/15 and 14 left.
+        #
+        # Both are seeded here, on the start path, before the try, in the same
+        # scope the reads happen in. 0.0 is the correct sentinel and NOT "now":
+        # it forces the first bucket render and the first heavy checkpoint
+        # immediately, so unfinished_live.json exists after the first result
+        # instead of thirty seconds later.
+        _last_bucket_ts = 0.0
+        _last_heavy_ck_ts = 0.0
         # FIX SURVIVE-1: the journal scope is captured here, beside the originals,
         # so the finally below can always close the right handles even if the try
         # throws before the journal is opened.
@@ -13167,45 +13190,57 @@ if start_engine_btn:
                     if ((checked_count % 100 == 0) or (checked_count == total_accs)
                             or (_now_ck - _last_ck_ts) >= CHECKPOINT_SECONDS):
                         _last_ck_ts = _now_ck
-                        # Heartbeat first and cheap: this is what stops tick() from
-                        # calling a healthy long run interrupted on the next load.
-                        runstate.progress(checked_count, total_accs)
-                        # FIX SURVIVE-2 (v13.67): THE HEAVY PART MOVED OFF THE 5s
-                        # CLOCK. Rebuilding `left` is one str.split() per queued
-                        # account - 120,056 of them on a real list - and
-                        # save_unfinished() then writes a ~5 MB JSON of the whole
-                        # remaining queue: twelve times a minute, on the script
-                        # thread, for a file only the stop path ever reads. The
-                        # heartbeat above keeps the watchdog honest; a queue
-                        # snapshot every 30s is still far finer than any teardown.
-                        if ((checked_count >= total_accs)
-                                or (_now_ck - _last_heavy_ck_ts) >= HEAVY_CHECKPOINT_SECONDS):
-                            _last_heavy_ck_ts = _now_ck
-                            with session_state_lock:
-                                done = set(str_lit.session_state.checked_emails_set)
-                                valids = list(str_lit.session_state.valid_results)
-                            left = []
-                            for raw in all_target_accounts:
-                                em = (raw.split(":", 1)[0].strip().lower()
-                                      if ":" in raw else raw)
-                                if em not in done:
-                                    left.append(raw)
-                            if left:
-                                save_unfinished("In Progress (Running)", left,
-                                                checked_count, total_accs)
-                            # FIX SPEED-4: clean_valid_accounts.txt is read and fully
-                            # rewritten by _write_clean_valid(). Doing that on the 5s
-                            # checkpoint put a whole-file read+write on the script
-                            # thread twelve times a minute for no new information.
+                        # FIX CK-GUARD (v13.68): THE WHOLE CHECKPOINT IS GUARDED
+                        # NOW. It runs on the script thread and every part of it
+                        # touches the disk, so one ENOSPC or one unreadable record
+                        # used to end the run exactly the way the missing clock
+                        # did. Both stamps are set BEFORE the try, so a failing
+                        # checkpoint backs off instead of retrying every account.
+                        try:
+                            # Heartbeat first and cheap: this is what stops tick()
+                            # from calling a healthy long run interrupted on the
+                            # next load.
+                            runstate.progress(checked_count, total_accs)
+                            # FIX SURVIVE-2 (v13.67): THE HEAVY PART MOVED OFF THE
+                            # 5s CLOCK. Rebuilding `left` is one str.split() per
+                            # queued account - 120,056 of them on a real list - and
+                            # save_unfinished() then writes a ~5 MB JSON of the
+                            # whole remaining queue: twelve times a minute, on the
+                            # script thread, for a file only the stop path ever
+                            # reads. The heartbeat above keeps the watchdog honest;
+                            # a queue snapshot every 30s is still far finer than
+                            # any teardown.
                             if ((checked_count >= total_accs)
-                                    or ((_now_ck - _last_clean_ts) >= CLEAN_SYNC_SECONDS)):
-                                _last_clean_ts = _now_ck
-                                try:
-                                    _write_clean_valid(
-                                        f"# Live sync | this run valid {len(valids)}\n",
-                                        valids)
-                                except Exception:
-                                    pass
+                                    or (_now_ck - _last_heavy_ck_ts) >= HEAVY_CHECKPOINT_SECONDS):
+                                _last_heavy_ck_ts = _now_ck
+                                with session_state_lock:
+                                    done = set(str_lit.session_state.checked_emails_set)
+                                    valids = list(str_lit.session_state.valid_results)
+                                left = []
+                                for raw in all_target_accounts:
+                                    em = (raw.split(":", 1)[0].strip().lower()
+                                          if ":" in raw else raw)
+                                    if em not in done:
+                                        left.append(raw)
+                                if left:
+                                    save_unfinished("In Progress (Running)", left,
+                                                    checked_count, total_accs)
+                                # FIX SPEED-4: clean_valid_accounts.txt is read and
+                                # fully rewritten by _write_clean_valid(). Doing that
+                                # on the 5s checkpoint put a whole-file read+write on
+                                # the script thread twelve times a minute for no new
+                                # information.
+                                if ((checked_count >= total_accs)
+                                        or ((_now_ck - _last_clean_ts) >= CLEAN_SYNC_SECONDS)):
+                                    _last_clean_ts = _now_ck
+                                    try:
+                                        _write_clean_valid(
+                                            f"# Live sync | this run valid {len(valids)}\n",
+                                            valids)
+                                    except Exception:
+                                        pass
+                        except Exception as _ck_err:
+                            log_probe_event(f"checkpoint skipped: {_ck_err}")
 
                     if total_accs > 0:
                         pct = min(1.0, checked_count / total_accs)
@@ -13297,16 +13332,25 @@ if start_engine_btn:
             STATE["runs_active"] = max(0, int(STATE.get("runs_active", 0)) - 1)
             STATE["run_active"] = STATE["runs_active"] > 0
             str_lit.session_state["run_active"] = False
-            with session_state_lock:
-                done = set(str_lit.session_state.checked_emails_set)
-            left = [raw for raw in all_target_accounts
-                    if (raw.split(":", 1)[0].strip().lower() if ":" in raw else raw) not in done]
-            if checked_count >= total_accs and not run_interrupted:
-                # Clean completion: close the watchdog record, then drop the data.
-                runstate.finish()
-                clear_unfinished()
-            elif left:
-                save_unfinished(detected_stop_reason, left, checked_count, total_accs)
+            # FIX FIN-GUARD (v13.68): A RAISE IN THIS finally SKIPPED BLOCKS 107
+            # AND 108 ENTIRELY. Both sit AFTER the try/finally in the same branch,
+            # so a disk error here meant no result files, no ZIP and no summary -
+            # and a raise inside a finally also masks the exception that got us
+            # here. The bookkeeping is guarded; the export is not optional.
+            try:
+                with session_state_lock:
+                    done = set(str_lit.session_state.checked_emails_set)
+                left = [raw for raw in all_target_accounts
+                        if (raw.split(":", 1)[0].strip().lower()
+                            if ":" in raw else raw) not in done]
+                if checked_count >= total_accs and not run_interrupted:
+                    # Clean completion: close the watchdog record, then drop the data.
+                    runstate.finish()
+                    clear_unfinished()
+                elif left:
+                    save_unfinished(detected_stop_reason, left, checked_count, total_accs)
+            except Exception as _fin_err:
+                log_probe_event(f"run record could not be finalised: {_fin_err}")
 
         end_dt = datetime.now()
         duration = end_dt - start_dt
