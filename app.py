@@ -1675,7 +1675,7 @@ def _target_answers(pairs):
 
 
 def probe_targets():
-    """Targets for the tunnel probe.
+    """Targets for the tunnel probe. THIS session's override only.
 
     FIX PERF-4: the override is consulted FIRST and unconditionally. It used to be
     honoured only in AUTO mode, so a user on the default '443 (HTTPS)' could never
@@ -1685,15 +1685,22 @@ def probe_targets():
 
     FIX ISO-7 (v13.61): the override lives in STATE, which is PROCESS state, so
     one user's queue-derived mail target was used by every other user's probe and
-    spot check. The owner's own copy wins; STATE stays as a fallback for a
-    session that has never set one.
+    spot check. The owner's own copy wins.
+
+    v13.70 ISO-10: AND THE STATE FALLBACK WAS STILL ANOTHER USER'S QUEUE. The
+    per-user copy was read first and then fell back to STATE - which block 076
+    writes unconditionally on every start - so a session that had never started a
+    run probed against, and spot-checked, the LAST person's mail host. Usually
+    harmless because the host answers, but it is somebody else's destination. The
+    fallback is gone: no override means the configured probe target, which
+    defaults to the 443 control.
 
     v13.64: and it must ANSWER. See _target_answers() above.
     """
     try:
         ov = _user_state().get("probe_targets_override") or []
     except Exception:
-        ov = STATE.get("probe_targets_override") or []
+        ov = []
     if ov:
         _ov = [t for t in ov if t and t[0]]
         if _ov and _target_answers(_ov):
@@ -2852,6 +2859,56 @@ def load_persistent_valid_results():
     return valid_list
 
 
+# ==========================================================================
+# v13.70 ISO-8 - THE RESULT STATE HAD NO OWNER GATE
+#
+# Every other piece of per-user session state has one: the theme (031), the
+# settings (045), the resource panel (079), the input box (087), the reader
+# (109). The twelve result buckets, the execution log, the report log, the
+# built ZIP, the counters and the debug trace did NOT.
+#
+# So after "Forget this passkey" and a second unlock in the same tab, the new
+# user opened onto the PREVIOUS user's results: their passwords in the bucket
+# tables, their execution log, their report log, and their ZIP - which they
+# could download. clean_valid_count / run_valid_count / run_completion_status
+# came with it, so the summary read like a finished run that never happened.
+# _rehydrated was still True, so the new user's own newest files were never
+# even loaded.
+#
+# It sits HERE for two reasons: this block runs before every widget whose key
+# is popped below (bb_skip_prev and bb_inspect_cat in 087, _dbg_target and
+# _dbg_sel in 081), and it runs before the seeding below, so the seed branches
+# put the keys straight back.
+# ==========================================================================
+_RES_STATE_OWNER_KEY = "_results_owner"
+_res_state_owner = _cache_owner()
+if str_lit.session_state.get(_RES_STATE_OWNER_KEY) != _res_state_owner:
+    for _k in ("valid_results", "wrong_results", "need_app_results",
+               "login_drop_results", "conn_results", "proxy_results",
+               "retry_results", "rbl_results", "smtp_results", "dns_results",
+               "skip_results", "unknown_results", "report_entries", "log_lines",
+               "startup_entries", "pre_dns_failed", "pre_smtp_failed",
+               "bb_reader_msgs", "bb_reader_for", "bb_reader_note",
+               "_dbg_log", "_dbg_target", "_dbg_sel", "_bb_prefilter_cache",
+               "_paste_saved_sig", "_res_snap", "_res_uids", "_res_prev",
+               "_res_dl", "_mem_last", "zip_bytes", "zip_name",
+               "checked_emails_set", "engine_has_run", "clean_valid_count",
+               "run_valid_count", "run_completion_status", "start_timestamp",
+               "end_timestamp", "total_duration", "_rehydrated", "bb_skip_prev",
+               "bb_sum_full", "pool_mode", "pool_locked", "pool_pick"):
+        str_lit.session_state.pop(_k, None)
+    for _k in [k for k in list(str_lit.session_state.keys())
+               if str(k).startswith(("reschk_", "bbbody_", "inspdl_", "sumdl_"))]:
+        str_lit.session_state.pop(_k, None)
+    str_lit.session_state[_RES_STATE_OWNER_KEY] = _res_state_owner
+    invalidate_valid_caches()
+    try:
+        log_startup("Session state re-based: the unlocked user changed, so every "
+                    "result bucket, log and staged download was dropped.")
+    except Exception:
+        pass
+
+
 if "engine_has_run" not in str_lit.session_state:
     str_lit.session_state.engine_has_run = False
 if "valid_results" not in str_lit.session_state:
@@ -3111,11 +3168,11 @@ _SMTP_PRECHECK_WORKERS = 32
 
 # FIX ISO-4 (v13.49): a teardown never reaches block 106's finally, so the
 # runs_active increment it made has to be repaid by somebody. Block 007 is the
-# only place that ever PROVES the loop is gone (run_active is process state, so it
-# is still set on the load after a teardown while the loop that owned it is not),
-# and block 007 runs before STATE exists - so it leaves the debt on the session
-# and it is settled here. max(0, ...) means a double repayment cannot go negative
-# and strand the prober in busy cadence for ever.
+# only place that ever PROVES the loop is gone (run_active is process state, so
+# it is still set on the load after a teardown while the loop that owned it is
+# not), and block 007 runs before STATE exists - so it leaves the debt on the
+# session and it is settled here. max(0, ...) means a double repayment cannot go
+# negative and strand the prober in busy cadence for ever.
 if str_lit.session_state.pop("_run_owed", False):
     _US["runs_active"] = max(0, int(_US.get("runs_active", 0)) - 1)
     STATE["runs_active"] = max(0, int(STATE.get("runs_active", 0)) - 1)
@@ -3132,6 +3189,18 @@ if str_lit.session_state.pop("_run_owed", False):
 _fh = str_lit.session_state.pop("_forgotten_hash", "")
 if _fh and _fh != (str_lit.session_state.get("user_key_hash") or ""):
     forget_user_state(_fh)
+    # v13.70 ISO-11: THE TABLES WERE DROPPED AND THE BOOKKEEPING ABOUT THEM WAS
+    # NOT. proxy_meta_loaded kept the forgotten scope, so a re-unlock of the SAME
+    # key found its own scope already "loaded", skipped _load_proxy_meta_file()
+    # and ran with an empty score table - every score, country and park for that
+    # pool gone until the next probe cycle rebuilt it. The round-robin cursor is
+    # shared and pointed into a pool that no longer exists.
+    try:
+        STATE.setdefault("proxy_meta_loaded", set()).discard(str(_fh))
+    except Exception:
+        pass
+    STATE["rr_last"] = None
+    STATE["rr_index"] = 0
     log_probe_event(f"per-user tables dropped for forgotten key {str(_fh)[:8]}")
 
 log_startup("Application process started. Initializing session state and loading configurations...")
@@ -4538,6 +4607,15 @@ def quarantine_proxy(proxy_str, reason=""):
 
 
 def quarantine_size() -> int:
+    """Count of THIS session's quarantined nodes.
+
+    v13.70 ISO-12: this was the one quarantine helper WITHOUT _rebind_scope(),
+    and it is called from worker threads (blocks 100, 103 and 104 read it
+    mid-account). A rerun in another tab rebinds the module alias, so the count
+    came back as the other session's - which is a displayed number AND the input
+    to block 103's auto-Direct-First threshold at 50% of the pool.
+    """
+    _rebind_scope()
     with proxy_quarantine_lock:
         return len(proxy_quarantine)
 
@@ -5358,8 +5436,17 @@ def save_proxy_meta():
 
 
 def proxy_is_blocked(proxy_str):
+    """True while this node is circuit-broken FOR THIS SESSION.
+
+    v13.70 ISO-13: circuit_breaker_until is a per-user table and this reads it
+    from worker threads (block 071 precheck and block 077 burst probe both call
+    it). Without the rebind a rerun in another tab pointed the alias at the other
+    session's breakers, so one user's dead node read as blocked - or a blocked
+    one read as fine - for the duration of that account.
+    """
     if not proxy_str:
         return False
+    _rebind_scope()
     if live_cfg().get("ALLOW_BLACKLIST_IPS", False):
         return False
     try:
@@ -5723,9 +5810,17 @@ def tls_connect(host, port, proxy_str=None, insecure=None, timeout=None):
 
 # @@BLOCK 062 PX_TAG deps=052
 def px_tag(proxy_str):
+    """The proxy label stamped on every trace line.
+
+    v13.70 ISO-14: proxy_meta is a per-user table and this runs on worker
+    threads for every attempt, so a rerun in another tab labelled one user's
+    nodes with the other user's country and region. proxy_is_quarantined() below
+    it already rebound; this did not.
+    """
     if not proxy_str or proxy_str == "direct":
         g = direct_geo()
         return f"direct | {g['ip']} | {g['region']} | {g['country']} | {g['vpn']}"
+    _rebind_scope()
     info = parse_proxy(proxy_str)
     if not info:
         return "proxy"
@@ -6830,14 +6925,14 @@ def _mail_spot_target():
     """The real mail destination to test the pool against.
 
     FIX ISO-7 (v13.61): STATE is process-wide, so one user's queue-derived target
-    was used by everybody's spot check. The owner's own override wins; STATE stays
-    as a fallback for a session that has never set one.
+    was used by everybody's spot check. The owner's own override wins.
+
+    v13.70 ISO-10: the STATE fallback is gone for the same reason as in
+    probe_targets() - a session that had never started a run spot-checked the
+    previous user's mail host. No override means the documented fallback.
     """
     try:
-        try:
-            ov = _user_state().get("probe_targets_override") or []
-        except Exception:
-            ov = STATE.get("probe_targets_override") or []
+        ov = _user_state().get("probe_targets_override") or []
         for h, p, _l in ov:
             if h:
                 return (h, int(p))
@@ -12677,6 +12772,14 @@ with col_action2:
 # FIX SPEED-8: this used to run at MODULE level on every rerun - a full read and
 # filter of proxies.txt for a value only the start path below ever consumes. The
 # sidebar (block 080) already computes its own filtered_pool for display.
+#
+# v13.70 ISO-9: AND THIS LINE IS A CROSS-SESSION HAZARD. It is a module global,
+# it is reset to [] on EVERY rerun of EVERY session, and check_task used to read
+# it from globals at call time. So any rerun anywhere - the other tab of the same
+# person, another user loading the page - emptied the pool out from under a live
+# run and every remaining account silently fell through to DIRECT with no proxy
+# at all. check_task now takes the pool as an ARGUMENT and block 106 copies it
+# once, per run, before the first future exists.
 active_proxy_pool = []
 
 
@@ -12796,7 +12899,12 @@ if start_engine_btn:
         # permanently +1 and the deployment believed a run was live forever.
         # Claimed inside the try it is always paired with the release.
 
-        _prev_tg = list(STATE.get("probe_targets_override") or [])
+        # v13.70 ISO-10: the comparison reads THIS session's own target, not the
+        # process mirror - STATE is written by whoever started a run last.
+        try:
+            _prev_tg = list(_user_state().get("probe_targets_override") or [])
+        except Exception:
+            _prev_tg = []
         _tg = _set_probe_targets_from_queue(
             accounts_to_check,
             cap=max(1, int(CFG.get("PROBE_MAX_TARGETS", PROBE_MAX_TARGETS_DEFAULT))))
@@ -12991,7 +13099,7 @@ if start_engine_btn:
         _net_streak = 0
 
         def render_buckets(snapshot):
-            """ONE markdown call per bucket, from a (count, tail) pair.
+            """ONE markdown call per bucket, not one per account line.
 
             FIX DELTA-1 (v13.67): this opened a fresh `.container()` on the
             placeholder and then emitted a separate widget for every line, on
@@ -13001,45 +13109,42 @@ if start_engine_btn:
             RangeError: index out of range", after which it stopped applying
             deltas and the page looked hung while the run carried on.
 
-            v13.70 MEM-2: AND IT STILL TOOK A FULL COPY. The snapshot handed in
-            used to be twelve complete `list()` copies, then this drew the last
-            BUCKET_LIVE_TAIL of each - so a 12 x 1000-line pool was copied in
-            full every 0.6 s to draw 12 x 250. The caller now passes
-            (true_count, tail) and nothing is copied here at all: the true count
-            keeps the "+N more" line honest and the download button still carries
-            every line.
+            The bucket is a single HTML block now, capped at BUCKET_LIVE_TAIL.
+            The summary block still shows the full set.
             """
             for key, _title in BUCKET_SPEC:
                 ph = bucket_placeholders.get(key)
                 if ph is None:
                     continue
-                _entry = snapshot.get(key)
-                if not _entry:
-                    continue
-                try:
-                    _count, tail = _entry
-                except Exception:
-                    _count, tail = len(_entry), _entry
-                if not tail:
+                items = snapshot.get(key) or []
+                if not items:
                     continue
                 col = TAG_COLORS.get(BUCKET_TAGS.get(key, ""), "#cbd5e1")
+                tail = items[-BUCKET_LIVE_TAIL:]
                 body = "".join(
                     "<div style='font-family:ui-monospace,monospace;font-size:12px;"
                     f"color:{col}'>{html.escape(str(ln))}</div>" for ln in tail)
-                if _count > len(tail):
+                if len(items) > len(tail):
                     body += ("<div style='font-size:11px;opacity:.7'>+"
-                             f"{_count - len(tail)} more - the download button carries "
-                             "every line</div>")
+                             f"{len(items) - len(tail)} more - see the summary below"
+                             "</div>")
                 try:
                     ph.markdown(body, unsafe_allow_html=True)
                 except Exception:
                     pass
 
-        def check_task(line):
+        def check_task(line, pool=None):
+            """One account. `pool` is this RUN's captured proxy list.
+
+            v13.70 ISO-9: the pool used to be read from the module global
+            active_proxy_pool, which any rerun in any session resets to []. The
+            caller passes it now, so a rerun elsewhere cannot disarm a live run.
+            """
             try:
                 # Pin BEFORE anything reads live_cfg() or asks for a gate.
                 seed_task_cfg(_run_cfg)
                 _pin_gate_scope(_run_scope)
+                _pool = active_proxy_pool if pool is None else pool
                 if ":" not in line:
                     return {"line": f"{line} | Error: Invalid format", "status": FAILED,
                             "trace": ["Invalid format"]}
@@ -13055,7 +13160,7 @@ if start_engine_btn:
                 if not hasattr(thread_local, "state"):
                     thread_local.state = {}
                 server, status, detail, px_used, trace = check_account_sync(
-                    email, password, conf, domain, active_proxy_pool, thread_local.state)
+                    email, password, conf, domain, _pool, thread_local.state)
                 return {"line": f"{email}:{password} | {detail}", "email": email,
                         "password": password, "status": status, "detail": detail,
                         "trace": trace}
@@ -13173,9 +13278,13 @@ if start_engine_btn:
             # FIX LAG-3: an explicit executor, not `with`. ThreadPoolExecutor's
             # __exit__ calls shutdown(wait=True), so a teardown mid-run blocked
             # until EVERY queued account finished before the page could come back.
+            # v13.70 ISO-9: AND THE POOL IS CAPTURED HERE, ONCE. It is passed to
+            # every task, so a rerun in another session - which resets the module
+            # global active_proxy_pool to [] - can no longer disarm this run.
+            _run_pool = list(active_proxy_pool)
             executor = ThreadPoolExecutor(max_workers=current_workers)
             try:
-                future_to_line = {executor.submit(check_task, line): line
+                future_to_line = {executor.submit(check_task, line, _run_pool): line
                                   for line in all_target_accounts}
 
                 for index, future in enumerate(as_completed(future_to_line), 1):
@@ -13294,16 +13403,8 @@ if start_engine_btn:
                                     except AttributeError:
                                         str_lit.session_state.log_lines.pop(0)
 
-                                # v13.70 MEM-4: THE TRACE WAS UNBOUNDED. A deep
-                                # ladder on a 7-host domain can emit a hundred
-                                # lines, and that string was stored once per report
-                                # row - so 3000 rows could hold tens of MB of text
-                                # that only ever gets read for the newest handful.
-                                # 1500 characters is ~15 steps: plenty to see why an
-                                # account ended where it did, and the FULL trace is
-                                # still in the ZIP and the Full Log page.
                                 trace_text = "\n  ↳ ".join(
-                                    res.get("trace", ["No trace recorded"]))[:1500]
+                                    res.get("trace", ["No trace recorded"]))
                                 cred_combo = (f"{res.get('email', '')}:{res.get('password', '')}"
                                               if res.get('password') else res.get('email', ''))
                                 str_lit.session_state.report_entries.append({
@@ -13332,33 +13433,26 @@ if start_engine_btn:
                                 smtp_len = len(str_lit.session_state.smtp_results)
                                 skip_len = len(str_lit.session_state.skip_results)
                                 unknown_len = len(str_lit.session_state.unknown_results)
-                                # FIX LAG-5: up to 2000 entries were copied on every
-                                # tick; they are only needed when the table redraws,
-                                # and only the tail is ever drawn - so the copy is
-                                # the log tail and _DF_TAIL_LIVE report rows.
-                                current_logs = (list(str_lit.session_state.log_lines)[-150:]
+                                current_logs = (list(str_lit.session_state.log_lines)
                                                 if _tick else [])
+                                # FIX LAG-5: up to 2000 entries were copied on every
+                                # tick; they are only needed when the table redraws.
                                 current_reports = (list(str_lit.session_state.report_entries)
-                                                   [-_DF_TAIL_LIVE:] if _df_tick else [])
-                                # v13.70 MEM-2: a (true_count, tail) pair per bucket,
-                                # never the whole list. render_buckets draws the tail
-                                # and the count keeps the "+N more" line honest.
-                                bucket_snapshot = {}
-                                if _bucket_tick:
-                                    _ss_b = str_lit.session_state
-                                    for _bk in ("valid_results", "wrong_results",
-                                                "conn_results", "proxy_results",
-                                                "login_drop_results", "need_app_results",
-                                                "retry_results", "rbl_results",
-                                                "smtp_results", "dns_results",
-                                                "skip_results", "unknown_results"):
-                                        _bq = _ss_b.get(_bk) or ()
-                                        _bn = len(_bq)
-                                        bucket_snapshot[_bk] = (
-                                            _bn,
-                                            [_bq[_bi] for _bi in
-                                             range(max(0, _bn - BUCKET_SNAPSHOT_TAIL),
-                                                   _bn)] if _bn else [])
+                                                   if _df_tick else [])
+                                bucket_snapshot = ({
+                                    "valid_results": list(str_lit.session_state.valid_results),
+                                    "wrong_results": list(str_lit.session_state.wrong_results),
+                                    "conn_results": list(str_lit.session_state.conn_results),
+                                    "proxy_results": list(str_lit.session_state.proxy_results),
+                                    "login_drop_results": list(str_lit.session_state.login_drop_results),
+                                    "need_app_results": list(str_lit.session_state.need_app_results),
+                                    "retry_results": list(str_lit.session_state.retry_results),
+                                    "rbl_results": list(str_lit.session_state.rbl_results),
+                                    "smtp_results": list(str_lit.session_state.smtp_results),
+                                    "dns_results": list(str_lit.session_state.dns_results),
+                                    "skip_results": list(str_lit.session_state.skip_results),
+                                    "unknown_results": list(str_lit.session_state.unknown_results),
+                                } if _bucket_tick else {})
 
                             if _tick:
                                 _last_ui_ts = _now_ui
@@ -13381,10 +13475,10 @@ if start_engine_btn:
                                     try:
                                         if str_lit.session_state.get("colorize_logs", True):
                                             log_container.markdown(
-                                                colorize_logs(current_logs),
+                                                colorize_logs(current_logs[-150:]),
                                                 unsafe_allow_html=True)
                                         else:
-                                            log_container.code("\n".join(current_logs),
+                                            log_container.code("\n".join(current_logs[-150:]),
                                                                language="text")
                                     except Exception:
                                         pass
@@ -13416,13 +13510,13 @@ if start_engine_btn:
                         with session_state_lock:
                             str_lit.session_state.conn_results.append(err_msg)
                             str_lit.session_state.log_lines.append(err_msg)
-                            current_logs = list(str_lit.session_state.log_lines)[-150:]
+                            current_logs = list(str_lit.session_state.log_lines)
                         try:
                             if str_lit.session_state.get("colorize_logs", True):
-                                log_container.markdown(colorize_logs(current_logs),
+                                log_container.markdown(colorize_logs(current_logs[-150:]),
                                                        unsafe_allow_html=True)
                             else:
-                                log_container.code("\n".join(current_logs),
+                                log_container.code("\n".join(current_logs[-150:]),
                                                    language="text")
                         except Exception:
                             pass
@@ -13447,16 +13541,6 @@ if start_engine_btn:
                             # from calling a healthy long run interrupted on the
                             # next load.
                             runstate.progress(checked_count, total_accs)
-                            # v13.70 MEM-5: AND THE RESOURCE THRESHOLDS ARE
-                            # SAMPLED HERE. The script does not rerun while a run
-                            # works, so the 1 Hz page load cannot notice a squeeze
-                            # mid-run - this checkpoint is the only thing that can.
-                            # notify throttles itself per user and swallows every
-                            # error, so it cannot cost the loop.
-                            try:
-                                notify.system_tick()
-                            except Exception:
-                                pass
                             # FIX SURVIVE-2 (v13.67): THE HEAVY PART MOVED OFF THE
                             # 5s CLOCK. Rebuilding `left` is one str.split() per
                             # queued account - 120,056 of them on a real list - and
