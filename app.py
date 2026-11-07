@@ -12773,14 +12773,19 @@ with col_action2:
 # filter of proxies.txt for a value only the start path below ever consumes. The
 # sidebar (block 080) already computes its own filtered_pool for display.
 #
-# v13.70 ISO-9: AND THIS LINE IS A CROSS-SESSION HAZARD. It is a module global,
-# it is reset to [] on EVERY rerun of EVERY session, and check_task used to read
-# it from globals at call time. So any rerun anywhere - the other tab of the same
+# v13.70 ISO-9: AND IT IS A CROSS-SESSION HAZARD. It is a module global, it is
+# reset to [] on EVERY rerun of EVERY session, and check_task used to read it
+# from globals at call time. So any rerun anywhere - the other tab of the same
 # person, another user loading the page - emptied the pool out from under a live
-# run and every remaining account silently fell through to DIRECT with no proxy
-# at all. check_task now takes the pool as an ARGUMENT and block 106 copies it
-# once, per run, before the first future exists.
+# run and every remaining account silently fell through to DIRECT with no proxy.
+#
+# _run_pool_box is the fix: a fresh list per run, captured by check_task as a
+# DEFAULT ARGUMENT (so it binds the object, not the name) and filled once by
+# block 106 before the first future exists. A rerun rebinding the module name
+# cannot reach the list the live closure already holds. The submit call stays
+# exactly `executor.submit(check_task, line)`, which verify_v1337.py gates.
 active_proxy_pool = []
+_run_pool_box = []
 
 
 # v13.53: progress_bar / status_text are bound at MODULE scope behind a null shim.
@@ -13133,18 +13138,23 @@ if start_engine_btn:
                 except Exception:
                     pass
 
-        def check_task(line, pool=None):
-            """One account. `pool` is this RUN's captured proxy list.
+        def check_task(line, _box=_run_pool_box):
+            """One account. `_box` is this RUN's captured proxy list.
 
             v13.70 ISO-9: the pool used to be read from the module global
-            active_proxy_pool, which any rerun in any session resets to []. The
-            caller passes it now, so a rerun elsewhere cannot disarm a live run.
+            active_proxy_pool, which any rerun in any session resets to []. It is
+            bound as a DEFAULT ARGUMENT, so the closure holds the LIST OBJECT and a
+            rerun rebinding the module name cannot reach it. Block 106 fills the
+            box once, before the first future exists.
+
+            The default also keeps the submit call exactly
+            `executor.submit(check_task, line)`, which verify_v1337.py gates.
             """
             try:
                 # Pin BEFORE anything reads live_cfg() or asks for a gate.
                 seed_task_cfg(_run_cfg)
                 _pin_gate_scope(_run_scope)
-                _pool = active_proxy_pool if pool is None else pool
+                _pool = _box or active_proxy_pool
                 if ":" not in line:
                     return {"line": f"{line} | Error: Invalid format", "status": FAILED,
                             "trace": ["Invalid format"]}
@@ -13278,13 +13288,14 @@ if start_engine_btn:
             # FIX LAG-3: an explicit executor, not `with`. ThreadPoolExecutor's
             # __exit__ calls shutdown(wait=True), so a teardown mid-run blocked
             # until EVERY queued account finished before the page could come back.
-            # v13.70 ISO-9: AND THE POOL IS CAPTURED HERE, ONCE. It is passed to
-            # every task, so a rerun in another session - which resets the module
-            # global active_proxy_pool to [] - can no longer disarm this run.
-            _run_pool = list(active_proxy_pool)
+            # v13.70 ISO-9: AND THE POOL IS CAPTURED HERE, ONCE, INTO THE BOX that
+            # check_task already holds as a default argument. extend() MUTATES it,
+            # it is not rebound, so the live closure keeps pointing at this run's
+            # own list even if a rerun elsewhere rebinds the module name.
+            _run_pool_box.extend(active_proxy_pool)
             executor = ThreadPoolExecutor(max_workers=current_workers)
             try:
-                future_to_line = {executor.submit(check_task, line, _run_pool): line
+                future_to_line = {executor.submit(check_task, line): line
                                   for line in all_target_accounts}
 
                 for index, future in enumerate(as_completed(future_to_line), 1):
