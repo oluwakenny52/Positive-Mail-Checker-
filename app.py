@@ -67,6 +67,9 @@ import base64
 import glob
 import html
 import imaplib
+# Raise the default 1 MB line limit so large SEARCH responses do not abort.
+# A mailbox with tens of thousands of messages can return a SEARCH line longer than 1 MB.
+imaplib.IMAP4.maxline = 10_000_000
 import json
 import os
 import platform
