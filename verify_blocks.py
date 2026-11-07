@@ -48,6 +48,7 @@ BLOCKED_FILES = [
     "ms_oauth.py",
     "status.py",
     "verify_blocks.py",
+    "pages/1_Notifications.py",
     "pages/2_Diagnostics.py",
     "pages/3_Mailbox_Reader.py",
     "pages/4_Downloads.py",
@@ -61,10 +62,12 @@ BLOCKED_FILES = [
 # copy, and its api_conformance() asserts both names exist.
 #
 # tier2_split.py REWRITES app.py and OVERWRITES engine.py - it deletes no file -
-# so TARGET_FILES stays 13 and only TARGET_BLOCKS moves.  The split prints the
-# new line for you and records it in TIER2_MANIFEST.txt; paste it here.
-TARGET_FILES = 13
-TARGET_BLOCKS = 284
+# so TARGET_FILES only moves when a FILE is added or removed.  v13.70 added
+# pages/1_Notifications.py: files 13 -> 14, and blocks move by that page's own
+# block count.  tier2_split.py prints the new line for you and records it in
+# TIER2_MANIFEST.txt; paste it here.
+TARGET_FILES = 14
+TARGET_BLOCKS = 295
 
 FILE_RX = re.compile(r"^#\s*@@FILE\s+(\S+)\s+blocks=(\d+)\s+version=(\S+)\s*$")
 BLOCK_RX = re.compile(r"^#\s*@@BLOCK\s+(\d{3})\s+([A-Za-z0-9_]+)(?:\s+deps=(\S+))?\s*$")
