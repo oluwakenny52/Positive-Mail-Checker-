@@ -1,4 +1,4 @@
-"""notify.py - per-user, bounded, file-backed notifications.  v13.71
+"""notify.py - per-user, bounded, file-backed notifications.  v13.72
 
 WHY A FILE AND NOT session_state
 --------------------------------
@@ -22,6 +22,11 @@ v13.71: THE DEDUPE MAP IS NOW PRUNED.  It held one pair per (scope, key) for the
 life of the process and was never emptied, so every condition that had ever fired
 for every user who had ever visited stayed resident. Past DEDUPE_MAX entries the
 expired pairs are dropped; the same pass trims the per-scope throttle map.
+
+v13.72: THE PRUNE RAN ONLY ON A KEYED CALL.  _prune() sat inside `if key:`, so a
+keyless add() - a call that deliberately wants every occurrence - never pruned
+anything and the map grew exactly as before. It runs at the top of the lock now,
+before the branch, so both shapes prune.
 
 DEDUPE - AND WHY IT IS PER USER
 -------------------------------
@@ -198,6 +203,8 @@ def add(level, kind, text, suggestion="", key="", dedupe=SYS_REPEAT_SECONDS):
     now = time.time()
     try:
         with _lock:
+            # v13.72: BEFORE the `if key:` branch, so a keyless call prunes too.
+            _prune(now, dedupe)
             if key:
                 dkey = (_scope(), key)
                 prev = _dedupe.get(dkey)
@@ -205,7 +212,6 @@ def add(level, kind, text, suggestion="", key="", dedupe=SYS_REPEAT_SECONDS):
                     prev[1] += 1
                     return None
                 _dedupe[dkey] = [now, 1]
-                _prune(now, dedupe)
             rows = _read_rows()
             _seq = (_seq + 1) % 1000
             rec = {
