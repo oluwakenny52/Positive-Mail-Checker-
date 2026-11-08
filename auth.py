@@ -178,6 +178,22 @@ def user_dir(name=""):
 
 
 # @@BLOCK 002 GATE deps=001
+def _flash(st, outcome, text):
+    """Report a press through the ledger when it is present, else directly."""
+    try:
+        import audit_log
+        if hasattr(audit_log, "flash"):
+            audit_log.flash(st, outcome, text)
+            return
+    except Exception:
+        pass
+    try:
+        {"OK": st.success, "WARN": st.warning,
+         "FAILED": st.error}.get(outcome, st.info)(text)
+    except Exception:
+        pass
+
+
 def require(st, title="Unlock Positive Mail-Checker"):
     """Unlock, or create the first passkey. Sets session_state['user_key_hash']."""
     if st.session_state.get("user_key_hash"):
@@ -197,6 +213,7 @@ def require(st, title="Unlock Positive Mail-Checker"):
             h = match_key(phrase)
             if h:
                 st.session_state["user_key_hash"] = h
+                _flash(st, "OK", "Unlocked. Every file below is yours alone.")
                 st.rerun()
             else:
                 st.error("Wrong passphrase.")
@@ -215,6 +232,7 @@ def require(st, title="Unlock Positive Mail-Checker"):
                     st.error("The two passphrases differ.")
                 else:
                     st.session_state["user_key_hash"] = add_key(p2, lbl)
+                    _flash(st, "OK", "Passkey created and unlocked.")
                     st.rerun()
         with st.expander("Forget a passkey"):
             # Locked, so there is no session hash to "forget this one" with -
@@ -227,19 +245,27 @@ def require(st, title="Unlock Positive Mail-Checker"):
             st.caption("Removes ONE key. Every other user on this deployment keeps theirs.")
             choice = st.selectbox("Which passkey", list(pick))
             if st.button("Forget selected passkey", key="au_forget_one"):
-                forget_current(pick.get(choice, ""))
+                gone = pick.get(choice, "")
+                forget_current(gone)
                 st.session_state.pop("user_key_hash", None)
                 # v13.64: the forgotten key's per-user tables live in app.py's
                 # process STATE and used to survive for the life of the process -
                 # pool, quarantine, scores and its alive-pool thread. app.py block
                 # 039 drops them; this is the only place that knows WHICH key.
-                st.session_state["_forgotten_hash"] = pick.get(choice, "")
+                st.session_state["_forgotten_hash"] = gone
+                _flash(st, "OK", "Passkey forgotten. Its files stay on disk.")
                 st.rerun()
             st.caption("Or remove every key, for everyone.")
             if st.button("Forget all passkeys", key="au_forget_all"):
+                # v13.51: user_key_hash is ALWAYS "" on this branch, so the old
+                # read handed app.py block 039 an empty hash and it dropped no
+                # tables at all. Keep the selected key instead.
+                gone = pick.get(choice, "")
                 forget_all()
-                st.session_state["_forgotten_hash"] = st.session_state.get("user_key_hash", "")
+                st.session_state["_forgotten_hash"] = gone
                 st.session_state.pop("user_key_hash", None)
+                _flash(st, "WARN", "Every passkey was removed. Nothing unlocks now "
+                                   "until a new one is created.")
                 st.rerun()
         st.stop()
 
@@ -261,6 +287,7 @@ def require(st, title="Unlock Positive Mail-Checker"):
             else:
                 h = _digest(p1, secrets.token_hex(SALT_BYTES))
             st.session_state["user_key_hash"] = h
+            _flash(st, "OK", "Passkey created and unlocked.")
             st.rerun()
     st.stop()
 # @@END 002 GATE
