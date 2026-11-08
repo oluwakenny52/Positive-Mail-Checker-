@@ -1,4 +1,4 @@
-# @@FILE engine.py blocks=12 version=v13.48
+# @@FILE engine.py blocks=11 version=v13.49
 # ===========================================================================
 # engine.py - headless verification engine: rung planning, pooled execution,
 # verdict aggregation and backoff. No Streamlit, no side effects on import.
@@ -24,7 +24,7 @@ import sys
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 ENGINE_VERSION = "v13.40"
 
@@ -83,48 +83,7 @@ class Rung:
 # @@END 002 RUNG
 
 
-# @@BLOCK 003 BUCKET
-@dataclass
-class Bucket:
-    name: str
-    hosts: list = field(default_factory=list)
-    rungs: list = field(default_factory=list)
-
-    def add(self, rung):
-        self.rungs.append(rung)
-        if rung.host and rung.host not in self.hosts:
-            self.hosts.append(rung.host)
-        return rung
-
-
-BUCKET_SPEC = (
-    ("valid", "Confirmed working"),
-    ("wrong", "Wrong credentials"),
-    ("app", "App password / OAuth"),
-    ("rbl", "RBL listed"),
-    ("conn", "Transport failure"),
-    ("retry", "Retry"),
-    ("skip", "Skipped"),
-    ("other", "Other"),
-)
-
-
-def new_buckets():
-    return {name: Bucket(name) for name, _label in BUCKET_SPEC}
-
-
-def bucket_for(buckets, status_code):
-    name = "other"
-    if _status is not None:
-        try:
-            name = _status.bucket_of(status_code)
-        except Exception:
-            name = "other"
-    return buckets.get(name) or buckets["other"]
-# @@END 003 BUCKET
-
-
-# @@BLOCK 004 TARGET
+# @@BLOCK 003 TARGET
 @dataclass
 class Target:
     domain: str
@@ -149,10 +108,10 @@ class RungResult:
     @property
     def host(self):
         return self.rung.host
-# @@END 004 TARGET
+# @@END 003 TARGET
 
 
-# @@BLOCK 005 PLAN
+# @@BLOCK 004 PLAN
 def _hosts_of(domain):
     if _hosts is None:
         return []
@@ -244,10 +203,10 @@ def plan_rungs(domain, local="", *, include_pop=False, limit=DEFAULT_RUNG_LIMIT)
                 head = head[: max(0, limit - len(pop_tail))] + pop_tail
         rungs = head
     return rungs
-# @@END 005 PLAN
+# @@END 004 PLAN
 
 
-# @@BLOCK 006 AGGREGATE
+# @@BLOCK 005 AGGREGATE
 def _prio(code):
     if _status is not None:
         try:
@@ -340,10 +299,10 @@ def merge_result(acc, new_status):
     if acc is None:
         return new_status
     return acc if _prio(acc) >= _prio(new_status) else new_status
-# @@END 006 AGGREGATE
+# @@END 005 AGGREGATE
 
 
-# @@BLOCK 007 STATE
+# @@BLOCK 006 STATE
 class EngineState:
     """Thread-safe counters + cooldown table."""
 
@@ -381,21 +340,17 @@ class EngineState:
                 "errors": self.errors,
                 "elapsed": time.time() - self.started,
             }
-# @@END 007 STATE
+# @@END 006 STATE
 
 
-# @@BLOCK 008 BACKOFF
+# @@BLOCK 007 BACKOFF
 def backoff(attempt, base=BACKOFF_BASE, cap=BACKOFF_CAP, jitter=JITTER):
     delay = min(cap, base * (2 ** max(0, attempt - 1)))
     return delay * (1.0 + random.uniform(-jitter, jitter))
+# @@END 007 BACKOFF
 
 
-def retry_delays(attempts=MAX_ATTEMPTS):
-    return [backoff(a) for a in range(1, attempts + 1)]
-# @@END 008 BACKOFF
-
-
-# @@BLOCK 009 WORKER
+# @@BLOCK 008 WORKER
 def probe_once(target, rung, probe, timeout=DEFAULT_TIMEOUT):
     """Run one rung through `probe(target, rung, timeout)` -> (ok, text)."""
     started = time.time()
@@ -444,10 +399,10 @@ def run_rung(target, rung, probe, state=None, attempts=MAX_ATTEMPTS, sleep=True)
         else:
             state.fail()
     return last
-# @@END 009 WORKER
+# @@END 008 WORKER
 
 
-# @@BLOCK 010 ENGINE
+# @@BLOCK 009 ENGINE
 def run_engine(targets, probe, *, workers=DEFAULT_WORKERS, limit=DEFAULT_RUNG_LIMIT,
                include_pop=None, attempts=MAX_ATTEMPTS, progress=None, sleep=True):
     """Verify many targets concurrently.
@@ -510,10 +465,10 @@ def summarise(report):
         s = v.get("verdict", {}).get("status", UNKNOWN)
         counts[s] = counts.get(s, 0) + 1
     return counts
-# @@END 010 ENGINE
+# @@END 009 ENGINE
 
 
-# @@BLOCK 011 SELFTEST_MAIN
+# @@BLOCK 010 SELFTEST_MAIN
 def _selftest():
     checks = []
 
@@ -590,5 +545,5 @@ def main(argv=None):
 
 if __name__ == "__main__":
     sys.exit(main())
-# @@END 011 SELFTEST_MAIN
+# @@END 010 SELFTEST_MAIN
 # @@EOF
