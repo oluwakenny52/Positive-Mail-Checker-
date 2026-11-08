@@ -212,13 +212,19 @@ def _is_junk(host):
 def plan_rungs(domain, local="", *, include_pop=False, limit=DEFAULT_RUNG_LIMIT):
     """Build the ordered rung ladder for one target."""
     d = (domain or "").strip().lower()
+
+    # The four guesses are the `or` operand, so the `if not hosts:` branch that
+    # used to follow is genuinely dead now: an unknown domain takes the guesses
+    # directly instead of falling through a guard that could only ever run.
+    hosts = ([h for h in _hosts_of(d) if not _is_junk(h)]
+             or ["mail.%s" % d, d, "smtp.%s" % d, "imap.%s" % d])
+    # RANK ONCE, BEFORE EVERY LOOP. Only the 993 loop was ranked, so the 143
+    # rungs kept the raw conf() order and dialled a demoted host first - the
+    # whole ranking was thrown away for half the ladder.
+    hosts = _rank(d, hosts)
+
     rungs = []
-
-    hosts = [h for h in _hosts_of(d) if not _is_junk(h)]
-    if not hosts:
-        hosts = ["mail.%s" % d, d, "smtp.%s" % d, "imap.%s" % d]
-
-    for h in _rank(d, hosts):
+    for h in hosts:
         rungs.append(Rung(order=len(rungs), host=h, port=993, proto="imap", tls=True, source="ladder"))
     for h in hosts:
         rungs.append(Rung(order=len(rungs), host=h, port=143, proto="imap", tls=False, source="plain"))
@@ -261,11 +267,19 @@ def pick_verdict(results):
     """Aggregate rung results into one verdict + forensic detail.
 
     Order of authority:
-      1. any hard WRONG on the domain's own host  -> WRONG
-      2. any VALID                                -> VALID
-      3. any APP / NEED_APP_PASSWORD              -> APP
-      4. any RBL                                  -> RBL
+      1. any hard WRONG on the domain's OWN host   -> WRONG
+      2. any VALID                                 -> VALID
+      3. any APP / NEED_APP_PASSWORD               -> APP
+      4. any RBL                                   -> RBL
       5. otherwise the most decisive transport/retry status
+
+    A WRONG from a FOREIGN host does not decide the account. app.py block 104
+    discards a retained verdict whose host is not local for the domain, so an
+    aggregator that accepted one answered WRONG for an account app.py had
+    already refused to condemn. wrong_hosts / wrong_rungs still carry the
+    foreign hits as forensics - they are only barred from picking the verdict,
+    and they are skipped in the tail too, or the tail would just re-elect the
+    same foreign WRONG one line later.
     """
     wrong_hosts = set()
     wrong_rungs = []
@@ -288,10 +302,11 @@ def pick_verdict(results):
             domain_local_hosts.add(host)
 
     wrong_local = [r for r in wrong_rungs if _local_to(r.target.domain, r.host)]
+    _foreign_wrong = {id(r) for r in wrong_rungs
+                      if not _local_to(r.target.domain, r.host)}
+
     if wrong_local:
         verdict = WRONG if any(r.status == WRONG for r in wrong_local) else WRONG_PASSWORD
-    elif wrong_rungs:
-        verdict = WRONG if any(r.status == WRONG for r in wrong_rungs) else WRONG_PASSWORD
     elif valid_rungs:
         verdict = VALID
     elif app_rungs:
@@ -302,6 +317,8 @@ def pick_verdict(results):
         # defect worse_of() was fixed for.
         verdict = None
         for r in results or ():
+            if id(r) in _foreign_wrong:
+                continue
             if verdict is None or _prio(r.status) > _prio(verdict):
                 verdict = r.status
         if verdict is None:
