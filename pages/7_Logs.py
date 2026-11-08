@@ -649,6 +649,11 @@ with _t_rec:
 # counted twelve. This block owns it now. The 400-line display cap is gone too: a
 # result file is small, and truncating it made the download the only way to reach
 # the end of one.
+#
+# v13.49: THE DOWNLOAD IS THE RAW FILE. _read_lines() drops '#' lines and blanks
+# so the display stays readable, and the download button was handed that filtered
+# list - every file downloaded here lost its "# Started: ... | Duration: ..."
+# header. The button reads the bytes now; only the display is filtered.
 with _t_files:
     if hide_history:
         st.caption("Hidden - untick 'Hide the file history tab' in the sidebar.")
@@ -656,7 +661,7 @@ with _t_files:
         st.caption("Every stamped result file in YOUR results directory, newest first. "
                    "One expander per file with the full contents, plus a per-file "
                    "download. Nothing here is truncated.")
-        
+
         if not FILES:
             st.caption("No stamped result files yet. They appear the moment a run writes "
                        "its buckets.")
@@ -678,14 +683,20 @@ with _t_files:
             _hit = _fcache.get(_p)
             if _sig is not None and _hit and _hit.get("sig") == _sig:
                 _lines = _hit["lines"]
+                _raw = _hit.get("raw") or "\n".join(_lines)
             else:
                 _lines = _read_lines(_p)
+                try:
+                    with open(_p, encoding="utf-8", errors="ignore") as _fh:
+                        _raw = _fh.read()
+                except Exception:
+                    _raw = "\n".join(_lines)
                 if _sig is not None:
-                    _fcache[_p] = {"sig": _sig, "lines": _lines}
+                    _fcache[_p] = {"sig": _sig, "lines": _lines, "raw": _raw}
             with st.expander("%s  ·  %s  ·  %d line(s)" % (_tag, _stamp, len(_lines)),
                              expanded=False):
                 st.download_button(
-                    "⬇️ Download", data="\n".join(_lines).encode("utf-8"),
+                    "⬇️ Download", data=_raw.encode("utf-8"),
                     file_name=os.path.basename(_p), mime="text/plain",
                     key="lg_dl_%s" % os.path.basename(_p))
                 st.code("\n".join(_lines), language="text")
