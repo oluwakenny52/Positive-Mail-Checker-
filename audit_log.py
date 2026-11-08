@@ -1,4 +1,4 @@
-"""audit_log.py - per-user action & outcome ledger  (v13.50)
+"""audit_log.py - per-user action & outcome ledger  (v13.51)
 
 Records every press AND every state change with the page it came from, and
 records what the run then reports: OK / FAILED / WARN / ERROR / STOPPED. A press
@@ -9,10 +9,11 @@ Plain module, NOT frame-gated - like runstate.py.  Nothing here renders.
 
 INSTALL ORDER IS THE WHOLE POINT
 --------------------------------
-install() must run BEFORE the first widget of the page. A widget created by the
-unwrapped function is invisible to this module, so a hook placed after the
-sidebar records the sidebar's buttons and nothing else. Every page calls
-page() + install() in its auth block, ahead of its own widgets.
+install() must run BEFORE auth.require() and before the first widget of the page.
+require() calls st.stop() while the page is locked, so an install() placed after
+it never runs on a locked page and the Unlock button is never wrapped. A widget
+created by an unwrapped function is invisible to this module, so a hook placed
+after the sidebar records the sidebar's buttons and nothing else.
 
 WHY THE COMPARE BASE IS A MEMO AND NOT session_state  (v13.49)
 --------------------------------------------------------------
@@ -30,35 +31,51 @@ so it always holds the PREVIOUS run's value regardless of when Streamlit commits
 state. A run of edits on one widget inside 1.5s rewrites the same ledger line
 instead of appending one per keystroke.
 
+FIX AU-3 (v13.51) - THE SIDEBAR WAS NEVER WRAPPED
+-------------------------------------------------
+_wrap_messages() patched only the top-level st module. st.sidebar is a separate
+DeltaGenerator with its own success/warning/error, so every confirmation a page
+rendered inside `with st.sidebar:` was invisible here and the press aged into
+NO RESULT. The sidebar also holds most of the click widgets and those were not
+wrapped at all, so a sidebar press was never even recorded. install() now wraps
+BOTH st and st.sidebar, and st.toast closes an entry too.
+
+FIX AU-4 (v13.51) - flash() SURVIVES THE RERUN
+----------------------------------------------
+flash() closes the press NOW and queues the message for the top of the next run,
+so a confirmation is both recorded and still visible after the st.rerun() that
+used to wipe it. Pages use flash() instead of a bare st.success() + st.rerun().
+
 WHAT IS AND IS NOT VISIBLE
 --------------------------
 st.expander / st.tabs / st.popover are drawn by the browser. Opening one does
 not contact the server, so no server-side hook can see it. Everything whose
 change forces a rerun IS captured: button, form_submit_button, download_button,
 toggle, checkbox, slider, selectbox, multiselect, radio, number_input,
-color_picker, file_uploader, text_input, text_area, date_input. Page visits are
-written by page() itself, as a PAGE record.
+color_picker, file_uploader, text_input, text_area, date_input - on the page and
+in the sidebar. Page visits are written by page() itself, as a PAGE record.
 
 WHY A RERUN IS NOT AN OUTCOME
 -----------------------------
-Most presses here end in flash(...) + st.rerun(), and the flash is rendered on
+Most presses here end in a message + st.rerun(), and the message is rendered on
 the NEXT run. st.rerun keeps the entry OPEN for one more run so that message can
 be attributed to it. A press still open after that closes as NO RESULT. State
-changes are not deferred at all - they have no flash to wait for.
+changes are not deferred at all - they have no message to wait for.
 
 FIX AU-2 (v13.50) - THE DEFER WAS OFF BY ONE AND NOTHING EVER CLOSED AS OK
 -------------------------------------------------------------------------
 The rerun wrapper used to stamp p["age"] = max(1, ...) while _close_stale()
 closed at age >= 1. install() runs BEFORE the page body, so the entry was popped
-as NO RESULT by install() on the very next load - before the flash could render -
-and the flash then had nothing left to attach to. The whole ledger read NO RESULT
-and never OK. The wrapper now stamps 0, so that load increments to 1 and KEEPS
-the entry: the flash on the same load closes it as OK, and the load after closes
-it as NO RESULT if no flash ever arrived. Two selftest cases now cover it.
+as NO RESULT by install() on the very next load - before the message could
+render - and the message then had nothing left to attach to. The whole ledger
+read NO RESULT and never OK. The wrapper now stamps 0, so that load increments
+to 1 and KEEPS the entry: the message on the same load closes it as OK, and the
+load after closes it as NO RESULT if no message ever arrived. Two selftest cases
+cover it.
 
 st.info does NOT close an entry: it is page-render chrome ("Loaded Proxies..."),
 not a response, and it was claiming unrelated clicks. Only success / error /
-warning / exception / stop close one.
+warning / exception / stop / toast close one.
 
 ISOLATION
 ---------
@@ -80,9 +97,12 @@ _PAGE = "_audit_page"
 _SEEN = "_audit_seen"
 _USED = "_audit_used"
 _LAST = "_audit_last"
+_FLASH = "_audit_flash"
 _MISSING = object()
 # A burst of edits on one widget inside this window is one ledger line.
 BURST_SECONDS = 1.5
+# How many deferred messages one run may queue for the next.
+FLASH_MAX = 8
 
 # Passphrase boxes: the value is masked, so the detail would be useless.
 _SKIP_KEYS = frozenset({"au_p1", "au_p2", "au_p3", "au_c1", "au_c2", "au_lbl"})
@@ -91,9 +111,11 @@ _CLICK_WIDGETS = ("button", "form_submit_button", "download_button")
 _STATE_WIDGETS = ("toggle", "checkbox", "slider", "selectbox", "multiselect",
                   "radio", "number_input", "color_picker", "file_uploader",
                   "text_input", "text_area", "date_input")
-# st.info is deliberately absent - see the docstring.
+# st.info is deliberately absent - see the docstring. st.toast IS a response.
 _MESSAGES = (("success", "OK"), ("error", "FAILED"), ("warning", "WARN"),
-             ("exception", "ERROR"), ("stop", "STOPPED"))
+             ("exception", "ERROR"), ("stop", "STOPPED"), ("toast", "OK"))
+
+_FN_FOR = {"OK": "success", "WARN": "warning", "FAILED": "error"}
 
 
 def _path() -> str:
@@ -250,6 +272,52 @@ def _close(st, outcome: str, detail: str = "") -> None:
     _emit(p, outcome, str(detail or "")[:300])
 
 
+def _render_flashes(st) -> None:
+    """Re-show the messages the previous run queued, through the real widgets.
+
+    Rendering them here means the wrapped message functions see them, so the
+    entry they belong to is closed on the run that shows the text.
+    """
+    try:
+        q = st.session_state.pop(_FLASH, None)
+    except Exception:
+        return
+    if not q:
+        return
+    for outcome, text in q:
+        fn = getattr(st, _FN_FOR.get(outcome, "info"), None)
+        if fn is None:
+            continue
+        try:
+            fn(text)
+        except Exception:
+            pass
+
+
+def flash(st, outcome: str, text: str) -> None:
+    """Close the open press as `outcome`, show it now, and keep it for one run.
+
+    Use this instead of `st.success(...)` + `st.rerun()`: the message is recorded
+    against the press immediately and is still on screen after the rerun.
+    """
+    text = str(text or "")[:300]
+    outcome = outcome if outcome in _FN_FOR else "OK"
+    try:
+        _close(st, outcome, text)
+    except Exception:
+        pass
+    try:
+        q = st.session_state.setdefault(_FLASH, [])
+        if len(q) < FLASH_MAX:
+            q.append((outcome, text))
+    except Exception:
+        pass
+    try:
+        getattr(st, _FN_FOR[outcome])(text)
+    except Exception:
+        pass
+
+
 def _record_click(st, widget: str, label: str, key: str) -> None:
     if key in _SKIP_KEYS:
         return
@@ -289,7 +357,7 @@ def _close_stale(st) -> None:
     """Close a press the previous run left open, or give it one more run.
 
     The threshold is >= 1 and the rerun wrapper stamps 0, so a press that asked
-    for a rerun gets exactly one load in which its flash can render. FIX AU-2.
+    for a rerun gets exactly one load in which its message can render. FIX AU-2.
     """
     try:
         p = st.session_state.get(_PEND)
@@ -329,8 +397,8 @@ def _synth_key(st, page_: str, label: str) -> str:
     return base if n == 0 else "%s#%d" % (base, n)
 
 
-def _wrap_one(st, name: str, kind: str) -> None:
-    fn = getattr(st, name, None)
+def _wrap_one(st, target, name: str, kind: str) -> None:
+    fn = getattr(target, name, None)
     if fn is None or getattr(fn, _ATTR, False):
         return
 
@@ -371,14 +439,14 @@ def _wrap_one(st, name: str, kind: str) -> None:
 
     setattr(wrapper, _ATTR, True)
     try:
-        setattr(st, name, wrapper)
+        setattr(target, name, wrapper)
     except Exception:
         pass
 
 
-def _wrap_messages(st) -> None:
+def _wrap_messages(st, target) -> None:
     for name, outcome in _MESSAGES:
-        fn = getattr(st, name, None)
+        fn = getattr(target, name, None)
         if fn is None or getattr(fn, _ATTR, False):
             continue
 
@@ -391,11 +459,11 @@ def _wrap_messages(st) -> None:
 
         setattr(wrapper, _ATTR, True)
         try:
-            setattr(st, name, wrapper)
+            setattr(target, name, wrapper)
         except Exception:
             pass
 
-    fn = getattr(st, "rerun", None)
+    fn = getattr(target, "rerun", None)
     if fn is not None and not getattr(fn, _ATTR, False):
 
         def wrapper(*a, _fn=fn, **k):
@@ -404,10 +472,11 @@ def _wrap_messages(st) -> None:
                 if p and not p.get("outcome"):
                     # FIX AU-2: 0, not max(1, ...). install() runs BEFORE the page
                     # body, so stamping 1 let _close_stale() pop the entry as
-                    # NO RESULT on the very next load - before the flash could
+                    # NO RESULT on the very next load - before the message could
                     # render - and nothing ever closed as OK. 0 makes that load
-                    # increment to 1 and keep it: the flash closes it as OK on the
-                    # same load, and only the load AFTER falls back to NO RESULT.
+                    # increment to 1 and keep it: the message closes it as OK on
+                    # the same load, and only the load AFTER falls back to
+                    # NO RESULT.
                     p["age"] = 0
                     st.session_state[_PEND] = p
             except Exception:
@@ -416,13 +485,13 @@ def _wrap_messages(st) -> None:
 
         setattr(wrapper, _ATTR, True)
         try:
-            st.rerun = wrapper
+            target.rerun = wrapper
         except Exception:
             pass
 
 
 def install(st, page_: str) -> None:
-    """Call once per page, in the auth block, BEFORE the first widget."""
+    """Call once per page, in the auth block, BEFORE auth.require() and widgets."""
     try:
         try:
             st.session_state[_PAGE] = page_
@@ -430,16 +499,21 @@ def install(st, page_: str) -> None:
         except Exception:
             pass
         _close_stale(st)
-        if not getattr(st, _ATTR, False):
+        # FIX AU-3: the sidebar is a separate DeltaGenerator. Wrapping only `st`
+        # left every sidebar message and every sidebar press invisible.
+        for target in (st, getattr(st, "sidebar", None)):
+            if target is None or getattr(target, _ATTR, False):
+                continue
             for _n in _CLICK_WIDGETS:
-                _wrap_one(st, _n, "click")
+                _wrap_one(st, target, _n, "click")
             for _n in _STATE_WIDGETS:
-                _wrap_one(st, _n, "state")
-            _wrap_messages(st)
+                _wrap_one(st, target, _n, "state")
+            _wrap_messages(st, target)
             try:
-                setattr(st, _ATTR, True)
+                setattr(target, _ATTR, True)
             except Exception:
                 pass
+        _render_flashes(st)
     except Exception:
         pass
 
@@ -461,12 +535,40 @@ def selftest() -> int:
 
     sys.modules["auth"] = _A
 
+    class _Side:
+        """st.sidebar: its own message and widget surface, one shared state."""
+
+        def __init__(self, owner):
+            self._owner = owner
+
+        def button(self, label, key=None):
+            return True
+
+        def slider(self, label, lo, hi, key=None):
+            return self._owner.session_state.get(key)
+
+        def success(self, msg):
+            return None
+
+        def warning(self, msg):
+            return None
+
+        def error(self, msg):
+            return None
+
+        def info(self, msg):
+            return None
+
+        def toast(self, msg):
+            return None
+
     class _St:
         """Models REAL Streamlit: the client's widget value is already in
         session_state before the script body runs."""
 
         def __init__(self):
             self.session_state = {}
+            self.sidebar = _Side(self)
 
         def button(self, label, key=None):
             return True
@@ -477,7 +579,16 @@ def selftest() -> int:
         def success(self, msg):
             return None
 
+        def warning(self, msg):
+            return None
+
+        def error(self, msg):
+            return None
+
         def info(self, msg):
+            return None
+
+        def toast(self, msg):
             return None
 
         def rerun(self):
@@ -551,15 +662,15 @@ def selftest() -> int:
                   for e in entries()))
 
         # FIX AU-2 regression pair. The press asks for a rerun, the rerun is what
-        # carries the flash, and the flash is rendered by the load AFTER it.
+        # carries the message, and the message is rendered by the load AFTER it.
         st.button("Rerun press")
         st.rerun()
         install(st, "p.py")
-        check("a rerun keeps the entry open for its flash",
+        check("a rerun keeps the entry open for its message",
               not any(e["label"] == "Rerun press" and e["outcome"] == "NO RESULT"
                       for e in entries()))
         st.success("flashed")
-        check("the flash closes it as OK",
+        check("the message closes it as OK",
               any(e["label"] == "Rerun press" and e["outcome"] == "OK"
                   for e in entries()))
 
@@ -567,9 +678,40 @@ def selftest() -> int:
         st.rerun()
         install(st, "p.py")
         install(st, "p.py")
-        check("a rerun with no flash still ends as NO RESULT",
+        check("a rerun with no message still ends as NO RESULT",
               any(e["label"] == "Rerun with no flash" and e["outcome"] == "NO RESULT"
                   for e in entries()))
+
+        # FIX AU-3 regression triple: the sidebar was never wrapped at all.
+        install(st, "p.py")
+        st.sidebar.button("Sidebar press")
+        check("a sidebar press is recorded",
+              any(e["label"] == "Sidebar press" for e in entries()))
+        st.sidebar.success("applied in the sidebar")
+        check("a sidebar message closes it as OK",
+              any(e["label"] == "Sidebar press" and e["outcome"] == "OK"
+                  for e in entries()))
+
+        install(st, "p.py")
+        st.button("Toast press")
+        st.toast("done")
+        check("a toast closes an entry",
+              any(e["label"] == "Toast press" and e["outcome"] == "OK"
+                  for e in entries()))
+
+        # FIX AU-4: flash closes now AND is still shown on the next run.
+        install(st, "p.py")
+        st.button("Flash press")
+        flash(st, "OK", "applied by flash")
+        check("flash closes the press immediately",
+              any(e["label"] == "Flash press" and e["outcome"] == "OK"
+                  for e in entries()))
+        st.rerun()
+        install(st, "p.py")
+        check("the flash is still recorded as OK after the rerun",
+              any(e["label"] == "Flash press" and e["outcome"] == "OK"
+                  for e in entries()))
+        check("the flash queue is drained", not st.session_state.get("_audit_flash"))
 
         page("q.py")
         check("a page visit is recorded",
