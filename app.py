@@ -3471,6 +3471,43 @@ def _make_gate(table, key, limit):
     return g
 
 
+def _gate_cfg() -> dict:
+    """The config a gate limit is read from.
+
+    FIX GATE-CFG (v13.74): _limit() read the module global CFG, and CFG is bound
+    by block 055. Block 045's Reset path calls _apply_settings_reset() ->
+    _reset_gates() -> _limit() BEFORE block 055 has run on that load, so CFG was
+    unbound, the NameError was swallowed by _limit's own except, and every gate
+    was floored at its DEFAULT instead of the settings Reset had just restored.
+    _make_gate only creates a gate once and nothing re-applies afterwards, so the
+    concurrency governors stayed at the defaults until the next Apply Settings.
+
+    Order: the live global (script thread, after 055), then applied_cfg in
+    session_state (correct on the Reset path, where it has just been replaced),
+    then this user's own pinned copy, then an empty dict so _limit falls back to
+    its argument rather than raising.
+    """
+    try:
+        _c = globals().get("CFG")
+        if _c:
+            return _c
+    except Exception:
+        pass
+    try:
+        _c = str_lit.session_state.get("applied_cfg")
+        if _c:
+            return _c
+    except Exception:
+        pass
+    try:
+        _c = _user_state().get("cfg")
+        if _c:
+            return _c
+    except Exception:
+        pass
+    return {}
+
+
 def _limit(cfg_key, default):
     """CFG value, clamped to the SLIDER MINIMUM - never to the default.
 
@@ -3480,9 +3517,12 @@ def _limit(cfg_key, default):
     1 and the engine still used 2, PROXY_SUBUSER_CONCURRENCY could be dragged to
     1 and still used 2. The minimum the slider offers is 1, so floor there and
     let the widget mean what it says.
+
+    The source is _gate_cfg(), not the bare global - see the note there.
     """
+    _cfg = _gate_cfg()
     try:
-        got = int(CFG.get(cfg_key, default))
+        got = int(_cfg.get(cfg_key, default))
     except Exception:
         got = int(default)
     return max(1, got)
@@ -5253,6 +5293,34 @@ def build_cfg():
 # the new user. The owner is now part of the rebuild condition.
 _cfg_owner = _cache_owner()
 
+
+def _report_press(outcome, text):
+    """Close the open press NOW and keep the message across the rerun.
+
+    FIX FLASH-3 (v13.74): both buttons ended in str_lit.rerun() with no
+    audit_log.flash() call, so the only thing that could close the press was the
+    carried-over _settings_flash banner - and block 108's unconditional
+    warning() calls (login-drop / proxy-unhealthy) render on every load that has
+    a finished run behind it, AFTER the sidebar, so they closed the press as WARN
+    first. Apply and Reset therefore closed as WARN or NO RESULT and inherited
+    the summary warning.
+
+    audit_log.flash() is the owned API for this: it _close()s the entry as the
+    press, then queues the text for the next run and renders it. auth.py block
+    002 _flash() has used exactly this shape since v13.51. The _settings_flash
+    fallback stays for the case where audit_log is absent or stale.
+    """
+    try:
+        import audit_log as _al
+        if hasattr(_al, "flash"):
+            _al.flash(str_lit, outcome, text)
+            return
+    except Exception:
+        pass
+    str_lit.session_state["_settings_flash"] = (
+        "success" if outcome == "OK" else "warning", text)
+
+
 if "applied_cfg" not in str_lit.session_state:
     str_lit.session_state.applied_cfg = build_cfg()
     str_lit.session_state.applied_cfg_version = CFG_VERSION
@@ -5298,7 +5366,8 @@ with _btn_c2:
 # line directly above str_lit.rerun(), and a rerun destroys the delta it was drawn
 # into - so "Settings applied successfully!" was never once actually seen. It is
 # the identical defect block 080 already fixed for the proxy messages: the message
-# is carried across the rerun and drawn on the next load.
+# is carried across the rerun and drawn on the next load. FIX FLASH-3 replaces the
+# carry with audit_log.flash(); this block is only the fallback path now.
 _settings_flash = str_lit.session_state.pop("_settings_flash", None)
 if _settings_flash:
     _sfl_lvl, _sfl_msg = _settings_flash
@@ -5306,8 +5375,7 @@ if _settings_flash:
 
 if _reset_clicked:
     str_lit.session_state["_bb_reset_pending"] = True
-    str_lit.session_state["_settings_flash"] = (
-        "success", "Every setting restored to its universal default and saved.")
+    _report_press("OK", "Every setting restored to its universal default and saved.")
     str_lit.rerun()
 
 if _apply_clicked:
@@ -5316,12 +5384,13 @@ if _apply_clicked:
     str_lit.session_state.applied_cfg_owner = _cfg_owner
     _reset_gates()
     _settings_saved = _save_settings_to_disk("apply")
-    str_lit.session_state["_settings_flash"] = (
-        ("success", "Settings applied successfully - saved to your own settings file, "
-                    "they will survive a refresh.")
-        if _settings_saved else
-        ("warning", "Settings applied for this session, but settings.json could NOT be "
-                    "written - they will reset on the next refresh."))
+    if _settings_saved:
+        _report_press("OK", "Settings applied successfully - saved to your own "
+                            "settings file, they will survive a refresh.")
+    else:
+        _report_press("WARN", "Settings applied for this session, but settings.json "
+                              "could NOT be written - they will reset on the next "
+                              "refresh.")
     log_startup("User applied new configuration settings via sidebar control panel "
                 f"(persisted={_settings_saved}).")
     str_lit.rerun()
@@ -6782,6 +6851,15 @@ def tunnel_probe(proxy_str, targets=None, timeout=None):
     through to SOCKS5, which answered "authentication failed" on an HTTP-only
     port and re-labelled the whole node a 407 - so a bandwidth-refused pool read
     as a credential failure.
+
+    FIX SCHEME-1 (v13.74): PROBE_SECOND_SCHEME WAS INERT. _dial() set out["ok"]
+    and then returned "ok" on the same path, so the guard
+        if _s_idx and out["ok"] and not _second_scheme: break
+    could never be reached with out["ok"] true - out["ok"] was only ever set
+    immediately before a return. Turning the toggle ON changed nothing; the
+    alternate scheme was tried only after a FAILURE, which happened anyway.
+    A pass is now recorded and the scheme loop CONTINUES when the switch is on,
+    and a second-scheme failure is not allowed to overwrite the pass.
     """
     out = {"ok": False, "reason": "dead", "latency_ms": 0, "target": "",
            "scheme": None, "error": "", "control": ""}
@@ -6827,6 +6905,7 @@ def tunnel_probe(proxy_str, targets=None, timeout=None):
     def _dial(host, port, label):
         """One target across the scheme order. 'ok' | 'auth' | 'plan' | 'fail'."""
         for _s_idx, ptype in enumerate(_scheme_order(proxy_str)):
+            # FIX SCHEME-1: a PASS only ends the target when the switch is off.
             if _s_idx and out["ok"] and not _second_scheme:
                 break
             left = hard_deadline - time.time()
@@ -6847,34 +6926,46 @@ def tunnel_probe(proxy_str, targets=None, timeout=None):
                         kw["proxy_password"] = info["pass"]
                     s = socks.create_connection((host, port), timeout=attempt_to, **kw)
                 _remember_scheme(proxy_str, ptype)
-                out.update(ok=True, reason="ok", scheme=ptype, target=label,
-                           latency_ms=int((time.time() - started_all) * 1000))
-                return "ok"
+                # FIX SCHEME-1: record the FIRST pass only; a later scheme must
+                # not relabel the node, and with the switch off this is the exit.
+                if not out["ok"]:
+                    out.update(ok=True, reason="ok", scheme=ptype, target=label,
+                               latency_ms=int((time.time() - started_all) * 1000))
+                if not _second_scheme:
+                    return "ok"
             except Exception as e:
                 msg = str(e)
                 errors.append(f"{label}/{'HTTP' if ptype == socks.HTTP else 'SOCKS5'}: "
                               f"{type(e).__name__}: {msg[:110]}")
-                out["target"] = label
-                out["latency_ms"] = int((time.time() - started) * 1000)
                 if _is_proxy_plan_error(msg):
+                    auth_schemes.discard(ptype)
+                    if out["ok"]:
+                        # a pass already stands - 402 on the other scheme is noise
+                        break
                     out["reason"] = "plan"
                     return "plan"
                 if _is_proxy_auth_fail(msg):
                     auth_schemes.add(ptype)
+                    if out["ok"]:
+                        continue
                     return "auth"
+                if out["ok"]:
+                    # FIX SCHEME-1: a second-scheme failure must not overwrite
+                    # the pass's reason, target or latency.
+                    continue
+                out["target"] = label
+                out["latency_ms"] = int((time.time() - started) * 1000)
                 if isinstance(e, (socket.timeout, TimeoutError)) or "timed out" in msg.lower():
-                    if out["reason"] != "auth":
-                        out["reason"] = "timeout"
+                    out["reason"] = "timeout"
                 else:
-                    if out["reason"] != "auth":
-                        out["reason"] = "transport"
+                    out["reason"] = "transport"
             finally:
                 if s:
                     try:
                         s.close()
                     except Exception:
                         pass
-        return "fail"
+        return "ok" if out["ok"] else "fail"
 
     for host, port, label in targets:
         if time.time() >= hard_deadline:
@@ -6904,6 +6995,11 @@ def tunnel_probe(proxy_str, targets=None, timeout=None):
         out["reason"] = "auth"
 
     out["error"] = " ; ".join(errors)[:300]
+    # FIX SCHEME-1: with the switch ON, a pass now carries the OTHER scheme's
+    # failure text too. That is diagnostic noise on a healthy node, so a clean
+    # pass reports no error; auth_dest keeps its text.
+    if out["ok"] and out["reason"] == "ok":
+        out["error"] = ""
     return out
 # @@END 070 TUNNEL_PROBE
 
@@ -14226,6 +14322,13 @@ if start_engine_btn:
 # RAM / disk / payload and for a batch boundary, so a clean completed run wrote
 # nothing and the bell stayed silent for its whole life. One notification per
 # run now, keyed on the run's own start stamp so a reload cannot repeat it.
+#
+# v13.74: THE TWO WARNINGS STOLE EVERY PRESS. This block is module level and
+# runs on EVERY load, after the sidebar, and both warnings below were bare
+# str_lit.warning() calls - so on any load with a finished run behind it they
+# closed the open press as WARN before its own flash could render. That is the
+# "inherits the summary warning" symptom. They now degrade to a caption while a
+# press is unanswered, the same _steal shape block 080 already uses.
 _DF_TAIL = 1000
 
 try:
@@ -14250,6 +14353,10 @@ if _batch_hit:
         _batch_done = int((runstate.load() or {}).get("checked") or 0)
     except Exception:
         _batch_done = 0
+
+# v13.74: the steal guard. Local, so it cannot depend on block 080's ordering.
+_p108 = str_lit.session_state.get("_audit_pending") or {}
+_steal108 = bool(_p108) and not _p108.get("outcome")
 
 if str_lit.session_state.engine_has_run or _persisted_valid:
     section_title("📊", "Live Results Summary & ZIP Archive",
@@ -14337,6 +14444,11 @@ if str_lit.session_state.engine_has_run or _persisted_valid:
     # The whole point of the feature: it stops, it says so, it keeps the rest and
     # it offers the way on. The held queue lives in session_state and in
     # unfinished_live.json, so a refresh here is recoverable through Resume too.
+    #
+    # v13.74: both buttons get _report_press(). They set state and rerun with no
+    # message at all, so the press could only ever close as NO RESULT - and on the
+    # load after the click _batch_hit is empty, so this whole banner (and the
+    # button the press belonged to) is gone before anything could report.
     if _batch_hit:
         str_lit.info(
             f"🔢 **Batch complete.** {_batch_done or '?'} account(s) checked in this "
@@ -14348,10 +14460,14 @@ if str_lit.session_state.engine_has_run or _persisted_valid:
                               width="stretch"):
                 str_lit.session_state["_batch_autostart"] = list(_batch_hit)
                 str_lit.session_state.pop("_batch_hit", None)
+                _report_press("OK", f"Continuing - {len(_batch_hit)} account(s) queued "
+                                    f"for the next batch.")
                 str_lit.rerun()
         with _bc2:
             if str_lit.button("✖ Stop here and leave the rest queued", width="stretch"):
                 str_lit.session_state.pop("_batch_hit", None)
+                _report_press("OK", "Batch run closed here - the rest of the queue "
+                                    "stays on disk and Resume can pick it up.")
                 str_lit.rerun()
         try:
             notify.add(
@@ -14407,15 +14523,17 @@ if str_lit.session_state.engine_has_run or _persisted_valid:
     for _sc, (_sl, _sv) in zip(metric_grid(_s_pairs, per_row=3), _s_pairs):
         _sc.metric(_sl, _sv)
 
+    # FIX UI-8 (v13.74): the two per-bucket warnings are the ones that closed
+    # every press. Guarded on _steal108 - a caption while a press is unanswered.
     if login_drop_len_val:
-        str_lit.warning(
+        (str_lit.caption if _steal108 else str_lit.warning)(
             f"🚪 **{login_drop_len_val} account(s) hit a LOGIN DROP** - the mail server "
             f"ANSWERED, accepted the LOGIN command and then closed the socket (* BYE). "
             f"These passwords are still UNTESTED: it is usually a rejected password or an "
             f"app-password requirement, so retry them from a different IP (or with an app "
             f"password) before discarding them.")
     if proxy_len_val:
-        str_lit.warning(
+        (str_lit.caption if _steal108 else str_lit.warning)(
             f"🩹 **{proxy_len_val} account(s) never reached a mailbox** - every attempt died "
             f"with 407 Proxy Authentication Required. Those passwords are still UNTESTED.")
     if skip_len_val:
