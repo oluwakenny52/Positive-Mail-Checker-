@@ -355,6 +355,10 @@ def _detect_format(line):
 #         the widget key, so the old lookup always missed and the page fell
 #         through to the IMAP+POP default, defeating this whole block.
 #         Also split string values: iterating "IMAP,POP" yields characters.
+# v13.49: THE HOST CAP IS max(1, ...) NOW, not max(2, ...). app.py block 100
+#         uses `_imap_cap = max(1, min(4, max_hosts))` after FIX SPEED-5, so a
+#         slider of 1 dialled ONE host in the engine and this page drew two -
+#         the one number the page exists to get right.
 # --------------------------------------------------------------------------
 _WEB_ONLY = {
     "secure.windstream.net", "webmail.windstream.net",
@@ -431,7 +435,8 @@ def _build_plan(domain, max_hosts, flags=None):
     if not flags.get("pop"):
         all_pop = []
 
-    cap = max(2, min(4, int(max_hosts)))
+    # v13.49: max(1, ...) - see the block header. app.py block 100 is the truth.
+    cap = max(1, min(4, int(max_hosts)))
     imap_hosts = _dedupe_by_ip(all_imap, cap)
 
     if domain and domain not in imap_hosts and len(imap_hosts) < 4 and _resolve(domain):
