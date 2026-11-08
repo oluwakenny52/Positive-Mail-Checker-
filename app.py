@@ -879,7 +879,9 @@ SETTING_DEFAULTS = {
     "ui_workers": WORKERS_NORMAL,
     "ui_deadline": int(DEADLINE_NORMAL),
     "ui_timeout": ATTEMPT_TIMEOUT_NORMAL,
-    "ui_max_acc": 5000,
+    # v13.71: 0 MEANS ALL, and 0 is the default. 5000 silently cut every list
+    # longer than that with no word anywhere - the run just stopped.
+    "ui_max_acc": 0,
     "ui_blacklist_cf": BLACKLIST_CF_DEFAULT,
     "ui_dynamic_scaling": True,
     "ui_max_hosts": 3,
@@ -923,6 +925,11 @@ SETTING_DEFAULTS = {
     # targets now.
     "bb_whitelist": "",
     "bb_blacklist": "",
+    # v13.71: BATCH MODE. OFF by default, and 0 means "the whole queue" when it
+    # is on. bb_action_mode has no entry here on purpose - its option list lives
+    # in block 105, which runs long after this block, so block 105 seeds it.
+    "bb_batch_on": False,
+    "bb_batch_size": 0,
 }
 
 
@@ -974,7 +981,9 @@ def default_cfg() -> dict:
         "MAX_WORKERS_MAX": max(WORKERS_NORMAL * 2, 50),
         "TIMEOUT": ATTEMPT_TIMEOUT_NORMAL,
         "ACCOUNT_DEADLINE": int(DEADLINE_NORMAL),
-        "MAX_ACCOUNTS": 5000,
+        # v13.71: 0 = every account. This is the reset target and the migration
+        # target, so a 5000 here would put the cap straight back.
+        "MAX_ACCOUNTS": 0,
         "BLACKLIST_CF": BLACKLIST_CF_DEFAULT,
         "PROXY_MODE": "fallback",
         "RETRY_CONNECTION_FAILED": 1,
@@ -3744,6 +3753,12 @@ _SETTING_KINDS = {
     # the default, this supplies the memory.
     "bb_skip_prev": ("bool", 0, 0, None),
     "bb_sum_full": ("bool", 0, 0, None),
+    # v13.71: BATCH MODE. bb_action_mode is "text" rather than "choice" because
+    # its option list is built in block 105, after this dict exists; block 105
+    # validates the value against the real list when it seeds the widget.
+    "bb_batch_on": ("bool", 0, 0, None),
+    "bb_batch_size": ("int", 0, 5000, None),
+    "bb_action_mode": ("text", 0, 0, None),
     "pool_mode": ("choice", 0, 0, ("all", "us_only", "country", "mix")),
 }
 
@@ -4044,12 +4059,48 @@ else:
                                       key="ui_deadline")
     timeout = str_lit.sidebar.slider("Timeout", 3, 40, step=1, key="ui_timeout")
     default_hosts = 3
-max_acc = str_lit.sidebar.slider("Max Accounts", 0, 5000, step=100, key="ui_max_acc")
+# v13.71: 0 IS NOW "ALL" AND IS THE DEFAULT. 5000 cut every longer list silently.
+max_acc = str_lit.sidebar.slider("Max Accounts (0 = all)", 0, 5000, step=100,
+                                 key="ui_max_acc",
+                                 help="The hard ceiling for one run. 0 means every account "
+                                      "in the queue - the old 5000 default quietly dropped "
+                                      "everything past the five thousandth line.")
 blacklist_cf = str_lit.sidebar.slider(
     "Blacklist CF (consecutive proxy fails)", 3, 100, step=1,
     key="ui_blacklist_cf",
     help="A proxy is circuit-broken for 30s after this many consecutive network failures."
 )
+
+# ---------------------------------------------------------------------------
+# v13.71 BATCH MODE
+# ---------------------------------------------------------------------------
+# The slider is read straight out of session_state by block 105, NOT out of CFG,
+# so turning batch mode on and pressing Start works without Apply Settings first.
+# 0 on the slider means "everything that is left", which makes the toggle a
+# no-op while it is on and the slider is at 0 - deliberate, so the control can be
+# parked without changing behaviour.
+_seed_widget("bb_batch_on")
+batch_mode = str_lit.sidebar.toggle(
+    "🔢 Batch Mode", key="bb_batch_on",
+    help="ON: the run stops on its own after the number of accounts set below, keeps "
+         "the rest of the queue, and offers a Continue button. Use it to walk a huge "
+         "list in controlled chunks without one long run.\n\n"
+         "OFF (default): one run, the whole queue."
+)
+if batch_mode:
+    _seed_widget("bb_batch_size", lo=0, hi=5000, dflt=0)
+    batch_size = str_lit.sidebar.slider(
+        "Accounts per batch (0 = no limit)", 0, 5000, step=1, key="bb_batch_size",
+        help="How many accounts this run checks before it stops and offers Continue. "
+             "1 is allowed - one account per press. 0 means the toggle is effectively "
+             "off and the run goes to the end of the queue."
+    )
+    str_lit.sidebar.caption(
+        f"Batch: {'no limit' if batch_size == 0 else str(batch_size) + ' account(s)'} per "
+        f"run, then Continue. The rest of the queue is kept on disk either way."
+    )
+else:
+    batch_size = 0
 # @@END 046 SIDEBAR_MODE
 
 # @@BLOCK 047 SIDEBAR_PROTOCOLS deps=011,019,046
@@ -5062,6 +5113,7 @@ def build_cfg():
         "MAX_WORKERS_START": workers,
         "TIMEOUT": timeout,
         "ACCOUNT_DEADLINE": deadline,
+        # v13.71: 0 passes straight through and block 105 reads it as "all".
         "MAX_ACCOUNTS": max_acc,
         "BLACKLIST_CF": blacklist_cf,
         "PROXY_MODE": resolved_proxy_mode if use_proxy else "off",
@@ -5212,7 +5264,10 @@ for _k, _v in (
     ("FAILURE_COOLDOWN", FAILURE_COOLDOWN_DEFAULT),
     ("FAST_MODE", False), ("BLACKLIST_CF", BLACKLIST_CF_DEFAULT), ("DEBUG", False),
     ("PROXY_TEST_FLIGHT", True),
-    ("RETRY_CONNECTION_FAILED", 1), ("MAX_ACCOUNTS", 5000),
+    ("RETRY_CONNECTION_FAILED", 1),
+    # v13.71: 0, so a config inherited from a build that shipped 5000 does not
+    # keep the cap.
+    ("MAX_ACCOUNTS", 0),
     ("MAX_WORKERS_START", WORKERS_NORMAL),
     ("DYNAMIC_WORKER_SCALING", True), ("PROXY_MODE", "fallback"),
     ("ALLOW_BLACKLIST_IPS", False),
@@ -12752,6 +12807,27 @@ section_title("🚀", "Execute Live Checking Engine",
 RESULT_ACTION_MODES = BUCKETS
 ACTION_OPTIONS = list(PREFILTER_LABELS) + [label for label, _ in BUCKETS]
 
+# v13.71: THE SELECTOR SITS BETWEEN THE HEADING AND THE BUTTONS. It used to be
+# squeezed into a 0.35 column beside Start/Stop, so on a phone the thing that
+# decides WHICH queue runs was the smallest control on the page. It is now read
+# before the button that acts on it.
+_seed_widget("bb_action_mode", choices=ACTION_OPTIONS, dflt=ACTION_OPTIONS[0])
+engine_action_mode = str_lit.selectbox(
+    "Engine Action Mode:", options=ACTION_OPTIONS,
+    key="bb_action_mode",
+    help="Pick a pre-filter bucket (SMTP Failed sits right after DNS Failed) or a "
+         "previous result bucket to re-run."
+)
+if engine_action_mode == "Resume Unfinished":
+    # runstate.summary() reads the watchdog record, so this is the truth about
+    # whether anything is actually resumable - not a glob that always matched.
+    _rs_lines = runstate.summary()
+    if _rs_lines:
+        for _rs_line in _rs_lines:
+            str_lit.text(_rs_line)
+    else:
+        str_lit.caption("No interrupted run recorded.")
+
 col_action1, col_action2 = str_lit.columns([0.65, 0.35])
 with col_action1:
     start_engine_btn = str_lit.button("🔥 Start Live Checking Engine", type="primary")
@@ -12761,22 +12837,19 @@ with col_action1:
              "reason on the run record FIRST, then reruns, so the next page load "
              "reports 'Stopped by user' and leaves the queue resumable.")
 with col_action2:
-    _seed_widget("bb_action_mode", choices=ACTION_OPTIONS, dflt=ACTION_OPTIONS[0])
-    engine_action_mode = str_lit.selectbox(
-        "Engine Action Mode:", options=ACTION_OPTIONS,
-        key="bb_action_mode",
-        help="Pick a pre-filter bucket (SMTP Failed sits right after DNS Failed) or a "
-             "previous result bucket to re-run."
-    )
-    if engine_action_mode == "Resume Unfinished":
-        # runstate.summary() reads the watchdog record, so this is the truth about
-        # whether anything is actually resumable - not a glob that always matched.
-        _rs_lines = runstate.summary()
-        if _rs_lines:
-            for _rs_line in _rs_lines:
-                str_lit.text(_rs_line)
-        else:
-            str_lit.caption("No interrupted run recorded.")
+    # v13.71: batch state, read straight from session_state so no Apply Settings is
+    # needed. It is published as text only - the engine never reads it.
+    _batch_on = bool(str_lit.session_state.get("bb_batch_on"))
+    try:
+        _batch_size = max(0, int(str_lit.session_state.get("bb_batch_size") or 0))
+    except Exception:
+        _batch_size = 0
+    if _batch_on and _batch_size > 0:
+        str_lit.caption(f"🔢 Batch: {_batch_size} per run")
+    elif _batch_on:
+        str_lit.caption("🔢 Batch on, no limit")
+    else:
+        str_lit.caption("Batch off")
 
 # FIX SPEED-8: this used to run at MODULE level on every rerun - a full read and
 # filter of proxies.txt for a value only the start path below ever consumes. The
@@ -12795,6 +12868,10 @@ with col_action2:
 # exactly `executor.submit(check_task, line)`, which verify_v1337.py gates.
 active_proxy_pool = []
 _run_pool_box = []
+# v13.71: batch state for block 106 and block 108. Bound here, unconditionally,
+# so neither of them ever reads an unbound name.
+_batch_rest = []
+_batch_active = False
 
 
 # v13.53: progress_bar / status_text are bound at MODULE scope behind a null shim.
@@ -12829,6 +12906,13 @@ class _NullUI:
 progress_bar = _NullUI()
 status_text = _NullUI()
 
+# v13.71: CONTINUE. The batch banner in block 108 parks the remaining queue here
+# and reruns; this is what turns that rerun back into a start. Consumed with pop
+# so a plain refresh cannot re-trigger it.
+_autostart = str_lit.session_state.pop("_batch_autostart", None)
+if _autostart:
+    start_engine_btn = True
+
 # The stop is a rerun with a reason attached: the click tears the loop down
 # before anything below executes, so the stamp has to happen here and the
 # interrupt itself is performed by block 007 on the next load.
@@ -12862,7 +12946,8 @@ if start_engine_btn:
         f"subuser_conc={CFG.get('PROXY_SUBUSER_CONCURRENCY')} "
         f"proxy_conc={CFG.get('PROXY_CONCURRENCY')} "
         f"max_rotations={CFG.get('MAX_ROTATIONS')} check_pass2={CFG.get('CHECK_PASS2')} "
-        f"direct_first={CFG.get('DIRECT_FIRST')} mail_spot={CFG.get('MAIL_SPOT_CHECK')}"
+        f"direct_first={CFG.get('DIRECT_FIRST')} mail_spot={CFG.get('MAIL_SPOT_CHECK')} "
+        f"batch={_batch_size if _batch_on else 'off'}"
     )
 
     resume_lines = []
@@ -12891,6 +12976,13 @@ if start_engine_btn:
         ]
 
     accounts_to_check = category_queue_map.get(engine_action_mode, [])
+
+    # v13.71: a Continue carries its own queue and overrides the category.
+    if _autostart:
+        accounts_to_check = [str(x) for x in _autostart if str(x).strip()]
+        log_startup(f"BATCH CONTINUE -> {len(accounts_to_check)} account(s) carried over.")
+    # A banner from the previous batch must not survive into this run.
+    str_lit.session_state.pop("_batch_hit", None)
 
     if not accounts_to_check:
         str_lit.warning(f"⚠ No accounts found in the selected category: "
@@ -13093,8 +13185,23 @@ if start_engine_btn:
                     bucket_placeholders[_key] = str_lit.empty()
             report_log_container = str_lit.empty()
 
-        all_target_accounts = (accounts_to_check[:CFG["MAX_ACCOUNTS"]]
-                               if CFG["MAX_ACCOUNTS"] > 0 else accounts_to_check)
+        # v13.71: MAX_ACCOUNTS 0 = all, then the batch slice. THE SLICE HAPPENS
+        # BEFORE SUBMIT, not by counting completions: every future handed to the
+        # executor is collected, and executor.shutdown(wait=False) lets stragglers
+        # finish after the loop - so a batch counted inside the loop would run the
+        # whole queue and simply not report it.
+        _full_queue = (accounts_to_check[:CFG["MAX_ACCOUNTS"]]
+                       if CFG["MAX_ACCOUNTS"] > 0 else list(accounts_to_check))
+        if _batch_on and _batch_size > 0 and len(_full_queue) > _batch_size:
+            all_target_accounts = _full_queue[:_batch_size]
+            _batch_rest = _full_queue[_batch_size:]
+            _batch_active = True
+            log_startup(f"BATCH MODE -> this run takes {len(all_target_accounts)} of "
+                        f"{len(_full_queue)} account(s); {len(_batch_rest)} held for Continue.")
+        else:
+            all_target_accounts = _full_queue
+            _batch_rest = []
+            _batch_active = False
         total_accs = len(all_target_accounts)
         checked_count = 0
         # The queue is final and counted - open the run record here.
@@ -13582,8 +13689,12 @@ if start_engine_btn:
                                           if ":" in raw else raw)
                                     if em not in done:
                                         left.append(raw)
-                                if left:
-                                    save_unfinished("In Progress (Running)", left,
+                                # v13.71: at a batch boundary the queue snapshot
+                                # must carry the HELD lines too, or a refresh
+                                # during a batch leaves the rest unreachable.
+                                if left or _batch_rest:
+                                    save_unfinished("In Progress (Running)",
+                                                    left + list(_batch_rest),
                                                     checked_count, total_accs)
                                 # FIX SPEED-4: clean_valid_accounts.txt is read and
                                 # fully rewritten by _write_clean_valid(). Doing that
@@ -13703,7 +13814,16 @@ if start_engine_btn:
                 left = [raw for raw in all_target_accounts
                         if (raw.split(":", 1)[0].strip().lower()
                             if ":" in raw else raw) not in done]
-                if checked_count >= total_accs and not run_interrupted:
+                # v13.71: A BATCH BOUNDARY IS NOT A FINISH. runstate.finish() and
+                # clear_unfinished() would throw the held lines away, and the
+                # banner in block 108 is what carries them forward.
+                if _batch_rest and checked_count >= total_accs and not run_interrupted:
+                    str_lit.session_state["_batch_hit"] = list(_batch_rest)
+                    runstate.note(f"Batch boundary: {checked_count} checked, "
+                                  f"{len(_batch_rest)} left for the next batch")
+                    save_unfinished("Batch boundary - press Continue for the next batch",
+                                    list(_batch_rest) + left, checked_count, total_accs)
+                elif checked_count >= total_accs and not run_interrupted:
                     # Clean completion: close the watchdog record, then drop the data.
                     runstate.finish()
                     clear_unfinished()
@@ -13716,8 +13836,12 @@ if start_engine_btn:
         duration = end_dt - start_dt
 
         with session_state_lock:
+            # v13.71: a completed batch is its own outcome - not "Successful" (the
+            # queue is not done) and not "Unfinished" (nothing went wrong).
             str_lit.session_state.run_completion_status = (
-                "Successful" if (checked_count >= total_accs and not run_interrupted)
+                "Batch complete"
+                if (_batch_rest and checked_count >= total_accs and not run_interrupted)
+                else "Successful" if (checked_count >= total_accs and not run_interrupted)
                 else "Unfinished")
             str_lit.session_state.end_timestamp = end_dt.strftime("%Y-%m-%d %H:%M:%S")
             str_lit.session_state.total_duration = str(timedelta(seconds=int(duration.total_seconds())))
