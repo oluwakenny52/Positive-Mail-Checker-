@@ -839,18 +839,27 @@ with tab_proxy:
 with tab_cache:
     st.markdown("#### Host cache tools")
 
+    # v13.49: THE PATH IS READ FROM cache_stats(), NOT GUESSED. The cache has
+    # been a per-user file (<hash>_hosts_cache.json) since v13.51 of hosts.py, so
+    # opening APP_DIR/hosts_cache.json showed nothing on any live deployment -
+    # the expander was always empty and the "no readable cache" caption read
+    # like a bug in the app rather than in this page.
     try:
         stats = H.cache_stats()
     except Exception as e:
         stats = {"error": str(e)}
     st.json(stats)
 
+    _cache_path = stats.get("path") or ""
+    if _cache_path:
+        st.caption("Cache file: `%s`" % _cache_path)
+
     c1, c2 = st.columns(2)
     with c1:
-        if st.button("🧹 Clear hosts_cache.json", width="stretch"):
+        if st.button("🧹 Clear my host cache", width="stretch"):
             try:
                 H.clear_cache()
-                st.success("Cache cleared. Reload this page to rebuild it.")
+                st.success("Your cache cleared. Reload this page to rebuild it.")
             except Exception as e:
                 st.error(f"clear_cache failed: {e}")
     with c2:
@@ -867,17 +876,22 @@ with tab_cache:
     )
 
     with st.expander("Cached entries (domain -> counts)"):
-        try:
-            with open(os.path.join(APP_DIR, "hosts_cache.json"), encoding="utf-8") as f:
-                data = json.load(f)
-            if isinstance(data, dict):
-                st.code(
-                    "\n".join(f"{k}: imap={len(v.get('imap') or [])} pop={len(v.get('pop') or [])} "
-                              f"sources={v.get('sources')}" for k, v in list(data.items())[:60]),
-                    language="text",
-                )
-        except Exception as e:
-            st.caption(f"no readable cache: {e}")
+        if not _cache_path:
+            st.caption("cache_stats() reported no path.")
+        else:
+            try:
+                with open(_cache_path, encoding="utf-8") as f:
+                    data = json.load(f)
+                if isinstance(data, dict):
+                    st.code(
+                        "\n".join(f"{k}: imap={len(v.get('imap') or [])} pop={len(v.get('pop') or [])} "
+                                  f"sources={v.get('sources')}" for k, v in list(data.items())[:60]),
+                        language="text",
+                    )
+                else:
+                    st.caption("cache file is not a dict")
+            except Exception as e:
+                st.caption(f"no readable cache: {e}")
 # @@END 017 TAB_CACHE
 
 
