@@ -670,13 +670,41 @@ def rank_hosts(hosts, domain, probe=True):
 
 # @@BLOCK 012 CACHE_ATOMIC deps=000
 _CACHE_FILE = "hosts_cache.json"
+# v13.51: the bare name is now only the FALLBACK and the legacy alias. The real
+# path is per user, and _cache_owner is what stops two sessions in one process
+# swapping their parsed dicts.
+_LEGACY_CACHE = _CACHE_FILE
 _CACHE_TTL = 86400
 _CACHE_MAX_AGE = 7 * 86400
 _cache_lock = threading.RLock()
 _cache = None
+_cache_owner = ""
 
 _resolve_lock = threading.Lock()
 _resolve_cache = {}
+
+
+def _cache_file():
+    """This user's cache file. Never bare while a session exists.
+
+    v13.51: hosts_cache.json was a bare module constant, so every user on one
+    deployment read and wrote the SAME file, and _cache - a process global -
+    handed the first user's parsed dict to the next one. The path is resolved
+    through auth.user_file() now; the bare name survives only as the headless
+    fallback and as the legacy file an existing deployment already has.
+    """
+    try:
+        import auth
+        p = auth.user_file(_CACHE_FILE)
+        if p:
+            return p
+    except Exception:
+        pass
+    return _CACHE_FILE
+
+
+def _cache_bak():
+    return _cache_file() + ".bak"
 
 
 def _atomic_write_json(path, obj, indent=2):
@@ -720,11 +748,15 @@ def _atomic_write_json(path, obj, indent=2):
 
 
 def _load_cache():
-    global _cache
-    if _cache is not None:
+    global _cache, _cache_owner
+    owner = _cache_file()
+    if _cache is not None and _cache_owner == owner:
         return _cache
+    if _cache is not None:
+        # a different user's dict is resident - drop it, never serve it
+        _cache = None
 
-    for candidate in (_CACHE_FILE, _CACHE_FILE + ".bak"):
+    for candidate in (owner, owner + ".bak", _LEGACY_CACHE, _LEGACY_CACHE + ".bak"):
         if not os.path.exists(candidate):
             continue
         try:
@@ -732,9 +764,11 @@ def _load_cache():
                 parsed = json.load(f)
             if isinstance(parsed, dict):
                 _cache = parsed
-                if candidate.endswith(".bak"):
+                _cache_owner = owner
+                # a legacy or .bak source is promoted into the user's own file
+                if candidate != owner:
                     try:
-                        _atomic_write_json(_CACHE_FILE, parsed)
+                        _atomic_write_json(owner, parsed)
                     except Exception:
                         pass
                 return _cache
@@ -742,6 +776,7 @@ def _load_cache():
             continue
 
     _cache = {}
+    _cache_owner = owner
     return _cache
 
 
@@ -756,9 +791,9 @@ def _save_cache():
                 data.pop(k, None)
             snapshot = dict(data)
 
-        payload = _atomic_write_json(_CACHE_FILE, snapshot)
+        payload = _atomic_write_json(_cache_file(), snapshot)
         try:
-            with open(_CACHE_FILE + ".bak", "w", encoding="utf-8") as f:
+            with open(_cache_bak(), "w", encoding="utf-8") as f:
                 f.write(payload)
         except Exception:
             pass
@@ -772,10 +807,12 @@ def flush_cache():
 
 
 def clear_cache():
-    global _cache
+    """Delete THIS user's cache. Another user's cache is untouched."""
+    global _cache, _cache_owner
     with _cache_lock:
         _cache = {}
-    for p in (_CACHE_FILE, _CACHE_FILE + ".bak"):
+        _cache_owner = _cache_file()
+    for p in (_cache_file(), _cache_bak()):
         try:
             if os.path.exists(p):
                 os.remove(p)
@@ -785,13 +822,15 @@ def clear_cache():
 
 
 def cache_stats():
-    stats = {"entries": 0, "file_bytes": 0, "path": _CACHE_FILE,
-             "has_backup": os.path.exists(_CACHE_FILE + ".bak"), "healthy": True}
+    path = _cache_file()
+    stats = {"entries": 0, "file_bytes": 0, "path": path,
+             "has_backup": os.path.exists(path + ".bak"), "healthy": True,
+             "legacy_present": os.path.exists(_LEGACY_CACHE)}
     try:
         with _cache_lock:
             stats["entries"] = len(_load_cache())
-        if os.path.exists(_CACHE_FILE):
-            stats["file_bytes"] = os.path.getsize(_CACHE_FILE)
+        if os.path.exists(path):
+            stats["file_bytes"] = os.path.getsize(path)
     except Exception:
         stats["healthy"] = False
     return stats
