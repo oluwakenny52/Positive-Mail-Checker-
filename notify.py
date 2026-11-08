@@ -1,4 +1,4 @@
-"""notify.py - per-user, bounded, file-backed notifications.  v13.70
+"""notify.py - per-user, bounded, file-backed notifications.  v13.71
 
 WHY A FILE AND NOT session_state
 --------------------------------
@@ -17,6 +17,11 @@ BOUNDS
 ------
 MAX_LINES rows, trimmed to that once TRIM_AT is passed, written to .tmp and
 os.replace()d. A 300-row file is ~90 KB and cannot grow.
+
+v13.71: THE DEDUPE MAP IS NOW PRUNED.  It held one pair per (scope, key) for the
+life of the process and was never emptied, so every condition that had ever fired
+for every user who had ever visited stayed resident. Past DEDUPE_MAX entries the
+expired pairs are dropped; the same pass trims the per-scope throttle map.
 
 DEDUPE - AND WHY IT IS PER USER
 -------------------------------
@@ -48,6 +53,8 @@ MAX_LINES = 300
 TRIM_AT = 450
 LOG_NAME = "notifications.jsonl"
 SEEN_NAME = "notify_seen.json"
+# v13.71: prune the dedupe map once it passes this many pairs.
+DEDUPE_MAX = 400
 
 LEVELS = ("info", "warn", "critical")
 LEVEL_COLOR = {"info": "#38bdf8", "warn": "#facc15", "critical": "#ef4444"}
@@ -158,6 +165,26 @@ def _write_seen(last):
         pass
 
 
+def _prune(now, window=SYS_REPEAT_SECONDS):
+    """Drop dedupe pairs whose window has expired. Called under _lock.
+
+    v13.71: without this the map only ever grew. The longest window in the module
+    is SYS_REPEAT_SECONDS, so a pair older than that can never suppress anything
+    again and is safe to forget.
+    """
+    try:
+        if len(_dedupe) > DEDUPE_MAX:
+            cutoff = float(now) - float(window)
+            for k in [k for k, v in _dedupe.items() if float(v[0]) < cutoff]:
+                _dedupe.pop(k, None)
+        if len(_last_sys) > DEDUPE_MAX:
+            cutoff = float(now) - SYS_MIN_SECONDS
+            for k in [k for k, v in _last_sys.items() if float(v) < cutoff]:
+                _last_sys.pop(k, None)
+    except Exception:
+        pass
+
+
 # ---------------------------------------------------------------------------
 # write
 # ---------------------------------------------------------------------------
@@ -178,6 +205,7 @@ def add(level, kind, text, suggestion="", key="", dedupe=SYS_REPEAT_SECONDS):
                     prev[1] += 1
                     return None
                 _dedupe[dkey] = [now, 1]
+                _prune(now, dedupe)
             rows = _read_rows()
             _seq = (_seq + 1) % 1000
             rec = {
