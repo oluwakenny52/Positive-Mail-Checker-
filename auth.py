@@ -52,6 +52,17 @@ MIN_LEN = 8
 
 
 # @@BLOCK 001 KEYS deps=000
+import threading
+
+# One lock for every read-modify-write on passkey.json. _save() is atomic for the
+# WRITE, but add_key() and the two forget_* calls read the list first, so two
+# people creating a passkey at the same moment both built from the same snapshot
+# and the second os.replace() dropped the first's key. Reentrant because
+# forget_current() is called from inside require() while a caller may already
+# hold it.
+_key_lock = threading.RLock()
+
+
 def _digest(phrase, salt):
     return hashlib.sha256((salt + "\x00" + phrase).encode("utf-8")).hexdigest()[:HASH_LEN]
 
@@ -80,13 +91,14 @@ def _save(data):
 def add_key(phrase, label=""):
     """Create a passkey, persist it, return its hash."""
     phrase = (phrase or "").strip()
-    data = _load()
-    salt = secrets.token_hex(SALT_BYTES)
-    h = _digest(phrase, salt)
-    data["keys"].append({"salt": salt, "hash": h,
-                         "label": (label or "").strip()[:40],
-                         "created": int(time.time())})
-    _save(data)
+    with _key_lock:
+        data = _load()
+        salt = secrets.token_hex(SALT_BYTES)
+        h = _digest(phrase, salt)
+        data["keys"].append({"salt": salt, "hash": h,
+                             "label": (label or "").strip()[:40],
+                             "created": int(time.time())})
+        _save(data)
     return h
 
 
@@ -95,7 +107,9 @@ def match_key(phrase):
     phrase = (phrase or "").strip()
     if not phrase:
         return ""
-    for k in reversed(_load().get("keys") or []):
+    with _key_lock:
+        keys = list(_load().get("keys") or [])
+    for k in reversed(keys):
         if secrets.compare_digest(_digest(phrase, k.get("salt", "")), k.get("hash", "")):
             return k.get("hash", "")
     return ""
@@ -105,26 +119,28 @@ def forget_current(h):
     """Drop ONE key. Every other user keeps working. Empty list -> delete file."""
     if not h:
         return
-    data = _load()
-    data["keys"] = [k for k in (data.get("keys") or []) if k.get("hash") != h]
-    if data["keys"]:
-        _save(data)
-    else:
+    with _key_lock:
+        data = _load()
+        data["keys"] = [k for k in (data.get("keys") or []) if k.get("hash") != h]
+        if data["keys"]:
+            _save(data)
+        else:
+            for p in (PASSKEY_FILE, PASSKEY_FILE + ".tmp"):
+                try:
+                    if os.path.exists(p):
+                        os.remove(p)
+                except Exception:
+                    pass
+
+
+def forget_all():
+    with _key_lock:
         for p in (PASSKEY_FILE, PASSKEY_FILE + ".tmp"):
             try:
                 if os.path.exists(p):
                     os.remove(p)
             except Exception:
                 pass
-
-
-def forget_all():
-    for p in (PASSKEY_FILE, PASSKEY_FILE + ".tmp"):
-        try:
-            if os.path.exists(p):
-                os.remove(p)
-        except Exception:
-            pass
 
 
 def user_key_hash():
