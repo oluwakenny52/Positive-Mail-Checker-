@@ -26,7 +26,7 @@ except Exception:
              "pages/2_Diagnostics.py", "pages/3_Mailbox_Reader.py",
              "pages/4_Downloads.py", "pages/5_Blocks.py", "pages/6_User_Guide.py",
              "pages/7_Logs.py"]
-    EXPECT_FILES, EXPECT_BLOCKS = 14, 295
+    EXPECT_FILES, EXPECT_BLOCKS = 14, 294
 
 FILE_RX  = re.compile(r"^#\s*@@FILE\s+(\S+)\s+blocks=(\d+)\s+version=(\S+)\s*$")
 BLOCK_RX = re.compile(r"^#\s*@@BLOCK\s+(\d{3})\s+([A-Za-z0-9_]+)(?:\s+deps=(\S+))?\s*$")
