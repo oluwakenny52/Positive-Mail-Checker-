@@ -12763,7 +12763,29 @@ def _check_account_core(email, password, conf, domain, proxy_pool, thread_state,
             except Exception:
                 pass
 
-        allow_proxy = bool(px) and proxy_mode != "off" and not proxy_is_quarantined(px)
+        # v13.73: A POOL THAT CANNOT REACH THE MAIL PORT IS NOT USED AT ALL.
+        # The node probe dials the 443 control first, so a node that answers 443
+        # and is refused 993/143/110 is armed and then burns ladder time on every
+        # account. The MAIL-DESTINATION spot check is the only evidence that
+        # speaks about the port we actually dial, so when it reports zero passes
+        # out of a real sample the proxy phase is skipped outright. The run is
+        # unaffected - DIRECT carries it - it just stops paying for the hop.
+        _ms = {}
+        try:
+            _ms = STATE.get("mail_spot") or {}
+            if _ms.get("user") and _ms.get("user") != _gate_scope():
+                _ms = {}
+        except Exception:
+            _ms = {}
+        _spot_dead = bool(_ms) and not _ms.get("ok") and int(_ms.get("n") or 0) > 0
+
+        allow_proxy = (bool(px) and proxy_mode != "off"
+                       and not proxy_is_quarantined(px) and not _spot_dead)
+        if _spot_dead and px:
+            trace_logs.append(
+                f"Proxy phase skipped: the mail-destination spot check got 0 pass out of "
+                f"{_ms.get('n')} sampled node(s) on {_ms.get('host')}:{_ms.get('port')} - "
+                f"the pool cannot reach the mail port, so only DIRECT is dialled.")
         direct_gate = (px is None or proxy_mode == "fallback"
                        or bool(CFG.get("RETRY_CONNECTION_FAILED")) or force_direct["flag"]
                        or flags["saw_407"])
@@ -12771,6 +12793,12 @@ def _check_account_core(email, password, conf, domain, proxy_pool, thread_state,
 
         def _run_direct(primary_dl, hard_dl):
             nonlocal retryable
+            # v13.73: RECORD THAT DIRECT RAN. The three proxy-hop tails in block
+            # 104 outrank retryable / saw_server, so without this a 407 or 402 in
+            # the proxy phase buried a real direct failure and a valid account was
+            # reported PROXY_UNHEALTHY. Block 104 stands those tails down when
+            # this is set.
+            flags["ran_direct"] = True
             dp = [r for r in primary_plan if fast_fail_dns_check(r[1])] or primary_plan
             df = [r for r in fallback_plan if fast_fail_dns_check(r[1])]
             dgeo = direct_geo()
@@ -12871,7 +12899,16 @@ def _check_account_core(email, password, conf, domain, proxy_pool, thread_state,
                               f"verdict [{best_verdict['status']}].")
             return None, best_verdict["status"], detail, None, trace_logs
 
+    # v13.73: THE THREE PROXY-HOP TAILS STAND DOWN ONCE DIRECT HAS RUN.
+    # With DIRECT_FIRST on, direct is always dialled BEFORE the proxy, so a proxy
+    # 407 / 402 / 403 is by definition a SECOND answer - and these tails used to
+    # sit above retryable and saw_server, so they outranked the real direct
+    # failure and reported a valid account as PROXY_UNHEALTHY with "the password
+    # is untested". Two accounts were lost that way on a 33-account run. The
+    # guards keep the old behaviour when no direct sweep happened (proxy-only
+    # modes), which is the case these tails were written for.
     if flags["saw_407"] and not flags.get("saw_server") \
+            and not flags.get("ran_direct") \
             and acct_407_total >= PROXY_407_FORCE_DIRECT:
         trace_logs.append(
             f"Every attempt died in the PROXY hop ({acct_407_total} x 407, "
@@ -12911,7 +12948,8 @@ def _check_account_core(email, password, conf, domain, proxy_pool, thread_state,
     # v13.54: THE 402 TAIL. Without this a wholly 402 run ended on the generic
     # "all hosts unreachable" text, which blames the mail host for a provider
     # bandwidth/plan refusal and tells the user nothing they can act on.
-    if flags.get("saw_plan") and not flags.get("saw_server") and not retryable:
+    if flags.get("saw_plan") and not flags.get("saw_server") and not retryable \
+            and not flags.get("ran_direct"):
         trace_logs.append(
             "Every rung answered 402 Payment Required in the PROXY hop and no host ever "
             "answered - the mailbox was never reached, so the password is untested. "
@@ -12931,7 +12969,8 @@ def _check_account_core(email, password, conf, domain, proxy_pool, thread_state,
     # answer from a later rung, and the verdict is PROXY_UNHEALTHY - the passwords
     # are UNTESTED, not wrong.
     if flags.get("saw_port_block") and not flags.get("saw_server") \
-            and not flags.get("saw_auth") and not retryable:
+            and not flags.get("saw_auth") and not retryable \
+            and not flags.get("ran_direct"):
         trace_logs.append(
             "Every rung answered 403 client_connect_forbidden_port in the PROXY hop - the "
             "provider refuses these DESTINATION PORTS by policy, so the mailbox was never "
@@ -14182,6 +14221,11 @@ if start_engine_btn:
 # carry every row. The block also WRITES to status_text, because until now
 # nothing here touched it: the screen sat on block 107's "writing result files"
 # line for the entire render, which is exactly what was reported as a hang.
+#
+# v13.73: THE BELL NOW HEARS ABOUT RUNS. notify.add() was only ever called for
+# RAM / disk / payload and for a batch boundary, so a clean completed run wrote
+# nothing and the bell stayed silent for its whole life. One notification per
+# run now, keyed on the run's own start stamp so a reload cannot repeat it.
 _DF_TAIL = 1000
 
 try:
@@ -14242,6 +14286,7 @@ if str_lit.session_state.engine_has_run or _persisted_valid:
         start_ts_copy = str_lit.session_state.start_timestamp
         end_ts_copy = str_lit.session_state.end_timestamp
         duration_copy = str_lit.session_state.total_duration
+        _completion_copy = str_lit.session_state.run_completion_status
         summary_buckets = {
             "✅ Valid Accounts Found": list(str_lit.session_state.valid_results),
             "❌ Wrong Password Found": list(str_lit.session_state.wrong_results),
@@ -14262,6 +14307,31 @@ if str_lit.session_state.engine_has_run or _persisted_valid:
     str_lit.caption(f"Protocols dialled this run: **{' + '.join(active_protocols())}**"
                     + ("  ·  SMTP/ManageSieve were CONFIRM-ONLY"
                        if any(p in ("SMTP", "ManageSieve") for p in active_protocols()) else ""))
+
+    # v13.73: ONE notification per run. The key carries the run's own start
+    # stamp, so every reload of this page is the same key and the 24h window
+    # swallows the repeats - but the NEXT run is a new stamp and notifies again.
+    # A batch boundary keeps its own message in the banner below.
+    if start_ts_copy and not _batch_hit:
+        try:
+            if _completion_copy == "Successful":
+                notify.add(
+                    "info", "run",
+                    f"Run complete: {clean_count_val} valid, {wrong_len_val} wrong, "
+                    f"{login_drop_len_val} login dropped, {conn_len_val} connection failed.",
+                    "Open the results summary to export the buckets.",
+                    key="run-done-%s" % start_ts_copy, dedupe=86400.0)
+            elif _completion_copy == "Unfinished":
+                _rec_n = runstate.load() or {}
+                notify.add(
+                    "warn", "run",
+                    "Run stopped unfinished: %s (%s/%s checked)."
+                    % (_rec_n.get("reason") or _rec_n.get("cause") or "unknown",
+                       _rec_n.get("checked", 0), _rec_n.get("total", 0)),
+                    "Set Engine Action Mode to 'Resume Unfinished' and press Start.",
+                    key="run-stop-%s" % start_ts_copy, dedupe=86400.0)
+        except Exception:
+            pass
 
     # ---- v13.71 BATCH BANNER -------------------------------------------------
     # The whole point of the feature: it stops, it says so, it keeps the rest and
