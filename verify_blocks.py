@@ -67,7 +67,7 @@ BLOCKED_FILES = [
 # block count.  tier2_split.py prints the new line for you and records it in
 # TIER2_MANIFEST.txt; paste it here.
 TARGET_FILES = 14
-TARGET_BLOCKS = 295
+TARGET_BLOCKS = 294
 
 FILE_RX = re.compile(r"^#\s*@@FILE\s+(\S+)\s+blocks=(\d+)\s+version=(\S+)\s*$")
 BLOCK_RX = re.compile(r"^#\s*@@BLOCK\s+(\d{3})\s+([A-Za-z0-9_]+)(?:\s+deps=(\S+))?\s*$")
