@@ -1360,6 +1360,14 @@ def _looks_like_network_error(err_text: str) -> bool:
 # user_file() returns an "anon<16 hex>_" name, which the old ^[0-9a-f]{16}_
 # never matched - so _own() called every anon file unprefixed, showed it to
 # every user, and the isolation this page is built around leaked again.
+#
+# v13.49: READING AND DELETING ARE NOT THE SAME QUESTION.
+#   _own()        - "may I show this?"  A bare, unprefixed file is legacy and
+#                   genuinely shared, so it stays readable here, in the valid
+#                   list and in the ZIP. That is deliberate.
+#   _own_strict() - "may I REWRITE this?"  Only this user's own prefix. The two
+#                   delete paths used _own(), so a user could truncate or edit a
+#                   bare file that every other user was reading.
 _HASH_RX = re.compile(r"^(?:anon)?[0-9a-f]{16}_")
 _RES_DIR = user_file("mail_results")
 CLEAN_VALID_FILE = user_file("clean_valid_accounts.txt")
@@ -1378,10 +1386,18 @@ _META_TAGS = ("found:", "proxy:", "path:", "xoauth2", "no standard", "aadsts",
 
 
 def _own(path) -> bool:
-    """True when `path` belongs to the unlocked user (unprefixed files count)."""
+    """True when `path` may be SHOWN to the unlocked user (bare files count)."""
     base = os.path.basename(path)
     if not _HASH_RX.match(base):
         return True
+    return base.startswith(user_file(""))
+
+
+def _own_strict(path) -> bool:
+    """True only when `path` carries THIS user's own prefix - safe to rewrite."""
+    base = os.path.basename(path)
+    if not _HASH_RX.match(base):
+        return False
     return base.startswith(user_file(""))
 
 
@@ -1516,9 +1532,11 @@ def merge_into_clean_valid(new_combo_lines: List[str]) -> int:
 
 
 def delete_specific_account_from_storage(target_combo: str):
+    """v13.49: _own_strict - a bare file belongs to every user, so this only
+    rewrites files that carry THIS user's own prefix."""
     search_files = glob.glob(os.path.join(_RES_DIR, "*.txt")) + glob.glob("*.txt")
     for path in search_files:
-        if not _own(path):
+        if not _own_strict(path):
             continue
         filename_lower = os.path.basename(path).lower()
         if filename_lower == os.path.basename(LAST_ACCOUNT_FILE) or any(kw in filename_lower for kw in ["resume", "unfinished", "remaining", "input", "proxies", "proxy", "config", "blocklist"]):
@@ -1555,9 +1573,10 @@ def delete_specific_account_from_storage(target_combo: str):
 
 
 def clear_all_valid_accounts_storage():
+    """v13.49: _own_strict - see delete_specific_account_from_storage()."""
     search_files = glob.glob(os.path.join(_RES_DIR, "*.txt")) + glob.glob("*.txt")
     for path in search_files:
-        if not _own(path):
+        if not _own_strict(path):
             continue
         filename_lower = os.path.basename(path).lower()
         if "valid" not in filename_lower and "clean" not in filename_lower:
