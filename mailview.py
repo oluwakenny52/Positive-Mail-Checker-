@@ -13,6 +13,22 @@ caller's fallback is only a last resort. The markup handed to the widget is also
 capped, because a 2 MB HTML body re-sanitised on every rerun is what segfaulted
 the container.
 
+v13.55a SANITISER HOLES CLOSED. Two, both real:
+  * _DROP mixed PAIRED tags with VOID ones and ran a paired-tag regex over all of
+    them. script / iframe / object / embed / form were removed; link / meta /
+    base have no closing tag, so `.*?</link>` never matched and every external
+    stylesheet and meta tag in a marketing mail reached the DOM. The two kinds
+    are separate tuples now and the void ones are matched with a single-tag regex.
+  * the event-handler stripper only matched QUOTED values, so `onerror=alert(1)`
+    - the form most spam actually ships - survived. An unquoted pass follows the
+    quoted one, and `href="javascript:..."` is neutralised too.
+
+Attachments also render under the TEXT view now. They were HTML-mode only, so a
+text-only message showed no attachment list at all.
+
+__version__ stays "v13.55" on purpose: app.py block 109 captions a mismatch with
+"update it to v13.55", so bumping it here would print that caption on every load.
+
 Nothing here raises: every public function swallows and the caller falls back to
 a text_area.
 """
@@ -29,7 +45,13 @@ _MAX_MARKUP = 400 * 1024           # what is actually handed to the widget
 _TRUNC_HINT = 256000               # stored copy at/over this is probably cut
 
 _CID_RX = re.compile(r"cid:([^\"')\s>]+)", re.I)
-_DROP = ("script", "iframe", "object", "embed", "form", "link", "meta", "base")
+# Paired tags: the closing tag exists, so the greedy-until-close removal works.
+_DROP_PAIRED = ("script", "iframe", "object", "embed", "form")
+# Void tags: no closing tag. `.*?</link>` never matches, so they need their own
+# single-tag pattern. This was the hole.
+_DROP_VOID = ("link", "meta", "base")
+# Kept as one name in case anything reads it; the sanitiser uses the two above.
+_DROP = _DROP_PAIRED + _DROP_VOID
 
 _SHELL = (
     '<div style="all:initial;display:block;font-family:Arial,Helvetica,sans-serif;'
@@ -97,9 +119,10 @@ def inline_images(raw):
             blob = _bytes(part)
             if not blob or len(blob) > _MAX_PART:
                 continue
-            total += len(blob)
-            if total > _MAX_TOTAL:
+            # v13.55a: check BEFORE adding, so the cap is not overshot by one part.
+            if total + len(blob) > _MAX_TOTAL:
                 break
+            total += len(blob)
             out[cid] = "data:%s;base64,%s" % (ctype, base64.b64encode(blob).decode("ascii"))
     except Exception:
         pass
@@ -128,11 +151,22 @@ def attachments(raw):
 def sanitize(markup, inline, allow_remote=False):
     """Embed cids, drop scripts and handlers, optionally kill remote assets."""
     markup = _CID_RX.sub(lambda m: inline.get(m.group(1), ""), markup or "")
-    for tag in _DROP:
+    # Paired tags - closing tag present.
+    for tag in _DROP_PAIRED:
         markup = re.sub(r"(?is)<%s\b.*?</%s\s*>" % (tag, tag), "", markup)
+    # Void tags - single tag, no closing form. v13.55a: this is what was missing.
+    for tag in _DROP_VOID:
+        markup = re.sub(r"(?is)<%s\b[^>]*>" % tag, "", markup)
     markup = re.sub(r"(?is)<!--.*?-->", "", markup)
     markup = re.sub(r"(?is)<!doctype[^>]*>", "", markup)
+    # v13.55a: quoted handler values first, then UNQUOTED ones. The unquoted form
+    # (`onerror=alert(1)`) is what most spam ships and the old single pattern
+    # could not see it. Both run before the anchor rewrite so a handler on an <a>
+    # is gone by the time target/rel are injected.
     markup = re.sub(r"(?i)\son[a-z]+\s*=\s*(\"[^\"]*\"|'[^']*')", "", markup)
+    markup = re.sub(r"(?i)\son[a-z]+\s*=\s*[^\"'\s>]+", "", markup)
+    # v13.55a: a javascript: href executes in the widget's origin on click.
+    markup = re.sub(r"(?i)href\s*=\s*([\"'])\s*javascript:[^\"']*\1", 'href="#"', markup)
     markup = re.sub(r"(?i)<a(\s|>)", r'<a target="_blank" rel="noopener noreferrer"\1', markup)
     markup = re.sub(r'(?i)(target="_blank"\s*){2,}', 'target="_blank" ', markup)
     if not allow_remote:
@@ -186,11 +220,18 @@ def _paint(st, raw, key, markup, allow_remote):
     return True
 
 
-def _text_area(st, key):
+def _text_area(st, raw, key):
+    """The text view, and its attachments.
+
+    v13.55a: the attachment list was only ever drawn from _paint(), i.e. only in
+    HTML mode - so a text-only message, and every message while the switch sat
+    on Text, showed no attachments at all even though they had been parsed.
+    """
     try:
         st.text_area("Message Body", height=180, key=key)
     except Exception:
         pass
+    _render_attachments(st, raw, key)
 
 
 def render(st, raw, key, fallback="", allow_remote=False):
@@ -203,7 +244,7 @@ def render(st, raw, key, fallback="", allow_remote=False):
                 return
         except Exception:
             pass
-    _text_area(st, key)
+    _text_area(st, raw, key)
 
 
 def render_auto(st, msg, key, mail_getter, allow_remote=False):
@@ -229,7 +270,7 @@ def render_auto(st, msg, key, mail_getter, allow_remote=False):
                 return
         except Exception:
             pass
-    _text_area(st, key)
+    _text_area(st, raw, key)
 
 
 def _render_attachments(st, raw, key):
