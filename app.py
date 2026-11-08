@@ -13818,17 +13818,28 @@ if start_engine_btn:
                 # clear_unfinished() would throw the held lines away, and the
                 # banner in block 108 is what carries them forward.
                 if _batch_rest and checked_count >= total_accs and not run_interrupted:
-                    str_lit.session_state["_batch_hit"] = list(_batch_rest)
+                    # FIX BATCH-CARRY: the banner carries the HELD lines AND any
+                    # in-batch line that produced no result, so Continue can never
+                    # skip an account that raised. They go first because they are
+                    # the ones that need re-checking soonest.
+                    _batch_carry = left + list(_batch_rest)
+                    str_lit.session_state["_batch_hit"] = list(_batch_carry)
                     runstate.note(f"Batch boundary: {checked_count} checked, "
-                                  f"{len(_batch_rest)} left for the next batch")
+                                  f"{len(_batch_carry)} left for the next batch")
                     save_unfinished("Batch boundary - press Continue for the next batch",
-                                    list(_batch_rest) + left, checked_count, total_accs)
+                                    _batch_carry, checked_count, total_accs)
                 elif checked_count >= total_accs and not run_interrupted:
                     # Clean completion: close the watchdog record, then drop the data.
                     runstate.finish()
                     clear_unfinished()
-                elif left:
-                    save_unfinished(detected_stop_reason, left, checked_count, total_accs)
+                # FIX BATCH-RESUME: an INTERRUPTED batch must keep the held lines
+                # too. `left` alone overwrote the last heavy checkpoint - which did
+                # carry them - with only the in-batch leftovers, so stopping a
+                # batch at account 1 of 2 with 8 held left ONE resumable line
+                # instead of nine.
+                elif left or _batch_rest:
+                    save_unfinished(detected_stop_reason, left + list(_batch_rest),
+                                    checked_count, total_accs)
             except Exception as _fin_err:
                 log_probe_event(f"run record could not be finalised: {_fin_err}")
 
@@ -13996,6 +14007,22 @@ except Exception:
 
 _persisted_valid = load_persistent_valid_results()
 
+# v13.71: the batch banner state. Read once, at the top, so every branch below
+# agrees about it.
+_batch_hit = list(str_lit.session_state.get("_batch_hit") or [])
+# THE COUNT IS NOT total_accs. This block is MODULE level - it runs on every
+# page load - and total_accs is only bound inside the start branch, so a refresh
+# after a batch raised NameError on the first f-string and took the whole
+# summary down with it. The run record already holds this batch's own checked
+# count (the final checkpoint writes checked == total before the finally), so it
+# is read from there and nothing has to be carried across the rerun.
+_batch_done = 0
+if _batch_hit:
+    try:
+        _batch_done = int((runstate.load() or {}).get("checked") or 0)
+    except Exception:
+        _batch_done = 0
+
 if str_lit.session_state.engine_has_run or _persisted_valid:
     section_title("📊", "Live Results Summary & ZIP Archive",
                   "persisted results, downloadable bundle, full under-the-hood traces")
@@ -14003,6 +14030,8 @@ if str_lit.session_state.engine_has_run or _persisted_valid:
     with session_state_lock:
         status_label = ("🎉 Check Complete!"
                         if str_lit.session_state.run_completion_status == "Successful"
+                        else "🔢 Batch Complete"
+                        if str_lit.session_state.run_completion_status == "Batch complete"
                         else "⚠️ Unfinished / Loaded from Disk")
         clean_count_val = str_lit.session_state.get("run_valid_count",
                                                     str_lit.session_state.clean_valid_count)
@@ -14047,7 +14076,38 @@ if str_lit.session_state.engine_has_run or _persisted_valid:
                     + ("  ·  SMTP/ManageSieve were CONFIRM-ONLY"
                        if any(p in ("SMTP", "ManageSieve") for p in active_protocols()) else ""))
 
-    if str_lit.session_state.run_completion_status == "Unfinished":
+    # ---- v13.71 BATCH BANNER -------------------------------------------------
+    # The whole point of the feature: it stops, it says so, it keeps the rest and
+    # it offers the way on. The held queue lives in session_state and in
+    # unfinished_live.json, so a refresh here is recoverable through Resume too.
+    if _batch_hit:
+        str_lit.info(
+            f"🔢 **Batch complete.** {_batch_done or '?'} account(s) checked in this "
+            f"batch, **{len(_batch_hit)} still queued**. Nothing was lost - the rest of "
+            f"the queue is held, here and on disk.")
+        _bc1, _bc2 = str_lit.columns(2)
+        with _bc1:
+            if str_lit.button("▶ Continue with the next batch", type="primary",
+                              width="stretch"):
+                str_lit.session_state["_batch_autostart"] = list(_batch_hit)
+                str_lit.session_state.pop("_batch_hit", None)
+                str_lit.rerun()
+        with _bc2:
+            if str_lit.button("✖ Stop here and leave the rest queued", width="stretch"):
+                str_lit.session_state.pop("_batch_hit", None)
+                str_lit.rerun()
+        try:
+            notify.add(
+                "info", "batch",
+                f"Batch complete: {_batch_done or '?'} checked, {len(_batch_hit)} still "
+                f"queued.",
+                "Open the app and press Continue for the next batch - the queue is held.",
+                key="batch-boundary", dedupe=20.0)
+        except Exception:
+            pass
+
+    if (str_lit.session_state.run_completion_status == "Unfinished"
+            and not _batch_hit):
         # FIX RS-4: the reason came from list_unfinished_runs(), so the TypeError
         # in block 083 degraded this to a bare warning with no cause and no
         # progress. It reads the watchdog record and remaining() directly now.
