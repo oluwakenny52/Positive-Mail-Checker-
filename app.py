@@ -613,7 +613,10 @@ PROBE_TIMEOUT_DEFAULT = 8.0
 PROXY_PRECHECK_TIMEOUT_DEFAULT = 5
 CONNECT_FLOOR_DEFAULT = 10.0
 READ_FLOOR_DEFAULT = 15.0
-CONNECT_FLOOR_MIN = 10.0
+# v13.72: CONNECT_FLOOR_MIN was here and is gone. It was 10.0 and identical to
+# CONNECT_FLOOR_DEFAULT, and nothing in app.py or engine.py read it - the connect
+# cap is written as min(CONNECT_FLOOR_DEFAULT, ...) at every site, never as a
+# separate floor. READ_FLOOR_MIN below IS read (blocks 065 and 066) and stays.
 READ_FLOOR_MIN = 15.0
 ATTEMPT_TIMEOUT_NORMAL = 15
 ATTEMPT_TIMEOUT_FAST = 10
@@ -637,7 +640,6 @@ SAME_HOST_RETRIES_DEFAULT = 1
 FAILURE_COOLDOWN_DEFAULT = 45.0
 WORKER_FUTURE_PAD = 60
 GEO_CACHE_TTL = 600
-PROBE_RESULT_TTL = 120
 LEGACY_RUNG_TIMEOUT = 8.0
 LEGACY_PORTS = (143, 110)
 GEO_FAIL_TTL = 300.0
@@ -978,7 +980,13 @@ def default_cfg() -> dict:
         "MODE_NAME": "Normal",
         "PROTOCOLS": list(PROTOCOL_SELECTION_DEFAULT),
         "MAX_WORKERS_START": WORKERS_NORMAL,
-        "MAX_WORKERS_MAX": max(WORKERS_NORMAL * 2, 50),
+        # v13.72: MAX_WORKERS_MAX IS GONE. Block 054 removed it from build_cfg()
+        # because nothing reads it, but this reset target still emitted it - and
+        # block 055's _settings_dirty compares build_cfg() against applied_cfg.
+        # Reset Defaults sets applied_cfg to THIS dict, so the extra key made the
+        # two differ and the sidebar shouted "You have UNAPPLIED settings changes"
+        # the instant a reset succeeded, until Apply was pressed. The key set is
+        # identical on both sides now.
         "TIMEOUT": ATTEMPT_TIMEOUT_NORMAL,
         "ACCOUNT_DEADLINE": int(DEADLINE_NORMAL),
         # v13.71: 0 = every account. This is the reset target and the migration
@@ -1505,6 +1513,44 @@ def record_probe_result(proxy_str, ok, reason, latency_ms=0, target="",
     _user_state()["last_probe_ts"] = time.time()
 
 
+_LIVE_KEYS_TTL = 5.0
+
+
+def _live_keys_for_scope():
+    """THIS scope's own pool lines, cached for _LIVE_KEYS_TTL.
+
+    v13.72 ISO-15: _probe_snapshot() filtered against globals()["all_proxies"] -
+    a module global that the LAST rerun of ANY session sets - so on a shared
+    deployment user B's probe summary and histogram were filtered against user
+    A's pool and under-reported. probe_stats itself was already per-user; only
+    the filter was not.
+
+    load_proxies() resolves through live_cfg(), which block 055 seeds on the
+    script thread and blocks 074 and 105 pin on the threads they own, so this
+    reads THIS user's proxies.txt from every caller - including block 103's
+    per-account worker call, which the 5s cache keeps off the disk.
+
+    An empty result is a real answer: the caller then skips filtering entirely,
+    exactly as the old code did when the global was empty.
+    """
+    who = _gate_scope()
+    tbl = STATE.setdefault("probe_live_keys", {})
+    now = time.time()
+    hit = tbl.get(who)
+    if hit and (now - hit[0]) < _LIVE_KEYS_TTL:
+        return hit[1]
+    try:
+        keys = set(load_proxies(quiet=True))
+    except Exception:
+        keys = set()
+    tbl[who] = (now, keys)
+    # A forgotten scope must not leave a stale entry for the life of the process.
+    if len(tbl) > 32:
+        for _k in [k for k in list(tbl) if (now - tbl[k][0]) > 600.0]:
+            tbl.pop(_k, None)
+    return keys
+
+
 def _probe_snapshot():
     """(key, record) pairs, RESTRICTED to lines that are still in this user's file.
 
@@ -1516,13 +1562,14 @@ def _probe_snapshot():
     display without touching the prune.
 
     v13.59: probe_stats is per-scope now, so this is the user's own history only.
+    v13.72: and the FILTER is per-scope now too - see _live_keys_for_scope().
     """
     if '_rebind_scope' in globals():
         _rebind_scope()
     with probe_stats_lock:
         snap = list(probe_stats.items())
     try:
-        live_keys = set(globals().get("all_proxies") or ())
+        live_keys = _live_keys_for_scope()
     except Exception:
         live_keys = set()
     if live_keys:
@@ -1567,6 +1614,12 @@ def clear_tunnel_cache():
         _rebind_scope()
     with probe_stats_lock:
         probe_stats.clear()
+    # v13.72: and drop the cached key set, or a re-probe immediately after a
+    # proxies.txt change would filter against the pool that just went away.
+    try:
+        STATE.setdefault("probe_live_keys", {}).clear()
+    except Exception:
+        pass
 # @@END 025 PROBE_TELEMETRY
 
 # @@BLOCK 026 RUNTIME_HELPERS deps=024
@@ -3955,7 +4008,10 @@ def _apply_settings_reset(reason: str = "Reset Defaults"):
     log_probe_event(f"settings reset to universal defaults ({reason})")
 
 
-_reset_all_settings = _apply_settings_reset
+# v13.72: `_reset_all_settings = _apply_settings_reset` stood here. Nothing in
+# app.py or in pages/ ever read that alias - the pending-flag path below and the
+# sidebar button both call _apply_settings_reset by its real name - so the alias
+# was a second, stale handle on the same function.
 
 if str_lit.session_state.pop("_bb_reset_pending", False):
     _apply_settings_reset("Reset Defaults button")
@@ -12972,8 +13028,11 @@ active_proxy_pool = []
 _run_pool_box = []
 # v13.71: batch state for block 106 and block 108. Bound here, unconditionally,
 # so neither of them ever reads an unbound name.
+# v13.72: `_batch_active` WAS HERE AND IS GONE. It was bound here and set True /
+# False in the start path below, and no block ever read it - block 106 decides
+# the batch boundary from `_batch_rest` and block 108 from `_batch_hit`, both of
+# which are real. Three assignments to a name nobody consults.
 _batch_rest = []
-_batch_active = False
 
 
 # v13.53: progress_bar / status_text are bound at MODULE scope behind a null shim.
@@ -13297,13 +13356,11 @@ if start_engine_btn:
         if _batch_on and _batch_size > 0 and len(_full_queue) > _batch_size:
             all_target_accounts = _full_queue[:_batch_size]
             _batch_rest = _full_queue[_batch_size:]
-            _batch_active = True
             log_startup(f"BATCH MODE -> this run takes {len(all_target_accounts)} of "
                         f"{len(_full_queue)} account(s); {len(_batch_rest)} held for Continue.")
         else:
             all_target_accounts = _full_queue
             _batch_rest = []
-            _batch_active = False
         total_accs = len(all_target_accounts)
         checked_count = 0
         # The queue is final and counted - open the run record here.
@@ -13334,12 +13391,26 @@ if start_engine_btn:
 
             The bucket is a single HTML block now, capped at BUCKET_LIVE_TAIL.
             The summary block still shows the full set.
+
+            v13.72 MEM-2: THE VALUES ARE (TRUE TOTAL, TAIL) NOW. The caller cuts
+            each bucket to BUCKET_SNAPSHOT_TAIL before handing it over, so the
+            copy in the live loop stopped being the whole bucket - and len() of an
+            already-cut list would have understated every bucket above the cap and
+            silently dropped the "+N more" line. The total travels with the tail.
+            A plain list is still accepted, so a shape mismatch degrades to a
+            short count instead of a blank box.
             """
             for key, _title in BUCKET_SPEC:
                 ph = bucket_placeholders.get(key)
                 if ph is None:
                     continue
-                items = snapshot.get(key) or []
+                entry = snapshot.get(key)
+                if not entry:
+                    continue
+                if isinstance(entry, tuple) and len(entry) == 2:
+                    total, items = entry
+                else:
+                    total, items = len(entry), entry
                 if not items:
                     continue
                 col = TAG_COLORS.get(BUCKET_TAGS.get(key, ""), "#cbd5e1")
@@ -13347,9 +13418,9 @@ if start_engine_btn:
                 body = "".join(
                     "<div style='font-family:ui-monospace,monospace;font-size:12px;"
                     f"color:{col}'>{html.escape(str(ln))}</div>" for ln in tail)
-                if len(items) > len(tail):
+                if total > len(tail):
                     body += ("<div style='font-size:11px;opacity:.7'>+"
-                             f"{len(items) - len(tail)} more - see the summary below"
+                             f"{total - len(tail)} more - see the summary below"
                              "</div>")
                 try:
                     ph.markdown(body, unsafe_allow_html=True)
@@ -13666,22 +13737,33 @@ if start_engine_btn:
                                                 if _tick else [])
                                 # FIX LAG-5: up to 2000 entries were copied on every
                                 # tick; they are only needed when the table redraws.
-                                current_reports = (list(str_lit.session_state.report_entries)
-                                                   if _df_tick else [])
-                                bucket_snapshot = ({
-                                    "valid_results": list(str_lit.session_state.valid_results),
-                                    "wrong_results": list(str_lit.session_state.wrong_results),
-                                    "conn_results": list(str_lit.session_state.conn_results),
-                                    "proxy_results": list(str_lit.session_state.proxy_results),
-                                    "login_drop_results": list(str_lit.session_state.login_drop_results),
-                                    "need_app_results": list(str_lit.session_state.need_app_results),
-                                    "retry_results": list(str_lit.session_state.retry_results),
-                                    "rbl_results": list(str_lit.session_state.rbl_results),
-                                    "smtp_results": list(str_lit.session_state.smtp_results),
-                                    "dns_results": list(str_lit.session_state.dns_results),
-                                    "skip_results": list(str_lit.session_state.skip_results),
-                                    "unknown_results": list(str_lit.session_state.unknown_results),
-                                } if _bucket_tick else {})
+                                # v13.72 MEM-1: AND IT COPIED ALL 3000 OF THEM. The
+                                # ring was cut to REPORT_ENTRIES_MAX=3000 and this
+                                # still copied the whole ring into a list, then a
+                                # dataframe, then an Arrow buffer, once a second, for
+                                # the entire run. _DF_TAIL_LIVE was declared for
+                                # exactly this and read nowhere. The table takes the
+                                # newest N now; the ZIP, the .txt export and the Full
+                                # Log page still carry every row.
+                                current_reports = (
+                                    list(str_lit.session_state.report_entries)[-_DF_TAIL_LIVE:]
+                                    if _df_tick else [])
+                                # v13.72 MEM-2: same story per bucket, and the true
+                                # count travels WITH the tail so render_buckets can
+                                # keep the "+N more" line honest. Capping the copy
+                                # without the count would have understated every
+                                # bucket above 250 lines.
+                                bucket_snapshot = {}
+                                if _bucket_tick:
+                                    for _bk in ("valid_results", "wrong_results",
+                                                "conn_results", "proxy_results",
+                                                "login_drop_results", "need_app_results",
+                                                "retry_results", "rbl_results",
+                                                "smtp_results", "dns_results",
+                                                "skip_results", "unknown_results"):
+                                        _bv = str_lit.session_state.get(_bk) or []
+                                        bucket_snapshot[_bk] = (
+                                            len(_bv), list(_bv)[-BUCKET_SNAPSHOT_TAIL:])
 
                             if _tick:
                                 _last_ui_ts = _now_ui
@@ -14148,7 +14230,10 @@ if str_lit.session_state.engine_has_run or _persisted_valid:
         dns_len_val = len(str_lit.session_state.get("pre_dns_failed", []))
         skip_len_val = len(str_lit.session_state.skip_results)
         unknown_len_val = len(str_lit.session_state.unknown_results)
-        valid_res_copy = list(str_lit.session_state.valid_results)
+        # v13.72: valid_res_copy stood here - a full copy of the valid bucket on
+        # every single page load, and nothing read it. summary_buckets re-lists
+        # valid_results itself two lines below and the metric row uses
+        # clean_count_val, so the copy only cost memory.
         log_lines_copy = list(str_lit.session_state.log_lines)
         _report_total = len(str_lit.session_state.report_entries)
         report_entries_copy = list(str_lit.session_state.report_entries)[-_DF_TAIL:]
@@ -14566,9 +14651,12 @@ else:
                     ok_read, msgs, note = read_mailbox_messages(
                         acc_email, acc_pass, imap_hosts[0],
                         proxy_str=mailbox_proxy, limit=limit)
-                    fetched_msgs, success_read = msgs, True
+                    # v13.72: `fetched_msgs, success_read = msgs, True` stood here
+                    # and success_read was set again two lines down and never read
+                    # by anything. The branch below tests ok_read and the list.
+                    fetched_msgs = msgs
                     if not ok_read:
-                        fetched_msgs, success_read = [], False
+                        fetched_msgs = []
                 if ok_read and fetched_msgs:
                     # v13.55: THE LIST LIVES IN SESSION STATE. It used to be a
                     # local inside this button branch, so tapping the View
