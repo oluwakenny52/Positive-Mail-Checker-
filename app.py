@@ -507,9 +507,7 @@ import auth
 import runstate
 
 # v13.48: the click/outcome ledger. page() runs BEFORE the gate so even the
-# Unlock press is attributed; install() runs AFTER it so the file lands on the
-# unlocked prefix and not the anon placeholder. Both must be above the first
-# widget - a widget built before install() is invisible to it.
+# Unlock press is attributed, and install() runs BEFORE require() too - see below.
 import audit_log
 
 # FIX AU-1 (v13.49): audit_log gained page() at 02:25, two hours AFTER this
@@ -549,13 +547,20 @@ if not hasattr(runstate, "interrupt"):
 # every results glob prefix per-user names with the unlocked hash.
 user_file = auth.user_file
 
+# FIX AU-5 (v13.51): INSTALL BEFORE require(), NOT AFTER.
+# require() calls st.stop() while the page is locked, so install() placed after it
+# never ran on a locked page - and the Unlock box, the Create box and both Forget
+# buttons were built by unwrapped functions, invisible to the ledger. The old
+# comment claimed install had to sit late "so the file lands on the unlocked
+# prefix"; it does not, because _path() resolves user_file() at WRITE time, not at
+# install time. Every page uses this order.
+if hasattr(audit_log, "install"):
+    audit_log.install(str_lit, "app.py")
+
 # require() first, fit() second - the order every page uses. require() stops the
 # script while locked, so fit() only runs once the gate has passed.
 auth.require(str_lit)
 auth.fit(str_lit)
-
-if hasattr(audit_log, "install"):
-    audit_log.install(str_lit, "app.py")
 
 # ---- teardown watchdog, and it MUST be after require() ---------------------
 # runstate._dir() resolves through auth.user_file(), which is a throwaway
@@ -790,7 +795,11 @@ MAIL_SPOT_FALLBACK = ("imap.gmail.com", 993)
 # @@BLOCK 016 PROXY_407_CONTRACT deps=-
 # FIX P2-1: every 407ing proxy attempt is a request that cannot succeed, and a
 # same-node retry costs a whole attempt.  3 strikes per rung let a single rung
-# spend ~4 x 28s before the storm breaker armed.  2 is the working number.
+# spend ~4 x 28s before the storm breaker armed - which is why this started at 2.
+# v13.36 P5 put it back to 3: at two strikes a node was quarantined after two
+# 407s, so a provider-wide 407 emptied the pool mid-run and the run spent its
+# remaining window rotating instead of falling back to DIRECT.  3 is the value the
+# rest of the file assumes and the value block 080 prints.
 PROXY_407_QUARANTINE = 3
 PROXY_407_FORCE_DIRECT = 2
 PROXY_407_BACKOFF = 0.8
