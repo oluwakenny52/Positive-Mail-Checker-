@@ -1280,8 +1280,10 @@ def _engine_state():
         # the module alias stable across reruns.
         "alive_pool_lock": threading.Lock(),
         "rr_lock": threading.Lock(),
-        "rr_index": 0,
-        "rr_last": None,
+        # v13.71: rr_last / rr_index moved into the per-user tables below. They
+        # were process values, so one user's pick was excluded from the next
+        # user's rotation as "the last node used". Cosmetic, but it is another
+        # user's traffic deciding ours.
         # v13.51: RLock, not Lock.  _write_clean_valid() takes this lock itself,
         # and block 107 already holds it while writing the result files - so any
         # call site that nests the two deadlocked the SCRIPT THREAD for ever and
@@ -1369,6 +1371,20 @@ def _new_user_state() -> dict:
         # same domain into cooldown for 45s - user B's run then reported them SKIP
         # for a reason that happened in someone else's tab. Per user now.
         "failed_domain_cache": {},
+        # v13.71: THIS USER'S APPLIED CONFIG, kept so a background thread can pin
+        # its OWN user's settings. live_cfg() reads _CFG_TLS.cfg first and that is
+        # thread-local, so on the prober, the first-probe thread and every pool
+        # thread it was unset and fell through to STATE["cfg"] - which the last
+        # rerun of ANY session overwrites. One user's probe therefore dialled
+        # another user's PROBE_TARGET, filtered with their MIN_PROXY_SCORE and
+        # POOL_MODE, could read their proxies.txt, and wrote their scores into
+        # their proxy_meta.json. Block 055 stores the copy; block 074 and block
+        # 072 pin it on the threads they own.
+        "cfg": None,
+        # v13.71: the round-robin cursor, per user (see the note in
+        # _engine_state above).
+        "rr_index": 0,
+        "rr_last": None,
     }
 
 
@@ -5308,6 +5324,18 @@ STATE["cfg"] = CFG
 # straight through to STATE["cfg"], which any other session's rerun overwrites.
 seed_task_cfg(CFG)
 
+# v13.71: AND KEEP THIS USER'S OWN COPY. seed_task_cfg() only covers the SCRIPT
+# thread - _CFG_TLS is thread-local - so the prober, the first-probe thread and
+# every pool thread still had no snapshot and fell through to STATE["cfg"], which
+# the last rerun of ANY session overwrites. That is how one user's probe came to
+# dial another user's PROBE_TARGET, filter with their MIN_PROXY_SCORE / POOL_MODE,
+# read their proxies.txt and write their scores into their proxy_meta.json.
+# Blocks 074 and 072 pin this copy on the threads they own.
+try:
+    _user_state()["cfg"] = _cfg_snapshot()
+except Exception:
+    pass
+
 log_startup(
     f"ACTIVE CONFIG -> protocols={CFG.get('PROTOCOLS')} mode={CFG.get('MODE_NAME')} "
     f"workers={CFG.get('MAX_WORKERS_START')} "
@@ -6573,6 +6601,10 @@ def sample_alive_proxy(exclude=None, domain=None, avoid=None):
 
     A 402 node is therefore only ever drawn when nothing better is left, which is
     the correct role for it: a fallback, not a peer.
+
+    v13.71: THE CURSOR IS PER USER. rr_last / rr_index were process values, so
+    the node user A had just used was excluded from user B's next pick as well -
+    one user's traffic steering another's rotation.
     """
     _rebind_scope()
     exclude = set(exclude or ())
@@ -6640,15 +6672,15 @@ def sample_alive_proxy(exclude=None, domain=None, avoid=None):
         # and then thrown away, so round-robin re-served a node the account had
         # just failed through - the one thing the avoid-set exists to stop.
         with _rr_lock:
-            STATE["rr_index"] = (STATE["rr_index"] + 1) % len(cand)
-            return cand[STATE["rr_index"]]
+            _US["rr_index"] = (int(_US.get("rr_index", 0)) + 1) % len(cand)
+            return cand[_US["rr_index"]]
 
     with _rr_lock:
-        last = STATE.get("rr_last")
+        last = _US.get("rr_last")
         if len(cand) > 1 and last in cand:
             cand = [p for p in cand if p != last]
         pick = random.choice(cand)
-        STATE["rr_last"] = pick
+        _US["rr_last"] = pick
         return pick
 # @@END 069 POOL_SAMPLE
 
@@ -6941,7 +6973,7 @@ def precheck_proxy_fast(proxy_str):
         return False
 # @@END 071 PRECHECK_FAST
 
-# @@BLOCK 072 RUN_BATCH deps=-
+# @@BLOCK 072 RUN_BATCH deps=024,026
 def _run_batch(fn, items, workers, budget):
     """Run fn(item) over items with a HARD wall-clock budget.
 
@@ -6949,6 +6981,15 @@ def _run_batch(fn, items, workers, budget):
     stable while something holds a reference and two equal strings can share one,
     so a duplicate line could be credited twice. Items are materialised once so
     the caller's list cannot be mutated underneath the pool.
+
+    v13.71: EVERY TASK PINS THE CALLER'S CONFIG. live_cfg() reads _CFG_TLS.cfg
+    first and that is thread-local, so a fresh pool thread had nothing and fell
+    through to STATE["cfg"] - which any other session's rerun overwrites. During
+    a fetch that can be minutes, so user B loading the page retargeted user A's
+    in-flight probe: their PROBE_TARGET, their PRECHECK_TIMEOUT, their
+    QUARANTINE_407 and their BLACKLIST_CF. The snapshot is taken ONCE, here, on
+    the caller's thread, and handed to each task; the per-user copy is preferred
+    because the caller may itself be a background thread.
     """
     items = list(items or ())
     if not items:
@@ -6956,11 +6997,23 @@ def _run_batch(fn, items, workers, budget):
     done = set()
     timed_out = False
     budget = max(1.0, float(budget or 1.0))
+    try:
+        _task_cfg = _user_state().get("cfg") or _cfg_snapshot()
+    except Exception:
+        _task_cfg = _cfg_snapshot()
+
+    def _pinned(item, _fn=fn, _cfg=_task_cfg):
+        seed_task_cfg(_cfg)
+        try:
+            return _fn(item)
+        finally:
+            clear_task_cfg()
+
     ex = ThreadPoolExecutor(max_workers=max(1, min(int(workers or 1), len(items))))
     f2i = {}
     try:
         for idx, it in enumerate(items):
-            f2i[ex.submit(fn, it)] = idx
+            f2i[ex.submit(_pinned, it)] = idx
         try:
             for fut in as_completed(f2i, timeout=budget):
                 idx = f2i.get(fut)
@@ -7073,7 +7126,7 @@ def mail_dest_spot_check(force: bool = False):
                         "authenticate and are alive ***")
 # @@END 073 MAIL_SPOT_CHECK
 
-# @@BLOCK 074 REFRESH_POOL deps=013,014,025,058,069,071,073
+# @@BLOCK 074 REFRESH_POOL deps=013,014,025,026,058,069,071,073
 def _collapse_by_hostport(lines, reasons):
     """One entry per (host:port, SUB-USER) pair. No per-IP cap.
 
@@ -7132,19 +7185,39 @@ def refresh_alive_pool(force: bool = False, budget: float = None):
     # last_probe_ts on whoever reran last - leaving the real owner marked
     # "probe in flight" for ever.
     _us = _US
+    # v13.71: AND THE CONFIG IS PINNED HERE TOO. This runs on the per-scope
+    # prober thread, on the first-probe thread and on the script thread (the
+    # Re-probe button). None of those had a _CFG_TLS snapshot on the first two,
+    # so every live_cfg() below - PROBE_TARGET, PROBE_STRICT, PROBE_SAMPLE_MAX,
+    # MIN_PROXY_SCORE, POOL_MODE, PROXY_FILE, PROXY_META_FILE - read whatever the
+    # LAST rerun of ANY session left in STATE["cfg"]. One user's probe therefore
+    # dialled another user's target, filtered their pool with another user's
+    # settings, could load another user's proxies.txt and wrote their scores into
+    # another user's proxy_meta.json. The per-user copy block 055 stores is the
+    # only correct source off the script thread.
+    _prev_cfg = getattr(_CFG_TLS, "cfg", None)
+    seed_task_cfg(_us.get("cfg") or _cfg_snapshot())
     budget = float(budget if budget is not None else PROBE_BATCH_BUDGET)
 
     if (not force) and (not _any_run_active()) \
             and not live_cfg().get("PROBER_IDLE_ENABLED", PROBER_IDLE_ENABLED_DEFAULT):
+        _CFG_TLS.cfg = _prev_cfg
         return
 
     if not _PROBE_OWNER_LOCK.acquire(blocking=False):
         if not force:
+            _CFG_TLS.cfg = _prev_cfg
             return
+        # FIX LAG-P2 (v13.71): this spun for the WHOLE budget - 120s - on the
+        # script thread, so a Re-probe press could hang the page for two minutes
+        # behind an idle prober that was going to finish on its own anyway. The
+        # wait is short now; the call is skipped rather than queued for ever.
         _t0 = time.time()
-        while _PROBE_OWNER_LOCK.locked() and (time.time() - _t0) < budget:
+        while _PROBE_OWNER_LOCK.locked() and (time.time() - _t0) < min(budget, 20.0):
             time.sleep(0.2)
         if not _PROBE_OWNER_LOCK.acquire(blocking=False):
+            log_probe_event("refresh skipped: another probe still holds the lock")
+            _CFG_TLS.cfg = _prev_cfg
             return
 
     if (not force) and _any_run_active():
@@ -7154,6 +7227,7 @@ def refresh_alive_pool(force: bool = False, budget: float = None):
                 _PROBE_OWNER_LOCK.release()
             except Exception:
                 pass
+            _CFG_TLS.cfg = _prev_cfg
             return
 
     _us["probe_in_flight"] = True
@@ -7308,6 +7382,10 @@ def refresh_alive_pool(force: bool = False, budget: float = None):
             _PROBE_OWNER_LOCK.release()
         except Exception:
             pass
+        # v13.71: hand the caller its own config back. On the script thread that
+        # is the same CFG block 055 seeded; on a background thread it is None and
+        # live_cfg() goes back to the per-user copy on the next pin.
+        _CFG_TLS.cfg = _prev_cfg
 # @@END 074 REFRESH_POOL
 
 # @@BLOCK 075 ALIVE_THREAD deps=013,074
@@ -10407,14 +10485,23 @@ BUCKET_TAGS = {
 # per-user file), seeded BEFORE the widget is created and rewritten from an
 # on_change callback - a callback runs BEFORE the script body, so no widget key
 # is ever touched after the widget has been instantiated.
+#
+# v13.71: THE CAP WAS 2 MB AND THE WRITE WAS UNCONDITIONAL.
+#   * 2 MB is ~65,000 lines, and MAX_ACCOUNTS at 0 no longer cuts a long list,
+#     so a 5 MB paste is now a real thing to support: 5 MB is ~160,000 lines.
+#   * _on_paste_change() rewrote the WHOLE file on every commit, even when the
+#     text was byte-identical - so clicking into the box and straight back out
+#     wrote 5 MB to disk for nothing. The signature is compared first now and an
+#     unchanged commit costs one hash.
+#
+# THE COST, stated plainly: the restored text lives in session_state as one
+# string, so a full 5 MB paste holds 5 MB of the container. That is why the cap
+# exists at all and why the resource monitor's "my session payload" is the number
+# to watch. The truncation note below names the exact cap and the exact size.
 # ==========================================================================
 _PASTE_FILE = user_file("paste_accounts.txt")
 _INSPECT_FILE = user_file("inspect_cat.txt")
-# v13.70: 8 MB was ~260,000 lines of restored text held as ONE string in
-# session_state, and MAX_ACCOUNTS caps a run at 5000 - so seven eighths of it
-# was text nothing would ever dial. 2 MB is ~65,000 lines and still far past any
-# single run.
-_PASTE_MAX = 2 * 1024 * 1024
+_PASTE_MAX = 5 * 1024 * 1024
 _INPUT_OWNER_KEY = "_input_owner"
 _PASTE_LIMIT_NOTE = ""
 
@@ -10454,11 +10541,25 @@ def _read_paste():
 
 
 def _on_paste_change():
-    _write_text_file(_PASTE_FILE, str_lit.session_state.get("bb_raw_text", ""))
+    """Persist the box - but only when the text actually changed.
+
+    v13.71: the callback rewrote the entire file on every commit. A 5 MB paste
+    made every click into and out of the box a 5 MB disk write for no new
+    information. The (length, hash) signature is checked first, so an unchanged
+    commit is one hash and no write at all. The upload path below already uses
+    the same key, so an upload followed by a commit cannot double-write either.
+    """
+    _txt = str_lit.session_state.get("bb_raw_text", "")
+    _sig = (len(_txt), hash(_txt))
+    if str_lit.session_state.get("_paste_saved_sig") == _sig:
+        return
+    str_lit.session_state["_paste_saved_sig"] = _sig
+    _write_text_file(_PASTE_FILE, _txt)
 
 
 def _on_paste_clear():
     str_lit.session_state["bb_raw_text"] = ""
+    str_lit.session_state["_paste_saved_sig"] = (0, hash(""))
     _write_text_file(_PASTE_FILE, "")
 
 
@@ -10472,6 +10573,7 @@ _input_owner = _cache_owner()
 if str_lit.session_state.get(_INPUT_OWNER_KEY) != _input_owner:
     str_lit.session_state.pop("bb_raw_text", None)
     str_lit.session_state.pop("bb_inspect_cat", None)
+    str_lit.session_state.pop("_paste_saved_sig", None)
     str_lit.session_state[_INPUT_OWNER_KEY] = _input_owner
 if "bb_raw_text" not in str_lit.session_state:
     str_lit.session_state["bb_raw_text"] = _read_paste()
