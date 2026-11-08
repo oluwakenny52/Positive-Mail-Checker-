@@ -504,7 +504,15 @@ _FIX_CHECKS = (
     ("app.py", "unfinished_count = unfinished_remaining_count()", 1,
      "the Resume metric uses the helper"),
     ("app.py", "if _is_proxy_auth_fail(s):", 1, "raw 407 text is recognised, not normalised"),
-    ("app.py", "executor.shutdown(wait=False)", 1, "a teardown does not drain the queue"),
+    # 16 spaces of indent on the needle. The real call in app.py block 106 is the
+    # only site carrying them, so an 8-space comment that NAMES the call can no
+    # longer satisfy this row - which is exactly what happened: the comment in
+    # block 105 spelled the call out and the row read got 2 want 1 on correct
+    # code. Same class as P0-6, a gate must not be satisfiable by prose. Do not
+    # shorten this needle back, and do not raise want to 2 - a second REAL
+    # teardown would then pass unnoticed.
+    ("app.py", "                executor.shutdown(wait=False)", 1,
+     "a teardown does not drain the queue"),
     ("app.py", "_metric_phs", 2, "metric cells are built once, not per tick"),
     ("app.py", "for _ph, _ml, _mv in zip(_metric_phs, _metric_labels, _vals):", 1,
      "metric cells unpack label AND value, not a bare int"),
