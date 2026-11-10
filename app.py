@@ -13225,6 +13225,47 @@ class _NullUI:
 progress_bar = _NullUI()
 status_text = _NullUI()
 
+# ==========================================================================
+# FIX COMBO-1 (v13.75) - THE EMAIL:PASSWORD WAS THERE AND COULD NOT BE SEEN
+#
+# The run loop builds every bucket line as
+#
+#     f"{email}:{password} | {detail}"
+#
+# so the combo is in the line, in the file and in the ZIP. The renderers threw
+# the visibility away, not the data:
+#
+#   * block 105 drew the whole line as ONE div with no wrap rule, so a long
+#     detail string pushed the combo past the right edge of the expander and the
+#     screen showed the tail of the sentence and no address.
+#   * block 108 drew the bucket through st.code, which is white-space:pre with
+#     horizontal overflow - so the line scrolled sideways inside the box and the
+#     combo sat off the left of the visible area.
+#
+# Both now split the line at its FIRST " | " (the separator the writer uses; the
+# detail may itself contain " | ", a password practically never does), draw the
+# combo in BOLD on its own line, and put the detail under it in a smaller,
+# dimmed line. Every div carries word-break + overflow-wrap, so the combo wraps
+# instead of scrolling - an address and password stay readable on a phone.
+#
+# Nothing about the stored line changes, so the download buttons, the ZIP, the
+# .txt export and the Full Log page are all unaffected.
+# ==========================================================================
+def _bucket_combo_html(line, col):
+    """One bucket line -> the combo in bold, the detail dimmed under it, both wrapping."""
+    combo, _sep, detail = str(line).partition(" | ")
+    out = ("<div style='font-family:ui-monospace,monospace;font-size:12px;"
+           "font-weight:700;color:%s;white-space:pre-wrap;word-break:break-all;"
+           "overflow-wrap:anywhere;max-width:100%%'>%s</div>"
+           % (col, html.escape(combo)))
+    if detail:
+        out += ("<div style='font-family:ui-monospace,monospace;font-size:11px;"
+                "opacity:.72;white-space:pre-wrap;word-break:break-word;"
+                "overflow-wrap:anywhere;max-width:100%%;margin:0 0 5px 0'>%s</div>"
+                % html.escape(detail))
+    return out
+
+
 # v13.71: CONTINUE. The batch banner in block 108 parks the remaining queue here
 # and reruns; this is what turns that rerun back into a start. Consumed with pop
 # so a plain refresh cannot re-trigger it.
@@ -13557,6 +13598,12 @@ if start_engine_btn:
             silently dropped the "+N more" line. The total travels with the tail.
             A plain list is still accepted, so a shape mismatch degrades to a
             short count instead of a blank box.
+
+            FIX COMBO-1 (v13.75): each line is drawn through
+            _bucket_combo_html(), which puts the email:password on its own bold
+            line and the detail dimmed beneath it, both WRAPPING. The line used to
+            be one unwrapped div, so a long detail ran past the right edge and the
+            combo - the only part anybody wants - was the part off screen.
             """
             for key, _title in BUCKET_SPEC:
                 ph = bucket_placeholders.get(key)
@@ -13573,13 +13620,13 @@ if start_engine_btn:
                     continue
                 col = TAG_COLORS.get(BUCKET_TAGS.get(key, ""), "#cbd5e1")
                 tail = items[-BUCKET_LIVE_TAIL:]
-                body = "".join(
-                    "<div style='font-family:ui-monospace,monospace;font-size:12px;"
-                    f"color:{col}'>{html.escape(str(ln))}</div>" for ln in tail)
+                body = ("<div style='max-width:100%;overflow-x:hidden'>"
+                        + "".join(_bucket_combo_html(ln, col) for ln in tail))
                 if total > len(tail):
                     body += ("<div style='font-size:11px;opacity:.7'>+"
                              f"{total - len(tail)} more - see the summary below"
                              "</div>")
+                body += "</div>"
                 try:
                     ph.markdown(body, unsafe_allow_html=True)
                 except Exception:
@@ -14324,9 +14371,9 @@ if start_engine_btn:
             str_lit.error(f"Error compiling results export files: {ex}")
 # @@END 107 RUN_EXPORT
 
-# @@BLOCK 108 RESULTS_SUMMARY deps=007,014,019,035,036,037,087,106
+# @@BLOCK 108 RESULTS_SUMMARY deps=007,014,019,035,036,037,087,105,106
 # v13.51: THE 98-SECOND FREEZE.  Measured from the logs: the loop ends, the
-# page reports the run OK 98 seconds later.  Block 107 writes twelve small files
+# page reports the run OK 98 seconds later. Block 107 writes twelve small files
 # and a twelve-entry in-memory zip in one or two seconds - the rest was THIS
 # block, which built up to 480 separate st.code widgets (12 expanders x 40
 # lines), a 2000-row dataframe and a full log re-render on every rerun, and
@@ -14352,7 +14399,17 @@ if start_engine_btn:
 # closed the open press as WARN before its own flash could render. That is the
 # "inherits the summary warning" symptom. They now degrade to a caption while a
 # press is unanswered, the same _steal shape block 080 already uses.
-_DF_TAIL = 1000
+#
+# v13.75 FIX COMBO-1 / CAP-1:
+#   * the buckets were drawn with st.code, which is white-space:pre with
+#     horizontal overflow - the line scrolled sideways inside the box and the
+#     email:password sat off the left of the visible area. They go through
+#     _bucket_combo_html() (block 105) now: combo bold on its own line, detail
+#     dimmed under it, both wrapping, inside one vertical scroller.
+#   * _DF_TAIL was a magic 1000 while the ring it reads is REPORT_ENTRIES_MAX,
+#     so a finished run hid two thirds of its own report table for no stated
+#     reason. It is derived from the ring now.
+_DF_TAIL = REPORT_ENTRIES_MAX
 
 try:
     status_text.text("Progress: complete - building the results summary...")
@@ -14417,20 +14474,29 @@ if str_lit.session_state.engine_has_run or _persisted_valid:
         end_ts_copy = str_lit.session_state.end_timestamp
         duration_copy = str_lit.session_state.total_duration
         _completion_copy = str_lit.session_state.run_completion_status
+        # v13.75: (tag, items), so the renderer can colour each bucket without a
+        # second parallel title->tag table to keep in step.
         summary_buckets = {
-            "✅ Valid Accounts Found": list(str_lit.session_state.valid_results),
-            "❌ Wrong Password Found": list(str_lit.session_state.wrong_results),
+            "✅ Valid Accounts Found": ("VALID", list(str_lit.session_state.valid_results)),
+            "❌ Wrong Password Found": ("WRONG_PASSWORD",
+                                       list(str_lit.session_state.wrong_results)),
             "🚪 Login Dropped (* BYE) - server answered, password untested":
-                list(str_lit.session_state.login_drop_results),
-            "🔌 Connection Failed Found": list(str_lit.session_state.conn_results),
-            "🩹 Proxy Unhealthy Found": list(str_lit.session_state.proxy_results),
-            "🔐 App Password / 2FA Found": list(str_lit.session_state.need_app_results),
-            "🕓 RETRY_LATER Found": list(str_lit.session_state.retry_results),
-            "🚫 RBL Blocked Found": list(str_lit.session_state.rbl_results),
-            "🛰 DNS Failed (pre-check)": list(str_lit.session_state.get("pre_dns_failed", [])),
-            "📮 SMTP Failed (pre-check)": list(str_lit.session_state.get("pre_smtp_failed", [])),
-            "⏭ Skipped / Filtered": list(str_lit.session_state.skip_results),
-            "❓ Unclassified": list(str_lit.session_state.unknown_results),
+                ("LOGIN_DROPPED", list(str_lit.session_state.login_drop_results)),
+            "🔌 Connection Failed Found": ("CONNECTION_FAILED",
+                                           list(str_lit.session_state.conn_results)),
+            "🩹 Proxy Unhealthy Found": ("PROXY_UNHEALTHY",
+                                         list(str_lit.session_state.proxy_results)),
+            "🔐 App Password / 2FA Found": ("NEED_APP_PASSWORD",
+                                            list(str_lit.session_state.need_app_results)),
+            "🕓 RETRY_LATER Found": ("RETRY_LATER",
+                                     list(str_lit.session_state.retry_results)),
+            "🚫 RBL Blocked Found": ("RBL_BLOCKED", list(str_lit.session_state.rbl_results)),
+            "🛰 DNS Failed (pre-check)": ("DNS_FAILED",
+                                          list(str_lit.session_state.get("pre_dns_failed", []))),
+            "📮 SMTP Failed (pre-check)": ("SMTP_FAILED",
+                                           list(str_lit.session_state.get("pre_smtp_failed", []))),
+            "⏭ Skipped / Filtered": ("SKIPPED", list(str_lit.session_state.skip_results)),
+            "❓ Unclassified": ("UNCLASSIFIED", list(str_lit.session_state.unknown_results)),
         }
 
     str_lit.markdown(f"### {status_label}")
@@ -14570,15 +14636,16 @@ if str_lit.session_state.engine_has_run or _persisted_valid:
             "no candidate left to dial) before being accepted. Turn the sidebar guard OFF "
             "only if you need raw speed.")
 
-    # FIX SPEED-12 / v13.51: one st.code per bucket instead of one per LINE. Up to
-    # 480 code widgets became 12, and the per-line widgets are behind a toggle.
+    # FIX SPEED-12 / v13.51: one widget per bucket instead of one per LINE. Up to
+    # 480 code widgets became 12. v13.75: the inline view is HTML now, not st.code,
+    # so a long line wraps instead of scrolling the combo out of sight.
     _seed_widget("bb_sum_full", dflt=False)
     _show_full = str_lit.toggle(
         "Show full bucket contents inline (slower on a phone)",
         key="bb_sum_full",
         help="Off: 12 boxes with a count. On: every line, still capped at "
              "BUCKET_RENDER_TAIL. The download button above always carries all of it.")
-    for title, items in summary_buckets.items():
+    for title, (_btag, items) in summary_buckets.items():
         with str_lit.expander(f"{title} ({len(items)})", expanded=False):
             if not items:
                 str_lit.caption("nothing here yet")
@@ -14590,8 +14657,14 @@ if str_lit.session_state.engine_has_run or _persisted_valid:
                 file_name=f"{_safe}_{len(items)}.txt",
                 mime="text/plain", key=f"sumdl_{_safe}")
             if _show_full:
-                str_lit.code("\n".join(str(i) for i in items[:BUCKET_RENDER_TAIL]),
-                             language="text")
+                _bcol = TAG_COLORS.get(_btag, "#cbd5e1")
+                str_lit.markdown(
+                    "<div style='max-height:460px;overflow-y:auto;overflow-x:hidden;"
+                    "max-width:100%'>"
+                    + "".join(_bucket_combo_html(ln, _bcol)
+                              for ln in items[:BUCKET_RENDER_TAIL])
+                    + "</div>",
+                    unsafe_allow_html=True)
                 if len(items) > BUCKET_RENDER_TAIL:
                     str_lit.caption(f"... and {len(items) - BUCKET_RENDER_TAIL} more - use the "
                                     f"download button above for the full list.")
