@@ -487,6 +487,16 @@ with st.expander("🛠 Canonicalise @@END names (no terminal needed)", expanded=
 # `word-break:break-all;` went with it. The row is re-worded to match, and the
 # combo-only contract is gated on the three shapes that actually hold it: the
 # helper, the checkbox callback and the stripped return.
+#
+# v13.77: THE INSPECTOR CALLBACK GETS A ROW FOR THE DEFINITION. The row below the
+# checkbox counted the CALL SITE only, and nothing anywhere counted the
+# DEFINITION - so the whole fix-check stayed green while the app died with
+#     NameError: name '_on_inspect_change' is not defined
+# on the selectbox line itself (app.py:11111), before the panel could open. A
+# gate satisfied by half a fix is not a gate. The two rows are deliberately
+# adjacent and both want 1, so a call without a definition now reads FAIL on the
+# second one instead of passing. _self is False, so the literal in this table
+# does not inflate the count.
 _FIX_CHECKS = (
     ("status.py", "_PROXY_BLOCKED", 2, "proxy-blocked classifies as CONNECTION_FAILED"),
     ("status.py", "best = None", 1, "worse_of no longer seeds with UNKNOWN"),
@@ -594,6 +604,8 @@ _FIX_CHECKS = (
      "the inspector opens from a checkbox, not a collapsing expander"),
     ("app.py", 'key="bb_inspect_cat", on_change=_on_inspect_change)', 1,
      "the category inside the inspector is still a selectbox"),
+    ("app.py", "def _on_inspect_change():", 1,
+     "the inspector callback is DEFINED, not only called"),
     ("app.py", "_clean_items = [_combo_only(i) for i in selected_list_items]", 1,
      "the inspector display and download are combo-only"),
     ("app.py", "limit=limit, page=page, info=_info)", 1, "the reader passes a page"),
