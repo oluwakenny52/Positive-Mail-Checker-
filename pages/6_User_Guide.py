@@ -1,4 +1,4 @@
-# @@FILE pages/6_User_Guide.py blocks=17 version=v13.48
+# @@FILE pages/6_User_Guide.py blocks=17 version=v13.76
 # @@BLOCK 000 FILE_HEADER deps=-
 """
 pages/6_User_Guide.py - User Guide  (v13.48)
