@@ -66,7 +66,7 @@ _TH_DEFAULTS = {
 
 
 def _theme_candidates():
-    """The owner's file first, then the two legacy bare paths.
+    """The owner's file ONLY.
 
     v13.65: THE THEME WAS NEVER LOADED. theme.json became a per-user file
     (<hash>_theme.json) at v13.61 and this function only ever looked at
@@ -74,20 +74,23 @@ def _theme_candidates():
     every user's Guide rendered in the factory palette and the silent except made
     it look like a design choice.
 
+    v13.75 FIX THEME-1: the fix added the owner's path but KEPT the two bare ones
+    behind it, and `theme.json` is committed in the repo - so on a fresh user the
+    bare file still won and the Guide painted the repo's palette while the
+    checker painted the defaults. The bare paths are a fallback for a file that
+    exists, not for a file that does not, so they are gone. One source, the same
+    one the checker and the reader read.
+
     user_file() is read through a lazy import because this block runs before the
     gate in block 005; on the very first load it answers with the anonymous
     prefix, which simply does not exist and falls through to the defaults. Block
     005 re-runs this after the gate and repaints.
     """
-    out = []
     try:
         import auth as _a
-        out.append(_a.user_file("theme.json"))
+        return [_a.user_file("theme.json")]
     except Exception:
-        pass
-    out.append(os.path.join(APP_DIR, "theme.json"))
-    out.append("theme.json")
-    return out
+        return []
 
 
 def _load_theme():
@@ -679,7 +682,6 @@ with _t8:
 | The bell count never moves | Alerts are per user and throttled (30 s minimum, 10 minutes before a repeat of the same one). If the container is genuinely calm there is nothing to raise. Press **📌 Take a sample now** in the resource monitor to force a reading. |
 | `TypeError: Importing a module script failed.` in red | **Not a Python error.** Your browser is holding a stale JS chunk after a redeploy. Hard-refresh (`Ctrl`/`Cmd`+`Shift`+`R`). |
 | `Alive: 0` after Fetch & Test | The pool genuinely failed the tunnel probe. Press it again, or lower `Min Proxy Score`. |
-| Every account `PROXY_UNHEALTHY` | The pool passes the web probe but your provider is capping **email-server** destinations. Set `Proxy Mode Engine = off`, or wait for the cap to reset. |
 | Lots of `LOGIN_DROPPED` | The mail server answered and hung up. Retry from a different IP, or use an app password. **Not** a wrong password. |
 | Lots of `APP` | Normal for Gmail / Yahoo / O365. Generate app passwords. |
 | `Every proxy was filtered out` | `Min Proxy Score`, pool mode or the circuit breaker emptied the pool. The raw list is **not** used as a silent fallback - by design. |
@@ -687,6 +689,30 @@ with _t8:
 | Settings do not change | Nothing applies until **💾 Apply Settings**. |
 | `⚠ You have UNAPPLIED settings changes` | Exactly that. Press Apply. |
 | `407` shown as a proxy failure, not a password failure | Correct. The mailbox was never reached. |
+"""
+    )
+
+    # FIX TB-1 (v13.75): THE ONE ROW THAT HAD TO BE RIGHT AND WAS NOT.
+    # "Every account PROXY_UNHEALTHY" was a single row saying the pool passes the
+    # web probe and the provider is capping mail ports - which is the 407 story
+    # only. The verdict is now also returned for a wholly 402 pool (the plan is
+    # out of bandwidth) and for a wholly 403 pool (the provider refuses the
+    # DESTINATION PORT), and those need completely different actions: one is
+    # "wait", one is "dial a port the plan allows". They are split out, the 407
+    # row says which of its two sub-cases you are in, and the last row states the
+    # rule that decides whether PROXY_UNHEALTHY means anything at all - all three
+    # tails stand down once DIRECT has run.
+    ug_h("`PROXY_UNHEALTHY` - which of the three is it?")
+    st.markdown(
+        """
+| The bucket says | Read the detail, then do this |
+|---|---|
+| `407` on every attempt, and the node **failed the 443 control** | The **credential or the plan** is being rejected provider-wide. Check the sub-user passwords in `proxies.txt`, lower `Per-Proxy-SUBUSER Connection Cap`, or set `Proxy Mode Engine = off`. |
+| `407` on every attempt, and the node **passed the 443 control** | The node authenticated and only the **mail destination** was refused. The node is good - do not re-fetch the pool. Set `Proxy Mode Engine = off` for this run. |
+| `402 Payment Required` on every attempt | The plan's **bandwidth or concurrency is spent**. The nodes are alive and authenticate, so the passwords are untested and **not wrong**. Wait for the reset, or run DIRECT. |
+| `403 client_connect_forbidden_port` on every attempt | The provider **refuses that destination port** by policy. Webshare blocks 25, 110, 465 and 587 permanently on every plan, so an IMAP/POP rung on those ports can never pass through it. Dial 993 / 995, or run DIRECT. |
+| `PROXY_UNHEALTHY` even though you ran DIRECT first | It should not happen: all three tails stand down once the direct sweep has run, so a real direct failure is reported as `FAILED` instead. If you still see it, the proxy phase was the only phase - check `Proxy Mode Engine`. |
+| Every attempt reports `timeouts/refused` and nothing was ever reached | Two consecutive timeouts now abandon the pass and hand the account to DIRECT, so this means the path failed on **both** egresses. The host names are the suspect, not the password. |
 """
     )
 
