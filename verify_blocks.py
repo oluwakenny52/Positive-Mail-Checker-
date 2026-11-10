@@ -153,8 +153,15 @@ def _scan(path):
 
 
 def _finalise(rep):
-    """Derive faults/fails/table/ok from details+blocks. Called before EVERY return."""
-    rep["faults"] = len(rep["details"]); rep["ok"] = not rep["faults"]
+    """Derive faults/fails/table/ok from details+blocks. Called before EVERY return.
+
+    v13.75: `ok` WAS ASSIGNED TWICE. The old first line was
+    `rep["faults"] = len(...); rep["ok"] = not rep["faults"]` and the same
+    assignment was repeated after the comment that explains why a real key is
+    needed. Two writes of the same value, one of them dead. The documented one
+    stays; the other is gone.
+    """
+    rep["faults"] = len(rep["details"])
     rep["fails"] = ["L%d %s: %s" % (d["line"], d["kind"], d["text"])
                     for d in rep["details"]]
     rep["table"] = [{"id": b[0], "name": b[1], "line": b[2]} for b in rep["blocks"]]
@@ -389,4 +396,5 @@ def main(argv=None):
 if __name__ == "__main__":
     sys.exit(main())
 # @@END 000 VERIFIER
+# @@EOF
 # @@EOF
