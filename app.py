@@ -5610,6 +5610,22 @@ if hasattr(audit_log, "_DEFER_PAGES") and hasattr(audit_log, "_render_flashes"):
     except Exception:
         pass
 
+# v13.76 FIX ADMIN-1: THE PASSKEY MANAGER IS DRAWN HERE.
+# It lived inside auth.require(), which returns the moment the session is
+# unlocked - so the panel could only be built on a screen where is_admin was
+# false, and "Forget this passkey" could not be reached at all. It is
+# auth.admin_panel() now, called after the gate where it is actually reachable,
+# and it returns immediately for a non-admin.
+#
+# The guard is hasattr(): a page served from a cached auth module that predates
+# this build has no admin_panel, and a bare `auth.admin_panel` expression is
+# magic-written by Streamlit through st.help -> ast.parse.
+if hasattr(auth, "admin_panel"):
+    try:
+        auth.admin_panel(str_lit)
+    except Exception as _ap_err:
+        str_lit.caption(f"passkey manager unavailable: {_ap_err}")
+
 # The thresholds are sampled here on every rerun, and again from the run
 # checkpoint (block 106) - the script does not rerun while a run works, so the
 # checkpoint is the only thing that can notice a squeeze mid-run. notify throttles
