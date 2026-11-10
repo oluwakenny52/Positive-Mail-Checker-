@@ -10865,11 +10865,6 @@ def _on_paste_clear():
     _write_text_file(_PASTE_FILE, "")
 
 
-def _on_inspect_change():
-    _write_text_file(_INSPECT_FILE,
-                     str(str_lit.session_state.get("bb_inspect_cat", ""))[:200])
-
-
 def _insp_safe(label):
     """Widget-key fragment for a category label."""
     return re.sub(r"[^a-z0-9]+", "_", str(label).lower()).strip("_") or "items"
@@ -10923,10 +10918,13 @@ with input_tab2:
                 str_lit.warning("Uploaded file is empty.")
                 raw_text = ""
             else:
-                try:
-                    raw_text = file_bytes.decode("utf-8", errors="ignore")
-                except Exception:
-                    raw_text = file_bytes.decode("latin-1", errors="ignore")
+                # v13.76: decode under a spinner, so picking a big file answers
+                # before the prefilter bar below takes over.
+                with str_lit.spinner(f"Reading {uploaded_file.name}..."):
+                    try:
+                        raw_text = file_bytes.decode("utf-8", errors="ignore")
+                    except Exception:
+                        raw_text = file_bytes.decode("latin-1", errors="ignore")
                 # v13.63: the upload is written to the paste file too, so the
                 # numbers do not vanish on the next refresh. Guarded by a
                 # signature so a 3000-line file is not rewritten on every rerun.
@@ -10978,7 +10976,13 @@ if raw_text:
         _pf_throttle = {"t": 0.0}
 
         def _pf_progress(_phase, _done, _total):
-            """phase, done, total -> one throttled bar update. Never raises."""
+            """phase, done, total -> one throttled bar update. Never raises.
+
+            Throttled to ~8 updates a second: 160,000 lines at a tick every 25
+            is 6,400 updates, which is more websocket traffic than the bar can
+            show. The element is a per-run local, so two users in two tabs each
+            drive their own bar and neither can repaint the other's.
+            """
             try:
                 _now = time.time()
                 if _now - _pf_throttle["t"] < 0.12:
@@ -11040,76 +11044,100 @@ if raw_text:
     for _pc, (_pl, _pv) in zip(metric_grid(_pf_metrics, per_row=3), _pf_metrics):
         _pc.metric(_pl, _pv)
 
-    # -------------------------------------
-    unfinished_runs = list_unfinished_runs()
-    unfinished_preview = []
-    for run in unfinished_runs:
-        unfinished_preview.extend(run.get("remaining") or [])
+# --------------------------------------------------------------------------
+# INSPECTOR - v13.63, re-cut v13.76
+#
+#   * it lived inside `if raw_text:`, so with an empty paste box the result
+#     buckets could not be inspected at all. It is module level now.
+#   * the list was an uncapped st.code, so 3445 rows pushed the selectbox off
+#     the top of the screen. It is a fixed-height scroller (420px) now.
+#   * the choice was session-only. It is a per-user file, validated against the
+#     CURRENT option list so a retired value can never raise.
+#
+# v13.76 FIX INSPECT-1: THE PANEL KEPT SHUTTING. It was an expander, and an
+# expander collapses on every rerun - a tick anywhere, a download, a slider, the
+# refresh of the panel above, and it was gone; the category then had to be
+# re-opened and re-picked before the next look. The opener is a keyed CHECKBOX
+# now, which is a widget with its own state: it stays ticked until it is
+# unticked, and nothing but unticking it can close the panel. The CATEGORY
+# inside it is still a plain selectbox - that part was never the problem.
+#
+# v13.76 FIX COMBO-2: THE PANEL PRINTED THE WHOLE LINE. The list showed
+# "email:pass | direct | 35.185.209.55 | Oregon | United States | VPN OFF (auto)
+# IMAP | Host: ... | Port: 993", so the password sat in the middle of a
+# sentence. Display and download are _combo_only() now.
+# --------------------------------------------------------------------------
+inspect_options = list(PREFILTER_LABELS) + [label for label, _ in BUCKETS]
 
-    category_map = {
-        "Ready to Check": clean_lines,
-        "Resume Unfinished": unfinished_preview,
-        "Disposables": disp,
-        "Typos": typo,
-        "Skip previously valid": resume,
-        "App-Skipped": app_skip,
-        "Custom Filtered": custom_skipped,
-        "DNS Failed": dns_skipped,
-        "SMTP Failed": smtp_skipped,
-    }
-    for _b_lbl, _b_key in BUCKETS:
-        category_map[_b_lbl] = list(str_lit.session_state.get(_b_key, []))
+if "bb_inspect_cat" not in str_lit.session_state:
+    str_lit.session_state["bb_inspect_cat"] = _read_text_file(_INSPECT_FILE, 200).strip()
+# A keyed selectbox raises if its value is not one of its options, and the file
+# can hold a label a later version no longer ships. The checkbox row allowed ""
+# as a resting value; a selectbox does not, so the resting value is the first
+# category instead.
+if str_lit.session_state.get("bb_inspect_cat") not in inspect_options:
+    str_lit.session_state["bb_inspect_cat"] = inspect_options[0]
 
-    inspect_options = list(PREFILTER_LABELS) + [label for label, _ in BUCKETS]
 
-    # v13.76 FIX INSPECT-1: the panel used to be an EXPANDER, and an expander
-    # collapses on every rerun - picking anything, ticking anything, even paging
-    # the reader shut it, so the choice had to be made again each time. The
-    # opener is a keyed CHECKBOX now: it is a widget with its own state, so it
-    # stays ticked until it is unticked. The category INSIDE the panel is still a
-    # selectbox - that part was never the problem.
-    if "bb_inspect_cat" not in str_lit.session_state:
-        str_lit.session_state["bb_inspect_cat"] = _read_text_file(
-            _INSPECT_FILE, 200).strip()
-    # A keyed selectbox raises if its value is not one of the options, and the
-    # persisted file can hold a label a later version no longer ships.
-    if str_lit.session_state.get("bb_inspect_cat") not in inspect_options:
-        str_lit.session_state["bb_inspect_cat"] = inspect_options[0]
+section_title("🔍", "Filter & Result Categories Inspector",
+              "pick ONE category - the list scrolls in place")
 
-    if str_lit.checkbox("🔍 Inspect the contents of one category",
-                        key="bb_inspect_open"):
-        filter_category_choice = str_lit.selectbox(
-            "Select category to inspect contents:", options=inspect_options,
-            key="bb_inspect_cat", on_change=_on_inspect_change)
+# FIX RS-3: the preview used to append a metadata line per run into the SAME
+# list as the account lines, so "Showing N items" counted headers too. The
+# metadata is a caption now and the list holds account lines only.
+unfinished_runs = list_unfinished_runs()
+unfinished_preview = []
+for run in unfinished_runs:
+    unfinished_preview.extend(run.get("remaining") or [])
 
-        if unfinished_runs:
-            _r0 = unfinished_runs[0]
-            str_lit.caption(
-                f"Record: {_r0.get('saved_at', '?')} | reason: {_r0.get('reason', '?')} | "
-                f"{_r0.get('checked', 0)}/{_r0.get('total', 0)} checked at stop")
+category_map = {
+    "Ready to Check": clean_lines,
+    "Resume Unfinished": unfinished_preview,
+    "Disposables": disp,
+    "Typos": typo,
+    "Skip previously valid": resume,
+    "App-Skipped": app_skip,
+    "Custom Filtered": custom_skipped,
+    "DNS Failed": dns_skipped,
+    "SMTP Failed": smtp_skipped,
+}
+for _b_lbl, _b_key in BUCKETS:
+    category_map[_b_lbl] = list(str_lit.session_state.get(_b_key, []))
 
-        selected_list_items = category_map.get(filter_category_choice, [])
-        if not filter_category_choice:
-            str_lit.caption("Pick a category above to see its contents.")
-        elif not selected_list_items:
-            str_lit.info(f"No items in **{filter_category_choice}**.")
-        else:
-            # FIX COMBO-2: combo only, on screen AND in the download.
-            _clean_items = [_combo_only(i) for i in selected_list_items]
-            _ih1, _ih2 = str_lit.columns([0.6, 0.4])
-            with _ih1:
-                str_lit.info(f"Showing **{len(_clean_items)}** items for "
-                             f"**{filter_category_choice}** - the box scrolls, the page "
-                             f"does not grow.")
-            with _ih2:
-                _safe_cat = _insp_safe(filter_category_choice)
-                str_lit.download_button(
-                    f"⬇️ Download all {len(_clean_items)}",
-                    data="\n".join(_clean_items).encode("utf-8"),
-                    file_name=f"{_safe_cat}_{len(_clean_items)}.txt",
-                    mime="text/plain", width="stretch", key=f"inspdl_{_safe_cat}")
-            with str_lit.container(height=420):
-                str_lit.code("\n".join(_clean_items), language="text")
+if str_lit.checkbox("🔍 Inspect the contents of one category",
+                    key="bb_inspect_open"):
+    filter_category_choice = str_lit.selectbox(
+        "Select category to inspect contents:", options=inspect_options,
+        key="bb_inspect_cat", on_change=_on_inspect_change)
+
+    if unfinished_runs:
+        _r0 = unfinished_runs[0]
+        str_lit.caption(
+            f"Record: {_r0.get('saved_at', '?')} | reason: {_r0.get('reason', '?')} | "
+            f"{_r0.get('checked', 0)}/{_r0.get('total', 0)} checked at stop")
+
+    selected_list_items = category_map.get(filter_category_choice, [])
+    if not filter_category_choice:
+        str_lit.caption("Pick a category above to see its contents.")
+    elif not selected_list_items:
+        str_lit.info(f"No items in **{filter_category_choice}**.")
+    else:
+        # FIX COMBO-2: combo only, on screen AND in the download.
+        _clean_items = [_combo_only(i) for i in selected_list_items]
+        _ih1, _ih2 = str_lit.columns([0.6, 0.4])
+        with _ih1:
+            str_lit.info(f"Showing **{len(_clean_items)}** items for "
+                         f"**{filter_category_choice}** - the box scrolls, the page "
+                         f"does not grow.")
+        with _ih2:
+            _safe_cat = _insp_safe(filter_category_choice)
+            str_lit.download_button(
+                f"⬇️ Download all {len(_clean_items)}",
+                data="\n".join(_clean_items).encode("utf-8"),
+                file_name=f"{_safe_cat}_{len(_clean_items)}.txt",
+                mime="text/plain", width="stretch", key=f"inspdl_{_safe_cat}")
+        with str_lit.container(height=420):
+            str_lit.code("\n".join(_clean_items), language="text")
 # @@END 087 INPUT_UI
 
 # @@BLOCK 088 PROVIDER_TABLES deps=002,052
