@@ -10570,6 +10570,27 @@ def _domains_in_text(text):
 # @@END 085 PREV_VALID_IO
 
 # @@BLOCK 086 PROCESS_ACCOUNTS deps=021,038,058,068,082,084,085
+def _combo_only(line):
+    """`email:password` from a bucket line, verdict tail cut off.
+
+    v13.76 FIX COMBO-2: every surface that shows or hands out a combo emits ONLY
+    the credential now. The writer used to store f"{email}:{password} | {detail}"
+    and every renderer, download, .txt file and ZIP entry carried that whole
+    sentence - so a list exported from the app was not a list you could paste
+    back into the box, and a combo read on a phone was buried under an IP, a
+    country and a hostname.
+
+    check_task() (block 105) is the one place the tail is cut, so the buckets,
+    the journal, the result files and the ZIP are all clean. `detail` still
+    travels in its own key, which is what the report table and the trace use, so
+    nothing diagnostic is lost - it is just no longer glued to the password.
+
+    Applied again on READ as well, because the buckets rehydrated from files
+    written by an older build still carry the old shape.
+    """
+    return str(line or "").split("|", 1)[0].strip()
+
+
 def process_accounts(text, previous_valid, progress=None):
     lines = []
     disp_list, typo_list, resume_list, app_skip_list, custom_list = [], [], [], [], []
@@ -10844,9 +10865,9 @@ def _on_paste_clear():
     _write_text_file(_PASTE_FILE, "")
 
 
-def _on_inspect_change():
-    _write_text_file(_INSPECT_FILE,
-                     str(str_lit.session_state.get("bb_inspect_cat", ""))[:200])
+def _insp_safe(label):
+    """Widget-key fragment for a category label."""
+    return re.sub(r"[^a-z0-9]+", "_", str(label).lower()).strip("_") or "items"
 
 
 # ---- owner gate: a second unlock in this tab must not inherit the last one ----
@@ -10862,6 +10883,9 @@ if str_lit.session_state.get(_INPUT_OWNER_KEY) != _input_owner:
     str_lit.session_state.pop("bb_inspect_cat", None)
     str_lit.session_state.pop("_paste_saved_sig", None)
     str_lit.session_state.pop("_bb_prefilter_cache", None)
+    for _k in [k for k in list(str_lit.session_state.keys())
+               if str(k).startswith("inspchk_")]:
+        str_lit.session_state.pop(_k, None)
     str_lit.session_state[_INPUT_OWNER_KEY] = _input_owner
 if "bb_raw_text" not in str_lit.session_state:
     str_lit.session_state["bb_raw_text"] = _read_paste()
@@ -11023,27 +11047,54 @@ if raw_text:
         _pc.metric(_pl, _pv)
 
 # --------------------------------------------------------------------------
-# INSPECTOR - v13.63
+# INSPECTOR - v13.63, re-cut v13.76
 #
-# Three separate faults, all fixed here:
 #   * it lived inside `if raw_text:`, so with an empty paste box the result
 #     buckets could not be inspected at all. It is module level now.
 #   * the list was an uncapped st.code, so 3445 rows pushed the selectbox off
-#     the top of the screen and you had to drag the whole page to reach it. It
-#     is a fixed-height scroller (420px) inside an expander now: the page stops
-#     growing and the box can be opened and closed.
-#   * the choice was session-only. It is a per-user file now, validated against
-#     the CURRENT option list so a retired value can never raise.
+#     the top of the screen. It is a fixed-height scroller (420px) inside an
+#     expander now.
+#   * the choice was session-only. It is a per-user file, validated against the
+#     CURRENT option list so a retired value can never raise.
+#
+# v13.76 FIX INSPECT-1: THE DROPDOWN CLOSED. The selectbox is a popover - any
+# rerun (a tick, a download, a slider, the 3-second refresh of the panel above)
+# shut it and the category had to be re-opened and re-picked before the next
+# look. It is a ROW OF CHECKBOXES now: always visible, nothing to open, nothing
+# to close. Ticking one clears the rest, so it still means "one category at a
+# time" - the on_change callback runs BEFORE the body, which is the only point
+# where another widget's key may be written.
+#
+# v13.76 FIX COMBO-2: THE PANEL PRINTED THE WHOLE LINE. The list showed
+# "email:pass | direct | 35.185.209.55 | Oregon | United States | VPN OFF (auto)
+# IMAP | Host: ... | Port: 993", so the password sat in the middle of a
+# sentence. Display and download are _combo_only() now.
 # --------------------------------------------------------------------------
 inspect_options = list(PREFILTER_LABELS) + [label for label, _ in BUCKETS]
 
 if "bb_inspect_cat" not in str_lit.session_state:
     str_lit.session_state["bb_inspect_cat"] = _read_text_file(_INSPECT_FILE, 200).strip()
-if str_lit.session_state.get("bb_inspect_cat") not in inspect_options:
-    str_lit.session_state["bb_inspect_cat"] = inspect_options[0]
+if (str_lit.session_state.get("bb_inspect_cat")
+        and str_lit.session_state.get("bb_inspect_cat") not in inspect_options):
+    str_lit.session_state["bb_inspect_cat"] = ""
+
+
+def _on_inspect_pick(label, safe):
+    """One tick at a time, persisted. Runs BEFORE the script body."""
+    if not str_lit.session_state.get("inspchk_" + safe):
+        str_lit.session_state["bb_inspect_cat"] = ""
+        _write_text_file(_INSPECT_FILE, "")
+        return
+    str_lit.session_state["bb_inspect_cat"] = label
+    for _other in inspect_options:
+        _os = _insp_safe(_other)
+        if _os != safe:
+            str_lit.session_state["inspchk_" + _os] = False
+    _write_text_file(_INSPECT_FILE, str(label)[:200])
+
 
 section_title("🔍", "Filter & Result Categories Inspector",
-              "open the box, pick ONE category - the list scrolls in place")
+              "tick ONE category - the list scrolls in place")
 
 # FIX RS-3: the preview used to append a metadata line per run into the SAME
 # list as the account lines, so "Showing N items" counted headers too. The
@@ -11068,9 +11119,21 @@ for _b_lbl, _b_key in BUCKETS:
     category_map[_b_lbl] = list(str_lit.session_state.get(_b_key, []))
 
 with str_lit.expander("🔎 Inspect the contents of one category", expanded=False):
-    filter_category_choice = str_lit.selectbox(
-        "Select category to inspect contents:", options=inspect_options,
-        key="bb_inspect_cat", on_change=_on_inspect_change)
+    # Seeded from the persisted choice BEFORE the boxes exist, so a refresh
+    # lands on the same tick. key= only - a default beside a key warns.
+    for _opt in inspect_options:
+        _os = _insp_safe(_opt)
+        if "inspchk_" + _os not in str_lit.session_state:
+            str_lit.session_state["inspchk_" + _os] = (
+                str_lit.session_state.get("bb_inspect_cat") == _opt)
+
+    _igrid = metric_grid(inspect_options, per_row=3)
+    for _icol, _opt in zip(_igrid, inspect_options):
+        _os = _insp_safe(_opt)
+        _n_opt = len(category_map.get(_opt) or [])
+        with _icol:
+            str_lit.checkbox(f"{_opt} ({_n_opt})", key="inspchk_" + _os,
+                             on_change=_on_inspect_pick, args=(_opt, _os))
 
     if unfinished_runs:
         _r0 = unfinished_runs[0]
@@ -11078,25 +11141,29 @@ with str_lit.expander("🔎 Inspect the contents of one category", expanded=Fals
             f"Record: {_r0.get('saved_at', '?')} | reason: {_r0.get('reason', '?')} | "
             f"{_r0.get('checked', 0)}/{_r0.get('total', 0)} checked at stop")
 
+    filter_category_choice = str_lit.session_state.get("bb_inspect_cat") or ""
     selected_list_items = category_map.get(filter_category_choice, [])
-    if not selected_list_items:
+    if not filter_category_choice:
+        str_lit.caption("Tick one category above to see its contents.")
+    elif not selected_list_items:
         str_lit.info(f"No items in **{filter_category_choice}**.")
     else:
+        # FIX COMBO-2: combo only, on screen AND in the download.
+        _clean_items = [_combo_only(i) for i in selected_list_items]
         _ih1, _ih2 = str_lit.columns([0.6, 0.4])
         with _ih1:
-            str_lit.info(f"Showing **{len(selected_list_items)}** items for "
+            str_lit.info(f"Showing **{len(_clean_items)}** items for "
                          f"**{filter_category_choice}** - the box scrolls, the page "
                          f"does not grow.")
         with _ih2:
-            _safe_cat = re.sub(r"[^a-z0-9]+", "_",
-                               filter_category_choice.lower()).strip("_") or "items"
+            _safe_cat = _insp_safe(filter_category_choice)
             str_lit.download_button(
-                f"⬇️ Download all {len(selected_list_items)}",
-                data="\n".join(str(i) for i in selected_list_items).encode("utf-8"),
-                file_name=f"{_safe_cat}_{len(selected_list_items)}.txt",
+                f"⬇️ Download all {len(_clean_items)}",
+                data="\n".join(_clean_items).encode("utf-8"),
+                file_name=f"{_safe_cat}_{len(_clean_items)}.txt",
                 mime="text/plain", width="stretch", key=f"inspdl_{_safe_cat}")
         with str_lit.container(height=420):
-            str_lit.code("\n".join(str(i) for i in selected_list_items), language="text")
+            str_lit.code("\n".join(_clean_items), language="text")
 # @@END 087 INPUT_UI
 
 # @@BLOCK 088 PROVIDER_TABLES deps=002,052
@@ -13532,43 +13599,28 @@ status_text = _NullUI()
 #     f"{email}:{password} | {detail}"
 #
 # so the combo is in the line, in the file and in the ZIP. The renderers threw
-# the visibility away, not the data:
+# the visibility away, not the data.
 #
-#   * block 105 drew the whole line as ONE div with no wrap rule, so a long
-#     detail string pushed the combo past the right edge of the expander and the
-#     screen showed the tail of the sentence and no address.
-#   * block 108 drew the bucket through st.code, which is white-space:pre with
-#     horizontal overflow - so the line scrolled sideways inside the box and the
-#     combo sat off the left of the visible area.
+# v13.76 FIX COMBO-2: AND THE TAIL IS GONE FROM THE LINE ITSELF. Cutting it in
+# the renderer still left it in the .txt files, in the ZIP, in every download
+# button and in the inspector, so a list exported from the app was not a list
+# you could paste back into it. check_task() emits `email:password` only now;
+# `detail` travels in its own key, which is what the report table and the
+# under-the-hood trace read. Nothing diagnostic is lost - it is just no longer
+# glued to the password.
 #
-# Both now split the line at its FIRST " | " (the separator the writer uses; the
-# detail may itself contain " | ", a password practically never does), draw the
-# combo in BOLD on its own line, and put the detail under it in a smaller,
-# dimmed line. Every div carries word-break + overflow-wrap, so the combo wraps
-# instead of scrolling - an address and password stay readable on a phone.
-#
-# v13.76: THE DETAIL DIV CARRIED break-word, NOT break-all. break-word only
-# breaks at word boundaries, so one unbroken detail string - a 60-char hostname,
-# a URL, a base64 blob - still pushed the line sideways and undid the fix on
-# exactly the lines that need it most. Both divs are break-all now, which is
-# what the check in pages/5_Blocks.py counts.
-#
-# Nothing about the stored line changes, so the download buttons, the ZIP, the
-# .txt export and the Full Log page are all unaffected.
+# The renderer therefore draws the combo alone. The partition is kept (the gate
+# in pages/5_Blocks.py pins that exact line) and detail is simply not drawn, so
+# a bucket rehydrated from an older file still renders clean.
 # ==========================================================================
 def _bucket_combo_html(line, col):
-    """One bucket line -> the combo in bold, the detail dimmed under it, both wrapping."""
+    """One bucket line -> the combo in bold, wrapping. Verdict tail dropped."""
     combo, _sep, detail = str(line).partition(" | ")
-    out = ("<div style='font-family:ui-monospace,monospace;font-size:12px;"
-           "font-weight:700;color:%s;white-space:pre-wrap;word-break:break-all;"
-           "overflow-wrap:anywhere;max-width:100%%'>%s</div>"
-           % (col, html.escape(combo)))
-    if detail:
-        out += ("<div style='font-family:ui-monospace,monospace;font-size:11px;"
-                "opacity:.72;white-space:pre-wrap;word-break:break-all;"
-                "overflow-wrap:anywhere;max-width:100%%;margin:0 0 5px 0'>%s</div>"
-                % html.escape(detail))
-    return out
+    combo = combo.strip() or str(line).strip()
+    return ("<div style='font-family:ui-monospace,monospace;font-size:12px;"
+            "font-weight:700;color:%s;white-space:pre-wrap;word-break:break-all;"
+            "overflow-wrap:anywhere;max-width:100%%'>%s</div>"
+            % (col, html.escape(combo)))
 
 
 # v13.71: CONTINUE. The batch banner in block 108 parks the remaining queue here
@@ -13904,11 +13956,10 @@ if start_engine_btn:
             A plain list is still accepted, so a shape mismatch degrades to a
             short count instead of a blank box.
 
-            FIX COMBO-1 (v13.75): each line is drawn through
-            _bucket_combo_html(), which puts the email:password on its own bold
-            line and the detail dimmed beneath it, both WRAPPING. The line used to
-            be one unwrapped div, so a long detail ran past the right edge and the
-            combo - the only part anybody wants - was the part off screen.
+            FIX COMBO-1 / COMBO-2 (v13.75 / v13.76): each line is drawn through
+            _bucket_combo_html(), which is combo-only and wraps. The line used to
+            be one unwrapped div carrying the whole verdict sentence, so the combo
+            - the only part anybody wants - was the part off screen.
             """
             for key, _title in BUCKET_SPEC:
                 ph = bucket_placeholders.get(key)
@@ -13948,6 +13999,12 @@ if start_engine_btn:
 
             The default also keeps the submit call exactly
             `executor.submit(check_task, line)`, which verify_v1337.py gates.
+
+            FIX COMBO-2: `line` is the combo ALONE now. The verdict detail is
+            returned in its own `detail` key, which block 106 files into the
+            report table and the trace. Every bucket, every journal write, every
+            result file, the ZIP and every download button therefore carry
+            `email:password` and nothing else.
             """
             try:
                 # Pin BEFORE anything reads live_cfg() or asks for a gate.
@@ -13955,13 +14012,13 @@ if start_engine_btn:
                 _pin_gate_scope(_run_scope)
                 _pool = _box or active_proxy_pool
                 if ":" not in line:
-                    return {"line": f"{line} | Error: Invalid format", "status": FAILED,
+                    return {"line": _combo_only(line), "status": FAILED,
                             "trace": ["Invalid format"]}
                 email, password = line.split(":", 1)
                 email, password = email.strip(), password.strip()
                 reason = drop_before_check(email)
                 if reason:
-                    return {"line": f"{email}:{password} | {reason}", "email": email,
+                    return {"line": f"{email}:{password}", "email": email,
                             "password": password, "status": SKIP, "detail": reason,
                             "trace": [reason]}
                 domain = email.split("@")[-1].lower()
@@ -13970,11 +14027,11 @@ if start_engine_btn:
                     thread_local.state = {}
                 server, status, detail, px_used, trace = check_account_sync(
                     email, password, conf, domain, _pool, thread_local.state)
-                return {"line": f"{email}:{password} | {detail}", "email": email,
+                return {"line": f"{email}:{password}", "email": email,
                         "password": password, "status": status, "detail": detail,
                         "trace": trace}
             except Exception as ex:
-                return {"line": f"{line} | Error: {ex}", "email": line, "password": "",
+                return {"line": _combo_only(line), "email": line, "password": "",
                         "status": FAILED, "detail": str(ex), "trace": [str(ex)]}
             finally:
                 # v13.51: the whole per-thread dict was cleared, so the
