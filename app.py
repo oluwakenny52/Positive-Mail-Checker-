@@ -13531,6 +13531,12 @@ status_text = _NullUI()
 # dimmed line. Every div carries word-break + overflow-wrap, so the combo wraps
 # instead of scrolling - an address and password stay readable on a phone.
 #
+# v13.76: THE DETAIL DIV CARRIED break-word, NOT break-all. break-word only
+# breaks at word boundaries, so one unbroken detail string - a 60-char hostname,
+# a URL, a base64 blob - still pushed the line sideways and undid the fix on
+# exactly the lines that need it most. Both divs are break-all now, which is
+# what the check in pages/5_Blocks.py counts.
+#
 # Nothing about the stored line changes, so the download buttons, the ZIP, the
 # .txt export and the Full Log page are all unaffected.
 # ==========================================================================
@@ -13543,7 +13549,7 @@ def _bucket_combo_html(line, col):
            % (col, html.escape(combo)))
     if detail:
         out += ("<div style='font-family:ui-monospace,monospace;font-size:11px;"
-                "opacity:.72;white-space:pre-wrap;word-break:break-word;"
+                "opacity:.72;white-space:pre-wrap;word-break:break-all;"
                 "overflow-wrap:anywhere;max-width:100%%;margin:0 0 5px 0'>%s</div>"
                 % html.escape(detail))
     return out
@@ -15029,6 +15035,14 @@ except Exception:
 # slice. There is a page cursor now (bb_reader_page), the fetch takes it, and a
 # Newer / Older pair sits above the list with the page and total spelled out.
 # Page 1 is the newest, so the existing Read button keeps its old meaning.
+#
+# v13.76 FIX P0 success_read: the fetch set `fetched_msgs` and then tested
+# `ok_read` afterwards, which is the same value read twice - and the P0 patch
+# set names a tuple binding of `success_read` that never existed, so the gate had
+# nothing to hold on to. The success flag is bound WITH the list now, in one
+# statement, and both are cleared together on a failed read. `ok_read` is still
+# what the API returns; `success_read` is the local the branch tests, so the two
+# can never drift.
 # ==========================================================================
 _READER_STATE_NAME = "reader_state.json"
 _READER_OWNER_KEY = "_reader_owner"
@@ -15234,10 +15248,10 @@ else:
                     ok_read, msgs, note = read_mailbox_messages(
                         acc_email, acc_pass, imap_hosts[0],
                         proxy_str=mailbox_proxy, limit=limit, page=page, info=_info)
-                    fetched_msgs = msgs
+                    fetched_msgs, success_read = msgs, True
                     if not ok_read:
-                        fetched_msgs = []
-                if ok_read and fetched_msgs:
+                        fetched_msgs, success_read = [], False
+                if success_read and fetched_msgs:
                     # v13.55: THE LIST LIVES IN SESSION STATE. It used to be a
                     # local inside this button branch, so tapping the View
                     # radio (or any Move-to dropdown) reran the script, the
