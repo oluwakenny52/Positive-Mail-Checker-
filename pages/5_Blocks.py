@@ -462,6 +462,14 @@ with st.expander("🛠 Canonicalise @@END names (no terminal needed)", expanded=
 # The order check is flattened on BOTH sides and uses index(), not rindex():
 # rindex() took the LAST occurrence of the first needle, so a second copy in a
 # comment decided the comparison and the real call site was never looked at.
+#
+# v13.75: THE FLASH DRAIN, THE COMBO RENDER, THE RUNG FLOOR, THE TIMEOUT BREAKER,
+# THE APP LOCAL-ONLY GATE AND THE PASTE NORMALISER GET ROWS. Every one of them is
+# a behaviour a later reflow could quietly undo, and each is anchored on a shape
+# only the real code carries - never on prose. Two of them (the flash drain and
+# the drain guard) are ORDER pairs, because the bug was the drain's POSITION, not
+# its existence: a needle for the call alone would pass with it back inside
+# install().
 _FIX_CHECKS = (
     ("status.py", "_PROXY_BLOCKED", 2, "proxy-blocked classifies as CONNECTION_FAILED"),
     ("status.py", "best = None", 1, "worse_of no longer seeds with UNKNOWN"),
@@ -521,6 +529,45 @@ _FIX_CHECKS = (
      "startup ledger dedupes per session, not per process"),
     ("pages/7_Logs.py", "_RES_IS_MINE", 4, "the log page proves whose directory it reads"),
     ("pages/7_Logs.py", "Strict: only my own directory", 1, "strict mode refuses a shared dir"),
+    # ---- v13.75 flash position, combo render, transport breaker, paste parser ----
+    # 4 spaces of indent: the drain is a statement of the page body, not of a
+    # nested branch, so a copy pushed back inside a def would lose the indent.
+    ("app.py", "    audit_log._render_flashes(str_lit)", 1,
+     "the flash is drained under the header, not inside install()"),
+    ("audit_log.py", 'if page_ not in _DEFER_PAGES:', 1,
+     "install() skips the drain for a deferred page"),
+    ("audit_log.py", '_DEFER_PAGES = frozenset({"app.py"})', 1,
+     "app.py is the registered deferred page"),
+    ("app.py", 'combo, _sep, detail = str(line).partition(" | ")', 1,
+     "the bucket combo is split from the detail at the writer's separator"),
+    ("app.py", "def _bucket_combo_html(line, col):", 1,
+     "one bucket-line renderer, used by live and summary"),
+    ("app.py", "word-break:break-all;", 2,
+     "combo and detail both wrap instead of scrolling"),
+    ("app.py", "left / max(1, len(rungs))))", 1,
+     "the per-rung share is capped, not floored at 3s"),
+    ("app.py", "RUNG_COST_MIN, min(configured_to, RUNG_COST_MAX,", 1,
+     "the rung floor is RUNG_COST_MIN"),
+    ("app.py", "consecutive timeouts - the", 1,
+     "two timeouts abandon the pass for DIRECT"),
+    ("app.py", '"saw_port_block": False, "ran_direct": False', 1,
+     "both tail flags are declared in the literal"),
+    ("app.py", "_local_app = [h for h in app_hosts if _is_local_host(h)]", 1,
+     "APP confirmation is local-only, like WRONG"),
+    ("app.py", "def _normalise_combo_line(line):", 1, "the paste normaliser exists"),
+    ("app.py", '_MAILTO_RE = re.compile(r"^mailto:\\s*", re.IGNORECASE)', 1,
+     "mailto: prefixes are stripped"),
+    ("app.py", 'if "|" in s:', 1, "a re-pasted bucket line is cut at the pipe"),
+    ("app.py", "limit=limit, page=page, info=_info)", 1, "the reader passes a page"),
+    ("app.py", 'key="bb_reader_next"', 1, "the reader has forward paging"),
+    ("app.py", 'key="bb_reader_prev"', 1, "the reader has back paging"),
+    ("app.py", "_BODY_SHOW_CHARS = 120000", 1, "the body cap is not 20000 any more"),
+    ("pages/3_Mailbox_Reader.py", "return [THEME_FILE]", 1,
+     "the reader theme has one source"),
+    ("pages/6_User_Guide.py", "return [_a.user_file(\"theme.json\")]", 1,
+     "the Guide theme has one source"),
+    ("pages/6_User_Guide.py", "403 client_connect_forbidden_port` on every attempt", 1,
+     "the troubleshooting table splits the three proxy tails"),
 )
 
 # Needles that point at THIS file. want is the CODE-only count; the literal in
@@ -535,6 +582,12 @@ _SELF_CHECKS = (
 _ORDER_CHECKS = (
     ("app.py", 'if flags.get("saw_login_drop"):',
      '    if retryable:\n        return None, RETRY', "LOGIN_DROPPED before retryable"),
+    # v13.75: the drain must be AFTER the bell row and BEFORE notify.system_tick,
+    # or it is back above the header or lost behind the tick's own work.
+    ("app.py", "    notify.render_bell(str_lit)",
+     "    audit_log._render_flashes(str_lit)", "the flash drains after the bell"),
+    ("app.py", "    audit_log._render_flashes(str_lit)",
+     "    notify.system_tick()", "the flash drains before the threshold tick"),
 )
 
 
