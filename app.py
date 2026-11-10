@@ -10865,6 +10865,44 @@ def _on_paste_clear():
     _write_text_file(_PASTE_FILE, "")
 
 
+# ==========================================================================
+# v13.77 FIX INSPECT-2 - THE INSPECTOR'S CALLBACK DID NOT EXIST
+#
+# Block 087 passed _on_inspect_change as on_change= on the category selectbox
+# and NO BLOCK IN app.py DEFINED IT. on_change= is evaluated when the widget is
+# created, so the panel died on that line itself - app.py:11111 in the deployed
+# traceback - with
+#
+#     NameError: name '_on_inspect_change' is not defined
+#
+# before a single item was listed. _INSPECT_FILE made it worse: it was READ at
+# every load and written by NOTHING, so the "restored" choice was always "" and
+# the panel always fell back to the first option. The persistence the v13.63
+# comment block above describes for this widget was half-built and never closed.
+#
+# WHY NO GATE CAUGHT IT: pages/5_Blocks.py counts the CALL SITE
+# ('key="bb_inspect_cat", on_change=_on_inspect_change)') and nothing counted the
+# DEFINITION, and verify_v1337.py has no block-087 needle at all. A green
+# fix-check proved only that the call was still spelled that way. The matching
+# row is added to pages/5_Blocks.py with this fix.
+#
+# The function has to be defined ABOVE the selectbox - the module executes top
+# to bottom - and it must touch nothing but the file and the key it owns.
+# ==========================================================================
+def _on_inspect_change():
+    """Persist the chosen category.
+
+    A callback runs BEFORE the script body, so no widget key is touched after
+    its widget exists, and session_state already holds the NEW value here. The
+    file is compared first, so re-picking what is already stored costs one small
+    read and no write - the same shape _on_paste_change() uses.
+    """
+    _val = str(str_lit.session_state.get("bb_inspect_cat") or "").strip()
+    if _read_text_file(_INSPECT_FILE, 200).strip() == _val:
+        return
+    _write_text_file(_INSPECT_FILE, _val)
+
+
 def _insp_safe(label):
     """Widget-key fragment for a category label."""
     return re.sub(r"[^a-z0-9]+", "_", str(label).lower()).strip("_") or "items"
@@ -10877,6 +10915,10 @@ def _insp_safe(label):
 # Ready/Skip numbers. It is popped with the rest of the input state now, and the
 # fingerprint below carries the owner as well, so a stale entry can never be a
 # hit even if a future edit forgets the pop.
+#
+# v13.77: _INSPECT_FILE is resolved ABOVE this gate (the block runs after
+# auth.require() in 007), so the reseed two lines below already reads the NEW
+# owner's file. The pop and the reseed are therefore in the right order.
 _input_owner = _cache_owner()
 if str_lit.session_state.get(_INPUT_OWNER_KEY) != _input_owner:
     str_lit.session_state.pop("bb_raw_text", None)
@@ -11045,7 +11087,7 @@ if raw_text:
         _pc.metric(_pl, _pv)
 
 # --------------------------------------------------------------------------
-# INSPECTOR - v13.63, re-cut v13.76
+# INSPECTOR - v13.63, re-cut v13.76, v13.77
 #
 #   * it lived inside `if raw_text:`, so with an empty paste box the result
 #     buckets could not be inspected at all. It is module level now.
@@ -11066,6 +11108,15 @@ if raw_text:
 # "email:pass | direct | 35.185.209.55 | Oregon | United States | VPN OFF (auto)
 # IMAP | Host: ... | Port: 993", so the password sat in the middle of a
 # sentence. Display and download are _combo_only() now.
+#
+# v13.77 FIX INSPECT-2: the callback existed nowhere - see the note above
+# _on_inspect_change(). FIX INSPECT-3: the per-rerun work moved inside the
+# checkbox. list_unfinished_runs() is a glob plus a json.load() per record, and
+# the category_map copied all twelve buckets, and BOTH ran on every rerun of
+# every load whether the panel was open or not - twelve list copies of up to
+# 3000 entries apiece for a panel nobody had opened. FIX INSPECT-4: the
+# `if not filter_category_choice:` branch was dead - a selectbox always returns
+# one of its options - so it is gone.
 # --------------------------------------------------------------------------
 inspect_options = list(PREFILTER_LABELS) + [label for label, _ in BUCKETS]
 
@@ -11082,33 +11133,33 @@ if str_lit.session_state.get("bb_inspect_cat") not in inspect_options:
 section_title("🔍", "Filter & Result Categories Inspector",
               "pick ONE category - the list scrolls in place")
 
-# FIX RS-3: the preview used to append a metadata line per run into the SAME
-# list as the account lines, so "Showing N items" counted headers too. The
-# metadata is a caption now and the list holds account lines only.
-unfinished_runs = list_unfinished_runs()
-unfinished_preview = []
-for run in unfinished_runs:
-    unfinished_preview.extend(run.get("remaining") or [])
-
-category_map = {
-    "Ready to Check": clean_lines,
-    "Resume Unfinished": unfinished_preview,
-    "Disposables": disp,
-    "Typos": typo,
-    "Skip previously valid": resume,
-    "App-Skipped": app_skip,
-    "Custom Filtered": custom_skipped,
-    "DNS Failed": dns_skipped,
-    "SMTP Failed": smtp_skipped,
-}
-for _b_lbl, _b_key in BUCKETS:
-    category_map[_b_lbl] = list(str_lit.session_state.get(_b_key, []))
-
 if str_lit.checkbox("🔍 Inspect the contents of one category",
                     key="bb_inspect_open"):
     filter_category_choice = str_lit.selectbox(
         "Select category to inspect contents:", options=inspect_options,
         key="bb_inspect_cat", on_change=_on_inspect_change)
+
+    # FIX RS-3: the preview used to append a metadata line per run into the SAME
+    # list as the account lines, so "Showing N items" counted headers too. The
+    # metadata is a caption now and the list holds account lines only.
+    unfinished_runs = list_unfinished_runs()
+    unfinished_preview = []
+    for run in unfinished_runs:
+        unfinished_preview.extend(run.get("remaining") or [])
+
+    category_map = {
+        "Ready to Check": clean_lines,
+        "Resume Unfinished": unfinished_preview,
+        "Disposables": disp,
+        "Typos": typo,
+        "Skip previously valid": resume,
+        "App-Skipped": app_skip,
+        "Custom Filtered": custom_skipped,
+        "DNS Failed": dns_skipped,
+        "SMTP Failed": smtp_skipped,
+    }
+    for _b_lbl, _b_key in BUCKETS:
+        category_map[_b_lbl] = list(str_lit.session_state.get(_b_key, []))
 
     if unfinished_runs:
         _r0 = unfinished_runs[0]
@@ -11117,9 +11168,7 @@ if str_lit.checkbox("🔍 Inspect the contents of one category",
             f"{_r0.get('checked', 0)}/{_r0.get('total', 0)} checked at stop")
 
     selected_list_items = category_map.get(filter_category_choice, [])
-    if not filter_category_choice:
-        str_lit.caption("Pick a category above to see its contents.")
-    elif not selected_list_items:
+    if not selected_list_items:
         str_lit.info(f"No items in **{filter_category_choice}**.")
     else:
         # FIX COMBO-2: combo only, on screen AND in the download.
