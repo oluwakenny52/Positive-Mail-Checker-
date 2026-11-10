@@ -3625,6 +3625,40 @@ active_email, active_password = "", ""
 if actual_pick != "none" and ":" in actual_pick:
     active_email, active_password = actual_pick.split(":", 1)
 
+# The loaded rows belong to ONE mailbox. IMAP uids are per-mailbox, so the
+# moment the account dropdown moves, every uid in current_messages,
+# otp_messages and search_messages points at whatever happens to sit at that
+# number in the NEW mailbox. mailview's full_raw() dials with the current
+# account, so a >256 KB row or any row carrying cid: would fetch a stranger's
+# message (or nothing) and render it under the old subject.
+#
+# _stream_account is deliberately NOT in the _UI_TEXT whitelist: a restored
+# session comes back with rows AND with no marker, so the marker is simply
+# re-set and the restored rows are kept. Only a real move clears.
+_prev_account = st.session_state.get("_stream_account")
+if active_email and _prev_account != active_email:
+    _had_rows = bool(st.session_state.get("current_messages")
+                     or st.session_state.get("otp_messages")
+                     or st.session_state.get("search_messages"))
+    st.session_state["_stream_account"] = active_email
+    if _prev_account:
+        for _bucket in ("current_messages", "otp_messages", "search_messages"):
+            st.session_state[_bucket] = []
+        st.session_state["total_matched_count"] = 0
+        st.session_state["search_total_matched_count"] = 0
+        st.session_state["otp_total_matched_count"] = 0
+        st.session_state["current_page"] = 1
+        st.session_state["search_current_page"] = 1
+        st.session_state["otp_current_page"] = 1
+        st.session_state["bot_current_page"] = 1
+        st.session_state["stream_page_rows"] = 0
+        st.session_state["search_page_rows"] = 0
+        st.session_state["otp_page_rows"] = 0
+        save_session_cache()
+        if _had_rows:
+            st.info(f"Account changed - cleared the rows loaded from {_prev_account}. "
+                    "Press Connect & Discover Folders, then load again.")
+
 # v13.40: 'override' was assigned and never used; show the effective host instead.
 if active_email:
     st.caption(f"Effective host: `{resolve_active_host(active_email) or '(none)'}` · port {st.session_state.app_config.get('imap_port', 993)}")
