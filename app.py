@@ -10881,11 +10881,9 @@ _input_owner = _cache_owner()
 if str_lit.session_state.get(_INPUT_OWNER_KEY) != _input_owner:
     str_lit.session_state.pop("bb_raw_text", None)
     str_lit.session_state.pop("bb_inspect_cat", None)
+    str_lit.session_state.pop("bb_inspect_open", None)
     str_lit.session_state.pop("_paste_saved_sig", None)
     str_lit.session_state.pop("_bb_prefilter_cache", None)
-    for _k in [k for k in list(str_lit.session_state.keys())
-               if str(k).startswith("inspchk_")]:
-        str_lit.session_state.pop(_k, None)
     str_lit.session_state[_INPUT_OWNER_KEY] = _input_owner
 if "bb_raw_text" not in str_lit.session_state:
     str_lit.session_state["bb_raw_text"] = _read_paste()
@@ -11052,18 +11050,17 @@ if raw_text:
 #   * it lived inside `if raw_text:`, so with an empty paste box the result
 #     buckets could not be inspected at all. It is module level now.
 #   * the list was an uncapped st.code, so 3445 rows pushed the selectbox off
-#     the top of the screen. It is a fixed-height scroller (420px) inside an
-#     expander now.
+#     the top of the screen. It is a fixed-height scroller (420px) now.
 #   * the choice was session-only. It is a per-user file, validated against the
 #     CURRENT option list so a retired value can never raise.
 #
-# v13.76 FIX INSPECT-1: THE DROPDOWN CLOSED. The selectbox is a popover - any
-# rerun (a tick, a download, a slider, the 3-second refresh of the panel above)
-# shut it and the category had to be re-opened and re-picked before the next
-# look. It is a ROW OF CHECKBOXES now: always visible, nothing to open, nothing
-# to close. Ticking one clears the rest, so it still means "one category at a
-# time" - the on_change callback runs BEFORE the body, which is the only point
-# where another widget's key may be written.
+# v13.76 FIX INSPECT-1: THE PANEL KEPT SHUTTING. It was an expander, and an
+# expander collapses on every rerun - a tick anywhere, a download, a slider, the
+# refresh of the panel above, and it was gone; the category then had to be
+# re-opened and re-picked before the next look. The opener is a keyed CHECKBOX
+# now, which is a widget with its own state: it stays ticked until it is
+# unticked, and nothing but unticking it can close the panel. The CATEGORY
+# inside it is still a plain selectbox - that part was never the problem.
 #
 # v13.76 FIX COMBO-2: THE PANEL PRINTED THE WHOLE LINE. The list showed
 # "email:pass | direct | 35.185.209.55 | Oregon | United States | VPN OFF (auto)
@@ -11074,27 +11071,16 @@ inspect_options = list(PREFILTER_LABELS) + [label for label, _ in BUCKETS]
 
 if "bb_inspect_cat" not in str_lit.session_state:
     str_lit.session_state["bb_inspect_cat"] = _read_text_file(_INSPECT_FILE, 200).strip()
-if (str_lit.session_state.get("bb_inspect_cat")
-        and str_lit.session_state.get("bb_inspect_cat") not in inspect_options):
-    str_lit.session_state["bb_inspect_cat"] = ""
-
-
-def _on_inspect_pick(label, safe):
-    """One tick at a time, persisted. Runs BEFORE the script body."""
-    if not str_lit.session_state.get("inspchk_" + safe):
-        str_lit.session_state["bb_inspect_cat"] = ""
-        _write_text_file(_INSPECT_FILE, "")
-        return
-    str_lit.session_state["bb_inspect_cat"] = label
-    for _other in inspect_options:
-        _os = _insp_safe(_other)
-        if _os != safe:
-            str_lit.session_state["inspchk_" + _os] = False
-    _write_text_file(_INSPECT_FILE, str(label)[:200])
+# A keyed selectbox raises if its value is not one of its options, and the file
+# can hold a label a later version no longer ships. The checkbox row allowed ""
+# as a resting value; a selectbox does not, so the resting value is the first
+# category instead.
+if str_lit.session_state.get("bb_inspect_cat") not in inspect_options:
+    str_lit.session_state["bb_inspect_cat"] = inspect_options[0]
 
 
 section_title("🔍", "Filter & Result Categories Inspector",
-              "tick ONE category - the list scrolls in place")
+              "pick ONE category - the list scrolls in place")
 
 # FIX RS-3: the preview used to append a metadata line per run into the SAME
 # list as the account lines, so "Showing N items" counted headers too. The
@@ -11118,22 +11104,11 @@ category_map = {
 for _b_lbl, _b_key in BUCKETS:
     category_map[_b_lbl] = list(str_lit.session_state.get(_b_key, []))
 
-with str_lit.expander("🔎 Inspect the contents of one category", expanded=False):
-    # Seeded from the persisted choice BEFORE the boxes exist, so a refresh
-    # lands on the same tick. key= only - a default beside a key warns.
-    for _opt in inspect_options:
-        _os = _insp_safe(_opt)
-        if "inspchk_" + _os not in str_lit.session_state:
-            str_lit.session_state["inspchk_" + _os] = (
-                str_lit.session_state.get("bb_inspect_cat") == _opt)
-
-    _igrid = metric_grid(inspect_options, per_row=3)
-    for _icol, _opt in zip(_igrid, inspect_options):
-        _os = _insp_safe(_opt)
-        _n_opt = len(category_map.get(_opt) or [])
-        with _icol:
-            str_lit.checkbox(f"{_opt} ({_n_opt})", key="inspchk_" + _os,
-                             on_change=_on_inspect_pick, args=(_opt, _os))
+if str_lit.checkbox("🔍 Inspect the contents of one category",
+                    key="bb_inspect_open"):
+    filter_category_choice = str_lit.selectbox(
+        "Select category to inspect contents:", options=inspect_options,
+        key="bb_inspect_cat", on_change=_on_inspect_change)
 
     if unfinished_runs:
         _r0 = unfinished_runs[0]
@@ -11141,10 +11116,9 @@ with str_lit.expander("🔎 Inspect the contents of one category", expanded=Fals
             f"Record: {_r0.get('saved_at', '?')} | reason: {_r0.get('reason', '?')} | "
             f"{_r0.get('checked', 0)}/{_r0.get('total', 0)} checked at stop")
 
-    filter_category_choice = str_lit.session_state.get("bb_inspect_cat") or ""
     selected_list_items = category_map.get(filter_category_choice, [])
     if not filter_category_choice:
-        str_lit.caption("Tick one category above to see its contents.")
+        str_lit.caption("Pick a category above to see its contents.")
     elif not selected_list_items:
         str_lit.info(f"No items in **{filter_category_choice}**.")
     else:
