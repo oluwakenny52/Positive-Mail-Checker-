@@ -10880,11 +10880,16 @@ def _on_paste_clear():
 # the panel always fell back to the first option. The persistence the v13.63
 # comment block above describes for this widget was half-built and never closed.
 #
-# WHY NO GATE CAUGHT IT: pages/5_Blocks.py counts the CALL SITE
-# ('key="bb_inspect_cat", on_change=_on_inspect_change)') and nothing counted the
-# DEFINITION, and verify_v1337.py has no block-087 needle at all. A green
-# fix-check proved only that the call was still spelled that way. The matching
-# row is added to pages/5_Blocks.py with this fix.
+# WHY NO GATE CAUGHT IT: pages/5_Blocks.py counts the CALL SITE only, and
+# nothing counted the DEFINITION - and verify_v1337.py has no block-087 needle
+# at all. A green fix-check proved only that the call was still spelled that
+# way. The matching row is added to pages/5_Blocks.py with this fix.
+#
+# NOTE FOR THE NEXT EDITOR: that row is a raw substring count over app.py with
+# comments included, so the QUOTED form of the selectbox line must not be
+# repeated anywhere in a comment - it makes the row read got 2 want 1 on correct
+# code. That is exactly how this block failed its first gate run, and why the
+# quoted form is not used above.
 #
 # The function has to be defined ABOVE the selectbox - the module executes top
 # to bottom - and it must touch nothing but the file and the key it owns.
