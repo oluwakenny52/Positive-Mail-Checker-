@@ -1,4 +1,4 @@
-"""runstate.py - unfinished-run watchdog  (v13.48)
+"""runstate.py - unfinished-run watchdog  (v13.77)
 ================================================
 The run loop lives in app.py block 106. A Streamlit rerun (tab backgrounded,
 WebSocket drop, phone lock, redeploy) tears the script down and the loop never
@@ -26,6 +26,27 @@ cannot see each other's progress. The record holds COUNTS only; the remaining
 ACCOUNT LINES stay in unfinished_live.json, which app.py writes on every
 checkpoint and in its own finally. remaining() reads that file and nothing else.
 
+v13.77 FIX PRUNE-1: prune() HAD NO CALLER. It existed, it worked, and nothing in
+app.py or in any page ever called it, so a FINISHED record sat in
+unfinished_run.json for the life of the account. It is not a leak - summary()
+filters to running/interrupted and clear_unfinished() takes the queue file on a
+clean finish - but it is dead code with a stale file behind it. tick() ages the
+record out now: it is the only call that already runs on every load, after
+auth.require() (so the per-user path is resolved correctly), on the script
+thread, and it returns early for a non-running record, which makes the ageing
+invisible to every caller. drop() is therefore live again too.
+
+v13.77 FIX PRUNE-2: THE TEST OVERRIDE COULD BE SHADOWED BY A SECRET. The
+directory override was the environment variable BB_RUN_DIR, and app.py block
+043 bridges EVERY Streamlit secret into os.environ under its own key - so a
+secret named BB_RUN_DIR would have overridden the per-user directory for the
+whole process and put every user on one record, silently. Nothing outside this
+file referenced the name, so it is RUNSTATE_DIR_OVERRIDE now, which no secret
+is going to collide with.
+
+_write() also stopped lying: it returned the path even when the write had
+failed, so no caller could ever tell. It returns None on failure.
+
 _write() always stamps the heartbeat with "now" - every production caller
 (begin, progress, note, tick, interrupt, finish) means exactly that. Only the
 selftest needs to lie about the clock, so it rewrites the record by hand.
@@ -39,8 +60,12 @@ import time
 from datetime import datetime
 
 STALE_SECONDS = 60.0
+# How long a FINISHED record is kept before tick() ages it out.
+PRUNE_DAYS = 7
 RUN_FILE = "unfinished_run.json"
 UNFINISHED_FILE = "unfinished_live.json"
+# Process-wide directory override. Distinctive on purpose - see FIX PRUNE-2.
+RUN_DIR_OVERRIDE = "RUNSTATE_DIR_OVERRIDE"
 
 
 def _stamp():
@@ -48,7 +73,7 @@ def _stamp():
 
 
 def _dir():
-    ov = os.environ.get("BB_RUN_DIR")
+    ov = os.environ.get(RUN_DIR_OVERRIDE)
     if ov:
         return ov
     try:
@@ -77,6 +102,7 @@ def _read():
 
 
 def _write(rec):
+    """Persist `rec` atomically. Returns the path, or None when it did not land."""
     p = _path()
     rec["heartbeat"] = time.time()
     tmp = p + ".tmp"
@@ -85,7 +111,7 @@ def _write(rec):
             json.dump(rec, f)
         os.replace(tmp, p)
     except Exception:
-        return p
+        return None
     return p
 
 
@@ -153,9 +179,14 @@ def interrupt(reason):
 def tick():
     """Last-resort watchdog. Returns the record path while a live run is still
     beating, or after marking a quiet one interrupted. Returns None when nothing
-    is open."""
+    is open.
+
+    v13.77 FIX PRUNE-1: a FINISHED record is also aged out here. See prune().
+    """
     rec = _read()
     if not rec or rec.get("state") != "running":
+        if rec and rec.get("state") == "finished":
+            prune()
         return None
     if (time.time() - float(rec.get("heartbeat") or 0.0)) < STALE_SECONDS:
         return _path()
@@ -235,12 +266,23 @@ def drop():
             pass
 
 
-def prune(max_age_days=7):
-    """Delete a finished record older than max_age_days."""
+def prune(max_age_days=PRUNE_DAYS):
+    """Delete a finished record older than max_age_days.
+
+    v13.77 FIX PRUNE-1: this had no caller at all. tick() calls it now for a
+    finished record, so a completed run is aged out instead of sitting on disk
+    for the life of the account. It stays callable on its own and still refuses
+    anything that is not FINISHED, so an interrupted run with a resumable queue
+    is never taken.
+    """
     rec = _read()
     if not rec or rec.get("state") != "finished":
         return False
-    if (time.time() - float(rec.get("heartbeat") or 0.0)) < max_age_days * 86400:
+    try:
+        age = time.time() - float(rec.get("heartbeat") or 0.0)
+    except Exception:
+        return False
+    if age < max_age_days * 86400:
         return False
     drop()
     return True
@@ -251,7 +293,7 @@ def _selftest():
     import tempfile
 
     d = tempfile.mkdtemp(prefix="runstate_")
-    os.environ["BB_RUN_DIR"] = d
+    os.environ[RUN_DIR_OVERRIDE] = d
     fails = []
 
     def check(name, cond):
@@ -341,11 +383,28 @@ def _selftest():
         check("a finished run is not listed as running",
               not any("running now" in ln for ln in summary()))
 
+        # v13.77 FIX PRUNE-1: the ageing path. It had no caller AND no test,
+        # which is how it got orphaned. A fresh finished record must survive a
+        # tick; an aged one must be taken by it; an interrupted one must not.
+        tick()
+        check("a fresh finished record survives a tick", _read() is not None)
+        backdate(PRUNE_DAYS * 86400 + 60)
+        tick()
+        check("an aged finished record is pruned by tick", _read() is None)
+
+        begin(5)
+        backdate(PRUNE_DAYS * 86400 + 60)
+        tick()
+        check("an aged INTERRUPTED record is not pruned by the first tick",
+              _read() is not None)
+        check("the first tick marked it interrupted",
+              (_read() or {}).get("state") == "interrupted")
+
         drop()
         check("drop clears the record", _read() is None)
     finally:
         shutil.rmtree(d, ignore_errors=True)
-        os.environ.pop("BB_RUN_DIR", None)
+        os.environ.pop(RUN_DIR_OVERRIDE, None)
 
     print("SELFTEST: %s (%d failure(s))"
           % ("OK" if not fails else "FAILED", len(fails)))
