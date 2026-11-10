@@ -411,6 +411,14 @@ def _selftest():
         check("tick keeps the existing cause as the reason",
               rec.get("reason") == "network flapping")
 
+        # REVIVE FIRST. The tick above left the record INTERRUPTED, and
+        # interrupt() refuses a record that is not running - so without this the
+        # next three checks were testing a no-op. The v13.77 selftest had a
+        # progress() here; the rewrite dropped it.
+        progress(120, 120)
+        check("progress revives the record",
+              (_read() or {}).get("state") == "running")
+
         live_file(remaining=["a@x.com", "b@x.com"], checked=7, total=120)
         interrupt("UI interaction / rerun - the run loop was torn down")
         rec = _read() or {}
