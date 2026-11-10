@@ -5548,7 +5548,7 @@ with str_lit.sidebar.expander("🎨 Theme Studio & Colours", expanded=False):
     _sync_theme_from_widgets()
 # @@END 056 THEME_STUDIO
 
-# @@BLOCK 057 BOOT_RENDER deps=033,034,055,056
+# @@BLOCK 057 BOOT_RENDER deps=007,033,034,055,056
 _theme = str_lit.session_state.theme
 
 str_lit.markdown(theme_css(_theme), unsafe_allow_html=True)
@@ -5577,6 +5577,29 @@ if not (hasattr(notify, "render_bell") and hasattr(notify, "system_tick")):
 _nb_l, _nb_r = str_lit.columns([0.24, 0.76])
 with _nb_l:
     notify.render_bell(str_lit)
+
+# FIX FLASH-4 (v13.75): THE FLASHED MESSAGE IS PAINTED HERE, NOT IN install().
+#
+# install() used to drain the queue as its last statement, and install() runs in
+# block 007 - before require(), long before render_hero() above. So every
+# confirmation an audit_log.flash() carried ("Settings applied", "Pool restored",
+# "Ticks cleared") was drawn ABOVE the hero header, over the very title it was
+# confirming, and on a phone it landed under the collapsed-sidebar chevron.
+#
+# audit_log now skips its own drain for a page listed in _DEFER_PAGES, and that
+# page drains under its own header. This is that drain point: below the hero,
+# below the Display Fit panel, below the bell row - so the text reads as a
+# response to the press instead of as page chrome.
+#
+# Both guards are hasattr(): a module cached from before this build has no
+# _DEFER_PAGES, in which case it is still draining inside install() and a second
+# drain here would show the message twice - so the version check comes first. A
+# stale or broken audit_log degrades to "no flash", never to a dead page.
+if hasattr(audit_log, "_DEFER_PAGES") and hasattr(audit_log, "_render_flashes"):
+    try:
+        audit_log._render_flashes(str_lit)
+    except Exception:
+        pass
 
 # The thresholds are sampled here on every rerun, and again from the run
 # checkpoint (block 106) - the script does not rerun while a run works, so the
