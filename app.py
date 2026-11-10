@@ -1,4 +1,4 @@
-# @@FILE app.py blocks=111 version=v13.48
+# @@FILE app.py blocks=111 version=v13.76
 # @@BLOCK 000 FILE_HEADER deps=-
 """
 Mega Ultimate Mail Checker - v13.48  (BLOCK EDITION)
@@ -597,14 +597,11 @@ _rs_path = runstate.tick()
 
 # @@BLOCK 008 BUILD_IDENTITY deps=-
 # Bump CFG_VERSION whenever a DEFAULT changes in a way users should inherit.
-# v13.54: block 012's probe/proxy concurrency defaults were lowered, but
-# CFG_VERSION stays 1348 - verify_v1337.py pins the constant to the @@FILE header
-# version (v13.48) and a bump without also moving the header, BUILD_TAG and
-# status.py's own version goes red. The new numbers are applied by
-# SETTING_DEFAULTS on Reset Defaults, which is the path that actually assigns the
-# widget keys.
-CFG_VERSION = 1348
-BUILD_TAG = "v13.48"
+# v13.76: verify_v1337.py derives this constant from the @@FILE header line 1,
+# so the header, BUILD_TAG and pages/6_User_Guide.py block 001 move together or
+# the gate goes red on the header alone.
+CFG_VERSION = 1376
+BUILD_TAG = "v13.76"
 # @@END 008 BUILD_IDENTITY
 
 # @@BLOCK 009 TIMING_CONSTANTS deps=-
@@ -10557,14 +10554,29 @@ def _domains_in_text(text):
 # @@END 085 PREV_VALID_IO
 
 # @@BLOCK 086 PROCESS_ACCOUNTS deps=021,038,058,068,082,084,085
-def process_accounts(text, previous_valid):
+def process_accounts(text, previous_valid, progress=None):
     lines = []
     disp_list, typo_list, resume_list, app_skip_list, custom_list = [], [], [], [], []
     dns_fail_list, smtp_fail_list = [], []
     whitelist = CFG.get("CUSTOM_WHITELIST", [])
     blacklist = CFG.get("CUSTOM_BLACKLIST", [])
 
-    for line in text.splitlines():
+    # v13.76 FIX LOAD-1: the parse reports where it is. `progress(phase, done,
+    # total)` is optional, so both call sites keep working unchanged, and a
+    # callback that raises can never take the parse down with it.
+    def _tick(phase, done, total):
+        if progress is None:
+            return
+        try:
+            progress(phase, done, total)
+        except Exception:
+            pass
+
+    _src = text.splitlines()
+    _src_total = len(_src)
+    for _i, line in enumerate(_src, 1):
+        if _i == 1 or _i % 25 == 0 or _i == _src_total:
+            _tick("filter", _i, _src_total)
         line = line.strip().lstrip('\ufeff').strip('"').strip("'").strip()
         if not line or line.startswith("#") or ":" not in line:
             continue
@@ -10613,7 +10625,14 @@ def process_accounts(text, previous_valid):
     if CFG.get("SMTP_CHECK", False) and lines:
         domains = list(dict.fromkeys(l.split(":", 1)[0].split("@")[-1].lower()
                                      for l in lines if "@" in l))
-        results = smtp_precheck_domains(domains)
+        # v13.76: one opaque call meant the bar froze for the whole pre-check.
+        # Batched instead and the results merged; smtp_precheck_domains caches
+        # per domain either way, so a second pass over the same list is free.
+        results = {}
+        _dom_total = len(domains)
+        for _start in range(0, _dom_total, 25):
+            results.update(smtp_precheck_domains(domains[_start:_start + 25]))
+            _tick("smtp", min(_dom_total, _start + 25), _dom_total)
         keep = []
         for l in lines:
             d = l.split(":", 1)[0].split("@")[-1].lower()
@@ -10626,6 +10645,7 @@ def process_accounts(text, previous_valid):
         log_startup(f"SMTP pre-check: {len(results)} domain(s) probed, {dead} dead, "
                     f"{len(smtp_fail_list)} account(s) bucketed.")
 
+    _tick("dedupe", 0, 1)
     seen_email, clean = set(), []
     for line in lines:
         em = line.split(":", 1)[0].strip().lower()
@@ -10633,6 +10653,7 @@ def process_accounts(text, previous_valid):
             seen_email.add(em)
             clean.append(line)
 
+    _tick("dedupe", 1, 1)
     log_startup(
         f"Processed account input. Clean valid count ready: {len(clean)} "
         f"(Filtered DNS failures: {len(dns_fail_list)}, SMTP failures: {len(smtp_fail_list)})"
@@ -10813,11 +10834,18 @@ def _on_inspect_change():
 
 
 # ---- owner gate: a second unlock in this tab must not inherit the last one ----
+# v13.76 FIX ISO-8: _bb_prefilter_cache is NOT popped here before. The cached
+# data is derived from the previous owner's paste AND from the previous owner's
+# valid files, so the next unlock in the same tab rendered the last user's
+# Ready/Skip numbers. It is popped with the rest of the input state now, and the
+# fingerprint below carries the owner as well, so a stale entry can never be a
+# hit even if a future edit forgets the pop.
 _input_owner = _cache_owner()
 if str_lit.session_state.get(_INPUT_OWNER_KEY) != _input_owner:
     str_lit.session_state.pop("bb_raw_text", None)
     str_lit.session_state.pop("bb_inspect_cat", None)
     str_lit.session_state.pop("_paste_saved_sig", None)
+    str_lit.session_state.pop("_bb_prefilter_cache", None)
     str_lit.session_state[_INPUT_OWNER_KEY] = _input_owner
 if "bb_raw_text" not in str_lit.session_state:
     str_lit.session_state["bb_raw_text"] = _read_paste()
@@ -10852,10 +10880,13 @@ with input_tab2:
                 str_lit.warning("Uploaded file is empty.")
                 raw_text = ""
             else:
-                try:
-                    raw_text = file_bytes.decode("utf-8", errors="ignore")
-                except Exception:
-                    raw_text = file_bytes.decode("latin-1", errors="ignore")
+                # v13.76: decode under a spinner, so picking a big file answers
+                # before the prefilter bar below takes over.
+                with str_lit.spinner(f"Reading {uploaded_file.name}..."):
+                    try:
+                        raw_text = file_bytes.decode("utf-8", errors="ignore")
+                    except Exception:
+                        raw_text = file_bytes.decode("latin-1", errors="ignore")
                 # v13.63: the upload is written to the paste file too, so the
                 # numbers do not vanish on the next refresh. Guarded by a
                 # signature so a 3000-line file is not rewritten on every rerun.
@@ -10888,7 +10919,7 @@ if raw_text:
         len(raw_text), hash(raw_text), bool(skip_previous), len(previous_valid),
         tuple(CFG.get("CUSTOM_WHITELIST", [])), tuple(CFG.get("CUSTOM_BLACKLIST", [])),
         bool(CFG.get("FAST_MODE")), bool(CFG.get("SKIP_STRICT_APP_PROVIDERS")),
-        bool(CFG.get("SMTP_CHECK")),
+        bool(CFG.get("SMTP_CHECK")), _input_owner,
     )
     _pf_cache = str_lit.session_state.get("_bb_prefilter_cache") or {}
     _pf_data = _pf_cache.get("data") if _pf_cache.get("fp") == _pf_fp else None
@@ -10896,18 +10927,59 @@ if raw_text:
     # from the normalised text - the counts, the SMTP domain scan and the queue.
     _pf_text = _normalise_paste(raw_text)
     if _pf_data is None:
+        # v13.76 FIX LOAD-1: a 5 MB paste is ~160,000 lines and this prefilter is
+        # the slowest thing on the page, but it ran behind a blank screen - a long
+        # list looked like a dead app until the metrics finally appeared. The bar
+        # is drawn BEFORE the work, is driven from inside process_accounts, and
+        # covers the SMTP pre-check, which is the phase that really hangs. It is
+        # created on a cache MISS only, so a rerun that changes nothing is silent.
+        _pf_bar = str_lit.progress(0.0, text="0% - reading the paste...")
+        _pf_t0 = time.time()
+        _pf_throttle = {"t": 0.0}
+
+        def _pf_progress(_phase, _done, _total):
+            """phase, done, total -> one throttled bar update. Never raises.
+
+            Throttled to ~8 updates a second: 160,000 lines at a tick every 25
+            is 6,400 updates, which is more websocket traffic than the bar can
+            show. The element is a per-run local, so two users in two tabs each
+            drive their own bar and neither can repaint the other's.
+            """
+            try:
+                _now = time.time()
+                if _now - _pf_throttle["t"] < 0.12:
+                    return
+                _pf_throttle["t"] = _now
+                _frac = min(1.0, _done / max(1, _total))
+                if _phase == "smtp":
+                    _pct, _lbl = 0.90 + 0.09 * _frac, "SMTP pre-check"
+                elif _phase == "dedupe":
+                    _pct, _lbl = 0.85 + 0.05 * _frac, "de-duplicating"
+                else:
+                    _pct, _lbl = 0.85 * _frac, "filtering"
+                _pct = min(1.0, _pct)
+                _el = max(0.001, _now - _pf_t0)
+                _eta = int((_total - _done) / (_done / _el)) if _done else 0
+                _pf_bar.progress(
+                    _pct,
+                    text=f"{int(_pct * 100)}% - {_lbl} {_done}/{_total} "
+                         f"- about {max(0, _eta)}s left")
+            except Exception:
+                pass
+
         try:
             _pending_smtp = ([d for d in _domains_in_text(_pf_text) if not smtp_cached(d)]
                              if CFG.get("SMTP_CHECK", False) else [])
             if _pending_smtp:
-                with str_lit.spinner(f"🛰 SMTP reachability pre-check on "
-                                     f"{len(_pending_smtp)} new domain(s)..."):
-                    _pf_data = process_accounts(_pf_text, previous_valid)
-            else:
-                _pf_data = process_accounts(_pf_text, previous_valid)
+                _pf_progress("smtp", 0, len(_pending_smtp))
+            _pf_data = process_accounts(_pf_text, previous_valid,
+                                        progress=_pf_progress)
+            _pf_bar.progress(1.0, text=f"100% - {len(_pf_data[0])} account(s) ready "
+                                       f"in {time.time() - _pf_t0:.1f}s")
         except Exception as _pf_err:
             str_lit.exception(_pf_err)
             _pf_data = ([], [], [], [], [], [], [], [])
+            _pf_bar.empty()
         str_lit.session_state["_bb_prefilter_cache"] = {"fp": _pf_fp, "data": _pf_data}
     (clean_lines, disp, typo, resume, app_skip,
      custom_skipped, dns_skipped, smtp_skipped) = _pf_data
