@@ -152,6 +152,30 @@ if hasattr(audit_log, "page"):
     audit_log.page("pages/3_Mailbox_Reader.py")
 
 auth.require(st, "Unlock Mailbox Reader")
+
+# DISPLAY FIT MUST BE SEEDED BEFORE auth.fit() BUILDS ITS SLIDERS.
+# The full panel restore is in block 013 and cannot move here - it validates the
+# scope lists against mb_folders, which block 013 creates. But fit() runs right
+# below and creates the two sliders AND computes the CSS from their current
+# values, so a restore that lands afterwards is one run too late: you get factory
+# size on the first render after a reload, with the restored number sitting in a
+# slider that has not taken effect yet. Read only those two ints, only from the
+# owner's own file, only when the key is still missing.
+try:
+    _fit_path = user_file("reader_ui.json")
+    if os.path.exists(_fit_path):
+        with open(_fit_path, "r", encoding="utf-8") as _fit_f:
+            _fit_settings = (json.load(_fit_f) or {}).get("settings") or {}
+        if isinstance(_fit_settings, dict):
+            for _fk, _flo, _fhi in (("ui_font_size", 12, 22), ("ui_content_scale", 80, 140)):
+                if _fk not in st.session_state and _fk in _fit_settings:
+                    try:
+                        st.session_state[_fk] = max(_flo, min(_fhi, int(_fit_settings[_fk])))
+                    except (TypeError, ValueError):
+                        pass
+except Exception:
+    pass
+
 auth.fit(st)                        # CSS only, before the first widget
 
 if hasattr(audit_log, "install"):
@@ -820,6 +844,7 @@ def save_session_cache():
             "otp_current_page": st.session_state.get("otp_current_page", 1),
             "bot_current_page": st.session_state.get("bot_current_page", 1),
             "bot_filter_mode": st.session_state.get("bot_filter_mode", False),
+            "bot_filter_view": st.session_state.get("bot_filter_view", "All"),
             "total_matched_count": st.session_state.get("total_matched_count", 0),
             "search_total_matched_count": st.session_state.get("search_total_matched_count", 0),
             "otp_total_matched_count": st.session_state.get("otp_total_matched_count", 0),
@@ -902,10 +927,10 @@ _UI_BODY_PREFIXES = ("body_", "otp_b_", "s_body_")
 
 _UI_FLAGS = ("mv_remote", "hub_otp_open", "hub_search_open", "hub_bot_open",
              "otp_clean_toggle", "otp_regex_chk", "otp_all_folders",
-             "deep_all_folders", "bot_filter_mode")
+             "deep_all_folders", "bot_filter_mode", "reader_use_proxy")
 
 _UI_TEXT = ("otp_custom_kw", "otp_blacklist_kw", "deep_search_query",
-            "deep_search_blacklist_kw", "folder_sel", "mv_view")
+            "deep_search_blacklist_kw", "folder_sel", "mv_view", "bot_filter_view")
 
 _UI_PICK = ("otp_search_field", "deep_search_field", "sort_order_sel")
 
@@ -921,6 +946,15 @@ _UI_NUMS = {
 }
 
 _UI_LISTS = ("otp_scan_scope", "deep_search_scope", "bot_hub_folder_select")
+
+# otp_category_select is a LIST but not of folders, so _ui_list() cannot validate
+# it against _ui_folder_options() - every category name would be filtered out and
+# the selection lost. It gets its own option tuple and its own restore.
+_UI_CATS = ("All Security Categories", "Debit Card & Credit Card Details",
+            "Bank Debit Alert & Online Debit", "Order Tracking & Purchase Confirmation",
+            "OTP Message & Verification", "Telegram Alerts & Blacklist",
+            "Password / Reset Code", "Gift Cards", "ID Cards / Credentials",
+            "Application Passwords", "Login Info / Info")
 
 # `owner` is the unlocked hash. The writer, the valid-list cache and the ZIP
 # cache are all process values, so they must be reset when a DIFFERENT user's run
@@ -997,9 +1031,9 @@ def _reader_ui_restore() -> None:
     must win, or every slider snaps back to whatever was on disk when the run
     started and the control can never move. So the file is read on the first run
     only, and even then a key that a widget already owns this run has to be
-    FORCED: bot_filter_mode is initialised in block 013, and the Display Fit pair
-    is written by auth.fit() in block 001 - a plain "only seed missing keys"
-    restore can never reach any of them.
+    FORCED: bot_filter_mode and reader_use_proxy are initialised in block 013, and
+    the Display Fit pair is written by auth.fit() in block 001 - a plain "only
+    seed missing keys" restore can never reach any of them.
     """
     if st.session_state.get("_ui_restored"):
         return
@@ -1012,6 +1046,8 @@ def _reader_ui_restore() -> None:
         # ---- keys a widget already owns this run: FORCE -------------------
         if "bot_filter_mode" in settings:
             st.session_state["bot_filter_mode"] = _ui_bool(settings.get("bot_filter_mode"), False)
+        if "reader_use_proxy" in settings:
+            st.session_state["reader_use_proxy"] = _ui_bool(settings.get("reader_use_proxy"), False)
         for k in ("ui_font_size", "ui_content_scale"):
             if k in settings:
                 lo, hi, dflt = _UI_NUMS[k]
@@ -1029,6 +1065,11 @@ def _reader_ui_restore() -> None:
         for k in _UI_LISTS:
             if k in settings and k not in st.session_state:
                 st.session_state[k] = _ui_list(settings.get(k), _ui_folder_options(), ["INBOX"])
+        if "otp_category_select" in settings and "otp_category_select" not in st.session_state:
+            _cats = settings.get("otp_category_select")
+            _cats = _cats if isinstance(_cats, list) else []
+            _cats = [c for c in _cats if isinstance(c, str) and c in _UI_CATS]
+            st.session_state["otp_category_select"] = _cats or ["All Security Categories"]
 
     scope = data.get("scope") or ""
     bodies = data.get("bodies")
@@ -1062,6 +1103,9 @@ def _reader_ui_snapshot() -> dict:
         v = st.session_state.get(k)
         if isinstance(v, list):
             out[k] = [x for x in v if isinstance(x, str)]
+    _cat_sel = st.session_state.get("otp_category_select")
+    if isinstance(_cat_sel, list):
+        out["otp_category_select"] = [c for c in _cat_sel if isinstance(c, str)]
     return out
 
 
@@ -3674,7 +3718,10 @@ if st.sidebar.button("🔄 Refresh Inbox", type="secondary", width="stretch"):
                     page_size=15, page_number=1, sort_order="Newest First", log_target="DEBUG"
                 )
                 st.session_state.current_page = 1
+                # both halves of the filter move together, or the radio keeps
+                # showing a mode the boolean no longer agrees with.
                 st.session_state.bot_filter_mode = False
+                st.session_state["bot_filter_view"] = "All"
                 save_session_cache()
                 flash("Inbox refreshed successfully.")
                 st.rerun()
@@ -3886,26 +3933,38 @@ def _render_body(key: str, msg: dict) -> None:
 
 
 # Main Message Stream
-# THE STREAM DOES NOT FILTER. It is the main stream - everything loaded is shown.
-# The bot filter is an opt-in checkbox, default OFF, and a bot scan no longer
-# forces it on.
-bot_only = st.checkbox(
-    "Show only detected bot / OTP / Telegram messages", key="bot_filter_mode",
-    help="Off = every loaded message. On = only rows already classified as bot "
-         "traffic. Nothing is removed from the mailbox either way.")
+# THE STREAM DOES NOT FILTER. It is the main stream - everything loaded is shown
+# unless the filter below says otherwise. Three states, not two: a bare "only
+# bots" checkbox could not express "show me real mail and hide the noise", which
+# is the common case once a scan has loaded a mailbox full of OTP rows.
+# bot_filter_mode is kept as a derived boolean for anything still reading it, and
+# a stored True from before this change migrates to "Only bots".
+_BOT_FILTER_VIEWS = ["All", "Only bots", "Hide bots"]
+if st.session_state.get("bot_filter_view") not in _BOT_FILTER_VIEWS:
+    st.session_state["bot_filter_view"] = "Only bots" if st.session_state.get("bot_filter_mode") else "All"
+_bot_view = st.radio(
+    "Stream filter", _BOT_FILTER_VIEWS, horizontal=True, key="bot_filter_view",
+    help="All = every loaded row. Only bots = just the rows already classified as "
+         "bot / OTP / Telegram. Hide bots = those rows removed. Nothing is deleted "
+         "from the mailbox in any mode.")
+st.session_state["bot_filter_mode"] = (_bot_view == "Only bots")
 
-if bot_only:
+if _bot_view == "Only bots":
     active_msgs = [m for m in st.session_state.current_messages if m.get("is_bot")]
-    st.info("🤖 Stream filtered to detected bot / Telegram / blacklist rows. Untick the box for everything.")
+    st.info("🤖 Stream filtered to detected bot / Telegram / blacklist rows. Set the filter to All for everything.")
+elif _bot_view == "Hide bots":
+    active_msgs = [m for m in st.session_state.current_messages if not m.get("is_bot")]
+    st.info("🧹 Bot / OTP / Telegram rows hidden. Set the filter to All to bring them back.")
 else:
     active_msgs = st.session_state.current_messages
 
 page_size = max(5, min(200, int(st.session_state.get("stream_page_size") or page_size)))
 total_msgs = st.session_state.total_matched_count or len(active_msgs)
 
-if bot_only:
-    st.caption(f"🤖 {sum(1 for m in active_msgs if m.get('is_bot'))} bot row(s) on this page of "
-               f"{len(active_msgs)} loaded. Filtering is per page, so a page can look short.")
+if _bot_view != "All":
+    _bots_loaded = sum(1 for m in st.session_state.current_messages if m.get("is_bot"))
+    st.caption(f"🤖 {_bots_loaded} bot row(s) among {len(st.session_state.current_messages)} loaded. "
+               "Filtering is per page, so a page can look short.")
 
 if len(active_msgs) > 0 or total_msgs > 0:
     st.markdown("---")
@@ -3917,7 +3976,7 @@ if len(active_msgs) > 0 or total_msgs > 0:
     with st.expander(f"✉️ Main Message Stream — Page {curr_p} of {total_pages} ({total_msgs} Total Matches)", expanded=False):
         st.markdown(f"**Showing Page {curr_p} of {total_pages} (Total Server Matches: {total_msgs})**")
         if not active_msgs:
-            st.caption("This page is empty - it failed to fetch, or the bot filter removed every row. Use Next / Previous.")
+            st.caption("This page is empty - it failed to fetch, or the stream filter removed every row. Use Next / Previous.")
 
         # truthy, not "is not None": stream_page_rows is 0 in a restored session
         # that never fetched, and 0 != total would caption a false shortfall.
@@ -4530,10 +4589,10 @@ if hub_bot_open:
                         st.session_state.current_messages = msgs
                         st.session_state.bot_current_page = 1
                         # the scan no longer FORCES the stream into bot filter mode;
-                        # the stream stays complete unless you tick it.
+                        # the stream stays complete unless the filter says otherwise.
                         st.session_state["_pending_page_size"] = bot_scan_limit
                         save_session_cache()
-                        flash("Scan complete. The stream holds every row; tick the filter box to narrow it to bots.")
+                        flash("Scan complete. The stream holds every row; set the stream filter to Only bots to narrow it.")
                         st.rerun()
                 except Exception as ex:
                     st.error(str(ex))
