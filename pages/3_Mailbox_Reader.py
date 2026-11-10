@@ -363,18 +363,20 @@ def default_theme() -> dict:
     }
 
 def _theme_candidates() -> List[str]:
-    """The owner's file first, then the two legacy bare paths."""
-    cands = [THEME_FILE, os.path.join(APP_DIR, "theme.json"), os.path.abspath("theme.json")]
-    out, seen = [], set()
-    for c in cands:
-        try:
-            ap = os.path.abspath(c)
-        except Exception:
-            continue
-        if ap not in seen:
-            seen.add(ap)
-            out.append(c)
-    return out
+    """The owner's file ONLY.
+
+    v13.65 added the two legacy bare paths as a fallback, and on a deployment
+    that still has the committed repo-root theme.json they are not legacy at all
+    - they are a SECOND source. `theme.json` is in the repo, so every brand-new
+    user's reader painted the repo's committed palette instead of their own
+    defaults, and the checker (whose load_theme reads only THEME_FILE) painted
+    the defaults over the top. The two pages disagreed on first load and the
+    reader looked like it was ignoring the theme.
+
+    Reads and writes now agree on one path, which is also the only path
+    save_theme() ever wrote.
+    """
+    return [THEME_FILE]
 
 def load_theme() -> dict:
     """The owner's theme when it parses, else the defaults."""
@@ -829,7 +831,14 @@ with st.sidebar.expander("🎨 Theme (synced with checker)", expanded=False):
         save_theme(THEME)
         st.rerun()
 
-    st.caption("Saved to theme.json — the main checker picks it up automatically.")
+    # FIX THEME-1 (v13.75): "Saved to theme.json" was true at v13.61 and stale
+    # from v13.65 - the file is <hash>_theme.json, one per user. The caption now
+    # names the thing it actually writes, and says what that means: the change is
+    # YOURS, it is already on disk, and the checker reads the same file on its
+    # next load, so there is nothing to press over there.
+    st.caption("Saved to **your own** theme file (`<your passkey>_theme.json`), which "
+               "the main checker reads on its next load - the change is already live "
+               "there, nothing to press on that page.")
 # @@END 011 SIDEBAR_THEME
 
 
