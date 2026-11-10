@@ -46,6 +46,16 @@ flash() closes the press NOW and queues the message for the top of the next run,
 so a confirmation is both recorded and still visible after the st.rerun() that
 used to wipe it. Pages use flash() instead of a bare st.success() + st.rerun().
 
+FIX FLASH-4 - "THE TOP OF THE NEXT RUN" WAS THE TOP OF THE PAGE
+--------------------------------------------------------------
+install() drained the queue as its LAST statement, and install() runs BEFORE
+require() - so on app.py the flashed text painted ABOVE the hero header, over the
+very title it was confirming. A page that owns a header now drains the queue
+itself, directly under that header, and registers its name in _DEFER_PAGES.
+install() skips the drain for those pages and nothing else changes: a page that
+is not listed still drains in install() exactly as before. app.py block 057 is
+the drain point, immediately after the bell row - see the note there.
+
 WHAT IS AND IS NOT VISIBLE
 --------------------------
 st.expander / st.tabs / st.popover are drawn by the browser. Opening one does
@@ -103,6 +113,10 @@ _MISSING = object()
 BURST_SECONDS = 1.5
 # How many deferred messages one run may queue for the next.
 FLASH_MAX = 8
+# FIX FLASH-4: pages that drain the flash queue THEMSELVES, under their own
+# header. install() skips the drain for these. Exact page names, as passed to
+# page() / install().
+_DEFER_PAGES = frozenset({"app.py"})
 
 # Passphrase boxes: the value is masked, so the detail would be useless.
 _SKIP_KEYS = frozenset({"au_p1", "au_p2", "au_p3", "au_c1", "au_c2", "au_lbl"})
@@ -277,6 +291,11 @@ def _render_flashes(st) -> None:
 
     Rendering them here means the wrapped message functions see them, so the
     entry they belong to is closed on the run that shows the text.
+
+    FIX FLASH-4: install() calls this only for a page that is NOT in
+    _DEFER_PAGES. A deferred page calls it itself, under its own header, so the
+    text lands below the title instead of above it. It is idempotent - the queue
+    is POPPED - so a second call on the same run shows nothing.
     """
     try:
         q = st.session_state.pop(_FLASH, None)
@@ -513,7 +532,11 @@ def install(st, page_: str) -> None:
                 setattr(target, _ATTR, True)
             except Exception:
                 pass
-        _render_flashes(st)
+        # FIX FLASH-4: a page listed in _DEFER_PAGES drains the queue itself,
+        # under its own header, so the message does not paint above the title.
+        # Every other page keeps the old drain-in-install behaviour unchanged.
+        if page_ not in _DEFER_PAGES:
+            _render_flashes(st)
     except Exception:
         pass
 
@@ -712,6 +735,25 @@ def selftest() -> int:
               any(e["label"] == "Flash press" and e["outcome"] == "OK"
                   for e in entries()))
         check("the flash queue is drained", not st.session_state.get("_audit_flash"))
+
+        # FIX FLASH-4 regression pair: a DEFERRED page (app.py) must NOT be
+        # drained by install(), and its own drain must still close the press.
+        install(st, "app.py")
+        st.button("Deferred press")
+        flash(st, "OK", "deferred by flash")
+        st.rerun()
+        install(st, "app.py")
+        check("a deferred page is NOT drained by install()",
+              bool(st.session_state.get("_audit_flash")))
+        check("the deferred press is not closed as NO RESULT before its drain",
+              not any(e["label"] == "Deferred press" and e["outcome"] == "NO RESULT"
+                      for e in entries()))
+        _render_flashes(st)
+        check("the page drain empties the queue",
+              not st.session_state.get("_audit_flash"))
+        check("the deferred message still records the press as OK",
+              any(e["label"] == "Deferred press" and e["outcome"] == "OK"
+                  for e in entries()))
 
         page("q.py")
         check("a page visit is recorded",
