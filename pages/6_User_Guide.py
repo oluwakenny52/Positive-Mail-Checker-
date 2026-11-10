@@ -42,8 +42,8 @@ if APP_DIR not in sys.path:
     sys.path.insert(0, APP_DIR)
 
 # Mirrors app.py block 008. Keep the two identical - verify_v1337.py enforces it.
-BUILD_TAG = "v13.48"
-CFG_VERSION = 1348
+BUILD_TAG = "v13.76"
+CFG_VERSION = 1376
 # @@END 001 SYSPATH_AND_BUILD
 
 # @@BLOCK 002 PAGE_CONFIG deps=001
