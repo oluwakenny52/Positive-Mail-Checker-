@@ -460,6 +460,62 @@ def theme_css(th: dict) -> str:
     hr {{ border-color: {border} !important; }}
     a {{ color: {ac2} !important; }}
 
+    /* ---- TEXT AUTHORITY ---------------------------------------------------
+       Streamlit's generated rules beat bare element selectors: a class always
+       outranks `p`, `label` and `span`, so captions, widget labels, radio text
+       and alert bodies kept the base theme's colour while everything that
+       merely inherited looked right. That is the dark-on-dark you see on every
+       caption and every label.
+
+       Drive the variables Streamlit reads, then the containers themselves, and
+       keep the .bb-hero rules BELOW this section so the white-on-gradient still
+       wins the specificity tie. */
+    .stApp, [data-testid="stAppViewContainer"], [data-testid="stMain"] {{
+        --text-color: {text} !important;
+        --background-color: {bg} !important;
+        --secondary-background-color: {panel} !important;
+        --primary-color: {ac} !important;
+    }}
+    [data-testid="stCaptionContainer"],
+    [data-testid="stCaptionContainer"] p,
+    [data-testid="stWidgetLabel"],
+    [data-testid="stWidgetLabel"] p,
+    [data-testid="stWidgetLabel"] label,
+    [data-testid="stMarkdownContainer"] p,
+    [data-testid="stMarkdownContainer"] li,
+    [data-testid="stMarkdownContainer"] span,
+    [data-testid="stAlertContainer"] p,
+    [data-testid="stAlertContainer"] div,
+    [data-testid="stAlertContainer"] span,
+    .stRadio [data-baseweb="radio"] div,
+    .stRadio label,
+    .stCheckbox label,
+    .stToggle label,
+    .stSelectbox label,
+    .stMultiSelect label,
+    .stSlider [data-testid="stTickBar"],
+    .stSlider [data-testid="stThumbValue"],
+    .stTextInput label,
+    .stTextArea label,
+    .stNumberInput label {{
+        color: {text} !important;
+    }}
+    /* captions stay a touch quieter than body text without going grey-dark */
+    [data-testid="stCaptionContainer"] p {{ opacity: .80; }}
+
+    /* the header carried the light theme's icons: dark on dark. Give it the page
+       colour and let its own buttons follow. */
+    [data-testid="stHeader"], [data-testid="stToolbar"] {{
+        background: {bg} !important;
+        color: {text} !important;
+    }}
+    [data-testid="stHeader"] *, [data-testid="stToolbar"] * {{ color: {text} !important; }}
+    [data-testid="stToolbar"] button, [data-testid="stAppDeployButton"] {{
+        background: {panel} !important; color: {text} !important;
+        border: 1px solid {border} !important;
+    }}
+    /* ---- END TEXT AUTHORITY ---- */
+
     .stButton > button, .stDownloadButton > button, .stFormSubmitButton > button {{
         background: {panel} !important; color: {text} !important;
         border: 1px solid {border} !important; border-radius: {r}px !important;
@@ -475,6 +531,9 @@ def theme_css(th: dict) -> str:
         box-shadow: 0 8px 22px {g1}66;
     }}
     .stButton > button[kind="primary"]:hover {{ filter: brightness(1.08); }}
+    /* a primary button's own label must not be recoloured by the header rule */
+    .stButton > button[kind="primary"] *,
+    .stDownloadButton > button[kind="primary"] * {{ color: #fff !important; }}
 
     [data-testid="stMetric"] {{
         background: {panel} !important; border: 1px solid {border};
@@ -526,7 +585,7 @@ def theme_css(th: dict) -> str:
     .bb-hero h1 {{ color: #fff !important; margin: 0; font-size: 1.85rem; font-weight: 800; }}
     .bb-hero p {{ color: rgba(255,255,255,.94) !important; margin: 8px 0 0 0; font-size: .93rem; }}
     .bb-hero .bb-tags {{ margin-top: 12px; }}
-    .bb-tag {{
+    .bb-hero .bb-tag {{
         display: inline-block; padding: 3px 11px; margin: 0 6px 6px 0;
         border-radius: 999px; font-size: .72rem; font-weight: 700;
         background: rgba(255,255,255,.20); color: #fff !important;
@@ -581,7 +640,7 @@ def theme_css(th: dict) -> str:
         .bb-hero {{ padding: 14px 16px; border-radius: 12px; margin-bottom: 10px; }}
         .bb-hero h1 {{ font-size: 1.18rem; line-height: 1.25; }}
         .bb-hero p {{ font-size: .76rem; line-height: 1.35; }}
-        .bb-tag {{ font-size: .61rem; padding: 2px 8px; margin: 0 4px 4px 0; }}
+        .bb-hero .bb-tag {{ font-size: .61rem; padding: 2px 8px; margin: 0 4px 4px 0; }}
         .bb-section {{ margin: 14px 0 8px 0; padding: 8px 12px; gap: 8px; }}
         .bb-section .bb-t {{ font-size: .9rem; }}
         .bb-section .bb-s {{ display: block; margin: 2px 0 0 0; font-size: .67rem; }}
