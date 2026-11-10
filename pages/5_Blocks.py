@@ -1,4 +1,4 @@
-# @@FILE pages/5_Blocks.py blocks=12 version=v13.47
+# @@FILE pages/5_Blocks.py blocks=12 version=v13.76
 # @@BLOCK 000 FILE_HEADER deps=-
 """
 pages/5_Blocks.py - Block Inspector  (v13.47)
@@ -470,6 +470,17 @@ with st.expander("🛠 Canonicalise @@END names (no terminal needed)", expanded=
 # the drain guard) are ORDER pairs, because the bug was the drain's POSITION, not
 # its existence: a needle for the call alone would pass with it back inside
 # install().
+#
+# v13.76: FIX LOAD-1 GETS THREE ROWS. The paste prefilter is now driven by a
+# progress callback, and the value of it is entirely in the WIRING - a bar that
+# is drawn but never fed, or a callback the parse ignores, looks identical on
+# screen for the first second and is useless on a 160,000-line paste. The
+# signature, the builder and the call site are gated separately for that reason.
+#
+# v13.76: THE success_read ROW IS UNQUOTED. It was written as a quoted literal,
+# but count() runs against app.py, where that statement carries no quote marks
+# around it - so the quoted needle could only ever read 0. The literal lives in
+# THIS file, so an unquoted needle cannot inflate its own count.
 _FIX_CHECKS = (
     ("status.py", "_PROXY_BLOCKED", 2, "proxy-blocked classifies as CONNECTION_FAILED"),
     ("status.py", "best = None", 1, "worse_of no longer seeds with UNKNOWN"),
@@ -558,6 +569,17 @@ _FIX_CHECKS = (
     ("app.py", '_MAILTO_RE = re.compile(r"^mailto:\\s*", re.IGNORECASE)', 1,
      "mailto: prefixes are stripped"),
     ("app.py", 'if "|" in s:', 1, "a re-pasted bucket line is cut at the pipe"),
+    # ---- v13.76 FIX LOAD-1: the parse must be reachable, fed and wired ----
+    ("app.py", "def process_accounts(text, previous_valid, progress=None):", 1,
+     "the parse accepts a progress callback"),
+    ("app.py", "def _pf_progress(", 1,
+     "the paste prefilter draws a live 0-100% bar"),
+    ("app.py", "progress=_pf_progress)", 1,
+     "the bar is wired into the parse, not merely drawn"),
+    ("app.py", "fetched_msgs, success_read = msgs, True", 1,
+     "the mailbox fetch binds success_read with the list"),
+    ("app.py", "if success_read and fetched_msgs:", 1,
+     "the fetch branch tests success_read, not the stale ok_read"),
     ("app.py", "limit=limit, page=page, info=_info)", 1, "the reader passes a page"),
     ("app.py", 'key="bb_reader_next"', 1, "the reader has forward paging"),
     ("app.py", 'key="bb_reader_prev"', 1, "the reader has back paging"),
