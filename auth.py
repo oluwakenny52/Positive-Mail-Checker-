@@ -254,7 +254,7 @@ def _enter(st, key, why="Unlocked"):
 
 
 def _key_rows():
-    """(label, hash, created, phrase) for every stored key, oldest first."""
+    """(label, hash, created, phrase, admin) for every stored key, oldest first."""
     rows = []
     for k in (_load().get("keys") or []):
         if not isinstance(k, dict):
@@ -272,6 +272,29 @@ def _when(ts):
         return time.strftime("%Y-%m-%d %H:%M", time.localtime(ts)) if ts else "?"
     except Exception:
         return "?"
+
+
+def is_admin():
+    """True when the UNLOCKED key carries the admin bit.
+
+    v13.76 FIX ADMIN-1: the bit was only ever read from session_state and only
+    ever written by _enter() on unlock - so it survived exactly the one session
+    in which require() short-circuits and the panel could not be drawn. It is
+    DERIVED from the stored record for the current hash now, so it survives a
+    refresh, and a second unlock can never inherit it.
+    """
+    try:
+        import streamlit as st
+        cur = str(st.session_state.get("user_key_hash") or "")
+    except Exception:
+        return False
+    if not cur:
+        return False
+    with _key_lock:
+        for k in (_load().get("keys") or []):
+            if isinstance(k, dict) and str(k.get("hash", "")) == cur:
+                return bool(k.get("admin"))
+    return False
 
 
 def require(st, title="Unlock Positive Mail-Checker"):
@@ -328,58 +351,14 @@ def require(st, title="Unlock Positive Mail-Checker"):
                     _enter(st, {"hash": h, "admin": False}, "Passkey created")
                     st.rerun()
 
-        # ---- ADMIN ONLY from here down ----
-        # v13.75: THE FORGET EXPANDER WAS OPEN TO EVERYBODY. Any user could
-        # remove any key, including the admin's, and nothing showed who held
-        # which key. It is admin-gated now and the table lists every key.
-        if st.session_state.get("is_admin"):
-            with st.expander("Manage passkeys (admin)"):
-                st.caption("Removing a key removes that person's access. Their files "
-                           "stay on disk and reopen if the key is re-created with the "
-                           "same phrase.")
-                rows = _key_rows()
-                pick = {}
-                for label, h, created, phrase, is_admin in rows:
-                    pick["%s%s · %s · %s" % (label, " (admin)" if is_admin else "",
-                                             h[:8], _when(created))] = h
-                st.dataframe(
-                    [{"Label": lb, "Admin": "yes" if ad else "",
-                      "Hash": h[:12], "Created": _when(cr),
-                      "Passphrase": ph or "(not stored - re-create this key)"}
-                     for lb, h, cr, ph, ad in rows],
-                    width="stretch", hide_index=True,
-                )
-                if pick:
-                    choice = st.selectbox("Which passkey", list(pick))
-                    if st.button("Forget selected passkey", key="au_forget_one"):
-                        gone = pick.get(choice, "")
-                        forget_current(gone)
-                        st.session_state.pop("user_key_hash", None)
-                        st.session_state.pop("is_admin", None)
-                        # v13.64: the forgotten key's per-user tables live in
-                        # app.py's process STATE and used to survive for the life
-                        # of the process - pool, quarantine, scores and its
-                        # alive-pool thread. app.py block 039 drops them; this is
-                        # the only place that knows WHICH key.
-                        st.session_state["_forgotten_hash"] = gone
-                        _flash(st, "OK", "Passkey forgotten. Its files stay on disk.")
-                        st.rerun()
-                    st.caption("Or remove every key, for everyone.")
-                    if st.button("Forget all passkeys", key="au_forget_all"):
-                        # v13.51: user_key_hash is ALWAYS "" on this branch, so the
-                        # old read handed app.py block 039 an empty hash and it
-                        # dropped no tables at all. Keep the selected key instead.
-                        gone = pick.get(choice, "")
-                        forget_all()
-                        st.session_state["_forgotten_hash"] = gone
-                        st.session_state.pop("user_key_hash", None)
-                        st.session_state.pop("is_admin", None)
-                        _flash(st, "WARN", "Every passkey was removed. Nothing unlocks "
-                                           "now until a new one is created.")
-                        st.rerun()
-        else:
-            st.caption("Passkey management is the admin's. The first passphrase "
-                       "created on a device is its admin.")
+        # v13.76 FIX ADMIN-1: the manager is NOT here any more. It lived below
+        # this point, inside `if known:`, gated on session_state["is_admin"] -
+        # and require() returns before any of it once the session is unlocked,
+        # while is_admin is only set by the unlock that is followed by a rerun.
+        # It is admin_panel() now and the caller draws it AFTER the gate.
+        st.caption("Passkey management (including Forget) is on the page once you "
+                   "are unlocked - the first passphrase created on a device is its "
+                   "admin.")
         st.stop()
 
     st.caption("No passkey yet - create one. It is asked once per session. This one "
@@ -403,6 +382,76 @@ def require(st, title="Unlock Positive Mail-Checker"):
             _enter(st, {"hash": h, "admin": True}, "Passkey created as admin")
             st.rerun()
     st.stop()
+
+
+def admin_panel(st):
+    """The admin keyring: every passphrase, and both Forget buttons.
+
+    Draw it AFTER the gate, from a page that has already called require() and
+    fit(). Returns immediately for a non-admin, so a normal user sees nothing.
+
+    v13.76 FIX ADMIN-1: reachable for the first time. The gate is is_admin(),
+    which reads the stored record for the CURRENT hash - not a session flag that
+    the next rerun outlives.
+
+    v13.76 FIX ADMIN-2: THE CAPTION WAS WRONG. It promised that files reopen if a
+    key is re-created with the same phrase. add_key() mints a fresh random salt
+    every time, so the same phrase yields a DIFFERENT hash and therefore a
+    different user_file() prefix - the old <hash>_* files stay on disk and the
+    new key cannot see a single one. The caption says so now, and the Forget
+    action reports the prefix it is about to orphan.
+    """
+    if not is_admin():
+        return
+    with st.expander("🔑 Manage passkeys (admin)", expanded=False):
+        st.caption("Every key on this device, with its phrase in clear - passkey.json "
+                   "is a keyring, not a secret, so whoever holds that file holds every "
+                   "phrase. Removing a key removes that person's ACCESS. Their files "
+                   "stay on disk but are ORPHANED: re-creating the same phrase mints a "
+                   "new random salt, so it gets a different hash and a different file "
+                   "prefix and cannot reach the old files.")
+        rows = _key_rows()
+        pick = {}
+        for label, h, created, phrase, is_admin_ in rows:
+            pick["%s%s · %s · %s" % (label, " (admin)" if is_admin_ else "",
+                                     h[:8], _when(created))] = h
+        st.dataframe(
+            [{"Label": lb, "Admin": "yes" if ad else "",
+              "Hash": h[:12], "Prefix": "%s_" % h, "Created": _when(cr),
+              "Passphrase": ph or "(not stored - re-create this key)"}
+             for lb, h, cr, ph, ad in rows],
+            width="stretch", hide_index=True,
+        )
+        if pick:
+            choice = st.selectbox("Which passkey", list(pick))
+            if st.button("Forget selected passkey", key="au_forget_one"):
+                gone = pick.get(choice, "")
+                forget_current(gone)
+                st.session_state.pop("user_key_hash", None)
+                st.session_state.pop("is_admin", None)
+                # v13.64: the forgotten key's per-user tables live in app.py's
+                # process STATE and used to survive for the life of the process -
+                # pool, quarantine, scores and its alive-pool thread. app.py block
+                # 039 drops them; this is the only place that knows WHICH key.
+                st.session_state["_forgotten_hash"] = gone
+                _flash(st, "OK", "Passkey forgotten. Its files stay on disk under the "
+                                 "prefix %s_ and are orphaned until a key with that "
+                                 "exact hash exists again." % gone)
+                st.rerun()
+            st.caption("Or remove every key, for everyone.")
+            if st.button("Forget all passkeys", key="au_forget_all"):
+                # v13.51: user_key_hash is ALWAYS "" on this branch, so the old
+                # read handed app.py block 039 an empty hash and it dropped no
+                # tables at all. Keep the selected key instead.
+                gone = pick.get(choice, "")
+                forget_all()
+                st.session_state["_forgotten_hash"] = gone
+                st.session_state.pop("user_key_hash", None)
+                st.session_state.pop("is_admin", None)
+                _flash(st, "WARN", "Every passkey was removed. Nothing unlocks now "
+                                   "until a new one is created - and the new key gets "
+                                   "a new prefix, so every existing file is orphaned.")
+                st.rerun()
 # @@END 002 GATE
 
 
