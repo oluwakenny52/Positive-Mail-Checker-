@@ -24,6 +24,11 @@ CHANGES IN THIS REVISION
 * CAPS RAISED. _MAX_RAW 700 KB -> 8 MB, _MAX_MARKUP 400 KB -> 4 MB. Truncation is
   the exception now, and when it happens it says so.
 * ATTACHMENTS CACHED. The part walk ran twice per render (paint + list).
+* UNKNOWN KEYWORDS TOLERATED. render()/render_auto() swallow **kw. A page left in
+  sys.modules from before a push can pass a keyword this module does not have; it
+  used to be a TypeError that took the whole row down. The page reloads a stale
+  mailview itself, so this is the reverse case only - an old page against a new
+  module - and it is one line of insurance rather than a second code path.
 
 __version__ STAYS "v13.55" ON PURPOSE. app.py block 109 captions a mismatch with
 "update it to v13.55"; bumping the constant would print that caption on every
@@ -278,8 +283,12 @@ def _text_area(st, raw, key, ns=""):
     _render_attachments(st, raw, key, ns)
 
 
-def render(st, raw, key, fallback="", allow_remote=False, view=None, ns=""):
-    """Text/HTML render from an already-complete raw message."""
+def render(st, raw, key, fallback="", allow_remote=False, view=None, ns="", **kw):
+    """Text/HTML render from an already-complete raw message.
+
+    **kw absorbs a keyword this revision does not know, so a caller left over
+    from before a push cannot take the row down with a TypeError.
+    """
     text, markup = split_message(raw)
     _seed(st, key, text.strip() or fallback)
     mode = view or _mode(st, key)
@@ -292,12 +301,12 @@ def render(st, raw, key, fallback="", allow_remote=False, view=None, ns=""):
     _text_area(st, raw, key, ns)
 
 
-def render_auto(st, msg, key, mail_getter, allow_remote=False, view=None, ns=""):
+def render_auto(st, msg, key, mail_getter, allow_remote=False, view=None, ns="", **kw):
     """Same, but completes a cut copy from the server (once) and prefers HTML.
 
     `mail_getter` is a zero-arg callable returning an open mailbox. It is only
     called for a message whose stored copy is cut, and the result is cached, so a
-    rerun does not dial the server again.
+    rerun does not dial the server again. **kw as in render().
     """
     raw = msg.get("raw") or b""
     uid = msg.get("id")
