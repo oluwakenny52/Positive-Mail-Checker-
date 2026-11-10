@@ -481,6 +481,12 @@ with st.expander("🛠 Canonicalise @@END names (no terminal needed)", expanded=
 # but count() runs against app.py, where that statement carries no quote marks
 # around it - so the quoted needle could only ever read 0. The literal lives in
 # THIS file, so an unquoted needle cannot inflate its own count.
+#
+# v13.76 COMBO-2: the word-break row wants ONE now, not two. The renderer no
+# longer draws the dimmed detail line under the combo, so the second
+# `word-break:break-all;` went with it. The row is re-worded to match, and the
+# combo-only contract is gated on the three shapes that actually hold it: the
+# helper, the checkbox callback and the stripped return.
 _FIX_CHECKS = (
     ("status.py", "_PROXY_BLOCKED", 2, "proxy-blocked classifies as CONNECTION_FAILED"),
     ("status.py", "best = None", 1, "worse_of no longer seeds with UNKNOWN"),
@@ -553,8 +559,8 @@ _FIX_CHECKS = (
      "the bucket combo is split from the detail at the writer's separator"),
     ("app.py", "def _bucket_combo_html(line, col):", 1,
      "one bucket-line renderer, used by live and summary"),
-    ("app.py", "word-break:break-all;", 2,
-     "combo and detail both wrap instead of scrolling"),
+    ("app.py", "word-break:break-all;", 1,
+     "the combo wraps instead of scrolling"),
     ("app.py", "left / max(1, len(rungs))))", 1,
      "the per-rung share is capped, not floored at 3s"),
     ("app.py", "RUNG_COST_MIN, min(configured_to, RUNG_COST_MAX,", 1,
@@ -580,6 +586,14 @@ _FIX_CHECKS = (
      "the mailbox fetch binds success_read with the list"),
     ("app.py", "if success_read and fetched_msgs:", 1,
      "the fetch branch tests success_read, not the stale ok_read"),
+    # ---- v13.76 COMBO-2 / INSPECT-1: combo only, and a checkbox row ----
+    ("app.py", "def _combo_only(line):", 1, "the combo helper exists"),
+    ("app.py", '{"line": f"{email}:{password}", "email": email,', 2,
+     "both result returns carry the combo with no verdict tail"),
+    ("app.py", "on_change=_on_inspect_pick, args=(_opt, _os))", 1,
+     "the inspector is a checkbox row, not a selectbox"),
+    ("app.py", "_clean_items = [_combo_only(i) for i in selected_list_items]", 1,
+     "the inspector display and download are combo-only"),
     ("app.py", "limit=limit, page=page, info=_info)", 1, "the reader passes a page"),
     ("app.py", 'key="bb_reader_next"', 1, "the reader has forward paging"),
     ("app.py", 'key="bb_reader_prev"', 1, "the reader has back paging"),
