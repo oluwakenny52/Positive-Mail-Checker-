@@ -167,10 +167,29 @@ except ImportError:
         domain = email.split("@")[-1].lower() if "@" in email else ""
         return [f"imap.{domain}"] if domain else ["imap.gmail.com"]
 
-# v13.52: body renderer. Optional - a failed import degrades to the plain
+# v13.57: body renderer. Optional - a failed import degrades to the plain
 # text_area, it must never blank the page.
+#
+# hasattr() IS NOT A SHAPE CHECK. A module cached before a redeploy keeps the old
+# signature; hasattr(mailview, "render_auto") is True on the pre-v13.56 module
+# too, whose def is render_auto(st, msg, key, mail_getter, allow_remote=False)
+# with no `view` and no `ns`. The call sites pass both, so the first rendered
+# row raised TypeError and killed the page. __version__ cannot detect it - it is
+# frozen at "v13.55" on purpose. So probe the PARAMETERS the call sites use,
+# reload once, and drop the renderer entirely if they are still missing.
+def _mv_capable(mod) -> bool:
+    try:
+        params = inspect.signature(mod.render_auto).parameters
+    except Exception:
+        return False
+    return "view" in params and "ns" in params
+
 try:
     import mailview
+    if not _mv_capable(mailview):
+        mailview = importlib.reload(mailview)
+        if not _mv_capable(mailview):
+            mailview = None
 except Exception:
     mailview = None
 # @@END 002 HOSTS_IMPORT
@@ -3807,6 +3826,29 @@ def _mv_mail():
                            resolve_active_host(active_email))
 
 
+def _render_body(key: str, msg: dict) -> None:
+    """The one body-render path for the stream, the OTP scanner and deep search.
+
+    A stale renderer raises TypeError on view=/ns=; anything else can raise too.
+    Either way the row must still show its body, so every failure degrades to the
+    plain text_area instead of taking the page down. The second try covers the
+    case where the renderer already drew the box before it failed.
+    """
+    if mailview is not None and hasattr(mailview, "render_auto"):
+        try:
+            mailview.render_auto(st, msg, key, _mv_mail, allow_remote=_mv_remote,
+                                 view=_mv_view, ns=active_email)
+            return
+        except TypeError as ex:
+            st.caption(f"body renderer mismatch ({ex}) - plain text shown")
+        except Exception as ex:
+            st.caption(f"body render failed ({ex}) - plain text shown")
+    try:
+        st.text_area("Cleaned Message Body", height=150, key=key)
+    except Exception:
+        st.caption("(body shown above)")
+
+
 # Main Message Stream
 # THE STREAM DOES NOT FILTER. It is the main stream - everything loaded is shown.
 # The bot filter is an opt-in checkbox, default OFF, and a bot scan no longer
@@ -3871,12 +3913,7 @@ if len(active_msgs) > 0 or total_msgs > 0:
                 _body_key = f"body_{msg['folder']}_{msg['id']}_{idx}"
                 if _body_key not in st.session_state:
                     st.session_state[_body_key] = msg["body"]
-                if mailview is not None and hasattr(mailview, "render_auto"):
-                    mailview.render_auto(st, msg, _body_key, _mv_mail,
-                                         allow_remote=_mv_remote, view=_mv_view,
-                                         ns=active_email)
-                else:
-                    st.text_area("Cleaned Message Body", height=150, key=_body_key)
+                _render_body(_body_key, msg)
 
                 op_col1, op_col2, op_col3, op_col4 = st.columns(4)
                 host = resolve_active_host(active_email)
@@ -4108,12 +4145,7 @@ if hub_otp_open:
                 _ob_key = f"otp_b_{msg['folder']}_{msg['id']}_{idx}"
                 if _ob_key not in st.session_state:
                     st.session_state[_ob_key] = display_body
-                if mailview is not None and hasattr(mailview, "render_auto"):
-                    mailview.render_auto(st, msg, _ob_key, _mv_mail,
-                                         allow_remote=_mv_remote, view=_mv_view,
-                                         ns=active_email)
-                else:
-                    st.text_area("Message Payload Body", height=150, key=_ob_key)
+                _render_body(_ob_key, msg)
 
                 o_col1, o_col2, o_col3, o_col4 = st.columns(4)
                 host = resolve_active_host(active_email)
@@ -4303,12 +4335,7 @@ if hub_search_open:
                 _sb_key = f"s_body_{msg['folder']}_{msg['id']}_{idx}"
                 if _sb_key not in st.session_state:
                     st.session_state[_sb_key] = msg["body"]
-                if mailview is not None and hasattr(mailview, "render_auto"):
-                    mailview.render_auto(st, msg, _sb_key, _mv_mail,
-                                         allow_remote=_mv_remote, view=_mv_view,
-                                         ns=active_email)
-                else:
-                    st.text_area("Cleaned Message Body", height=150, key=_sb_key)
+                _render_body(_sb_key, msg)
 
                 s_op1, s_op2, s_op3, s_op4 = st.columns(4)
                 host = resolve_active_host(active_email)
