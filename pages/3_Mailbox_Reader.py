@@ -1029,6 +1029,9 @@ _UI_CATS = ("All Security Categories", "Debit Card & Credit Card Details",
 # reaches them - otherwise one user's write suppresses the other's.
 _UI_WRITE = {"owner": None, "t": 0.0, "sig": None, "err": "", "paused": 0}
 
+# Memo for _ui_reseed(): the settings block, re-read only when the file moves.
+_RESEED = {"owner": None, "mtime": None, "vals": {}}
+
 
 def _ui_owner():
     try:
@@ -1092,6 +1095,59 @@ def _reader_ui_load() -> dict:
         return {}
 
 
+def _ui_reseed() -> None:
+    """Put back any whitelisted key that is missing, from disk, on EVERY run.
+
+    Streamlit drops a widget's key at the end of any run that did not render the
+    widget, so collapsing a panel garbage-collects every key inside it. Without
+    this the panel's own `if key not in st.session_state: <default>` fires the
+    next time it is opened, and block 043's snapshot then writes that default
+    over the saved value - so closing a panel DESTROYED the settings in it, and
+    the reload is only where it became visible.
+
+    setdefault only: a key that is present is a live widget value and must win.
+    The settings block is memoised on the file mtime, so this costs one stat per
+    run and one read per change, not a read per run.
+    """
+    try:
+        owner = _ui_owner()
+        try:
+            mtime = os.path.getmtime(READER_UI_FILE) if os.path.exists(READER_UI_FILE) else None
+        except Exception:
+            mtime = None
+        if _RESEED["owner"] != owner or _RESEED["mtime"] != mtime or not isinstance(_RESEED["vals"], dict):
+            _RESEED["owner"] = owner
+            _RESEED["mtime"] = mtime
+            _data = _reader_ui_load()
+            _settings = _data.get("settings")
+            _RESEED["vals"] = _settings if isinstance(_settings, dict) else {}
+    except Exception:
+        if not isinstance(_RESEED.get("vals"), dict):
+            _RESEED["vals"] = {}
+    settings = _RESEED["vals"]
+    if not settings:
+        return
+    for k in _UI_FLAGS:
+        if k in settings and k not in st.session_state:
+            st.session_state[k] = _ui_bool(settings.get(k), False)
+    for k in _UI_TEXT:
+        if k in settings and k not in st.session_state:
+            st.session_state[k] = _ui_text(settings.get(k))
+    for k in _UI_PICK:
+        if k in settings and k not in st.session_state:
+            st.session_state[k] = _ui_text(settings.get(k))
+    for k, (lo, hi, dflt) in _UI_NUMS.items():
+        if k in settings and k not in st.session_state:
+            st.session_state[k] = _ui_int(settings.get(k), lo, hi, dflt)
+    for k in _UI_LISTS:
+        if k in settings and k not in st.session_state:
+            st.session_state[k] = _ui_list(settings.get(k), _ui_folder_options(), ["INBOX"])
+    if "otp_category_select" in settings and "otp_category_select" not in st.session_state:
+        _c = settings.get("otp_category_select")
+        _c = [x for x in _c if isinstance(x, str) and x in _UI_CATS] if isinstance(_c, list) else []
+        st.session_state["otp_category_select"] = _c or ["All Security Categories"]
+
+
 def _reader_ui_restore() -> None:
     """Seed session_state from disk. ONCE per session, before any widget exists.
 
@@ -1125,6 +1181,11 @@ def _reader_ui_restore() -> None:
             if k in settings and k not in st.session_state:
                 st.session_state[k] = _ui_bool(settings.get(k), False)
         for k in _UI_TEXT:
+            if k in settings and k not in st.session_state:
+                st.session_state[k] = _ui_text(settings.get(k))
+        # _UI_PICK was in the whitelist but was never restored here, so Scan
+        # Field, Search Field and Sort Order never survived anything at all.
+        for k in _UI_PICK:
             if k in settings and k not in st.session_state:
                 st.session_state[k] = _ui_text(settings.get(k))
         for k, (lo, hi, dflt) in _UI_NUMS.items():
@@ -1209,6 +1270,9 @@ def _reader_ui_save(force: bool = False) -> None:
         _UI_WRITE["sig"] = blob
         _UI_WRITE["t"] = now
         _UI_WRITE["err"] = ""
+        # the file just moved under the reseed memo; drop it so the next run
+        # re-reads instead of serving a stale copy
+        _RESEED["mtime"] = None
     except Exception as ex:
         _UI_WRITE["err"] = str(ex)
 
@@ -1310,6 +1374,9 @@ if "otp_page_rows" not in st.session_state:
 # mb_folders exists now, so the scope multiselects can be validated against the
 # real folder list before their widgets are built.
 _reader_ui_restore()
+# ...and then put back anything Streamlit collected at the end of the previous
+# run because its panel was collapsed. setdefault only, so live values win.
+_ui_reseed()
 # @@END 013 SESSION_INIT
 
 
