@@ -67,11 +67,27 @@ def _digest(phrase, salt):
     return hashlib.sha256((salt + "\x00" + phrase).encode("utf-8")).hexdigest()[:HASH_LEN]
 
 
+def _norm(phrase):
+    """Comparison form: trimmed, single-spaced, casefolded.
+
+    v13.75: THIS IS THE "Wrong passphrase" FIX. The comparison was exact-only, so
+    a phone keyboard that capitalises the first letter, or a paste that carries a
+    trailing space, rejected a correct phrase. The exact hash is still tried
+    FIRST, so case still distinguishes two keys that would otherwise collide; the
+    normalised form is only a fallback.
+    """
+    return " ".join((phrase or "").split()).casefold()
+
+
 def _load():
     try:
         with open(PASSKEY_FILE, encoding="utf-8") as fh:
             data = json.load(fh)
         if isinstance(data, dict) and isinstance(data.get("keys"), list):
+            # A hand-edited or half-written record used to crash compare_digest
+            # (str vs None) and surface as a bare exception, not "wrong phrase".
+            data["keys"] = [k for k in data["keys"]
+                            if isinstance(k, dict) and isinstance(k.get("hash"), str)]
             return data
     except Exception:
         pass
@@ -88,31 +104,51 @@ def _save(data):
         pass
 
 
-def add_key(phrase, label=""):
-    """Create a passkey, persist it, return its hash."""
+def add_key(phrase, label="", admin=False):
+    """Create a passkey, persist it, return its hash.
+
+    v13.75: THE FIRST KEY IS THE ADMIN, and every key now stores its phrase. The
+    phrase is stored in clear beside the salted hash because there is no way to
+    recover it from a hash, and the admin has to be able to read it back.
+    passkey.json is therefore a keyring, not a secret: whoever holds the file
+    holds every phrase.
+    """
     phrase = (phrase or "").strip()
     with _key_lock:
         data = _load()
         salt = secrets.token_hex(SALT_BYTES)
         h = _digest(phrase, salt)
         data["keys"].append({"salt": salt, "hash": h,
+                             "hash_n": _digest(_norm(phrase), salt),
+                             "phrase": phrase[:120],
                              "label": (label or "").strip()[:40],
+                             "admin": bool(admin) or not data["keys"],
                              "created": int(time.time())})
         _save(data)
     return h
 
 
-def match_key(phrase):
-    """Return the stored hash `phrase` opens, or ''."""
+def match_key_full(phrase):
+    """The stored key `phrase` opens, or {}. Exact pass first, then normalised."""
     phrase = (phrase or "").strip()
     if not phrase:
-        return ""
+        return {}
     with _key_lock:
-        keys = list(_load().get("keys") or [])
+        keys = [k for k in (_load().get("keys") or []) if isinstance(k, dict)]
     for k in reversed(keys):
         if secrets.compare_digest(_digest(phrase, k.get("salt", "")), k.get("hash", "")):
-            return k.get("hash", "")
-    return ""
+            return k
+    n = _norm(phrase)
+    for k in reversed(keys):
+        if k.get("hash_n") and secrets.compare_digest(
+                _digest(n, k.get("salt", "")), k["hash_n"]):
+            return k
+    return {}
+
+
+def match_key(phrase):
+    """Return the stored hash `phrase` opens, or ''."""
+    return match_key_full(phrase).get("hash", "")
 
 
 def forget_current(h):
@@ -210,6 +246,34 @@ def _flash(st, outcome, text):
         pass
 
 
+def _enter(st, key, why="Unlocked"):
+    """Bind this session to `key` and mirror its admin bit."""
+    st.session_state["user_key_hash"] = key.get("hash", "")
+    st.session_state["is_admin"] = bool(key.get("admin"))
+    _flash(st, "OK", why + ". Every file below is yours alone.")
+
+
+def _key_rows():
+    """(label, hash, created, phrase) for every stored key, oldest first."""
+    rows = []
+    for k in (_load().get("keys") or []):
+        if not isinstance(k, dict):
+            continue
+        rows.append((((k.get("label") or "").strip() or "unlabelled"),
+                      str(k.get("hash", "")),
+                      int(k.get("created") or 0),
+                      str(k.get("phrase") or ""),
+                      bool(k.get("admin"))))
+    return rows
+
+
+def _when(ts):
+    try:
+        return time.strftime("%Y-%m-%d %H:%M", time.localtime(ts)) if ts else "?"
+    except Exception:
+        return "?"
+
+
 def require(st, title="Unlock Positive Mail-Checker"):
     """Unlock, or create the first passkey. Sets session_state['user_key_hash']."""
     if st.session_state.get("user_key_hash"):
@@ -226,13 +290,25 @@ def require(st, title="Unlock Positive Mail-Checker"):
             phrase = st.text_input("Passphrase", type="password", key="au_p1")
             ok = st.form_submit_button("Unlock", type="primary")
         if ok:
-            h = match_key(phrase)
-            if h:
-                st.session_state["user_key_hash"] = h
-                _flash(st, "OK", "Unlocked. Every file below is yours alone.")
+            hit = match_key_full(phrase)
+            if hit:
+                st.session_state.pop("au_fails", None)
+                _enter(st, hit)
                 st.rerun()
             else:
+                fails = int(st.session_state.get("au_fails", 0)) + 1
+                st.session_state["au_fails"] = fails
                 st.error("Wrong passphrase.")
+                # v13.75: after a second miss, name the keys that exist. The
+                # "wrong passphrase" box used to be a dead end - the user could
+                # not tell a typo from having no key here at all, which is what a
+                # passphrase created with "remember" unticked used to leave.
+                if fails >= 2:
+                    _labels = [r[0] for r in _key_rows()]
+                    if _labels:
+                        st.caption("Keys on this device: %s. Case and spacing are "
+                                   "forgiven; a different word is not."
+                                   % ", ".join("`%s`" % x for x in _labels))
         with st.expander("Start fresh as a different user on this device"):
             st.caption("Adds a SECOND passkey. The existing ones keep working.")
             with st.form("auth_new"):
@@ -247,49 +323,70 @@ def require(st, title="Unlock Positive Mail-Checker"):
                 elif p2 != p3:
                     st.error("The two passphrases differ.")
                 else:
-                    st.session_state["user_key_hash"] = add_key(p2, lbl)
-                    _flash(st, "OK", "Passkey created and unlocked.")
+                    h = add_key(p2, lbl)
+                    st.session_state.pop("au_fails", None)
+                    _enter(st, {"hash": h, "admin": False}, "Passkey created")
                     st.rerun()
-        with st.expander("Forget a passkey"):
-            # Locked, so there is no session hash to "forget this one" with -
-            # pick the key explicitly instead of reading user_key_hash (which is
-            # always "" on this branch, making the old button a permanent no-op).
-            pick = {}
-            for k in (_load().get("keys") or []):
-                lab = (k.get("label") or "").strip() or "unlabelled"
-                pick["%s · %s" % (lab, str(k.get("hash", ""))[:8])] = k.get("hash", "")
-            st.caption("Removes ONE key. Every other user on this deployment keeps theirs.")
-            choice = st.selectbox("Which passkey", list(pick))
-            if st.button("Forget selected passkey", key="au_forget_one"):
-                gone = pick.get(choice, "")
-                forget_current(gone)
-                st.session_state.pop("user_key_hash", None)
-                # v13.64: the forgotten key's per-user tables live in app.py's
-                # process STATE and used to survive for the life of the process -
-                # pool, quarantine, scores and its alive-pool thread. app.py block
-                # 039 drops them; this is the only place that knows WHICH key.
-                st.session_state["_forgotten_hash"] = gone
-                _flash(st, "OK", "Passkey forgotten. Its files stay on disk.")
-                st.rerun()
-            st.caption("Or remove every key, for everyone.")
-            if st.button("Forget all passkeys", key="au_forget_all"):
-                # v13.51: user_key_hash is ALWAYS "" on this branch, so the old
-                # read handed app.py block 039 an empty hash and it dropped no
-                # tables at all. Keep the selected key instead.
-                gone = pick.get(choice, "")
-                forget_all()
-                st.session_state["_forgotten_hash"] = gone
-                st.session_state.pop("user_key_hash", None)
-                _flash(st, "WARN", "Every passkey was removed. Nothing unlocks now "
-                                   "until a new one is created.")
-                st.rerun()
+
+        # ---- ADMIN ONLY from here down ----
+        # v13.75: THE FORGET EXPANDER WAS OPEN TO EVERYBODY. Any user could
+        # remove any key, including the admin's, and nothing showed who held
+        # which key. It is admin-gated now and the table lists every key.
+        if st.session_state.get("is_admin"):
+            with st.expander("Manage passkeys (admin)"):
+                st.caption("Removing a key removes that person's access. Their files "
+                           "stay on disk and reopen if the key is re-created with the "
+                           "same phrase.")
+                rows = _key_rows()
+                pick = {}
+                for label, h, created, phrase, is_admin in rows:
+                    pick["%s%s · %s · %s" % (label, " (admin)" if is_admin else "",
+                                             h[:8], _when(created))] = h
+                st.dataframe(
+                    [{"Label": lb, "Admin": "yes" if ad else "",
+                      "Hash": h[:12], "Created": _when(cr),
+                      "Passphrase": ph or "(not stored - re-create this key)"}
+                     for lb, h, cr, ph, ad in rows],
+                    width="stretch", hide_index=True,
+                )
+                if pick:
+                    choice = st.selectbox("Which passkey", list(pick))
+                    if st.button("Forget selected passkey", key="au_forget_one"):
+                        gone = pick.get(choice, "")
+                        forget_current(gone)
+                        st.session_state.pop("user_key_hash", None)
+                        st.session_state.pop("is_admin", None)
+                        # v13.64: the forgotten key's per-user tables live in
+                        # app.py's process STATE and used to survive for the life
+                        # of the process - pool, quarantine, scores and its
+                        # alive-pool thread. app.py block 039 drops them; this is
+                        # the only place that knows WHICH key.
+                        st.session_state["_forgotten_hash"] = gone
+                        _flash(st, "OK", "Passkey forgotten. Its files stay on disk.")
+                        st.rerun()
+                    st.caption("Or remove every key, for everyone.")
+                    if st.button("Forget all passkeys", key="au_forget_all"):
+                        # v13.51: user_key_hash is ALWAYS "" on this branch, so the
+                        # old read handed app.py block 039 an empty hash and it
+                        # dropped no tables at all. Keep the selected key instead.
+                        gone = pick.get(choice, "")
+                        forget_all()
+                        st.session_state["_forgotten_hash"] = gone
+                        st.session_state.pop("user_key_hash", None)
+                        st.session_state.pop("is_admin", None)
+                        _flash(st, "WARN", "Every passkey was removed. Nothing unlocks "
+                                           "now until a new one is created.")
+                        st.rerun()
+        else:
+            st.caption("Passkey management is the admin's. The first passphrase "
+                       "created on a device is its admin.")
         st.stop()
 
-    st.caption("No passkey yet - create one. It is asked once per session.")
+    st.caption("No passkey yet - create one. It is asked once per session. This one "
+               "becomes the admin key.")
     with st.form("auth_create"):
         p1 = st.text_input("Choose a passphrase", type="password", key="au_c1")
         p2 = st.text_input("Repeat it", type="password", key="au_c2")
-        remember = st.checkbox("Remember on this device", value=True)
         go = st.form_submit_button("Create and enter", type="primary")
     if go:
         p1 = (p1 or "").strip()
@@ -298,12 +395,12 @@ def require(st, title="Unlock Positive Mail-Checker"):
         elif p1 != p2:
             st.error("The two passphrases differ.")
         else:
-            if remember:
-                h = add_key(p1)
-            else:
-                h = _digest(p1, secrets.token_hex(SALT_BYTES))
-            st.session_state["user_key_hash"] = h
-            _flash(st, "OK", "Passkey created and unlocked.")
+            # v13.75: THIS ALWAYS PERSISTS NOW. With "Remember on this device"
+            # unticked the old path hashed the phrase with a fresh random salt and
+            # wrote nothing, so that passphrase could never match again - it worked
+            # for the session and was "wrong" forever after.
+            h = add_key(p1)
+            _enter(st, {"hash": h, "admin": True}, "Passkey created as admin")
             st.rerun()
     st.stop()
 # @@END 002 GATE
