@@ -1,4 +1,4 @@
-# @@FILE pages/3_Mailbox_Reader.py blocks=44 version=v13.47
+# @@FILE pages/3_Mailbox_Reader.py blocks=44 version=v13.56
 # @@BLOCK 000 FILE_HEADER deps=-
 """
 pages/3_Mailbox_Reader.py — Bobito Mailbox Reader & Portal Hub  (v13.47)
@@ -52,6 +52,29 @@ v13.47 fixes on this page
   so every run fell through to the deprecated components.html. A bare HTML string
   is also passed now instead of a data: URI, because src-loaded data: frames have
   no app origin for a root-relative fetch; srcdoc keeps it.
+  
+  v13.56 fixes on this page
+-------------------------
+* UI PERSISTENCE: reader_ui.json, per user, whitelisted keys only, restored before
+  any widget exists and written once per run when it changes. Settings, toggles,
+  sliders, keyword boxes and per-mail body edits now survive a reload. Body edits
+  are keyed by account|folder|mode|page, so switching mail clears the previous one.
+* KEYED WIDGETS: folder, page size, sort order and bot scan depth had no key at all
+  and reset on every rerun. All keyed, all validated against live options.
+* STREAM FILTERS NOTHING: bot filtering is an opt-in checkbox, default OFF, and the
+  extortion/ransom drop in fetch_messages_paginated is now a category tag.
+* HTML FOLLOWS THE SWITCH: a global view mode, persisted, forced to HTML while the
+  remote-image switch is on. Per-message radios remain as the fallback.
+* NO TRUNCATION: the 256 KB partial BODY.PEEK[] fetch is gone, and mailview's caps
+  moved to 8 MB raw / 4 MB markup.
+* NO REFETCH PER RERUN: mailview memoises the full fetch and the sanitised shell.
+* NO HARD LOADING: the valid-list fingerprint is TTL-cached, the cache writer is
+  paused for the whole fetch loop, and the diagnostic panes render 250 lines.
+* SEARCH REACHES THE WHOLE MAILBOX: an "all folders" box starts ticked, the term
+  cap moved 25 -> 60, and the fallback walks BODY.PEEK[TEXT] 250 at a time.
+* THREE EXPANDERS BECAME CHECKBOXES: an expander collapses on every rerun.
+* CROSS-USER CACHE FIXES: _UI_WRITE, _VALID_CACHE, _FP_MEMO, _ZIP_CACHE and every
+  mailview cache are keyed per user, so one user cannot suppress or serve another.
 """
 
 import streamlit as st
@@ -716,6 +739,12 @@ APP_CONFIG_FILE = user_file("app_config.json")
 MANUAL_VALID_FILE = user_file("manual_valid_accounts.txt")
 SESSION_CACHE_FILE = user_file("session_cache.json")
 
+# The reader's own UI store. Every setting, toggle, slider and per-mail body edit
+# lands here, per user, so a reload restores the panel instead of the factory
+# defaults. Body edits are keyed by SCOPE (account|folder|mode|page) and only the
+# current scope is kept, so switching mail clears the previous mail.
+READER_UI_FILE = user_file("reader_ui.json")
+
 DEFAULT_APP_CONFIG = {
     "connection_timeout": 15,
     "imap_port": 993,
@@ -776,14 +805,19 @@ def save_session_cache():
             "total_matched_count": st.session_state.get("total_matched_count", 0),
             "search_total_matched_count": st.session_state.get("search_total_matched_count", 0),
             "otp_total_matched_count": st.session_state.get("otp_total_matched_count", 0),
+            # the selected folder travels with the page counter. Without it a
+            # restored page number pointed into a folder that was no longer
+            # selected, so the pager fetched the wrong mailbox.
+            "folder_sel": st.session_state.get("folder_sel", ""),
+            "sort_order_sel": st.session_state.get("sort_order_sel", "Newest First"),
         }
 
-        # v13.43: raw/body/body_raw are persisted now, so a restored page does
-        # not have to re-fetch a mailbox to show a message.  `raw` is bytes, so
-        # it is base64-encoded here - json.dump cannot take bytes, and the bare
-        # except below would swallow the TypeError and stop writing the cache
-        # entirely, with no visible error.
-        MAX_CACHED = 60
+        # raw/body/body_raw are persisted so a restored page does not have to
+        # re-fetch a mailbox to show a message. `raw` is bytes, so it is
+        # base64-encoded here - json.dump cannot take bytes.
+        # 60 -> 40 rows: each carries a base64 blob and the file was rewritten
+        # every 2s during a fetch.
+        MAX_CACHED = 40
         KEEP_KEYS = {
             "id", "folder", "from", "to", "subject", "date",
             "is_read", "is_bot", "categories", "flags", "size_bytes",
@@ -803,8 +837,10 @@ def save_session_cache():
                 serialized_list.append(m_copy)
             cache_data[k_name] = serialized_list
 
-        with open(SESSION_CACHE_FILE, "w", encoding="utf-8") as f:
-            json.dump(cache_data, f)
+        tmp = SESSION_CACHE_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(cache_data, f, separators=(",", ":"))
+        os.replace(tmp, SESSION_CACHE_FILE)
     except Exception:
         pass
 
@@ -832,6 +868,236 @@ def load_session_cache():
                         st.session_state[k] = v
         except Exception:
             pass
+
+
+# ============================================================================
+# READER UI STORE
+# ============================================================================
+# Streamlit throws session_state away when the WebSocket drops - a reload, a tab
+# restored from the background, a redeploy. Every control on this page therefore
+# has to be seeded from disk BEFORE its widget is created, or the panel comes
+# back at factory defaults while the loaded messages come back intact.
+#
+# The whitelist below is the whole contract: only these keys are written, and
+# only these are read back. A key that is not here cannot leak into the file.
+_UI_BODY_PREFIXES = ("body_", "otp_b_", "s_body_")
+
+_UI_FLAGS = ("mv_remote", "hub_otp_open", "hub_search_open", "hub_bot_open",
+             "otp_clean_toggle", "otp_regex_chk", "otp_all_folders",
+             "deep_all_folders", "bot_filter_mode")
+
+_UI_TEXT = ("otp_custom_kw", "otp_blacklist_kw", "deep_search_query",
+            "deep_search_blacklist_kw", "folder_sel", "mv_view")
+
+_UI_PICK = ("otp_search_field", "deep_search_field", "sort_order_sel")
+
+_UI_NUMS = {
+    "ui_font_size": (12, 22, 16),
+    "ui_content_scale": (80, 140, 100),
+    "page_size_sel": (5, 200, 15),
+    "stream_page_size": (5, 200, 15),
+    "otp_page_size_slider": (5, 200, 15),
+    "search_page_size_slider": (5, 200, 15),
+    "bot_page_size_slider": (5, 200, 15),
+    "bot_scan_depth": (1, 5000, 100),
+}
+
+_UI_LISTS = ("otp_scan_scope", "deep_search_scope", "bot_hub_folder_select")
+
+# `owner` is the unlocked hash. The writer, the valid-list cache and the ZIP
+# cache are all process values, so they must be reset when a DIFFERENT user's run
+# reaches them - otherwise one user's write suppresses the other's.
+_UI_WRITE = {"owner": None, "t": 0.0, "sig": None, "err": "", "paused": 0}
+
+
+def _ui_owner():
+    try:
+        return user_file("")
+    except Exception:
+        return ""
+
+
+def _ui_bool(v, default=False):
+    if isinstance(v, bool):
+        return v
+    if isinstance(v, (int, float)):
+        return bool(v)
+    s = str(v).strip().lower()
+    if s in ("1", "true", "yes", "on"):
+        return True
+    if s in ("0", "false", "no", "off", ""):
+        return False
+    return default
+
+
+def _ui_int(v, lo, hi, default):
+    try:
+        n = int(float(v))
+    except (TypeError, ValueError):
+        return default
+    return max(lo, min(hi, n))
+
+
+def _ui_text(v, default=""):
+    if isinstance(v, str):
+        return v
+    return default if v is None else str(v)
+
+
+def _ui_list(v, options, default):
+    if not isinstance(v, list):
+        return list(default)
+    keep = [x for x in v if isinstance(x, str) and x in options]
+    return keep or list(default)
+
+
+def _ui_folder_options():
+    folders = st.session_state.get("mb_folders") or ["INBOX"]
+    return ["INBOX"] + [f for f in folders if f != "INBOX"]
+
+
+def _ui_body_keys():
+    return [k for k in list(st.session_state)
+            if isinstance(k, str) and k.startswith(_UI_BODY_PREFIXES)]
+
+
+def _reader_ui_load() -> dict:
+    if not os.path.exists(READER_UI_FILE):
+        return {}
+    try:
+        with open(READER_UI_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _reader_ui_restore() -> None:
+    """Seed session_state from disk. ONCE per session, before any widget exists.
+
+    Overwrite-versus-skip is the whole point. On a rerun the LIVE widget value
+    must win, or every slider snaps back to whatever was on disk when the run
+    started and the control can never move. So the file is read on the first run
+    only, and even then a key that a widget already owns this run has to be
+    FORCED: bot_filter_mode is initialised in block 013, and the Display Fit pair
+    is written by auth.fit() in block 001 - a plain "only seed missing keys"
+    restore can never reach any of them.
+    """
+    if st.session_state.get("_ui_restored"):
+        return
+    data = _reader_ui_load()
+    st.session_state["_ui_restored"] = True
+    if not data:
+        return
+    settings = data.get("settings")
+    if isinstance(settings, dict):
+        # ---- keys a widget already owns this run: FORCE -------------------
+        if "bot_filter_mode" in settings:
+            st.session_state["bot_filter_mode"] = _ui_bool(settings.get("bot_filter_mode"), False)
+        for k in ("ui_font_size", "ui_content_scale"):
+            if k in settings:
+                lo, hi, dflt = _UI_NUMS[k]
+                st.session_state[k] = _ui_int(settings.get(k), lo, hi, dflt)
+        # ---- everything else: seed only what is still missing -------------
+        for k in _UI_FLAGS:
+            if k in settings and k not in st.session_state:
+                st.session_state[k] = _ui_bool(settings.get(k), False)
+        for k in _UI_TEXT:
+            if k in settings and k not in st.session_state:
+                st.session_state[k] = _ui_text(settings.get(k))
+        for k, (lo, hi, dflt) in _UI_NUMS.items():
+            if k in settings and k not in st.session_state:
+                st.session_state[k] = _ui_int(settings.get(k), lo, hi, dflt)
+        for k in _UI_LISTS:
+            if k in settings and k not in st.session_state:
+                st.session_state[k] = _ui_list(settings.get(k), _ui_folder_options(), ["INBOX"])
+
+    scope = data.get("scope") or ""
+    bodies = data.get("bodies")
+    bodies = bodies if isinstance(bodies, dict) else {}
+    if "_reader_bodies" not in st.session_state:
+        st.session_state["_reader_bodies"] = bodies
+    if scope and "_reader_scope" not in st.session_state:
+        st.session_state["_reader_scope"] = scope
+        for k, v in (bodies.get(scope) or {}).items():
+            if isinstance(k, str) and isinstance(v, str) and k not in st.session_state:
+                st.session_state[k] = v
+
+
+def _reader_ui_snapshot() -> dict:
+    out = {}
+    for k in _UI_FLAGS:
+        out[k] = bool(st.session_state.get(k, False))
+    for k in _UI_TEXT:
+        v = st.session_state.get(k)
+        if isinstance(v, str):
+            out[k] = v
+    for k in _UI_PICK:
+        v = st.session_state.get(k)
+        if isinstance(v, str):
+            out[k] = v
+    for k in _UI_NUMS:
+        v = st.session_state.get(k)
+        if isinstance(v, (int, float)):
+            out[k] = int(v)
+    for k in _UI_LISTS:
+        v = st.session_state.get(k)
+        if isinstance(v, list):
+            out[k] = [x for x in v if isinstance(x, str)]
+    return out
+
+
+def _reader_ui_save(force: bool = False) -> None:
+    """Write the panel + the current mail's body edits. Throttled and deduped."""
+    if _UI_WRITE["paused"] > 0 and not force:
+        return
+    try:
+        owner = _ui_owner()
+        if _UI_WRITE["owner"] != owner:
+            # a different user reached this process value - reset the memo
+            _UI_WRITE["owner"] = owner
+            _UI_WRITE["sig"] = None
+        scope = st.session_state.get("_reader_scope", "")
+        bodies = {}
+        if scope:
+            cur = {k: st.session_state[k] for k in _ui_body_keys()
+                   if isinstance(st.session_state.get(k), str)}
+            if cur:
+                bodies[scope] = cur
+        payload = {"v": 1, "settings": _reader_ui_snapshot(),
+                   "scope": scope, "bodies": bodies}
+        blob = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+        now = time.time()
+        if not force and blob == _UI_WRITE["sig"]:
+            return
+        if not force and now - _UI_WRITE["t"] < 1.0:
+            return
+        tmp = READER_UI_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write(blob)
+        os.replace(tmp, READER_UI_FILE)
+        _UI_WRITE["sig"] = blob
+        _UI_WRITE["t"] = now
+        _UI_WRITE["err"] = ""
+    except Exception as ex:
+        _UI_WRITE["err"] = str(ex)
+
+
+def _reader_scope_apply(scope: str) -> None:
+    """Focus a mail scope. A different scope clears the previous mail's edits."""
+    prev = st.session_state.get("_reader_scope")
+    st.session_state["_reader_scope"] = scope
+    if prev == scope:
+        return
+    for k in _ui_body_keys():
+        st.session_state.pop(k, None)
+    store = st.session_state.get("_reader_bodies")
+    store = store if isinstance(store, dict) else {}
+    keep = store.get(scope) or {}
+    st.session_state["_reader_bodies"] = {scope: keep} if keep else {}
+    for k, v in keep.items():
+        if isinstance(k, str) and isinstance(v, str):
+            st.session_state[k] = v
 # @@END 012 FILES_AND_CONFIG
 
 
@@ -909,26 +1175,50 @@ if "search_page_rows" not in st.session_state:
     st.session_state.search_page_rows = 0
 if "otp_page_rows" not in st.session_state:
     st.session_state.otp_page_rows = 0
+
+# Seed the whole panel from disk. LAST statement of the block on purpose -
+# mb_folders exists now, so the scope multiselects can be validated against the
+# real folder list before their widgets are built.
+_reader_ui_restore()
 # @@END 013 SESSION_INIT
 
 
 # @@BLOCK 014 LOGGERS deps=013
-# v13.43: log() rewrote the entire session cache - 60 messages with base64 raw
-# blobs - on every single line. Throttled to one write per 2s; the explicit
-# save_session_cache() at the end of each action still lands.
+# log() rewrote the entire session cache - 40 messages with base64 raw blobs - on
+# every single line. Throttled to one write per 2s, and PAUSED entirely while a
+# fetch loop runs: 15 log lines inside one 300 ms fetch still tripped the 2 s
+# throttle once and wrote megabytes to disk mid-loop, which is what made a search
+# stall. The loop writes once, at the end.
 _LAST_CACHE_WRITE = {"t": 0.0}
+_CACHE_PAUSE = {"n": 0}
+
+
+def _cache_pause():
+    _CACHE_PAUSE["n"] += 1
+    _UI_WRITE["paused"] += 1
+
+
+def _cache_resume():
+    _CACHE_PAUSE["n"] = max(0, _CACHE_PAUSE["n"] - 1)
+    _UI_WRITE["paused"] = max(0, _UI_WRITE["paused"] - 1)
+    if _CACHE_PAUSE["n"] == 0:
+        save_session_cache()
 
 
 def log(msg):
     st.session_state.mb_log.insert(0, msg)
     st.session_state.mb_log = st.session_state.mb_log[:50]
+    if _CACHE_PAUSE["n"] > 0:
+        return
     _now = time.time()
     if _now - _LAST_CACHE_WRITE.get("t", 0.0) >= 2.0:
         _LAST_CACHE_WRITE["t"] = _now
         save_session_cache()
 
-# v13.40: diagnostic logs grew without limit for the whole session.
+# diagnostic logs grew without limit for the whole session.
 _DIAG_CAP = 400
+# and every run rendered all of them into one st.code block.
+_DIAG_RENDER = 250
 
 
 def _diag(bucket: str, msg: str) -> None:
@@ -940,6 +1230,15 @@ def _diag(bucket: str, msg: str) -> None:
     if len(lst) > _DIAG_CAP:
         head = lst[:1]
         lst[:] = head + lst[len(lst) - (_DIAG_CAP - 1):]
+
+
+def diag_text(bucket: str) -> str:
+    """Newest _DIAG_RENDER lines, with the trimmed count stated."""
+    lines = st.session_state.get(bucket) or []
+    if len(lines) > _DIAG_RENDER:
+        cut = len(lines) - _DIAG_RENDER
+        lines = [f"[... {cut} earlier line(s) trimmed ...]"] + lines[-_DIAG_RENDER:]
+    return "\n".join(lines)
 
 
 def debug_log(msg):
@@ -959,13 +1258,13 @@ def otp_log(msg):
 
 
 def flash(msg: str, kind: str = "success") -> None:
-    """v13.40: st.success() before st.rerun() is thrown away by the rerun.
+    """st.success() before st.rerun() is thrown away by the rerun.
     Queue it, show it at the top of the next run."""
     st.session_state.setdefault("_flash", []).append((kind, msg))
 
 
 def msg_label(msg, idx: int) -> str:
-    """v13.40: raw subjects with newlines / huge length wreck the expander row."""
+    """Raw subjects with newlines / huge length wreck the expander row."""
     icon = "📖" if msg.get("is_read") else "📩"
     subj = re.sub(r"\s+", " ", str(msg.get("subject", ""))).strip()[:90] or "(no subject)"
     frm = re.sub(r"\s+", " ", str(msg.get("from", ""))).strip()[:45] or "(unknown)"
@@ -977,6 +1276,40 @@ def msg_label(msg, idx: int) -> str:
 def render_flash() -> None:
     for kind, msg in st.session_state.pop("_flash", []):
         {"success": st.success, "warning": st.warning, "error": st.error}.get(kind, st.info)(msg)
+
+
+# bucket -> the ONE counter that bucket drives. The first version decremented
+# total_matched_count for every bucket, so deleting an OTP row dropped the main
+# stream's pager.
+_DROP_COUNTER = {
+    "current_messages": "total_matched_count",
+    "search_messages": "search_total_matched_count",
+    "otp_messages": "otp_total_matched_count",
+}
+
+
+def drop_msg(bucket: str, msg) -> None:
+    """Remove one row without raising when it is already gone.
+
+    `list.remove()` raises ValueError on a row a restored cache had duplicated or
+    that an earlier press already dropped, and the handler around it reported
+    that as a failed delete.
+    """
+    lst = st.session_state.get(bucket)
+    if not isinstance(lst, list):
+        return
+    try:
+        lst.remove(msg)
+    except ValueError:
+        for i, m in enumerate(lst):
+            if m.get("id") == msg.get("id") and m.get("folder") == msg.get("folder"):
+                del lst[i]
+                break
+    counter = _DROP_COUNTER.get(bucket)
+    if counter:
+        n = st.session_state.get(counter)
+        if isinstance(n, int) and n > 0:
+            st.session_state[counter] = n - 1
 # @@END 014 LOGGERS
 
 
@@ -1354,20 +1687,13 @@ def _looks_like_network_error(err_text: str) -> bool:
 
 # @@BLOCK 019 VALID_STORAGE deps=018
 # ============================================================================
-# VALID ACCOUNT STORAGE  (v13.43: per-user isolation)
+# VALID ACCOUNT STORAGE  (per-user isolation)
 # ============================================================================
-# v13.47: the hash prefix is optional, not fixed. Before the passkey unlock
-# user_file() returns an "anon<16 hex>_" name, which the old ^[0-9a-f]{16}_
-# never matched - so _own() called every anon file unprefixed, showed it to
-# every user, and the isolation this page is built around leaked again.
-#
-# v13.49: READING AND DELETING ARE NOT THE SAME QUESTION.
+# READING AND DELETING ARE NOT THE SAME QUESTION.
 #   _own()        - "may I show this?"  A bare, unprefixed file is legacy and
-#                   genuinely shared, so it stays readable here, in the valid
-#                   list and in the ZIP. That is deliberate.
-#   _own_strict() - "may I REWRITE this?"  Only this user's own prefix. The two
-#                   delete paths used _own(), so a user could truncate or edit a
-#                   bare file that every other user was reading.
+#                   genuinely shared, so it stays readable here, in the valid list
+#                   and in the ZIP. That is deliberate.
+#   _own_strict() - "may I REWRITE this?"  Only this user's own prefix.
 _HASH_RX = re.compile(r"^(?:anon)?[0-9a-f]{16}_")
 _RES_DIR = user_file("mail_results")
 CLEAN_VALID_FILE = user_file("clean_valid_accounts.txt")
@@ -1379,10 +1705,21 @@ _VALID_FILE_PATTERNS = [
     "*clean*.txt",
 ]
 _VALID_IGNORE = ["resume", "unfinished", "remaining", "input", "proxies", "proxy", "config", "blocklist"]
-_VALID_CACHE = {"fp": None, "options": None}   # v13.37
 
 _META_TAGS = ("found:", "proxy:", "path:", "xoauth2", "no standard", "aadsts",
               "http ", "imap.", "retry", "row-level", "rejected before")
+
+# The fingerprint is (path, mtime, size) for every candidate file, so computing
+# it costs a glob + a stat per file - on every rerun, before the cache is even
+# consulted. load_valid() and generate_all_mail_zip() both call it at module
+# level. A 3 second TTL removes that I/O without hiding a change a user can
+# perceive; every writer clears the memo explicitly.
+#
+# BOTH caches carry `owner` because they are process values: user A's run would
+# otherwise populate a slot user B then read or evict.
+_FP_TTL = 3.0
+_FP_MEMO = {"owner": None, "t": -1e9, "fp": None}
+_VALID_CACHE = {"owner": None, "fp": None, "options": None}
 
 
 def _own(path) -> bool:
@@ -1433,20 +1770,44 @@ def _valid_files() -> List[str]:
     return out
 
 
+def _fp_owner_reset() -> None:
+    owner = _ui_owner()
+    if _FP_MEMO["owner"] != owner:
+        _FP_MEMO["owner"] = owner
+        _FP_MEMO["fp"] = None
+        _FP_MEMO["t"] = -1e9
+    if _VALID_CACHE["owner"] != owner:
+        _VALID_CACHE["owner"] = owner
+        _VALID_CACHE["fp"] = None
+        _VALID_CACHE["options"] = None
+
+
 def _valid_fingerprint():
-    """v13.37: (path, mtime) for every candidate file — cheap change detector."""
+    """(path, mtime, size) for every candidate file - memoised for _FP_TTL."""
+    _fp_owner_reset()
+    now = time.monotonic()
+    if _FP_MEMO["fp"] is not None and (now - _FP_MEMO["t"]) < _FP_TTL:
+        return _FP_MEMO["fp"]
     fp = []
     for p in _valid_files():
         try:
             fp.append((p, os.path.getmtime(p), os.path.getsize(p)))
         except Exception:
             continue
-    return tuple(sorted(fp))
+    fp = tuple(sorted(fp))
+    _FP_MEMO["fp"] = fp
+    _FP_MEMO["t"] = now
+    return fp
+
+
+def _fp_invalidate():
+    _FP_MEMO["fp"] = None
+    _FP_MEMO["t"] = -1e9
 
 
 def load_valid():
-    """Optimized instant loader: scans only valid text result files, bypassing
-    heavy log scanning.  v13.37: cached until one of those files changes."""
+    """Instant loader: scans only valid text result files, cached on the
+    fingerprint until one of those files changes."""
     fp = _valid_fingerprint()
     if _VALID_CACHE["fp"] == fp and _VALID_CACHE["options"] is not None:
         return list(_VALID_CACHE["options"])
@@ -1493,13 +1854,8 @@ def valid_combos(valid_list) -> List[str]:
 
 
 def merge_into_clean_valid(new_combo_lines: List[str]) -> int:
-    """v13.37: MERGE into the per-user clean-valid file, deduped by email.
-
-    v13.43: the target is now user_file()'d. It used to be the shared
-    clean_valid_accounts.txt while app.py wrote <hash>_clean_valid_accounts.txt,
-    so the reader's merges never reached the engine and vice versa.
-    Returns the number of unique accounts now stored.
-    """
+    """MERGE into the per-user clean-valid file, deduped by email.
+    Returns the number of unique accounts now stored."""
     merged = {}
     target = CLEAN_VALID_FILE
     try:
@@ -1528,12 +1884,13 @@ def merge_into_clean_valid(new_combo_lines: List[str]) -> int:
     except Exception:
         pass
     _VALID_CACHE["fp"] = None
+    _fp_invalidate()
     return len(merged)
 
 
 def delete_specific_account_from_storage(target_combo: str):
-    """v13.49: _own_strict - a bare file belongs to every user, so this only
-    rewrites files that carry THIS user's own prefix."""
+    """_own_strict - a bare file belongs to every user, so this only rewrites
+    files that carry THIS user's own prefix."""
     search_files = glob.glob(os.path.join(_RES_DIR, "*.txt")) + glob.glob("*.txt")
     for path in search_files:
         if not _own_strict(path):
@@ -1555,8 +1912,6 @@ def delete_specific_account_from_storage(target_combo: str):
                 new_lines.append(line)
             if removed_here == 0:
                 continue
-            # v13.40: write to a temp file and os.replace so a crash mid-write
-            # cannot leave a half-truncated results file behind.
             tmp = path + ".tmp"
             with open(tmp, "w", encoding="utf-8") as f:
                 f.writelines(new_lines)
@@ -1570,10 +1925,11 @@ def delete_specific_account_from_storage(target_combo: str):
             except Exception:
                 pass
     _VALID_CACHE["fp"] = None
+    _fp_invalidate()
 
 
 def clear_all_valid_accounts_storage():
-    """v13.49: _own_strict - see delete_specific_account_from_storage()."""
+    """_own_strict - see delete_specific_account_from_storage()."""
     search_files = glob.glob(os.path.join(_RES_DIR, "*.txt")) + glob.glob("*.txt")
     for path in search_files:
         if not _own_strict(path):
@@ -1581,7 +1937,7 @@ def clear_all_valid_accounts_storage():
         filename_lower = os.path.basename(path).lower()
         if "valid" not in filename_lower and "clean" not in filename_lower:
             continue
-        # v13.40: clean_proxies.txt matched 'clean' and got truncated to 0 bytes.
+        # clean_proxies.txt matched 'clean' and got truncated to 0 bytes.
         if any(kw in filename_lower for kw in ("prox", "config", "blocklist", "resume", "unfinished", "remaining", "input")):
             continue
         try:
@@ -1595,16 +1951,24 @@ def clear_all_valid_accounts_storage():
         except Exception:
             pass
     _VALID_CACHE["fp"] = None
+    _fp_invalidate()
 # @@END 019 VALID_STORAGE
 
 
 # @@BLOCK 020 ZIP_CACHE deps=019
-_ZIP_CACHE = {"fp": None, "blob": None}        # v13.37
+_ZIP_CACHE = {"owner": None, "fp": None, "blob": None}
 
 
 def generate_all_mail_zip():
-    """v13.37: cached on the same (path, mtime) fingerprint as load_valid().
-    v13.43: per-user - only this user's result files are packed."""
+    """Cached on the same (path, mtime) fingerprint as load_valid().
+    Per-user - only this user's result files are packed, and the cache slot is
+    reset when a different user's run reaches it."""
+    owner = _ui_owner()
+    if _ZIP_CACHE["owner"] != owner:
+        _ZIP_CACHE["owner"] = owner
+        _ZIP_CACHE["fp"] = None
+        _ZIP_CACHE["blob"] = None
+
     _paths = [p for p in (glob.glob(os.path.join(_RES_DIR, "*.txt")) + glob.glob("*.txt"))
               if _own(p)]
     fp = _valid_fingerprint() + tuple(sorted(
@@ -2179,7 +2543,7 @@ def should_blacklist_message(msg, blacklist_input) -> bool:
 
 # @@BLOCK 026 SEARCH_AND_FETCH deps=025
 def execute_imap_search_safely(mail, field_cmd: str, query_term: str, log_func):
-    # v13.40: only quotes were escaped; ( ) { } \ broke the command outright.
+    # only quotes were escaped; ( ) { } \ broke the command outright.
     clean_q = re.sub(r'([\\(){}"\[\]])', r'\\\1', query_term).strip()
     f_cmd = field_cmd.upper()
 
@@ -2209,16 +2573,19 @@ def execute_imap_search_safely(mail, field_cmd: str, query_term: str, log_func):
             matched_ids = []
             q_lower = query_term.lower()
 
+            # TEXT asked for BODY.PEEK[] - the whole message, headers,
+            # attachments and all - for every chunk. BODY.PEEK[TEXT] is the part
+            # the match is actually run against, and a fraction of the size.
             if f_cmd == "SUBJECT":
                 fetch_query = "(BODY.PEEK[HEADER.FIELDS (SUBJECT)])"
             elif f_cmd == "FROM":
                 fetch_query = "(BODY.PEEK[HEADER.FIELDS (FROM)])"
-            elif f_cmd == "BODY":
-                fetch_query = "(BODY.PEEK[TEXT])"
             else:
-                fetch_query = "(BODY.PEEK[])"
+                fetch_query = "(BODY.PEEK[TEXT])"
 
-            chunk_size = 100
+            # 100 -> 250. The whole folder is walked either way; the chunk size
+            # only changes the number of round trips.
+            chunk_size = 250
             for i in range(0, len(all_ids), chunk_size):
                 chunk_ids = all_ids[i:i + chunk_size]
                 id_range_bytes = b",".join(chunk_ids)
@@ -2230,7 +2597,6 @@ def execute_imap_search_safely(mail, field_cmd: str, query_term: str, log_func):
                             if isinstance(item, tuple) and len(item) >= 2:
                                 header_str = item[0].decode("utf-8", errors="ignore")
                                 content_bytes = item[1].decode("utf-8", errors="ignore")
-                                # v13.43: raw substring made 'pin' match 'shipping'.
                                 if _has_word(content_bytes.lower(), [q_lower]):
                                     mid_match = re.search(r'^(\d+)', header_str.strip())
                                     if mid_match:
@@ -2247,11 +2613,7 @@ def execute_imap_search_safely(mail, field_cmd: str, query_term: str, log_func):
     return "NO", [b""]
 
 def html_to_text(raw_html: str) -> str:
-    """Minimal, dependency-free HTML -> text for HTML-only mail.
-
-    v13.40: only text/plain was read, so HTML-only mail produced an empty body
-    and every OTP / card / credential regex missed it.
-    """
+    """Minimal, dependency-free HTML -> text for HTML-only mail."""
     if not raw_html:
         return ""
     s = re.sub(r"(?is)<(script|style)\b.*?</\1>", " ", raw_html)
@@ -2297,209 +2659,219 @@ def fetch_messages_paginated(mail, email_addr, password_val, host_val, target_fo
 
     total_matched_all_folders = 0
 
-    # ------------------------------------------------------------------
-    # PHASE 1 - collect every matching (folder, id) across the whole scope,
-    # so pagination is GLOBAL.  v13.40: slicing inside the folder loop gave
-    # page_size rows per folder (3 folders x 15 = 45 rows on "page 1") while
-    # the pager counted the sum, so pages overlapped and repeated.
-    # ------------------------------------------------------------------
-    collected = []
-    for f_label in target_folders:
-        real_imap_folder = get_imap_path(f_label)
-        real_imap_encoded = encode_imap_utf7(real_imap_folder)
-        log_func(f"\n📂 [PROCESSING FOLDER] Label='{f_label}' -> IMAP Path='{real_imap_folder}' (Encoded: '{real_imap_encoded}')")
-
-        try:
-            sel_typ, sel_data = mail.select(f'"{real_imap_encoded}"', readonly=True)
-            log_func(f"  ├─ [IMAP SELECT] Status: '{sel_typ}' | Response: {sel_data}")
-
-            if sel_typ != "OK":
-                log_func(f"  └─ ⚠️ Skipped folder '{f_label}': Failed to select IMAP path.")
-                continue
-
-            if mode == "FOLDER_ONLY" or not clean_query:
-                log_func("  ├─ [EXECUTING COMMAND] mail.search(None, 'ALL')")
-                typ, data = mail.search(None, "ALL")
-            else:
-                field_cmd = search_field if search_field in ("TEXT", "SUBJECT", "FROM", "BODY") else "TEXT"
-                terms = clean_query.split()
-
-                if len(terms) > 1:
-                    # v13.40: terms[:10] silently dropped the tail of the preset list.
-                    max_terms = 25
-                    log_func(f"  ├─ [MULTI-TERM SEARCH] Query has {len(terms)} keywords, using the first {min(len(terms), max_terms)}. Executing individual IMAP fetches...")
-                    matched_ids_set = set()
-                    for t_idx, term in enumerate(terms[:max_terms], 1):
-                        log_func(f"  │   ├─ [Term #{t_idx}/{min(len(terms), max_terms)}]: '{term}'")
-                        sub_typ, sub_data = execute_imap_search_safely(mail, field_cmd, term, log_func)
-                        if sub_typ in ("OK", "OK_FALLBACK") and sub_data and sub_data[0]:
-                            found_ids = (sub_data[0] or b"").split()
-                            matched_ids_set.update(found_ids)
-                            log_func(f"  │   └─ Matches for '{term}': {len(found_ids)} IDs")
-                    typ = "OK"
-                    data = [b" ".join(sorted(matched_ids_set, key=lambda x: int(x)))]
-                else:
-                    log_func(f"  ├─ [SINGLE-TERM SEARCH] Querying term: '{clean_query}' via field '{field_cmd}'")
-                    typ, data = execute_imap_search_safely(mail, field_cmd, clean_query, log_func)
-
-            log_func(f"  ├─ [IMAP SEARCH RESPONSE] Status: '{typ}' | Raw Bytes: {data}")
-            ids = (data[0] or b"").split() if typ in ("OK", "OK_FALLBACK") and data else []
-
-            if sort_order == "Newest First":
-                ids = list(reversed(ids))
-
-            log_func(f"  ├─ [FOLDER MATCHES] '{f_label}' returned {len(ids)} IDs.")
-            for mid in ids:
-                collected.append((f_label, mid))
-
-        except (socket.timeout, TimeoutError):
-            log_func(f"  └─ ❌ [TIMEOUT ERROR] Folder '{f_label}' timed out during IMAP search.")
-        except MsVerdict as mv:
-            log_func(f"  └─ ❌ [MICROSOFT VERDICT] {mv.verdict}: {mv.detail}")
-            raise
-        except Exception as ex:
-            log_func(f"  └─ ❌ [EXCEPTION ERROR] Querying folder '{f_label}' failed: {ex}")
-
-    total_matched_all_folders = len(collected)
-
-    # ------------------------------------------------------------------
-    # PHASE 2 - one global slice, clamped so an out-of-range page still shows
-    # something instead of a blank screen.
-    # ------------------------------------------------------------------
-    total_pages_here = max(1, math.ceil(total_matched_all_folders / max(1, page_size)))
-    page_number = max(1, min(int(page_number or 1), total_pages_here))
-    start_idx = (page_number - 1) * page_size
-    end_idx = start_idx + page_size
-    target_slice = collected[start_idx:end_idx]
-
-    log_func(f"  ├─ [PAGINATION RANGE] Global matches: {total_matched_all_folders} | Page {page_number}/{total_pages_here} | Slice ({start_idx}:{end_idx}) = {len(target_slice)} IDs")
-
-    last_sel = None
-    for idx, (f_label, mid) in enumerate(target_slice, 1):
-        try:
+    # The cache writer is held off for the whole loop. save_session_cache()
+    # serialises up to 40 messages WITH base64 raw blobs; letting log() trigger it
+    # mid-fetch is what made a search appear to hang. _cache_resume() writes ONCE
+    # in the finally below, so there is no explicit save at the end.
+    _cache_pause()
+    try:
+        # ------------------------------------------------------------------
+        # PHASE 1 - collect every matching (folder, id) across the whole scope,
+        # so pagination is GLOBAL. Slicing inside the folder loop gave page_size
+        # rows per folder (3 folders x 15 = 45 rows on "page 1") while the pager
+        # counted the sum, so pages overlapped and repeated.
+        # ------------------------------------------------------------------
+        collected = []
+        for f_label in target_folders:
             real_imap_folder = get_imap_path(f_label)
             real_imap_encoded = encode_imap_utf7(real_imap_folder)
+            log_func(f"\n📂 [PROCESSING FOLDER] Label='{f_label}' -> IMAP Path='{real_imap_folder}' (Encoded: '{real_imap_encoded}')")
 
-            # v13.41: the return was ignored, so a folder that failed to open
-            # had its messages fetched from whatever was selected before it.
-            # Also skip the re-select while the folder has not changed.
-            if last_sel != real_imap_encoded:
+            try:
                 sel_typ, sel_data = mail.select(f'"{real_imap_encoded}"', readonly=True)
+                log_func(f"  ├─ [IMAP SELECT] Status: '{sel_typ}' | Response: {sel_data}")
+
                 if sel_typ != "OK":
-                    log_func(f"  │   ├─ [Msg ID #{mid.decode()}] ⚠️ SELECT '{f_label}' failed "
-                             f"({sel_typ} {sel_data}) - skipped.")
-                    last_sel = None
+                    log_func(f"  └─ ⚠️ Skipped folder '{f_label}': Failed to select IMAP path.")
                     continue
-                last_sel = real_imap_encoded
 
-            msg_start = time.time()
-
-            # v13.40: BODYSTRUCTURE/ENVELOPE were requested and never parsed.
-            # Cap the body at 256 KB so one huge mail cannot stall the page.
-            typ, msgdata = mail.fetch(mid, "(FLAGS BODY.PEEK[]<0.262144>)")
-
-            if not msgdata or not isinstance(msgdata[0], tuple):
-                log_func(f"  │   ├─ [Msg ID #{mid.decode()}] ⚠️ FETCH returned empty structure.")
-                continue
-
-            raw_msg_bytes = msgdata[0][1]
-            msg = message_from_bytes(raw_msg_bytes)
-            subject = decode_hdr(msg.get("Subject", ""))
-            frm = decode_hdr(msg.get("From", ""))
-            to_hdr = decode_hdr(msg.get("To", ""))
-            date_val = decode_hdr(msg.get("Date", ""))
-            flags_str = str(msgdata[0][0])
-            is_read = "\\Seen" in flags_str
-
-            # v13.40: text/plain only, so HTML-only mail yielded an empty body.
-            body_text, html_text = "", ""
-            if msg.is_multipart():
-                for part in msg.walk():
-                    ctype = part.get_content_type()
-                    if ctype == "text/plain" and not body_text:
-                        body_text = _part_text(part)
-                    elif ctype == "text/html" and not html_text:
-                        html_text = _part_text(part)
-            else:
-                _single = _part_text(msg)
-                if msg.get_content_type() == "text/html":
-                    html_text = _single
+                if mode == "FOLDER_ONLY" or not clean_query:
+                    log_func("  ├─ [EXECUTING COMMAND] mail.search(None, 'ALL')")
+                    typ, data = mail.search(None, "ALL")
                 else:
-                    body_text = _single
-            if not body_text.strip() and html_text:
-                body_text = html_to_text(html_text)
+                    field_cmd = search_field if search_field in ("TEXT", "SUBJECT", "FROM", "BODY") else "TEXT"
+                    terms = clean_query.split()
 
-            if is_extortion_spam(subject, body_text, frm):
-                log_func(f"  │   ├─ [Msg ID #{mid.decode()}] ⚠️ EXCLUDED: Extortion / Ransom Spam detected.")
-                continue
+                    if len(terms) > 1:
+                        # 25 -> 60. The preset keyword lists are ~15 terms and a
+                        # custom override can be longer; the tail was dropped
+                        # without a word.
+                        max_terms = 60
+                        log_func(f"  ├─ [MULTI-TERM SEARCH] Query has {len(terms)} keywords, using the first {min(len(terms), max_terms)}. Executing individual IMAP fetches...")
+                        matched_ids_set = set()
+                        for t_idx, term in enumerate(terms[:max_terms], 1):
+                            log_func(f"  │   ├─ [Term #{t_idx}/{min(len(terms), max_terms)}]: '{term}'")
+                            sub_typ, sub_data = execute_imap_search_safely(mail, field_cmd, term, log_func)
+                            if sub_typ in ("OK", "OK_FALLBACK") and sub_data and sub_data[0]:
+                                found_ids = (sub_data[0] or b"").split()
+                                matched_ids_set.update(found_ids)
+                                log_func(f"  │   └─ Matches for '{term}': {len(found_ids)} IDs")
+                        typ = "OK"
+                        data = [b" ".join(sorted(matched_ids_set, key=lambda x: int(x)))]
+                    else:
+                        log_func(f"  ├─ [SINGLE-TERM SEARCH] Querying term: '{clean_query}' via field '{field_cmd}'")
+                        typ, data = execute_imap_search_safely(mail, field_cmd, clean_query, log_func)
 
-            cleaned_body = clean_boilerplate(body_text)
-            pins, links = extract_pins_and_links(body_text)
-            if st.session_state.get("otp_regex_chk", True):
-                cards, creds = extract_credentials_and_cards(body_text)
-            else:
-                cards, creds = [], []
-            detected_categories = detect_specific_categories(subject, body_text, frm, pins, cards, creds)
-            is_bot = len(detected_categories) > 0
+                log_func(f"  ├─ [IMAP SEARCH RESPONSE] Status: '{typ}' | Raw Bytes: {data}")
+                ids = (data[0] or b"").split() if typ in ("OK", "OK_FALLBACK") and data else []
 
-            messages.append({
-                "id": mid.decode(),
-                "folder": f_label,
-                "from": frm,
-                "to": to_hdr,
-                "subject": subject,
-                "date": date_val,
-                "is_read": is_read,
-                "is_bot": is_bot,
-                "categories": detected_categories,
-                "body": cleaned_body,
-                "body_raw": body_text,
-                "pins": pins,
-                "links": links,
-                "cards": cards,
-                "creds": creds,
-                "raw": raw_msg_bytes,
-                "flags": flags_str,
-                "size_bytes": len(raw_msg_bytes)
-            })
+                if sort_order == "Newest First":
+                    ids = list(reversed(ids))
 
-            fetch_elapsed = round((time.time() - msg_start) * 1000, 2)
-            log_func(
-                f"  │   ├─ [Msg #{idx} | ID: {mid.decode()}] Parsed in {fetch_elapsed}ms | Size: {len(raw_msg_bytes)}B | "
-                f"From: '{frm}' | To: '{to_hdr}' | Subject: '{subject}' | "
-                f"Flags: {flags_str} | Categories={detected_categories} | Pins={pins} | Cards={cards}"
-            )
+                log_func(f"  ├─ [FOLDER MATCHES] '{f_label}' returned {len(ids)} IDs.")
+                for mid in ids:
+                    collected.append((f_label, mid))
 
-        except (socket.timeout, TimeoutError):
-            log_func(f"  │   └─ ❌ [TIMEOUT ERROR] Message {mid!r} in '{f_label}' timed out.")
-        except MsVerdict as mv:
-            log_func(f"  │   └─ ❌ [MICROSOFT VERDICT] {mv.verdict}: {mv.detail}")
-            raise
-        except Exception as ex:
-            log_func(f"  │   └─ ❌ [EXCEPTION ERROR] Message {mid!r} in '{f_label}' failed: {ex}")
+            except (socket.timeout, TimeoutError):
+                log_func(f"  └─ ❌ [TIMEOUT ERROR] Folder '{f_label}' timed out during IMAP search.")
+            except MsVerdict as mv:
+                log_func(f"  └─ ❌ [MICROSOFT VERDICT] {mv.verdict}: {mv.detail}")
+                raise
+            except Exception as ex:
+                log_func(f"  └─ ❌ [EXCEPTION ERROR] Querying folder '{f_label}' failed: {ex}")
 
-    total_elapsed = round(time.time() - start_time, 2)
+        total_matched_all_folders = len(collected)
 
-    # v13.41: the pager must count MATCHES, not the rows on this page.  v13.40
-    # stored len(messages) for SEARCH mode, so total_pages was always 1 and the
-    # Next Page button in the OTP scanner and Deep Search was permanently dead.
-    # The true match total drives the pager; the page row count is stored
-    # separately so the header can show the post-filter reality.
-    page_rows = len(messages)
-    if log_target == "SEARCH":
-        st.session_state.search_total_matched_count = total_matched_all_folders
-        st.session_state.search_page_rows = page_rows
-    elif log_target == "OTP":
-        st.session_state.otp_total_matched_count = total_matched_all_folders
-        st.session_state.otp_page_rows = page_rows
-    else:
-        st.session_state.total_matched_count = total_matched_all_folders
-        st.session_state.stream_page_rows = page_rows
+        # ------------------------------------------------------------------
+        # PHASE 2 - one global slice, clamped so an out-of-range page still shows
+        # something instead of a blank screen.
+        # ------------------------------------------------------------------
+        total_pages_here = max(1, math.ceil(total_matched_all_folders / max(1, page_size)))
+        page_number = max(1, min(int(page_number or 1), total_pages_here))
+        start_idx = (page_number - 1) * page_size
+        end_idx = start_idx + page_size
+        target_slice = collected[start_idx:end_idx]
 
-    save_session_cache()
-    log_func(f"\n🏁 [ENGINE COMPLETE] Page messages: {page_rows} | Global matches: "
-             f"{total_matched_all_folders} | Execution time: {total_elapsed}s")
-    return messages
+        log_func(f"  ├─ [PAGINATION RANGE] Global matches: {total_matched_all_folders} | Page {page_number}/{total_pages_here} | Slice ({start_idx}:{end_idx}) = {len(target_slice)} IDs")
+
+        last_sel = None
+        for idx, (f_label, mid) in enumerate(target_slice, 1):
+            try:
+                real_imap_folder = get_imap_path(f_label)
+                real_imap_encoded = encode_imap_utf7(real_imap_folder)
+
+                # the return was ignored, so a folder that failed to open had its
+                # messages fetched from whatever was selected before it.
+                if last_sel != real_imap_encoded:
+                    sel_typ, sel_data = mail.select(f'"{real_imap_encoded}"', readonly=True)
+                    if sel_typ != "OK":
+                        log_func(f"  │   ├─ [Msg ID #{mid.decode()}] ⚠️ SELECT '{f_label}' failed "
+                                 f"({sel_typ} {sel_data}) - skipped.")
+                        last_sel = None
+                        continue
+                    last_sel = real_imap_encoded
+
+                msg_start = time.time()
+
+                # NO PARTIAL FETCH. BODY.PEEK[]<0.262144> cut every message at
+                # 256 KB, so the body view was short, the regexes missed whatever
+                # followed, and mailview had to dial the server again to complete
+                # it. One full fetch here costs less than that second round trip
+                # and removes the truncation outright.
+                typ, msgdata = mail.fetch(mid, "(FLAGS BODY.PEEK[])")
+
+                if not msgdata or not isinstance(msgdata[0], tuple):
+                    log_func(f"  │   ├─ [Msg ID #{mid.decode()}] ⚠️ FETCH returned empty structure.")
+                    continue
+
+                raw_msg_bytes = msgdata[0][1]
+                msg = message_from_bytes(raw_msg_bytes)
+                subject = decode_hdr(msg.get("Subject", ""))
+                frm = decode_hdr(msg.get("From", ""))
+                to_hdr = decode_hdr(msg.get("To", ""))
+                date_val = decode_hdr(msg.get("Date", ""))
+                flags_str = str(msgdata[0][0])
+                is_read = "\\Seen" in flags_str
+
+                body_text, html_text = "", ""
+                if msg.is_multipart():
+                    for part in msg.walk():
+                        ctype = part.get_content_type()
+                        if ctype == "text/plain" and not body_text:
+                            body_text = _part_text(part)
+                        elif ctype == "text/html" and not html_text:
+                            html_text = _part_text(part)
+                else:
+                    _single = _part_text(msg)
+                    if msg.get_content_type() == "text/html":
+                        html_text = _single
+                    else:
+                        body_text = _single
+                if not body_text.strip() and html_text:
+                    body_text = html_to_text(html_text)
+
+                # extortion mail is TAGGED now, not dropped. It used to be
+                # `continue`d, so a ransom mail appeared in no stream at all.
+                _extortion = is_extortion_spam(subject, body_text, frm)
+
+                cleaned_body = clean_boilerplate(body_text)
+                pins, links = extract_pins_and_links(body_text)
+                if st.session_state.get("otp_regex_chk", True):
+                    cards, creds = extract_credentials_and_cards(body_text)
+                else:
+                    cards, creds = [], []
+                detected_categories = detect_specific_categories(subject, body_text, frm, pins, cards, creds)
+                if _extortion and "🕵️ EXTORTION / RANSOM" not in detected_categories:
+                    detected_categories.append("🕵️ EXTORTION / RANSOM")
+                is_bot = len(detected_categories) > 0
+
+                messages.append({
+                    "id": mid.decode(),
+                    "folder": f_label,
+                    "from": frm,
+                    "to": to_hdr,
+                    "subject": subject,
+                    "date": date_val,
+                    "is_read": is_read,
+                    "is_bot": is_bot,
+                    "categories": detected_categories,
+                    "body": cleaned_body,
+                    "body_raw": body_text,
+                    "pins": pins,
+                    "links": links,
+                    "cards": cards,
+                    "creds": creds,
+                    "raw": raw_msg_bytes,
+                    "flags": flags_str,
+                    "size_bytes": len(raw_msg_bytes)
+                })
+
+                fetch_elapsed = round((time.time() - msg_start) * 1000, 2)
+                log_func(
+                    f"  │   ├─ [Msg #{idx} | ID: {mid.decode()}] Parsed in {fetch_elapsed}ms | Size: {len(raw_msg_bytes)}B | "
+                    f"From: '{frm}' | To: '{to_hdr}' | Subject: '{subject}' | "
+                    f"Flags: {flags_str} | Categories={detected_categories} | Pins={pins} | Cards={cards}"
+                )
+
+            except (socket.timeout, TimeoutError):
+                log_func(f"  │   └─ ❌ [TIMEOUT ERROR] Message {mid!r} in '{f_label}' timed out.")
+            except MsVerdict as mv:
+                log_func(f"  │   └─ ❌ [MICROSOFT VERDICT] {mv.verdict}: {mv.detail}")
+                raise
+            except Exception as ex:
+                log_func(f"  │   └─ ❌ [EXCEPTION ERROR] Message {mid!r} in '{f_label}' failed: {ex}")
+
+        total_elapsed = round(time.time() - start_time, 2)
+
+        # The pager must count MATCHES, not the rows on this page. The true match
+        # total drives the pager; the page row count is stored separately so the
+        # header can show the post-filter reality.
+        page_rows = len(messages)
+        if log_target == "SEARCH":
+            st.session_state.search_total_matched_count = total_matched_all_folders
+            st.session_state.search_page_rows = page_rows
+        elif log_target == "OTP":
+            st.session_state.otp_total_matched_count = total_matched_all_folders
+            st.session_state.otp_page_rows = page_rows
+        else:
+            st.session_state.total_matched_count = total_matched_all_folders
+            st.session_state.stream_page_rows = page_rows
+
+        log_func(f"\n🏁 [ENGINE COMPLETE] Page messages: {page_rows} | Global matches: "
+                 f"{total_matched_all_folders} | Execution time: {total_elapsed}s")
+        return messages
+    finally:
+        _cache_resume()
 # @@END 026 SEARCH_AND_FETCH
 
 
@@ -2537,19 +2909,42 @@ with st.expander("🗑️ Account Deletion Manager", expanded=False):
     clean_valid_accounts_list = valid_combos(valid)
 
     if clean_valid_accounts_list:
+        # The mode selectbox is validated before it is built. Its options are
+        # static, so a bad key can only arrive from a stale session, but the
+        # check costs one comparison and removes the class of error entirely.
+        _DEL_MODES = ["-- Choose Action --", "Delete Selected Valid Account(s)", "Delete ALL Valid Accounts"]
+        if st.session_state.get("del_action_mode_sel") not in _DEL_MODES:
+            st.session_state["del_action_mode_sel"] = _DEL_MODES[0]
+
         del_action_mode = st.selectbox(
             "Select Deletion Mode",
-            ["-- Choose Action --", "Delete Selected Valid Account(s)", "Delete ALL Valid Accounts"],
+            _DEL_MODES,
             key="del_action_mode_sel"
         )
 
         if del_action_mode == "Delete Selected Valid Account(s)":
             if "select_all_accounts_chk" not in st.session_state:
-                st.session_state.select_all_accounts_chk = False
+                st.session_state["select_all_accounts_chk"] = False
+
+            # v13.56: THE MULTISELECT USED TO OUTLIVE ITS OWN OPTIONS.
+            # `accounts_to_del_multiselect` keeps its values across a rerun while
+            # clean_valid_accounts_list shrinks by whatever was just deleted, and
+            # st.multiselect raises "Every Multiselect default value must exist in
+            # options" when a stored value is no longer offered. Pruning here is
+            # legal because neither widget below exists yet this run.
+            _del_stored = st.session_state.get("accounts_to_del_multiselect")
+            if not isinstance(_del_stored, list):
+                st.session_state["accounts_to_del_multiselect"] = []
+            else:
+                _del_kept = [a for a in _del_stored if a in clean_valid_accounts_list]
+                if _del_kept != _del_stored:
+                    st.session_state["accounts_to_del_multiselect"] = _del_kept
+                    # the selection is now partial, so Select All would be lying
+                    st.session_state["select_all_accounts_chk"] = False
 
             def toggle_select_all():
                 if st.session_state.select_all_accounts_chk:
-                    st.session_state.accounts_to_del_multiselect = clean_valid_accounts_list
+                    st.session_state.accounts_to_del_multiselect = list(clean_valid_accounts_list)
                 else:
                     st.session_state.accounts_to_del_multiselect = []
 
@@ -2681,21 +3076,47 @@ if clean_download_lines:
 with st.sidebar.expander("⚙️ App Configuration Settings", expanded=False):
     cfg = st.session_state.app_config
 
-    new_timeout = st.number_input("Connection Timeout (seconds)", min_value=5, max_value=300, value=cfg.get("connection_timeout", 15))
-    new_port = st.number_input("Default IMAP Port", min_value=1, max_value=65535, value=cfg.get("imap_port", 993))
-    new_fallback = st.checkbox("Enable Auto-Fallback Host Probing (Spectrum/Charter/TWC)", value=cfg.get("auto_fallback_probing", True))
+    # Every field is seeded and created key-only. They had NO key, so an edit
+    # vanished on the next rerun before the Save button could see it, and value=
+    # plus a key would warn once the key is seeded.
+    # Both numbers are clamped into the widget range at seed time: a hand-edited
+    # app_config.json holding 999 or port 0 would otherwise raise inside
+    # st.number_input before the panel could render.
+    if "cfg_timeout" not in st.session_state:
+        try:
+            _t = int(cfg.get("connection_timeout", 15))
+        except (TypeError, ValueError):
+            _t = 15
+        st.session_state["cfg_timeout"] = max(5, min(300, _t))
+    if "cfg_port" not in st.session_state:
+        try:
+            _p = int(cfg.get("imap_port", 993))
+        except (TypeError, ValueError):
+            _p = 993
+        st.session_state["cfg_port"] = max(1, min(65535, _p))
+    if "cfg_fallback" not in st.session_state:
+        st.session_state["cfg_fallback"] = bool(cfg.get("auto_fallback_probing", True))
+    if "cfg_starttls" not in st.session_state:
+        st.session_state["cfg_starttls"] = bool(cfg.get("try_starttls", True))
+    if "cfg_altuser" not in st.session_state:
+        st.session_state["cfg_altuser"] = bool(cfg.get("try_alt_username", True))
+    if "cfg_selfsigned" not in st.session_state:
+        st.session_state["cfg_selfsigned"] = bool(cfg.get("allow_self_signed", True))
+
+    new_timeout = st.number_input("Connection Timeout (seconds)", min_value=5, max_value=300, key="cfg_timeout")
+    new_port = st.number_input("Default IMAP Port", min_value=1, max_value=65535, key="cfg_port")
+    new_fallback = st.checkbox("Enable Auto-Fallback Host Probing (Spectrum/Charter/TWC)", key="cfg_fallback")
     new_starttls = st.checkbox(
         "Try STARTTLS upgrade on port 143 (plaintext 143 still tried either way)",
-        value=cfg.get("try_starttls", True),
+        key="cfg_starttls",
         help="Ticked: the ladder is implicit-TLS on the configured port, then STARTTLS on 143, "
              "then cleartext 143. Unticked: the STARTTLS rung is skipped entirely, but the "
              "cleartext 143 rung still runs so legacy servers stay reachable."
     )
-    new_altuser = st.checkbox("Try local-part username on auth failure", value=cfg.get("try_alt_username", True))
-    # v13.39: allow_self_signed existed in app_config.json and was read by nothing.
+    new_altuser = st.checkbox("Try local-part username on auth failure", key="cfg_altuser")
     new_selfsigned = st.checkbox(
         "Allow self-signed / expired certificates",
-        value=cfg.get("allow_self_signed", True),
+        key="cfg_selfsigned",
         help="Untick to require a valid, hostname-matching certificate. This setting was in the "
              "config file but the page hardcoded verify=False in both the implicit and STARTTLS rung, "
              "so it could never take effect."
@@ -2709,7 +3130,8 @@ with st.sidebar.expander("⚙️ App Configuration Settings", expanded=False):
         st.session_state.app_config["try_alt_username"] = new_altuser
         st.session_state.app_config["allow_self_signed"] = new_selfsigned
         save_app_config(st.session_state.app_config)
-        st.success("App configuration updated and saved globally!")
+        flash("App configuration updated and saved.")
+        st.rerun()
 # @@END 031 SIDEBAR_CONFIG
 
 
@@ -3280,15 +3702,39 @@ if st.button("Connect & Discover Folders", type="primary", width="stretch"):
 # @@BLOCK 037 FOLDER_LOGS_AND_CONTROLS deps=036
 if st.session_state.folder_debug_logs:
     with st.expander("🛠️ Folder Discovery Diagnostic Traces", expanded=False):
-        st.code("\n".join(st.session_state.folder_debug_logs), language="text")
+        st.code(diag_text("folder_debug_logs"), language="text")
+
+# The folder selectbox and the page-size slider had NO key, so they reset to the
+# first folder and 15 rows on every rerun - let alone a reload. Both are keyed,
+# restored, and validated against the live folder list (a restored folder that is
+# no longer listed would raise).
+_folders_now = st.session_state.get("mb_folders") or ["INBOX"]
+if st.session_state.get("folder_sel") not in _folders_now:
+    st.session_state["folder_sel"] = _folders_now[0]
+
+_ps_pending = st.session_state.pop("_pending_page_size", None)
+if isinstance(_ps_pending, int):
+    st.session_state["page_size_sel"] = max(5, min(200, _ps_pending))
+
+if st.session_state.get("sort_order_sel") not in ("Newest First", "Oldest First"):
+    st.session_state["sort_order_sel"] = "Newest First"
+if not isinstance(st.session_state.get("page_size_sel"), int):
+    st.session_state["page_size_sel"] = 15
 
 col1, col2, col3 = st.columns([2, 1, 1])
 with col1:
-    folder = st.selectbox("Select Mail Folder", st.session_state.mb_folders)
+    folder = st.selectbox("Select Mail Folder", _folders_now, key="folder_sel")
 with col2:
-    page_size = st.slider("Page size", 5, 200, 15)
+    page_size = st.slider("Page size", 5, 200, key="page_size_sel")
 with col3:
-    sort_order = st.selectbox("Sort Order", ["Newest First", "Oldest First"])
+    sort_order = st.selectbox("Sort Order", ["Newest First", "Oldest First"], key="sort_order_sel")
+
+# The stream pager reads this; keep it in step with the slider.
+st.session_state["stream_page_size"] = page_size
+
+# Focus the mail scope (account | folder | mode | page). A change clears the
+# previous mail's body edits and restores this one's.
+_reader_scope_apply(f"{active_email}|{folder}|FOLDER|{st.session_state.get('current_page', 1)}")
 
 if st.button("📂 Load Folder Messages", type="primary", width="stretch"):
     host = resolve_active_host(active_email)
@@ -3304,8 +3750,6 @@ if st.button("📂 Load Folder Messages", type="primary", width="stretch"):
                 )
                 st.session_state.current_messages = msgs
                 st.session_state.current_page = 1
-                st.session_state.bot_filter_mode = False
-                st.session_state.stream_page_size = page_size
                 save_session_cache()
                 log(f"Loaded {len(msgs)} messages from folder '{folder}'.")
                 flash(f"Loaded {len(msgs)} messages from '{folder}'.")
@@ -3318,13 +3762,7 @@ if st.button("📂 Load Folder Messages", type="primary", width="stretch"):
 # @@BLOCK 038 MAIN_STREAM deps=037
 def _reader_reload_page(page_no, folders, mode, page_size, sort_order, log_target,
                         bucket, query="", field="TEXT"):
-    """Re-fetch one page for a pager button.
-
-    FIX PG-1 (v13.50): the six pager buttons called get_active_mail() with no
-    guard. Messages survive a session reset (tab backgrounded, WebSocket drop,
-    redeploy) while active_mail does not, so clicking Next on a restored stream
-    raised inside open_mail("", "", "") and printed a raw traceback.
-    """
+    """Re-fetch one page for a pager button."""
     host = resolve_active_host(active_email)
     if not active_email or not active_password or not host:
         st.error("Reconnect first - this session lost its mailbox (restored tab, "
@@ -3344,14 +3782,23 @@ def _reader_reload_page(page_no, folders, mode, page_size, sort_order, log_targe
     st.rerun()
 
 
-# v13.52: one switch for the whole page. Off = no pixel ever calls home, which
-# is what you want while triaging someone else's mailbox.
+# One switch for the whole page. Off = no pixel ever calls home.
 if "mv_remote" not in st.session_state:
     st.session_state["mv_remote"] = False
 _mv_remote = st.checkbox(
     "Load remote images in HTML view (tracking pixels fire)", key="mv_remote",
     help="Inline cid: images are always shown - they are embedded in the message "
-         "itself. This switch is only about images hosted on the sender's server.")
+         "itself. This switch is only about images hosted on the sender's server. "
+         "While this is ON every message renders as HTML, not text.")
+
+# The global view mode. It was a per-message radio defaulting to Text, so "load
+# remote images" changed nothing on screen and every row needed its own click.
+# Persisted, and forced to HTML while the remote switch is on.
+if st.session_state.get("mv_view") not in ("Text", "HTML"):
+    st.session_state["mv_view"] = "HTML" if _mv_remote else "Text"
+_mv_view = st.radio("Message view", ["Text", "HTML"], horizontal=True, key="mv_view")
+if _mv_remote:
+    _mv_view = "HTML"
 
 
 def _mv_mail():
@@ -3361,41 +3808,42 @@ def _mv_mail():
 
 
 # Main Message Stream
-_bot_mode = bool(st.session_state.bot_filter_mode)
-if _bot_mode:
-    active_msgs = [m for m in st.session_state.current_messages if m["is_bot"]]
-    st.info("⚠️ Message stream is currently filtered to show DETECTED BOT/SPAM/TELEGRAM/BLACKLIST MESSAGES ONLY.")
+# THE STREAM DOES NOT FILTER. It is the main stream - everything loaded is shown.
+# The bot filter is an opt-in checkbox, default OFF, and a bot scan no longer
+# forces it on.
+bot_only = st.checkbox(
+    "Show only detected bot / OTP / Telegram messages", key="bot_filter_mode",
+    help="Off = every loaded message. On = only rows already classified as bot "
+         "traffic. Nothing is removed from the mailbox either way.")
+
+if bot_only:
+    active_msgs = [m for m in st.session_state.current_messages if m.get("is_bot")]
+    st.info("🤖 Stream filtered to detected bot / Telegram / blacklist rows. Untick the box for everything.")
 else:
     active_msgs = st.session_state.current_messages
 
-# v13.41: in bot mode total_msgs was len(active_msgs) - the PAGE slice - so
-# total_pages was always 1 and both pager buttons were dead. The pager is driven
-# by the server match total; the bot count on this page is reported separately.
-if _bot_mode:
-    page_size = st.session_state.get("stream_page_size", page_size)
-    total_msgs = st.session_state.total_matched_count or len(active_msgs)
-    st.caption(f"🤖 {sum(1 for m in active_msgs if m.get('is_bot'))} bot message(s) on this page "
-               f"of {len(active_msgs)} loaded. Filtering is applied per page, so a page can be short.")
-else:
-    total_msgs = st.session_state.total_matched_count or len(active_msgs)
+page_size = max(5, min(200, int(st.session_state.get("stream_page_size") or page_size)))
+total_msgs = st.session_state.total_matched_count or len(active_msgs)
+
+if bot_only:
+    st.caption(f"🤖 {sum(1 for m in active_msgs if m.get('is_bot'))} bot row(s) on this page of "
+               f"{len(active_msgs)} loaded. Filtering is per page, so a page can look short.")
 
 if len(active_msgs) > 0 or total_msgs > 0:
     st.markdown("---")
 
     total_pages = max(1, math.ceil(total_msgs / max(1, page_size)))
-    # v13.40: an out-of-range counter disabled both pager buttons and stranded
-    # the user on an empty page.
     curr_p = max(1, min(int(st.session_state.current_page or 1), total_pages))
     st.session_state.current_page = curr_p
 
     with st.expander(f"✉️ Main Message Stream — Page {curr_p} of {total_pages} ({total_msgs} Total Matches)", expanded=False):
         st.markdown(f"**Showing Page {curr_p} of {total_pages} (Total Server Matches: {total_msgs})**")
         if not active_msgs:
-            st.caption("This page is empty — every match here was filtered out or failed to fetch. Use Next / Previous.")
+            st.caption("This page is empty - it failed to fetch, or the bot filter removed every row. Use Next / Previous.")
 
         _rows = st.session_state.get("stream_page_rows")
         if _rows is not None and _rows != total_msgs:
-            st.caption(f"{_rows} of {total_msgs} server matches survived fetch + extortion filtering on this page.")
+            st.caption(f"{_rows} of {total_msgs} server matches survived the fetch on this page.")
 
         for idx, msg in enumerate(active_msgs):
             with st.expander(msg_label(msg, idx), expanded=False):
@@ -3420,19 +3868,13 @@ if len(active_msgs) > 0 or total_msgs > 0:
                         st.markdown(f"- [{link}]({link})", unsafe_allow_html=True)
 
                 st.markdown("---")
-                # FIX W-2 (v13.50): the body box carried BOTH value= and key=, so
-                # every rerun raised "created with a default value but also had its
-                # value set via the Session State API". Seeded instead - the key
-                # still keeps an edit alive across a rerun.
-                # v13.52: mailview renders the real message (text or HTML, inline
-                # cid: images embedded, attachments listed) and falls back to this
-                # same seeded text box when it cannot.
                 _body_key = f"body_{msg['folder']}_{msg['id']}_{idx}"
                 if _body_key not in st.session_state:
                     st.session_state[_body_key] = msg["body"]
                 if mailview is not None and hasattr(mailview, "render_auto"):
                     mailview.render_auto(st, msg, _body_key, _mv_mail,
-                                         allow_remote=_mv_remote)
+                                         allow_remote=_mv_remote, view=_mv_view,
+                                         ns=active_email)
                 else:
                     st.text_area("Cleaned Message Body", height=150, key=_body_key)
 
@@ -3461,7 +3903,7 @@ if len(active_msgs) > 0 or total_msgs > 0:
                         try:
                             m_client = get_active_mail(active_email, active_password, host)
                             move_message(m_client, msg["folder"], msg["id"], target_move)
-                            st.session_state.current_messages.remove(msg)
+                            drop_msg("current_messages", msg)
                             save_session_cache()
                             flash(f"Moved to {target_move}.")
                             st.rerun()
@@ -3476,7 +3918,7 @@ if len(active_msgs) > 0 or total_msgs > 0:
                             m_client.select(f'"{real_imap_encoded}"', readonly=False)
                             m_client.store(msg["id"], '+FLAGS', '\\Deleted')
                             m_client.expunge()
-                            st.session_state.current_messages.remove(msg)
+                            drop_msg("current_messages", msg)
                             save_session_cache()
                             flash("Message deleted.")
                             st.rerun()
@@ -3492,7 +3934,7 @@ if len(active_msgs) > 0 or total_msgs > 0:
 
         with p_col1:
             if st.button("Previous Page", disabled=(curr_p <= 1), width="stretch", key="msg_stream_prev"):
-                st.session_state.current_page -= 1
+                st.session_state.current_page = curr_p - 1
                 _reader_reload_page(st.session_state.current_page, [folder], "FOLDER_ONLY",
                                     page_size, sort_order, "DEBUG", "current_messages")
 
@@ -3501,7 +3943,7 @@ if len(active_msgs) > 0 or total_msgs > 0:
 
         with p_col3:
             if st.button("Next Page", disabled=(curr_p >= total_pages), width="stretch", key="msg_stream_next"):
-                st.session_state.current_page += 1
+                st.session_state.current_page = curr_p + 1
                 _reader_reload_page(st.session_state.current_page, [folder], "FOLDER_ONLY",
                                     page_size, sort_order, "DEBUG", "current_messages")
 # @@END 038 MAIN_STREAM
@@ -3510,13 +3952,16 @@ if len(active_msgs) > 0 or total_msgs > 0:
 # @@BLOCK 039 OTP_SCANNER deps=038
 # Standalone OTP / Debit / Sensitive Data Scanner
 st.markdown("---")
-with st.expander("🔑 Standalone OTP, Debit/Credit Cards & Sensitive Data Scanner", expanded=False):
+# A CHECKBOX, not an expander. An expander's open/closed state is widget state
+# Streamlit throws away on every rerun, so the panel shut itself the moment you
+# touched anything inside it. A checkbox persists (and is written to disk).
+hub_otp_open = st.checkbox(
+    "🔑 Standalone OTP, Debit/Credit Cards & Sensitive Data Scanner", key="hub_otp_open")
+if hub_otp_open:
     st.markdown("#### Dynamic OTP, Password, Debit & Credit Cards, Gift Cards, Telegram & Credential Scanner Controls")
 
-    # FIX W-2 (v13.50): every widget below is SEEDED here and created key-only.
-    # A widget given BOTH a default and a session_state value raises Streamlit's
-    # "created with a default value but also had its value set via the Session
-    # State API" warning on every rerun after the first.
+    # Every widget below is SEEDED and created key-only. A widget given BOTH a
+    # default and a session_state value warns on every rerun after the first.
     if "otp_scan_scope" not in st.session_state:
         st.session_state["otp_scan_scope"] = ["INBOX"]
     if "otp_category_select" not in st.session_state:
@@ -3527,9 +3972,28 @@ with st.expander("🔑 Standalone OTP, Debit/Credit Cards & Sensitive Data Scann
         st.session_state["otp_clean_toggle"] = True
     if "otp_regex_chk" not in st.session_state:
         st.session_state["otp_regex_chk"] = True
+    if "otp_all_folders" not in st.session_state:
+        st.session_state["otp_all_folders"] = False
+    if "otp_custom_kw" not in st.session_state:
+        st.session_state["otp_custom_kw"] = ""
+    if "otp_blacklist_kw" not in st.session_state:
+        st.session_state["otp_blacklist_kw"] = "Telegram, spam, scam, promo"
+    if st.session_state.get("otp_search_field") not in ("TEXT", "SUBJECT", "BODY", "FROM"):
+        st.session_state["otp_search_field"] = "TEXT"
+    if not isinstance(st.session_state.get("otp_page_size_slider"), int):
+        st.session_state["otp_page_size_slider"] = 15
+
+    otp_folder_options = _ui_folder_options()
+    # a restored scope can name a folder this account does not have
+    _otp_scope_keep = [f for f in (st.session_state.get("otp_scan_scope") or []) if f in otp_folder_options]
+    st.session_state["otp_scan_scope"] = _otp_scope_keep or ["INBOX"]
+
+    # "all folders" first, so the key it writes is set before the multiselect
+    # exists.
+    if st.checkbox("Scan every folder in the mailbox", key="otp_all_folders"):
+        st.session_state["otp_scan_scope"] = list(otp_folder_options)
 
     otp_c1, otp_c2, otp_c3 = st.columns([2, 1, 1])
-    otp_folder_options = ["INBOX"] + [f for f in st.session_state.mb_folders if f != "INBOX"]
 
     with otp_c1:
         otp_scope_choice = st.multiselect("Target Folder Scope", otp_folder_options, key="otp_scan_scope")
@@ -3539,6 +4003,8 @@ with st.expander("🔑 Standalone OTP, Debit/Credit Cards & Sensitive Data Scann
             "Order Tracking & Purchase Confirmation", "OTP Message & Verification", "Telegram Alerts & Blacklist",
             "Password / Reset Code", "Gift Cards", "ID Cards / Credentials", "Application Passwords", "Login Info / Info"
         ]
+        _otp_cat_keep = [c for c in (st.session_state.get("otp_category_select") or []) if c in category_options]
+        st.session_state["otp_category_select"] = _otp_cat_keep or ["All Security Categories"]
         otp_scan_category = st.multiselect("Target Data Type Dropdown", category_options, key="otp_category_select")
     with otp_c3:
         otp_search_field = st.selectbox("Scan Field", ["TEXT", "SUBJECT", "BODY", "FROM"], key="otp_search_field")
@@ -3565,8 +4031,10 @@ with st.expander("🔑 Standalone OTP, Debit/Credit Cards & Sensitive Data Scann
         "Login Info / Info": "login details signin info account access"
     }
 
+    # no value= here. The key is seeded above, so a reload restores the edit
+    # instead of resetting the box to the sample string.
     otp_custom_keyword = st.text_input("Custom Keyword Override (Optional)", key="otp_custom_kw")
-    otp_blacklist_input = st.text_input("Blacklist Keywords (comma-separated)", value="Telegram, spam, scam, promo", key="otp_blacklist_kw")
+    otp_blacklist_input = st.text_input("Blacklist Keywords (comma-separated)", key="otp_blacklist_kw")
 
     def _otp_keywords():
         """The keyword string the scan uses - one implementation, three callers."""
@@ -3636,18 +4104,14 @@ with st.expander("🔑 Standalone OTP, Debit/Credit Cards & Sensitive Data Scann
                         st.markdown(f"- [{link}]({link})", unsafe_allow_html=True)
 
                 st.markdown("---")
-                # v13.40: both branches were msg["body"], so the toggle did nothing.
                 display_body = msg["body"] if otp_auto_clean_toggle else msg.get("body_raw", msg["body"])
-                # FIX W-2: seeded, not value= + key=.
-                # v13.52: mailview renders the real message and falls back to this
-                # same seeded box. Its text fallback shows the RAW body, matching
-                # the toggle, because the renderer reads the untouched source.
                 _ob_key = f"otp_b_{msg['folder']}_{msg['id']}_{idx}"
                 if _ob_key not in st.session_state:
                     st.session_state[_ob_key] = display_body
                 if mailview is not None and hasattr(mailview, "render_auto"):
                     mailview.render_auto(st, msg, _ob_key, _mv_mail,
-                                         allow_remote=st.session_state.get("mv_remote", False))
+                                         allow_remote=_mv_remote, view=_mv_view,
+                                         ns=active_email)
                 else:
                     st.text_area("Message Payload Body", height=150, key=_ob_key)
 
@@ -3676,7 +4140,7 @@ with st.expander("🔑 Standalone OTP, Debit/Credit Cards & Sensitive Data Scann
                         try:
                             m_client = get_active_mail(active_email, active_password, host)
                             move_message(m_client, msg["folder"], msg["id"], otp_mv_target)
-                            st.session_state.otp_messages.remove(msg)
+                            drop_msg("otp_messages", msg)
                             save_session_cache()
                             flash(f"Moved to {otp_mv_target}.")
                             st.rerun()
@@ -3690,7 +4154,7 @@ with st.expander("🔑 Standalone OTP, Debit/Credit Cards & Sensitive Data Scann
                             m_client.select(f'"{real_imap_encoded}"', readonly=False)
                             m_client.store(msg["id"], '+FLAGS', '\\Deleted')
                             m_client.expunge()
-                            st.session_state.otp_messages.remove(msg)
+                            drop_msg("otp_messages", msg)
                             save_session_cache()
                             flash("Message deleted.")
                             st.rerun()
@@ -3706,7 +4170,7 @@ with st.expander("🔑 Standalone OTP, Debit/Credit Cards & Sensitive Data Scann
 
         with op_c1:
             if st.button("Previous Page", disabled=(otp_curr_p <= 1), width="stretch", key="otp_prev_pg"):
-                st.session_state.otp_current_page -= 1
+                st.session_state.otp_current_page = otp_curr_p - 1
                 _reader_reload_page(st.session_state.otp_current_page,
                                     otp_scope_choice if otp_scope_choice else [folder],
                                     "SEARCH", otp_page_size, sort_order, "OTP",
@@ -3718,7 +4182,7 @@ with st.expander("🔑 Standalone OTP, Debit/Credit Cards & Sensitive Data Scann
 
         with op_c3:
             if st.button("Next Page", disabled=(otp_curr_p >= otp_total_pages), width="stretch", key="otp_next_pg"):
-                st.session_state.otp_current_page += 1
+                st.session_state.otp_current_page = otp_curr_p + 1
                 _reader_reload_page(st.session_state.otp_current_page,
                                     otp_scope_choice if otp_scope_choice else [folder],
                                     "SEARCH", otp_page_size, sort_order, "OTP",
@@ -3730,7 +4194,7 @@ with st.expander("🔑 Standalone OTP, Debit/Credit Cards & Sensitive Data Scann
     st.markdown("#### 🛠️ OTP Engine Debugging & Diagnose Log Screen")
     with st.expander("🔐 OTP Scanner IMAP Diagnostic Traces & Logs", expanded=False):
         if st.session_state.otp_diag_logs:
-            st.code("\n".join(st.session_state.otp_diag_logs), language="text")
+            st.code(diag_text("otp_diag_logs"), language="text")
         else:
             st.caption("OTP scanner traces and raw server logs will appear here during execution.")
 # @@END 039 OTP_SCANNER
@@ -3739,15 +4203,35 @@ with st.expander("🔑 Standalone OTP, Debit/Credit Cards & Sensitive Data Scann
 # @@BLOCK 040 DEEP_SEARCH deps=039
 # Deep Keyword Search & Scope Filters
 st.markdown("---")
-with st.expander("🔍 Deep Keyword Search & Scope Filters", expanded=False):
-    # FIX W-2 (v13.50): seeded, not default= / value= + key=.
+# checkbox, not expander - an expander collapsed on every rerun.
+hub_search_open = st.checkbox("🔍 Deep Keyword Search & Scope Filters", key="hub_search_open")
+if hub_search_open:
     if "deep_search_scope" not in st.session_state:
         st.session_state["deep_search_scope"] = ["INBOX"]
     if "search_page_size_slider" not in st.session_state:
         st.session_state["search_page_size_slider"] = 15
+    if "deep_all_folders" not in st.session_state:
+        st.session_state["deep_all_folders"] = True
+    if "deep_search_query" not in st.session_state:
+        st.session_state["deep_search_query"] = ""
+    if "deep_search_blacklist_kw" not in st.session_state:
+        st.session_state["deep_search_blacklist_kw"] = "Telegram, spam, scam, promo"
+    if st.session_state.get("deep_search_field") not in ("TEXT", "SUBJECT", "BODY", "FROM"):
+        st.session_state["deep_search_field"] = "TEXT"
+    if not isinstance(st.session_state.get("search_page_size_slider"), int):
+        st.session_state["search_page_size_slider"] = 15
+
+    search_scope_options = _ui_folder_options()
+    _ds_keep = [f for f in (st.session_state.get("deep_search_scope") or []) if f in search_scope_options]
+    st.session_state["deep_search_scope"] = _ds_keep or list(search_scope_options)
+
+    # A search should reach the WHOLE mailbox. The scope defaulted to INBOX only,
+    # so "search" quietly meant "search one folder". This box starts ticked and
+    # re-asserts every folder; untick it to narrow the scope.
+    if st.checkbox("Search every folder in the mailbox", key="deep_all_folders"):
+        st.session_state["deep_search_scope"] = list(search_scope_options)
 
     s_col1, s_col2 = st.columns([1, 1])
-    search_scope_options = ["INBOX"] + [f for f in st.session_state.mb_folders if f != "INBOX"]
 
     with s_col1:
         search_scope_choice = st.multiselect("Search Scope Option", search_scope_options, key="deep_search_scope")
@@ -3755,7 +4239,7 @@ with st.expander("🔍 Deep Keyword Search & Scope Filters", expanded=False):
         search_field_choice = st.selectbox("Search Field Option", ["TEXT", "SUBJECT", "BODY", "FROM"], key="deep_search_field")
 
     search_query_input = st.text_input("Search term or keyword", key="deep_search_query")
-    search_blacklist_input = st.text_input("Blacklist Keywords (comma-separated)", value="Telegram, spam, scam, promo", key="deep_search_blacklist_kw")
+    search_blacklist_input = st.text_input("Blacklist Keywords (comma-separated)", key="deep_search_blacklist_kw")
 
     search_page_size = st.slider("Search Results Page Size", 5, 200, key="search_page_size_slider")
 
@@ -3816,14 +4300,13 @@ with st.expander("🔍 Deep Keyword Search & Scope Filters", expanded=False):
                         st.markdown(f"- [{link}]({link})", unsafe_allow_html=True)
 
                 st.markdown("---")
-                # FIX W-2: seeded, not value= + key=.
-                # v13.52: mailview renders the real message, falling back here.
                 _sb_key = f"s_body_{msg['folder']}_{msg['id']}_{idx}"
                 if _sb_key not in st.session_state:
                     st.session_state[_sb_key] = msg["body"]
                 if mailview is not None and hasattr(mailview, "render_auto"):
                     mailview.render_auto(st, msg, _sb_key, _mv_mail,
-                                         allow_remote=st.session_state.get("mv_remote", False))
+                                         allow_remote=_mv_remote, view=_mv_view,
+                                         ns=active_email)
                 else:
                     st.text_area("Cleaned Message Body", height=150, key=_sb_key)
 
@@ -3852,7 +4335,7 @@ with st.expander("🔍 Deep Keyword Search & Scope Filters", expanded=False):
                         try:
                             m_client = get_active_mail(active_email, active_password, host)
                             move_message(m_client, msg["folder"], msg["id"], s_target_move)
-                            st.session_state.search_messages.remove(msg)
+                            drop_msg("search_messages", msg)
                             save_session_cache()
                             flash(f"Moved to {s_target_move}.")
                             st.rerun()
@@ -3867,7 +4350,7 @@ with st.expander("🔍 Deep Keyword Search & Scope Filters", expanded=False):
                             m_client.select(f'"{real_imap_encoded}"', readonly=False)
                             m_client.store(msg["id"], '+FLAGS', '\\Deleted')
                             m_client.expunge()
-                            st.session_state.search_messages.remove(msg)
+                            drop_msg("search_messages", msg)
                             save_session_cache()
                             flash("Message deleted.")
                             st.rerun()
@@ -3883,7 +4366,7 @@ with st.expander("🔍 Deep Keyword Search & Scope Filters", expanded=False):
 
         with sp_col1:
             if st.button("Previous Page", disabled=(search_curr_p <= 1), width="stretch", key="s_prev_pg"):
-                st.session_state.search_current_page -= 1
+                st.session_state.search_current_page = search_curr_p - 1
                 _reader_reload_page(st.session_state.search_current_page,
                                     search_scope_choice if search_scope_choice else [folder],
                                     "SEARCH", search_page_size, sort_order, "SEARCH",
@@ -3895,7 +4378,7 @@ with st.expander("🔍 Deep Keyword Search & Scope Filters", expanded=False):
 
         with sp_col3:
             if st.button("Next Page", disabled=(search_curr_p >= search_total_pages), width="stretch", key="s_next_pg"):
-                st.session_state.search_current_page += 1
+                st.session_state.search_current_page = search_curr_p + 1
                 _reader_reload_page(st.session_state.search_current_page,
                                     search_scope_choice if search_scope_choice else [folder],
                                     "SEARCH", search_page_size, sort_order, "SEARCH",
@@ -3907,7 +4390,7 @@ with st.expander("🔍 Deep Keyword Search & Scope Filters", expanded=False):
     st.markdown("#### 🛠️ Deep Search Debugging & Diagnostic Log Screen")
     with st.expander("🔍 Search Engine IMAP Diagnostic Traces & Logs", expanded=False):
         if st.session_state.search_diag_logs:
-            st.code("\n".join(st.session_state.search_diag_logs), language="text")
+            st.code(diag_text("search_diag_logs"), language="text")
         else:
             st.caption("Search engine logs will be recorded here after executing a keyword search.")
 # @@END 040 DEEP_SEARCH
@@ -3916,27 +4399,35 @@ with st.expander("🔍 Deep Keyword Search & Scope Filters", expanded=False):
 # @@BLOCK 041 BOT_PURGE deps=040
 # Mass Bot Purge & Intelligence Hub
 st.markdown("---")
-with st.expander("🤖 Mass Bot Purge & Intelligence Hub", expanded=False):
-    all_loaded_bot_msgs = [m for m in st.session_state.current_messages if m["is_bot"]]
+# checkbox, not expander.
+hub_bot_open = st.checkbox("🤖 Mass Bot Purge & Intelligence Hub", key="hub_bot_open")
+if hub_bot_open:
+    all_loaded_bot_msgs = [m for m in st.session_state.current_messages if m.get("is_bot")]
 
-    # FIX W-2 (v13.50): seeded, not default= / value= + key=.
     if "bot_hub_folder_select" not in st.session_state:
         st.session_state["bot_hub_folder_select"] = ["INBOX"]
     if "bot_page_size_slider" not in st.session_state:
         st.session_state["bot_page_size_slider"] = 15
+    # bot_scan_depth is a SELECTBOX: the value must be one of the four options,
+    # not merely inside a numeric range, or st.selectbox raises on restore.
+    if st.session_state.get("bot_scan_depth") not in (50, 100, 200, 500):
+        st.session_state["bot_scan_depth"] = 100
+    if not isinstance(st.session_state.get("bot_page_size_slider"), int):
+        st.session_state["bot_page_size_slider"] = 15
+
+    bot_scope_options = _ui_folder_options()
+    _bt_keep = [f for f in (st.session_state.get("bot_hub_folder_select") or []) if f in bot_scope_options]
+    st.session_state["bot_hub_folder_select"] = _bt_keep or ["INBOX"]
 
     bot_col1, bot_col2 = st.columns([2, 1])
-    bot_scope_options = ["INBOX"] + [f for f in st.session_state.mb_folders if f != "INBOX"]
 
     with bot_col1:
         bot_target_folder = st.multiselect("Select Bot Target Scope", bot_scope_options, key="bot_hub_folder_select")
     with bot_col2:
-        bot_scan_limit = st.selectbox("Bot Scan Depth", [50, 100, 200, 500], index=1)
+        bot_scan_limit = st.selectbox("Bot Scan Depth", [50, 100, 200, 500], key="bot_scan_depth")
 
     bot_page_size = st.slider("Bot Stream Results Page Size", 5, 200, key="bot_page_size_slider")
 
-    # v13.41: purge now deletes only the already-detected bot messages in the loaded stream.
-    # No SEARCH TEXT. Only the IDs the user has already seen as bots.
     st.caption("⚠️ The purge below deletes only the bot messages currently shown in the loaded stream. "
                "It uses their stored IDs. It does not run a new server search.")
 
@@ -3960,11 +4451,12 @@ with st.expander("🤖 Mass Bot Purge & Intelligence Hub", expanded=False):
                             log_target="DEBUG"
                         )
                         st.session_state.current_messages = msgs
-                        st.session_state.bot_filter_mode = True
                         st.session_state.bot_current_page = 1
-                        st.session_state.stream_page_size = bot_scan_limit
+                        # the scan no longer FORCES the stream into bot filter mode;
+                        # the stream stays complete unless you tick it.
+                        st.session_state["_pending_page_size"] = bot_scan_limit
                         save_session_cache()
-                        flash("Scan complete. Stream filtered to detected bot/Telegram messages.")
+                        flash("Scan complete. The stream holds every row; tick the filter box to narrow it to bots.")
                         st.rerun()
                 except Exception as ex:
                     st.error(str(ex))
@@ -3981,8 +4473,6 @@ with st.expander("🤖 Mass Bot Purge & Intelligence Hub", expanded=False):
                     mail = get_active_mail(active_email, active_password, host)
                     deleted_count = 0
 
-                    # Group already-detected bot message IDs by folder.
-                    # No SEARCH TEXT. Only the messages the user has already seen as bots.
                     by_folder = {}
                     for bm in all_loaded_bot_msgs:
                         by_folder.setdefault(bm.get("folder") or folder, []).append(bm.get("id"))
@@ -4003,12 +4493,8 @@ with st.expander("🤖 Mass Bot Purge & Intelligence Hub", expanded=False):
                             bot_log(f"  └─ no bot IDs in '{r_folder}'.")
                             continue
 
-                        # IMAP IDs are numeric strings; store in one call.
                         id_csv = b",".join(sorted(ids, key=lambda x: int(x)))
                         st_typ, st_data = mail.store(id_csv, "+FLAGS", "\\Deleted")
-                        # v13.43: the STORE reply was never checked, so a refused
-                        # flag update still counted as a deletion and expunged
-                        # nothing, while the UI reported success.
                         if st_typ != "OK":
                             bot_log(f"  └─ ⚠️ STORE refused in '{r_folder}': {st_typ} {st_data}")
                             skipped_folders.append(r_folder)
@@ -4022,8 +4508,12 @@ with st.expander("🤖 Mass Bot Purge & Intelligence Hub", expanded=False):
 
                     bot_log(f"🏁 [MASS DELETE COMPLETE] Purged {deleted_count} messages across {len(folders) - len(skipped_folders)} folder(s).")
 
-                    st.session_state.current_messages = [m for m in st.session_state.current_messages if not m["is_bot"]]
-                    st.session_state.bot_filter_mode = False
+                    st.session_state.current_messages = [m for m in st.session_state.current_messages if not m.get("is_bot")]
+                    # the pager counts server matches, so the deleted rows have to
+                    # come off the total or the last pages are phantom.
+                    _tm = st.session_state.get("total_matched_count")
+                    if isinstance(_tm, int):
+                        st.session_state.total_matched_count = max(0, _tm - deleted_count)
                     save_session_cache()
                     flash(f"Purged {deleted_count} message(s)." + (f" Skipped: {', '.join(skipped_folders)}" if skipped_folders else ""))
                     st.rerun()
@@ -4056,14 +4546,14 @@ with st.expander("🤖 Mass Bot Purge & Intelligence Hub", expanded=False):
         bp_c1, bp_c2, bp_c3 = st.columns([1, 2, 1])
         with bp_c1:
             if st.button("Previous Bot Page", disabled=(bot_curr_p <= 1), width="stretch", key="bot_prev_pg"):
-                st.session_state.bot_current_page -= 1
+                st.session_state.bot_current_page = bot_curr_p - 1
                 save_session_cache()
                 st.rerun()
         with bp_c2:
             st.markdown(f"<h4 style='text-align: center; margin: 0;'>Page {bot_curr_p} of {bot_total_pages}</h4>", unsafe_allow_html=True)
         with bp_c3:
             if st.button("Next Bot Page", disabled=(bot_curr_p >= bot_total_pages), width="stretch", key="bot_next_pg"):
-                st.session_state.bot_current_page += 1
+                st.session_state.bot_current_page = bot_curr_p + 1
                 save_session_cache()
                 st.rerun()
     else:
@@ -4071,7 +4561,7 @@ with st.expander("🤖 Mass Bot Purge & Intelligence Hub", expanded=False):
 
     st.markdown("#### 🛠️ Mass Bot Delete Diagnostic & Diagnose Log Screen")
     if st.session_state.bot_diag_logs:
-        st.code("\n".join(st.session_state.bot_diag_logs), language="text")
+        st.code(diag_text("bot_diag_logs"), language="text")
     else:
         st.caption("Bot engine traces will be printed here during purge operations.")
 # @@END 041 BOT_PURGE
@@ -4093,6 +4583,9 @@ except Exception:
 
 
 # @@BLOCK 043 TRAILING deps=042
-# (reserved tail - keeps the file closed after the last block)
+# The last thing a run does is persist the panel and this mail's edits. Deduped
+# and throttled inside _reader_ui_save, so a run that changed nothing costs one
+# string compare and no write.
+_reader_ui_save()
 # @@END 043 TRAILING
 # @@EOF
