@@ -34,10 +34,16 @@ boundaries, and every one of them is enforced here, not assumed:
 
 WHAT IS SHARED, AND WHAT THAT COSTS YOU
 ---------------------------------------
-Two files only: passkey.json (the keyring) and disposable_domains.txt (a
-downloaded blocklist, identical for everybody). theme.json, settings.json,
-proxies.txt, proxies_all.txt, proxy_meta.json, proxy_key_map.json and
-domain_cache.json are all per-user since v13.61.
+ONE file only: passkey.json (the keyring - it has to be shared, or nothing could
+find your key). Everything else is per-user: theme.json, settings.json,
+proxies.txt, proxies_all.txt, proxy_meta.json, proxy_key_map.json,
+domain_cache.json since v13.61, and disposable_domains.txt since v13.66.
+
+v13.75: this header still said disposable_domains.txt was a shared blocklist
+"identical for everybody". It stopped being shared at v13.66 - app.py block 082
+resolves it through user_file() and block 079 keeps it in the per-user file list -
+so a user who fetched the blocklist was told it belonged to everyone, and could
+not tell whether what they were looking at was theirs. Corrected here.
 
 v13.64: this header used to say theme.json, proxies.txt and proxy_meta.json stay
 SHARED on purpose. They stopped being shared three versions earlier, and block
@@ -97,28 +103,25 @@ _TH_DEFAULTS = {
 
 
 def _theme_candidates():
-    """This user's own theme file first, then the legacy bare ones.
+    """This user's own theme file, and nothing else.
 
-    v13.64: THE THEME WAS NEVER LOADED. theme.json became a per-user file
-    (<hash>_theme.json) at v13.61, but this function only ever looked at
-    APP_DIR/theme.json and "theme.json", neither of which exists any more - so
-    every user's Logs page rendered in the factory palette and the silent
-    except made it look like a design choice.
+    v13.75: THE BARE FALLBACKS ARE GONE. app.py block 031 has exactly one
+    candidate - user_file("theme.json") - and no bare path at all. The two bare
+    paths here and on pages/3 and pages/6 meant that a theme.json committed to the
+    repo was painted for every user who had never saved one, so two people on one
+    deployment could not tell whose colours they were looking at. A user with no
+    saved theme now gets the factory palette, which is the truth.
 
     user_file() is read through a lazy import because this block runs before the
     gate in block 005; on the very first load it answers with the anonymous
-    prefix, which simply does not exist and falls through to the defaults. Block
-    005 re-runs this after the gate and repaints.
+    prefix, which simply does not exist, so it falls through to the defaults.
+    Block 005 re-runs this after the gate and repaints with the real file.
     """
-    out = []
     try:
         import auth as _a
-        out.append(_a.user_file("theme.json"))
+        return [_a.user_file("theme.json")]
     except Exception:
-        pass
-    out.append(os.path.join(APP_DIR, "theme.json"))
-    out.append("theme.json")
-    return out
+        return []
 
 
 def _load_theme():
