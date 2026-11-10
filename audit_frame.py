@@ -20,7 +20,10 @@ try:
 except Exception:
     # Mirror for the import-failure path.  tier2_split.py REWRITES app.py and
     # OVERWRITES engine.py; it deletes nothing, so EXPECT_FILES only moves when a
-    # file is added.  v13.70 added pages/1_Notifications.py: 14 files, 295 blocks.
+    # file is added.  v13.70 added pages/1_Notifications.py: 14 files, 294 blocks.
+    # v13.75: the comment said 295 while the value has been 294 - the comment was
+    # the stale half, and a mirror that disagrees with the thing it mirrors is
+    # worse than no mirror.
     GATED = ["app.py", "auth.py", "engine.py", "hosts.py", "ms_oauth.py",
              "status.py", "verify_blocks.py", "pages/1_Notifications.py",
              "pages/2_Diagnostics.py", "pages/3_Mailbox_Reader.py",
@@ -223,7 +226,18 @@ def api_conformance():
 
 
 def main():
-    reps = [scan(p) for p in GATED] + [scan("verify_blocks.py")]
+    # v13.75: THE VERIFIER WAS SCANNED TWICE. verify_blocks.py is already in
+    # GATED, and the old line appended a second scan of it. `gated = reps[:-1]`
+    # kept the file-count arithmetic right, but `faults` summed BOTH copies, so
+    # one fault in the verifier counted double and the "must be 0" line read the
+    # appended copy while the total read both.
+    reps = [scan(p) for p in GATED]
+    if "verify_blocks.py" not in GATED:
+        reps.append(scan("verify_blocks.py"))
+    gated = reps[:len(GATED)]
+    by_path = {r["path"]: r for r in reps}
+    vb_rep = by_path.get("verify_blocks.py") or {"faults": []}
+
     faults = sum(len(r["faults"]) for r in reps)
     bare = sum(r["bare"] for r in reps)
 
@@ -237,15 +251,15 @@ def main():
             print("      " + f)
         if len(r["faults"]) > 25:
             print("      ... and %d more" % (len(r["faults"]) - 25))
-    gated = reps[:-1]
     print("-" * 74)
     print("gated files=%d blocks=%d faults=%d bare_ends=%d"
           % (sum(1 for r in gated if r["exists"]),
-             sum(r["blocks"] for r in gated), faults - len(reps[-1]["faults"]), bare))
+             sum(r["blocks"] for r in gated),
+             sum(len(r["faults"]) for r in gated), bare))
     print("TARGET       files=%d blocks=%d faults=0 bare_ends=0"
           % (EXPECT_FILES, EXPECT_BLOCKS))
     print("verify_blocks.py itself: %d fault(s) (must be 0)"
-          % len(reps[-1]["faults"]))
+          % len(vb_rep["faults"]))
 
     print()
     print("=" * 74)
