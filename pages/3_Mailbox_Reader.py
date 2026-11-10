@@ -167,31 +167,30 @@ except ImportError:
         domain = email.split("@")[-1].lower() if "@" in email else ""
         return [f"imap.{domain}"] if domain else ["imap.gmail.com"]
 
-# v13.57: body renderer. Optional - a failed import degrades to the plain
+# v13.52: body renderer. Optional - a failed import degrades to the plain
 # text_area, it must never blank the page.
-#
-# hasattr() IS NOT A SHAPE CHECK. A module cached before a redeploy keeps the old
-# signature; hasattr(mailview, "render_auto") is True on the pre-v13.56 module
-# too, whose def is render_auto(st, msg, key, mail_getter, allow_remote=False)
-# with no `view` and no `ns`. The call sites pass both, so the first rendered
-# row raised TypeError and killed the page. __version__ cannot detect it - it is
-# frozen at "v13.55" on purpose. So probe the PARAMETERS the call sites use,
-# reload once, and drop the renderer entirely if they are still missing.
-def _mv_capable(mod) -> bool:
-    try:
-        params = inspect.signature(mod.render_auto).parameters
-    except Exception:
-        return False
-    return "view" in params and "ns" in params
-
 try:
     import mailview
-    if not _mv_capable(mailview):
-        mailview = importlib.reload(mailview)
-        if not _mv_capable(mailview):
-            mailview = None
 except Exception:
     mailview = None
+
+# A redeploy re-executes THIS page and leaves mailview in sys.modules, so the
+# import above can hand back the module as it was before the last push. hasattr()
+# cannot tell the two apart - both expose render_auto - and the stale one raises
+# TypeError on view=/ns=. Reload until the signature is the current one, exactly
+# as block 001 does for auth, then re-check it. If the reload also fails the stale
+# module is kept and the text_area fallback in block 038 still holds.
+if mailview is not None:
+    try:
+        _mv_fn = getattr(mailview, "render_auto", None)
+        _mv_code = getattr(_mv_fn, "__code__", None)
+        _mv_args = ()
+        if _mv_code is not None:
+            _mv_args = _mv_code.co_varnames[:_mv_code.co_argcount + _mv_code.co_kwonlyargcount]
+        if "view" not in _mv_args or "ns" not in _mv_args:
+            mailview = importlib.reload(mailview)
+    except Exception:
+        pass
 # @@END 002 HOSTS_IMPORT
 
 
@@ -3815,9 +3814,12 @@ _mv_remote = st.checkbox(
 # Persisted, and forced to HTML while the remote switch is on.
 if st.session_state.get("mv_view") not in ("Text", "HTML"):
     st.session_state["mv_view"] = "HTML" if _mv_remote else "Text"
-_mv_view = st.radio("Message view", ["Text", "HTML"], horizontal=True, key="mv_view")
+# the switch forces HTML, so the radio must SAY HTML. Writing the key before the
+# widget is created is legal; without it the control read "Text" while every row
+# rendered markup.
 if _mv_remote:
-    _mv_view = "HTML"
+    st.session_state["mv_view"] = "HTML"
+_mv_view = st.radio("Message view", ["Text", "HTML"], horizontal=True, key="mv_view")
 
 
 def _mv_mail():
@@ -3883,8 +3885,10 @@ if len(active_msgs) > 0 or total_msgs > 0:
         if not active_msgs:
             st.caption("This page is empty - it failed to fetch, or the bot filter removed every row. Use Next / Previous.")
 
+        # truthy, not "is not None": stream_page_rows is 0 in a restored session
+        # that never fetched, and 0 != total would caption a false shortfall.
         _rows = st.session_state.get("stream_page_rows")
-        if _rows is not None and _rows != total_msgs:
+        if _rows and _rows != total_msgs:
             st.caption(f"{_rows} of {total_msgs} server matches survived the fetch on this page.")
 
         for idx, msg in enumerate(active_msgs):
@@ -4100,6 +4104,10 @@ if hub_otp_open:
                     )
                     st.session_state.otp_messages = msgs
                     st.session_state.otp_current_page = 1
+                    # the pager must reuse the term that actually produced these
+                    # rows, not whatever the boxes say by the time it is pressed.
+                    st.session_state["otp_exec_kw"] = kw_to_use
+                    st.session_state["otp_exec_field"] = otp_search_field
                     save_session_cache()
                     otp_log(f"Scan complete. Retrieved {st.session_state.otp_total_matched_count} matching messages.")
                     flash(f"Security scan complete. Found {st.session_state.otp_total_matched_count} message(s).")
@@ -4206,8 +4214,9 @@ if hub_otp_open:
                 _reader_reload_page(st.session_state.otp_current_page,
                                     otp_scope_choice if otp_scope_choice else [folder],
                                     "SEARCH", otp_page_size, sort_order, "OTP",
-                                    "otp_messages", query=_otp_keywords(),
-                                    field=otp_search_field)
+                                    "otp_messages",
+                                    query=st.session_state.get("otp_exec_kw") or _otp_keywords(),
+                                    field=st.session_state.get("otp_exec_field") or otp_search_field)
 
         with op_c2:
             st.markdown(f"<h4 style='text-align: center; margin: 0;'>Page {otp_curr_p} of {otp_total_pages}</h4>", unsafe_allow_html=True)
@@ -4218,8 +4227,9 @@ if hub_otp_open:
                 _reader_reload_page(st.session_state.otp_current_page,
                                     otp_scope_choice if otp_scope_choice else [folder],
                                     "SEARCH", otp_page_size, sort_order, "OTP",
-                                    "otp_messages", query=_otp_keywords(),
-                                    field=otp_search_field)
+                                    "otp_messages",
+                                    query=st.session_state.get("otp_exec_kw") or _otp_keywords(),
+                                    field=st.session_state.get("otp_exec_field") or otp_search_field)
     else:
         st.caption("No security messages scanned yet. Select categories or keywords and click 'Execute Dedicated Security Scan'.")
 
@@ -4295,6 +4305,10 @@ if hub_search_open:
                     )
                     st.session_state.search_messages = msgs
                     st.session_state.search_current_page = 1
+                    # the pager must reuse the term that produced these rows, not
+                    # whatever the box holds when Next Page is pressed.
+                    st.session_state["search_exec_query"] = search_query_input
+                    st.session_state["search_exec_field"] = search_field_choice
                     save_session_cache()
                     log(f"Search found {st.session_state.search_total_matched_count} total matches across target scope.")
                     flash(f"Search complete. Found {st.session_state.search_total_matched_count} match(es).")
@@ -4397,8 +4411,9 @@ if hub_search_open:
                 _reader_reload_page(st.session_state.search_current_page,
                                     search_scope_choice if search_scope_choice else [folder],
                                     "SEARCH", search_page_size, sort_order, "SEARCH",
-                                    "search_messages", query=search_query_input,
-                                    field=search_field_choice)
+                                    "search_messages",
+                                    query=st.session_state.get("search_exec_query") or search_query_input,
+                                    field=st.session_state.get("search_exec_field") or search_field_choice)
 
         with sp_col2:
             st.markdown(f"<h4 style='text-align: center; margin: 0;'>Page {search_curr_p} of {search_total_pages}</h4>", unsafe_allow_html=True)
@@ -4409,8 +4424,9 @@ if hub_search_open:
                 _reader_reload_page(st.session_state.search_current_page,
                                     search_scope_choice if search_scope_choice else [folder],
                                     "SEARCH", search_page_size, sort_order, "SEARCH",
-                                    "search_messages", query=search_query_input,
-                                    field=search_field_choice)
+                                    "search_messages",
+                                    query=st.session_state.get("search_exec_query") or search_query_input,
+                                    field=st.session_state.get("search_exec_field") or search_field_choice)
     else:
         st.caption("No search results loaded yet. Enter a query and click 'Execute Keyword Search'.")
 
@@ -4520,7 +4536,10 @@ if hub_bot_open:
                             bot_log(f"  └─ no bot IDs in '{r_folder}'.")
                             continue
 
-                        id_csv = b",".join(sorted(ids, key=lambda x: int(x)))
+                        # str join, not b",".join: msg["id"] is set from
+                        # mid.decode() and restored from JSON as str, so a bytes
+                        # separator raised TypeError on every purge.
+                        id_csv = ",".join(sorted(ids, key=lambda x: int(x)))
                         st_typ, st_data = mail.store(id_csv, "+FLAGS", "\\Deleted")
                         if st_typ != "OK":
                             bot_log(f"  └─ ⚠️ STORE refused in '{r_folder}': {st_typ} {st_data}")
