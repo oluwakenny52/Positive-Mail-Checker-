@@ -16,6 +16,10 @@
 
 Importable anywhere: hosts.py and status.py are picked up when present and
 degrade to safe local tables when absent.
+
+ENGINE_VERSION MUST equal the `version=` on line 1 of this file. It sat at
+v13.40 while the header said v13.49. If you bump the header, bump this too -
+the selftest asserts on the constant, not on the header.
 """
 
 import argparse
@@ -26,7 +30,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 
-ENGINE_VERSION = "v13.40"
+ENGINE_VERSION = "v13.49"
 
 try:
     import status as _status
