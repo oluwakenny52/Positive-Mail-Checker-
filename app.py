@@ -6137,6 +6137,15 @@ class ProxyPOP3(poplib.POP3):
 
 
 def pop3_ok(resp):
+    """True only for an affirmative POP3 reply.
+
+    FIX POP-OK: the tuple/list arm returned True for ANY sequence of len >= 1,
+    so an `(b'-ERR ...',)` reply read as success. stat() is the only caller that
+    passes a real tuple and its three ints are truthy, so the bug was invisible
+    there - but every user/pass reply goes through here too, and a refused
+    USER or PASS was being treated as accepted. The arm now checks the payload
+    when the sequence actually carries one.
+    """
     if resp is None:
         return False
     if isinstance(resp, (bytes, bytearray)):
@@ -6144,7 +6153,14 @@ def pop3_ok(resp):
     if isinstance(resp, str):
         return resp.lstrip().startswith("+")
     if isinstance(resp, (tuple, list)):
-        return len(resp) >= 1
+        if not resp:
+            return False
+        head = resp[0]
+        if isinstance(head, (bytes, bytearray)):
+            return bytes(head).lstrip().startswith(b"+")
+        if isinstance(head, str):
+            return head.lstrip().startswith("+")
+        return True
     return True
 # @@END 063 PROTOCOL_CLIENTS
 
@@ -11218,11 +11234,20 @@ PARENT_PROVIDER_MAPPINGS = PARENT
 
 
 def get_mx_hosts(domain):
+    """MX exchange hosts, best preference first.
+
+    FIX MX-LIFETIME: this was the only resolver call in the file without a
+    lifetime= - 089 and 090 both pass 2. dnspython's default is about five
+    seconds PER NAMESERVER PER ATTEMPT, and this runs on the script thread
+    inside _get_servers_raw() for every domain not already in the cache, so one
+    unresponsive resolver froze the page for seconds. Three seconds is enough
+    for a real answer and short enough not to be felt.
+    """
     if not dns:
         return []
     try:
         return [str(r.exchange).lower().rstrip(".")
-                for r in sorted(dns.resolver.resolve(domain, "MX"),
+                for r in sorted(dns.resolver.resolve(domain, "MX", lifetime=3.0),
                                 key=lambda x: x.preference)]
     except Exception:
         return []
@@ -11280,6 +11305,10 @@ def _expand_cnames(hosts, limit=6):
 # @@END 089 MX_PARENT
 
 # @@BLOCK 090 CANDIDATE_GEN deps=002,088,089
+_HOST_DNS_TTL = 300.0
+_HOST_DNS_MAX = 4000
+
+
 def generate_candidate_hosts(domain: str, mx_records: list = None) -> list:
     candidates = []
     dl = domain.lower()
@@ -11338,31 +11367,55 @@ def drop_before_check(email):
 
 
 def host_resolves(host):
+    """True when `host` resolves. Cached WITH a TTL, never for ever.
+
+    FIX HOST-DNS-TTL: the answer was stored in _host_dns_cache with no time
+    limit at all, so one DNS blip marked a host unresolvable for the whole life
+    of the process. Block 093 reads this to decide whether to front the domain's
+    own pop.<domain> ahead of a borrowed global endpoint, so a single blip
+    deleted the POP ladder for every later account on that domain until a
+    redeploy. Five minutes is long enough to absorb a real run's worth of
+    repeated lookups and short enough that a blip heals itself.
+
+    The entry shape is (timestamp, answer) now. A bare bool left by an older
+    build is still honoured and simply treated as expired, so a redeploy does
+    not have to clear the table.
+    """
     if not host:
         return False
+    h = host.lower().strip()
+    now = time.time()
     with _host_dns_lock:
-        cached = _host_dns_cache.get(host)
-    if cached is not None:
-        return cached
+        cached = _host_dns_cache.get(h)
+    if isinstance(cached, tuple) and len(cached) == 2:
+        if (now - cached[0]) < _HOST_DNS_TTL:
+            return bool(cached[1])
     ok = False
     try:
         if dns:
             try:
-                dns.resolver.resolve(host, "A", lifetime=2)
+                dns.resolver.resolve(h, "A", lifetime=2)
                 ok = True
             except Exception:
                 try:
-                    dns.resolver.resolve(host, "AAAA", lifetime=2)
+                    dns.resolver.resolve(h, "AAAA", lifetime=2)
                     ok = True
                 except Exception:
                     pass
         if not ok:
-            socket.gethostbyname(host)
+            socket.gethostbyname(h)
             ok = True
     except Exception:
         ok = False
     with _host_dns_lock:
-        _host_dns_cache[host] = ok
+        _host_dns_cache[h] = (now, ok)
+        # A long run walks a lot of generated candidates; the table is otherwise
+        # unbounded for the life of the process.
+        if len(_host_dns_cache) > _HOST_DNS_MAX:
+            _cutoff = now - _HOST_DNS_TTL
+            for _k in [k for k, v in _host_dns_cache.items()
+                       if not (isinstance(v, tuple) and v[0] > _cutoff)][:1000]:
+                _host_dns_cache.pop(_k, None)
     return ok
 # @@END 090 CANDIDATE_GEN
 
@@ -12095,17 +12148,40 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, 
 
     v13.64: the cooldown table is per user now and this is the FIRST thing a
     worker touches, before any other call has re-asserted a scope.
+
+    FIX COOLDOWN-SCOPE: two things were wrong with the outcome set.
+
+    * DNS_FAILED and SMTP_FAILED were armed. Both are already decided PER DOMAIN
+      and cached by the prefilter - process_accounts() ran them before the queue
+      existed - so a cooldown on them buys nothing and costs a lot: every later
+      account on that domain came back SKIP, was counted as checked, and was
+      never actually tested.
+
+    * PROXY_UNHEALTHY was armed. That is a property of the POOL, not of the
+      domain, and it is the case most worth retrying: each account has its own
+      DIRECT fallback and its own rotation, so the next account on the same
+      domain very often succeeds. It is left to the ladder now.
+
+    What remains is transport-level inconclusiveness, which is what the cooldown
+    was written for. UNKNOWN stays: it is a genuine "no answer".
+
+    FIX COOLDOWN-CFG: the config was read from the module global CFG. This runs
+    on a worker thread, where CFG is whatever the LAST rerun of ANY session
+    bound - so a second user loading the page could switch FAST_MODE off, or
+    change the cooldown length, underneath a live account. live_cfg() reads the
+    snapshot block 105 pinned on this thread.
     """
     _rebind_scope()
     if trace_logs is None:
         trace_logs = []
+    _cfg = live_cfg()
 
-    if not CFG.get("FAST_MODE", True):
+    if not _cfg.get("FAST_MODE", True):
         return _check_account_core(email, password, conf, domain, proxy_pool,
                                    thread_state, trace_logs)
 
     ts = failed_domain_cache.get(domain)
-    if ts and (time.time() - ts) < CFG.get("FAILURE_COOLDOWN", FAILURE_COOLDOWN_DEFAULT):
+    if ts and (time.time() - ts) < _cfg.get("FAILURE_COOLDOWN", FAILURE_COOLDOWN_DEFAULT):
         trace_logs.append(f"Fast Mode: Domain '{domain}' is in cooldown cache. "
                           f"Skipping immediately.")
         return None, SKIP, SKIP, None, trace_logs
@@ -12117,12 +12193,11 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, 
         _status = out[1]
     except Exception:
         _status = None
-    if _status in (FAILED, CONNECTION_FAILED, PROXY_UNHEALTHY, RETRY, RETRY_LATER,
-                   UNKNOWN, DNS_FAILED, SMTP_FAILED):
+    if _status in (FAILED, CONNECTION_FAILED, RETRY, RETRY_LATER, UNKNOWN):
         failed_domain_cache[domain] = time.time()
         trace_logs.append(
             f"Fast Mode: domain '{domain}' armed for cooldown "
-            f"({CFG.get('FAILURE_COOLDOWN', FAILURE_COOLDOWN_DEFAULT)}s) after an "
+            f"({_cfg.get('FAILURE_COOLDOWN', FAILURE_COOLDOWN_DEFAULT)}s) after an "
             f"inconclusive result [{_status}].")
     return out
 # @@END 099 CHECK_WRAPPER
