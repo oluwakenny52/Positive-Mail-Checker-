@@ -26,11 +26,15 @@
 Single source of truth for every verdict token the app uses. app.py imports
 the short aliases from here; if that import ever fails the app falls back to
 an inline copy of the same tables, so the two must stay in lockstep.
+
+STATUS_VERSION MUST equal the `version=` on line 1 of this file. It sat at
+v13.42 while the header said v13.48, so every version string this module
+reported was wrong by six releases. If you bump the header, bump this too.
 """
 
 import re
 
-STATUS_VERSION = "v13.42"
+STATUS_VERSION = "v13.48"
 STATUS_MODULE = "status"
 STATUS_BLOCKS = 13
 # @@END 000 HEADER
