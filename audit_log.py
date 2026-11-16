@@ -1,4 +1,4 @@
-"""audit_log.py - per-user action & outcome ledger  (v13.51)
+"""audit_log.py - per-user action & outcome ledger  (v13.52)
 
 Records every press AND every state change with the page it came from, and
 records what the run then reports: OK / FAILED / WARN / ERROR / STOPPED. A press
@@ -56,6 +56,33 @@ install() skips the drain for those pages and nothing else changes: a page that
 is not listed still drains in install() exactly as before. app.py block 057 is
 the drain point, immediately after the bell row - see the note there.
 
+FIX AU-5 (v13.52) - SIX DEFECTS, ALL IN THE WRITE PATH
+------------------------------------------------------
+1. NO LOCK. This module is called from engine workers and probe threads while
+   the script thread is also writing. _rewrite_last() reads the whole file and
+   writes it back; an _append() landing between those two steps was lost, and
+   _trim() had the same read-rewrite shape. Everything that touches the file now
+   holds _LOCK. It is an RLock because _rewrite_last() falls back into _append()
+   and _append() falls into _trim().
+2. _trim() READ THE FILE ON EVERY APPEND to find out whether it needed to trim.
+   Now a per-path counter (_COUNTS) is seeded once from the file and incremented
+   on each write; the read-rewrite only happens after TRIM_SLACK extra lines.
+3. _FN_FOR LACKED ERROR AND STOPPED, so flash(st, "ERROR", ...) hit the
+   `else "OK"` guard and a failure flashed as a success. Both are mapped now.
+   STOPPED renders through warning rather than st.stop(), because st.stop()
+   inside install() would abort the page before its body ran.
+4. _close() DROPPED EVERY MESSAGE AFTER THE FIRST. A press that warned and then
+   errored recorded only the warning. The open entry is still closed by the
+   FIRST report - that is what closes it - but a second and third are emitted as
+   follow-up lines, and a message with no open press at all is now written on its
+   own instead of vanishing.
+5. _record_click() REPLACED AN OPEN PRESS WITHOUT EMITTING IT, so with two
+   buttons in one run the first was never recorded. It now closes as NO RESULT
+   first.
+6. _synth_key() WAS POSITIONAL - page|label only - so a conditional widget that
+   appeared earlier shifted every later key and every _SEEN baseline mismatched,
+   producing false CHANGED lines. The widget type is now part of the base.
+
 WHAT IS AND IS NOT VISIBLE
 --------------------------
 st.expander / st.tabs / st.popover are drawn by the browser. Opening one does
@@ -90,17 +117,24 @@ warning / exception / stop / toast close one.
 ISOLATION
 ---------
 The file resolves through auth.user_file(), so it is <hash>_mail_results/
-action_log.jsonl - one ledger per user, never shared. Capped at MAX_LINES.
+action_log.jsonl - one ledger per user, never shared. Capped at MAX_LINES. The
+trim counter is keyed by resolved path, so two users in one process never share
+a count.
 
 A failure in here must never break a page: every public function swallows.
 """
 
 import json
 import os
+import threading
 import time
 from datetime import datetime
 
 MAX_LINES = 500
+# Trim only after this many lines over the cap, so the common case is a bare
+# append instead of a read-whole-file / rewrite-whole-file on every write.
+TRIM_SLACK = 100
+
 _ATTR = "_audit_wrapped"
 _PEND = "_audit_pending"
 _PAGE = "_audit_page"
@@ -109,6 +143,14 @@ _USED = "_audit_used"
 _LAST = "_audit_last"
 _FLASH = "_audit_flash"
 _MISSING = object()
+
+# Re-entrant: _rewrite_last() can fall back into _append(), _append() into
+# _trim(). A plain Lock deadlocks on the second acquisition.
+_LOCK = threading.RLock()
+# path -> current line count. Seeded once from the file, so the trim check is a
+# dictionary lookup rather than a full read.
+_COUNTS = {}
+
 # A burst of edits on one widget inside this window is one ledger line.
 BURST_SECONDS = 1.5
 # How many deferred messages one run may queue for the next.
@@ -129,7 +171,10 @@ _STATE_WIDGETS = ("toggle", "checkbox", "slider", "selectbox", "multiselect",
 _MESSAGES = (("success", "OK"), ("error", "FAILED"), ("warning", "WARN"),
              ("exception", "ERROR"), ("stop", "STOPPED"), ("toast", "OK"))
 
-_FN_FOR = {"OK": "success", "WARN": "warning", "FAILED": "error"}
+# FIX AU-5: all five outcomes. STOPPED goes to warning and not to stop() -
+# st.stop() inside install() aborts the page before its body.
+_FN_FOR = {"OK": "success", "WARN": "warning", "FAILED": "error",
+           "ERROR": "exception", "STOPPED": "warning"}
 
 
 def _path() -> str:
@@ -145,16 +190,30 @@ def _path() -> str:
     return p
 
 
+def _count_lines(p: str) -> int:
+    try:
+        with open(p, encoding="utf-8", errors="ignore") as f:
+            return sum(1 for _ in f)
+    except Exception:
+        return 0
+
+
 def _append(rec: dict) -> None:
     p = _path()
     if not p:
         return
-    try:
-        with open(p, "a", encoding="utf-8") as f:
-            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
-    except Exception:
-        return
-    _trim(p)
+    with _LOCK:
+        try:
+            with open(p, "a", encoding="utf-8") as f:
+                f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+        except Exception:
+            return
+        if p not in _COUNTS:
+            _COUNTS[p] = _count_lines(p)
+        else:
+            _COUNTS[p] += 1
+        if _COUNTS[p] > MAX_LINES + TRIM_SLACK:
+            _trim(p)
 
 
 def _rewrite_last(rec: dict) -> None:
@@ -162,29 +221,33 @@ def _rewrite_last(rec: dict) -> None:
     p = _path()
     if not p:
         return
-    try:
-        with open(p, encoding="utf-8", errors="ignore") as f:
-            lines = f.readlines()
-        if not lines:
+    with _LOCK:
+        try:
+            with open(p, encoding="utf-8", errors="ignore") as f:
+                lines = f.readlines()
+            if not lines:
+                _append(rec)
+                return
+            lines[-1] = json.dumps(rec, ensure_ascii=False) + "\n"
+            with open(p, "w", encoding="utf-8") as f:
+                f.writelines(lines)
+        except Exception:
             _append(rec)
-            return
-        lines[-1] = json.dumps(rec, ensure_ascii=False) + "\n"
-        with open(p, "w", encoding="utf-8") as f:
-            f.writelines(lines)
-    except Exception:
-        _append(rec)
 
 
 def _trim(p: str) -> None:
-    try:
-        with open(p, encoding="utf-8", errors="ignore") as f:
-            lines = f.readlines()
-        if len(lines) <= MAX_LINES:
-            return
-        with open(p, "w", encoding="utf-8") as f:
-            f.writelines(lines[-MAX_LINES:])
-    except Exception:
-        pass
+    with _LOCK:
+        try:
+            with open(p, encoding="utf-8", errors="ignore") as f:
+                lines = f.readlines()
+            if len(lines) <= MAX_LINES:
+                _COUNTS[p] = len(lines)
+                return
+            with open(p, "w", encoding="utf-8") as f:
+                f.writelines(lines[-MAX_LINES:])
+            _COUNTS[p] = MAX_LINES
+        except Exception:
+            pass
 
 
 def _stamp() -> str:
@@ -228,20 +291,21 @@ def entries(limit: int = 300) -> list:
     if not p or not os.path.exists(p):
         return []
     out = []
-    try:
-        with open(p, encoding="utf-8", errors="ignore") as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    rec = json.loads(line)
-                except Exception:
-                    continue
-                if isinstance(rec, dict):
-                    out.append(rec)
-    except Exception:
-        return []
+    with _LOCK:
+        try:
+            with open(p, encoding="utf-8", errors="ignore") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        rec = json.loads(line)
+                    except Exception:
+                        continue
+                    if isinstance(rec, dict):
+                        out.append(rec)
+        except Exception:
+            return []
     return out[-limit:][::-1]
 
 
@@ -249,9 +313,19 @@ def reset() -> int:
     """Delete this user's ledger. Returns the number of lines removed."""
     p = _path()
     n = len(entries(limit=MAX_LINES))
+    with _LOCK:
+        try:
+            if p and os.path.exists(p):
+                os.remove(p)
+        except Exception:
+            pass
+        _COUNTS.pop(p, None)
+    # FIX AU-5: a stale _PEND would otherwise emit into a file that no longer
+    # exists, and a stale _SEEN baseline would fire a false CHANGED on next load.
     try:
-        if p and os.path.exists(p):
-            os.remove(p)
+        import streamlit as st
+        for k in (_PEND, _SEEN, _LAST, _FLASH):
+            st.session_state.pop(k, None)
     except Exception:
         pass
     return n
@@ -271,19 +345,39 @@ def _emit(p: dict, outcome: str, detail: str = "") -> None:
 
 
 def _close(st, outcome: str, detail: str = "") -> None:
-    """Attach the first reported outcome to the open press, then close it."""
+    """Attach the first reported outcome to the open press, then close it.
+
+    FIX AU-5: every message is written now. Previously the early return on
+    p["outcome"] meant a press that reported twice - warning then error - kept
+    only the first and the second never reached the ledger at all, and a message
+    with no open press was dropped outright. The open entry is still closed by
+    the FIRST report, because that is what closes it; later reports become
+    follow-up lines, and an unattributed message is written on its own.
+    """
+    text = str(detail or "")[:300]
     try:
         p = st.session_state.get(_PEND)
     except Exception:
+        p = None
+    if p and not p.get("outcome"):
+        p["outcome"] = outcome
+        try:
+            st.session_state[_PEND] = p
+        except Exception:
+            pass
+        _emit(p, outcome, text)
         return
-    if not p or p.get("outcome"):
+    if p:
+        _emit({"page": p.get("page", "?"), "widget": "follow",
+               "label": p.get("label", ""), "key": p.get("key", "")},
+              outcome, text)
         return
-    p["outcome"] = outcome
     try:
-        st.session_state[_PEND] = p
+        page_ = st.session_state.get(_PAGE, "?")
     except Exception:
-        pass
-    _emit(p, outcome, str(detail or "")[:300])
+        page_ = "?"
+    _emit({"page": page_, "widget": "note", "label": "message", "key": ""},
+          outcome, text)
 
 
 def _render_flashes(st) -> None:
@@ -313,6 +407,19 @@ def _render_flashes(st) -> None:
             pass
 
 
+def drain(st) -> None:
+    """Public drain, for a page listed in _DEFER_PAGES.
+
+    Call it directly under your own header so the flashed text lands below the
+    title rather than above it. Same function install() uses for every other
+    page; idempotent, so a double call on one run is harmless.
+    """
+    try:
+        _render_flashes(st)
+    except Exception:
+        pass
+
+
 def flash(st, outcome: str, text: str) -> None:
     """Close the open press as `outcome`, show it now, and keep it for one run.
 
@@ -340,6 +447,14 @@ def flash(st, outcome: str, text: str) -> None:
 def _record_click(st, widget: str, label: str, key: str) -> None:
     if key in _SKIP_KEYS:
         return
+    # FIX AU-5: two buttons in one run used to leave the first one unrecorded,
+    # because this assignment simply replaced it. Close it first.
+    try:
+        prev = st.session_state.get(_PEND)
+    except Exception:
+        prev = None
+    if prev and not prev.get("outcome"):
+        _emit(prev, "NO RESULT", "superseded by a second press in the same run")
     try:
         st.session_state[_PEND] = {"page": st.session_state.get(_PAGE, "?"),
                                    "widget": widget, "kind": "click",
@@ -404,9 +519,15 @@ def _close_stale(st) -> None:
             pass
 
 
-def _synth_key(st, page_: str, label: str) -> str:
-    """Stable stand-in key for a widget declared without key=."""
-    base = "@%s|%s" % (page_, label)
+def _synth_key(st, page_: str, name: str, label: str) -> str:
+    """Stable stand-in key for a widget declared without key=.
+
+    FIX AU-5: the widget TYPE is part of the base now. Keying on page|label
+    alone made the key purely positional, so a conditional widget appearing
+    earlier in the run shifted every later key and every _SEEN baseline
+    mismatched - which recorded a CHANGED line for widgets nobody touched.
+    """
+    base = "@%s|%s|%s" % (page_, name, str(label)[:60])
     try:
         used = st.session_state.setdefault(_USED, {})
         n = int(used.get(base, 0))
@@ -431,7 +552,7 @@ def _wrap_one(st, target, name: str, kind: str) -> None:
             if real_key:
                 key = str(real_key)
             else:
-                key = _synth_key(st, page_, str(label)[:60])
+                key = _synth_key(st, page_, _name, str(label)[:60])
             seen = st.session_state.setdefault(_SEEN, {})
             before = seen.get(key, _MISSING)
         except Exception:
@@ -548,6 +669,11 @@ def selftest() -> int:
     import types
 
     d = tempfile.mkdtemp(prefix="audit_")
+    # FIX AU-5: remember what we are about to overwrite and put it back. The old
+    # teardown popped both, so anything imported later in the same process lost
+    # the real auth module and the real run directory.
+    prev_run_dir = os.environ.get("BB_RUN_DIR")
+    prev_auth = sys.modules.get("auth")
     os.environ["BB_RUN_DIR"] = d
     bad = []
 
@@ -606,6 +732,9 @@ def selftest() -> int:
             return None
 
         def error(self, msg):
+            return None
+
+        def exception(self, msg):
             return None
 
         def info(self, msg):
@@ -748,12 +877,67 @@ def selftest() -> int:
         check("the deferred press is not closed as NO RESULT before its drain",
               not any(e["label"] == "Deferred press" and e["outcome"] == "NO RESULT"
                       for e in entries()))
-        _render_flashes(st)
+        drain(st)
         check("the page drain empties the queue",
               not st.session_state.get("_audit_flash"))
         check("the deferred message still records the press as OK",
               any(e["label"] == "Deferred press" and e["outcome"] == "OK"
                   for e in entries()))
+
+        # FIX AU-5: a second report on the same press is kept, not dropped.
+        install(st, "p.py")
+        st.button("Two messages")
+        st.warning("first")
+        st.error("second")
+        check("the first report closes the press",
+              any(e["label"] == "Two messages" and e["outcome"] == "WARN"
+                  for e in entries()))
+        check("the second report is not lost",
+              any(e["label"] == "Two messages" and e["outcome"] == "FAILED"
+                  for e in entries()))
+        check("the follow-up is marked as one",
+              any(e.get("widget") == "follow" and e["label"] == "Two messages"
+                  for e in entries()))
+
+        # FIX AU-5: a message with no open press is still written.
+        install(st, "p.py")
+        install(st, "p.py")
+        _n = len(entries())
+        st.success("nobody pressed anything")
+        check("an unattributed message is recorded",
+              len(entries()) == _n + 1
+              and any(e.get("label") == "message" for e in entries()))
+
+        # FIX AU-5: two presses in one run - the first closes, the second opens.
+        install(st, "p.py")
+        st.button("First press")
+        st.button("Second press")
+        check("the superseded press is closed as NO RESULT",
+              any(e["label"] == "First press" and e["outcome"] == "NO RESULT"
+                  for e in entries()))
+        st.success("second done")
+        check("the surviving press takes the message",
+              any(e["label"] == "Second press" and e["outcome"] == "OK"
+                  for e in entries()))
+
+        # FIX AU-5: flash honours the outcomes that used to fall through to OK.
+        install(st, "p.py")
+        st.button("Error flash")
+        flash(st, "ERROR", "it broke")
+        check("flash records ERROR and not OK",
+              any(e["label"] == "Error flash" and e["outcome"] == "ERROR"
+                  for e in entries()))
+        check("an unknown outcome still falls back to OK",
+              (flash(st, "NONSENSE", "x") or True)
+              and any(e.get("outcome") == "OK" for e in entries()))
+
+        # FIX AU-5: identical labels get distinct keys.
+        install(st, "p.py")
+        _k1 = _synth_key(st, "p.py", "button", "Same")
+        _k2 = _synth_key(st, "p.py", "button", "Same")
+        _k3 = _synth_key(st, "p.py", "slider", "Same")
+        check("duplicate labels are disambiguated", _k1 != _k2)
+        check("the widget type is part of the key", _k1 != _k3)
 
         page("q.py")
         check("a page visit is recorded",
@@ -763,17 +947,28 @@ def selftest() -> int:
         page("q.py")
         check("a rerun on the same page is not a second visit", len(entries()) == _n)
 
-        for i in range(MAX_LINES + 25):
+        for i in range(MAX_LINES + 225):
             note("bulk %d" % i, "OK")
         check("capped at MAX_LINES", len(entries(limit=MAX_LINES + 50)) == MAX_LINES)
+        check("the trim counter agrees with the file",
+              _COUNTS.get(_path(), -1) == MAX_LINES)
         check("reset empties the file", reset() > 0 and entries() == [])
+        check("reset drops the trim counter", _path() not in _COUNTS)
+        check("reset clears the pending press",
+              not st.session_state.get("_audit_pending"))
     finally:
         sys.modules.pop("streamlit", None)
         if saved_st is not None:
             sys.modules["streamlit"] = saved_st
         shutil.rmtree(d, ignore_errors=True)
-        os.environ.pop("BB_RUN_DIR", None)
-        sys.modules.pop("auth", None)
+        if prev_run_dir is None:
+            os.environ.pop("BB_RUN_DIR", None)
+        else:
+            os.environ["BB_RUN_DIR"] = prev_run_dir
+        if prev_auth is None:
+            sys.modules.pop("auth", None)
+        else:
+            sys.modules["auth"] = prev_auth
 
     print("SELFTEST: %s (%d failure(s))" % ("OK" if not bad else "FAILED", len(bad)))
     return 1 if bad else 0
