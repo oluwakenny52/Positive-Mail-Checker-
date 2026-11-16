@@ -67,21 +67,34 @@ FIX AU-5 (v13.52) - SIX DEFECTS, ALL IN THE WRITE PATH
 2. _trim() READ THE FILE ON EVERY APPEND to find out whether it needed to trim.
    Now a per-path counter (_COUNTS) is seeded once from the file and incremented
    on each write; the read-rewrite only happens after TRIM_SLACK extra lines.
+   The file is therefore bounded by MAX_LINES + TRIM_SLACK, and is trimmed back
+   to MAX_LINES when that is crossed.
 3. _FN_FOR LACKED ERROR AND STOPPED, so flash(st, "ERROR", ...) hit the
    `else "OK"` guard and a failure flashed as a success. Both are mapped now.
    STOPPED renders through warning rather than st.stop(), because st.stop()
    inside install() would abort the page before its body ran.
 4. _close() DROPPED EVERY MESSAGE AFTER THE FIRST. A press that warned and then
    errored recorded only the warning. The open entry is still closed by the
-   FIRST report - that is what closes it - but a second and third are emitted as
-   follow-up lines, and a message with no open press at all is now written on its
-   own instead of vanishing.
+   FIRST report - that is what closes it - but a DIFFERENT second and third
+   report are emitted as follow-up lines, and a message with no open press at all
+   is written on its own instead of vanishing. A repeat of the SAME outcome on
+   the same press is suppressed, because flash() renders through the wrapped
+   message function and would otherwise write its line twice.
 5. _record_click() REPLACED AN OPEN PRESS WITHOUT EMITTING IT, so with two
    buttons in one run the first was never recorded. It now closes as NO RESULT
    first.
 6. _synth_key() WAS POSITIONAL - page|label only - so a conditional widget that
    appeared earlier shifted every later key and every _SEEN baseline mismatched,
    producing false CHANGED lines. The widget type is now part of the base.
+
+WHY THE REPLAY IS SILENT  (v13.52)
+----------------------------------
+A queued flash is re-rendered on the next run through the same wrapped message
+functions. By then _close_stale() has already popped the press, so _close() would
+fall through to the unattributed branch and write an orphan "message" line for a
+press that was recorded a run earlier. _render_flashes() raises _REPLAY around
+the loop and _close() returns immediately while it is set - the text still
+paints, nothing is written twice.
 
 WHAT IS AND IS NOT VISIBLE
 --------------------------
@@ -117,9 +130,9 @@ warning / exception / stop / toast close one.
 ISOLATION
 ---------
 The file resolves through auth.user_file(), so it is <hash>_mail_results/
-action_log.jsonl - one ledger per user, never shared. Capped at MAX_LINES. The
-trim counter is keyed by resolved path, so two users in one process never share
-a count.
+action_log.jsonl - one ledger per user, never shared. Bounded by MAX_LINES plus
+TRIM_SLACK. The trim counter is keyed by resolved path, so two users in one
+process never share a count.
 
 A failure in here must never break a page: every public function swallows.
 """
@@ -142,6 +155,7 @@ _SEEN = "_audit_seen"
 _USED = "_audit_used"
 _LAST = "_audit_last"
 _FLASH = "_audit_flash"
+_REPLAY = "_audit_replay"
 _MISSING = object()
 
 # Re-entrant: _rewrite_last() can fall back into _append(), _append() into
@@ -324,7 +338,7 @@ def reset() -> int:
     # exists, and a stale _SEEN baseline would fire a false CHANGED on next load.
     try:
         import streamlit as st
-        for k in (_PEND, _SEEN, _LAST, _FLASH):
+        for k in (_PEND, _SEEN, _LAST, _FLASH, _REPLAY):
             st.session_state.pop(k, None)
     except Exception:
         pass
@@ -347,13 +361,23 @@ def _emit(p: dict, outcome: str, detail: str = "") -> None:
 def _close(st, outcome: str, detail: str = "") -> None:
     """Attach the first reported outcome to the open press, then close it.
 
-    FIX AU-5: every message is written now. Previously the early return on
-    p["outcome"] meant a press that reported twice - warning then error - kept
+    FIX AU-5: every DISTINCT message is written now. Previously the early return
+    on p["outcome"] meant a press that reported twice - warning then error - kept
     only the first and the second never reached the ledger at all, and a message
     with no open press was dropped outright. The open entry is still closed by
     the FIRST report, because that is what closes it; later reports become
     follow-up lines, and an unattributed message is written on its own.
+
+    A repeat of the SAME outcome is suppressed: flash() renders through the
+    wrapped message function straight after closing, so without this every flash
+    wrote its line twice. While _REPLAY is set nothing is written at all - that
+    text belongs to a press already recorded a run ago.
     """
+    try:
+        if st.session_state.get(_REPLAY):
+            return
+    except Exception:
+        pass
     text = str(detail or "")[:300]
     try:
         p = st.session_state.get(_PEND)
@@ -368,9 +392,10 @@ def _close(st, outcome: str, detail: str = "") -> None:
         _emit(p, outcome, text)
         return
     if p:
-        _emit({"page": p.get("page", "?"), "widget": "follow",
-               "label": p.get("label", ""), "key": p.get("key", "")},
-              outcome, text)
+        if p.get("outcome") != outcome:
+            _emit({"page": p.get("page", "?"), "widget": "follow",
+                   "label": p.get("label", ""), "key": p.get("key", "")},
+                  outcome, text)
         return
     try:
         page_ = st.session_state.get(_PAGE, "?")
@@ -383,8 +408,9 @@ def _close(st, outcome: str, detail: str = "") -> None:
 def _render_flashes(st) -> None:
     """Re-show the messages the previous run queued, through the real widgets.
 
-    Rendering them here means the wrapped message functions see them, so the
-    entry they belong to is closed on the run that shows the text.
+    Rendering them here means the text still paints after the st.rerun() that
+    carried it, but the record already exists, so _REPLAY is raised and _close()
+    stays silent for the whole loop.
 
     FIX FLASH-4: install() calls this only for a page that is NOT in
     _DEFER_PAGES. A deferred page calls it itself, under its own header, so the
@@ -397,12 +423,22 @@ def _render_flashes(st) -> None:
         return
     if not q:
         return
-    for outcome, text in q:
-        fn = getattr(st, _FN_FOR.get(outcome, "info"), None)
-        if fn is None:
-            continue
+    try:
+        st.session_state[_REPLAY] = True
+    except Exception:
+        pass
+    try:
+        for outcome, text in q:
+            fn = getattr(st, _FN_FOR.get(outcome, "info"), None)
+            if fn is None:
+                continue
+            try:
+                fn(text)
+            except Exception:
+                pass
+    finally:
         try:
-            fn(text)
+            st.session_state.pop(_REPLAY, None)
         except Exception:
             pass
 
@@ -858,12 +894,17 @@ def selftest() -> int:
         check("flash closes the press immediately",
               any(e["label"] == "Flash press" and e["outcome"] == "OK"
                   for e in entries()))
+        check("flash writes the line once, not twice",
+              sum(1 for e in entries() if e["label"] == "Flash press") == 1)
         st.rerun()
         install(st, "p.py")
         check("the flash is still recorded as OK after the rerun",
               any(e["label"] == "Flash press" and e["outcome"] == "OK"
                   for e in entries()))
+        check("the replay adds no duplicate line",
+              sum(1 for e in entries() if e["label"] == "Flash press") == 1)
         check("the flash queue is drained", not st.session_state.get("_audit_flash"))
+        check("the replay flag is cleared", not st.session_state.get("_audit_replay"))
 
         # FIX FLASH-4 regression pair: a DEFERRED page (app.py) must NOT be
         # drained by install(), and its own drain must still close the press.
@@ -883,8 +924,10 @@ def selftest() -> int:
         check("the deferred message still records the press as OK",
               any(e["label"] == "Deferred press" and e["outcome"] == "OK"
                   for e in entries()))
+        check("the drain does not duplicate the record",
+              sum(1 for e in entries() if e["label"] == "Deferred press") == 1)
 
-        # FIX AU-5: a second report on the same press is kept, not dropped.
+        # FIX AU-5: a DIFFERENT second report on the same press is kept.
         install(st, "p.py")
         st.button("Two messages")
         st.warning("first")
@@ -927,11 +970,11 @@ def selftest() -> int:
         check("flash records ERROR and not OK",
               any(e["label"] == "Error flash" and e["outcome"] == "ERROR"
                   for e in entries()))
+        flash(st, "NONSENSE", "x")
         check("an unknown outcome still falls back to OK",
-              (flash(st, "NONSENSE", "x") or True)
-              and any(e.get("outcome") == "OK" for e in entries()))
+              entries()[0].get("outcome") == "OK")
 
-        # FIX AU-5: identical labels get distinct keys.
+        # FIX AU-5: identical labels get distinct keys, and the type separates.
         install(st, "p.py")
         _k1 = _synth_key(st, "p.py", "button", "Same")
         _k2 = _synth_key(st, "p.py", "button", "Same")
@@ -949,9 +992,10 @@ def selftest() -> int:
 
         for i in range(MAX_LINES + 225):
             note("bulk %d" % i, "OK")
-        check("capped at MAX_LINES", len(entries(limit=MAX_LINES + 50)) == MAX_LINES)
-        check("the trim counter agrees with the file",
-              _COUNTS.get(_path(), -1) == MAX_LINES)
+        _live = len(entries(limit=MAX_LINES + TRIM_SLACK + 50))
+        check("trimmed back to at most the cap plus slack",
+              MAX_LINES <= _live <= MAX_LINES + TRIM_SLACK)
+        check("the trim counter agrees with the file", _COUNTS.get(_path()) == _live)
         check("reset empties the file", reset() > 0 and entries() == [])
         check("reset drops the trim counter", _path() not in _COUNTS)
         check("reset clears the pending press",
