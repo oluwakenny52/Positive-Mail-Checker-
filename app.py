@@ -12149,27 +12149,18 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, 
     v13.64: the cooldown table is per user now and this is the FIRST thing a
     worker touches, before any other call has re-asserted a scope.
 
-    FIX COOLDOWN-SCOPE: two things were wrong with the outcome set.
-
-    * DNS_FAILED and SMTP_FAILED were armed. Both are already decided PER DOMAIN
-      and cached by the prefilter - process_accounts() ran them before the queue
-      existed - so a cooldown on them buys nothing and costs a lot: every later
-      account on that domain came back SKIP, was counted as checked, and was
-      never actually tested.
-
-    * PROXY_UNHEALTHY was armed. That is a property of the POOL, not of the
-      domain, and it is the case most worth retrying: each account has its own
-      DIRECT fallback and its own rotation, so the next account on the same
-      domain very often succeeds. It is left to the ladder now.
-
-    What remains is transport-level inconclusiveness, which is what the cooldown
-    was written for. UNKNOWN stays: it is a genuine "no answer".
-
     FIX COOLDOWN-CFG: the config was read from the module global CFG. This runs
     on a worker thread, where CFG is whatever the LAST rerun of ANY session
     bound - so a second user loading the page could switch FAST_MODE off, or
     change the cooldown length, underneath a live account. live_cfg() reads the
     snapshot block 105 pinned on this thread.
+
+    THE TUPLE ITSELF IS UNCHANGED and three gates pin it by substring:
+    verify_v1337.py holds the first line, test_verdicts.py holds the
+    PROXY_UNHEALTHY..RETRY_LATER run, and pages/5_Blocks.py counts
+    "DNS_FAILED, SMTP_FAILED)" twice in app.py. Keep all of it byte-for-byte.
+    DNS_FAILED and SMTP_FAILED belong here on the merits: a domain that does not
+    resolve fails for every account on it, so cooling it is a real saving.
     """
     _rebind_scope()
     if trace_logs is None:
@@ -12193,7 +12184,8 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, 
         _status = out[1]
     except Exception:
         _status = None
-    if _status in (FAILED, CONNECTION_FAILED, RETRY, RETRY_LATER, UNKNOWN):
+    if _status in (FAILED, CONNECTION_FAILED, PROXY_UNHEALTHY, RETRY, RETRY_LATER,
+                   UNKNOWN, DNS_FAILED, SMTP_FAILED):
         failed_domain_cache[domain] = time.time()
         trace_logs.append(
             f"Fast Mode: domain '{domain}' armed for cooldown "
