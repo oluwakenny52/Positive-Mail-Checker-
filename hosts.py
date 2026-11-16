@@ -353,10 +353,16 @@ def _order_provider_hosts(hosts, domain, pop=False):
 # @@END 006 FAMILY_PRIORITY
 
 
-# @@BLOCK 007 POP_DERIVE deps=004,005
+# @@BLOCK 007 POP_DERIVE deps=004,005,013
 # v13.30: derive a POP list from an IMAP list when no curated POP list exists.
 # A COUNTRY entry used to be handed to BOTH buckets verbatim, so the POP rung
 # dialled an IMAP-only hostname on 995 and the real POP host was never reached.
+#
+# deps corrected to include 013: every candidate below is gated on
+# host_resolves(), which lives there. The old header claimed 004,005 only, so a
+# re-order on the headers alone left this block calling an unbound name.
+# The cost is real - up to two candidate lookups per rewritten host plus the two
+# prefix guesses, all synchronous DNS - so this stays behind the curated path.
 _POP_REWRITE = (
     ("imaps.", "pop3s."),
     ("imapmail.", "pop."),
@@ -567,9 +573,6 @@ def is_junk_host(host, domain=None):
             return True
 
     return False
-
-
-_is_junk_host = is_junk_host
 
 
 def host_tier(host, domain):
@@ -986,16 +989,6 @@ def _guess_candidates(domain, prefixes):
     return out
 
 
-def _is_plain_domain_guess(host, domain, prefixes):
-    h = (host or "").lower().strip()
-    d = (domain or "").lower().strip()
-    if not h or not d:
-        return False
-    if h == d:
-        return True
-    return any(h == f"{p}{d}" for p in prefixes if p)
-
-
 def merge_domain_guesses(servers, domain):
     """Insert the domain's own AND alias-root resolving service names.
 
@@ -1307,17 +1300,6 @@ def _with_discovery(got, domain):
         if cur:
             out[key] = cur
     return out
-
-
-def get_mx_host(domain):
-    mx_records = resolve_mx(domain)
-    if not mx_records:
-        return None
-    exchange = mx_records[0]
-    provider = _provider_from_mx(exchange)
-    if provider and provider[0]:
-        return provider[0]
-    return exchange
 
 
 def smtp_candidates(domain):
