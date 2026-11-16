@@ -1,4 +1,4 @@
-"""notify.py - per-user, bounded, file-backed notifications.  v13.72
+"""notify.py - per-user, bounded, file-backed notifications.  v13.73
 
 WHY A FILE AND NOT session_state
 --------------------------------
@@ -27,6 +27,30 @@ v13.72: THE PRUNE RAN ONLY ON A KEYED CALL.  _prune() sat inside `if key:`, so a
 keyless add() - a call that deliberately wants every occurrence - never pruned
 anything and the map grew exactly as before. It runs at the top of the lock now,
 before the branch, so both shapes prune.
+
+v13.73: FIVE DEFECTS IN THE PRUNE, THE ID AND THE WRITE.
+1. THE WINDOW WAS THE CALLER'S, NOT THE MODULE'S.  _prune(now, dedupe) cut off at
+   `now - dedupe`, so a short-window caller (30 s) dropped pairs that a 600 s
+   caller still needed and its dedupe silently stopped working. The cutoff is
+   max(dedupe, SYS_REPEAT_SECONDS) - the longest window in the module - which is
+   what v13.71's own comment already claimed.
+2. THE PRUNE WAS PURELY SIZE-TRIGGERED.  Under DEDUPE_MAX pairs nothing was ever
+   dropped, so a deployment with a handful of keys kept every expired pair for
+   the life of the process. _prune now also runs every PRUNE_EVERY adds.
+3. THE ID WAS TWO NUMBERS CONCATENATED - "%d%03d" - and counts() compares ids as
+   STRINGS to find the unseen tail. That ordering survived only because the
+   millisecond part is always 13 digits and happens to dominate; _seq wrapping to
+   0 inside one millisecond would have inverted it. The id is one monotonic
+   integer now, zero-padded to 16, so string order IS numeric order.
+4. THE .tmp FILE WAS NEVER CLEANED.  A failed write left notifications.jsonl.tmp
+   behind for good, one per failure, next to the log. Both writers remove it now.
+5. THE DIRECTORY WAS NEVER CREATED.  Only the anon fallback in _dir() made it; if
+   auth.user_dir() handed back a path that did not exist yet, every write failed
+   silently and the bell stayed empty with no error anywhere. _write_rows and
+   _write_seen makedirs first.
+Also: the system_tick throttle was read and written OUTSIDE the lock, so two
+threads both passed it and both raised the same alert; and mark_seen wrote "" when
+the last row carried no id, which marked the whole ring unseen again.
 
 DEDUPE - AND WHY IT IS PER USER
 -------------------------------
@@ -60,6 +84,8 @@ LOG_NAME = "notifications.jsonl"
 SEEN_NAME = "notify_seen.json"
 # v13.71: prune the dedupe map once it passes this many pairs.
 DEDUPE_MAX = 400
+# v13.73: and also every this many adds, whatever the map size.
+PRUNE_EVERY = 64
 
 LEVELS = ("info", "warn", "critical")
 LEVEL_COLOR = {"info": "#38bdf8", "warn": "#facc15", "critical": "#ef4444"}
@@ -77,6 +103,7 @@ _lock = threading.RLock()
 _dedupe = {}
 _last_sys = {}
 _seq = 0
+_adds = 0
 
 
 # ---------------------------------------------------------------------------
@@ -139,12 +166,21 @@ def _write_rows(rows):
     p = _log_path()
     tmp = p + ".tmp"
     try:
+        # v13.73: the directory is not guaranteed to exist - only the anon
+        # fallback used to create it, so a real user's first write could fail
+        # silently and leave the bell permanently empty.
+        os.makedirs(os.path.dirname(p) or ".", exist_ok=True)
         with open(tmp, "w", encoding="utf-8") as fh:
             for rec in rows:
                 fh.write(json.dumps(rec, separators=(",", ":")) + "\n")
         os.replace(tmp, p)
         return True
     except Exception:
+        # v13.73: a failed write used to strand the .tmp file for good.
+        try:
+            os.remove(tmp)
+        except Exception:
+            pass
         return False
 
 
@@ -163,26 +199,38 @@ def _write_seen(last):
     p = _path(SEEN_NAME)
     tmp = p + ".tmp"
     try:
+        os.makedirs(os.path.dirname(p) or ".", exist_ok=True)
         with open(tmp, "w", encoding="utf-8") as fh:
             json.dump({"last": str(last or "")}, fh)
         os.replace(tmp, p)
     except Exception:
-        pass
+        try:
+            os.remove(tmp)
+        except Exception:
+            pass
 
 
-def _prune(now, window=SYS_REPEAT_SECONDS):
+def _prune(now, window=SYS_REPEAT_SECONDS, force=False):
     """Drop dedupe pairs whose window has expired. Called under _lock.
 
     v13.71: without this the map only ever grew. The longest window in the module
     is SYS_REPEAT_SECONDS, so a pair older than that can never suppress anything
     again and is safe to forget.
+
+    v13.73: the cutoff uses max(window, SYS_REPEAT_SECONDS). It used to use the
+    CALLER's window, so a 30 s caller expired pairs a 600 s caller still needed.
+    `force` lets the add counter drive a sweep even while the map is small.
     """
     try:
-        if len(_dedupe) > DEDUPE_MAX:
-            cutoff = float(now) - float(window)
+        try:
+            span = max(float(window), SYS_REPEAT_SECONDS)
+        except Exception:
+            span = SYS_REPEAT_SECONDS
+        if force or len(_dedupe) > DEDUPE_MAX:
+            cutoff = float(now) - span
             for k in [k for k, v in _dedupe.items() if float(v[0]) < cutoff]:
                 _dedupe.pop(k, None)
-        if len(_last_sys) > DEDUPE_MAX:
+        if force or len(_last_sys) > DEDUPE_MAX:
             cutoff = float(now) - SYS_MIN_SECONDS
             for k in [k for k, v in _last_sys.items() if float(v) < cutoff]:
                 _last_sys.pop(k, None)
@@ -195,7 +243,7 @@ def _prune(now, window=SYS_REPEAT_SECONDS):
 # ---------------------------------------------------------------------------
 def add(level, kind, text, suggestion="", key="", dedupe=SYS_REPEAT_SECONDS):
     """Record one notification. Returns its id, or None when deduped."""
-    global _seq
+    global _seq, _adds
     level = level if level in LEVELS else "info"
     text = str(text or "").strip()
     if not text:
@@ -204,7 +252,9 @@ def add(level, kind, text, suggestion="", key="", dedupe=SYS_REPEAT_SECONDS):
     try:
         with _lock:
             # v13.72: BEFORE the `if key:` branch, so a keyless call prunes too.
-            _prune(now, dedupe)
+            # v13.73: and every PRUNE_EVERY adds, not only past DEDUPE_MAX.
+            _adds = (_adds + 1) % PRUNE_EVERY
+            _prune(now, dedupe, force=(_adds == 0))
             if key:
                 dkey = (_scope(), key)
                 prev = _dedupe.get(dkey)
@@ -215,7 +265,10 @@ def add(level, kind, text, suggestion="", key="", dedupe=SYS_REPEAT_SECONDS):
             rows = _read_rows()
             _seq = (_seq + 1) % 1000
             rec = {
-                "id": "%d%03d" % (int(now * 1000), _seq),
+                # v13.73: ONE monotonic integer, zero-padded. Two concatenated
+                # fields were only accidentally ordered, and counts() compares
+                # these as strings.
+                "id": "%016d" % (int(now * 1000) * 1000 + _seq),
                 "ts": time.strftime("%Y-%m-%d %H:%M:%S"),
                 "epoch": round(now, 1),
                 "level": level,
@@ -263,8 +316,10 @@ def mark_seen():
     try:
         with _lock:
             rows = _read_rows()
-            if rows:
-                _write_seen(rows[-1].get("id"))
+            # v13.73: writing "" when the last row has no id marked the whole
+            # ring unseen again on the next counts().
+            if rows and rows[-1].get("id"):
+                _write_seen(rows[-1]["id"])
     except Exception:
         pass
 
@@ -349,9 +404,15 @@ def system_tick(force=False, session_bytes=0):
     """
     now = time.time()
     scope = _scope()
-    if not force and (now - float(_last_sys.get(scope, 0.0))) < SYS_MIN_SECONDS:
-        return 0
-    _last_sys[scope] = now
+    # v13.73: the throttle was read AND written outside the lock, so two threads
+    # both passed it and both raised the same alert. Held only for the decision.
+    try:
+        with _lock:
+            if not force and (now - float(_last_sys.get(scope, 0.0))) < SYS_MIN_SECONDS:
+                return 0
+            _last_sys[scope] = now
+    except Exception:
+        pass
     made = 0
     try:
         rss, cused, lim = _ram()
