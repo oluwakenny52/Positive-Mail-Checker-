@@ -12155,11 +12155,13 @@ def check_account_sync(email, password, conf, domain, proxy_pool, thread_state, 
     change the cooldown length, underneath a live account. live_cfg() reads the
     snapshot block 105 pinned on this thread.
 
-    THE TUPLE ITSELF IS UNCHANGED and three gates pin it by substring:
-    verify_v1337.py holds the first line, test_verdicts.py holds the
-    PROXY_UNHEALTHY..RETRY_LATER run, and pages/5_Blocks.py counts
-    "DNS_FAILED, SMTP_FAILED)" twice in app.py. Keep all of it byte-for-byte.
-    DNS_FAILED and SMTP_FAILED belong here on the merits: a domain that does not
+    THE TUPLE IS UNCHANGED and three gates pin it. verify_v1337.py holds the
+    first line, test_verdicts.py holds the PROXY_UNHEALTHY to RETRY_LATER run,
+    and pages/5_Blocks.py counts the DNS_FAILED / SMTP_FAILED tail exactly twice
+    across app.py. That second count is why the tail must NOT be spelled with
+    its closing paren anywhere in THIS docstring: the tuple already supplies one
+    occurrence, and a quoted copy here makes the count three. DNS_FAILED and
+    SMTP_FAILED belong in the tuple on the merits - a domain that does not
     resolve fails for every account on it, so cooling it is a real saving.
     """
     _rebind_scope()
