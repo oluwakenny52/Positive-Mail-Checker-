@@ -353,14 +353,16 @@ def _order_provider_hosts(hosts, domain, pop=False):
 # @@END 006 FAMILY_PRIORITY
 
 
-# @@BLOCK 007 POP_DERIVE deps=004,005,013
+# @@BLOCK 007 POP_DERIVE deps=004,005
 # v13.30: derive a POP list from an IMAP list when no curated POP list exists.
 # A COUNTRY entry used to be handed to BOTH buckets verbatim, so the POP rung
 # dialled an IMAP-only hostname on 995 and the real POP host was never reached.
 #
-# deps corrected to include 013: every candidate below is gated on
-# host_resolves(), which lives there. The old header claimed 004,005 only, so a
-# re-order on the headers alone left this block calling an unbound name.
+# FORWARD REFERENCE, and the header cannot say it: every candidate below is
+# gated on host_resolves(), which lives in block 013 - AFTER this block. The
+# frame contract only allows deps that are EARLIER than the block itself, so the
+# dependency is documented here rather than declared. If these two blocks are
+# ever re-ordered, 013 must stay below 007.
 # The cost is real - up to two candidate lookups per rewritten host plus the two
 # prefix guesses, all synchronous DNS - so this stays behind the curated path.
 _POP_REWRITE = (
