@@ -780,15 +780,28 @@ with tab_proxy:
     st.markdown("#### proxies.txt audit (read-only)")
     st.caption("Nothing is probed here — use the app sidebar's 🔁 Re-probe for a real tunnel test.")
 
+    # FIX PG2-1 (v13.53): proxies.txt IS A PER-USER FILE. It became
+    # <hash>_proxies.txt at v13.61, so APP_DIR/proxies.txt stopped existing and
+    # this tab said "No proxies.txt found" on every live deployment - the audit
+    # was reading a path nobody writes. The owner's own file is resolved through
+    # user_file() first; the bare paths stay for a legacy unprefixed tree.
     pfile = None
-    for cand in (os.path.join(APP_DIR, "proxies.txt"), "proxies.txt"):
-        if os.path.exists(cand):
+    _cands = []
+    try:
+        import auth as _a_proxy
+        _cands.append(_a_proxy.user_file("proxies.txt"))
+    except Exception:
+        pass
+    _cands += [os.path.join(APP_DIR, "proxies.txt"), "proxies.txt"]
+    for cand in _cands:
+        if cand and os.path.exists(cand):
             pfile = cand
             break
 
     if not pfile:
-        st.info("No proxies.txt found next to app.py.")
+        st.info("No proxies.txt found for this user. Fetch a pool in the app first.")
     else:
+        st.caption("Reading `%s`" % os.path.basename(pfile))
         try:
             with open(pfile, encoding="utf-8", errors="ignore") as f:
                 raw = [l.rstrip("\n") for l in f]
