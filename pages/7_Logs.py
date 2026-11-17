@@ -601,7 +601,13 @@ with _t_trace:
         _labels = ["%s  %s  %s" % (r["Time"], r["Status"], r["Combo"])
                    for r in FILTERED_REPORTS]
         _pick = st.selectbox("Pick an account", _labels, key="lg_pick")
-        _row = FILTERED_REPORTS[_labels.index(_pick)]
+        # FIX PG7-1 (v13.53): A STALE lg_pick RAISED ValueError.
+        # The key survives a filter change, so a stored label that the new
+        # FILTERED_REPORTS no longer contains reached list.index() and threw -
+        # taking the whole trace tab down instead of showing the first row. A
+        # membership test falls back to the top of the list.
+        _idx = _labels.index(_pick) if _pick in _labels else 0
+        _row = FILTERED_REPORTS[_idx]
         st.markdown("**%s**  ·  `%s`" % (_row["Status"], _row["Time"]))
         st.code(_row["Trace"] or "(no trace recorded)", language="text")
 
@@ -625,6 +631,11 @@ with _t_boot:
 # @@END 012 TAB_BOOT
 
 # @@BLOCK 013 TAB_RECORD_FILES deps=008
+# FIX PG7-2 (v13.53): `io` WAS NEVER IMPORTED ON THIS PAGE.
+# The CSV block reached it as `__import__("io").StringIO()` on every rerun, while
+# the header imports csv and json normally. It is a real module import now.
+import io
+
 with _t_rec:
     _c1, _c2 = st.columns(2)
     with _c1:
@@ -715,7 +726,7 @@ with _t_files:
     if REPORTS:
         st.markdown("---")
         st.markdown("**Traces as CSV**")
-        _buf = __import__("io").StringIO()
+        _buf = io.StringIO()
         _w = csv.writer(_buf)
         _w.writerow(["time", "combo", "status", "trace"])
         for r in FILTERED_REPORTS:
