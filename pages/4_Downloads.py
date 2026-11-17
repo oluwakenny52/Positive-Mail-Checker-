@@ -266,6 +266,14 @@ def _own(path) -> bool:
     return bool(pfx) and base.startswith(pfx)
 
 
+# FIX PG4-1 (v13.53): THIS SET MATCHED BARE NAMES ONLY, AND NO FILE IS BARE ANY
+# MORE. It is compared as `b in IGNORE` against a basename, so it only ever
+# matched an unprefixed file - but every per-user file is `<hash>_proxies.txt`
+# since v13.61. Only "proxies" and "last_account" happened to be covered by
+# IGNORE_TOKENS; disposable_domains.txt and download_presets.json were not, so
+# `<hash>_disposable_domains.txt` was offered as an exportable source with a
+# MIXED status and a row count of zero. Both tokens are in the list now, and the
+# set stays for a legacy unprefixed tree.
 IGNORE = {
     "last_account.txt", "proxies.txt", "proxies_all.txt", "disposable_domains.txt",
     "clean_proxies.txt", "proxy_pool.txt", "download_presets.json",
@@ -274,7 +282,8 @@ IGNORE = {
 # viewer state. They are .txt in the same directory, so without these two tokens
 # they were offered as exportable sources with a MIXED status.
 IGNORE_TOKENS = ("resume", "unfinished", "remaining", "input", "proxies", "config",
-                 "last_account", "paste_accounts", "inspect_cat")
+                 "last_account", "paste_accounts", "inspect_cat",
+                 "disposable", "download_presets")
 
 # v13.55: STRONGEST STATUS WINS on dedupe. Without a rank the survivor of a
 # duplicate email was whichever file was read first, so a VALID address could be
