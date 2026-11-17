@@ -152,13 +152,20 @@ audit_log = _audit
 if hasattr(audit_log, "page"):
     audit_log.page("pages/1_Notifications.py")
 
-auth.require(st, "Unlock Notifications")
-auth.fit(st)
-
+# FIX 5a (v13.53): INSTALL BEFORE require(), exactly as app.py block 007 does.
+# require() calls st.stop() while the page is locked, so an install() placed
+# after it never runs on a locked page at all - and every widget require()
+# builds (the Unlock box, the Create box, both Forget buttons) is then created
+# by an unwrapped function and is invisible to the ledger. The old comment said
+# install had to sit late "so the file lands on the unlocked prefix"; it does
+# not, because _path() resolves user_file() at WRITE time, not at install time.
 if hasattr(audit_log, "install"):
     audit_log.install(st, "pages/1_Notifications.py")
 
-auth.fit_panel(st)
+auth.require(st, "Unlock Notifications")
+auth.fit(st)                        # CSS only, before the first widget
+
+auth.fit_panel(st)                  # the controls; collapsed until tapped
 
 # The first theme read ran before the gate and therefore used the anonymous
 # prefix. Now that the passphrase is unlocked the owner's real file exists, so
