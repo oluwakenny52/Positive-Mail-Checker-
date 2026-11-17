@@ -127,10 +127,10 @@ if not hasattr(auth, "fit_panel"):
 from auth import user_file          # blocks 012, 019 and 032 resolve paths through it
                                     # NB: must stay AFTER the reload above
 
-# v13.48: ledger. page() before the gate, install() after it, both above the
-# first widget so the sidebar and the page body are wrapped. fit_panel() is NOT
-# called here - it renders the Display Fit expanders and belongs under the hero
-# (block 027), so install() must land before it to see its sliders.
+# v13.48: ledger. page() before the gate, install() before require() and before
+# the first widget, so the Unlock box and the Display Fit sliders are wrapped.
+# fit_panel() is NOT called here - it renders the Display Fit expanders and
+# belongs under the hero (block 027).
 #
 # FIX AU-1 (v13.49): a module imported before a redeploy stays in sys.modules and
 # keeps answering with the OLD shape. audit_log gained page() at 02:25, two hours
@@ -150,6 +150,15 @@ audit_log = _audit
 
 if hasattr(audit_log, "page"):
     audit_log.page("pages/3_Mailbox_Reader.py")
+
+# FIX 5a (v13.53): INSTALL BEFORE require(), exactly as app.py block 007 does.
+# require() calls st.stop() while the page is locked, so an install() placed
+# after it never runs on a locked page at all - and every widget require()
+# builds is then created by an unwrapped function and is invisible to the
+# ledger. _path() resolves user_file() at WRITE time, so installing early costs
+# nothing on the unlocked prefix.
+if hasattr(audit_log, "install"):
+    audit_log.install(st, "pages/3_Mailbox_Reader.py")
 
 auth.require(st, "Unlock Mailbox Reader")
 
@@ -177,9 +186,6 @@ except Exception:
     pass
 
 auth.fit(st)                        # CSS only, before the first widget
-
-if hasattr(audit_log, "install"):
-    audit_log.install(st, "pages/3_Mailbox_Reader.py")
 # @@END 001 PAGE_CONFIG
 
 
