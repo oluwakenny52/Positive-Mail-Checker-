@@ -206,11 +206,17 @@ audit_log = _audit
 if hasattr(audit_log, "page"):
     audit_log.page("pages/4_Downloads.py")
 
-auth.require(st, "Unlock Export Studio")
-auth.fit(st)                        # CSS only, before the first widget
-
+# FIX 5a (v13.53): INSTALL BEFORE require(), exactly as app.py block 007 does.
+# require() calls st.stop() while the page is locked, so an install() placed
+# after it never runs on a locked page at all - and every widget require()
+# builds is then created by an unwrapped function and is invisible to the
+# ledger. _path() resolves user_file() at WRITE time, so installing early costs
+# nothing on the unlocked prefix.
 if hasattr(audit_log, "install"):
     audit_log.install(st, "pages/4_Downloads.py")
+
+auth.require(st, "Unlock Export Studio")
+auth.fit(st)                        # CSS only, before the first widget
 
 auth.fit_panel(st)                  # the controls; collapsed until tapped
 
