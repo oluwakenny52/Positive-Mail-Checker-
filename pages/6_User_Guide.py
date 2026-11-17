@@ -183,8 +183,8 @@ if not hasattr(auth, "fit_panel"):
 from auth import user_file         # AFTER the reload, so it binds to the live module
 
 # v13.48: ledger. page() before the gate so even the Unlock press is attributed;
-# install() after the gate and before the first widget. fit_panel() is called in
-# block 005, so install() lands ahead of it and its sliders are wrapped.
+# install() before require() and before the first widget. fit_panel() is called
+# in block 005, so install() lands ahead of it and its sliders are wrapped.
 #
 # FIX AU-1 (v13.49): audit_log gained page() at 02:25, two hours after this
 # process had already imported it at 00:42, and the process was never restarted -
@@ -204,15 +204,20 @@ audit_log = _audit
 if hasattr(audit_log, "page"):
     audit_log.page("pages/6_User_Guide.py")
 
-# require() first, fit() second - the order every page uses. fit() is CSS-only
-# and must land before the first widget. fit_panel() lands after the hero.
+# FIX 5a (v13.53): INSTALL BEFORE require(), exactly as app.py block 007 does.
+# require() calls st.stop() while the page is locked, so an install() placed
+# after it never runs on a locked page at all - and the Unlock box is then built
+# by an unwrapped function and is invisible to the ledger. _path() resolves
+# user_file() at WRITE time, so installing early costs nothing.
+#
+# require() first, fit() second - and fit() is CSS-only, before the first widget.
 # Call each EXACTLY once: a second fit() raises
 # StreamlitWidgetAlreadyInstantiatedError inside its own try/except.
-auth.require(st, "Unlock User Guide")
-auth.fit(st)
-
 if hasattr(audit_log, "install"):
     audit_log.install(st, "pages/6_User_Guide.py")
+
+auth.require(st, "Unlock User Guide")
+auth.fit(st)
 # @@END 004 AUTH
 
 # @@BLOCK 005 HERO deps=004
