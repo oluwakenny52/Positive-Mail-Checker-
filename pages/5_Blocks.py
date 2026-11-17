@@ -166,7 +166,7 @@ if not _CLI_FIX_CHECK:
 
     # v13.48: ledger, all inside the branch - audit_log needs the real st, and
     # the branch is what keeps --fix-check free of Streamlit. page() before the
-    # gate, install() after it and before the first widget.
+    # gate, install() before require() and before the first widget.
     #
     # FIX AU-1 (v13.49): a module imported before a redeploy stays in sys.modules
     # and keeps answering with the OLD shape. audit_log gained page() at 02:25,
@@ -188,11 +188,15 @@ if not _CLI_FIX_CHECK:
     if hasattr(audit_log, "page"):
         audit_log.page("pages/5_Blocks.py")
 
-    auth.require(st, "Unlock Block Inspector")
-    auth.fit(st)                        # CSS only, before the first widget
-
+    # FIX 5a (v13.53): INSTALL BEFORE require(), exactly as app.py block 007
+    # does. require() calls st.stop() while the page is locked, so an install()
+    # placed after it never runs on a locked page at all - and the Unlock box is
+    # then built by an unwrapped function and is invisible to the ledger.
     if hasattr(audit_log, "install"):
         audit_log.install(st, "pages/5_Blocks.py")
+
+    auth.require(st, "Unlock Block Inspector")
+    auth.fit(st)                        # CSS only, before the first widget
 
     auth.fit_panel(st)                  # the controls; collapsed until tapped
 # @@END 004 HERO
