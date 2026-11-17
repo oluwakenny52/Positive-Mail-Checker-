@@ -316,10 +316,19 @@ D_TOTAL, D_FREE = _disk()
 MY_N, MY_B = _my_files()
 SESS_B = _session_bytes()
 
+# FIX PG1-1 (v13.53): THE TICK RAN AFTER THE COUNTS.
+# system_tick(force=True) raises this load's RAM / disk / payload alert, but it
+# ran LAST - after counts() had already read the ring and mark_seen() had closed
+# it. So an alert raised by the very load that was supposed to report it landed
+# in the file already marked read: the page said "0 unread when opened", the bell
+# showed nothing, and the alert existed only in the list below. The tick now runs
+# FIRST, so the numbers taken here include what it just raised, and mark_seen()
+# closes the ring afterwards - after the readings, not before them.
+notify.system_tick(force=True, session_bytes=SESS_B)
+
 COUNT = notify.counts()
 UNSEEN_BEFORE = int(COUNT.get("unseen") or 0)
 notify.mark_seen()
-notify.system_tick(force=True, session_bytes=SESS_B)
 # @@END 006 SOURCES
 
 # @@BLOCK 007 SIDEBAR deps=006
