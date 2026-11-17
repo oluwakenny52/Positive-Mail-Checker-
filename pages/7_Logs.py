@@ -205,7 +205,7 @@ import importlib
 
 import auth
 
-# v13.48: ledger. page() before the gate, install() after it, install BEFORE
+# v13.48: ledger. page() before the gate, install() before require() and before
 # fit_panel so this page's own controls are recorded too.
 #
 # FIX AU-1 (v13.49): a module imported before a redeploy stays in sys.modules and
@@ -227,12 +227,17 @@ audit_log = _audit
 if hasattr(audit_log, "page"):
     audit_log.page("pages/7_Logs.py")
 
+# FIX 5a (v13.53): INSTALL BEFORE require(), exactly as app.py block 007 does.
+# require() calls st.stop() while the page is locked, so an install() placed
+# after it never runs on a locked page at all - and the Unlock box is then built
+# by an unwrapped function and is invisible to the ledger. _path() resolves
+# user_file() at WRITE time, so installing early costs nothing.
+if hasattr(audit_log, "install"):
+    audit_log.install(st, "pages/7_Logs.py")
+
 auth.require(st, "Unlock Full Log")
 auth.fit(st)                        # CSS only, before the first widget
 from auth import user_file          # after the gate, so it binds the live module
-
-if hasattr(audit_log, "install"):
-    audit_log.install(st, "pages/7_Logs.py")
 
 auth.fit_panel(st)                  # the controls; collapsed until tapped
 
