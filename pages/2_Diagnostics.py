@@ -152,8 +152,9 @@ import importlib
 
 import auth
 
-# v13.48: ledger. page() before the gate, install() after it, install BEFORE
-# fit_panel so the Display Fit sliders are recorded too.
+# v13.48: ledger. page() before the gate, install() before require() and before
+# the first widget, so the Unlock box and the Display Fit sliders are recorded
+# too.
 #
 # FIX AU-1 (v13.49): a module imported before a redeploy stays in sys.modules and
 # keeps answering with the OLD shape. audit_log gained page() at 02:25, two hours
@@ -174,11 +175,17 @@ audit_log = _audit
 if hasattr(audit_log, "page"):
     audit_log.page("pages/2_Diagnostics.py")
 
-auth.require(st, "Unlock Diagnostics")
-auth.fit(st)                        # CSS only, before the first widget
-
+# FIX 5a (v13.53): INSTALL BEFORE require(), exactly as app.py block 007 does.
+# require() calls st.stop() while the page is locked, so an install() placed
+# after it never runs on a locked page at all - and every widget require()
+# builds is then created by an unwrapped function and is invisible to the
+# ledger. _path() resolves user_file() at WRITE time, so installing early costs
+# nothing on the unlocked prefix.
 if hasattr(audit_log, "install"):
     audit_log.install(st, "pages/2_Diagnostics.py")
+
+auth.require(st, "Unlock Diagnostics")
+auth.fit(st)                        # CSS only, before the first widget
 
 auth.fit_panel(st)                  # the controls; collapsed until tapped
 
