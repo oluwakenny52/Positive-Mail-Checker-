@@ -661,9 +661,17 @@ with st.sidebar:
     labels = list(sess.keys()) + list(srcs.keys())
     _label_of = dict(sess)
     _label_of.update(srcs)
+    # FIX PG4-2 (v13.53): st.stop() HERE KILLED THE WHOLE PAGE.
+    # With no sources yet, the sidebar stopped the script from inside
+    # `with st.sidebar:`, so the hero, the four metrics and all five export tabs
+    # never rendered - the page was one line of grey text, and there was no way to
+    # reach the format controls to set anything up before a run existed. The page
+    # now renders in full at zero sources and says so; block 012's own stop is the
+    # one that matters and it sits below the metrics.
     if not labels:
-        st.info("No result files yet. Run the checker, or validate a batch in the Reader.")
-        st.stop()
+        st.info("No result files yet. Run the checker, or validate a batch in the "
+                "Reader. The format controls below still work and are saved.")
+        st.caption("0 source(s) available.")
 
     # v13.55: RETIRED FILES ARE HIDEABLE. Every result file from every past run
     # used to be preselected, so an export silently padded itself with accounts
