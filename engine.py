@@ -1,4 +1,4 @@
-# @@FILE engine.py blocks=11 version=v13.49
+# @@FILE engine.py blocks=11 version=v13.76
 # ===========================================================================
 # engine.py - headless verification engine: rung planning, pooled execution,
 # verdict aggregation and backoff. No Streamlit, no side effects on import.
