@@ -501,6 +501,14 @@ with st.expander("🛠 Canonicalise @@END names (no terminal needed)", expanded=
 # adjacent and both want 1, so a call without a definition now reads FAIL on the
 # second one instead of passing. _self is False, so the literal in this table
 # does not inflate the count.
+#
+# v13.81: THE AI PROBE GETS FIVE ROWS, split three ways over two files. Three
+# hold the classifier down: a closed output space, a scrub before anything
+# leaves the box, and a probe that is its own tier rather than a free-text
+# round trip. Two hold the page: the tab must have a BODY (`with tab_ai:`), not
+# just a label in st.tabs(), and it must call the probe - a report-only tab that
+# renders a paragraph and never dials is the exact shape this row set exists to
+# catch. All five are _self False: none of these strings occurs in this file.
 _FIX_CHECKS = (
     ("status.py", "_PROXY_BLOCKED", 2, "proxy-blocked classifies as CONNECTION_FAILED"),
     ("status.py", "best = None", 1, "worse_of no longer seeds with UNKNOWN"),
@@ -622,6 +630,14 @@ _FIX_CHECKS = (
      "the Guide theme has one source"),
     ("pages/6_User_Guide.py", "403 client_connect_forbidden_port` on every attempt", 1,
      "the troubleshooting table splits the three proxy tails"),
+    # ---- v13.81: the AI probe tab, and the classifier it drives ----
+    ("aiassist.py", "ALLOWED = frozenset({", 1,
+     "the classifier's output space is a closed set"),
+    ("aiassist.py", "def _scrub(", 1, "only scrubbed text leaves the box"),
+    ("aiassist.py", "def probe()", 1, "the probe is the one tier that proves the key"),
+    ("pages/2_Diagnostics.py", "with tab_ai:", 1, "the seventh tab has a body"),
+    ("pages/2_Diagnostics.py", "aiassist.probe()", 1,
+     "the tab is wired to a live call, not just a report"),
 )
 
 # Needles that point at THIS file. want is the CODE-only count; the literal in
