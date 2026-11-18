@@ -1,8 +1,25 @@
 # @@FILE app.py blocks=111 version=v13.76
 # @@BLOCK 000 FILE_HEADER deps=-
 """
-Mega Ultimate Mail Checker - v13.48  (BLOCK EDITION)
-====================================================
+Mega Ultimate Mail Checker  (BLOCK EDITION)
+===========================================
+ONE BUILD NUMBER
+----------------
+A build number is typed by hand in exactly ONE place: line 1 of this file.
+
+    # @@FILE app.py blocks=N version=v13.76
+
+Block 008 mirrors it as BUILD_TAG and CFG_VERSION, pages/6_User_Guide.py block
+001 mirrors both again, and verify_v1337.py parses line 1 and fails if either
+constant disagrees, if either is assigned twice, or if the guide drifts. Every
+user-visible version string - the hero title, the diag bundle, the run export,
+the footer, the guide hero - reads BUILD_TAG and types nothing.
+
+A bump is line 1, block 008, pages/6_User_Guide.py block 001, and nothing else.
+A number typed anywhere else is a bug. The v13.48 / v13.40 / v13.30 stamps that
+used to sit in this docstring, in theme.json and in eleven file headers are
+gone.
+
 Full version history lives in CHANGELOG.md.
 
 HOW THIS FILE IS ORGANISED
@@ -596,10 +613,13 @@ _rs_path = runstate.tick()
 # @@END 007 PAGE_CONFIG
 
 # @@BLOCK 008 BUILD_IDENTITY deps=-
-# Bump CFG_VERSION whenever a DEFAULT changes in a way users should inherit.
-# v13.76: verify_v1337.py derives this constant from the @@FILE header line 1,
-# so the header, BUILD_TAG and pages/6_User_Guide.py block 001 move together or
-# the gate goes red on the header alone.
+# THE ONLY BUILD NUMBER IN THE APP. Line 1 of this file carries it, these two
+# constants mirror it, pages/6_User_Guide.py block 001 mirrors both again, and
+# verify_v1337.py proves all four agree. Nothing else types a version - every
+# display reads BUILD_TAG.
+# Bump CFG_VERSION whenever a DEFAULT changes in a way users should inherit; its
+# digits must stay identical to BUILD_TAG or verify_v1337.py goes red on the
+# header alone.
 CFG_VERSION = 1376
 BUILD_TAG = "v13.76"
 # @@END 008 BUILD_IDENTITY
@@ -2356,6 +2376,11 @@ def build_diagnostics_text():
 # radius and hero text - the one preference a user actually notices. It is a
 # per-user file now, named by the unlocked prefix. This block runs AFTER
 # auth.require() in block 007, so the hash already exists here.
+# v13.76: theme.json is RUNTIME ONLY and no longer committed. The committed seed
+# was stamped v13.40, so a fresh clone advertised a build that had not existed
+# for thirty versions - the same second-build-number fault this wave kills.
+# Absence is the NORMAL state: load_theme() starts from default_theme(), which
+# builds its hero from BUILD_TAG, and the file is written on first load below.
 THEME_FILE = user_file("theme.json")
 
 THEME_PRESETS = {
@@ -2468,6 +2493,8 @@ if "theme" not in str_lit.session_state:
 if "colorize_logs" not in str_lit.session_state:
     str_lit.session_state.colorize_logs = str_lit.session_state.theme.get("colorize_logs", True)
 
+# The file is runtime state, not a shipped seed: it exists only once a user has
+# loaded the app, and never in the repo.
 if not os.path.exists(THEME_FILE):
     save_theme(str_lit.session_state.theme)
 
