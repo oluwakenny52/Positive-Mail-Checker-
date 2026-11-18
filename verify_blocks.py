@@ -67,6 +67,10 @@ BLOCKED_FILES = [
 # pages/1_Notifications.py: files 13 -> 14, and blocks move by that page's own
 # block count.  tier2_split.py prints the new line for you and records it in
 # TIER2_MANIFEST.txt; paste it here.
+#
+# v13.77 added pages/8_Breach.py: files 14 -> 15, blocks 294 -> 306 (its own
+# frame is 12).  Both numbers move together, as above - a file that is gated but
+# not counted, or counted but not gated, is a hole either way.
 TARGET_FILES = 15
 TARGET_BLOCKS = 306
 
