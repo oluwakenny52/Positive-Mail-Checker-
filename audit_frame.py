@@ -20,19 +20,20 @@ try:
 except Exception:
     # Mirror for the import-failure path.  tier2_split.py REWRITES app.py and
     # OVERWRITES engine.py; it deletes nothing, so EXPECT_FILES only moves when a
-    # file is added.  v13.70 added pages/1_Notifications.py (+1 file, +24 blocks);
-    # v13.76 added pages/8_Breach.py (+1 file, +12 blocks) -> 15 files, 306 blocks.
-    # v13.76: this mirror was still 14 / 294 with the breach page ABSENT, so on the
-    # import-failure path the gate reported TARGET DRIFT against a correct tree -
-    # and fix_end_names.py's own fallback had all fifteen, so the two disagreed.
-    # A mirror that disagrees with the thing it mirrors is worse than no mirror:
-    # if you edit BLOCKED_FILES, edit this list in the SAME commit.
+    # FRAMED file is added.  Plain modules are not gated: breach.py carries no
+    # frame and is out of the list.
+    #   v13.70  +pages/1_Notifications.py   files +1, blocks +24
+    #   v13.76  +pages/8_Breach.py          files +1, blocks +12
+    #   v13.81  pages/2_Diagnostics.py +1 block (AI_PROBE)  files 0, blocks +1
+    # 15 files, 307 blocks.  If you edit BLOCKED_FILES, edit this list in the
+    # SAME commit - a mirror that disagrees with the thing it mirrors is worse
+    # than no mirror.
     GATED = ["app.py", "auth.py", "engine.py", "hosts.py", "ms_oauth.py",
              "status.py", "verify_blocks.py", "pages/1_Notifications.py",
              "pages/2_Diagnostics.py", "pages/3_Mailbox_Reader.py",
              "pages/4_Downloads.py", "pages/5_Blocks.py", "pages/6_User_Guide.py",
              "pages/7_Logs.py", "pages/8_Breach.py"]
-    EXPECT_FILES, EXPECT_BLOCKS = 15, 306
+    EXPECT_FILES, EXPECT_BLOCKS = 15, 307
 
 FILE_RX  = re.compile(r"^#\s*@@FILE\s+(\S+)\s+blocks=(\d+)\s+version=(\S+)\s*$")
 BLOCK_RX = re.compile(r"^#\s*@@BLOCK\s+(\d{3})\s+([A-Za-z0-9_]+)(?:\s+deps=(\S+))?\s*$")
@@ -231,9 +232,12 @@ def api_conformance():
 def main():
     # v13.75: THE VERIFIER WAS SCANNED TWICE. verify_blocks.py is already in
     # GATED, and the old line appended a second scan of it. `gated = reps[:-1]`
-    # kept the file-count arithmetic right, but `faults` summed BOTH copies, so
-    # one fault in the verifier counted double and the "must be 0" line read the
-    # appended copy while the total read both.
+    # kept the file-count arithmetic right, but `faults` summed BOTH copies.
+    #
+    # v13.81: THE SLICE WAS MOVED AND THE SUM WAS NOT. `gated = reps[:len(GATED)]`
+    # still leaves the duplicate in `reps`, and `faults`/`bare` were still summed
+    # over `reps`, so one fault in the verifier printed twice and `bare` was
+    # inflated. Both totals now sum `gated`. The appended copy is a scan only.
     reps = [scan(p) for p in GATED]
     if "verify_blocks.py" not in GATED:
         reps.append(scan("verify_blocks.py"))
@@ -241,8 +245,8 @@ def main():
     by_path = {r["path"]: r for r in reps}
     vb_rep = by_path.get("verify_blocks.py") or {"faults": []}
 
-    faults = sum(len(r["faults"]) for r in reps)
-    bare = sum(r["bare"] for r in reps)
+    faults = sum(len(r["faults"]) for r in gated)
+    bare = sum(r["bare"] for r in gated)
 
     print("=" * 74)
     print("FRAME  (raw byte scan - independent of verify_blocks.py)")
@@ -258,7 +262,7 @@ def main():
     print("gated files=%d blocks=%d faults=%d bare_ends=%d"
           % (sum(1 for r in gated if r["exists"]),
              sum(r["blocks"] for r in gated),
-             sum(len(r["faults"]) for r in gated), bare))
+             faults, bare))
     print("TARGET       files=%d blocks=%d faults=0 bare_ends=0"
           % (EXPECT_FILES, EXPECT_BLOCKS))
     print("verify_blocks.py itself: %d fault(s) (must be 0)"
