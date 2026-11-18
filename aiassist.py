@@ -1,0 +1,676 @@
+#!/usr/bin/env python3
+"""aiassist.py - UNKNOWN-tail classifier of last resort.  PLAIN MODULE.
+
+WHAT IT IS FOR
+--------------
+status.classify_error walks a regex table and returns UNKNOWN when nothing
+matches.  Those raw strings are server text the app has never seen, and they are
+the only place a model earns its cost.  Everything else stays local.
+
+CONTRACT
+--------
+  * UNKNOWN tail only.  Never a verdict.  The caller already decided UNKNOWN;
+    this may only name a better bucket from a closed list, and priority_of and
+    the existing ladder still decide what happens next.
+  * Off unless GEMINI_ENABLED is the STRING "true".  app.py block 043's
+    os.environ bridge stringifies every secret, so `is True` would never fire.
+  * Never raises.  A model failure must never touch a run.
+  * The output space is a CLOSED whitelist.  Anything else becomes None.
+  * One call per DISTINCT text, not per occurrence.  The same BYE line repeats
+    thousands of times across a run; the cache is keyed on the scrubbed text.
+  * Only scrubbed server text leaves the box: no address local-part, no
+    credential, no proxy string.
+  * Budgeted twice: per run and per user per day, and it stops itself after N
+    consecutive failures.
+
+WHAT IT IS NOT
+--------------
+Not in the hot path.  classify() is a cache read and returns None immediately on
+a miss; a miss is queued and drain() does the network, off a daemon thread, after
+the account.  Nothing here blocks a socket, a rung or a verdict.
+
+PER-USER, NOT PER-PROCESS
+-------------------------
+app.py is ONE process for every user, so a module-global counter would let one
+user's tail eat another's allowance.  The day counter is a per-user file behind
+auth.user_file(); only the run counter and the cache are process state, and the
+cache is keyed by the scrubbed text so two sessions cannot read each other's
+numbers.
+
+USAGE
+    import aiassist
+    aiassist.configure(enabled=os.getenv("GEMINI_ENABLED"),
+                       key=os.getenv("GEMINI_API_KEY"),
+                       model=os.getenv("GEMINI_MODEL"))
+    aiassist.reset_run()                      # once per run, not per account
+    tok = aiassist.classify(raw_server_text)  # token, or None - never blocks
+    aiassist.drain(limit=6)                   # do the network, later
+    aiassist.report()                         # counters dict for the diag bundle
+
+    python aiassist.py --selftest     offline, canned payloads, no network
+    python aiassist.py --probe        ONE live call; prints status and latency
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import re
+import threading
+import time
+import urllib.error
+import urllib.request
+
+AI_VERSION = "v13.76"
+
+ENDPOINT = ("https://generativelanguage.googleapis.com/v1beta/models/"
+            "%s:generateContent")
+
+# The ONLY tokens this module may return.  Mirrors status.py's vocabulary.
+ALLOWED = frozenset({
+    "WRONG", "NEED_APP_PASSWORD", "LOGIN_DROPPED", "RETRY_LATER",
+    "CONNECTION_FAILED", "PROXY_UNHEALTHY", "DNS_FAILED", "SMTP_FAILED",
+    "UNKNOWN",
+})
+
+INSTRUCTION = (
+    "You classify one raw mail-server or proxy error line into exactly one "
+    "token from this closed list:\n"
+    "WRONG - credentials were refused\n"
+    "NEED_APP_PASSWORD - provider wants an app-specific password\n"
+    "LOGIN_DROPPED - server read the login then closed the connection\n"
+    "RETRY_LATER - rate limit, greylist or temporary block\n"
+    "CONNECTION_FAILED - never reached the server\n"
+    "PROXY_UNHEALTHY - the proxy hop itself failed\n"
+    "DNS_FAILED - the hostname did not resolve\n"
+    "SMTP_FAILED - an SMTP-specific rejection\n"
+    "UNKNOWN - none of the above\n"
+    "Reply with the token alone, uppercase, nothing else."
+)
+
+TIMEOUT = 8.0
+MAX_CHARS = 600
+CACHE_MAX = 512
+QUEUE_MAX = 256
+DAY_CACHE_TTL = 5.0
+USAGE_NAME = "ai_usage.json"
+DEFAULT_MODEL = "gemini-flash-latest"
+
+_cfg = {
+    "enabled": False,
+    "key": "",
+    "model": DEFAULT_MODEL,
+    "max_per_run": 40,
+    "max_per_day": 300,
+    "stop_after_fails": 4,
+}
+
+_lock = threading.Lock()
+_cache = {}          # key -> token
+_cache_order = []    # LRU
+_queue = []          # keys awaiting a call
+_queued = set()      # membership for _queue
+_texts = {}          # key -> scrubbed text, so a queued key can still be sent
+_day_cache = {}      # usage path -> (day, count, fetched_at)
+_resolved_model = ""
+_calls_run = 0
+_consec_fails = 0
+_tripped = False
+_last = {"ts": 0.0, "status": "", "token": "", "latency_ms": 0, "error": ""}
+
+_EMAIL_RE = re.compile(r"([A-Za-z0-9._%+\-]+)@([A-Za-z0-9.\-]+\.[A-Za-z]{2,})")
+_CRED_RE = re.compile(r"\b([^\s:@]+):([^\s@]+)@([A-Za-z0-9.\-]+:\d{2,5})\b")
+_WS_RE = re.compile(r"\s+")
+_STRIP_RE = re.compile(r"[^A-Z0-9_]+")
+
+
+# ---------------------------------------------------------------------------
+# config
+# ---------------------------------------------------------------------------
+def _truthy(value):
+    """String-safe flag test.  The env bridge makes everything a str."""
+    if isinstance(value, bool):
+        return value
+    return str(value or "").strip().lower() in ("true", "1", "yes", "on")
+
+
+def configure(enabled=None, key=None, model=None, max_per_run=None,
+              max_per_day=None, stop_after_fails=None):
+    """Set the runtime config.  Any argument left None falls back to os.environ.
+
+    Never raises: a bad int is coerced, a bad model string falls back.
+    """
+    with _lock:
+        if enabled is None:
+            enabled = os.getenv("GEMINI_ENABLED")
+        if key is None:
+            key = os.getenv("GEMINI_API_KEY")
+        if model is None:
+            model = os.getenv("GEMINI_MODEL")
+        _cfg["enabled"] = _truthy(enabled)
+        _cfg["key"] = str(key or "").strip()
+        _cfg["model"] = str(model or "").strip() or DEFAULT_MODEL
+        for name, val in (("max_per_run", max_per_run),
+                          ("max_per_day", max_per_day),
+                          ("stop_after_fails", stop_after_fails)):
+            if val is None:
+                continue
+            try:
+                _cfg[name] = max(0, int(val))
+            except Exception:
+                pass
+
+
+def enabled() -> bool:
+    """True only when the flag is truthy AND a key is present."""
+    with _lock:
+        return bool(_cfg["enabled"] and _cfg["key"])
+
+
+def reset_run():
+    """Clear the per-run counter and the trip latch.  Call once per run."""
+    global _calls_run, _consec_fails, _tripped
+    with _lock:
+        _calls_run = 0
+        _consec_fails = 0
+        _tripped = False
+
+
+# ---------------------------------------------------------------------------
+# per-user day budget
+# ---------------------------------------------------------------------------
+def _usage_path() -> str:
+    try:
+        import auth
+        return auth.user_file(USAGE_NAME) or ""
+    except Exception:
+        return ""
+
+
+def _day_key() -> str:
+    return time.strftime("%Y-%m-%d", time.gmtime())
+
+
+def _day_read(path) -> int:
+    if not path:
+        return 0
+    try:
+        with open(path, encoding="utf-8", errors="ignore") as fh:
+            data = json.load(fh)
+    except Exception:
+        return 0
+    if not isinstance(data, dict) or data.get("day") != _day_key():
+        return 0
+    try:
+        return int(data.get("calls") or 0)
+    except Exception:
+        return 0
+
+
+def _day_count(path) -> int:
+    """Cached day count for THIS user's file.  Never raises."""
+    now = time.time()
+    with _lock:
+        hit = _day_cache.get(path)
+        if hit and (now - hit[2]) < DAY_CACHE_TTL and hit[0] == _day_key():
+            return hit[1]
+    count = _day_read(path)
+    with _lock:
+        _day_cache[path] = (_day_key(), count, now)
+    return count
+
+
+def _day_bump(path) -> None:
+    if not path:
+        return
+    count = _day_read(path) + 1
+    try:
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump({"day": _day_key(), "calls": count}, fh)
+        os.replace(tmp, path)
+    except Exception:
+        pass
+    with _lock:
+        _day_cache[path] = (_day_key(), count, time.time())
+
+
+def _budget_free() -> bool:
+    """True when this run and this user still have allowance.  Never raises."""
+    if _tripped:
+        return False
+    with _lock:
+        if _calls_run >= int(_cfg["max_per_run"]):
+            return False
+        limit = int(_cfg["max_per_day"])
+    if limit <= 0:
+        return True
+    return _day_count(_usage_path()) < limit
+
+
+# ---------------------------------------------------------------------------
+# text handling
+# ---------------------------------------------------------------------------
+def _scrub(text) -> str:
+    """Strip what must not leave the box, keep what the model needs.
+
+    The local part of an address goes to '*'; the domain stays because
+    'needs app password at gmail.com' is the whole signal.  A credential pair is
+    reduced to its host:port.  _CRED_RE runs first or the email pattern eats the
+    left half of a proxy string.
+    """
+    t = "" if text is None else str(text)
+    if not t:
+        return ""
+    t = _CRED_RE.sub(lambda m: m.group(3), t)
+    t = _EMAIL_RE.sub(lambda m: "*@" + m.group(2), t)
+    t = _WS_RE.sub(" ", t).strip()
+    return t[:MAX_CHARS]
+
+
+def _norm(text) -> str:
+    return _WS_RE.sub(" ", str(text or "")).strip().lower()
+
+
+def _key(text) -> str:
+    return hashlib.sha1(_norm(text).encode("utf-8", "replace")).hexdigest()
+
+
+def _token(raw) -> str:
+    """First token of a model reply, if it is in the whitelist.  Else ""."""
+    t = _STRIP_RE.sub(" ", str(raw or "").upper()).strip()
+    if not t:
+        return ""
+    first = t.split(" ")[0]
+    return first if first in ALLOWED else ""
+
+
+# ---------------------------------------------------------------------------
+# cache
+# ---------------------------------------------------------------------------
+def _cache_get(key):
+    with _lock:
+        tok = _cache.get(key)
+        if tok is None:
+            return None
+        try:
+            _cache_order.remove(key)
+        except ValueError:
+            pass
+        _cache_order.append(key)
+        return tok
+
+
+def _cache_put(key, tok):
+    with _lock:
+        _cache[key] = tok
+        try:
+            _cache_order.remove(key)
+        except ValueError:
+            pass
+        _cache_order.append(key)
+        while len(_cache_order) > CACHE_MAX:
+            old = _cache_order.pop(0)
+            _cache.pop(old, None)
+
+
+# ---------------------------------------------------------------------------
+# queue
+# ---------------------------------------------------------------------------
+def enqueue(text) -> bool:
+    """Queue one distinct text for a later call.  False if it is not needed."""
+    if not enabled():
+        return False
+    body = _scrub(text)
+    if not body:
+        return False
+    key = _key(body)
+    with _lock:
+        if key in _cache or key in _queued or len(_queue) >= QUEUE_MAX:
+            return False
+        _queue.append(key)
+        _queued.add(key)
+        _texts[key] = body
+    return True
+
+
+def pending() -> int:
+    with _lock:
+        return len(_queue)
+
+
+def classify(text, defer=True):
+    """Token for this text, or None.  Cache read only - never blocks.
+
+    A miss is queued when `defer` is set, so the next drain() can fill it in.
+    """
+    if not enabled() or _tripped:
+        return None
+    body = _scrub(text)
+    if not body:
+        return None
+    key = _key(body)
+    tok = _cache_get(key)
+    if tok is not None:
+        return tok
+    if defer and _budget_free():
+        enqueue(body)
+    return None
+
+
+def drain(limit=None) -> dict:
+    """Spend calls on queued texts.  Returns {'tried','got','skipped'}.
+
+    Never raises.  Safe to call from a thread; the network happens outside the
+    lock so a slow call cannot stall classify().
+    """
+    out = {"tried": 0, "got": 0, "skipped": 0}
+    try:
+        limit = int(_cfg["max_per_run"]) if limit is None else int(limit)
+    except Exception:
+        limit = 0
+    while out["tried"] < max(0, limit):
+        if not enabled() or _tripped or not _budget_free():
+            out["skipped"] += 1
+            break
+        with _lock:
+            if not _queue:
+                break
+            key = _queue.pop(0)
+            _queued.discard(key)
+            body = _texts.pop(key, "")
+        if not body:
+            continue
+        out["tried"] += 1
+        tok = _one_call(body, key)
+        if tok:
+            out["got"] += 1
+    return out
+
+
+# ---------------------------------------------------------------------------
+# the call
+# ---------------------------------------------------------------------------
+def _post(url, payload, key) -> tuple:
+    """(http_code, body_text, latency_ms).  code 0 = transport failure."""
+    started = time.time()
+    data = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(
+        url, data=data, method="POST",
+        headers={"Content-Type": "application/json",
+                 "x-goog-api-key": key,
+                 "User-Agent": "PositiveMailChecker/" + AI_VERSION})
+    try:
+        with urllib.request.urlopen(req, timeout=TIMEOUT) as resp:
+            body = resp.read().decode("utf-8", "replace")
+            return resp.status, body, int((time.time() - started) * 1000)
+    except urllib.error.HTTPError as exc:
+        try:
+            body = exc.read().decode("utf-8", "replace")
+        except Exception:
+            body = ""
+        return exc.code, body, int((time.time() - started) * 1000)
+    except Exception as exc:
+        return 0, "%s: %s" % (type(exc).__name__, exc), int((time.time() - started) * 1000)
+
+
+def _extract(payload) -> str:
+    try:
+        cands = payload.get("candidates") or []
+        if not cands:
+            return ""
+        parts = (cands[0].get("content") or {}).get("parts") or []
+        return " ".join(str(p.get("text") or "") for p in parts if isinstance(p, dict))
+    except Exception:
+        return ""
+
+
+def _parse(payload):
+    """Token from a response body, or None.  Pure - used by the selftest."""
+    if not isinstance(payload, dict):
+        return None
+    return _token(_extract(payload)) or None
+
+
+def _one_call(body, key_cache=None):
+    """One live call for one scrubbed text.  Token or None.  Never raises."""
+    global _calls_run, _consec_fails, _tripped, _resolved_model
+    with _lock:
+        model = _cfg["model"]
+        api_key = _cfg["key"]
+        stop_after = int(_cfg["stop_after_fails"])
+    if not api_key or not model:
+        return None
+
+    payload = {
+        "contents": [{"role": "user",
+                      "parts": [{"text": INSTRUCTION + "\n\n---\n" + body}]}],
+        "generationConfig": {"temperature": 0.0, "maxOutputTokens": 8,
+                             "candidateCount": 1},
+    }
+    code, text, ms = _post(ENDPOINT % model, payload, api_key)
+    _day_bump(_usage_path())
+
+    with _lock:
+        _calls_run += 1
+        _last.update({"ts": time.time(), "status": str(code),
+                      "token": "", "latency_ms": ms, "error": ""})
+
+    if code == 0 or code >= 400:
+        with _lock:
+            _consec_fails += 1
+            if stop_after and _consec_fails >= stop_after:
+                _tripped = True
+            _last["error"] = (text or "")[:180]
+        return None
+
+    try:
+        parsed = json.loads(text or "{}")
+    except Exception:
+        parsed = {}
+
+    resolved = ""
+    if isinstance(parsed, dict):
+        resolved = str(parsed.get("modelVersion") or "")
+    if resolved:
+        with _lock:
+            _resolved_model = resolved
+
+    tok = _parse(parsed)
+    with _lock:
+        _consec_fails = 0
+        _last["token"] = tok or ""
+    if not tok:
+        return None
+    if key_cache:
+        _cache_put(key_cache, tok)
+    return tok
+
+
+# ---------------------------------------------------------------------------
+# reporting
+# ---------------------------------------------------------------------------
+def report() -> dict:
+    """Counters for the diag bundle and the sidebar.  Never raises."""
+    try:
+        path = _usage_path()
+        with _lock:
+            data = {
+                "version": AI_VERSION,
+                "enabled": bool(_cfg["enabled"]),
+                "key_present": bool(_cfg["key"]),
+                "key_tail": ("..." + _cfg["key"][-4:]) if _cfg["key"] else "",
+                "model": _cfg["model"],
+                "resolved_model": _resolved_model or "(not resolved yet)",
+                "calls_run": _calls_run,
+                "calls_day": _day_count(path) if path else "(no auth)",
+                "max_per_run": _cfg["max_per_run"],
+                "max_per_day": _cfg["max_per_day"],
+                "consecutive_fails": _consec_fails,
+                "tripped": _tripped,
+                "cache_entries": len(_cache),
+                "queue": len(_queue),
+                "last_status": _last["status"],
+                "last_latency_ms": _last["latency_ms"],
+                "last_token": _last["token"],
+                "last_error": _last["error"],
+                "usage_file": bool(path),
+            }
+    except Exception as exc:
+        return {"error": "%s: %s" % (type(exc).__name__, exc)}
+    return data
+
+
+# ---------------------------------------------------------------------------
+# selftest - offline, canned payloads, no network
+# ---------------------------------------------------------------------------
+def selftest(verbose=False) -> bool:
+    checks = []
+
+    def add(name, ok):
+        checks.append((name, bool(ok)))
+
+    add("version", AI_VERSION.startswith("v13."))
+    add("whitelist_closed", _token("banana") == "")
+    add("whitelist_member", _token("wrong") == "WRONG")
+
+    add("parse_plain", _parse({"candidates": [{"content": {"parts": [{"text": "WRONG"}]}}]}) == "WRONG")
+    add("parse_padded", _parse({"candidates": [{"content": {"parts": [{"text": "  retry_later\n"}]}}]}) == "RETRY_LATER")
+    add("parse_markdown", _parse({"candidates": [{"content": {"parts": [{"text": "**UNKNOWN**"}]}}]}) == "UNKNOWN")
+    add("parse_junk", _parse({"candidates": [{"content": {"parts": [{"text": "I think it is wrong"}]}}]}) is None)
+    add("parse_empty", _parse({}) is None)
+    add("parse_not_dict", _parse(None) is None)
+    add("parse_no_parts", _parse({"candidates": [{"content": {}}]}) is None)
+
+    add("scrub_email", _scrub("550 bob.smith@example.com unknown") == "550 *@example.com unknown")
+    add("scrub_cred", _scrub("user-1:pw@1.2.3.4:8080 refused") == "1.2.3.4:8080 refused")
+    add("scrub_capped", len(_scrub("x" * 5000)) == MAX_CHARS)
+    add("scrub_empty", _scrub(None) == "")
+
+    add("truthy_bool", _truthy(True) is True)
+    add("truthy_str", _truthy("True") is True)
+    add("truthy_junk", _truthy("no") is False)
+    add("truthy_none", _truthy(None) is False)
+
+    add("norm_case", _norm("  A  B ") == "a b")
+    add("key_stable", _key("A  B") == _key("a b"))
+    add("key_distinct", _key("a b") != _key("a c"))
+
+    _cache_put("k1", "WRONG")
+    add("cache_hit", _cache_get("k1") == "WRONG")
+    add("cache_miss", _cache_get("k2") is None)
+
+    configure(enabled="false", key="")
+    add("disabled_off", enabled() is False)
+    add("disabled_classify_none", classify("anything") is None)
+
+    configure(enabled="true", key="")
+    add("no_key_still_off", enabled() is False)
+
+    configure(enabled="true", key="fake-key", model="m1",
+              max_per_run=2, max_per_day=5, stop_after_fails=2)
+    add("enabled_with_key", enabled() is True)
+    add("model_set", report()["model"] == "m1")
+    add("key_tail", report()["key_tail"] == "...-key")
+
+    reset_run()
+    add("enqueue_accepts", enqueue("first text") is True)
+    add("enqueue_dedupes", enqueue("first text") is False)
+    add("pending_one", pending() == 1)
+    add("classify_miss_none", classify("unseen text", defer=False) is None)
+
+    reset_run()
+    add("budget_run_start", _calls_run == 0)
+    for _ in range(2):
+        with _lock:
+            _calls_run += 1
+    add("budget_exhausted", _budget_free() is False)
+    reset_run()
+    add("budget_reset", _budget_free() is True)
+
+    with _lock:
+        _consec_fails = 9
+        _tripped = True
+    add("tripped_blocks", _budget_free() is False)
+    add("tripped_classify_none", classify("x") is None)
+    reset_run()
+    with _lock:
+        _tripped = False
+
+    add("report_shape", isinstance(report().get("enabled"), bool))
+    add("drain_no_key_no_raise", isinstance(drain(limit=1), dict))
+
+    bad = [n for n, ok in checks if not ok]
+    if bad:
+        raise AssertionError("aiassist selftest failed: " + ", ".join(bad))
+    if verbose:
+        print("aiassist.py selftest: %d checks OK" % len(checks))
+    return True
+
+
+# ---------------------------------------------------------------------------
+# live probe - the ONLY tier that proves the key
+# ---------------------------------------------------------------------------
+def probe() -> dict:
+    """One live call.  Returns the diagnosis: http code, latency, token, model."""
+    configure()
+    out = {"enabled": enabled(), "model": _cfg["model"], "http_code": 0,
+           "latency_ms": 0, "token": "", "resolved_model": "", "verdict": "",
+           "error": ""}
+    if not enabled():
+        out["verdict"] = "OFF - set GEMINI_ENABLED=true and GEMINI_API_KEY"
+        return out
+    body = "Socket error: 535 authentication rejected by provider"
+    code, text, ms = _post(ENDPOINT % _cfg["model"],
+                           {"contents": [{"role": "user",
+                                          "parts": [{"text": INSTRUCTION +
+                                                     "\n\n---\n" + body}]}],
+                            "generationConfig": {"temperature": 0.0,
+                                                 "maxOutputTokens": 8}},
+                           _cfg["key"])
+    out.update({"http_code": code, "latency_ms": ms})
+    if code == 0:
+        out["verdict"] = "TRANSPORT FAIL - no HTTP answer"
+        out["error"] = text[:200]
+        return out
+    if code >= 400:
+        out["verdict"] = {400: "BAD REQUEST - model name wrong",
+                          401: "UNAUTHORIZED - key not accepted",
+                          403: "FORBIDDEN - key lacks access",
+                          404: "NOT FOUND - model id wrong",
+                          429: "QUOTA - rate or day limit hit",
+                          500: "PROVIDER ERROR",
+                          503: "PROVIDER UNAVAILABLE"}.get(
+                              code, "HTTP %d" % code)
+        out["error"] = text[:200]
+        return out
+    try:
+        parsed = json.loads(text or "{}")
+    except Exception:
+        parsed = {}
+    out["resolved_model"] = str((parsed or {}).get("modelVersion") or "")
+    out["token"] = _parse(parsed) or ""
+    out["verdict"] = ("OK - key, quota, model and network all proven"
+                      if out["token"] else
+                      "200 but no whitelisted token - model answered junk")
+    return out
+
+
+def main(argv=None) -> int:
+    import sys
+    argv = list(sys.argv[1:] if argv is None else argv)
+    if "--probe" in argv:
+        res = probe()
+        print("aiassist probe  version=%s" % AI_VERSION)
+        for k in ("enabled", "model", "http_code", "latency_ms", "token",
+                  "resolved_model", "verdict", "error"):
+            print("  %-15s: %s" % (k, res.get(k)))
+        return 0 if res.get("token") else 1
+    selftest(verbose=True)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
