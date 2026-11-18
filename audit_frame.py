@@ -20,16 +20,19 @@ try:
 except Exception:
     # Mirror for the import-failure path.  tier2_split.py REWRITES app.py and
     # OVERWRITES engine.py; it deletes nothing, so EXPECT_FILES only moves when a
-    # file is added.  v13.70 added pages/1_Notifications.py: 14 files, 294 blocks.
-    # v13.75: the comment said 295 while the value has been 294 - the comment was
-    # the stale half, and a mirror that disagrees with the thing it mirrors is
-    # worse than no mirror.
+    # file is added.  v13.70 added pages/1_Notifications.py (+1 file, +24 blocks);
+    # v13.76 added pages/8_Breach.py (+1 file, +12 blocks) -> 15 files, 306 blocks.
+    # v13.76: this mirror was still 14 / 294 with the breach page ABSENT, so on the
+    # import-failure path the gate reported TARGET DRIFT against a correct tree -
+    # and fix_end_names.py's own fallback had all fifteen, so the two disagreed.
+    # A mirror that disagrees with the thing it mirrors is worse than no mirror:
+    # if you edit BLOCKED_FILES, edit this list in the SAME commit.
     GATED = ["app.py", "auth.py", "engine.py", "hosts.py", "ms_oauth.py",
              "status.py", "verify_blocks.py", "pages/1_Notifications.py",
              "pages/2_Diagnostics.py", "pages/3_Mailbox_Reader.py",
              "pages/4_Downloads.py", "pages/5_Blocks.py", "pages/6_User_Guide.py",
-             "pages/7_Logs.py"]
-    EXPECT_FILES, EXPECT_BLOCKS = 14, 294
+             "pages/7_Logs.py", "pages/8_Breach.py"]
+    EXPECT_FILES, EXPECT_BLOCKS = 15, 306
 
 FILE_RX  = re.compile(r"^#\s*@@FILE\s+(\S+)\s+blocks=(\d+)\s+version=(\S+)\s*$")
 BLOCK_RX = re.compile(r"^#\s*@@BLOCK\s+(\d{3})\s+([A-Za-z0-9_]+)(?:\s+deps=(\S+))?\s*$")
