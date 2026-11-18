@@ -518,11 +518,16 @@ with _t3:
 """
     )
 
-    ug_h("Diagnostics (pages/2) - all read-only")
+    ug_h("Diagnostics (pages/2)")
     st.markdown(
         "**▶ Probe all targets**, **Run full discovery**, **Probe SMTP candidates**, "
-        "**🧹 Clear hosts_cache.json**, **♻️ Refresh this domain**, "
+        "**🧹 Clear my host cache**, **♻️ Refresh this domain**, "
         "**📋 Build copy/paste bundle**."
+    )
+    st.markdown(
+        "The **🤖 AI Probe** tab is the only part of that page that spends a real "
+        "call: **▶ Run one live probe** proves the classifier key, and "
+        "**🧪 Offline selftest** proves the parser with no network at all."
     )
 # @@END 010 TAB_BUTTONS
 
