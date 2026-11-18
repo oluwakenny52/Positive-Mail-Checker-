@@ -9794,9 +9794,20 @@ with str_lit.sidebar:
             str_lit.session_state["_proxy_flash"] = ("warning", "Nothing pasted.")
             return
         _add, _drop, _msk, _dup, _bad = import_custom_proxies(_txt)
+        # v13.81: the importer now joins a wrapped `host:port:user` line to the
+        # continuation that follows it, and publishes how many it joined. Saying
+        # so matters: a phone paste arrives wrapped, and without this the join is
+        # invisible and the count looks like a line went missing.
+        try:
+            _joined = int(LAST_IMPORT_STITCH or 0)
+        except Exception:
+            _joined = 0
         clear_tunnel_cache()
         _m = (f"Imported **{_add}** line(s) into the custom list. Dropped **{_drop}**, "
               f"duplicates {_dup}, masked {_msk} (kept, but they cannot resolve).")
+        if _joined:
+            _m += (f" Re-joined **{_joined}** wrapped credential pair(s) that the paste "
+                   f"had split across two lines.")
         if _bad:
             _m += " Unreadable: " + " | ".join(_bad)
         str_lit.session_state["_proxy_flash"] = ("success" if _add else "warning", _m)
@@ -9823,10 +9834,15 @@ with str_lit.sidebar:
             str_lit.session_state["_proxy_flash"] = ("warning", f"The {kind} list is empty.")
             return
         if _sentinel is not None:
+            # v13.81: THE MESSAGE WAS WRONG. It said every line "was removed from
+            # it", but the write below is guarded by `if _keep:` - so a total
+            # failure keeps the whole list on disk and only the report was
+            # claiming a prune. The expect text now matches what happens.
             _sentinel.expect(f"reprobe:{kind}",
                              f"The {kind} re-probe kept no node",
-                             "Every line in that list failed the tunnel probe and was "
-                             "removed from it. Fetch again, or import a fresh list.",
+                             "Every line in that list failed the tunnel probe. The list "
+                             "is left as it was, because a failed probe is not proof a "
+                             "line is dead - fetch or import a fresh list, then re-probe.",
                              severity="warn")
         clear_tunnel_cache()
         _budget = max(45.0, min(PROBE_BATCH_MAX, len(_lines) * 4.0))
@@ -10280,6 +10296,17 @@ with str_lit.sidebar:
             log_startup(f"Fetch survivors folded into the provider list ({_n_sec} line(s)).")
             if _sentinel is not None:
                 _sentinel.satisfy("fetch", f"{_n_alive} node(s)")
+        else:
+            # v13.81: THE PASTED LIST WENT MISSING. fetch_and_test_all_proxies()
+            # writes proxies.txt directly with the survivors, and only the branch
+            # above rebuilds the merge. With zero survivors nothing rebuilt, so
+            # proxies.txt held the TCP-fallback list and every custom line was
+            # absent from the pool until _ensure_proxy_sources() ran in a NEW
+            # session - it is guarded by src_init_done, so a reload would not do
+            # it. The files were always intact on disk; the merge was stale.
+            _r_merge = rebuild_merged_proxies("fetch produced no node")
+            log_startup(f"Fetch kept nothing - merge rebuilt from sources "
+                        f"({_r_merge.get('merged', 0)} line(s) restored to the pool).")
         _msr = STATE.get("mail_spot") or {}
         if _msr.get("user") and _msr.get("user") != _gate_scope():
             _msr = {}
@@ -10298,7 +10325,9 @@ with str_lit.sidebar:
             str_lit.session_state["_proxy_flash"] = ("success", _msg)
         else:
             str_lit.session_state["_proxy_flash"] = (
-                "warning", "No node passed validation. Check WEBSHARE_KEYS in secrets.")
+                "warning", f"No node passed validation. Check WEBSHARE_KEYS in secrets. "
+                           f"Your pasted list is untouched and is back in the pool "
+                           f"({_r_merge.get('merged', 0)} line(s) total).")
         str_lit.rerun()
 
     # v13.70: A KEYED CHECKBOX, NOT AN EXPANDER. An expander keeps no state, so
