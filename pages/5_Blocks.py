@@ -508,7 +508,8 @@ with st.expander("🛠 Canonicalise @@END names (no terminal needed)", expanded=
 # round trip. Two hold the page: the tab must have a BODY (`with tab_ai:`), not
 # just a label in st.tabs(), and it must call the probe - a report-only tab that
 # renders a paragraph and never dials is the exact shape this row set exists to
-# catch. All five are _self False: none of these strings occurs in this file.
+# catch. All five are _self False, so the literals in this table cannot inflate
+# them - not even `with tab_ai:`, which this comment itself contains.
 _FIX_CHECKS = (
     ("status.py", "_PROXY_BLOCKED", 2, "proxy-blocked classifies as CONNECTION_FAILED"),
     ("status.py", "best = None", 1, "worse_of no longer seeds with UNKNOWN"),
