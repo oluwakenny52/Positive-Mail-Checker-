@@ -2841,6 +2841,10 @@ TAG_COLORS = {
     "SKIPPED": "#a78bfa",
     "EXCEPTION": "#fb7185",
     "ERROR": "#fb7185",
+    # v13.79 WAVE 6: keyword hits are not a verdict, so they get a colour of
+    # their own - cyan, distinct from every status above, so a hit cannot be
+    # mistaken for a WRONG or a RETRY at a glance.
+    "KW_HITS": "#22d3ee",
 }
 
 
@@ -8677,6 +8681,9 @@ _RES_SESSION_KEYS = (
     "valid_results", "wrong_results", "need_app_results", "login_drop_results",
     "conn_results", "proxy_results", "retry_results", "rbl_results",
     "smtp_results", "dns_results", "skip_results", "unknown_results",
+    # v13.79 WAVE 6: keyword hits are a session list like any other bucket, so
+    # they are counted in "my payload" and trimmed by "Free my RAM".
+    "kw_hits_results",
     "log_lines", "report_entries", "startup_entries", "pre_dns_failed",
     "pre_smtp_failed", "bb_reader_msgs", "_dbg_log", "_res_dl",
 )
@@ -9220,7 +9227,10 @@ def _on_free_ram():
     """Trim MY session payload. Nothing on disk is touched, no result is lost."""
     _ss = str_lit.session_state
     for _k, _keep in (("report_entries", 300), ("log_lines", 200),
-                      ("startup_entries", 200), ("_dbg_log", 100)):
+                      ("startup_entries", 200), ("_dbg_log", 100),
+                      # v13.79 WAVE 6: keyword hits carry a body each, so they
+                      # are the heaviest list here and the first thing to trim.
+                      ("kw_hits_results", 200), ("bb_kw_hits", 20)):
         try:
             _v = _ss.get(_k) or []
             if len(_v) > _keep:
@@ -9229,7 +9239,7 @@ def _on_free_ram():
             pass
     for _k in ("_bb_prefilter_cache", "bb_reader_msgs", "bb_reader_note",
                "_ex_zip", "_fmt_bad", "_fmt_truncated", "_res_snap",
-               "_res_dl", "_res_prev"):
+               "_res_dl", "_res_prev", "bb_kw_hits"):
         try:
             _ss.pop(_k, None)
         except Exception:
@@ -9290,7 +9300,8 @@ def _on_clear_result_files():
     for _k in ("valid_results", "wrong_results", "need_app_results",
                "login_drop_results", "conn_results", "proxy_results",
                "retry_results", "rbl_results", "smtp_results", "dns_results",
-               "skip_results", "unknown_results", "report_entries", "log_lines",
+               "skip_results", "unknown_results", "kw_hits_results",
+               "report_entries", "log_lines",
                "pre_dns_failed", "pre_smtp_failed"):
         try:
             _ss[_k] = []
@@ -9300,7 +9311,7 @@ def _on_clear_result_files():
                    ("zip_name", ""), ("engine_has_run", False),
                    ("clean_valid_count", 0), ("run_valid_count", 0),
                    ("_bb_prefilter_cache", None), ("_res_snap", None),
-                   ("_res_prev", None)):
+                   ("_res_prev", None), ("bb_kw_hits", None)):
         try:
             _ss[_k] = _v
         except Exception:
@@ -11226,6 +11237,9 @@ BUCKETS = [
     ("🩹 Proxy Unhealthy Found", "proxy_results"),
     ("⏭ Skipped / Filtered Found", "skip_results"),
     ("❓ Unclassified Found", "unknown_results"),
+    # v13.79 WAVE 6: a keyword hit is a COMBO, so it re-runs like any other
+    # bucket - _raw_of() cuts it at "|" and the engine checks the credential.
+    ("🔎 Keyword Hits Found", "kw_hits_results"),
 ]
 BUCKET_TAGS = {
     "valid_results": "VALID", "wrong_results": "WRONG_PASSWORD",
@@ -11234,6 +11248,7 @@ BUCKET_TAGS = {
     "retry_results": "RETRY_LATER", "rbl_results": "RBL_BLOCKED",
     "smtp_results": "SMTP_FAILED", "dns_results": "DNS_FAILED",
     "skip_results": "SKIPPED", "unknown_results": "UNCLASSIFIED",
+    "kw_hits_results": "KW_HITS",
 }
 
 # ==========================================================================
@@ -14442,6 +14457,9 @@ if start_engine_btn:
             str_lit.session_state.dns_results = list(str_lit.session_state.get("pre_dns_failed", []))
             str_lit.session_state.skip_results = []
             str_lit.session_state.unknown_results = []
+            # v13.79 WAVE 6: kw_hits_results is deliberately NOT reset here. It
+            # comes from the Mailbox Reader's search, not from a run, so a re-run
+            # must not wipe a set of hits the user just collected.
             # FIX LAG-7 (v13.67): both of these were plain lists and the run loop
             # trimmed them with pop(0) / del[:-N] on EVERY result. After the cap
             # was reached that is a 5,000-element shift and a 20,000-element slice
@@ -14486,6 +14504,9 @@ if start_engine_btn:
                 ("dns_results", "🛰 DNS Failed (pre-check)"),
                 ("skip_results", "⏭ Skipped / Filtered"),
                 ("unknown_results", "❓ Unclassified"),
+                # v13.79 WAVE 6: the box exists so hits collected in the reader
+                # before a run still have a place on this screen.
+                ("kw_hits_results", "🔎 Keyword Hits"),
             ]
             for _key, _title in BUCKET_SPEC:
                 with str_lit.expander(f"{_title}", expanded=False):
@@ -14917,7 +14938,11 @@ if start_engine_btn:
                                                 "login_drop_results", "need_app_results",
                                                 "retry_results", "rbl_results",
                                                 "smtp_results", "dns_results",
-                                                "skip_results", "unknown_results"):
+                                                "skip_results", "unknown_results",
+                                                # v13.79 WAVE 6: read-only here - the
+                                                # run never writes this bucket, it is
+                                                # only redrawn so hits stay visible.
+                                                "kw_hits_results"):
                                         _bv = str_lit.session_state.get(_bk) or []
                                         bucket_snapshot[_bk] = (
                                             len(_bv), list(_bv)[-BUCKET_SNAPSHOT_TAIL:])
@@ -15249,6 +15274,12 @@ if start_engine_btn:
             dns_path = os.path.join(CFG["RESULTS_DIR"], f"dns_failed_{stamp}.txt")
             skip_path = os.path.join(CFG["RESULTS_DIR"], f"skipped_{stamp}.txt")
             unknown_path = os.path.join(CFG["RESULTS_DIR"], f"unclassified_{stamp}.txt")
+            # v13.79 WAVE 6: keyword hits belong to the same archive. They are not
+            # produced by this run, so they are read here rather than snapshotted
+            # by block 106 - and they are only written when there are any.
+            kw_hits_path = os.path.join(CFG["RESULTS_DIR"], f"kw_hits_{stamp}.txt")
+            with session_state_lock:
+                kw_hits_snapshot = list(str_lit.session_state.get("kw_hits_results") or [])
             try:
                 os.makedirs(CFG["RESULTS_DIR"], exist_ok=True)
             except OSError:
@@ -15266,7 +15297,8 @@ if start_engine_btn:
                                    (proxy_path, proxy_snapshot),
                                    (retry_path, retry_snapshot), (rbl_path, rbl_snapshot),
                                    (smtp_path, smtp_snapshot), (dns_path, dns_snapshot),
-                                   (skip_path, skip_snapshot), (unknown_path, unknown_snapshot)):
+                                   (skip_path, skip_snapshot), (unknown_path, unknown_snapshot),
+                                   (kw_hits_path, kw_hits_snapshot)):
                     with open(path, "w", encoding="utf-8") as f:
                         f.write(hdr)
                         f.write("\n".join(str(i) for i in snap) + ("\n" if snap else ""))
@@ -15305,6 +15337,27 @@ if start_engine_btn:
                         (os.path.basename(unknown_path), unknown_snapshot)):
                     z.writestr(_arc, hdr + "\n".join(str(i) for i in _snap)
                                + ("\n" if _snap else ""))
+                # v13.79 WAVE 6: the keyword hits, plus every body file the reader
+                # already wrote to disk under keyword_bodies/. Read from disk, so
+                # the archive carries the full message, not the trimmed view.
+                if kw_hits_snapshot:
+                    z.writestr("keyword_hits.txt",
+                               hdr + "\n".join(str(i) for i in kw_hits_snapshot) + "\n")
+                    try:
+                        for _dn in sorted(os.listdir(CFG["RESULTS_DIR"])):
+                            if not _dn.startswith("kw_hits_"):
+                                continue
+                            _dp = os.path.join(CFG["RESULTS_DIR"], _dn)
+                            if not os.path.isdir(_dp):
+                                continue
+                            for _fn in sorted(os.listdir(_dp)):
+                                try:
+                                    z.write(os.path.join(_dp, _fn),
+                                            f"keyword_bodies/{_dn}/{_fn}")
+                                except Exception:
+                                    continue
+                    except Exception as _kwe:
+                        log_probe_event(f"keyword bodies not added to the ZIP: {_kwe}")
             zip_bytes_data = _zbuf.getvalue()
 
             # v13.51: tell the screen the write finished, because block 108's
@@ -15364,6 +15417,10 @@ if start_engine_btn:
 #   * the skipped-accounts line was the last bare str_lit.info here. It is not a
 #     message widget (st.info never closes an entry) but it still painted a
 #     full-width box over whatever the load had to say, so it is guarded too.
+#
+# v13.79 WAVE 6: keyword hits are a bucket like the rest here. They are counted,
+# listed and downloadable, and the note under them says where the bodies are -
+# because a hit without its body is only half the answer.
 _DF_TAIL = REPORT_ENTRIES_MAX
 
 try:
@@ -15416,6 +15473,8 @@ if str_lit.session_state.engine_has_run or _persisted_valid:
         dns_len_val = len(str_lit.session_state.get("pre_dns_failed", []))
         skip_len_val = len(str_lit.session_state.skip_results)
         unknown_len_val = len(str_lit.session_state.unknown_results)
+        # v13.79 WAVE 6
+        kw_hits_len_val = len(str_lit.session_state.get("kw_hits_results", []))
         # v13.72: valid_res_copy stood here - a full copy of the valid bucket on
         # every single page load, and nothing read it. summary_buckets re-lists
         # valid_results itself two lines below and the metric row uses
@@ -15452,6 +15511,8 @@ if str_lit.session_state.engine_has_run or _persisted_valid:
                                            list(str_lit.session_state.get("pre_smtp_failed", []))),
             "⏭ Skipped / Filtered": ("SKIPPED", list(str_lit.session_state.skip_results)),
             "❓ Unclassified": ("UNCLASSIFIED", list(str_lit.session_state.unknown_results)),
+            "🔎 Keyword Hits Found (from the Mailbox Reader)":
+                ("KW_HITS", list(str_lit.session_state.get("kw_hits_results", []))),
         }
 
     str_lit.markdown(f"### {status_label}")
@@ -15557,12 +15618,14 @@ if str_lit.session_state.engine_has_run or _persisted_valid:
         ("📮 SMTP Failed", smtp_len_val),
         ("⏭ Skipped", skip_len_val),
         ("❓ Unclassified", unknown_len_val),
+        # v13.79 WAVE 6: printed and counted, like every other bucket row.
+        ("🔎 Keyword Hits", kw_hits_len_val),
         # v13.67: smtp/dns were missing from this sum while both rows are printed
         # above it, so the total never matched the table.
         ("📚 Accounts In Buckets",
          clean_count_val + wrong_len_val + need_len_val + login_drop_len_val
          + conn_len_val + proxy_len_val + rbl_len_val + retry_len_val + skip_len_val
-         + unknown_len_val + smtp_len_val + dns_len_val),
+         + unknown_len_val + smtp_len_val + dns_len_val + kw_hits_len_val),
     ]
     for _sc, (_sl, _sv) in zip(metric_grid(_s_pairs, per_row=3), _s_pairs):
         _sc.metric(_sl, _sv)
@@ -15586,6 +15649,12 @@ if str_lit.session_state.engine_has_run or _persisted_valid:
             f"⏭ **{skip_len_val} account(s) were skipped** (bad format / disposable / "
             f"fast-mode cooldown). They were counted as checked; they are listed in the "
             f"Skipped bucket and the ZIP.")
+    if kw_hits_len_val:
+        str_lit.caption(
+            f"🔎 **{kw_hits_len_val} keyword hit(s)** came from the Mailbox Reader, not from "
+            f"this run. The message bodies are on disk under `mail_results/kw_hits_*` and in "
+            f"the ZIP under `keyword_bodies/`. Set Engine Action Mode to '🔎 Keyword Hits "
+            f"Found' to run these accounts through the checker.")
     if wrong_len_val and CFG.get("CONFIRM_WRONG_ACROSS_HOSTS", True):
         str_lit.caption(
             "❌ Wrong Password was CONFIRMED across at least two hosts or two rungs (or with "
@@ -15667,6 +15736,13 @@ try:
     import mailview
 except Exception:
     mailview = None
+
+# v13.79 WAVE 6: keyword search. Also optional - the panel degrades to a caption
+# if the module is missing from the deployment, exactly like mailview above.
+try:
+    import mailsearch
+except Exception:
+    mailsearch = None
 
 # ==========================================================================
 # v13.66 - THE READER NOW SURVIVES A REFRESH
@@ -15775,7 +15851,8 @@ if str_lit.session_state.get(_READER_OWNER_KEY) != _reader_owner:
     for _k in ("bb_reader_acct", "bb_reader_max", "bb_reader_remote", "bb_reader_auto",
                "bb_reader_msgs", "bb_reader_for", "bb_reader_note",
                "bb_reader_page", "bb_reader_total", "bb_reader_combo",
-               "_reader_tried", "_rdr_state"):
+               "_reader_tried", "_rdr_state",
+               "bb_kw_folders", "bb_kw_folder", "bb_kw_words", "bb_kw_hits", "bb_kw_note"):
         str_lit.session_state.pop(_k, None)
     str_lit.session_state[_READER_OWNER_KEY] = _reader_owner
 if "_rdr_state" not in str_lit.session_state:
@@ -16040,6 +16117,172 @@ else:
                             + html.escape(_mv_body)
                             + "</div>",
                             unsafe_allow_html=True)
+
+        # ==================================================================
+        # v13.79 WAVE 6 - KEYWORD SEARCH
+        #
+        # THE FOLDER IS A PROMPT WITH NOTHING SELECTED. It used to be implied
+        # (098 hard-codes INBOX), so a keyword in Sent, Archive or Spam could not
+        # be looked for at all - and the obvious fix, defaulting the box to
+        # INBOX, is the wrong one: a search run against a folder the user did not
+        # choose is a result they did not ask for. `index=None` plus a
+        # placeholder means the Search button refuses until a folder is picked,
+        # and the list is only populated by an explicit connect.
+        #
+        # Every hit is a COMBO, so it lands in a real bucket that the engine can
+        # re-run, and the body goes to disk under mail_results/kw_hits_<stamp>/
+        # where block 079's file browser and block 107's ZIP both already look.
+        # ==================================================================
+        with str_lit.expander("🔎 Search this mailbox for keywords", expanded=False):
+            if mailsearch is None:
+                str_lit.caption("mailsearch.py is missing from this deployment - "
+                                "keyword search is unavailable.")
+            elif not selected_combo or ":" not in selected_combo:
+                str_lit.caption("The selected line carries no password, so it cannot be "
+                                "opened.")
+            else:
+                str_lit.caption(
+                    "Connect once to list the folders, pick ONE, then type keywords. "
+                    "Nothing is selected for you. Matching is case-insensitive across "
+                    "Subject, From and body, and it reads READ-ONLY so no message is "
+                    "marked seen. Bodies are written to your own results directory and "
+                    "included in the ZIP.")
+
+                if "bb_kw_folders" not in str_lit.session_state:
+                    str_lit.session_state["bb_kw_folders"] = []
+
+                def _kw_connect(combo):
+                    """Open a verified session. Returns (mail, host_or_error)."""
+                    try:
+                        _e, _p = combo.split(":", 1)
+                    except Exception:
+                        return None, "the selected line has no password"
+                    _e, _p = _e.strip(), _p.strip()
+                    _hosts = get_servers(_e).get("imap", [])
+                    if not _hosts:
+                        return None, "no IMAP host for this domain"
+                    _px = sample_alive_proxy(domain=_e.split("@")[-1]) if use_proxy else None
+                    _ok, _mail, _h = verify_and_connect(_e, _p, _hosts, proxy_str=_px)
+                    if not _ok or not _mail:
+                        return None, "credential verification failed"
+                    return _mail, _h
+
+                def _kw_list_folders():
+                    _combo = str_lit.session_state.get("bb_reader_acct") or ""
+                    _m, _err = _kw_connect(_combo)
+                    if not _m:
+                        str_lit.session_state["bb_kw_folders"] = []
+                        str_lit.session_state["bb_kw_note"] = _err
+                        return
+                    try:
+                        _f, _e2 = mailsearch.list_folders(_m)
+                    finally:
+                        mailsearch.close(_m)
+                    str_lit.session_state["bb_kw_folders"] = _f
+                    str_lit.session_state["bb_kw_note"] = (
+                        _e2 or f"{len(_f)} folder(s) - pick one, then type keywords.")
+                    # Popped, not assigned: the widget does not exist yet in a
+                    # callback, so this is the safe direction and it forces the
+                    # prompt back to "nothing selected".
+                    str_lit.session_state.pop("bb_kw_folder", None)
+
+                def _kw_search():
+                    _combo = str_lit.session_state.get("bb_reader_acct") or ""
+                    _folder = str_lit.session_state.get("bb_kw_folder") or ""
+                    _words = str_lit.session_state.get("bb_kw_words") or ""
+                    if not _folder:
+                        str_lit.session_state["bb_kw_note"] = (
+                            "pick a folder first - nothing is selected for you")
+                        return
+                    if not _words.strip():
+                        str_lit.session_state["bb_kw_note"] = "type at least one keyword"
+                        return
+                    _m, _err = _kw_connect(_combo)
+                    if not _m:
+                        str_lit.session_state["bb_kw_note"] = _err
+                        return
+                    _bar = str_lit.progress(0.0, text="searching...")
+
+                    def _prog(done, total, phase):
+                        try:
+                            _bar.progress(min(1.0, done / max(1, total)),
+                                          text=f"{phase} {done}/{total}")
+                        except Exception:
+                            pass
+
+                    try:
+                        _hits, _note = mailsearch.search(_m, _folder, _words,
+                                                         on_progress=_prog)
+                    finally:
+                        mailsearch.close(_m)
+                        try:
+                            _bar.empty()
+                        except Exception:
+                            pass
+                    try:
+                        _acc, _pw = _combo.split(":", 1)
+                    except Exception:
+                        _acc, _pw = _combo, ""
+                    _stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                    _kdir = os.path.join(user_file("mail_results"), f"kw_hits_{_stamp}")
+                    for _h in _hits:
+                        _h["email"] = _acc.strip()
+                        _h["password"] = _pw.strip()
+                        _h["folder"] = _folder
+                    _ipath, _written = mailsearch.save_bodies(_kdir, _stamp, _hits)
+                    _new = [mailsearch.hit_line(_h) for _h in _hits]
+                    with session_state_lock:
+                        _cur = list(str_lit.session_state.get("kw_hits_results") or [])
+                        for _ln in _new:
+                            if _ln not in _cur:
+                                _cur.append(_ln)
+                        str_lit.session_state["kw_hits_results"] = _cur
+                    # raw bytes are not kept in session - the body file has them.
+                    str_lit.session_state["bb_kw_hits"] = [
+                        {_k: _v for _k, _v in _h.items() if _k != "raw"}
+                        for _h in _hits[:50]]
+                    _msg = (f"{len(_hits)} hit(s) in {_folder}; {_written} body file(s) "
+                            f"written to {os.path.basename(_kdir)}.")
+                    if _note:
+                        _msg += f" {_note}"
+                    str_lit.session_state["bb_kw_note"] = _msg
+                    log_probe_event(f"keyword search: {len(_hits)} hit(s) for "
+                                    f"{_acc} in {_folder}")
+
+                str_lit.button("📁 Connect & list folders", width="stretch",
+                               on_click=_kw_list_folders)
+
+                _kw_folders = str_lit.session_state.get("bb_kw_folders") or []
+                if _kw_folders:
+                    str_lit.selectbox(
+                        "Folder to search (nothing is selected for you)",
+                        options=_kw_folders, index=None, key="bb_kw_folder",
+                        placeholder="— pick a folder —")
+                str_lit.text_input("Keywords (commas separate them)", key="bb_kw_words",
+                                   placeholder="invoice, receipt, statement")
+                str_lit.button("🔎 Search this folder", width="stretch",
+                               on_click=_kw_search)
+
+                _kw_note = str_lit.session_state.get("bb_kw_note") or ""
+                if _kw_note:
+                    str_lit.caption(_kw_note)
+                _kw_hits = str_lit.session_state.get("bb_kw_hits") or []
+                if _kw_hits:
+                    str_lit.caption(f"Showing the first {len(_kw_hits)} of this pass. "
+                                    f"Every hit is also in the 🔎 Keyword Hits bucket.")
+                    for _h in _kw_hits:
+                        with str_lit.expander(f"{(_h.get('subject') or '')[:70]} - "
+                                              f"{(_h.get('from') or '')[:40]}",
+                                              expanded=False):
+                            str_lit.caption(
+                                f"{_h.get('folder')} · {_h.get('date')} · matched in "
+                                f"**{_h.get('where')}** on "
+                                f"{', '.join(_h.get('keywords') or [])}")
+                            str_lit.markdown(
+                                "<div style='white-space:pre-wrap;"
+                                "font-family:ui-monospace,monospace;font-size:12px'>"
+                                + html.escape((_h.get("body") or "")[:4000])
+                                + "</div>", unsafe_allow_html=True)
 # @@END 109 IN_APP_READER
 
 # @@BLOCK 110 FOOTER deps=008,034
