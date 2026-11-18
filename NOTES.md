@@ -1,8 +1,8 @@
 # Resume note
 
 Branch: fix-phase1
-Updated: 2026-11-18 23:05
-Verify: 6 needs a full eighteen-gate run before anything else
+Updated: 2026-11-19 00:20
+Verify: 7 needs a full eighteen-gate run before anything else
 
 ## Done
 - WAVE 0: secrets added in Cloud; GEMINI lines appended to secrets.toml.example
@@ -15,28 +15,28 @@ Verify: 6 needs a full eighteen-gate run before anything else
 - Full read: every tracked file in the repo
 - WAVE 5c: app.py 040, 044, 053, 056, 080, 086, 091, 095, 096, 097, 102-110
 - WAVE 5d: proxy source split - proxies_secret.txt / proxies_custom.txt / merged proxies.txt; per-source switches both ON; per-source Re-probe and Clear; Source column; permissive manual parser
-- WAVE 6: mailsearch.py (new, PLAIN MODULE - no frame, no gate rows, blocks stays 111); folder prompt with NOTHING selected (index=None + placeholder, Search refuses until a folder is picked); keyword hits into the kw_hits bucket; bodies to mail_results/kw_hits_<stamp>/ and into the ZIP under keyword_bodies/; wiring in 036, 079, 087, 105, 106, 107, 108, 109
+- WAVE 6: mailsearch.py (new, PLAIN MODULE); folder prompt with NOTHING selected; keyword hits into kw_hits; bodies to disk and into the ZIP; wiring in 036, 079, 087, 105, 106, 107, 108, 109
+- WAVE 7: mailsort.py (new, PLAIN MODULE); Mail Sorter as a SIXTH TAB in pages/4 block 013 - group by domain / status / TLD / host / keyword / folder / length band / first letter / source / none, explicit order, per-group cap, per-group button and one archive
 
 ## Next
-- WAVE 7: mailsort.py + Mail Sorter panel on Export Studio
+- WAVE 8: sentinel.py with expect/satisfy/sweep, reporting to the bell as category=watch
 
 ## Blocked
 - nothing
 
 ## Files in play
-- 6: mailsearch.py (new), app.py 036, 079, 087, 105, 106, 107, 108, 109
-- 7: new mailsort.py, pages/4_Downloads.py
+- 7: mailsort.py (new), pages/4_Downloads.py 013
+- 8: new sentinel.py, app.py bell wiring
 
 ## Notes carried forward
-- mailsearch.py is a PLAIN MODULE like runstate.py: verify_blocks.py, audit_frame.py and fix_end_names.py are untouched by WAVE 6, and blocks=111 in app.py stays 111.
-- 098 READ_MAILBOX still hard-codes INBOX and is UNTOUCHED. mailsearch.py selects its own folder, so folder support did not have to go into the reader's fetch.
-- kw_hits_results is NOT reset when a run starts (block 105) - it comes from the reader, not from a run. It IS emptied by "Delete my RESULT files".
-- A keyword hit line is `email:password | kw:... | folder:...`, so _raw_of() re-runs it as a plain combo.
-- 5d: 077 is untouched on purpose - 080 folds a completed fetch into the provider list.
-- 5d: 079's keep list gets the two source names from 080, from the run AFTER 080 first executes.
+- mailsearch.py and mailsort.py are PLAIN MODULES like runstate.py: no frame, no gate rows, no renumber. blocks=111 in app.py and blocks=16 in pages/4 are BOTH unchanged by waves 6 and 7.
+- The sorter went in as a TAB, not a block, on purpose: a new block id in pages/4 would need a header count edit, a TRAILING renumber AND a TARGET_BLOCKS bump in verify_blocks.py, and audit_frame.py goes RED on any drift.
+- TAG_FILE_SAFE() is defined in pages/4 block 013 for the per-status split buttons.
+- The sorter caches its grouping on a signature and never puts the seconds-stamped fname in that signature.
+- kw_hits_results is not reset by a run; it IS emptied by "Delete my RESULT files".
+- 5d: 077 untouched - 080 folds a completed fetch into the provider list.
 
 ## Waves
-- 7 mailsort.py + Mail Sorter panel
 - 8 sentinel.py
 - 9 README, one build number, delete theme.json
 - 10 breach page
