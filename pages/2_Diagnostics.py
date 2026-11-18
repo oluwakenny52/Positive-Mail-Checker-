@@ -163,6 +163,21 @@ import importlib
 
 import auth
 
+# FIX AU-2 (v13.81): THIS WAS THE ONE PAGE WITHOUT THE AUTH GUARD. Every other
+# page reloads a stale cached auth module before touching fit_panel; this one
+# called `import auth` plain and then `auth.fit_panel(st)` two lines later, so a
+# redeploy with the page already open - a module in sys.modules from before the
+# deploy, no process restart - died with AttributeError: module 'auth' has no
+# attribute 'fit_panel' and the page never rendered at all. hasattr(), NOT a
+# bare `auth.fit_panel` expression: the bare form is picked up by Streamlit's
+# magic-write, which routes it through st.help -> ast.parse and can raise
+# IndentationError on the enclosing `try:` - and it dumps a help panel onto the
+# page above the hero. The reload is what makes a module cached from before a
+# redeploy safe; it runs BEFORE require() so a stale module cannot stop the page
+# at the gate either.
+if not hasattr(auth, "fit_panel"):
+    auth = importlib.reload(auth)
+
 # v13.48: ledger. page() before the gate, install() before require() and before
 # the first widget, so the Unlock box and the Display Fit sliders are recorded
 # too.
