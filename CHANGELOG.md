@@ -1,3 +1,106 @@
+Mega Ultimate Mail Checker — v13.76
+===================================
+
+The block audit, consolidated. One entry covers v13.46 through v13.76, because the
+per-version prose for the middle of that stretch was never written down and is not
+reconstructed here - git is the record for it, and padding the gap with guesses
+would be worse than naming it.
+
+WHY THE AUDIT EXISTED
+---------------------
+The tree had grown past 1,100 commits with app.py at 111 blocks and no file framed
+end to end. Marker lines were bare, some blocks had no `@@END` at all, and a bare
+`# @@END` matches nothing - so the verifier reported two faults per marker and the
+frame was red across five files. A block cannot be replaced safely while its own
+edges are in doubt, so the edges were fixed first.
+
+THE FRAME
+---------
+* Every runtime file is framed: `# @@FILE` header with a matching count, contiguous
+  zero-padded ids from 000, a NAMED `@@END` on every block, `# @@EOF` last.
+* `verify_blocks.py` owns BLOCKED_FILES and the frame target, audits itself, and
+  compiles every file it gates.
+* `audit_frame.py` re-derives every rule from raw bytes, so the verifier is never
+  its own judge.
+* `pages/5_Blocks.py` canonicalises a bare `@@END` in the browser and validates a
+  paste before it is committed - the frame is repairable with no terminal.
+* `fix_end_names.py` rewrites marker lines only, and inserts a missing `@@END`
+  ABOVE `@@EOF` rather than below it.
+* The frame size is written in exactly one file. A stale copy in a doc was deleted
+  rather than maintained.
+
+THE GATES
+---------
+* Eighteen gates, every one in `.github/workflows/gates.yml`, every one on every
+  push with `if: always()` so one red cannot mask the rest.
+* The run summary is a PASS/FAIL table and the Summary step exits non-zero, so a
+  red gate reds the run.
+* `cancel-in-progress: false`: a rapid second push used to cancel the first run and
+  mask a red commit.
+* Gates now assert compilation, the no-text-between-END-and-BLOCK rule, `ok` /
+  `faults` / `fails` on every report, and the verifier's API against its three
+  callers.
+
+NEW MODULES (all PLAIN - no frame, no gate rows)
+------------------------------------------------
+`audit_log.py` per-user action and outcome ledger. `notify.py` bounded per-user
+notification ring. `mailview.py` safe body renderer. `mailsearch.py` keyword search
+over one mailbox. `mailsort.py` group/sort/zip a row set. `runstate.py` unfinished
+-run watchdog. `sentinel.py` expect/satisfy/sweep delivery watchdog. `breach.py`
+keyless breach lookup with freshness bands and an offline selftest.
+
+NEW PAGES
+---------
+`pages/1_Notifications.py` (the bell) and `pages/8_Breach.py`. Adding a page is four
+registration edits and the resume note carries all four.
+
+ONE BUILD NUMBER
+----------------
+Line 1 of `app.py` is the only typed number. Block 008 mirrors it as `BUILD_TAG` and
+`CFG_VERSION`, `pages/6` block 001 mirrors both, and `verify_v1337.py` fails if any
+of the four disagrees or is assigned twice.
+
+ISOLATION
+---------
+Every per-user file - results, clean-valid, last account, session cache, presets,
+ZIP, resume record, proxy pool and metadata, domain cache, probe key map, theme,
+applied settings - is prefixed with the unlocked hash. `theme.json` is runtime-only
+and gitignored. `passkey.json` and `disposable_domains.txt` are the only shared
+files, and both are documented as shared.
+
+FIXED DURING THE AUDIT
+----------------------
+* Block 099's docstring quoted the `DNS_FAILED, SMTP_FAILED` tail with its closing
+  paren, supplying a second occurrence and turning a want-2 check into want-3.
+* `hosts.py` 007 declared `deps=004,005,013`. 013 is later, so the forward
+  reference moved into the block comment.
+* `pages/8_Breach.py` shipped without `# @@EOF` and failed three gates at once.
+* `verify_blocks.py` documented the breach page twice - once as v13.76 and once as
+  v13.77, a version no file has ever carried.
+* `audit_frame.py`'s import-failure mirror was still 14 files / 294 blocks with the
+  breach page absent, and disagreed with `fix_end_names.py`'s own fallback.
+* `fix_end_names.py` advertised "2 x 101 = 202 faults across the five files" long
+  after both numbers were wrong.
+* `tier2_split.py` fell back to `version = "v13.40"`.
+
+STAGED, NOT APPLIED
+-------------------
+`tier2_split.py` splits app.py into engine.py + app.py by moving whole blocks, and
+keeps every side-effecting block in app.py so its rerun cadence is unchanged.
+engine.py is currently a separate hand-written engine that app.py does not import,
+so running the splitter replaces it - the old file is backed up first.
+
+KNOWN GAPS
+----------
+* `proxies_custom.txt` does not exist. A Fetch & Test rewrites proxies.txt and
+  destroys a hand-added custom list within about 30 seconds.
+* "Show raw proxies.txt" closes as NO RESULT because the branch draws no message
+  widget.
+* Both Oxylabs lines answer 407 on the 443 control. One Webshare sub-user is spent
+  and answers 402 on all ten of its lines. The 14 keys share only 10 distinct IPs,
+  so the global concurrency cap of 6 is the binding limit.
+* Block re-arrangement is deliberately deferred until the app has been used once.
+  
 Mega Ultimate Mail Checker — v13.45
 ===================================
 Display Fit is usable again, and the two silent-failure paths behind it are closed.
