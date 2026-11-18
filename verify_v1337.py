@@ -664,6 +664,8 @@ def main():
         has(dia, "pop_only", "false POP warning replaced by a real test")
         has(dia, "elif all_pop_dup", "all_pop branch present")
         has(dia, "tab_cache", "tab_cache still exists")
+        has(dia, "tab_ai", "the seventh AI probe tab is declared")
+        has(dia, "aiassist.probe()", "the AI probe tab is wired to a live call")
 
     if rdr:
         compiles(rdr_path, rdr)
