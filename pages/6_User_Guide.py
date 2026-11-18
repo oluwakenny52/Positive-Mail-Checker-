@@ -623,16 +623,46 @@ with _t6:
 | **Main** (`app.py`) | The checker: settings, input, run, results, in-app reader, resource monitor and the bell. | proxy credit |
 | **`pages/2_Diagnostics.py`** | Read-only. Shows the **exact rung order** the engine will dial for a domain, live TCP probes on 993/143/995/110, MX/SRV discovery, SMTP candidates, a `proxies.txt` audit, and cache tools. | zero |
 | **`pages/3_Mailbox_Reader.py`** | Bulk inbox reader: folders, OTP scanner, card/credential scanner, bot purge, per-message actions. | proxy credit |
-| **`pages/4_Downloads.py`** | Export Studio. Text / CSV / JSON / ZIP / per-status split, with filters, sorting, dedupe and presets. | zero |
+| **`pages/4_Downloads.py`** | Export Studio, and the Mail Sorter: group and split a huge row set by country. Text / CSV / JSON / ZIP / per-status split, with filters, sorting, dedupe and presets. | zero |
 | **`pages/5_Blocks.py`** | Block Inspector. Frame audit, paste validation, `@@END` canonicaliser, fix self-check. | zero |
 | **`pages/6_User_Guide.py`** | This page. | zero |
 | **`pages/7_Logs.py`** | Full log & operator trace: the execution log, per-account dial traces, boot ledger, run record and every result file. Read-only, per user. | zero |
+| **`pages/8_Breach.py`** | Breach exposure for a list of addresses, from free sources. Verdict is about how **recent** the exposure is: ACT / REVIEW / HISTORIC / CLEAN / UNKNOWN. | free, rate-limited |
 """
     )
     st.markdown(
         "Start with **Diagnostics** for one domain if a run is behaving oddly - it tells "
         "you whether the host, the port or the path is the problem, before you spend a "
         "single proxy request."
+    )
+
+    ug_h("Breach Exposure, in more detail")
+    st.markdown(
+        """
+Breach Exposure never touches a mailbox, so it is safe to run on addresses you
+have already discarded.
+
+It uses three free sources and **no API key**:
+
+* the public breach catalogue, fetched once and matched locally by domain, so a
+  list of 500 addresses makes one request, not 500;
+* the account page on haveibeenpwned, fetched only when the local match found
+  nothing, at one request every two seconds because it is throttled;
+* `psbdmp.ws`, for pastes quoting the address.
+
+Read the verdict as urgency, not as a score:
+
+| Verdict | Meaning |
+|---|---|
+| **ACT** | a breach added inside 90 days, or a paste from the last year |
+| **REVIEW** | a breach added inside a year |
+| **HISTORIC** | only old exposure - rotate anyway, nothing is urgent |
+| **CLEAN** | not in those sources, which is not the same as never exposed |
+| **UNKNOWN** | no readable answer - usually a throttle |
+
+Nothing on that page is written outside your own files, and the history is yours
+alone.
+"""
     )
 # @@END 013 TAB_PAGES
 
