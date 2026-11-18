@@ -380,7 +380,8 @@ def worker_contract(app, app_code):
 
 
 AUTH_CALLERS = ("app.py", "pages/3_Mailbox_Reader.py", "pages/4_Downloads.py",
-                "pages/5_Blocks.py", "pages/6_User_Guide.py")
+                "pages/5_Blocks.py", "pages/6_User_Guide.py",
+                "pages/8_Breach.py")
 
 # anchored on the call paren: bare `auth.py` in prose must not read as auth.py()
 AUTH_CALL = re.compile(r"\bauth\.([A-Za-z_]\w*)\s*\(")
@@ -466,7 +467,8 @@ def page_numbers():
             FAILS.append("page number %s COLLIDES: %s" % (num, ", ".join(names)))
         else:
             PASSES.append("page number %s unique (%s)" % (num, names[0]))
-    for expected in ("pages/2_Diagnostics.py", "pages/3_Mailbox_Reader.py"):
+    for expected in ("pages/2_Diagnostics.py", "pages/3_Mailbox_Reader.py",
+                     "pages/8_Breach.py"):
         if os.path.exists(expected):
             PASSES.append(expected + " exists")
         else:
