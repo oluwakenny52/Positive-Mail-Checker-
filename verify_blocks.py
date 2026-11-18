@@ -63,15 +63,18 @@ BLOCKED_FILES = [
 # copy, and its api_conformance() asserts both names exist.
 #
 # tier2_split.py REWRITES app.py and OVERWRITES engine.py - it deletes no file -
-# so TARGET_FILES only moves when a FILE is added or removed.  v13.70 added
-# pages/1_Notifications.py (files 13 -> 14) and v13.76 added pages/8_Breach.py
-# (files 14 -> 15, blocks 294 -> 306); blocks move by the added file's own block
-# count, never by hand.  tier2_split.py prints the new line for you and records
-# it in TIER2_MANIFEST.txt; paste it here.
+# so TARGET_FILES only moves when a FILE is added or removed, and blocks move by
+# the added file's own block count, never by hand.  Both numbers move together:
+# a file that is gated but not counted, or counted but not gated, is a hole
+# either way.  tier2_split.py prints the new line for you and records it in
+# TIER2_MANIFEST.txt; paste it here.
 #
-# v13.77 added pages/8_Breach.py: files 14 -> 15, blocks 294 -> 306 (its own
-# frame is 12).  Both numbers move together, as above - a file that is gated but
-# not counted, or counted but not gated, is a hole either way.
+# History, deltas only - never a running total, which is what kept going stale:
+#   v13.70  +pages/1_Notifications.py   files +1, blocks +24
+#   v13.76  +pages/8_Breach.py          files +1, blocks +12  (its own frame is 12)
+# v13.76 is the version in the header above.  This comment used to carry the
+# breach page TWICE - once as v13.76 and once as v13.77, a version no file in the
+# tree has ever carried - so one event was recorded twice and half of it wrong.
 TARGET_FILES = 15
 TARGET_BLOCKS = 306
 
