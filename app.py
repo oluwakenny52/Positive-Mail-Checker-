@@ -2363,6 +2363,34 @@ def build_diagnostics_text():
     for e in startup_panel_lines()[-60:]:
         A(f"  {e}")
 
+    # v13.81 WAVE 13: THE AI SECTION. Without it a bundle could not say whether
+    # the classifier was on, what model it was asked for, what the provider
+    # actually resolved that alias to, how many calls it spent, or whether it had
+    # stopped itself - which is every question the feature exists to answer and
+    # every one a screenshot cannot show.
+    #
+    # Read through globals(): block 030 sits earlier in the file than block 067,
+    # where `_AI` is bound, so the name does not exist yet at def time but does at
+    # call time. The key is never printed, only its presence and last four.
+    A("")
+    A("--- 13. AI CLASSIFIER (UNKNOWN tail only, never a verdict) ---")
+    _ai_mod = globals().get("_AI")
+    if _ai_mod is None:
+        A("  module              : ABSENT or failed to import - tail stays UNKNOWN")
+    else:
+        try:
+            _ai_rep = _ai_mod.report()
+        except Exception as _aie:
+            _ai_rep = {"error": "%s: %s" % (type(_aie).__name__, _aie)}
+        for _k in sorted(_ai_rep):
+            A(f"  {_k:20}: {_ai_rep.get(_k)}")
+        A(f"  GEMINI_ENABLED raw  : {os.getenv('GEMINI_ENABLED')!r}   <-- must be the STRING true")
+        A(f"  GEMINI_API_KEY      : {'set' if os.getenv('GEMINI_API_KEY') else 'ABSENT'}")
+        if str(_ai_rep.get("resolved_model") or "").startswith("(not"):
+            A("  *** the alias has not been resolved yet this process - a -latest alias")
+            A("      can move under you, so a bundle without a resolved model proves")
+            A("      nothing about which model answered ***")
+
     A("")
     A("=" * 78)
     A("END OF DIAGNOSTIC BUNDLE")
@@ -14289,6 +14317,35 @@ except Exception:
 if _sentinel is not None:
     _sentinel.sweep()
 
+# v13.81 WAVE 13: THE LAST-RESORT CLASSIFIER IS CONFIGURED HERE, once, from the
+# GEMINI_* keys block 043 bridged into os.environ. This block is module level and
+# runs on every load, which is the only cadence a configure() has - block 067
+# calls classify() from worker threads long after any script run has ended.
+#
+# The drain is a DAEMON THREAD and runs once per session: block 067 has already
+# queued whatever it could not place, the account that produced it is long gone,
+# and the next account that sees the same text gets the cached token. Nothing
+# here can block the script thread, the ladder or a verdict.
+#
+# `_AI` is the same module object block 067 imported. Re-binding the name to the
+# same object (or to None on the same failure) is harmless because 067 looks the
+# global up at call time.
+try:
+    import aiassist as _AI
+except Exception:
+    _AI = None
+if _AI is not None:
+    try:
+        _AI.configure(enabled=os.getenv("GEMINI_ENABLED"),
+                      key=os.getenv("GEMINI_API_KEY"),
+                      model=os.getenv("GEMINI_MODEL"))
+    except Exception as _aie:
+        log_startup(f"WARNING: aiassist configure failed: {_aie}")
+    if not _US.get("ai_drained"):
+        _US["ai_drained"] = True
+        threading.Thread(target=_AI.drain, kwargs={"limit": 6},
+                         daemon=True, name="ai-drain").start()
+
 RESULT_ACTION_MODES = BUCKETS
 ACTION_OPTIONS = list(PREFILTER_LABELS) + [label for label, _ in BUCKETS]
 
@@ -14335,6 +14392,24 @@ with col_action2:
         str_lit.caption("🔢 Batch on, no limit")
     else:
         str_lit.caption("Batch off")
+
+# v13.81: THE CAPS ARE VISIBLE. A budget nobody can see is a budget nobody
+# believes, and the failure mode of an unbounded classifier is a silent quota
+# bill. Read from report(), which never raises.
+if _AI is not None:
+    try:
+        _ai_rep = _AI.report()
+    except Exception:
+        _ai_rep = {}
+    if _ai_rep.get("enabled") and _ai_rep.get("key_present"):
+        str_lit.caption(
+            f"🤖 Unknown-tail classifier: **{_ai_rep.get('calls_run', 0)}** call(s) this run · "
+            f"**{_ai_rep.get('calls_day', 0)}**/{_ai_rep.get('max_per_day', 0)} today · "
+            f"{_ai_rep.get('queue', 0)} queued"
+            + ("  ·  **STOPPED** after repeated failures"
+               if _ai_rep.get("tripped") else ""))
+    else:
+        str_lit.caption("🤖 Unknown-tail classifier: off (GEMINI_ENABLED or key absent).")
 
 # FIX SPEED-8: this used to run at MODULE level on every rerun - a full read and
 # filter of proxies.txt for a value only the start path below ever consumes. The
@@ -14441,6 +14516,14 @@ if stop_engine_btn and STATE.get("run_active"):
     str_lit.rerun()
 
 if start_engine_btn:
+    # v13.81: the run counter and the trip latch are per RUN, so they clear here
+    # and not on a load. A latch left armed by the previous run would keep the
+    # classifier silent for the whole of this one.
+    if _AI is not None:
+        try:
+            _AI.reset_run()
+        except Exception:
+            pass
     clear_proxy_quarantine()
     log_probe_event("run start: 407 quarantine cleared")
     # v13.80 WAVE 8: armed here, satisfied by block 106 when a single result
