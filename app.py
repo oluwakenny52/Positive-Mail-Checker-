@@ -3611,12 +3611,19 @@ def _reset_gates():
                     tbl[k].set_limit(_limit(cfg_key, dflt))
                 except Exception:
                     pass
-    _pg = _gate_table("proxy_gates").get(_gate_scope())
-    if _pg is not None:
-        try:
-            _pg.set_limit(_limit("PROXY_CONCURRENCY", PROXY_CONCURRENCY_DEFAULT))
-        except Exception:
-            pass
+        # v13.77 FIX GATE-RESET-LOCK: the proxy gate was read and re-limited
+        # OUTSIDE this lock. _gate_table() INSERTS the table on a miss, so a
+        # Reset racing the first worker of the session could build a SECOND
+        # proxy_gates dict, store it, and re-limit a gate object nobody was
+        # holding while the live one kept the old ceiling - the exact doubling
+        # the lock was added for in v13.53. It is inside the lock now, fetched
+        # through the same _gate_table() the getters use, so there is one table.
+        _pg = _gate_table("proxy_gates").get(_gate_scope())
+        if _pg is not None:
+            try:
+                _pg.set_limit(_limit("PROXY_CONCURRENCY", PROXY_CONCURRENCY_DEFAULT))
+            except Exception:
+                pass
     log_probe_event("concurrency gate limits rebuilt in place (objects kept)")
 
 
@@ -5509,6 +5516,13 @@ with str_lit.sidebar.expander("🎨 Theme Studio & Colours", expanded=False):
         "th_glow": bool(th.get("glow", True)),
         "th_glass": bool(th.get("glass", True)),
         "th_animate": bool(th.get("animate", True)),
+        # v13.77 FIX LOG-COLOUR-SEED: this was the ONE widget here with no seed, so
+        # it came up False on a fresh session while block 106 and block 108 both read
+        # it as .get("colorize_logs", True) - the two halves of the same switch
+        # disagreed and the live log rendered colourless until it was ticked by hand.
+        # Seeded from the theme like every other key, so the widget and the readers
+        # always start from the same answer.
+        "colorize_logs": bool(th.get("colorize_logs", True)),
         "th_hero_title": th.get("hero_title", ""),
         "th_hero_sub": th.get("hero_sub", ""),
     }
@@ -9497,6 +9511,13 @@ with str_lit.sidebar:
             str_lit.session_state["_proxy_flash"] = ("success", "Pool re-probed.")
             str_lit.rerun()
     with _rc2:
+        # FIX SHOWRAW-1 (v13.76): the output used to be a bare st.code and the
+        # caption was drawn unconditionally, so the press that opened this was
+        # closed by whatever banner happened to run first and the list itself was
+        # never the thing being read. The code block carries the lines and the
+        # credential check is a caption (captions never close a press), so nothing
+        # in here can steal the click that produced it. The only real message is
+        # the failure, which is the honest outcome for that press.
         if str_lit.button("🧾 Show raw proxies.txt", width="stretch"):
             try:
                 with open(CFG["PROXY_FILE"], encoding="utf-8", errors="ignore") as _pf:
@@ -14751,7 +14772,7 @@ if start_engine_btn:
             proxy_path = os.path.join(CFG["RESULTS_DIR"], f"proxy_unhealthy_{stamp}.txt")
             login_drop_path = os.path.join(CFG["RESULTS_DIR"], f"login_dropped_{stamp}.txt")
             retry_path = os.path.join(CFG["RESULTS_DIR"], f"retry_later_{stamp}.txt")
-            rbl_path = os.path.join(CFG["RESULTS_DIR"], f"rbl_blocked_{stamp}.txt")
+            rbl_path = os.path.join(CFG["RESULTS_DIR"], f"rbl_{stamp}.txt")
             smtp_path = os.path.join(CFG["RESULTS_DIR"], f"smtp_failed_{stamp}.txt")
             dns_path = os.path.join(CFG["RESULTS_DIR"], f"dns_failed_{stamp}.txt")
             skip_path = os.path.join(CFG["RESULTS_DIR"], f"skipped_{stamp}.txt")
