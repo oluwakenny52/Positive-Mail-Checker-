@@ -5,8 +5,14 @@ WHY THIS EXISTS
 ---------------
 verify_blocks.py matches '# @@END NNN NAME'.  A bare '# @@END NNN' matches
 nothing, so every such block reports TWO faults: 'opened while block NNN is
-still open' plus 'has no @@END'.  On this repo that is 2 x 101 = 202 faults
-across the five files that still carry bare markers.
+still open' plus 'has no @@END'.  The cost is therefore 2 x the number of bare
+markers, and it does not depend on how many files they are spread over.
+
+v13.76: this paragraph used to read '2 x 101 = 202 faults across the five files
+that still carry bare markers'.  Both halves were stale - five was true when
+five files were gated and fifteen are gated now, and the 101 had been wrong for
+longer.  Neither number is restated here; run `python fix_end_names.py --check`
+and read the row, which is the one place that cannot go stale.
 
 WHAT IT TOUCHES
 ---------------
@@ -58,10 +64,10 @@ try:
     from verify_blocks import BLOCKED_FILES as FILES
 except Exception:
     FILES = ("app.py", "auth.py", "engine.py", "hosts.py", "ms_oauth.py",
-             "status.py", "verify_blocks.py", "pages/2_Diagnostics.py",
-             "pages/3_Mailbox_Reader.py", "pages/4_Downloads.py",
-             "pages/5_Blocks.py", "pages/6_User_Guide.py", "pages/7_Logs.py",
-             "pages/8_Breach.py")
+             "status.py", "verify_blocks.py", "pages/1_Notifications.py",
+             "pages/2_Diagnostics.py", "pages/3_Mailbox_Reader.py",
+             "pages/4_Downloads.py", "pages/5_Blocks.py", "pages/6_User_Guide.py",
+             "pages/7_Logs.py", "pages/8_Breach.py")
 
 RE_ANY_MARKER = re.compile(r"@@(?:BLOCK|END)\b")
 RE_BLOCK = re.compile(r"^#\s*@@BLOCK\s+(\d{3})\s+([A-Za-z0-9_]+)"
