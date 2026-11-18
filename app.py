@@ -4812,6 +4812,11 @@ _PROXY_LABEL_RE = re.compile(r"^(?:[-*\u2022\u203a>\u2192]|\d{1,3}[.)])\s*")
 _HOST_OK = re.compile(r"^[A-Za-z0-9]([A-Za-z0-9.\-]{0,252})$")
 _MASKED_RE = re.compile(r"^(\d{1,3}|[A-Za-z]{1,5})(\.(\d{1,3}|[A-Za-z]{1,5})){1,3}$")
 
+# v13.81: how many wrapped pairs the LAST import re-joined. Block 080 reads it to
+# report the count; a module global rather than a sixth return value, so the
+# five-tuple stays five and the two blocks can land in either order.
+LAST_IMPORT_STITCH = 0
+
 
 def _looks_masked(host) -> bool:
     """True for an address with a masked octet, e.g. 192.168.1.xxx.
@@ -4857,7 +4862,7 @@ def _clean_proxy_token(raw) -> str:
 
 
 def parse_proxy(proxy_str):
-    """Any reasonable proxy line -> {host, port, user, pass, masked}, or None.
+    """Any reasonable proxy line -> {host, port, user, pass, masked, incomplete}.
 
     Accepted, in every combination, with or without a scheme and with or without
     a label in front:
@@ -4871,6 +4876,13 @@ def parse_proxy(proxy_str):
 
     The HOST and the PORT are validated, so a junk line still returns None
     rather than a dict the engine would dial and hang on for a full timeout.
+
+    v13.81: `incomplete` is True for the user-without-password shapes. They used
+    to be indistinguishable from a whole node - the import counted them as
+    imported and tunnel_probe() then rejected them as `format` before any
+    CONNECT, because PySocks omits Proxy-Authorization entirely on a falsy
+    password. A caller that sees the flag can join the line to a wrapped
+    continuation instead of writing a dead node.
     """
     if not proxy_str:
         return None
@@ -4885,7 +4897,8 @@ def parse_proxy(proxy_str):
             if _host_ok(host) and port and 0 < int(port) < 65536:
                 return {"host": host, "port": int(port),
                         "user": u.username, "pass": u.password,
-                        "masked": _looks_masked(host)}
+                        "masked": _looks_masked(host),
+                        "incomplete": bool(u.username and not u.password)}
         user = pwd = None
         hostpart = t
         if "@" in t:
@@ -4918,9 +4931,74 @@ def parse_proxy(proxy_str):
         return {"host": host, "port": port,
                 "user": (user.strip() or None) if user else None,
                 "pass": (pwd.strip() or None) if pwd else None,
-                "masked": _looks_masked(host)}
+                "masked": _looks_masked(host),
+                "incomplete": bool(user and not pwd)}
     except Exception:
         return None
+
+
+# ==========================================================================
+# v13.81 - THE WRAPPED PAIR
+#
+# A phone paste of a provider row wraps. What arrives is a 3-field line ending
+# in a bare username, then the rest of the credential as an orphan fragment:
+#
+#     51.79.219.19:5079:user1247
+#     88535212-1794752801:7d8cc0cc4f
+#
+# Line one parses, so nothing complains; line two has no dotted host and a
+# non-numeric "port", so it is dropped and counted as unreadable. The import
+# reports one line added and one dropped, and the node it added can never pass a
+# probe. The credential is the CONCATENATION - user124788535212-1794752801 -
+# and the ten digits are a unix stamp, not a separate field.
+#
+# Both tests are deliberately narrow:
+#   * a fragment is judged on its PORT, not its host. "88535212-1794752801"
+#     passes _host_ok, so a host test would call it a node.
+#   * only the exact host:port:user shape is joined, and never a line carrying
+#     '@', because `user@host:port` is also a user-without-password and would
+#     otherwise swallow the next fragment.
+# ==========================================================================
+def _incomplete_proxy(line) -> bool:
+    """True for exactly `host:port:user` - a node with no password yet."""
+    t = _clean_proxy_token(line)
+    if not t or "@" in t or len(t.split(":")) != 3:
+        return False
+    info = parse_proxy(t)
+    return bool(info) and bool(info.get("user")) and not info.get("pass")
+
+
+def _orphan_fragment(line) -> bool:
+    """True for a `x:y` line that is not a proxy on its own."""
+    t = _clean_proxy_token(line)
+    if not t or "@" in t:
+        return False
+    parts = t.split(":")
+    if len(parts) != 2:
+        return False
+    return (not parts[1].strip().isdigit()) or (not _host_ok(parts[0]))
+
+
+def stitch_wrapped_pairs(text):
+    """Join a wrapped credential pair. Returns (text, joined_count).
+
+    A pair only joins when the incomplete line is immediately followed by an
+    orphan fragment, so a list that is already whole is returned untouched.
+    """
+    lines = [l.strip() for l in (text or "").splitlines()]
+    out, joined = [], 0
+    i = 0
+    while i < len(lines):
+        cur = lines[i]
+        nxt = lines[i + 1] if (i + 1) < len(lines) else ""
+        if cur and nxt and _incomplete_proxy(cur) and _orphan_fragment(nxt):
+            out.append(cur + nxt)
+            joined += 1
+            i += 2
+            continue
+        out.append(cur)
+        i += 1
+    return "\n".join(out), joined
 
 
 def normalize_proxy_line(raw):
@@ -5062,15 +5140,26 @@ def rebuild_merged_proxies(reason="", quiet=True) -> dict:
 def import_custom_proxies(text):
     """Accept ANY pasted shape. Returns (added, dropped, masked, dupes, samples).
 
-    Nothing is mangled: a line either normalises to a dialable address or it is
-    dropped and counted. The first five unreadable lines are returned so the UI
-    can show them instead of silently swallowing them.
+    v13.81: a wrapped credential pair is joined BEFORE anything is parsed, so a
+    phone paste of the `host:port:user` + `rest-of-credential` shape imports as
+    one whole node instead of a dead one. The join count is published on
+    LAST_IMPORT_STITCH for the caller to report.
+
+    Nothing else is mangled: a line either normalises to a dialable address or it
+    is dropped and counted. The first five unreadable lines are returned so the
+    UI can show them instead of silently swallowing them.
     """
+    global LAST_IMPORT_STITCH
+    _stitched, _joined = stitch_wrapped_pairs(text)
+    LAST_IMPORT_STITCH = _joined
+    if _joined:
+        log_startup(f"custom import: re-joined {_joined} wrapped credential pair(s).")
+
     _cus_p = _src_path("custom")
     _existing = _read_lines(_cus_p)
     _seen = set(_existing)
     good, dropped, masked, dup, bad = [], 0, 0, 0, []
-    for raw in (text or "").splitlines():
+    for raw in (_stitched or "").splitlines():
         line = raw.strip()
         if not line or line.startswith("#"):
             continue
@@ -5157,13 +5246,18 @@ def quarantine_size() -> int:
 
 def clear_proxy_quarantine():
     _rebind_scope()
+    # v13.81: BOTH MAPS UNDER THE ONE LOCK. proxy_quarantine was cleared under it
+    # and the two strike maps beside it were cleared bare, so a worker incrementing
+    # _proxy_407 mid-clear could re-add a key that had just been wiped - and a
+    # single leftover strike is enough to quarantine a healthy node on its next
+    # 407.
     with proxy_quarantine_lock:
         proxy_quarantine.clear()
-    _proxy_407.clear()
-    try:
-        proxy_407_until.clear()
-    except Exception:
-        pass
+        _proxy_407.clear()
+        try:
+            proxy_407_until.clear()
+        except Exception:
+            pass
     log_probe_event("quarantine cleared by user")
 
 
@@ -6817,9 +6911,24 @@ _CANON_STATUS = {
     RBL_BLOCKED: RBL,
     RETRY_LATER: RETRY,
     FAILED: CONNECTION_FAILED,
+    # v13.81: status.py's classifier never emits PROXY_UNHEALTHY, so this map
+    # never needed the entry - but aiassist.py's whitelist can, and an unfolded
+    # PROXY_UNHEALTHY is not in note_verdict()'s whitelist either. PROXY_LEVEL_
+    # STATUSES folds it to conn anyway, so this is the same answer the taxonomy
+    # would give.
+    PROXY_UNHEALTHY: CONNECTION_FAILED,
     DNS_FAILED: DNS_FAILED,
     SMTP_FAILED: SMTP_FAILED,
 }
+
+# v13.81 WAVE 13: THE LAST-RESORT CLASSIFIER. Plain module, stdlib only, inert
+# until block 105 configures it from the GEMINI_* env keys block 043 bridges.
+# Guarded at import because a deployment that never uploads the file must behave
+# exactly as before.
+try:
+    import aiassist as _AI
+except Exception:
+    _AI = None
 
 # v13.60: THE POP3 TWINS.
 #
@@ -6866,7 +6975,21 @@ def classify_error(err, domain=""):
         if any(t in _low for t in _POP_APP):
             return APP
         st_val = st_classify(err_str, domain)
-        return _CANON_STATUS.get(st_val, st_val)
+        _canon = _CANON_STATUS.get(st_val, st_val)
+        # v13.81: THE TAIL ONLY. The local table has already failed to place this
+        # text, which makes it server wording the app has never seen - the one
+        # case a model is worth spending a call on. classify() is a CACHE READ and
+        # cannot block: a miss returns None, is queued, and block 105 drains the
+        # queue off the script thread. UNKNOWN is already in RETRY_STATUSES, so a
+        # late token changes WHICH retry, never whether.
+        if _canon == UNKNOWN and _AI is not None:
+            try:
+                _ai_tok = _AI.classify(err_str)
+            except Exception:
+                _ai_tok = None
+            if _ai_tok:
+                return _CANON_STATUS.get(_ai_tok, _ai_tok)
+        return _canon
     except Exception:
         return UNKNOWN
 
