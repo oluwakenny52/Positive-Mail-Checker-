@@ -626,7 +626,7 @@ with _t6:
 |---|---|---|
 | **`pages/1_Notifications.py`** | Everything raised for you: resource alerts with the fix beside each one, and run events. Mark read, dismiss one, dismiss all, download the lot. Yours only. | zero |
 | **Main** (`app.py`) | The checker: settings, input, run, results, in-app reader, resource monitor and the bell. | proxy credit |
-| **`pages/2_Diagnostics.py`** | Read-only. Shows the **exact rung order** the engine will dial for a domain, live TCP probes on 993/143/995/110, MX/SRV discovery, SMTP candidates, a `proxies.txt` audit, and cache tools. | zero |
+| **`pages/2_Diagnostics.py`** | Shows the **exact rung order** the engine will dial for a domain, live TCP probes on 993/143/995/110, MX/SRV discovery, SMTP candidates, a `proxies.txt` audit, cache tools, and an **AI probe** tab. | zero - the AI probe spends Gemini quota, not proxy credit |
 | **`pages/3_Mailbox_Reader.py`** | Bulk inbox reader: folders, OTP scanner, card/credential scanner, bot purge, per-message actions. | proxy credit |
 | **`pages/4_Downloads.py`** | Export Studio, and the Mail Sorter: group and split a huge row set by country. Text / CSV / JSON / ZIP / per-status split, with filters, sorting, dedupe and presets. | zero |
 | **`pages/5_Blocks.py`** | Block Inspector. Frame audit, paste validation, `@@END` canonicaliser, fix self-check. | zero |
