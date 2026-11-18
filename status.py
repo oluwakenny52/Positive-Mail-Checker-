@@ -27,14 +27,16 @@ Single source of truth for every verdict token the app uses. app.py imports
 the short aliases from here; if that import ever fails the app falls back to
 an inline copy of the same tables, so the two must stay in lockstep.
 
-STATUS_VERSION MUST equal the `version=` on line 1 of this file. It sat at
-v13.42 while the header said v13.48, so every version string this module
-reported was wrong by six releases. If you bump the header, bump this too.
+STATUS_VERSION MUST equal the `version=` on line 1 of this file, and the
+selftest now proves it by reading line 1, so the constant cannot drift again
+without a gate going red. It sat at v13.42 while the header said v13.48, then
+at v13.48 while the header said v13.76 - the same defect, shipped twice, with
+nothing checking it either time.
 """
 
 import re
 
-STATUS_VERSION = "v13.48"
+STATUS_VERSION = "v13.76"
 STATUS_MODULE = "status"
 STATUS_BLOCKS = 13
 # @@END 000 HEADER
@@ -576,9 +578,25 @@ def worst_of(results):
 
 
 # @@BLOCK 010 SELFTEST
+def _header_version():
+    """The `version=` on line 1 of this file, or "" if unreadable."""
+    try:
+        with open(__file__, encoding="utf-8") as fh:
+            first = fh.readline()
+    except Exception:
+        return ""
+    m = re.search(r"version=(v\d+\.\d+)\s*$", first.strip())
+    return m.group(1) if m else ""
+
+
 def alias_selftest(verbose=False):
     """Assert the taxonomy is internally consistent. Returns True or raises."""
     checks = []
+
+    _hdr = _header_version()
+    checks.append(("version_known", bool(_hdr)))
+    checks.append(("version_matches_header", STATUS_VERSION == _hdr))
+    checks.append(("blocks_matches_header", STATUS_BLOCKS == 13))
 
     for st in STATUS_ALL_STATUSES:
         checks.append((f"label:{st}", st in LABELS))
