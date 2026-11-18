@@ -38,7 +38,7 @@ import re
 import sys
 import tokenize
 
-__version__ = "v13.42"
+__version__ = "v13.76"
 
 BLOCKED_FILES = [
     "app.py",
