@@ -3710,6 +3710,29 @@ class CheckerConfig:
 # @@END 042 CHECKER_CONFIG
 
 # @@BLOCK 043 SECRETS_BRIDGE deps=038
+# ==========================================================================
+# v13.78 WAVE 5d - THE POOL HAS TWO SOURCES
+#
+# proxies_secret.txt  provider lines: every Webshare key's output and the
+#                     Oxylabs secrets. Written by a fetch, by Restore and by
+#                     the initial seed - never hand-edited.
+# proxies_custom.txt  whatever you paste. Written only by the importer, always
+#                     normalised to one shape first.
+# proxies.txt         the MERGE of whichever sources are switched on. Every
+#                     probe, filter, gate and the engine read only this, so
+#                     nothing downstream knows the split exists.
+#
+# Both switches default ON. Turning one off removes its lines from the merge -
+# it does NOT delete them, so the switch is reversible.
+#
+# The names live here because this block already owns where provider lines come
+# from. The paths, the merge and the parser are block 052; the buttons and the
+# Source column are block 080.
+# ==========================================================================
+PROXY_SRC_SECRET = "proxies_secret.txt"
+PROXY_SRC_CUSTOM = "proxies_custom.txt"
+
+
 def _secret_to_env(k, v):
     if v is None:
         return
@@ -3737,6 +3760,8 @@ OXYLABS_PROXIES = [line.strip() for line in
                    (os.getenv("OXYLABS_BASE") or os.getenv("OXYLABS_PROXIES") or "").splitlines()
                    if line.strip()]
 log_startup(f"Secrets keys: webshare={len(WEBSHARE_KEYS)} oxylabs={len(OXYLABS_PROXIES)}")
+log_startup(f"Proxy sources: {PROXY_SRC_SECRET} (provider) + {PROXY_SRC_CUSTOM} (pasted) "
+            f"merge into proxies.txt; both switches default ON.")
 # @@END 043 SECRETS_BRIDGE
 
 # @@BLOCK 044 HELP_WIDGET deps=043
@@ -4683,16 +4708,19 @@ def _proxy_path() -> str:
 
 
 def load_proxies(quiet: bool = False):
-    """Proxies come from THIS USER's proxies.txt only."""
+    """Proxies come from THIS USER's proxies.txt only - the merged file.
+
+    v13.78 WAVE 5d: the merged file is REBUILT from the two sources when it is
+    missing, instead of being seeded straight from OXYLABS. Seeding the merge
+    directly would have made the secret list look empty and lost the split on
+    the very first load.
+    """
     _path = _proxy_path()
     if not os.path.exists(_path):
         try:
-            with file_write_lock:
-                with open(_path, "w", encoding="utf-8") as f:
-                    if OXYLABS_PROXIES:
-                        f.write("\n".join(OXYLABS_PROXIES) + "\n")
-            log_startup(f"Created {_path} (seeded from secrets: "
-                        f"{len(OXYLABS_PROXIES)}).", quiet=quiet)
+            _r = rebuild_merged_proxies("merged file missing", quiet=quiet)
+            log_startup(f"Created {_path} ({_r.get('merged', 0)} line(s) from "
+                        f"the proxy sources).", quiet=quiet)
         except Exception as e:
             log_startup(f"WARNING: Failed to initialize {_path}: {e}", quiet=quiet)
     try:
@@ -4734,34 +4762,322 @@ def is_proxy_alive(proxy_host, proxy_port, timeout=2):
         return False
 
 
+# ==========================================================================
+# v13.78 WAVE 5d - THE PERMISSIVE PARSER
+#
+# A pasted provider page is not a tidy list. It arrives with bullets, "1."
+# numbering, "Proxy:" / "Sock5" / "SOCKS5:" labels, quotes, trailing commas,
+# blank lines and lines where the credentials sit IN FRONT of the address. The
+# old parser understood exactly four shapes and returned None for all of it, so
+# a real page imported as nothing.
+#
+# THE ONE RULE: a hyphen is NEVER a separator. Provider sub-user names and
+# passwords are full of them, and a parser that splits on '-' cuts a working
+# credential in half. Only ':', '@' and whitespace separate anything here.
+# ==========================================================================
+_PROXY_SCHEMES = ("socks5://", "socks4://", "sock5://", "socks://", "http://",
+                  "https://", "socks5:", "sock5:", "socks4:", "http:", "https:")
+_PROXY_LABEL_RE = re.compile(r"^(?:[-*\u2022\u203a>\u2192]|\d{1,3}[.)])\s*")
+_HOST_OK = re.compile(r"^[A-Za-z0-9]([A-Za-z0-9.\-]{0,252})$")
+_MASKED_RE = re.compile(r"^(\d{1,3}|[A-Za-z]{1,5})(\.(\d{1,3}|[A-Za-z]{1,5})){1,3}$")
+
+
+def _looks_masked(host) -> bool:
+    """True for an address with a masked octet, e.g. 192.168.1.xxx.
+
+    It parses, so it is KEPT - but it can never resolve, so the importer counts
+    it separately instead of quietly putting a dead line in the pool.
+    """
+    h = host or ""
+    if not h or not _MASKED_RE.match(h) or "." not in h:
+        return False
+    return any(c.isalpha() for c in h) and h.split(".")[0].isdigit()
+
+
+def _host_ok(h) -> bool:
+    if not h or len(h) > 253 or " " in h:
+        return False
+    if not _HOST_OK.match(h):
+        return False
+    if h.startswith(".") or h.endswith(".") or ".." in h:
+        return False
+    return True
+
+
+def _clean_proxy_token(raw) -> str:
+    """Strip bullets, numbering, scheme words, quotes and trailing punctuation.
+
+    Runs until it stops changing, so "1. Proxy: socks5://..." loses all four.
+    """
+    t = str(raw or "").replace("\ufeff", "").strip().strip("\"'`").strip()
+    t = t.replace("\u2013", "-").replace("\u2014", "-").strip(" ,;|")
+    prev = None
+    while prev != t:
+        prev = t
+        t = _PROXY_LABEL_RE.sub("", t).strip()
+        low = t.lower()
+        for sch in _PROXY_SCHEMES:
+            if low.startswith(sch):
+                t = t[len(sch):].strip()
+                low = t.lower()
+                break
+        t = t.strip(" ,;|")
+    return t.strip(" ,;|")
+
+
 def parse_proxy(proxy_str):
+    """Any reasonable proxy line -> {host, port, user, pass, masked}, or None.
+
+    Accepted, in every combination, with or without a scheme and with or without
+    a label in front:
+
+        host:port
+        host:port:user
+        host:port:user:pass
+        user@host:port
+        user:pass@host:port
+        scheme://user:pass@host:port
+
+    The HOST and the PORT are validated, so a junk line still returns None
+    rather than a dict the engine would dial and hang on for a full timeout.
+    """
     if not proxy_str:
         return None
     try:
-        p = proxy_str.strip()
-        if "://" in p:
-            u = urlparse(p)
-            return {"host": u.hostname, "port": u.port or 80,
-                    "user": u.username, "pass": u.password}
-        if "@" in p:
-            cred, hostpart = p.rsplit("@", 1)
-            user, pwd = cred.split(":", 1)
-            host, port = hostpart.split(":", 1)
-            return {"host": host, "port": int(port), "user": user, "pass": pwd}
-        parts = p.split(":")
-        if len(parts) == 4:
-            return {"host": parts[0], "port": int(parts[1]),
-                    "user": parts[2], "pass": parts[3]}
+        t = _clean_proxy_token(proxy_str)
+        if not t:
+            return None
+        if "://" in t:
+            u = urlparse(t)
+            host = u.hostname or ""
+            port = u.port
+            if _host_ok(host) and port and 0 < int(port) < 65536:
+                return {"host": host, "port": int(port),
+                        "user": u.username, "pass": u.password,
+                        "masked": _looks_masked(host)}
+        user = pwd = None
+        hostpart = t
+        if "@" in t:
+            cred, hostpart = t.rsplit("@", 1)
+            if ":" in cred:
+                user, pwd = cred.split(":", 1)
+            else:
+                user = cred
+        parts = hostpart.split(":")
         if len(parts) == 2:
-            return {"host": parts[0], "port": int(parts[1]), "user": None, "pass": None}
+            host, port_s = parts
+        elif len(parts) == 3:
+            host, port_s, user3 = parts
+            user = user or user3
+        elif len(parts) >= 4:
+            host, port_s = parts[0], parts[1]
+            user = user or parts[2]
+            pwd = pwd or ":".join(parts[3:])
+        else:
+            return None
+        host = (host or "").strip()
+        if not _host_ok(host):
+            return None
+        try:
+            port = int(str(port_s).strip())
+        except Exception:
+            return None
+        if not (0 < port < 65536):
+            return None
+        return {"host": host, "port": port,
+                "user": (user.strip() or None) if user else None,
+                "pass": (pwd.strip() or None) if pwd else None,
+                "masked": _looks_masked(host)}
     except Exception:
-        pass
-    return None
+        return None
+
+
+def normalize_proxy_line(raw):
+    """One pasted line -> (canonical_line, masked) or (None, False).
+
+    The canonical shape is the ONE the rest of the app already reads:
+    `user:pass@host:port`, `user@host:port`, or `host:port`. Anything that does
+    not survive validation is None and is COUNTED by the caller - never guessed
+    at, never half-written.
+    """
+    t = _clean_proxy_token(raw)
+    if not t:
+        return None, False
+    toks = [x for x in re.split(r"[\s,;|]+", t) if x]
+    if not toks:
+        return None, False
+    head = toks[0]
+    # "host:port user pass" and "host:port user:pass" - the credentials are
+    # separate tokens. A token that already carries '@' or 4+ parts is whole.
+    if "@" not in head and len(head.split(":")) <= 2 and len(toks) >= 2:
+        if len(toks) == 2 and ":" in toks[1]:
+            head = f"{toks[1]}@{head}"
+        elif len(toks) >= 3:
+            head = f"{toks[1]}:{toks[2]}@{head}"
+    info = parse_proxy(head)
+    if not info:
+        return None, False
+    host, port = info["host"], int(info["port"])
+    user, pwd = info.get("user") or "", info.get("pass") or ""
+    if user and pwd:
+        return f"{user}:{pwd}@{host}:{port}", bool(info.get("masked"))
+    if user:
+        return f"{user}@{host}:{port}", bool(info.get("masked"))
+    return f"{host}:{port}", bool(info.get("masked"))
+
+
+# ==========================================================================
+# v13.78 WAVE 5d - THE TWO SOURCES
+# ==========================================================================
+def _src_path(kind) -> str:
+    return user_file(PROXY_SRC_SECRET if kind == "secret" else PROXY_SRC_CUSTOM)
+
+
+def _read_lines(path) -> list:
+    try:
+        with open(path, encoding="utf-8", errors="ignore") as f:
+            return [l.strip() for l in f if l.strip() and not l.strip().startswith("#")]
+    except Exception:
+        return []
+
+
+def _write_lines(path, lines):
+    """Atomic, under the file lock. An empty list still creates the file."""
+    _tmp = path + ".tmp"
+    with file_write_lock:
+        with open(_tmp, "w", encoding="utf-8") as f:
+            f.write("\n".join(str(x) for x in lines) + ("\n" if lines else ""))
+        os.replace(_tmp, path)
+
+
+def proxy_source_enabled(kind) -> bool:
+    """Both sources default ON. The switch is per user and reversible."""
+    try:
+        _us = _user_state()
+        return bool(_us.get("src_secret" if kind == "secret" else "src_custom", True))
+    except Exception:
+        return True
+
+
+def source_line_count(kind) -> int:
+    try:
+        return len(_read_lines(_src_path(kind)))
+    except Exception:
+        return 0
+
+
+def proxy_line_sources() -> dict:
+    """line -> set of the sources it appears in. Used for the Source column."""
+    m = {}
+    for kind in ("secret", "custom"):
+        for p in _read_lines(_src_path(kind)):
+            m.setdefault(p, set()).add(kind)
+    return m
+
+
+def source_label(line, mapping=None) -> str:
+    _m = mapping if mapping is not None else proxy_line_sources()
+    _s = _m.get(line) or set()
+    if not _s:
+        return "?"
+    return "+".join(k for k in ("secret", "custom") if k in _s)
+
+
+def rebuild_merged_proxies(reason="", quiet=True) -> dict:
+    """Rewrite proxies.txt from the ENABLED sources. Never deletes a source.
+
+    MIGRATION: if neither source file exists but proxies.txt does, every line in
+    proxies.txt becomes a provider line. That is the correct call - the only
+    lines that existed before this wave came from a fetch - and it means the
+    split lands on an existing pool without losing one node.
+    """
+    _us = _user_state()
+    _sec_p = _src_path("secret")
+    _cus_p = _src_path("custom")
+    _mrg_p = _proxy_path()
+    try:
+        if (not os.path.exists(_sec_p) and not os.path.exists(_cus_p)
+                and os.path.exists(_mrg_p)):
+            _old = _read_lines(_mrg_p)
+            if _old:
+                _write_lines(_sec_p, _old)
+                log_startup(f"proxy sources: migrated {len(_old)} existing line(s) into "
+                            f"{PROXY_SRC_SECRET} as provider lines.", quiet=quiet)
+        if not os.path.exists(_sec_p):
+            _seed = list(dict.fromkeys(OXYLABS_PROXIES))
+            _write_lines(_sec_p, _seed)
+            if _seed:
+                log_startup(f"proxy sources: seeded {len(_seed)} Oxylabs line(s) from "
+                            f"secrets.", quiet=quiet)
+        if not os.path.exists(_cus_p):
+            _write_lines(_cus_p, [])
+
+        _sec = _read_lines(_sec_p) if proxy_source_enabled("secret") else []
+        _cus = _read_lines(_cus_p) if proxy_source_enabled("custom") else []
+        _merged = list(dict.fromkeys(_sec + _cus))
+        _write_lines(_mrg_p, _merged)
+        _out = {"secret": len(_sec), "custom": len(_cus), "merged": len(_merged)}
+        log_startup(f"proxy sources rebuilt ({reason or 'manual'}): secret={_out['secret']}"
+                    f"{'' if proxy_source_enabled('secret') else ' (off)'} "
+                    f"custom={_out['custom']}"
+                    f"{'' if proxy_source_enabled('custom') else ' (off)'} "
+                    f"-> merged {_out['merged']}.", quiet=quiet)
+        return _out
+    except Exception as e:
+        log_startup(f"WARNING: proxy source rebuild failed: {e}", quiet=quiet)
+        return {"secret": 0, "custom": 0, "merged": 0}
+
+
+def import_custom_proxies(text):
+    """Accept ANY pasted shape. Returns (added, dropped, masked, dupes, samples).
+
+    Nothing is mangled: a line either normalises to a dialable address or it is
+    dropped and counted. The first five unreadable lines are returned so the UI
+    can show them instead of silently swallowing them.
+    """
+    _cus_p = _src_path("custom")
+    _existing = _read_lines(_cus_p)
+    _seen = set(_existing)
+    good, dropped, masked, dup, bad = [], 0, 0, 0, []
+    for raw in (text or "").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        canon, is_masked = normalize_proxy_line(line)
+        if not canon:
+            dropped += 1
+            if len(bad) < 5:
+                bad.append(line[:60])
+            continue
+        if canon in _seen:
+            dup += 1
+            continue
+        _seen.add(canon)
+        if is_masked:
+            masked += 1
+        good.append(canon)
+    if good:
+        _write_lines(_cus_p, list(dict.fromkeys(_existing + good)))
+        rebuild_merged_proxies("custom import")
+    return len(good), dropped, masked, dup, bad
+
+
+def _ensure_proxy_sources():
+    """One-time per session: make the three files exist and the merge correct."""
+    _us = _user_state()
+    if _us.get("src_init_done"):
+        return
+    _us["src_init_done"] = True
+    rebuild_merged_proxies("session init")
 
 
 # The restore now has load_proxies() AND parse_proxy() above it, so its
 # "only lines still in proxies.txt" filter is real.
 _load_proxy_meta_file()
+try:
+    _ensure_proxy_sources()
+except Exception as _pse:
+    log_startup(f"WARNING: proxy source split not initialised: {_pse}")
 
 
 # v13.64: BOTH OF THESE ARE CALLED FROM WORKER THREADS - quarantine_proxy() from
@@ -5737,10 +6053,21 @@ def proxy_is_blocked(proxy_str):
 
 
 def get_filtered_active_proxies(quiet: bool = False):
-    """The pool the engine is allowed to use.  NO silent fallback to the raw list."""
+    """The pool the engine is allowed to use.  NO silent fallback to the raw list.
+
+    v13.78 WAVE 5d: this reads proxies.txt, which is already the MERGE of the
+    enabled sources - so a switched-off source is simply absent here and nothing
+    in this function had to learn about the split. The empty-pool message says
+    which sources were on, because "0 candidates" with both switches off is not
+    a broken pool, it is an empty one on purpose.
+    """
     try:
         raw = load_proxies(quiet=quiet)
         if not raw:
+            log_startup("Proxy filter: proxies.txt is empty - secret source "
+                        f"{'ON' if proxy_source_enabled('secret') else 'OFF'}, custom "
+                        f"source {'ON' if proxy_source_enabled('custom') else 'OFF'}.",
+                        quiet=quiet)
             return []
         try:
             dedupe = bool(live_cfg().get("DEDUPE_PROXIES", DEDUPE_PROXIES_DEFAULT))
@@ -9228,6 +9555,14 @@ if _res_open:
 # @@END 079 STARTUP_PANEL_UI
 
 # @@BLOCK 080 PROXY_MGMT_UI deps=014,016,024,043,052,058,068,070,073,074,077
+# v13.78 WAVE 5d: the resource sweep in block 079 keeps proxies.txt but not the
+# two source files, so "Delete my cache files" would take the split with it. The
+# keep list is extended here, from the run AFTER this block first executes.
+try:
+    _RES_KEEP_SUFFIX = tuple(_RES_KEEP_SUFFIX) + (PROXY_SRC_SECRET, PROXY_SRC_CUSTOM)
+except Exception:
+    pass
+
 with str_lit.sidebar:
     str_lit.markdown("---")
     str_lit.markdown("### 🌐 Proxy Management & Health")
@@ -9242,10 +9577,90 @@ with str_lit.sidebar:
         _lvl, _msg = _flash
         getattr(str_lit, _lvl, str_lit.info)(_msg)
 
+    # ---- v13.78 WAVE 5d helpers ------------------------------------------
+    def _on_src_toggle():
+        """A source switch moved: rewrite the merge, keep both files."""
+        _us = _user_state()
+        _us["src_secret"] = bool(str_lit.session_state.get("src_secret_chk", True))
+        _us["src_custom"] = bool(str_lit.session_state.get("src_custom_chk", True))
+        _r = rebuild_merged_proxies("source switch")
+        clear_tunnel_cache()
+        str_lit.session_state["_proxy_flash"] = (
+            "success",
+            f"Sources rebuilt - secret {'ON' if _us['src_secret'] else 'OFF'}, custom "
+            f"{'ON' if _us['src_custom'] else 'OFF'} -> {_r.get('merged', 0)} line(s) "
+            f"in the pool. Nothing was deleted.")
+
+    def _on_import_custom():
+        """Paste -> normalise -> custom file -> merge. Counts, never guesses."""
+        _txt = str_lit.session_state.get("custom_proxy_box") or ""
+        if not _txt.strip():
+            str_lit.session_state["_proxy_flash"] = ("warning", "Nothing pasted.")
+            return
+        _add, _drop, _msk, _dup, _bad = import_custom_proxies(_txt)
+        clear_tunnel_cache()
+        _m = (f"Imported **{_add}** line(s) into the custom list. Dropped **{_drop}**, "
+              f"duplicates {_dup}, masked {_msk} (kept, but they cannot resolve).")
+        if _bad:
+            _m += " Unreadable: " + " | ".join(_bad)
+        str_lit.session_state["_proxy_flash"] = ("success" if _add else "warning", _m)
+        str_lit.session_state["custom_proxy_box"] = ""
+
+    def _reprobe_source(kind):
+        """Probe ONE source, prune THAT source to the survivors. The other is untouched.
+
+        A timeout keeps the lines it never reached - the pass/fail of an unprobed
+        line is unknown, not negative.
+        """
+        _lines = [p for p in load_proxies() if kind in proxy_line_sources().get(p, set())]
+        if not _lines:
+            str_lit.session_state["_proxy_flash"] = ("warning", f"The {kind} list is empty.")
+            return
+        clear_tunnel_cache()
+        _budget = max(45.0, min(PROBE_BATCH_MAX, len(_lines) * 4.0))
+        with str_lit.spinner(f"Re-probing {len(_lines)} {kind} line(s)..."):
+            _got, _to = _run_batch(precheck_proxy_fast, _lines, probe_workers(), _budget)
+        _keep = list(dict.fromkeys(_got))
+        if _to:
+            with probe_stats_lock:
+                _probed = set(probe_stats)
+            _keep = list(dict.fromkeys(_keep + [p for p in _lines if p not in _probed]))
+        _keeps = set(_keep)
+        _pruned = [p for p in _lines if p not in _keeps]
+        if _keep:
+            _write_lines(_src_path(kind), _keep)
+        rebuild_merged_proxies(f"{kind} re-probe")
+        with alive_pool_lock:
+            _now = (set(alive_pool) - set(_pruned)) | _keeps
+            alive_pool[:] = [p for p in load_proxies() if p in _now]
+        str_lit.session_state["_proxy_flash"] = (
+            "success",
+            f"{kind} re-probe: {len(_keep)} kept, {len(_pruned)} removed from that list"
+            + (" - budget spent, unprobed lines were kept." if _to else "."))
+
+    def _on_clear_source(kind):
+        _n = source_line_count(kind)
+        _write_lines(_src_path(kind), [])
+        rebuild_merged_proxies(f"{kind} cleared")
+        clear_tunnel_cache()
+        str_lit.session_state["_proxy_flash"] = (
+            "success", f"Cleared {_n} {kind} line(s). The other list is untouched.")
+
+    def _capture_secret_from_merged():
+        """A completed fetch wrote proxies.txt - fold exactly those lines into the
+        secret source, and only those, so pasted lines are not relabelled."""
+        _km = _US.get("proxy_key_map") or {}
+        _fetched = [p for p in load_proxies() if p in _km]
+        _write_lines(_src_path("secret"), _fetched)
+        rebuild_merged_proxies("fetch capture")
+        return len(_fetched)
+
     if (not all_proxies) and WEBSHARE_KEYS and not _US.get("bootstrap_done"):
         with str_lit.spinner("First run - fetching and validating your proxy pool..."):
             try:
                 _boot_n, _boot_total = fetch_and_test_all_proxies(silent=True)
+                if _boot_n:
+                    _capture_secret_from_merged()
             except Exception as _be:
                 _boot_n = 0
                 log_startup(f"WARNING: auto-bootstrap failed: {_be}")
@@ -9337,9 +9752,15 @@ with str_lit.sidebar:
     # a load that HAS something to say ended up with the flash, then this box, then
     # the pool warnings. Under a pending press it is a caption like everything else
     # in this block.
+    # v13.78: the source counts are here too, because "Loaded 0" with a source
+    # switched off is the one number people will read wrong.
     (str_lit.caption if _steal else str_lit.info)(
         f"Loaded Proxies: **{len(all_proxies)}** lines / **{len(_ips)}** IPs / "
         f"**{len(_subs)}** sub-users / **{len(WEBSHARE_KEYS)}** keys | "
+        f"Sources: secret **{source_line_count('secret')}**"
+        f"{'' if proxy_source_enabled('secret') else ' (off)'} · custom "
+        f"**{source_line_count('custom')}**"
+        f"{'' if proxy_source_enabled('custom') else ' (off)'} | "
         f"Filtered: **{len(filtered_pool)}** | Alive: **{_alive_now}**")
 
     if all_proxies and not filtered_pool:
@@ -9531,7 +9952,8 @@ with str_lit.sidebar:
     with _rc3:
         if str_lit.button("↩️ Restore from proxies_all.txt", width="stretch",
                           help="Fetch & Test writes only the SURVIVORS into proxies.txt. "
-                               "This puts the full raw fetched pool back."):
+                               "This puts the full raw fetched pool back, into the "
+                               "provider list."):
             try:
                 _allp = CFG.get("PROXY_ALL_FILE") or "proxies_all.txt"
                 if os.path.exists(_allp):
@@ -9539,15 +9961,17 @@ with str_lit.sidebar:
                         _restore = [l.strip() for l in _rf
                                     if l.strip() and not l.strip().startswith("#")]
                     if _restore:
-                        with file_write_lock:
-                            with open(CFG["PROXY_FILE"], "w", encoding="utf-8") as _wf:
-                                _wf.write("\n".join(_restore) + "\n")
+                        # v13.78: proxies_all.txt is the raw FETCHED pool, so it is a
+                        # provider list. It goes to the secret source and the merge
+                        # is rebuilt, instead of overwriting the working file.
+                        _write_lines(_src_path("secret"), list(dict.fromkeys(_restore)))
+                        rebuild_merged_proxies("restore from proxies_all.txt")
                         clear_tunnel_cache()
-                        log_startup(f"proxies.txt restored from proxies_all.txt "
+                        log_startup(f"provider list restored from proxies_all.txt "
                                     f"({len(_restore)} line(s)).")
                         str_lit.session_state["_proxy_flash"] = (
                             "success",
-                            f"Restored {len(_restore)} line(s) from proxies_all.txt.")
+                            f"Restored {len(_restore)} line(s) into the provider list.")
                         str_lit.rerun()
                     else:
                         str_lit.session_state["_proxy_flash"] = (
@@ -9560,26 +9984,66 @@ with str_lit.sidebar:
             except Exception as _rex:
                 str_lit.error(f"Restore failed: {_rex}")
 
+    # ======================================================================
+    # v13.78 WAVE 5d - THE TWO SOURCES
+    # ======================================================================
+    with str_lit.expander("🗂 Proxy Sources (two lists, both on by default)", expanded=False):
+        str_lit.caption(
+            "The pool is the merge of these two lists. Switching one off removes its "
+            "lines from the pool but does NOT delete them, so it is always reversible. "
+            "proxies.txt stays the single file the probe, the filter and the engine read.")
+        for _k, _kind in (("src_secret_chk", "secret"), ("src_custom_chk", "custom")):
+            if _k not in str_lit.session_state:
+                str_lit.session_state[_k] = bool(
+                    _user_state().get("src_" + _kind, True))
+        str_lit.checkbox(f"Use the provider list ({PROXY_SRC_SECRET})", key="src_secret_chk",
+                         on_change=_on_src_toggle,
+                         help="Webshare keys and Oxylabs secrets. Written by a fetch and "
+                              "by Restore, never by hand.")
+        str_lit.caption(f"**{source_line_count('secret')}** line(s) in the provider list.")
+        str_lit.checkbox(f"Use my pasted list ({PROXY_SRC_CUSTOM})", key="src_custom_chk",
+                         on_change=_on_src_toggle,
+                         help="Whatever you imported below, normalised. Yours to clear.")
+        str_lit.caption(f"**{source_line_count('custom')}** line(s) in my pasted list.")
+
+        _ss1, _ss2 = str_lit.columns(2)
+        with _ss1:
+            if str_lit.button("🔁 Re-probe provider list", width="stretch",
+                              on_click=_reprobe_source, args=("secret",),
+                              help="Probes only these lines and keeps only the ones that "
+                                   "answer. The pasted list is not touched."):
+                pass
+        with _ss2:
+            if str_lit.button("🔁 Re-probe my list", width="stretch",
+                              on_click=_reprobe_source, args=("custom",),
+                              help="Probes only these lines and keeps only the ones that "
+                                   "answer. The provider list is not touched."):
+                pass
+        _sc1, _sc2 = str_lit.columns(2)
+        with _sc1:
+            if str_lit.button("🧽 Clear provider list", width="stretch",
+                              on_click=_on_clear_source, args=("secret",)):
+                pass
+        with _sc2:
+            if str_lit.button("🧽 Clear my list", width="stretch",
+                              on_click=_on_clear_source, args=("custom",)):
+                pass
+        str_lit.caption("Clearing is instant and does not re-probe. A fetch refills the "
+                        "provider list.")
+
     with str_lit.expander("➕ Add Custom Proxies", expanded=False):
-        custom_proxy_text = str_lit.text_area(
-            "Paste proxies (host:port or user:pass@host:port)",
-            placeholder="123.45.67.89:8080", height=100)
-        if str_lit.button("Save Custom Proxies"):
-            if custom_proxy_text.strip():
-                try:
-                    new_proxies = [l.strip() for l in custom_proxy_text.splitlines()
-                                   if l.strip() and not l.strip().startswith("#")]
-                    combined = list(dict.fromkeys(load_proxies() + new_proxies))
-                    with file_write_lock:
-                        with open(CFG["PROXY_FILE"], "w", encoding="utf-8") as f:
-                            f.write("\n".join(combined) + "\n")
-                    clear_tunnel_cache()
-                    log_startup(f"Added {len(new_proxies)} custom proxies successfully.")
-                    str_lit.session_state["_proxy_flash"] = (
-                        "success", f"Added {len(new_proxies)} custom proxies successfully!")
-                    str_lit.rerun()
-                except Exception as ex:
-                    str_lit.error(f"Error saving custom proxies: {ex}")
+        str_lit.caption(
+            "Paste anything. `host:port`, `host:port:user:pass`, `user:pass@host:port`, "
+            "`socks5://user:pass@host:port`, or a whole provider page with bullets, "
+            "numbering, `Proxy:` / `Sock5` labels and blank lines. A hyphen in a user or "
+            "a password is kept exactly as typed. Every line is rewritten in one shape; "
+            "what cannot be read is dropped and counted, never guessed at.")
+        str_lit.text_area(
+            "Paste proxies", placeholder="1.2.3.4:8080:user-name:pa-ss-word\n"
+                                         "Sock5 5.6.7.8:1080:other-user:other-pass",
+            height=150, key="custom_proxy_box")
+        str_lit.button("⬆️ Import into my pasted list", width="stretch",
+                       on_click=_on_import_custom)
 
     # FIX PERF-7: the blocking st.spinner is gone - block 077 now drives its own
     # progress bar in 24-line chunks, so the sidebar keeps painting instead of
@@ -9588,6 +10052,9 @@ with str_lit.sidebar:
         str_lit.caption("Phase 1 validates at burst width, then phase 2 confirms only "
                         "the ambiguous answers. Both bars move.")
         _n_alive, _n_total = fetch_and_test_all_proxies()
+        if _n_alive:
+            _n_sec = _capture_secret_from_merged()
+            log_startup(f"Fetch survivors folded into the provider list ({_n_sec} line(s)).")
         _msr = STATE.get("mail_spot") or {}
         if _msr.get("user") and _msr.get("user") != _gate_scope():
             _msr = {}
@@ -9626,6 +10093,8 @@ with str_lit.sidebar:
             _file_keys = set(all_proxies)
         except Exception:
             _file_keys = set()
+        # v13.78: which list each line came from, read once for the Source column.
+        _srcmap = proxy_line_sources()
         _meta_snap = dict(_meta_all)
         _hidden_snap = {}
         if _file_keys:
@@ -9755,6 +10224,7 @@ with str_lit.sidebar:
                 _lat = _ps.get("latency_ms", meta.get("latency_ms", 0))
                 rows.append({
                     "Key #": _key_label(_key_of(p_str)),
+                    "Source": source_label(p_str, _srcmap),
                     "Key": (info.get("user") if info else "") or "",
                     "Proxy": f"{info['host']}:{info['port']}" if info else "Unknown",
                     "Latency": f"{_lat} ms",
@@ -9829,6 +10299,7 @@ with str_lit.sidebar:
                     _hr = (_pstats.get(_hk) or {}).get("reason") or "not probed"
                     _rows_h.append({
                         "Key #": _key_label(_key_of(_hk)),
+                        "Source": source_label(_hk, _srcmap),
                         "Key": (_hi.get("user") if _hi else "") or "",
                         "Proxy": f"{_hi['host']}:{_hi['port']}" if _hi else "?",
                         "Verdict": _PROBE_REASON_LABEL.get(_hr, _hr),
@@ -9876,6 +10347,7 @@ with str_lit.sidebar:
                     _dr = (_pstats.get(_d) or {}).get("reason") or "not probed"
                     _rows_d.append({
                         "Key #": _key_label(_key_of(_d)),
+                        "Source": source_label(_d, _srcmap),
                         "Key": (_di.get("user") if _di else "") or "",
                         "Proxy": f"{_di['host']}:{_di['port']}" if _di else "?",
                         "Verdict": _PROBE_REASON_LABEL.get(_dr, _dr),
