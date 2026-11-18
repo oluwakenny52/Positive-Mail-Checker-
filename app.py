@@ -9578,6 +9578,13 @@ with str_lit.sidebar:
     str_lit.markdown("---")
     str_lit.markdown("### 🌐 Proxy Management & Health")
 
+    # v13.80 WAVE 8: the watchdog. Optional - every call site guards it, so a
+    # deployment without sentinel.py behaves exactly as before.
+    try:
+        import sentinel as _sentinel
+    except Exception:
+        _sentinel = None
+
     # FIX FLASH-1 (v13.49): every branch below ended in success()/warning() and
     # then str_lit.rerun(), and a rerun destroys the delta the message was drawn
     # into - so "N node(s) validated", "Pool re-probed" and "Restored N line(s)"
@@ -9616,6 +9623,16 @@ with str_lit.sidebar:
             _m += " Unreadable: " + " | ".join(_bad)
         str_lit.session_state["_proxy_flash"] = ("success" if _add else "warning", _m)
         str_lit.session_state["custom_proxy_box"] = ""
+        # v13.80: an import that added nothing is worth a bell - it means the
+        # paste was not a proxy list at all, which the screen says once and the
+        # bell says until it is read.
+        if _sentinel is not None:
+            _sentinel.expect(
+                "import", "Pasted proxy import added nothing",
+                "The paste produced no dialable line. Check it really is a proxy "
+                "list and that the host:port part is present.", severity="warn")
+            if _add:
+                _sentinel.satisfy("import")
 
     def _reprobe_source(kind):
         """Probe ONE source, prune THAT source to the survivors. The other is untouched.
@@ -9627,6 +9644,12 @@ with str_lit.sidebar:
         if not _lines:
             str_lit.session_state["_proxy_flash"] = ("warning", f"The {kind} list is empty.")
             return
+        if _sentinel is not None:
+            _sentinel.expect(f"reprobe:{kind}",
+                             f"The {kind} re-probe kept no node",
+                             "Every line in that list failed the tunnel probe and was "
+                             "removed from it. Fetch again, or import a fresh list.",
+                             severity="warn")
         clear_tunnel_cache()
         _budget = max(45.0, min(PROBE_BATCH_MAX, len(_lines) * 4.0))
         with str_lit.spinner(f"Re-probing {len(_lines)} {kind} line(s)..."):
@@ -9640,6 +9663,8 @@ with str_lit.sidebar:
         _pruned = [p for p in _lines if p not in _keeps]
         if _keep:
             _write_lines(_src_path(kind), _keep)
+            if _sentinel is not None:
+                _sentinel.satisfy(f"reprobe:{kind}", f"{len(_keep)} kept")
         rebuild_merged_proxies(f"{kind} re-probe")
         with alive_pool_lock:
             _now = (set(alive_pool) - set(_pruned)) | _keeps
@@ -9980,6 +10005,8 @@ with str_lit.sidebar:
                         clear_tunnel_cache()
                         log_startup(f"provider list restored from proxies_all.txt "
                                     f"({len(_restore)} line(s)).")
+                        if _sentinel is not None:
+                            _sentinel.satisfy("restore", f"{len(_restore)} line(s)")
                         str_lit.session_state["_proxy_flash"] = (
                             "success",
                             f"Restored {len(_restore)} line(s) into the provider list.")
@@ -10062,10 +10089,19 @@ with str_lit.sidebar:
     if str_lit.button("📥 Fetch & Test All Proxies"):
         str_lit.caption("Phase 1 validates at burst width, then phase 2 confirms only "
                         "the ambiguous answers. Both bars move.")
+        # v13.80 WAVE 8: armed BEFORE the work, satisfied only by a real survivor.
+        if _sentinel is not None:
+            _sentinel.expect(
+                "fetch", "Fetch & Test produced no node",
+                "Every fetched line failed validation, so the pool is unchanged and "
+                "the run will go DIRECT. Check WEBSHARE_KEYS in secrets, then press "
+                "Fetch & Test again.", severity="warn")
         _n_alive, _n_total = fetch_and_test_all_proxies()
         if _n_alive:
             _n_sec = _capture_secret_from_merged()
             log_startup(f"Fetch survivors folded into the provider list ({_n_sec} line(s)).")
+            if _sentinel is not None:
+                _sentinel.satisfy("fetch", f"{_n_alive} node(s)")
         _msr = STATE.get("mail_spot") or {}
         if _msr.get("user") and _msr.get("user") != _gate_scope():
             _msr = {}
@@ -14091,6 +14127,18 @@ def _check_account_core(email, password, conf, domain, proxy_pool, thread_state,
 section_title("🚀", "Execute Live Checking Engine",
               "proxy-backed, post-auth verified, resumable")
 
+# v13.80 WAVE 8: THE SWEEP LIVES HERE because this block is module level and runs
+# on EVERY load of the app - which is exactly the cadence a "did it deliver"
+# watchdog needs. Anything armed by the last load and not satisfied by the time
+# this one starts is reported to the bell as kind="watch". It fires once per
+# window, so a rerun loop cannot turn one dead fetch into fifty notifications.
+try:
+    import sentinel as _sentinel
+except Exception:
+    _sentinel = None
+if _sentinel is not None:
+    _sentinel.sweep()
+
 RESULT_ACTION_MODES = BUCKETS
 ACTION_OPTIONS = list(PREFILTER_LABELS) + [label for label, _ in BUCKETS]
 
@@ -14245,6 +14293,16 @@ if stop_engine_btn and STATE.get("run_active"):
 if start_engine_btn:
     clear_proxy_quarantine()
     log_probe_event("run start: 407 quarantine cleared")
+    # v13.80 WAVE 8: armed here, satisfied by block 106 when a single result
+    # lands. A run that checks accounts and buckets nothing is the failure mode
+    # that reads as success on screen - 0 valid, 0 wrong, 0 everything - and it
+    # is worth a bell because nobody is watching by then.
+    if _sentinel is not None:
+        _sentinel.expect(
+            "run", "The run finished without producing a single result",
+            "Every account ended in an empty bucket. Check the proxy pool, then set "
+            "Proxy Mode Engine = off (DIRECT) and re-run a few accounts by hand before "
+            "trusting the queue.", severity="warn")
     progress_bar = str_lit.progress(0, text=f"Initializing checking engine "
                                             f"for [{engine_action_mode}]...")
     status_text = str_lit.empty()
@@ -15151,6 +15209,20 @@ if start_engine_btn:
             # FIX SURVIVE-1 (v13.67): flush and close THIS run's bucket handles
             # before anything else can touch those files.
             live_journal_close(_journal_scope)
+            # v13.80 WAVE 8: the run delivered something, so the watchdog stands
+            # down. Checked over the buckets rather than over checked_count,
+            # because a run that checks everything and buckets nothing is the
+            # case being watched for. Guarded - a bell must never fail a run.
+            try:
+                import sentinel as _s8
+                if any(str_lit.session_state.get(_k) for _k in
+                       ("valid_results", "wrong_results", "need_app_results",
+                        "login_drop_results", "conn_results", "proxy_results",
+                        "retry_results", "rbl_results", "smtp_results", "dns_results",
+                        "skip_results", "unknown_results")):
+                    _s8.satisfy("run", f"{checked_count} checked")
+            except Exception:
+                pass
             # Restore the slider's own values so the sidebar does not report
             # unapplied settings after a run that used the tail caps.
             if _orig_deadline is not None:
@@ -15317,6 +15389,18 @@ if start_engine_btn:
             zip_output_name = f"{_cache_owner() or 'anon'}_mail_results_{stamp}.zip"
             import io as _io
             _zbuf = _io.BytesIO()
+            # v13.80 WAVE 8: armed before the build, satisfied by real bytes. A
+            # ZIP that fails to build is the one artefact failure that leaves the
+            # screen looking finished while nothing is downloadable.
+            _s9 = None
+            try:
+                import sentinel as _s9
+                _s9.expect("zip", "The results archive built no bytes",
+                           "The export failed, so there is nothing to download. Free "
+                           "some disk space, then export again from the summary.",
+                           severity="warn")
+            except Exception:
+                _s9 = None
             with zipfile.ZipFile(_zbuf, "w", zipfile.ZIP_DEFLATED) as z:
                 # v13.51: written from the in-memory snapshot, not re-read from the
                 # growing on-disk merge file.
@@ -15359,6 +15443,11 @@ if start_engine_btn:
                     except Exception as _kwe:
                         log_probe_event(f"keyword bodies not added to the ZIP: {_kwe}")
             zip_bytes_data = _zbuf.getvalue()
+            if _s9 is not None and zip_bytes_data:
+                try:
+                    _s9.satisfy("zip", f"{len(zip_bytes_data)} bytes")
+                except Exception:
+                    pass
 
             # v13.51: tell the screen the write finished, because block 108's
             # render is what the page sits on for the next while.
