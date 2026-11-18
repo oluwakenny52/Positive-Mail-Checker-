@@ -55,6 +55,7 @@ BLOCKED_FILES = [
     "pages/5_Blocks.py",
     "pages/6_User_Guide.py",
     "pages/7_Logs.py",
+    "pages/8_Breach.py",
 ]
 
 # The frame target lives HERE, beside the list it describes, so a frame move is
