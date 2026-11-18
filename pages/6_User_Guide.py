@@ -1,8 +1,8 @@
 # @@FILE pages/6_User_Guide.py blocks=17 version=v13.76
 # @@BLOCK 000 FILE_HEADER deps=-
 """
-pages/6_User_Guide.py - User Guide  (v13.48)
-============================================
+pages/6_User_Guide.py - User Guide
+==================================
 Everything the app can do, in one read-only page: every sidebar control, every
 button, every verdict the engine can return, every other page, and what each one
 is FOR - so a first-time user knows what a thing does before pressing it.
@@ -24,9 +24,11 @@ Streamlit, which routes it through st.help -> ast.parse and can raise
 IndentationError on the enclosing `try:` - and it dumps a help panel onto the
 page. The reload is what makes a module cached from before a redeploy safe.
 
-BUILD_TAG / CFG_VERSION mirror app.py block 008 exactly. verify_v1337.py derives
-both from app.py's @@FILE header and fails if this page disagrees, so the parity
-is a check now, not a comment.
+BUILD_TAG / CFG_VERSION mirror app.py block 008 exactly, and app.py block 008
+mirrors app.py line 1. That line is the ONLY place a build number is typed by
+hand; verify_v1337.py parses it and fails if this page disagrees, so the parity
+is a check now, not a comment. Nothing on this page types a version - block 005
+and block 016 read BUILD_TAG.
 """
 
 import os
