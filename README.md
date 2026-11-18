@@ -82,10 +82,11 @@ header is line 1, so it has no usable shebang.
 `auth.py` gates every page. First visit: choose a passphrase (optionally
 "Remember on this device", which writes a salted hash to `passkey.json`). Every
 per-user file - results directory, clean-valid list, last account, session
-cache, export presets, the results ZIP, the resume record, the proxy pool, the
-proxy metadata, the domain cache, the probe key map, the theme and the applied
-settings - is prefixed with the unlocked hash, so two people on one deployment
-stay separate. It is a lock, not encryption.
+cache, export presets, the results ZIP, the resume record, the proxy pool and
+its two source lists, the proxy metadata, the domain cache, the probe key map,
+the classifier's day budget, the theme and the applied settings - is prefixed
+with the unlocked hash, so two people on one deployment stay separate. It is a
+lock, not encryption.
 
 "Remember on this device" is a convenience for a private phone. On a shared
 deployment, "Forget this passkey" removes only the key you are signed in with;
@@ -103,11 +104,12 @@ they are not free:
   sessions fetching at once can race the write; the content is the same either
   way.
 
-`proxies.txt`, `proxies_all.txt`, `proxy_meta.json`, `proxy_key_map.json`,
-`domain_cache.json`, `theme.json` and `settings.json` are all per-user. So is
-every `ui_*` / `chk_*` value: they are written to `settings.json` on Apply
-Settings and re-read before the sidebar is built, so a refresh, a tab close or a
-redeploy restores the owner's own panel instead of the factory defaults.
+`proxies.txt`, the two proxy source lists, `proxies_all.txt`, `proxy_meta.json`,
+`proxy_key_map.json`, `domain_cache.json`, `ai_usage.json`, `theme.json` and
+`settings.json` are all per-user. So is every `ui_*` / `chk_*` value: they are
+written to `settings.json` on Apply Settings and re-read before the sidebar is
+built, so a refresh, a tab close or a redeploy restores the owner's own panel
+instead of the factory defaults.
 
 `theme.json` is NOT committed. It is a runtime file, created from
 `default_theme()` on a user's first load, so a fresh clone can never ship a
@@ -116,6 +118,12 @@ stale hero title or a stale build number.
 `STATE["cfg"]` is still a process value, and block 105 pins a per-task snapshot
 over it for workers, so a running check does not start following another
 session's settings mid-account.
+
+Two more things are process-wide rather than per-user, and both belong to the
+classifier: its per-run call counter and its text cache live in module memory,
+so a probe one session spends is charged to whichever run is live. Its DAY
+budget is the per-user file above, so the allowance itself cannot be eaten by
+somebody else.
 
 The identity is always DERIVED from `auth.user_file("")`, never from a second
 source. That matters: `pages/7_Logs.py` used to probe with `auth._anon_id()`,
@@ -128,12 +136,14 @@ Display Fit (font size / content scale) is in every page's sidebar via
 before creating the widgets, and a second call in the same run raises
 `StreamlitWidgetAlreadyInstantiatedError` inside its own `try/except`.
 
-Every page guards the import with `hasattr(auth, "fit_panel")` +
+Pages guard the import with `hasattr(auth, "fit_panel")` +
 `importlib.reload(auth)`, never a bare `auth.fit_panel` expression inside a
 `try:`. The bare form is intercepted by Streamlit's magic-write, which routes it
 through `st.help` -> `ast.parse` and can raise `IndentationError` on the
 enclosing `try:`; the reload is what makes a module cached from before a redeploy
-safe.
+safe. `pages/2_Diagnostics.py` is the one page without that guard - it calls
+`import auth` plain, so a stale cached module surfaces there as an
+`AttributeError` on `fit_panel` instead of a reload.
 
 ## Layout
 
@@ -142,7 +152,8 @@ safe.
 | `app.py` | UI shell + run loop |
 | `auth.py` | passphrase gate, per-user paths, Display Fit |
 | `engine.py` | headless verification engine |
-| `status.py` | canonical verdict taxonomy + classifier (13 blocks) |
+| `status.py` | canonical verdict taxonomy + error classifier |
+| `aiassist.py` | UNKNOWN-tail classifier of last resort (plain module) |
 | `hosts.py` | host discovery, family priority, ranking |
 | `ms_oauth.py` | Microsoft XOAUTH2 (personal accounts) |
 | `audit_log.py` | per-user action & outcome ledger (plain module) |
@@ -152,13 +163,15 @@ safe.
 | `mailsort.py` | group / sort / zip a row set (plain module) |
 | `runstate.py` | unfinished-run watchdog (plain module) |
 | `sentinel.py` | expect / satisfy / sweep delivery watchdog (plain module) |
+| `breach.py` | keyless breach lookup, freshness bands (plain module) |
 | `pages/1_Notifications.py` | the bell: filterable notification history |
-| `pages/2_Diagnostics.py` | read-only rung/DNS/proxy inspection |
+| `pages/2_Diagnostics.py` | rung / DNS / proxy inspection, plus a live AI-probe tab |
 | `pages/3_Mailbox_Reader.py` | inbox reader, OTP/card scanner |
 | `pages/4_Downloads.py` | export studio, Mail Sorter |
 | `pages/5_Blocks.py` | frame inspector |
 | `pages/6_User_Guide.py` | end-user manual: every control, button, verdict and page |
 | `pages/7_Logs.py` | full log & operator trace (read-only) |
+| `pages/8_Breach.py` | breach exposure for a list of addresses |
 
 `tier2_split.py` is staged but NOT applied - `engine.py` is currently a separate
 hand-written engine that `app.py` does not import.
@@ -169,6 +182,9 @@ runtime code. `NOTES.md` is the resume note and `CHANGELOG.md` is the history.
 
 ## Deploy
 
-Streamlit secrets: `WEBSHARE_KEYS`, `OXYLABS_BASE` (see
-`.streamlit/secrets.toml.example`). Runtime target is Python 3.14; the pins in
-`requirements.txt` are the versions the deploy proved resolve.
+Streamlit secrets: `WEBSHARE_KEYS`, `OXYLABS_BASE`, and optionally
+`GEMINI_ENABLED` (the string `true`), `GEMINI_API_KEY` and `GEMINI_MODEL` for the
+unknown-tail classifier - see `.streamlit/secrets.toml.example`. Leave the
+GEMINI lines out and the classifier stays off; nothing else changes. Runtime
+target is Python 3.14; the pins in `requirements.txt` are the versions the
+deploy proved resolve.
