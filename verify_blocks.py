@@ -64,9 +64,10 @@ BLOCKED_FILES = [
 #
 # tier2_split.py REWRITES app.py and OVERWRITES engine.py - it deletes no file -
 # so TARGET_FILES only moves when a FILE is added or removed.  v13.70 added
-# pages/1_Notifications.py: files 13 -> 14, and blocks move by that page's own
-# block count.  tier2_split.py prints the new line for you and records it in
-# TIER2_MANIFEST.txt; paste it here.
+# pages/1_Notifications.py (files 13 -> 14) and v13.76 added pages/8_Breach.py
+# (files 14 -> 15, blocks 294 -> 306); blocks move by the added file's own block
+# count, never by hand.  tier2_split.py prints the new line for you and records
+# it in TIER2_MANIFEST.txt; paste it here.
 #
 # v13.77 added pages/8_Breach.py: files 14 -> 15, blocks 294 -> 306 (its own
 # frame is 12).  Both numbers move together, as above - a file that is gated but
