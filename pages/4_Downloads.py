@@ -894,8 +894,9 @@ st.download_button(
 
 
 # @@BLOCK 013 TABS deps=012
-tab_txt, tab_csv, tab_json, tab_zip, tab_break = st.tabs(
-    ["Text / template", "CSV", "JSON", "ZIP (all formats)", "Per-status split"]
+tab_txt, tab_csv, tab_json, tab_zip, tab_break, tab_sort = st.tabs(
+    ["Text / template", "CSV", "JSON", "ZIP (all formats)", "Per-status split",
+     "Mail Sorter"]
 )
 
 with tab_txt:
@@ -961,10 +962,128 @@ with tab_break:
         with st.expander(f"{tag} — {len(by[tag])} row(s)"):
             body = "\n".join(r["line"] for r in by[tag])
             st.download_button(f"⬇️ {tag}.txt", data=body.encode("utf-8"),
-                               file_name=f"{tag}_{len(by[tag])}.txt",
+                               file_name=f"{TAG_FILE_SAFE(tag)}_{len(by[tag])}.txt",
                                mime="text/plain", key=f"dl_{tag}")
             with st.container(height=320):
                 st.code(body, language="text")
+
+# --------------------------------------------------------------------------
+# v13.79 WAVE 7 - MAIL SORTER
+#
+# WHY A TAB AND NOT A NEW BLOCK: the frame is 16 blocks and verify_blocks.py
+# pins the header count, so a new block id would mean a renumber, a header edit
+# and a TARGET_BLOCKS bump - three chances to break a gate on a phone. A tab is
+# a panel, the file stays 16 blocks, and mailsort.py is a plain module like
+# runstate.py so nothing has to be registered anywhere.
+#
+# WHAT IT DOES THAT "Per-status split" DOES NOT: status is one fixed key. This
+# groups by anything in the row - domain, TLD, host, keyword, folder, length
+# band, first letter, source - with a stated order, and it can also just sort
+# one flat file by email. Every group gets its own button and the whole set gets
+# one archive.
+#
+# THE GROUPING IS CACHED ON A SIGNATURE, not recomputed per rerun: this tab body
+# runs on every keystroke anywhere on the page, and grouping 200k rows for
+# nothing is exactly the per-rerun cost this page has already been bitten by.
+# --------------------------------------------------------------------------
+with tab_sort:
+    try:
+        import mailsort
+    except Exception as _ms_err:
+        mailsort = None
+        st.caption(f"mailsort.py is missing from this deployment: {_ms_err}")
+
+    if mailsort is None:
+        st.info("The sorter needs mailsort.py next to this page.")
+    elif not sel:
+        st.info("Nothing to sort yet - pick a source above.")
+    else:
+        st.caption("Sorts what is ALREADY selected above into named groups. It writes "
+                   "nothing on its own: every group has its own button, and the whole "
+                   "set has one archive. Grouping by 'None' simply sorts one flat file "
+                   "by email, which is the useful thing when you only want order.")
+
+        for _k, _v in (("ex_sort_by", mailsort.KEY_LABELS[0]),
+                       ("ex_sort_order", mailsort.ORDERS[0]),
+                       ("ex_sort_cap", mailsort.CAP_DEFAULT),
+                       ("ex_sort_dedupe", True)):
+            if _k not in st.session_state:
+                st.session_state[_k] = _v
+
+        _sc1, _sc2 = st.columns(2)
+        with _sc1:
+            _by = st.selectbox("Group by", mailsort.KEY_LABELS, key="ex_sort_by")
+            _order = st.selectbox("Order", mailsort.ORDERS, key="ex_sort_order")
+        with _sc2:
+            _cap = st.number_input("Most rows per group", min_value=1, max_value=200_000,
+                                   step=500, key="ex_sort_cap")
+            _dedupe = st.toggle("Dedupe by email inside a group", key="ex_sort_dedupe")
+
+        st.caption(mailsort.describe(_by))
+
+        # Signature: the row set is identified by its size and its two ends, which
+        # is cheap and stable. fname is deliberately NOT in it - it carries a
+        # seconds-resolution stamp and would invalidate the cache every second.
+        _sort_sig = (len(sel), _by, _order, int(_cap), bool(_dedupe),
+                     sel[0]["email"] if sel else "", sel[-1]["email"] if sel else "")
+        if st.session_state.get("_ex_sort_sig") != _sort_sig:
+            st.session_state["_ex_sort_sig"] = _sort_sig
+            st.session_state["_ex_sort_groups"] = mailsort.group_rows(
+                sel, _by, order=_order, dedupe=_dedupe, cap=int(_cap))
+            st.session_state.pop("_ex_sort_zip", None)
+
+        _groups, _dropped = st.session_state.get("_ex_sort_groups") or ([], 0)
+        _ngroups, _nrows = mailsort.totals(_groups)
+
+        _sm1, _sm2, _sm3 = st.columns(3)
+        _sm1.metric("Groups", _ngroups)
+        _sm2.metric("Rows sorted", _nrows)
+        _sm3.metric("Rows over the cap", _dropped)
+        if _dropped:
+            st.warning(f"{_dropped:,} row(s) were cut by the per-group cap of {int(_cap):,}. "
+                       f"Raise it to take them.")
+
+        if not _groups:
+            st.info("Nothing grouped - the selection is empty.")
+        else:
+            st.caption("Group sizes, in the order they would be written:")
+            st.dataframe(
+                [{"Group": _lbl, "Rows": len(_rows),
+                  "Example": (_rows[0]["email"] if _rows else "")}
+                 for _lbl, _rows in _groups[:300]],
+                width="stretch", height=260)
+            if _ngroups > 300:
+                st.caption(f"Showing the first 300 of {_ngroups} groups - the archive "
+                           f"carries all of them.")
+
+            if st.button("📦 Build the sorted archive", type="primary", width="stretch"):
+                _bytes = mailsort.zip_groups(_groups, prefix=mailsort.safe_name(_by))
+                st.session_state["_ex_sort_zip"] = (
+                    _bytes, fname.rsplit(".", 1)[0] + f"_sorted_by_{mailsort.safe_name(_by)}.zip")
+            _sz = st.session_state.get("_ex_sort_zip")
+            if _sz:
+                st.download_button(
+                    f"⬇️ Download {_ngroups} group(s) as a ZIP", data=_sz[0],
+                    file_name=_sz[1], mime="application/zip", width="stretch")
+                st.caption(f"{len(_sz[0]):,} bytes ready - built from the rows on screen.")
+            else:
+                st.caption("Press Build. It stays built until a setting or the selection "
+                           "changes.")
+
+            st.markdown("#### One group at a time")
+            if _ngroups > mailsort.MAX_GROUPS_RENDERED:
+                st.caption(f"The first {mailsort.MAX_GROUPS_RENDERED} groups have their own "
+                           f"button; the rest are in the archive.")
+            for _lbl, _rows in _groups[:mailsort.MAX_GROUPS_RENDERED]:
+                _safe = mailsort.safe_name(_lbl)
+                with st.expander(f"{_lbl} — {len(_rows)} row(s)"):
+                    st.download_button(
+                        f"⬇️ {_safe}_{len(_rows)}.txt",
+                        data=(mailsort.group_text(_rows) + "\n").encode("utf-8"),
+                        file_name=f"{_safe}_{len(_rows)}.txt",
+                        mime="text/plain", key=f"sortdl_{_safe}")
+                    with st.container(height=280):
+                        st.code(mailsort.group_text(_rows), language="text")
 # @@END 013 TABS
 
 
