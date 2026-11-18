@@ -83,6 +83,26 @@ FIXED DURING THE AUDIT
   after both numbers were wrong.
 * `tier2_split.py` fell back to `version = "v13.40"`.
 
+AI TAIL CLASSIFIER (wave 13, same build)
+----------------------------------------
+* NEW `aiassist.py`, a plain module. It names a bucket ONLY for the UNKNOWN tail
+  that `status.classify_error` could not place, from a closed whitelist, and never
+  decides a verdict. Off unless `GEMINI_ENABLED` is the string `true` and a key is
+  present; budgeted per run and per user per day; trips itself after repeated
+  failures; only scrubbed text leaves the box, with the address local part
+  replaced by `*` and a credential pair reduced to its host:port.
+* `pages/2_Diagnostics.py` gained a seventh tab, the AI probe - the one place that
+  spends a real call, because a probe is the only tier that proves the key, the
+  quota, the model id and the network at once. The offline selftest restores the
+  module's own config afterwards, since `selftest()` leaves it on a fake key and
+  shrunk budgets.
+* The frame moved to 307 blocks for that tab; `TARGET_BLOCKS`, the `audit_frame`
+  mirror, two `verify_v1337` assertions and five `_FIX_CHECKS` rows moved with it.
+* A fetch that keeps no node now rebuilds the merge, so the pasted list is back in
+  the pool instead of sitting on disk unreachable until the next session.
+* A per-source re-probe no longer says it "kept no node" and then keeps every line;
+  the sentinel text now matches the guarded write.
+
 STAGED, NOT APPLIED
 -------------------
 `tier2_split.py` splits app.py into engine.py + app.py by moving whole blocks, and
@@ -92,14 +112,19 @@ so running the splitter replaces it - the old file is backed up first.
 
 KNOWN GAPS
 ----------
-* `proxies_custom.txt` does not exist. A Fetch & Test rewrites proxies.txt and
-  destroys a hand-added custom list within about 30 seconds.
-* "Show raw proxies.txt" closes as NO RESULT because the branch draws no message
-  widget.
 * Both Oxylabs lines answer 407 on the 443 control. One Webshare sub-user is spent
   and answers 402 on all ten of its lines. The 14 keys share only 10 distinct IPs,
   so the global concurrency cap of 6 is the binding limit.
 * Block re-arrangement is deliberately deferred until the app has been used once.
+
+CLOSED SINCE - kept so the gap cannot be quietly re-opened
+----------------------------------------------------------
+* The custom proxy list used to be destroyed by a Fetch & Test within ~30 seconds.
+  Closed by the two-source split: the provider list and the pasted list are
+  separate files, `proxies.txt` is their merge, and each has its own switch,
+  Re-probe and Clear.
+* "Show raw proxies.txt" used to close as NO RESULT. Closed: the lines go into a
+  code block and the credential check is a caption, so nothing can close the press.
   
 Mega Ultimate Mail Checker — v13.45
 ===================================
