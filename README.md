@@ -19,7 +19,27 @@ NAMED, NUMBERED, REPLACEABLE block.
 prints target against found and warns on drift - so a stale number cannot hide
 in a doc. A frame move is one edit, in `verify_blocks.py`.
 
-## Gates - all thirteen must be green before every commit
+## One build number
+
+The build number is typed by hand in exactly ONE place: line 1 of `app.py`.
+
+    # @@FILE app.py blocks=N version=v13.76
+
+`app.py` block 008 mirrors it as `BUILD_TAG` and `CFG_VERSION`,
+`pages/6_User_Guide.py` block 001 mirrors both again, and `verify_v1337.py`
+parses line 1 and fails if either constant disagrees, if either is assigned
+twice, or if the guide drifts. Every user-visible version string - hero title,
+diag bundle, run export, footer, guide hero - reads `BUILD_TAG` and types
+nothing.
+
+A bump is therefore: line 1, block 008, `pages/6_User_Guide.py` block 001. A
+number typed anywhere else is a bug. File headers carry `version=` so
+`verify_v1337.py` can NOTE drift, but line 1 of `app.py` is the only authority.
+
+`CFG_VERSION` is the config-migration counter and its digits must equal
+`BUILD_TAG`'s. Bump it when a DEFAULT changes in a way users should inherit.
+
+## Gates - all eighteen must be green before every commit
 
     python fix_end_names.py --check      # exit 0 = no bare @@END pending
     python verify_blocks.py              # exit 0 = frame intact
@@ -35,11 +55,20 @@ in a doc. A frame move is one edit, in `verify_blocks.py`.
     python runstate.py --selftest        # exit 0 = watchdog lifecycle sanity
     python test_resume_io.py             # exit 0 = resume IO expressions are real
 
-`.github/workflows/gates.yml` runs all thirteen on every push and writes a PASS/FAIL
-table to the run summary, so the gates are checkable from a phone with no
-terminal. The Summary step exits non-zero when a gate fails, so the run itself
-goes red. The step names in the workflow are the authority if a command above
-ever drifts from them.
+Five more run as shell steps, because they are one-liners over the tree and a
+Python script would be more moving parts than the check:
+
+- `app.py`'s `blocks=N` header equals the number of `# @@BLOCK ` lines.
+- the number of `# @@END ` lines equals the same N.
+- the last line of `app.py` is `# @@EOF`.
+- `read_timeout` appears nowhere in `app.py`.
+- no `<<<<<<< ` conflict marker in any `.py`.
+
+`.github/workflows/gates.yml` runs all eighteen on every push and writes a
+PASS/FAIL table to the run summary, so the gates are checkable from a phone with
+no terminal. The Summary step exits non-zero when a gate fails, so the run
+itself goes red. The step names in the workflow are the authority if a command
+above ever drifts from them.
 
 `pages/5_Blocks.py` runs the same verifier in the browser and can canonicalise a
 bare `@@END` for you (download the fixed file, upload it back). It also
@@ -80,6 +109,10 @@ every `ui_*` / `chk_*` value: they are written to `settings.json` on Apply
 Settings and re-read before the sidebar is built, so a refresh, a tab close or a
 redeploy restores the owner's own panel instead of the factory defaults.
 
+`theme.json` is NOT committed. It is a runtime file, created from
+`default_theme()` on a user's first load, so a fresh clone can never ship a
+stale hero title or a stale build number.
+
 `STATE["cfg"]` is still a process value, and block 105 pins a per-task snapshot
 over it for workers, so a running check does not start following another
 session's settings mid-account.
@@ -112,16 +145,27 @@ safe.
 | `status.py` | canonical verdict taxonomy + classifier (13 blocks) |
 | `hosts.py` | host discovery, family priority, ranking |
 | `ms_oauth.py` | Microsoft XOAUTH2 (personal accounts) |
-| `runstate.py` | unfinished-run watchdog (plain module, not frame-gated) |
+| `audit_log.py` | per-user action & outcome ledger (plain module) |
+| `notify.py` | per-user bounded notification ring (plain module) |
+| `mailsearch.py` | keyword search over one verified mailbox (plain module) |
+| `mailview.py` | safe mail body renderer (plain module) |
+| `mailsort.py` | group / sort / zip a row set (plain module) |
+| `runstate.py` | unfinished-run watchdog (plain module) |
+| `sentinel.py` | expect / satisfy / sweep delivery watchdog (plain module) |
+| `pages/1_Notifications.py` | the bell: filterable notification history |
 | `pages/2_Diagnostics.py` | read-only rung/DNS/proxy inspection |
 | `pages/3_Mailbox_Reader.py` | inbox reader, OTP/card scanner |
-| `pages/4_Downloads.py` | export studio |
+| `pages/4_Downloads.py` | export studio, Mail Sorter |
 | `pages/5_Blocks.py` | frame inspector |
 | `pages/6_User_Guide.py` | end-user manual: every control, button, verdict and page |
 | `pages/7_Logs.py` | full log & operator trace (read-only) |
 
 `tier2_split.py` is staged but NOT applied - `engine.py` is currently a separate
 hand-written engine that `app.py` does not import.
+
+`audit_frame.py`, `verify_blocks.py`, `verify_v1337.py`, `fix_end_names.py`,
+`repair_app_syntax.py`, `test_verdicts.py` and `test_resume_io.py` are gates, not
+runtime code. `NOTES.md` is the resume note and `CHANGELOG.md` is the history.
 
 ## Deploy
 
