@@ -17,20 +17,23 @@
 Importable anywhere: hosts.py and status.py are picked up when present and
 degrade to safe local tables when absent.
 
-ENGINE_VERSION MUST equal the `version=` on line 1 of this file. It sat at
-v13.40 while the header said v13.49. If you bump the header, bump this too -
-the selftest asserts on the constant, not on the header.
+ENGINE_VERSION MUST equal the `version=` on line 1 of this file, and the
+selftest now proves it by reading line 1, so the constant cannot drift again
+without a gate going red. It sat at v13.40 while the header said v13.49, then at
+v13.49 while the header said v13.76 - and `--version` printed the stale one both
+times.
 """
 
 import argparse
 import random
+import re
 import sys
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 
-ENGINE_VERSION = "v13.49"
+ENGINE_VERSION = "v13.76"
 
 try:
     import status as _status
@@ -61,13 +64,23 @@ APP = getattr(_status, "APP", "APP")
 NEED_APP_PASSWORD = getattr(_status, "NEED_APP_PASSWORD", "NEED_APP_PASSWORD")
 CONNECTION_FAILED = getattr(_status, "CONNECTION_FAILED", "CONNECTION_FAILED")
 UNKNOWN = getattr(_status, "UNKNOWN", "UNKNOWN")
+RETRY = getattr(_status, "RETRY", "RETRY")
 RETRY_LATER = getattr(_status, "RETRY_LATER", "RETRY_LATER")
+SKIPPED_COOLDOWN = getattr(_status, "SKIPPED_COOLDOWN", "SKIPPED_COOLDOWN")
 LOGIN_DROPPED = getattr(_status, "LOGIN_DROPPED", "LOGIN_DROPPED")
 SKIP = getattr(_status, "SKIP", "SKIP")
 
 WRONG_SET = frozenset({WRONG, WRONG_PASSWORD})
 APP_SET = frozenset({APP, NEED_APP_PASSWORD})
-RETRY_SET = frozenset({UNKNOWN, RETRY_LATER, LOGIN_DROPPED})
+
+# DERIVED, not typed. This set had drifted: it held UNKNOWN / RETRY_LATER /
+# LOGIN_DROPPED while status.RETRY_STATUSES also holds RETRY and
+# SKIPPED_COOLDOWN, and neither of those two constants existed here at all, so a
+# rung answering either never retried. Taking the taxonomy when it is importable
+# is the only way the two stay in lockstep.
+_RETRY_FALLBACK = frozenset({UNKNOWN, RETRY, RETRY_LATER, SKIPPED_COOLDOWN,
+                             LOGIN_DROPPED})
+RETRY_SET = frozenset(getattr(_status, "RETRY_STATUSES", None) or _RETRY_FALLBACK)
 # @@END 001 CONSTANTS
 
 
@@ -413,13 +426,27 @@ def run_engine(targets, probe, *, workers=DEFAULT_WORKERS, limit=DEFAULT_RUNG_LI
 
     `probe(target, rung, timeout) -> (ok, text)` is supplied by the caller so
     the engine stays free of socket code. Returns
-    {target.email: {"target": Target, "verdict": {...}, "results": [RungResult]}}.
+    {key: {"target": Target, "verdict": {...}, "results": [RungResult]}}.
+
+    A duplicate address used to overwrite its twin in `out`, silently losing a
+    row. The key is still the address for the first occurrence and gets a
+    `#2`, `#3` ... suffix after that; every caller iterates `.values()`, so the
+    suffix is invisible to them and the collision is visible here.
     """
     targets = list(targets or ())
     workers = max(1, min(int(workers or DEFAULT_WORKERS), MAX_WORKERS))
     state = EngineState()
     state.total = len(targets)
     out = {}
+
+    def _slot(email):
+        base = str(email or "")
+        if base not in out:
+            return base
+        n = 2
+        while "%s#%d" % (base, n) in out:
+            n += 1
+        return "%s#%d" % (base, n)
 
     def work(target):
         pop = target.pop if include_pop is None else include_pop
@@ -443,12 +470,14 @@ def run_engine(targets, probe, *, workers=DEFAULT_WORKERS, limit=DEFAULT_RUNG_LI
             try:
                 _t, results = fut.result()
             except Exception as exc:
-                out[target.email] = {"target": target, "verdict": {"status": UNKNOWN,
-                                                                   "error": str(exc)},
-                                     "results": []}
+                out[_slot(target.email)] = {"target": target,
+                                            "verdict": {"status": UNKNOWN,
+                                                        "error": str(exc)},
+                                            "results": []}
                 continue
-            out[target.email] = {"target": target, "verdict": pick_verdict(results),
-                                 "results": results}
+            out[_slot(target.email)] = {"target": target,
+                                        "verdict": pick_verdict(results),
+                                        "results": results}
             if progress:
                 try:
                     progress(state.snapshot())
@@ -473,13 +502,28 @@ def summarise(report):
 
 
 # @@BLOCK 010 SELFTEST_MAIN
+def _header_version():
+    """The `version=` on line 1 of this file, or "" if unreadable."""
+    try:
+        with open(__file__, encoding="utf-8") as fh:
+            first = fh.readline()
+    except Exception:
+        return ""
+    m = re.search(r"version=(v\d+\.\d+)\s*$", first.strip())
+    return m.group(1) if m else ""
+
+
 def _selftest():
     checks = []
 
     def add(name, ok):
         checks.append((name, bool(ok)))
 
-    add("version", ENGINE_VERSION.startswith("v13."))
+    _hdr = _header_version()
+    add("version_known", bool(_hdr))
+    add("version_matches_header", ENGINE_VERSION == _hdr)
+    add("retry_set_from_taxonomy",
+        _status is None or RETRY_SET == _status.RETRY_STATUSES)
     add("plan_nonempty", len(plan_rungs("example.com", "bob")) > 0)
     add("plan_pop", any(r.proto == "pop" for r in plan_rungs("example.com", include_pop=True)))
     add("backoff_grows", backoff(3) > backoff(1))
@@ -517,6 +561,11 @@ def _selftest():
                      workers=2, limit=3, sleep=False)
     add("engine_runs", len(rep) == 1)
     add("engine_valid", list(rep.values())[0]["verdict"]["status"] == VALID)
+
+    twin = [Target(domain="example.com", local="bob"),
+            Target(domain="example.com", local="bob")]
+    rep2 = run_engine(twin, fake_probe, workers=2, limit=2, sleep=False)
+    add("duplicate_email_kept", len(rep2) == 2)
 
     if _status is not None:
         try:
