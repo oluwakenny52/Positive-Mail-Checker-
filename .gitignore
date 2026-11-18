@@ -37,3 +37,7 @@ notifications.jsonl
 notify_seen.json
 *_notifications.jsonl
 *_notify_seen.json
+# v13.76: theme.json is a per-user RUNTIME file, not a committed seed. The
+# committed copy was stamped v13.40 and advertised a build that no longer existed.
+theme.json
+*_theme.json
