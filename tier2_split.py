@@ -16,6 +16,13 @@ cached).  A block left in app.py executes on EVERY Streamlit rerun.  So:
 
 Everything with a side effect therefore keeps its exact current cadence.
 
+WHAT IS IN engine.py TODAY
+--------------------------
+Nothing this script wrote.  engine.py is a hand-written 11-block engine and
+app.py does not import it, so running this REPLACES it wholesale rather than
+extending it.  The old file is kept as engine.py.pre_tier2.bak and git has it
+too, but the two engines are NOT the same code - read the diff before committing.
+
 CROSS-FILE NAMES
 ----------------
 engine.install(globals()) at the top of app.py  -> engine names reach app.py
@@ -226,7 +233,10 @@ def main():
         print("app.py not found in %s" % os.getcwd())
         return 1
     src = read(SRC)
-    version = "v13.40"
+    # v13.76: the fallback was "v13.40", thirty-six versions behind the header it
+    # reads.  It is only used when line 1 does not parse, so a stale value would
+    # stamp an old version into BOTH rebuilt files and go unnoticed.
+    version = "v13.76"
     first = src.splitlines()[0] if src.splitlines() else ""
     m = RE_FILE.match(first)
     if m:
@@ -349,7 +359,7 @@ def main():
         os.replace(BACKUP, BACKUP + "." + time.strftime("%H%M%S"))
     os.replace(SRC, BACKUP)
     # engine.py is OVERWRITTEN, not deleted - and the hand-written engine that is
-    # there now is 12 blocks of work that git alone will not give back.
+    # there now is 11 blocks of work that git alone will not give back.
     if os.path.exists(ENGINE):
         os.replace(ENGINE, ENGINE + ".pre_tier2.bak")
     write(ENGINE, engine_src)
