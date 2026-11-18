@@ -1,3 +1,11 @@
+# Streamlit runtime config.
+#
+# WHO OWNS THE COLOURS: theme.json + theme_css() do, because the theme is per user
+# and this file is per deployment. The [theme] block below is only the FIRST PAINT,
+# before any CSS exists, so it must mirror default_theme() in app.py - a mismatch
+# shows as a flash of the wrong palette on every single load. If default_theme()
+# changes, change this block in the same commit. Two sources are fine only while
+# one of them is declared the fallback.
 [theme]
 base = "dark"
 primaryColor = "#4f8bf9"
@@ -8,15 +16,33 @@ font = "sans serif"
 
 [server]
 headless = true
+# Lists are pasted or uploaded. 60 MB is far past the largest sane list and well
+# under the 200 default, which only ever lets a mistake through.
 maxUploadSize = 60
+# The repo is edited from a phone, never from a local editor, so the watcher is
+# dead weight and its restarts fight the block-replacement workflow.
 fileWatcherType = "none"
+# Explicit, at the default: the run stream is chatty and the browser must not be
+# the bottleneck on a mobile connection.
+maxMessageSize = 200
+enableWebsocketCompression = true
 
 [runner]
+# Long-lived interactive page. Paying a full rerun on every keystroke is exactly
+# what this buys back.
 fastReruns = true
 
 [client]
+# The user debugs from a phone with no terminal, so a traceback in the browser is
+# the only traceback there is.
 showErrorDetails = true
 toolbarMode = "minimal"
+# Explicit: eight pages exist and the sidebar nav is the only way to them.
+showSidebarNavigation = true
 
 [browser]
 gatherUsageStats = false
+
+[logger]
+# Streamlit's info chatter crowds the Cloud log the audit has to read.
+level = "warning"
