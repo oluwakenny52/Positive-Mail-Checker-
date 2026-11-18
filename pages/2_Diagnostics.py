@@ -1,4 +1,4 @@
-# @@FILE pages/2_Diagnostics.py blocks=20 version=v13.76
+# @@FILE pages/2_Diagnostics.py blocks=21 version=v13.76
 # @@BLOCK 000 FILE_HEADER deps=-
 """
 pages/2_Diagnostics.py — Mega Ultimate Mail Checker  (v13.47)
@@ -38,6 +38,17 @@ v13.47 fixes on this page
   from this page. The expander stays collapsed until it is tapped.
 * use_container_width -> width="stretch" on the three dataframes and the two
   cache buttons. use_container_width is deprecated and warned on every render.
+
+v13.81 on this page
+-------------------
+* A SEVENTH TAB. aiassist.py classifies an UNKNOWN tail and nothing else, so the
+  only thing worth showing about it is a LIVE PROBE - the single tier that proves
+  the key, the quota, the model id and the network at once. The tab reports and
+  never touches a verdict; the counters it prints come from aiassist.report().
+* The probe is on the diagnostics page on purpose. It spends one real call, and a
+  diagnostic that lives nowhere is a diagnostic nobody runs.
+* Block ids: the new tab body is 019 and the old TRAILING block moved to 020, so
+  this file is 21 blocks and verify_blocks TARGET_BLOCKS moved with it.
 """
 
 import os
@@ -521,8 +532,11 @@ if not domain:
     st.stop()
 
 # --------------------------------------------------------------------------
-tab_plan, tab_probe, tab_dns, tab_smtp, tab_proxy, tab_cache = st.tabs(
-    ["🧭 Host Plan", "🔌 Live Port Probe", "🛰 DNS / Discovery", "📮 SMTP", "🌐 Proxy Audit", "🧰 Cache"]
+# v13.81: SEVEN tabs. The seventh is the AI probe (block 019) - the only place
+# in the app that spends a real call against the classifier.
+tab_plan, tab_probe, tab_dns, tab_smtp, tab_proxy, tab_cache, tab_ai = st.tabs(
+    ["🧭 Host Plan", "🔌 Live Port Probe", "🛰 DNS / Discovery", "📮 SMTP",
+     "🌐 Proxy Audit", "🧰 Cache", "🤖 AI Probe"]
 )
 
 _PROTO_FLAGS = _protocols_from_app()
@@ -958,7 +972,141 @@ if st.button("📋 Build copy/paste bundle"):
 # @@END 018 FOOTER_BUNDLE
 
 
-# @@BLOCK 019 TRAILING deps=018
+# @@BLOCK 019 TAB_AI deps=002,011
+# ==========================================================================
+# 7. AI PROBE
+# ==========================================================================
+with tab_ai:
+    st.markdown("#### AI tail classifier - live probe")
+    st.caption(
+        "aiassist.py is a classifier of LAST RESORT. `status.classify_error` runs "
+        "first and only an UNKNOWN tail ever reaches a model, which may only name "
+        "a better bucket from a closed list - never a verdict. Off unless "
+        "`GEMINI_ENABLED` is the string `true` AND `GEMINI_API_KEY` is set. Only "
+        "scrubbed text leaves the box: an address local part becomes `*`, a "
+        "credential pair becomes its host:port. A probe here counts against the "
+        "same per-run and per-day budgets a live run uses, and the classifier "
+        "trips itself after a few consecutive failures.")
+
+    try:
+        import aiassist
+        _ai_import_err = ""
+    except Exception as _ai_import_exc:
+        aiassist = None
+        _ai_import_err = str(_ai_import_exc)
+
+    if aiassist is None:
+        st.error(f"`aiassist.py` could not be imported: {_ai_import_err}")
+        st.caption(f"Looked in: {APP_DIR}  ·  cwd: {os.getcwd()}")
+    else:
+        _ai_rep = aiassist.report()
+        if _ai_rep.get("error"):
+            st.error(f"report() failed: {_ai_rep['error']}")
+        else:
+            _ai_on = bool(_ai_rep.get("enabled"))
+            _ai_key = bool(_ai_rep.get("key_present"))
+            if not _ai_key:
+                st.warning("The classifier is **OFF**. `GEMINI_ENABLED` must be the "
+                           "string `true` and `GEMINI_API_KEY` must be set, both in "
+                           "the app secrets. Every account still runs; the tail just "
+                           "stays UNKNOWN.")
+            elif not _ai_on:
+                st.warning("A key is present but `GEMINI_ENABLED` is not `true` - "
+                           "the classifier stays off and nothing is spent.")
+            else:
+                st.caption("Enabled. A live probe below is the only proof the key "
+                           "works. Nothing on this tab changes a verdict.")
+
+            st.dataframe([
+                {"Field": "Version", "Value": _ai_rep.get("version", "")},
+                {"Field": "Enabled", "Value": "yes" if _ai_on else "no"},
+                {"Field": "Key present", "Value": "yes" if _ai_key else "no"},
+                {"Field": "Key tail", "Value": _ai_rep.get("key_tail") or "-"},
+                {"Field": "Model requested", "Value": _ai_rep.get("model", "")},
+                {"Field": "Model resolved", "Value": _ai_rep.get("resolved_model", "")},
+                {"Field": "Calls this run",
+                 "Value": f"{_ai_rep.get('calls_run', 0)} / {_ai_rep.get('max_per_run', 0)}"},
+                {"Field": "Calls today",
+                 "Value": f"{_ai_rep.get('calls_day', 0)} / {_ai_rep.get('max_per_day', 0)}"},
+                {"Field": "Consecutive failures", "Value": _ai_rep.get("consecutive_fails", 0)},
+                {"Field": "Tripped", "Value": "yes" if _ai_rep.get("tripped") else "no"},
+                {"Field": "Cache entries", "Value": _ai_rep.get("cache_entries", 0)},
+                {"Field": "Queue", "Value": _ai_rep.get("queue", 0)},
+                {"Field": "Last status", "Value": _ai_rep.get("last_status") or "-"},
+                {"Field": "Last latency", "Value": f"{_ai_rep.get('last_latency_ms', 0)} ms"},
+                {"Field": "Last token", "Value": _ai_rep.get("last_token") or "-"},
+                {"Field": "Last error", "Value": (_ai_rep.get("last_error") or "-")[:180]},
+            ], width="stretch", hide_index=True)
+
+            _ac1, _ac2 = st.columns(2)
+            with _ac1:
+                if st.button("▶ Run one live probe", type="primary", key="ai_probe_go",
+                             width="stretch",
+                             help="One real call. Proves the key, the quota, the model "
+                                  "id and the network in a single answer."):
+                    with st.spinner("One live call..."):
+                        st.session_state["ai_probe_out"] = aiassist.probe()
+            with _ac2:
+                if st.button("🧪 Offline selftest", key="ai_selftest_go", width="stretch",
+                             help="Canned payloads, no network, no key. Proves the "
+                                  "parser, the closed whitelist and the budgets."):
+                    # THE SELFTEST LEAVES THE MODULE RECONFIGURED. It calls
+                    # configure() on fake-key, model m1 and budgets 2 / 5 / 2 and
+                    # never puts anything back. configure() re-reads enabled, key
+                    # and model from the env bridge block 043 fills, but it only
+                    # touches a budget when one is PASSED - so the three are handed
+                    # back from the report taken above, in a finally, so a failing
+                    # selftest still restores. stop_after_fails has no getter; 4 is
+                    # aiassist's own default and nothing in the tree passes another.
+                    _ai_st_err = ""
+                    try:
+                        aiassist.selftest()
+                    except Exception as _ai_st_exc:
+                        _ai_st_err = str(_ai_st_exc)
+                    finally:
+                        try:
+                            aiassist.configure(
+                                max_per_run=_ai_rep.get("max_per_run", 40),
+                                max_per_day=_ai_rep.get("max_per_day", 300),
+                                stop_after_fails=4)
+                        except Exception:
+                            pass
+                    if _ai_st_err:
+                        st.session_state["ai_selftest_msg"] = (
+                            "error", f"Selftest failed: {_ai_st_err}")
+                    else:
+                        st.session_state["ai_selftest_msg"] = (
+                            "success", "Selftest passed - classifier config restored.")
+
+            if st.session_state.get("ai_selftest_msg"):
+                _ai_lvl, _ai_msg = st.session_state["ai_selftest_msg"]
+                getattr(st, _ai_lvl, st.info)(_ai_msg)
+                st.session_state.pop("ai_selftest_msg", None)
+
+            _ai_out = st.session_state.get("ai_probe_out")
+            if _ai_out:
+                _ai_verdict = _ai_out.get("verdict") or ""
+                if _ai_out.get("token"):
+                    st.success(_ai_verdict)
+                else:
+                    st.error(_ai_verdict)
+                st.dataframe([
+                    {"Field": "HTTP code", "Value": _ai_out.get("http_code", 0)},
+                    {"Field": "Latency", "Value": f"{_ai_out.get('latency_ms', 0)} ms"},
+                    {"Field": "Token", "Value": _ai_out.get("token") or "-"},
+                    {"Field": "Model resolved", "Value": _ai_out.get("resolved_model") or "-"},
+                    {"Field": "Error", "Value": (_ai_out.get("error") or "-")[:200]},
+                ], width="stretch", hide_index=True)
+
+            st.caption(
+                "A 429 is the quota, not the key. A 404 means the model id is wrong. "
+                "A transport failure with no HTTP answer is the network or a proxy, "
+                "and it is the only case where the Proxy Audit tab above is worth "
+                "reading first.")
+# @@END 019 TAB_AI
+
+
+# @@BLOCK 020 TRAILING deps=019
 # (reserved tail - keeps the file closed after the last block)
-# @@END 019 TRAILING
+# @@END 020 TRAILING
 # @@EOF
