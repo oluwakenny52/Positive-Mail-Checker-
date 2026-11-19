@@ -16152,21 +16152,27 @@ if start_engine_btn:
                 if kw_hits_snapshot:
                     z.writestr("keyword_hits.txt",
                                hdr + "\n".join(str(i) for i in kw_hits_snapshot) + "\n")
-                    try:
-                        for _dn in sorted(os.listdir(CFG["RESULTS_DIR"])):
-                            if not _dn.startswith("kw_hits_"):
+                    # v13.87: CAPPED TO THE NEWEST DIRECTORIES. The body folders
+                    # are named by the READER's stamp, not this run's, so every
+                    # export used to sweep every folder ever written - a run
+                    # months later still packed month-old bodies and the archive
+                    # grew without limit.
+                    _kw_dirs = sorted(
+                        _d for _d in os.listdir(CFG["RESULTS_DIR"])
+                        if _d.startswith("kw_hits_")
+                        and os.path.isdir(os.path.join(CFG["RESULTS_DIR"], _d)))
+                    for _dn in _kw_dirs[-3:]:
+                        _dp = os.path.join(CFG["RESULTS_DIR"], _dn)
+                        for _fn in sorted(os.listdir(_dp)):
+                            try:
+                                z.write(os.path.join(_dp, _fn),
+                                        f"keyword_bodies/{_dn}/{_fn}")
+                            except Exception:
                                 continue
-                            _dp = os.path.join(CFG["RESULTS_DIR"], _dn)
-                            if not os.path.isdir(_dp):
-                                continue
-                            for _fn in sorted(os.listdir(_dp)):
-                                try:
-                                    z.write(os.path.join(_dp, _fn),
-                                            f"keyword_bodies/{_dn}/{_fn}")
-                                except Exception:
-                                    continue
-                    except Exception as _kwe:
-                        log_probe_event(f"keyword bodies not added to the ZIP: {_kwe}")
+                    if len(_kw_dirs) > 3:
+                        log_probe_event(
+                            f"keyword bodies: newest 3 of {len(_kw_dirs)} folder(s) "
+                            f"added to the ZIP")
             zip_bytes_data = _zbuf.getvalue()
             if _s9 is not None and zip_bytes_data:
                 try:
@@ -17052,8 +17058,12 @@ else:
                                 _cur.append(_ln)
                         str_lit.session_state["kw_hits_results"] = _cur
                     # raw bytes are not kept in session - the body file has them.
+                    # v13.87: AND THE BODY IS CUT TO 8000 CHARACTERS. 50 hits at
+                    # the 200k readable cap was 10 MB of session_state for a view
+                    # that slices to 4000 anyway.
                     str_lit.session_state["bb_kw_hits"] = [
-                        {_k: _v for _k, _v in _h.items() if _k != "raw"}
+                        dict({_k: _v for _k, _v in _h.items() if _k != "raw"},
+                             body=(_h.get("body") or "")[:8000])
                         for _h in _hits[:50]]
                     _msg = (f"{len(_hits)} hit(s) in {_folder}; {_written} body file(s) "
                             f"written to {os.path.basename(_kdir)}.")
@@ -17105,10 +17115,10 @@ section_title("🧭", "Navigation", f"{BUILD_TAG} - block edition")
 _n1, _n2, _n3, _n4, _n5 = str_lit.columns(5)
 with _n1:
     try:
-        str_lit.page_link("pages/3_Mailbox_Reader.py", label="📥 Mailbox Reader",
+        str_lit.page_link("pages/1_Notifications.py", label="🔔 Notifications",
                           width="stretch")
     except Exception:
-        str_lit.caption("Reader lives at pages/3_Mailbox_Reader.py")
+        str_lit.caption("Notifications lives at pages/1_Notifications.py")
 with _n2:
     try:
         str_lit.page_link("pages/2_Diagnostics.py", label="🔍 Diagnostics",
@@ -17117,22 +17127,54 @@ with _n2:
         str_lit.caption("Diagnostics lives at pages/2_Diagnostics.py")
 with _n3:
     try:
+        str_lit.page_link("pages/3_Mailbox_Reader.py", label="📥 Mailbox Reader",
+                          width="stretch")
+    except Exception:
+        str_lit.caption("Reader lives at pages/3_Mailbox_Reader.py")
+with _n4:
+    try:
         str_lit.page_link("pages/4_Downloads.py", label="📦 Export Studio",
                           width="stretch")
     except Exception:
         str_lit.caption("Export Studio lives at pages/4_Downloads.py")
-with _n4:
+with _n5:
     try:
         str_lit.page_link("pages/8_Breach.py", label="🛡 Breach Exposure",
                           width="stretch")
     except Exception:
         str_lit.caption("Breach Exposure lives at pages/8_Breach.py")
-with _n5:
+
+_m1, _m2, _m3, _m4, _m5 = str_lit.columns(5)
+with _m1:
+    try:
+        str_lit.page_link("pages/5_Blocks.py", label="🧩 Block Inspector",
+                          width="stretch")
+    except Exception:
+        str_lit.caption("Block Inspector lives at pages/5_Blocks.py")
+with _m2:
     try:
         str_lit.page_link("pages/6_User_Guide.py", label="📖 User Guide",
                           width="stretch")
     except Exception:
         str_lit.caption("User Guide lives at pages/6_User_Guide.py")
+with _m3:
+    try:
+        str_lit.page_link("pages/7_Logs.py", label="🧾 Logs",
+                          width="stretch")
+    except Exception:
+        str_lit.caption("Logs lives at pages/7_Logs.py")
+with _m4:
+    try:
+        str_lit.page_link("pages/9_AI.py", label="🤖 AI Classifier",
+                          width="stretch")
+    except Exception:
+        str_lit.caption("AI Classifier lives at pages/9_AI.py")
+with _m5:
+    try:
+        str_lit.page_link("pages/10_Debug.py", label="🩺 Debug Console",
+                          width="stretch")
+    except Exception:
+        str_lit.caption("Debug Console lives at pages/10_Debug.py")
 
 str_lit.caption(
     f"Build {BUILD_TAG} · CFG {CFG_VERSION} · block edition. "
