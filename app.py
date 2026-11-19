@@ -936,14 +936,18 @@ PROXY_PLAN_PARK = 600.0
 # v13.86 FIX AUDIT-1: _detect_format() AND _parse_proxy() WERE CALLED HERE AND
 # DEFINED NOWHERE UNDER EITHER NAME. The real pair is _detect_line_format()
 # (block 028) and parse_proxy() (block 052) - and BOTH sit LATER in the file than
-# this block, which executes at import time. The pair is resolved through
-# globals() with a compact local fallback now, so the block is correct at any
-# position and against either build of the helpers. The format counter also
+# this block, which executes at import time. The pair is resolved inside the
+# renderer below, at CALL time, so the real helpers win when they exist and the
+# compact local fallback only covers a stripped build. The format counter also
 # called the detector twice per line; once now.
 #
-# Position-independent for the same reason as block 013: the tab is resolved
-# through globals() with a container fallback, and APP_DIR falls back to the cwd,
-# because neither exists yet where this block sits.
+# v13.86 FIX AUDIT-2: THE AUDIT PAINTED ITSELF ABOVE THE HERO. The block runs at
+# position 016 and `tab_proxy` is referenced here and assigned NOWHERE in the
+# file, so `globals().get("tab_proxy")` was always None and the container
+# fallback rendered at 016 - a hundred lines of headings, metric boxes and raw
+# proxy lines over the header they belong under, exactly the failure FLASH-4
+# fixed for flash messages in v13.75. The body is a function now and block 057
+# calls it, under the hero, where page content starts.
 _PP_SCHEMES = ("socks5://", "socks4://", "sock5://", "socks://", "http://",
                "https://", "socks5:", "sock5:", "socks4:", "http:", "https:")
 
@@ -965,7 +969,7 @@ def _pp_detect(line):
 
 
 def _pp_parse(line):
-    """Local fallback ONLY - used when parse_proxy() is not bound yet."""
+    """Local fallback ONLY - used when parse_proxy() is not bound."""
     t = (line or "").strip()
     low = t.lower()
     for sch in _PP_SCHEMES:
@@ -1006,37 +1010,46 @@ def _pp_parse(line):
     return {"host": host, "port": port, "user": user, "pass": pwd}
 
 
-_detect_format = (globals().get("_detect_format")
-                  or globals().get("_detect_line_format") or _pp_detect)
-_parse_proxy = (globals().get("_parse_proxy")
-                or globals().get("parse_proxy") or _pp_parse)
+def render_proxy_audit():
+    """The read-only proxies.txt audit. CALLED FROM BLOCK 057, under the header.
 
-with (globals().get("tab_proxy") or str_lit.container()):
-    str_lit.markdown("#### proxies.txt audit (read-only)")
-    str_lit.caption("Nothing is probed here — use the app sidebar's 🔁 Re-probe for a real tunnel test.")
+    Never raises: a missing file, an unreadable one and an absent helper all
+    degrade to a caption or an info box. Nothing here is probed.
+    """
+    _detect = (globals().get("_detect_format")
+               or globals().get("_detect_line_format") or _pp_detect)
+    _parse = (globals().get("_parse_proxy")
+              or globals().get("parse_proxy") or _pp_parse)
 
-    # FIX PG2-1 (v13.53): proxies.txt IS A PER-USER FILE. It became
-    # <hash>_proxies.txt at v13.61, so APP_DIR/proxies.txt stopped existing and
-    # this tab said "No proxies.txt found" on every live deployment - the audit
-    # was reading a path nobody writes. The owner's own file is resolved through
-    # user_file() first; the bare paths stay for a legacy unprefixed tree.
-    pfile = None
-    _cands = []
-    try:
-        import auth as _a_proxy
-        _cands.append(_a_proxy.user_file("proxies.txt"))
-    except Exception:
-        pass
-    _app_dir = globals().get("APP_DIR") or os.getcwd()
-    _cands += [os.path.join(_app_dir, "proxies.txt"), "proxies.txt"]
-    for cand in _cands:
-        if cand and os.path.exists(cand):
-            pfile = cand
-            break
+    with str_lit.container():
+        str_lit.markdown("#### proxies.txt audit (read-only)")
+        str_lit.caption("Nothing is probed here — use the app sidebar's 🔁 Re-probe "
+                        "for a real tunnel test.")
 
-    if not pfile:
-        str_lit.info("No proxies.txt found for this user. Fetch a pool in the app first.")
-    else:
+        # FIX PG2-1 (v13.53): proxies.txt IS A PER-USER FILE. It became
+        # <hash>_proxies.txt at v13.61, so APP_DIR/proxies.txt stopped existing and
+        # this said "No proxies.txt found" on every live deployment - the audit was
+        # reading a path nobody writes. The owner's own file is resolved through
+        # user_file() first; the bare paths stay for a legacy unprefixed tree.
+        pfile = None
+        _cands = []
+        try:
+            import auth as _a_proxy
+            _cands.append(_a_proxy.user_file("proxies.txt"))
+        except Exception:
+            pass
+        _app_dir = globals().get("APP_DIR") or os.getcwd()
+        _cands += [os.path.join(_app_dir, "proxies.txt"), "proxies.txt"]
+        for cand in _cands:
+            if cand and os.path.exists(cand):
+                pfile = cand
+                break
+
+        if not pfile:
+            str_lit.info("No proxies.txt found for this user. Fetch a pool in the app "
+                         "first.")
+            return
+
         str_lit.caption("Reading `%s`" % os.path.basename(pfile))
         try:
             with open(pfile, encoding="utf-8", errors="ignore") as f:
@@ -1051,11 +1064,11 @@ with (globals().get("tab_proxy") or str_lit.container()):
         unparsable = 0
         with_creds = 0
         for l in lines:
-            _fmt = _detect_format(l)
+            _fmt = _detect(l)
             formats[_fmt] = formats.get(_fmt, 0) + 1
             if "@" in l:
                 with_creds += 1
-            if not _parse_proxy(l):
+            if not _parse(l):
                 unparsable += 1
 
         c1, c2, c3, c4 = str_lit.columns(4)
@@ -1076,7 +1089,7 @@ with (globals().get("tab_proxy") or str_lit.container()):
 
         dupes = {}
         for l in lines:
-            info = _parse_proxy(l)
+            info = _parse(l)
             if info:
                 k = f"{info['host']}:{info['port']}"
                 dupes[k] = dupes.get(k, 0) + 1
@@ -6345,6 +6358,10 @@ if not (hasattr(notify, "render_bell") and hasattr(notify, "system_tick")):
 # fails leaves hasattr False and the call below still ran into AttributeError on
 # a load that had already painted the hero and the whole sidebar. Guarded now,
 # and the system_tick() at the foot of this block gets the same treatment.
+#
+# v13.86 FIX BELL-2: _nb_r WAS CREATED AND NEVER WRITTEN TO, so the bell sat
+# alone in a 24% column with 76% of the row empty beside it. The build tag fills
+# it, which is also where a reader looks for it.
 _nb_l, _nb_r = str_lit.columns([0.24, 0.76])
 with _nb_l:
     if hasattr(notify, "render_bell"):
@@ -6352,6 +6369,8 @@ with _nb_l:
             notify.render_bell(str_lit)
         except Exception:
             pass
+with _nb_r:
+    str_lit.caption("build %s" % BUILD_TAG)
 
 # FIX FLASH-4 (v13.75): THE FLASHED MESSAGE IS PAINTED HERE, NOT IN install().
 #
@@ -6376,6 +6395,11 @@ if hasattr(audit_log, "_DEFER_PAGES") and hasattr(audit_log, "_render_flashes"):
     except Exception:
         pass
 
+# v13.86 FIX AUDIT-2: the proxies.txt audit is painted HERE, under the header.
+# It used to render at block 016 - above the hero, over the title - because the
+# `tab_proxy` it looked for is assigned nowhere in this file.
+render_proxy_audit()
+
 # v13.76 FIX ADMIN-1: THE PASSKEY MANAGER IS DRAWN HERE.
 # It lived inside auth.require(), which returns the moment the session is
 # unlocked - so the panel could only be built on a screen where is_admin was
@@ -6383,14 +6407,20 @@ if hasattr(audit_log, "_DEFER_PAGES") and hasattr(audit_log, "_render_flashes"):
 # auth.admin_panel() now, called after the gate where it is actually reachable,
 # and it returns immediately for a non-admin.
 #
+# v13.86 FIX ADMIN-2: it moved to the SIDEBAR. It is page chrome, not page
+# content, and in the main flow it was the fifth row of the header stack - on a
+# phone the paste box was a full screen away. The sidebar starts collapsed, so
+# it now costs nothing until it is wanted.
+#
 # The guard is hasattr(): a page served from a cached auth module that predates
 # this build has no admin_panel, and a bare `auth.admin_panel` expression is
 # magic-written by Streamlit through st.help -> ast.parse.
-if hasattr(auth, "admin_panel"):
-    try:
-        auth.admin_panel(str_lit)
-    except Exception as _ap_err:
-        str_lit.caption(f"passkey manager unavailable: {_ap_err}")
+with str_lit.sidebar:
+    if hasattr(auth, "admin_panel"):
+        try:
+            auth.admin_panel(str_lit)
+        except Exception as _ap_err:
+            str_lit.caption(f"passkey manager unavailable: {_ap_err}")
 
 # The thresholds are sampled here on every rerun, and again from the run
 # checkpoint (block 106) - the script does not rerun while a run works, so the
@@ -9130,8 +9160,6 @@ def _write_clean_valid(header, valids):
 # @@END 078 CLEAN_VALID_IO
 
 # @@BLOCK 079 STARTUP_PANEL_UI deps=007,034,037,038,039
-section_title("🖥️", "Startup & Under-The-Hood Display Panel",
-              "system boot, config injection, proxy health, engine state transitions")
 
 with str_lit.expander("🔍 View All Startup Entries & What Is Going On In The Hood",
                       expanded=False):
@@ -9927,7 +9955,8 @@ _mem_sample()
 # v13.63b: A CHECKBOX, not an expander. An expander keeps no state, so every
 # click collapsed it - which is what made the buttons look dead. The checkbox
 # persists, so the panel stays open while you work in it.
-_res_open = str_lit.checkbox("🧮 Open the resource monitor", key="res_open")
+_res_open = str_lit.checkbox("🖥️ Resources, startup ledger & under-the-hood display",
+                             key="res_open")
 
 if _res_open:
     _rs = _res_snapshot()
@@ -16672,7 +16701,8 @@ if str_lit.session_state.get(_READER_OWNER_KEY) != _reader_owner:
                "bb_reader_msgs", "bb_reader_for", "bb_reader_note",
                "bb_reader_page", "bb_reader_total", "bb_reader_combo",
                "_reader_tried", "_rdr_state",
-               "bb_kw_folders", "bb_kw_folder", "bb_kw_words", "bb_kw_hits", "bb_kw_note"):
+               "bb_kw_folders", "bb_kw_folder", "bb_kw_words", "bb_kw_hits",
+               "bb_kw_note", "bb_kw_on"):
         str_lit.session_state.pop(_k, None)
     str_lit.session_state[_READER_OWNER_KEY] = _reader_owner
 if "_rdr_state" not in str_lit.session_state:
@@ -16770,6 +16800,178 @@ else:
         _r_msgs = str_lit.session_state.get("bb_reader_msgs") or []
         _r_for = str_lit.session_state.get("bb_reader_for") or ""
         _r_note = str_lit.session_state.get("bb_reader_note") or ""
+
+        # ==================================================================
+        # v13.79 WAVE 6 - KEYWORD SEARCH
+        #
+        # THE FOLDER IS A PROMPT WITH NOTHING SELECTED. It used to be implied
+        # (098 hard-codes INBOX), so a keyword in Sent, Archive or Spam could not
+        # be looked for at all - and the obvious fix, defaulting the box to
+        # INBOX, is the wrong one: a search run against a folder the user did not
+        # choose is a result they did not ask for. `index=None` plus a
+        # placeholder means the Search button refuses until a folder is picked,
+        # and the list is only populated by an explicit connect.
+        #
+        # Every hit is a COMBO, so it lands in a real bucket that the engine can
+        # re-run, and the body goes to disk under mail_results/kw_hits_<stamp>/
+        # where block 079's file browser and block 107's ZIP both already look.
+        # ==================================================================
+        with str_lit.expander("🔎 Search this mailbox for keywords",
+                              expanded=not _r_msgs):
+            if mailsearch is None:
+                str_lit.caption("mailsearch.py is missing from this deployment - "
+                                "keyword search is unavailable.")
+            elif not selected_combo or ":" not in selected_combo:
+                str_lit.caption("The selected line carries no password, so it cannot be "
+                                "opened.")
+            else:
+                str_lit.caption(
+                    "Connect once to list the folders, pick ONE, then type keywords. "
+                    "Nothing is selected for you. Matching is case-insensitive across "
+                    "Subject, From and body, and it reads READ-ONLY so no message is "
+                    "marked seen. Bodies are written to your own results directory and "
+                    "included in the ZIP.")
+
+                if "bb_kw_folders" not in str_lit.session_state:
+                    str_lit.session_state["bb_kw_folders"] = []
+
+                def _kw_connect(combo):
+                    """Open a verified session. Returns (mail, host_or_error)."""
+                    try:
+                        _e, _p = combo.split(":", 1)
+                    except Exception:
+                        return None, "the selected line has no password"
+                    _e, _p = _e.strip(), _p.strip()
+                    _hosts = get_servers(_e).get("imap", [])
+                    if not _hosts:
+                        return None, "no IMAP host for this domain"
+                    _px = sample_alive_proxy(domain=_e.split("@")[-1]) if use_proxy else None
+                    _ok, _mail, _h = verify_and_connect(_e, _p, _hosts, proxy_str=_px)
+                    if not _ok or not _mail:
+                        return None, "credential verification failed"
+                    return _mail, _h
+
+                def _kw_list_folders():
+                    _combo = str_lit.session_state.get("bb_reader_acct") or ""
+                    _m, _err = _kw_connect(_combo)
+                    if not _m:
+                        str_lit.session_state["bb_kw_folders"] = []
+                        str_lit.session_state["bb_kw_note"] = _err
+                        return
+                    try:
+                        _f, _e2 = mailsearch.list_folders(_m)
+                    finally:
+                        mailsearch.close(_m)
+                    str_lit.session_state["bb_kw_folders"] = _f
+                    str_lit.session_state["bb_kw_note"] = (
+                        _e2 or f"{len(_f)} folder(s) - pick one, then type keywords.")
+                    # Popped, not assigned: the widget does not exist yet in a
+                    # callback, so this is the safe direction and it forces the
+                    # prompt back to "nothing selected".
+                    str_lit.session_state.pop("bb_kw_folder", None)
+
+                def _kw_search():
+                    _combo = str_lit.session_state.get("bb_reader_acct") or ""
+                    _folder = str_lit.session_state.get("bb_kw_folder") or ""
+                    _words = str_lit.session_state.get("bb_kw_words") or ""
+                    if not _folder:
+                        str_lit.session_state["bb_kw_note"] = (
+                            "pick a folder first - nothing is selected for you")
+                        return
+                    if not _words.strip():
+                        str_lit.session_state["bb_kw_note"] = "type at least one keyword"
+                        return
+                    _m, _err = _kw_connect(_combo)
+                    if not _m:
+                        str_lit.session_state["bb_kw_note"] = _err
+                        return
+                    _bar = str_lit.progress(0.0, text="searching...")
+
+                    def _prog(done, total, phase):
+                        try:
+                            _bar.progress(min(1.0, done / max(1, total)),
+                                          text=f"{phase} {done}/{total}")
+                        except Exception:
+                            pass
+
+                    try:
+                        _hits, _note = mailsearch.search(_m, _folder, _words,
+                                                         on_progress=_prog)
+                    finally:
+                        mailsearch.close(_m)
+                        try:
+                            _bar.empty()
+                        except Exception:
+                            pass
+                    try:
+                        _acc, _pw = _combo.split(":", 1)
+                    except Exception:
+                        _acc, _pw = _combo, ""
+                    _stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                    _kdir = os.path.join(user_file("mail_results"), f"kw_hits_{_stamp}")
+                    for _h in _hits:
+                        _h["email"] = _acc.strip()
+                        _h["password"] = _pw.strip()
+                        _h["folder"] = _folder
+                    _ipath, _written = mailsearch.save_bodies(_kdir, _stamp, _hits)
+                    _new = [mailsearch.hit_line(_h) for _h in _hits]
+                    with session_state_lock:
+                        _cur = list(str_lit.session_state.get("kw_hits_results") or [])
+                        for _ln in _new:
+                            if _ln not in _cur:
+                                _cur.append(_ln)
+                        str_lit.session_state["kw_hits_results"] = _cur
+                    # raw bytes are not kept in session - the body file has them.
+                    # v13.87: AND THE BODY IS CUT TO 8000 CHARACTERS. 50 hits at
+                    # the 200k readable cap was 10 MB of session_state for a view
+                    # that slices to 4000 anyway.
+                    str_lit.session_state["bb_kw_hits"] = [
+                        dict({_k: _v for _k, _v in _h.items() if _k != "raw"},
+                             body=(_h.get("body") or "")[:8000])
+                        for _h in _hits[:50]]
+                    _msg = (f"{len(_hits)} hit(s) in {_folder}; {_written} body file(s) "
+                            f"written to {os.path.basename(_kdir)}.")
+                    if _note:
+                        _msg += f" {_note}"
+                    str_lit.session_state["bb_kw_note"] = _msg
+                    log_probe_event(f"keyword search: {len(_hits)} hit(s) for "
+                                    f"{_acc} in {_folder}")
+
+                if str_lit.checkbox("Enable keyword search", value=True, key="bb_kw_on"):
+                    str_lit.button("📁 Connect & list folders", width="stretch",
+                                   on_click=_kw_list_folders)
+
+                    _kw_folders = str_lit.session_state.get("bb_kw_folders") or []
+                    if _kw_folders:
+                        str_lit.selectbox(
+                            "Folder to search (nothing is selected for you)",
+                            options=_kw_folders, index=None, key="bb_kw_folder",
+                            placeholder="— pick a folder —")
+                    str_lit.text_input("Keywords (commas separate them)", key="bb_kw_words",
+                                       placeholder="invoice, receipt, statement")
+                    str_lit.button("🔎 Search this folder", width="stretch",
+                                   on_click=_kw_search)
+
+                _kw_note = str_lit.session_state.get("bb_kw_note") or ""
+                if _kw_note:
+                    str_lit.caption(_kw_note)
+                _kw_hits = str_lit.session_state.get("bb_kw_hits") or []
+                if _kw_hits:
+                    str_lit.caption(f"Showing the first {len(_kw_hits)} of this pass. "
+                                    f"Every hit is also in the 🔎 Keyword Hits bucket.")
+                    for _h in _kw_hits:
+                        with str_lit.expander(f"{(_h.get('subject') or '')[:70]} - "
+                                              f"{(_h.get('from') or '')[:40]}",
+                                              expanded=False):
+                            str_lit.caption(
+                                f"{_h.get('folder')} · {_h.get('date')} · matched in "
+                                f"**{_h.get('where')}** on "
+                                f"{', '.join(_h.get('keywords') or [])}")
+                            str_lit.markdown(
+                                "<div style='white-space:pre-wrap;"
+                                "font-family:ui-monospace,monospace;font-size:12px'>"
+                                + html.escape((_h.get("body") or "")[:4000])
+                                + "</div>", unsafe_allow_html=True)
 
         def _reader_do_fetch(combo, limit, page=1):
             """Fetch ONE PAGE of one inbox into session state. Never raises."""
@@ -16937,176 +17139,6 @@ else:
                             + html.escape(_mv_body)
                             + "</div>",
                             unsafe_allow_html=True)
-
-        # ==================================================================
-        # v13.79 WAVE 6 - KEYWORD SEARCH
-        #
-        # THE FOLDER IS A PROMPT WITH NOTHING SELECTED. It used to be implied
-        # (098 hard-codes INBOX), so a keyword in Sent, Archive or Spam could not
-        # be looked for at all - and the obvious fix, defaulting the box to
-        # INBOX, is the wrong one: a search run against a folder the user did not
-        # choose is a result they did not ask for. `index=None` plus a
-        # placeholder means the Search button refuses until a folder is picked,
-        # and the list is only populated by an explicit connect.
-        #
-        # Every hit is a COMBO, so it lands in a real bucket that the engine can
-        # re-run, and the body goes to disk under mail_results/kw_hits_<stamp>/
-        # where block 079's file browser and block 107's ZIP both already look.
-        # ==================================================================
-        with str_lit.expander("🔎 Search this mailbox for keywords", expanded=False):
-            if mailsearch is None:
-                str_lit.caption("mailsearch.py is missing from this deployment - "
-                                "keyword search is unavailable.")
-            elif not selected_combo or ":" not in selected_combo:
-                str_lit.caption("The selected line carries no password, so it cannot be "
-                                "opened.")
-            else:
-                str_lit.caption(
-                    "Connect once to list the folders, pick ONE, then type keywords. "
-                    "Nothing is selected for you. Matching is case-insensitive across "
-                    "Subject, From and body, and it reads READ-ONLY so no message is "
-                    "marked seen. Bodies are written to your own results directory and "
-                    "included in the ZIP.")
-
-                if "bb_kw_folders" not in str_lit.session_state:
-                    str_lit.session_state["bb_kw_folders"] = []
-
-                def _kw_connect(combo):
-                    """Open a verified session. Returns (mail, host_or_error)."""
-                    try:
-                        _e, _p = combo.split(":", 1)
-                    except Exception:
-                        return None, "the selected line has no password"
-                    _e, _p = _e.strip(), _p.strip()
-                    _hosts = get_servers(_e).get("imap", [])
-                    if not _hosts:
-                        return None, "no IMAP host for this domain"
-                    _px = sample_alive_proxy(domain=_e.split("@")[-1]) if use_proxy else None
-                    _ok, _mail, _h = verify_and_connect(_e, _p, _hosts, proxy_str=_px)
-                    if not _ok or not _mail:
-                        return None, "credential verification failed"
-                    return _mail, _h
-
-                def _kw_list_folders():
-                    _combo = str_lit.session_state.get("bb_reader_acct") or ""
-                    _m, _err = _kw_connect(_combo)
-                    if not _m:
-                        str_lit.session_state["bb_kw_folders"] = []
-                        str_lit.session_state["bb_kw_note"] = _err
-                        return
-                    try:
-                        _f, _e2 = mailsearch.list_folders(_m)
-                    finally:
-                        mailsearch.close(_m)
-                    str_lit.session_state["bb_kw_folders"] = _f
-                    str_lit.session_state["bb_kw_note"] = (
-                        _e2 or f"{len(_f)} folder(s) - pick one, then type keywords.")
-                    # Popped, not assigned: the widget does not exist yet in a
-                    # callback, so this is the safe direction and it forces the
-                    # prompt back to "nothing selected".
-                    str_lit.session_state.pop("bb_kw_folder", None)
-
-                def _kw_search():
-                    _combo = str_lit.session_state.get("bb_reader_acct") or ""
-                    _folder = str_lit.session_state.get("bb_kw_folder") or ""
-                    _words = str_lit.session_state.get("bb_kw_words") or ""
-                    if not _folder:
-                        str_lit.session_state["bb_kw_note"] = (
-                            "pick a folder first - nothing is selected for you")
-                        return
-                    if not _words.strip():
-                        str_lit.session_state["bb_kw_note"] = "type at least one keyword"
-                        return
-                    _m, _err = _kw_connect(_combo)
-                    if not _m:
-                        str_lit.session_state["bb_kw_note"] = _err
-                        return
-                    _bar = str_lit.progress(0.0, text="searching...")
-
-                    def _prog(done, total, phase):
-                        try:
-                            _bar.progress(min(1.0, done / max(1, total)),
-                                          text=f"{phase} {done}/{total}")
-                        except Exception:
-                            pass
-
-                    try:
-                        _hits, _note = mailsearch.search(_m, _folder, _words,
-                                                         on_progress=_prog)
-                    finally:
-                        mailsearch.close(_m)
-                        try:
-                            _bar.empty()
-                        except Exception:
-                            pass
-                    try:
-                        _acc, _pw = _combo.split(":", 1)
-                    except Exception:
-                        _acc, _pw = _combo, ""
-                    _stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                    _kdir = os.path.join(user_file("mail_results"), f"kw_hits_{_stamp}")
-                    for _h in _hits:
-                        _h["email"] = _acc.strip()
-                        _h["password"] = _pw.strip()
-                        _h["folder"] = _folder
-                    _ipath, _written = mailsearch.save_bodies(_kdir, _stamp, _hits)
-                    _new = [mailsearch.hit_line(_h) for _h in _hits]
-                    with session_state_lock:
-                        _cur = list(str_lit.session_state.get("kw_hits_results") or [])
-                        for _ln in _new:
-                            if _ln not in _cur:
-                                _cur.append(_ln)
-                        str_lit.session_state["kw_hits_results"] = _cur
-                    # raw bytes are not kept in session - the body file has them.
-                    # v13.87: AND THE BODY IS CUT TO 8000 CHARACTERS. 50 hits at
-                    # the 200k readable cap was 10 MB of session_state for a view
-                    # that slices to 4000 anyway.
-                    str_lit.session_state["bb_kw_hits"] = [
-                        dict({_k: _v for _k, _v in _h.items() if _k != "raw"},
-                             body=(_h.get("body") or "")[:8000])
-                        for _h in _hits[:50]]
-                    _msg = (f"{len(_hits)} hit(s) in {_folder}; {_written} body file(s) "
-                            f"written to {os.path.basename(_kdir)}.")
-                    if _note:
-                        _msg += f" {_note}"
-                    str_lit.session_state["bb_kw_note"] = _msg
-                    log_probe_event(f"keyword search: {len(_hits)} hit(s) for "
-                                    f"{_acc} in {_folder}")
-
-                str_lit.button("📁 Connect & list folders", width="stretch",
-                               on_click=_kw_list_folders)
-
-                _kw_folders = str_lit.session_state.get("bb_kw_folders") or []
-                if _kw_folders:
-                    str_lit.selectbox(
-                        "Folder to search (nothing is selected for you)",
-                        options=_kw_folders, index=None, key="bb_kw_folder",
-                        placeholder="— pick a folder —")
-                str_lit.text_input("Keywords (commas separate them)", key="bb_kw_words",
-                                   placeholder="invoice, receipt, statement")
-                str_lit.button("🔎 Search this folder", width="stretch",
-                               on_click=_kw_search)
-
-                _kw_note = str_lit.session_state.get("bb_kw_note") or ""
-                if _kw_note:
-                    str_lit.caption(_kw_note)
-                _kw_hits = str_lit.session_state.get("bb_kw_hits") or []
-                if _kw_hits:
-                    str_lit.caption(f"Showing the first {len(_kw_hits)} of this pass. "
-                                    f"Every hit is also in the 🔎 Keyword Hits bucket.")
-                    for _h in _kw_hits:
-                        with str_lit.expander(f"{(_h.get('subject') or '')[:70]} - "
-                                              f"{(_h.get('from') or '')[:40]}",
-                                              expanded=False):
-                            str_lit.caption(
-                                f"{_h.get('folder')} · {_h.get('date')} · matched in "
-                                f"**{_h.get('where')}** on "
-                                f"{', '.join(_h.get('keywords') or [])}")
-                            str_lit.markdown(
-                                "<div style='white-space:pre-wrap;"
-                                "font-family:ui-monospace,monospace;font-size:12px'>"
-                                + html.escape((_h.get("body") or "")[:4000])
-                                + "</div>", unsafe_allow_html=True)
 # @@END 109 IN_APP_READER
 
 # @@BLOCK 110 FOOTER deps=008,034
