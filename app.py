@@ -6330,9 +6330,36 @@ _theme = str_lit.session_state.theme
 str_lit.markdown(theme_css(_theme), unsafe_allow_html=True)
 render_hero(_theme)
 
-# Display Fit controls belong UNDER the header. fit() in block 007 injects the
-# CSS only; the panel is drawn here.
-auth.fit_panel(str_lit)
+# v13.86 FIX HEAD-1: THE HEADER STACK IS GONE. fit_panel() was two full-width
+# expanders (one of them a debug panel) and admin_panel() a third, all between the
+# title and the first thing anybody came for. Both are sidebar controls now - the
+# sidebar starts collapsed, so they cost nothing until they are wanted, and the
+# header is the hero, the bell and the build tag.
+#
+# fit() in block 007 still injects the CSS on every load, so Display Fit keeps
+# working whether or not its panel has been opened.
+with str_lit.sidebar:
+    if hasattr(auth, "fit_panel"):
+        try:
+            auth.fit_panel(str_lit)
+        except Exception as _fp_err:
+            str_lit.caption(f"display fit unavailable: {_fp_err}")
+
+    # v13.76 FIX ADMIN-1: THE PASSKEY MANAGER IS DRAWN HERE.
+    # It lived inside auth.require(), which returns the moment the session is
+    # unlocked - so the panel could only be built on a screen where is_admin was
+    # false, and "Forget this passkey" could not be reached at all. It is
+    # auth.admin_panel() now, called after the gate where it is actually reachable,
+    # and it returns immediately for a non-admin.
+    #
+    # The guard is hasattr(): a page served from a cached auth module that predates
+    # this build has no admin_panel, and a bare `auth.admin_panel` expression is
+    # magic-written by Streamlit through st.help -> ast.parse.
+    if hasattr(auth, "admin_panel"):
+        try:
+            auth.admin_panel(str_lit)
+        except Exception as _ap_err:
+            str_lit.caption(f"passkey manager unavailable: {_ap_err}")
 
 # v13.70: THE BELL. Under the header and ahead of every other control, so it is
 # the first thing reachable on a phone.
@@ -6382,8 +6409,8 @@ with _nb_r:
 #
 # audit_log now skips its own drain for a page listed in _DEFER_PAGES, and that
 # page drains under its own header. This is that drain point: below the hero,
-# below the Display Fit panel, below the bell row - so the text reads as a
-# response to the press instead of as page chrome.
+# below the bell row - so the text reads as a response to the press instead of as
+# page chrome.
 #
 # Both guards are hasattr(): a module cached from before this build has no
 # _DEFER_PAGES, in which case it is still draining inside install() and a second
@@ -6394,33 +6421,6 @@ if hasattr(audit_log, "_DEFER_PAGES") and hasattr(audit_log, "_render_flashes"):
         audit_log._render_flashes(str_lit)
     except Exception:
         pass
-
-# v13.86 FIX AUDIT-2: the proxies.txt audit is painted HERE, under the header.
-# It used to render at block 016 - above the hero, over the title - because the
-# `tab_proxy` it looked for is assigned nowhere in this file.
-render_proxy_audit()
-
-# v13.76 FIX ADMIN-1: THE PASSKEY MANAGER IS DRAWN HERE.
-# It lived inside auth.require(), which returns the moment the session is
-# unlocked - so the panel could only be built on a screen where is_admin was
-# false, and "Forget this passkey" could not be reached at all. It is
-# auth.admin_panel() now, called after the gate where it is actually reachable,
-# and it returns immediately for a non-admin.
-#
-# v13.86 FIX ADMIN-2: it moved to the SIDEBAR. It is page chrome, not page
-# content, and in the main flow it was the fifth row of the header stack - on a
-# phone the paste box was a full screen away. The sidebar starts collapsed, so
-# it now costs nothing until it is wanted.
-#
-# The guard is hasattr(): a page served from a cached auth module that predates
-# this build has no admin_panel, and a bare `auth.admin_panel` expression is
-# magic-written by Streamlit through st.help -> ast.parse.
-with str_lit.sidebar:
-    if hasattr(auth, "admin_panel"):
-        try:
-            auth.admin_panel(str_lit)
-        except Exception as _ap_err:
-            str_lit.caption(f"passkey manager unavailable: {_ap_err}")
 
 # The thresholds are sampled here on every rerun, and again from the run
 # checkpoint (block 106) - the script does not rerun while a run works, so the
