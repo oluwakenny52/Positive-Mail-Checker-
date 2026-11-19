@@ -1,4 +1,4 @@
-# @@FILE pages/6_User_Guide.py blocks=17 version=v13.76
+# @@FILE pages/6_User_Guide.py blocks=17 version=v13.86
 # @@BLOCK 000 FILE_HEADER deps=-
 """
 pages/6_User_Guide.py - User Guide
@@ -633,6 +633,8 @@ with _t6:
 | **`pages/6_User_Guide.py`** | This page. | zero |
 | **`pages/7_Logs.py`** | Full log & operator trace: the execution log, per-account dial traces, boot ledger, run record and every result file. Read-only, per user. | zero |
 | **`pages/8_Breach.py`** | Breach exposure for a list of addresses, from free sources. Verdict is about how **recent** the exposure is: ACT / REVIEW / HISTORIC / CLEAN / UNKNOWN. | free, rate-limited |
+| **`pages/9_AI.py`** | The UNKNOWN-tail classifier on its own page: enable, key, model, per-run and per-day caps, the queue, the drain and the trace. | zero - spends Gemini quota, never proxy credit |
+| **`pages/10_Debug.py`** | Operator debug console: live counters, the probe log, the quarantine and strike maps, the gate table, thread census and the diagnostic bundle. | zero |
 """
     )
     st.markdown(
