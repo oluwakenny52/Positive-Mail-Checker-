@@ -1,4 +1,4 @@
-# @@FILE pages/7_Logs.py blocks=14 version=v13.76
+# @@FILE pages/7_Logs.py blocks=14 version=v13.86
 # @@BLOCK 000 FILE_HEADER deps=-
 """
 pages/7_Logs.py - Full Log & Operator Trace  (v13.48)
