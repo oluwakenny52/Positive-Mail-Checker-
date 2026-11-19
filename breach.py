@@ -431,7 +431,7 @@ def ensure_browser(force=False) -> str:
     real answer - re-running it on every page load would be a 900s download on
     every load.
     """
-    global _pw_thread
+    global _pw_thread, _pw_state
     if _installed():
         with _pw_lock:
             if _pw_state["state"] != "ready":
@@ -1406,6 +1406,8 @@ def selftest(verbose=False) -> bool:
         "http_only" in inspect.signature(configure).parameters)
     add("check_many_takes_http_only",
         "http_only" in inspect.signature(check_many).parameters)
+    add("ensure_browser_declares_pw_state",
+        "_pw_state" in inspect.getsource(ensure_browser).split("\n")[1])
     configure(http_only=True)
     add("http_only_on", _http_only() is True)
     configure(http_only=False)
