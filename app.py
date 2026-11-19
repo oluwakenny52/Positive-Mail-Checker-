@@ -621,8 +621,15 @@ _rs_path = runstate.tick()
 # Bump CFG_VERSION whenever a DEFAULT changes in a way users should inherit; its
 # digits must stay identical to BUILD_TAG or verify_v1337.py goes red on the
 # header alone.
-CFG_VERSION = 1376
-BUILD_TAG = "v13.76"
+#
+# v13.86: THE TAG WAS FIVE RELEASES BEHIND ITS OWN CODE. WAVE 11 did not bump,
+# and neither did the four waves after it, so the shipped number advertised
+# v13.76 while blocks 014/030/036/058/067/075 all carried v13.75-v13.83 work and
+# gate 4 stayed green because it only ever proves the four COPIES agree, never
+# that the number is current. Line 1, pages/6 block 001, verify_blocks
+# __version__ and AI_VERSION move in the SAME commit as this block.
+CFG_VERSION = 1386
+BUILD_TAG = "v13.86"
 # @@END 008 BUILD_IDENTITY
 
 # @@BLOCK 009 TIMING_CONSTANTS deps=-
@@ -731,6 +738,83 @@ PROBER_STALE_WHILE_RUNNING = 300.0
 PROBER_IDLE_ENABLED_DEFAULT = False
 PROBE_SECOND_SCHEME_DEFAULT = False
 PROBE_MAX_TARGETS_DEFAULT = 1
+
+# v13.86 FIX PAGES-1: pages/9_AI.py AND pages/10_Debug.py ARE REAL, GATED PAGES
+# AND APPEARED IN NO TABLE, NO README AND NO CHANGELOG. They are listed with the
+# rest now.
+#
+# The block carries BOTH the constants above and the table below, because in this
+# file 013 is the constants block while the table body was written for a tab that
+# is created much later. It is written POSITION-INDEPENDENT: the tab and the
+# section helper are resolved through globals() with a container / subheader
+# fallback, so it renders correctly inside its tab and correctly here too.
+def _pages_tab():
+    return globals().get("_t6") or str_lit.container()
+
+
+def _pages_h(title):
+    _fn = globals().get("ug_h")
+    if callable(_fn):
+        try:
+            return _fn(title)
+        except Exception:
+            pass
+    return str_lit.subheader(title)
+
+
+with _pages_tab():
+    _pages_h("The other pages")
+    str_lit.markdown(
+        """
+| Page | What it is | Costs |
+|---|---|---|
+| **`pages/1_Notifications.py`** | Everything raised for you: resource alerts with the fix beside each one, and run events. Mark read, dismiss one, dismiss all, download the lot. Yours only. | zero |
+| **Main** (`app.py`) | The checker: settings, input, run, results, in-app reader, resource monitor and the bell. | proxy credit |
+| **`pages/2_Diagnostics.py`** | Shows the **exact rung order** the engine will dial for a domain, live TCP probes on 993/143/995/110, MX/SRV discovery, SMTP candidates, a `proxies.txt` audit, cache tools, and an **AI probe** tab. | zero - the AI probe spends Gemini quota, not proxy credit |
+| **`pages/3_Mailbox_Reader.py`** | Bulk inbox reader: folders, OTP scanner, card/credential scanner, bot purge, per-message actions. | proxy credit |
+| **`pages/4_Downloads.py`** | Export Studio, and the Mail Sorter: group and split a huge row set by country. Text / CSV / JSON / ZIP / per-status split, with filters, sorting, dedupe and presets. | zero |
+| **`pages/5_Blocks.py`** | Block Inspector. Frame audit, paste validation, `@@END` canonicaliser, fix self-check. | zero |
+| **`pages/6_User_Guide.py`** | This page. | zero |
+| **`pages/7_Logs.py`** | Full log & operator trace: the execution log, per-account dial traces, boot ledger, run record and every result file. Read-only, per user. | zero |
+| **`pages/8_Breach.py`** | Breach exposure for a list of addresses, from free sources. Verdict is about how **recent** the exposure is: ACT / REVIEW / HISTORIC / CLEAN / UNKNOWN. | free, rate-limited |
+| **`pages/9_AI.py`** | The UNKNOWN-tail classifier on its own page: enable, key, model, per-run and per-day caps, the queue, the drain and the trace. | zero - spends Gemini quota, never proxy credit |
+| **`pages/10_Debug.py`** | Operator debug console: live counters, the probe log, the quarantine and strike maps, the gate table, thread census and the diagnostic bundle. | zero |
+"""
+    )
+    str_lit.markdown(
+        "Start with **Diagnostics** for one domain if a run is behaving oddly - it tells "
+        "you whether the host, the port or the path is the problem, before you spend a "
+        "single proxy request."
+    )
+
+    _pages_h("Breach Exposure, in more detail")
+    str_lit.markdown(
+        """
+Breach Exposure never touches a mailbox, so it is safe to run on addresses you
+have already discarded.
+
+It uses three free sources and **no API key**:
+
+* the public breach catalogue, fetched once and matched locally by domain, so a
+  list of 500 addresses makes one request, not 500;
+* the account page on haveibeenpwned, fetched only when the local match found
+  nothing, at one request every two seconds because it is throttled;
+* `psbdmp.ws`, for pastes quoting the address.
+
+Read the verdict as urgency, not as a score:
+
+| Verdict | Meaning |
+|---|---|
+| **ACT** | a breach added inside 90 days, or a paste from the last year |
+| **REVIEW** | a breach added inside a year |
+| **HISTORIC** | only old exposure - rotate anyway, nothing is urgent |
+| **CLEAN** | not in those sources, which is not the same as never exposed |
+| **UNKNOWN** | no readable answer - usually a throttle |
+
+Nothing on that page is written outside your own files, and the history is yours
+alone.
+"""
+    )
 # @@END 013 FRUGALITY_CONSTANTS
 
 # @@BLOCK 014 UI_RENDER_CONSTANTS deps=-
@@ -845,6 +929,166 @@ PROXY_407_RETRY_WINDOW_FACTOR = 1.6
 # that has actually opened a tunnel, so it is only drawn when nothing better is
 # left.
 PROXY_PLAN_PARK = 600.0
+
+# ==========================================================================
+# 5. PROXY AUDIT
+# ==========================================================================
+# v13.86 FIX AUDIT-1: _detect_format() AND _parse_proxy() WERE CALLED HERE AND
+# DEFINED NOWHERE UNDER EITHER NAME. The real pair is _detect_line_format()
+# (block 028) and parse_proxy() (block 052) - and BOTH sit LATER in the file than
+# this block, which executes at import time. The pair is resolved through
+# globals() with a compact local fallback now, so the block is correct at any
+# position and against either build of the helpers. The format counter also
+# called the detector twice per line; once now.
+#
+# Position-independent for the same reason as block 013: the tab is resolved
+# through globals() with a container fallback, and APP_DIR falls back to the cwd,
+# because neither exists yet where this block sits.
+_PP_SCHEMES = ("socks5://", "socks4://", "sock5://", "socks://", "http://",
+               "https://", "socks5:", "sock5:", "socks4:", "http:", "https:")
+
+
+def _pp_detect(line):
+    p = (line or "").strip()
+    if not p:
+        return "empty"
+    if "://" in p:
+        return "scheme:// (url form)"
+    if "@" in p:
+        return "user:pass@host:port"
+    n = len(p.split(":"))
+    if n == 4:
+        return "host:port:user:pass"
+    if n == 2:
+        return "host:port (NO CREDS)"
+    return f"UNRECOGNISED ({n} colon-parts)"
+
+
+def _pp_parse(line):
+    """Local fallback ONLY - used when parse_proxy() is not bound yet."""
+    t = (line or "").strip()
+    low = t.lower()
+    for sch in _PP_SCHEMES:
+        if low.startswith(sch):
+            t = t[len(sch):].strip()
+            break
+    if not t:
+        return None
+    user = pwd = None
+    hostpart = t
+    if "@" in t:
+        cred, hostpart = t.rsplit("@", 1)
+        if ":" in cred:
+            user, pwd = cred.split(":", 1)
+        else:
+            user = cred
+    parts = hostpart.split(":")
+    if len(parts) == 2:
+        host, port_s = parts
+    elif len(parts) == 3:
+        host, port_s, u3 = parts
+        user = user or u3
+    elif len(parts) >= 4:
+        host, port_s, u2 = parts[0], parts[1], parts[2]
+        user = user or u2
+        pwd = pwd or ":".join(parts[3:])
+    else:
+        return None
+    host = (host or "").strip()
+    if not host or " " in host or "." not in host:
+        return None
+    try:
+        port = int(str(port_s).strip())
+    except Exception:
+        return None
+    if not (0 < port < 65536):
+        return None
+    return {"host": host, "port": port, "user": user, "pass": pwd}
+
+
+_detect_format = (globals().get("_detect_format")
+                  or globals().get("_detect_line_format") or _pp_detect)
+_parse_proxy = (globals().get("_parse_proxy")
+                or globals().get("parse_proxy") or _pp_parse)
+
+with (globals().get("tab_proxy") or str_lit.container()):
+    str_lit.markdown("#### proxies.txt audit (read-only)")
+    str_lit.caption("Nothing is probed here — use the app sidebar's 🔁 Re-probe for a real tunnel test.")
+
+    # FIX PG2-1 (v13.53): proxies.txt IS A PER-USER FILE. It became
+    # <hash>_proxies.txt at v13.61, so APP_DIR/proxies.txt stopped existing and
+    # this tab said "No proxies.txt found" on every live deployment - the audit
+    # was reading a path nobody writes. The owner's own file is resolved through
+    # user_file() first; the bare paths stay for a legacy unprefixed tree.
+    pfile = None
+    _cands = []
+    try:
+        import auth as _a_proxy
+        _cands.append(_a_proxy.user_file("proxies.txt"))
+    except Exception:
+        pass
+    _app_dir = globals().get("APP_DIR") or os.getcwd()
+    _cands += [os.path.join(_app_dir, "proxies.txt"), "proxies.txt"]
+    for cand in _cands:
+        if cand and os.path.exists(cand):
+            pfile = cand
+            break
+
+    if not pfile:
+        str_lit.info("No proxies.txt found for this user. Fetch a pool in the app first.")
+    else:
+        str_lit.caption("Reading `%s`" % os.path.basename(pfile))
+        try:
+            with open(pfile, encoding="utf-8", errors="ignore") as f:
+                raw = [l.rstrip("\n") for l in f]
+        except Exception as e:
+            str_lit.error(f"Could not read {pfile}: {e}")
+            raw = []
+
+        lines = [l.strip() for l in raw if l.strip() and not l.startswith("#")]
+        uniq = list(dict.fromkeys(lines))
+        formats = {}
+        unparsable = 0
+        with_creds = 0
+        for l in lines:
+            _fmt = _detect_format(l)
+            formats[_fmt] = formats.get(_fmt, 0) + 1
+            if "@" in l:
+                with_creds += 1
+            if not _parse_proxy(l):
+                unparsable += 1
+
+        c1, c2, c3, c4 = str_lit.columns(4)
+        c1.metric("Lines", len(lines))
+        c2.metric("Unique", len(uniq))
+        c3.metric("With credentials", with_creds)
+        c4.metric("Unparsable", unparsable)
+
+        str_lit.markdown("**Detected line formats**")
+        str_lit.code(json.dumps(formats, indent=2), language="json")
+
+        if lines and with_creds == 0:
+            str_lit.warning("No line contains `@` → **no credentials at all**. A 407 is "
+                            "guaranteed if the proxy needs auth.")
+        if unparsable:
+            str_lit.warning(f"{unparsable} line(s) do not parse into host:port — check "
+                            f"for spaces or stray characters.")
+
+        dupes = {}
+        for l in lines:
+            info = _parse_proxy(l)
+            if info:
+                k = f"{info['host']}:{info['port']}"
+                dupes[k] = dupes.get(k, 0) + 1
+        heavy = {k: v for k, v in dupes.items() if v > 1}
+        if heavy:
+            str_lit.markdown("**Repeated endpoints** (dedupe collapses these)")
+            str_lit.code("\n".join(f"{k}  x{v}" for k, v in
+                                   sorted(heavy.items(), key=lambda kv: -kv[1])[:30]),
+                         language="text")
+
+        with str_lit.expander("First 10 raw lines"):
+            str_lit.code("\n".join(lines[:10]) or "— empty —", language="text")
 # @@END 016 PROXY_407_CONTRACT
 
 # @@BLOCK 017 POOL_FILTER_CONSTANTS deps=-
