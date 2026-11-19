@@ -495,6 +495,20 @@ def _load(selection):
 MAX_ROWS = 200_000
 
 
+def TAG_FILE_SAFE(tag, limit=40):
+    """A status tag -> a file-name fragment that cannot escape the directory.
+
+    UPPERCASE NAME ON PURPOSE. Block 013 calls TAG_FILE_SAFE(tag) for the
+    per-status download and the name was defined NOWHERE in this file - not in
+    any block, not imported, and mailsort.py does not export it. st.tabs runs
+    EVERY tab body on every render, so with at least one row selected the
+    "Per-status split" tab raised NameError, which took the Mail Sorter tab and
+    the footer with it. The page was dead for any export that matched anything.
+    """
+    s = re.sub(r"[^A-Za-z0-9._-]+", "_", str(tag or "")).strip("._-")
+    return (s or "status")[:limit]
+
+
 def _fmt(rows, template, delim, crlf, header, prefix, suffix,
          sort_key, dedupe, lower, regex_inc, regex_exc, host_filter):
     sel = rows
