@@ -1,4 +1,4 @@
-"""breach.py - breach exposure and combo freshness.  v13.83
+"""breach.py - breach exposure and combo freshness.  v13.84
 
 NO API KEY. Three keyless sources, in order of how much they prove:
 
@@ -38,15 +38,31 @@ Plain module, NOT frame-gated - like runstate.py and sentinel.py. No Streamlit.
 Nothing here renders. EVERY public function swallows: a breach lookup must never
 be the reason a page dies.
 
+THE BROWSER BINARY  (v13.84)
+----------------------------
+The Playwright PACKAGE comes from requirements.txt, but the CHROMIUM BINARY does
+not - it is a ~150 MB download and no wheel carries it. ensure_browser() fetches
+it once, into <app>/.pw-browsers, guarded by a sentinel and a lock and run on a
+daemon thread so the page never blocks on it. PLAYWRIGHT_BROWSERS_PATH is set at
+IMPORT, before anything can import playwright, because the driver reads it at
+launch time and a late assignment is simply ignored.
+
+The apt libraries Chromium links against come from packages.txt at build time.
+If they are missing, launch fails with a missing .so and browser_state() shows
+the text - which is why the state is a value on the page and not a log line.
+
 ISOLATION
 ---------
 The cache resolves through auth.user_file(), so it is one file per user. The
 browser pool is per process (one Chromium) but its pages are shared round-robin,
-and every result is keyed by address in the caller's own dict.
+and every result is keyed by address in the caller's own dict. The binary is
+process-wide on purpose: it is the same bytes for everybody.
 
 USAGE
     import breach
     breach.configure(pages=4)
+    breach.ensure_browser()                  # non-blocking, idempotent
+    breach.browser_state()                   # for the page to show
     breach.available()                       # False -> HTTP only, no browser
     rec = breach.check("a@b.com", password="hunter2")
     all = breach.check_many(pairs, workers=8, progress=cb, cancel=ev)
@@ -62,6 +78,8 @@ import json
 import os
 import queue
 import re
+import subprocess
+import sys
 import threading
 import time
 import urllib.error
@@ -69,7 +87,14 @@ import urllib.parse
 import urllib.request
 from datetime import datetime
 
-BREACH_VERSION = "v13.83"
+BREACH_VERSION = "v13.84"
+
+# MUST be set before anything imports playwright. setdefault, not assignment, so
+# an operator who exports their own path keeps it.
+_HERE = os.path.dirname(os.path.abspath(__file__))
+_PW_DIR = os.path.join(_HERE, ".pw-browsers")
+_PW_SENTINEL = os.path.join(_PW_DIR, ".installed")
+os.environ.setdefault("PLAYWRIGHT_BROWSERS_PATH", _PW_DIR)
 
 HIBP_BASE = "https://haveibeenpwned.com"
 UNIFIED = HIBP_BASE + "/unifiedsearch/%s"
@@ -88,6 +113,7 @@ DESC_MAX = 1200
 CACHE_NAME = "breach_cache.json"
 CACHE_TTL = 6 * 3600.0
 CATALOGUE_TTL = 6 * 3600.0
+INSTALL_TIMEOUT = 900
 
 # Band thresholds in days. Change here and nowhere else.
 PW_NEW_MAX = 0          # 0 hits = unseen = NEW
@@ -115,8 +141,11 @@ _pool = None
 _pw_missing = ""
 _last = {"ts": 0.0, "email": "", "verdict": "", "via": "", "ms": 0, "error": ""}
 
+_pw_lock = threading.Lock()
+_pw_thread = None
+_pw_state = {"state": "unknown", "error": "", "started": 0.0, "finished": 0.0}
+
 _EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[A-Za-z]{2,}$")
-_LINE_SPLIT = re.compile(r"[|:\t]")
 
 
 # ---------------------------------------------------------------------------
@@ -142,9 +171,109 @@ def _pages() -> int:
         return int(_cfg["pages"])
 
 
+# ---------------------------------------------------------------------------
+# the binary
+# ---------------------------------------------------------------------------
+def _installed() -> bool:
+    """True when the sentinel is there and a chromium build is actually present."""
+    try:
+        if not os.path.exists(_PW_SENTINEL):
+            return False
+        for entry in os.listdir(_PW_DIR):
+            if entry.startswith("chromium"):
+                return True
+    except Exception:
+        return False
+    return False
+
+
+def _install_now():
+    """The blocking install. Runs on its own thread only. Never raises."""
+    global _pw_state
+    with _pw_lock:
+        _pw_state = {"state": "installing", "error": "", "started": time.time(),
+                     "finished": 0.0}
+    try:
+        os.makedirs(_PW_DIR, exist_ok=True)
+        env = dict(os.environ)
+        env["PLAYWRIGHT_BROWSERS_PATH"] = _PW_DIR
+        proc = subprocess.run([sys.executable, "-m", "playwright", "install",
+                               "chromium"],
+                              capture_output=True, text=True,
+                              timeout=INSTALL_TIMEOUT, env=env)
+        if proc.returncode != 0:
+            _tail = ((proc.stderr or "") + (proc.stdout or "")).strip()[-500:]
+            with _pw_lock:
+                _pw_state = {"state": "failed", "error": _tail or "install exited %d"
+                             % proc.returncode, "started": _pw_state["started"],
+                             "finished": time.time()}
+            return
+        with open(_PW_SENTINEL, "w", encoding="utf-8") as fh:
+            fh.write("ok\n")
+        with _pw_lock:
+            _pw_state = {"state": "ready", "error": "", "started": _pw_state["started"],
+                         "finished": time.time()}
+    except Exception as exc:
+        with _pw_lock:
+            _pw_state = {"state": "failed", "error": "%s: %s"
+                         % (type(exc).__name__, exc),
+                         "started": _pw_state.get("started", 0.0),
+                         "finished": time.time()}
+
+
+def ensure_browser(force=False) -> str:
+    """Start the one-time install if it is needed. NEVER blocks. Returns state.
+
+    Idempotent: a sentinel means done, a live thread means already running, and a
+    previous failure is not retried unless `force` is set. A failed install is a
+    real answer - re-running it on every page load would be a 900s download on
+    every load.
+    """
+    global _pw_thread
+    if _installed():
+        with _pw_lock:
+            if _pw_state["state"] != "ready":
+                _pw_state = {"state": "ready", "error": "",
+                             "started": _pw_state.get("started", 0.0),
+                             "finished": time.time()}
+        return "ready"
+    with _pw_lock:
+        if _pw_thread is not None and _pw_thread.is_alive():
+            return _pw_state["state"]
+        if _pw_state["state"] == "failed" and not force:
+            return "failed"
+        _pw_thread = threading.Thread(target=_install_now, name="breach-install",
+                                      daemon=True)
+        _pw_thread.start()
+    return "installing"
+
+
+def browser_state() -> dict:
+    """What the page needs to say about the browser. Never raises."""
+    if _installed():
+        return {"state": "ready", "error": "", "path": _PW_DIR,
+                "seconds": 0}
+    with _pw_lock:
+        snap = dict(_pw_state)
+    if snap["state"] == "installing" and snap.get("started"):
+        snap["seconds"] = int(time.time() - snap["started"])
+    else:
+        snap["seconds"] = 0
+    snap["path"] = _PW_DIR
+    return snap
+
+
 def available() -> bool:
-    """True when Playwright imports. Cached - an import per address is waste."""
+    """True only when Playwright imports AND the binary is installed.
+
+    Cached on the import side. The binary check is a listdir, so it is cached too
+    once it succeeds - a pool that is already up cannot lose its browser.
+    """
     global _pw_missing
+    if _pool is not None:
+        return True
+    if not _installed():
+        return False
     if _pw_missing:
         return False
     try:
@@ -156,7 +285,15 @@ def available() -> bool:
 
 
 def browser_note() -> str:
-    return _pw_missing
+    """Why the browser tier is unavailable, in words the page can print."""
+    if _installed() and _pw_missing:
+        return _pw_missing
+    st = browser_state()
+    if st["state"] == "failed":
+        return st.get("error") or "install failed"
+    if st["state"] == "installing":
+        return "installing (%ss)" % st.get("seconds", 0)
+    return "not installed"
 
 
 # ---------------------------------------------------------------------------
@@ -696,14 +833,19 @@ def check(addr, password="", force=False, allow_browser=True) -> dict:
     rec["pw_count"] = pwned_count(password, force=force)
 
     addr_rec = _http_search(addr, password)
-    if addr_rec.get("error", "").startswith("challenge") and allow_browser and available():
-        try:
-            pool = _get_pool()
-            addr_rec = pool.submit(addr, password).result(timeout=_cfg["timeout"])
-        except Exception as exc:
-            rec["error"] = "browser failed: %s: %s" % (type(exc).__name__, exc)
-    elif addr_rec.get("error", "").startswith("challenge") and not available():
-        addr_rec["error"] += " | no browser (%s)" % (_pw_missing or "unavailable")
+    if addr_rec.get("error", "").startswith("challenge"):
+        if allow_browser and available():
+            try:
+                pool = _get_pool()
+                addr_rec = pool.submit(addr, password).result(timeout=_cfg["timeout"])
+            except Exception as exc:
+                rec["error"] = "browser failed: %s: %s" % (type(exc).__name__, exc)
+        else:
+            # Kick the install so the NEXT press has a browser, and say which of
+            # the two reasons it was: a missing binary is not a blocked site.
+            if allow_browser and not available():
+                ensure_browser()
+            addr_rec["error"] += " | no browser (%s)" % browser_note()
 
     rec["breaches"] = addr_rec.get("breaches") or []
     rec["pastes"] = addr_rec.get("pastes") or []
@@ -808,7 +950,8 @@ def score(records) -> dict:
 
 def report() -> dict:
     return {"version": BREACH_VERSION, "browser": available(),
-            "browser_error": _pw_missing, "pages": _pages(),
+            "browser_state": browser_state().get("state", ""),
+            "browser_error": browser_note(), "pages": _pages(),
             "pool": _pool is not None, "last": dict(_last)}
 
 
@@ -880,6 +1023,9 @@ def selftest(verbose=False) -> bool:
     add("challenge_json", not _looks_like_challenge(200, '{"Breaches":[]}'))
     add("pw_hash", len(_pw_hash("abc")) == 40)
     add("report_shape", isinstance(report().get("browser"), bool))
+    add("state_shape", "state" in browser_state())
+    add("note_is_str", isinstance(browser_note(), str))
+    add("env_set", os.environ.get("PLAYWRIGHT_BROWSERS_PATH") == _PW_DIR)
 
     bad_names = [n for n, ok in checks if not ok]
     if bad_names:
@@ -892,6 +1038,13 @@ def selftest(verbose=False) -> bool:
 def main(argv=None) -> int:
     import sys
     argv = list(sys.argv[1:] if argv is None else argv)
+    if "--install-browser" in argv:
+        ensure_browser(force=True)
+        while browser_state()["state"] == "installing":
+            time.sleep(2)
+        st = browser_state()
+        print("browser:", st["state"], st.get("error", ""))
+        return 0 if st["state"] == "ready" else 1
     if "--probe" in argv:
         try:
             target = argv[argv.index("--probe") + 1]
