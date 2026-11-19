@@ -1,4 +1,4 @@
-# @@FILE auth.py blocks=6 version=v13.76
+# @@FILE auth.py blocks=6 version=v13.86
 # @@BLOCK 000 HEADER deps=-
 """auth.py - per-user passkey gate and display-fit controls.
 
