@@ -273,11 +273,20 @@ def _my_files():
     return n, b
 
 
+# v13.86 FIX PG1-2: THIS LIST WAS NEVER BROUGHT UP TO DATE. v13.79 added
+# kw_hits_results to the app's own _RES_SESSION_KEYS and to "Free my RAM" - the
+# heaviest list in the whole app, because every entry is a combo plus a body -
+# and bb_kw_hits beside it, plus the two pre-filter buckets, the reader buffer
+# and the debug trace. None of them are counted here, so "My session payload"
+# under-reported exactly the keys that grow largest, and SESS_WARN_B could never
+# fire on them. It now matches the app's list key for key.
 _SESS_KEYS = ("valid_results", "wrong_results", "need_app_results",
               "login_drop_results", "conn_results", "proxy_results",
               "retry_results", "rbl_results", "smtp_results", "dns_results",
-              "skip_results", "unknown_results", "log_lines", "report_entries",
-              "startup_entries")
+              "skip_results", "unknown_results", "kw_hits_results", "bb_kw_hits",
+              "log_lines", "report_entries", "startup_entries",
+              "pre_dns_failed", "pre_smtp_failed", "bb_reader_msgs", "_dbg_log",
+              "_res_dl")
 
 
 def _session_bytes():
