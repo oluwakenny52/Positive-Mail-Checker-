@@ -79,6 +79,15 @@ code red.  It now snapshots and restores the queue, the cache and the usage path
 and drives the day budget against a tempfile so both the exhausted and the
 unlimited branch are provable.  A selftest that depends on what the app did
 earlier is not a selftest.
+
+THE LOCK IS REENTRANT  (v13.86)
+-------------------------------
+It was a plain Lock and report() called _day_count() INSIDE the with-block, and
+_day_count() takes the same lock - so the FIRST report() call nested the lock
+twice and blocked for ever, on the script thread.  Nothing raised and nothing
+logged; the page simply stopped.  report() is reached from app.py block 105
+(the sidebar counter), block 030 (the diagnostic bundle), pages/9 block 007 and
+pages/10 block 013, so the whole app froze on its first load with a key present.
 """
 
 from __future__ import annotations
@@ -94,7 +103,7 @@ import time
 import urllib.error
 import urllib.request
 
-AI_VERSION = "v13.85"
+AI_VERSION = "v13.86"
 
 ENDPOINT = ("https://generativelanguage.googleapis.com/v1beta/models/"
             "%s:generateContent")
@@ -139,7 +148,9 @@ _cfg = {
     "usage_path": "",
 }
 
-_lock = threading.Lock()
+# RLock, NOT Lock. report() reads the day count and _day_count() takes this lock
+# itself; a plain Lock deadlocked the script thread on the first report().
+_lock = threading.RLock()
 _cache = {}          # key -> token
 _cache_order = []    # LRU
 _queue = []          # keys awaiting a call
@@ -576,9 +587,23 @@ def _one_call(body, key_cache=None):
 # reporting
 # ---------------------------------------------------------------------------
 def report() -> dict:
-    """Counters for the diag bundle and the sidebar.  Never raises."""
+    """Counters for the diag bundle and the sidebar.  Never raises.
+
+    v13.86 FIX AI-DEADLOCK: THE WHOLE APP FROZE HERE. _lock was a plain Lock and
+    `_day_count()` re-acquires it, so the first call nested the same lock twice
+    and blocked for ever - on the script thread, reached from app.py block 105,
+    block 030's bundle, pages/9 and pages/10. Nothing raised and nothing logged.
+    The lock is an RLock now, and the day count - which also does a FILE READ -
+    is taken BEFORE the lock is held, so the critical section is a dict build and
+    no other thread waits on the disk.
+
+    "stop_after_fails" is reported too: pages/9 seeded its widget from a
+    hardcoded 4 because this dict had no such key, so a configured 2 was lost on
+    every reload.
+    """
     try:
         path = _path()
+        _day = _day_count(path) if path else "(no auth)"
         with _lock:
             data = {
                 "version": AI_VERSION,
@@ -588,9 +613,10 @@ def report() -> dict:
                 "model": _cfg["model"],
                 "resolved_model": _resolved_model or "(not resolved yet)",
                 "calls_run": _calls_run,
-                "calls_day": _day_count(path) if path else "(no auth)",
+                "calls_day": _day,
                 "max_per_run": _cfg["max_per_run"],
                 "max_per_day": _cfg["max_per_day"],
+                "stop_after_fails": _cfg["stop_after_fails"],
                 "consecutive_fails": _consec_fails,
                 "tripped": _tripped,
                 "cache_entries": len(_cache),
@@ -666,6 +692,9 @@ def selftest(verbose=False) -> bool:
     add("model_set", report()["model"] == "m1")
     add("key_tail", report()["key_tail"] == "...-key")
     add("path_is_str", isinstance(_path(), str))
+    # v13.86: report() must survive its own lock and must carry the fail budget.
+    add("report_no_deadlock", isinstance(report().get("calls_run"), int))
+    add("report_fails", report().get("stop_after_fails") == 2)
 
     # ---- everything below touches globals: snapshot first, restore in finally --
     with _lock:
