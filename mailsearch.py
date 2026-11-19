@@ -89,6 +89,24 @@ def list_folders(mail):
         return [], f"{type(e).__name__}: {e}"
 
 
+def _heads_from_bytes(payload):
+    """Header block -> {subject, from, date}. Empty strings on any failure."""
+    heads = {"subject": "", "from": "", "date": ""}
+    try:
+        msg = _mfb(payload)
+        for key in ("Subject", "From", "Date"):
+            value = msg.get(key) or ""
+            if value:
+                try:
+                    value = str(_mh(_dh(value)))
+                except Exception:
+                    pass
+            heads[key.lower()] = value.replace("\r", " ").replace("\n", " ").strip()
+    except Exception:
+        pass
+    return heads
+
+
 def _headers_of(mail, mid):
     """One message -> {subject, from, date}. Empty strings on any failure."""
     heads = {"subject": "", "from": "", "date": ""}
@@ -98,19 +116,43 @@ def _headers_of(mail, mid):
             return heads
         for rp in (data or []):
             if isinstance(rp, tuple) and rp[1]:
-                msg = _mfb(rp[1])
-                for key in ("Subject", "From", "Date"):
-                    value = msg.get(key) or ""
-                    if value:
-                        try:
-                            value = str(_mh(_dh(value)))
-                        except Exception:
-                            pass
-                    heads[key.lower()] = value.replace("\r", " ").replace("\n", " ").strip()
-                break
+                return _heads_from_bytes(rp[1])
     except Exception:
         pass
     return heads
+
+
+def _fetch_headers(mail, ids):
+    """Chunked header fetch -> {str(mid): heads}. One FETCH per _FETCH_CHUNK ids.
+
+    v13.87: THE CHUNKING WAS A LIE. _FETCH_CHUNK was declared and the loop then
+    fetched one id at a time, so a 200-id window was 200 round trips per folder
+    pass. A set is fetched in one command here; the server answers one tuple per
+    message, prefixed with its id. Any id that comes back unparsed - a pedantic
+    server, a partial answer - falls back to its own single fetch, so the
+    optimisation can only ever cost a round trip, never a message.
+    """
+    out = {}
+    ids = list(ids)
+    for i in range(0, len(ids), _FETCH_CHUNK):
+        part = ids[i:i + _FETCH_CHUNK]
+        got = {}
+        try:
+            typ, data = mail.fetch(
+                ",".join(_s(x) for x in part),
+                "(BODY.PEEK[HEADER.FIELDS (SUBJECT FROM DATE)])")
+            if typ == "OK":
+                for rp in (data or []):
+                    if not isinstance(rp, tuple) or not rp[1]:
+                        continue
+                    m = re.match(rb"(\d+)", rp[0] or b"")
+                    if m:
+                        got[_s(m.group(1))] = _heads_from_bytes(rp[1])
+        except Exception:
+            got = {}
+        for mid in part:
+            out[_s(mid)] = got.get(_s(mid)) or _headers_of(mail, mid)
+    return out
 
 
 def _raw_of(mail, mid):
@@ -174,8 +216,10 @@ def _readable(raw):
     return text[:BODY_SHOW]
 
 
-def _make_hit(mail, mid, folder, heads, keywords, where):
-    raw = _raw_of(mail, mid)
+def _make_hit(mail, mid, folder, heads, keywords, where, raw=None):
+    """One hit. `raw` is reused when the caller already has the body bytes."""
+    if raw is None:
+        raw = _raw_of(mail, mid)
     return {"id": _s(mid), "folder": folder,
             "subject": heads.get("subject") or "(no subject)",
             "from": heads.get("from") or "(unknown sender)",
@@ -220,18 +264,19 @@ def search(mail, folder, words, scan_limit=MAX_SCAN, body_scan=MAX_BODY_SCAN,
             scan_limit = MAX_SCAN
         window = ids[-scan_limit:]
         total = len(window)
-        lowered = [k.lower() for k in kws]
         seen = set()
 
         for i in range(0, len(window), _FETCH_CHUNK):
             part = window[i:i + _FETCH_CHUNK]
+            got = _fetch_headers(mail, part)
             for mid in part:
-                heads = _headers_of(mail, mid)
+                heads = got.get(_s(mid)) or {"subject": "", "from": "", "date": ""}
                 blob = (heads.get("subject", "") + " " + heads.get("from", "")).lower()
                 hit_kw = [k for k in kws if k.lower() in blob]
                 if hit_kw:
-                    seen.add(mid)
-                    hits.append(_make_hit(mail, mid, folder, heads, hit_kw, "subject/from"))
+                    seen.add(_s(mid))
+                    hits.append(_make_hit(mail, mid, folder, heads, hit_kw,
+                                          "subject/from"))
                     if len(hits) >= hit_limit:
                         break
             _tick(min(total, i + len(part)), total, "headers")
@@ -246,7 +291,7 @@ def search(mail, folder, words, scan_limit=MAX_SCAN, body_scan=MAX_BODY_SCAN,
             for n, mid in enumerate(reversed(window)):
                 if n >= body_scan:
                     break
-                if mid in seen:
+                if _s(mid) in seen:
                     continue
                 raw = _raw_of(mail, mid)
                 low = _readable(raw).lower()
@@ -255,7 +300,11 @@ def search(mail, folder, words, scan_limit=MAX_SCAN, body_scan=MAX_BODY_SCAN,
                 hit_kw = [k for k in kws if k.lower() in low]
                 if hit_kw:
                     heads = _headers_of(mail, mid)
-                    hits.append(_make_hit(mail, mid, folder, heads, hit_kw, "body"))
+                    # The body is already in hand from the match, so it is
+                    # reused - _make_hit used to fetch the same message a
+                    # second time for every single body hit.
+                    hits.append(_make_hit(mail, mid, folder, heads, hit_kw, "body",
+                                          raw=raw))
                     if len(hits) >= hit_limit:
                         break
                 if n and n % 10 == 0:
