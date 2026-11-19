@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""verify_v1337.py - regression harness for the v13.37 patch set (v13.53 revision).
+"""verify_v1337.py - regression harness for the v13.37 patch set (v13.85 revision).
 
 Run from the repo root:   python verify_v1337.py
 Exit code 0 = clean.
@@ -14,8 +14,21 @@ plus that no two files in pages/ share a page number, that the build identity in
 app.py, its @@FILE header and pages/6_User_Guide.py all agree, and that every
 auth.<name> a page CALLS is actually defined in auth.py.
 
-WHY THIS REVISION EXISTS (v13.53)
+WHY THIS REVISION EXISTS (v13.85)
 ---------------------------------
+  * TWO NEW ENTRY POINTS WERE OUTSIDE EVERY GATE.  pages/9_AI.py and
+    pages/10_Debug.py were added to BLOCKED_FILES and to the frame target and
+    then to nothing here: not in AUTH_CALLERS, not read in main(), not asserted
+    to exist in page_numbers().  A SyntaxError, a stray fence, an em dash, or an
+    auth.<name> that auth.py does not define would have passed all eighteen
+    gates on both pages.  fit_panel shipped exactly that way in v13.47.
+    Both are now gated like every other page, including the exactly-once fit()
+    rule that v13.45 established when a second call silently duplicated the CSS.
+  * The two pages are also in the existence list, so a deleted page is a FAIL
+    rather than a silent skip in auth_api().
+
+WHY THE PREVIOUS REVISION EXISTED (v13.53)
+------------------------------------------
   * THE WORKER PATH HAD NO GATE AT ALL.  current_workers, MAX_WORKERS_START,
     DYNAMIC_WORKER_SCALING and the executor were unasserted, so the whole
     concurrency contract could be edited away and thirteen gates stayed green.
@@ -381,7 +394,7 @@ def worker_contract(app, app_code):
 
 AUTH_CALLERS = ("app.py", "pages/3_Mailbox_Reader.py", "pages/4_Downloads.py",
                 "pages/5_Blocks.py", "pages/6_User_Guide.py",
-                "pages/8_Breach.py")
+                "pages/8_Breach.py", "pages/9_AI.py", "pages/10_Debug.py")
 
 # anchored on the call paren: bare `auth.py` in prose must not read as auth.py()
 AUTH_CALL = re.compile(r"\bauth\.([A-Za-z_]\w*)\s*\(")
@@ -468,7 +481,7 @@ def page_numbers():
         else:
             PASSES.append("page number %s unique (%s)" % (num, names[0]))
     for expected in ("pages/2_Diagnostics.py", "pages/3_Mailbox_Reader.py",
-                     "pages/8_Breach.py"):
+                     "pages/8_Breach.py", "pages/9_AI.py", "pages/10_Debug.py"):
         if os.path.exists(expected):
             PASSES.append(expected + " exists")
         else:
@@ -485,9 +498,11 @@ def main():
     dia_path = "pages/2_Diagnostics.py"
     rdr_path = "pages/3_Mailbox_Reader.py"
     gui_path = "pages/6_User_Guide.py"
+    ai_path = "pages/9_AI.py"
+    dbg_path = "pages/10_Debug.py"
     req_path = "requirements.txt"
 
-    for p in (app_path, dia_path, rdr_path, gui_path, req_path):
+    for p in (app_path, dia_path, rdr_path, gui_path, ai_path, dbg_path, req_path):
         if not os.path.exists(p):
             FAILS.append(p + " is MISSING")
 
@@ -495,6 +510,8 @@ def main():
     dia = read(dia_path) if os.path.exists(dia_path) else ""
     rdr = read(rdr_path) if os.path.exists(rdr_path) else ""
     gui = read(gui_path) if os.path.exists(gui_path) else ""
+    ai = read(ai_path) if os.path.exists(ai_path) else ""
+    dbg = read(dbg_path) if os.path.exists(dbg_path) else ""
     req = read(req_path) if os.path.exists(req_path) else ""
 
     if app:
@@ -710,6 +727,29 @@ def main():
         exactly(code_view(gui), "def ug_card(", 1, "ug_card() defined once")
         exactly(code_view(gui), "def ug_h(", 1, "ug_h() defined once")
         gone(code_view(gui), "import auth\nimport auth", "auth not imported twice")
+
+    if ai:
+        compiles(ai_path, ai)
+        tokenizes(ai_path, ai)
+        parses(ai_path, ai)
+        stray_lines(ai_path, code_view(ai))
+        has(ai, "pages/9_AI.py", "AI page self-identifies as 9_")
+        has(ai, "aiassist", "AI page imports the classifier")
+        has(ai, "auth.require(", "AI page is behind the passkey gate")
+        # exactly once: a second fit() throws inside its own try/except and only
+        # duplicates the CSS - the v13.45 defect, gated per page from then on.
+        exactly(code_view(ai), "auth.fit(st)", 1, "AI page calls auth.fit() exactly once")
+        gone(code_view(ai), "import auth\nimport auth", "AI page does not import auth twice")
+
+    if dbg:
+        compiles(dbg_path, dbg)
+        tokenizes(dbg_path, dbg)
+        parses(dbg_path, dbg)
+        stray_lines(dbg_path, code_view(dbg))
+        has(dbg, "pages/10_Debug.py", "debug page self-identifies as 10_")
+        has(dbg, "auth.require(", "debug page is behind the passkey gate")
+        exactly(code_view(dbg), "auth.fit(st)", 1, "debug page calls auth.fit() exactly once")
+        gone(code_view(dbg), "import auth\nimport auth", "debug page does not import auth twice")
 
     auth_api()
     page_numbers()
