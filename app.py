@@ -9490,10 +9490,17 @@ def _res_own_files():
 
 
 def _res_is_result_file(path):
-    """True for a file inside THIS user's results directory."""
+    """True for a file inside THIS user's results directory, bodies included.
+
+    v13.87: a keyword body lives in <results>/kw_hits_<stamp>/, one level deeper
+    than the directory this tested for - so a body counted as a CACHE file and
+    "Delete my cache files" removed it while "Delete my RESULT files" left it.
+    A kw_hits_* parent is a result parent.
+    """
     if not _RES_DIR_NAME:
         return False
-    return os.path.basename(os.path.dirname(path)) == _RES_DIR_NAME
+    _parent = os.path.basename(os.path.dirname(path))
+    return _parent == _RES_DIR_NAME or _parent.startswith("kw_hits_")
 
 
 def _res_snapshot():
@@ -9820,7 +9827,7 @@ def _on_free_ram():
             pass
     for _k in ("_bb_prefilter_cache", "bb_reader_msgs", "bb_reader_note",
                "_ex_zip", "_fmt_bad", "_fmt_truncated", "_res_snap",
-               "_res_dl", "_res_prev", "bb_kw_hits"):
+               "_res_dl", "_res_prev"):
         try:
             _ss.pop(_k, None)
         except Exception:
