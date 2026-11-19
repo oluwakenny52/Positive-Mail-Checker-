@@ -136,7 +136,7 @@ Display Fit (font size / content scale) is in every page's sidebar via
 before creating the widgets, and a second call in the same run raises
 `StreamlitWidgetAlreadyInstantiatedError` inside its own `try/except`.
 
-Every page guards the import with `hasattr(auth, "fit_panel")` +
+Pages guard the import with `hasattr(auth, "fit_panel")` +
 `importlib.reload(auth)`, never a bare `auth.fit_panel` expression inside a
 `try:`. The bare form is intercepted by Streamlit's magic-write, which routes it
 through `st.help` -> `ast.parse` and can raise `IndentationError` on the
