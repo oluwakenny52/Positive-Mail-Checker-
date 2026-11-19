@@ -446,10 +446,19 @@ _run = st.button("\U0001f6e1 Check exposure", type="primary",
                  disabled=not _pairs, width="stretch")
 
 if _run and _pairs:
+    _tier = "http-only" if _http_only else "http+browser"
     breach.trace("CLICK", "run", "pressed: %d address(es), workers=%d, delay=%s, "
-                 "browser=%s" % (len(_pairs), int(_workers), _delay,
-                                 "off" if _http_only else "on"))
-    breach.configure(pages=int(_pages), delay=float(_delay))
+                 "tier=%s" % (len(_pairs), int(_workers), _delay, _tier))
+    # v13.87: THE TIER IS PASSED. Both calls take it; the except is only for a
+    # breach.py that has not caught up yet, and it says so in the trace rather
+    # than silently running the old way.
+    try:
+        breach.configure(pages=int(_pages), delay=float(_delay),
+                         http_only=bool(_http_only))
+    except TypeError:
+        breach.configure(pages=int(_pages), delay=float(_delay))
+        breach.trace("WARN", "run", "breach.configure has no http_only argument - "
+                                    "the tier switch is NOT applied")
     _since0 = breach.trace_seq()
     _bar = st.progress(0.0, text="0 / %d" % len(_pairs))
     _live = st.empty()
@@ -466,10 +475,19 @@ if _run and _pairs:
         except Exception:
             pass
 
+    _rows = []
     try:
-        _rows = list(breach.check_many(
-            _pairs, workers=int(_workers), progress=_tick, cancel=_cancel,
-            force=bool(_force), delay=float(_delay)).values())
+        try:
+            _rows = list(breach.check_many(
+                _pairs, workers=int(_workers), progress=_tick, cancel=_cancel,
+                force=bool(_force), delay=float(_delay),
+                http_only=bool(_http_only)).values())
+        except TypeError:
+            breach.trace("WARN", "run", "breach.check_many has no http_only argument - "
+                                        "re-running without it")
+            _rows = list(breach.check_many(
+                _pairs, workers=int(_workers), progress=_tick, cancel=_cancel,
+                force=bool(_force), delay=float(_delay)).values())
     except Exception as e:
         _rows = []
         st.session_state[_MSG_KEY] = ("error", "Run failed: %s: %s"
@@ -487,17 +505,25 @@ if _run and _pairs:
         st.session_state[_QUAL_KEY] = breach.score(_rows)
         st.session_state[_RUN_KEY] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         _b = _band_counts(_rows)
-        _msg = ("Checked %d. %d old, %d partially new, %d new, %d clean, "
-                "%d unresolved." % (len(_rows), _b["OLD"], _b["PARTIAL"],
+        # The tier is part of the summary, not a detail: UNKNOWN under HTTP only
+        # means "challenged, not tried", and under http+browser it means the
+        # browser failed too. Those are different problems.
+        _msg = ("Checked %d via %s. %d old, %d partially new, %d new, %d clean, "
+                "%d unresolved." % (len(_rows), _tier, _b["OLD"], _b["PARTIAL"],
                                     _b["NEW"], _b["CLEAN"], _b["UNKNOWN"]))
         breach.trace("INFO", "run", "summary: " + _msg)
         # A message widget is REQUIRED here. Without one the ledger closes the
         # press as "NO RESULT | finished without reporting", which is exactly what
         # the 00:36:57 entry recorded.
-        if _b["UNKNOWN"]:
+        if _b["UNKNOWN"] and _http_only:
             st.session_state[_MSG_KEY] = (
-                "warning", _msg + " The unresolved ones could not be read - turn the "
-                                  "browser on, or untick HTTP only.")
+                "warning", _msg + " Unresolved ones were challenged and HTTP only was "
+                                  "selected - switch the tier to HTTP then browser to "
+                                  "resolve them.")
+        elif _b["UNKNOWN"]:
+            st.session_state[_MSG_KEY] = (
+                "warning", _msg + " The unresolved ones could not be read by either "
+                                  "tier - see the trace for the exact error.")
         else:
             st.session_state[_MSG_KEY] = ("success", _msg)
     elif not st.session_state.get(_MSG_KEY):
