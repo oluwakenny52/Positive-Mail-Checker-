@@ -1,7 +1,7 @@
-# @@FILE pages/8_Breach.py blocks=12 version=v13.83
+# @@FILE pages/8_Breach.py blocks=12 version=v13.84
 # @@BLOCK 000 FILE_HEADER deps=-
 """
-pages/8_Breach.py - breach exposure and combo freshness  (v13.83)
+pages/8_Breach.py - breach exposure and combo freshness  (v13.84)
 =================================================================
 What a list of combos has actually been in, from keyless sources, with the
 verdict about FRESHNESS rather than count.
@@ -28,12 +28,20 @@ THE BANDS
   CLEAN     password unseen and address in no readable source
   UNKNOWN   nothing readable - the only honest answer when every tier failed
 
+THE BROWSER (v13.84)
+--------------------
+The package comes from requirements.txt; the ~150 MB Chromium binary does not.
+The browser row in section 1 installs it once, on a background thread, and shows
+the state. A failed install prints its own error rather than pretending the site
+was blocked. Passwords work with no browser at all - the browser only rescues an
+address the site challenges.
+
 ISOLATION
 ---------
 The cache and the history resolve through auth.user_file(), so both are one
 file per user. Nothing on this page reads another user's data.
 
-Read-only except Run / Clear history / downloads.
+Read-only except Run / Prepare browser / Clear history / downloads.
 """
 
 import importlib
@@ -171,7 +179,7 @@ st.markdown(_css(), unsafe_allow_html=True)
 # @@BLOCK 006 SOURCES deps=005
 import breach
 
-if not (hasattr(breach, "check_many") and hasattr(breach, "score")):
+if not (hasattr(breach, "ensure_browser") and hasattr(breach, "check_many")):
     breach = importlib.reload(breach)
 
 from auth import user_file
@@ -325,6 +333,39 @@ if _pairs:
 else:
     st.caption("Nothing queued.")
 
+# ---- the browser, and its state ------------------------------------------------
+# Kicked on load so the first press already has one. Non-blocking and idempotent:
+# a sentinel means done, a live thread means running, a previous failure stays
+# failed until the button is pressed. The install is ~150 MB, so it is never
+# retried on its own.
+_bst = breach.browser_state()
+if _bst.get("state") == "unknown":
+    breach.ensure_browser()
+    _bst = breach.browser_state()
+
+_bst1, _bst2 = st.columns([0.72, 0.28])
+with _bst1:
+    if _bst.get("state") == "ready":
+        st.caption("\u2705 Browser ready - a challenged address is resolved in place.")
+    elif _bst.get("state") == "installing":
+        st.caption("\u23f3 Browser installing (%ss). Passwords are checked either way; "
+                   "a challenged address comes back UNKNOWN until it finishes."
+                   % _bst.get("seconds", 0))
+    elif _bst.get("state") == "failed":
+        st.caption("\u26a0 Browser install FAILED. Passwords still work; a challenged "
+                   "address comes back UNKNOWN. Error: `%s`"
+                   % (_bst.get("error") or "unknown")[:300])
+    else:
+        st.caption("Browser not installed. Passwords are checked either way; a "
+                   "challenged address comes back UNKNOWN without one.")
+with _bst2:
+    if _bst.get("state") != "ready" and _bst.get("state") != "installing":
+        if st.button("\u2b07 Prepare browser", width="stretch",
+                     help="Downloads Chromium once, into this repo, and keeps it. "
+                          "About 150 MB - do it on wifi."):
+            breach.ensure_browser(force=True)
+            st.rerun()
+
 _c1, _c2, _c3, _c4 = st.columns(4)
 with _c1:
     _workers = st.slider("Workers", 1, 8, 4,
@@ -333,8 +374,7 @@ with _c1:
 with _c2:
     _pages = st.number_input("Browser pages", 1, 8, 4, 1,
                              help="Chromium pages for addresses Cloudflare "
-                                  "challenges. Only used when the browser is "
-                                  "installed.")
+                                  "challenges. Only used when the browser is ready.")
 with _c3:
     _force = st.checkbox("Ignore cache", value=False,
                          help="A cached answer is served for 6 hours. Tick this to "
@@ -391,7 +431,7 @@ if _run and _pairs:
         if _b["UNKNOWN"]:
             st.session_state[_MSG_KEY] = (
                 "warning", _msg + " The unresolved ones could not be read - turn the "
-                                  "browser back on, or untick HTTP only.")
+                                  "browser on, or untick HTTP only.")
         else:
             st.session_state[_MSG_KEY] = ("success", _msg)
     elif not st.session_state.get(_MSG_KEY):
