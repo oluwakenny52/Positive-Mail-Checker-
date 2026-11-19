@@ -619,21 +619,21 @@ with _t5:
 
 # @@BLOCK 013 TAB_PAGES deps=007
 with _t6:
-    ug_h("The other pages")
+    ug_h("The pages, in the order the sidebar lists them")
     st.markdown(
         """
 | Page | What it is | Costs |
 |---|---|---|
+| **Main** (`app.py`) | The checker: settings, input, run, results, in-app reader, resource monitor and the bell. This is the page the app opens on. | proxy credit |
 | **`pages/1_Notifications.py`** | Everything raised for you: resource alerts with the fix beside each one, and run events. Mark read, dismiss one, dismiss all, download the lot. Yours only. | zero |
-| **Main** (`app.py`) | The checker: settings, input, run, results, in-app reader, resource monitor and the bell. | proxy credit |
-| **`pages/2_Diagnostics.py`** | Shows the **exact rung order** the engine will dial for a domain, live TCP probes on 993/143/995/110, MX/SRV discovery, SMTP candidates, a `proxies.txt` audit, cache tools, and an **AI probe** tab. | zero - the AI probe spends Gemini quota, not proxy credit |
+| **`pages/2_Diagnostics.py`** | Shows the **exact rung order** the engine will dial for a domain, live TCP probes on 993/143/995/110, MX/SRV discovery, SMTP candidates, a `proxies.txt` audit, cache tools, and an **AI probe** tab. | zero, except the AI probe tab, which spends Gemini quota |
 | **`pages/3_Mailbox_Reader.py`** | Bulk inbox reader: folders, OTP scanner, card/credential scanner, bot purge, per-message actions. | proxy credit |
 | **`pages/4_Downloads.py`** | Export Studio, and the Mail Sorter: group and split a huge row set by country. Text / CSV / JSON / ZIP / per-status split, with filters, sorting, dedupe and presets. | zero |
 | **`pages/5_Blocks.py`** | Block Inspector. Frame audit, paste validation, `@@END` canonicaliser, fix self-check. | zero |
 | **`pages/6_User_Guide.py`** | This page. | zero |
 | **`pages/7_Logs.py`** | Full log & operator trace: the execution log, per-account dial traces, boot ledger, run record and every result file. Read-only, per user. | zero |
 | **`pages/8_Breach.py`** | Breach exposure for a list of addresses, from free sources. Verdict is about how **recent** the exposure is: ACT / REVIEW / HISTORIC / CLEAN / UNKNOWN. | free, rate-limited |
-| **`pages/9_AI.py`** | The UNKNOWN-tail classifier on its own page: enable, key, model, per-run and per-day caps, the queue, the drain and the trace. | zero - spends Gemini quota, never proxy credit |
+| **`pages/9_AI.py`** | The UNKNOWN-tail classifier on its own page: enable, key, model, per-run and per-day caps, the queue, the drain and the trace. | zero, spends Gemini quota, never proxy credit |
 | **`pages/10_Debug.py`** | Operator debug console: live counters, the probe log, the quarantine and strike maps, the gate table, thread census and the diagnostic bundle. | zero |
 """
     )
@@ -657,6 +657,13 @@ It uses three free sources and **no API key**:
   nothing, at one request every two seconds because it is throttled;
 * `psbdmp.ws`, for pastes quoting the address.
 
+The account page can be fetched two ways, and the page lets you pick:
+
+* **Browser** - a real Chromium. It gets past the bot check, and it costs a 44 MB
+  package plus a ~292 MB browser image that the deploy has to download once.
+* **HTTP** - plain `requests`. No download, no browser, but the bot check refuses
+  it more often, and a refusal is reported as UNKNOWN rather than as CLEAN.
+
 Read the verdict as urgency, not as a score:
 
 | Verdict | Meaning |
@@ -665,7 +672,7 @@ Read the verdict as urgency, not as a score:
 | **REVIEW** | a breach added inside a year |
 | **HISTORIC** | only old exposure - rotate anyway, nothing is urgent |
 | **CLEAN** | not in those sources, which is not the same as never exposed |
-| **UNKNOWN** | no readable answer - usually a throttle |
+| **UNKNOWN** | no readable answer - usually a throttle or a refused bot check |
 
 Nothing on that page is written outside your own files, and the history is yours
 alone.
