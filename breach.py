@@ -1,4 +1,4 @@
-"""breach.py - breach exposure and combo freshness.  v13.84
+"""breach.py - breach exposure and combo freshness.  v13.85
 
 NO API KEY. Three keyless sources, in order of how much they prove:
 
@@ -12,6 +12,18 @@ NO API KEY. Three keyless sources, in order of how much they prove:
                Cloudflare answers with the interstitial.
     catalogue  /api/v3/breaches - one fetch, matched LOCALLY by domain. Kept as
                a fallback for when the address tiers are blocked.
+
+WHAT IS ACTUALLY SENT  (v13.85)
+-------------------------------
+The address endpoint takes an EMAIL and nothing else. A pasted combo arrives as
+"a@b.co:hunter2" or "a@b.co | OLD" or "mailto:a@b.co", and every one of those
+tails has to come off before the URL is built - a colon is legal inside a path
+segment, so "unifiedsearch/a@b.co:hunter2" is a DIFFERENT search, not an error
+you would notice. _email_only() is the single funnel: check(), _http_search(),
+_blank(), parse_addresses() and the browser pool all pass through it, and the
+selftest asserts the transmitted URL equals the bare address. The password
+reaches exactly one place, the SHA-1 hash that is split for k-anonymity, and only
+5 hex characters of it leave the box.
 
 WHY THE CATALOGUE ALONE COULD NEVER WORK
 ----------------------------------------
@@ -34,12 +46,26 @@ thing you act on. Nothing here scores on PwnCount.
 A combo is only as good as its worse half, so the worse of the two halves wins.
 A unique password on a burned address is still burned.
 
+TRACING AND PACING  (v13.85)
+----------------------------
+HIBP is rate limited and the failure modes are quiet - a 403 that looks like an
+empty answer, a challenge page that parses as zero breaches, a browser that never
+launched. So every step is recorded: what was normalised, whether the cache
+answered, the exact URL put on the wire, the status, whether a challenge was
+detected, which tier took over, the band, the error. trace() is safe to call from
+any thread and swallows everything; trace_read() is what a page renders and
+trace_dump() is what it downloads. The ring is bounded and the file is capped.
+
+Pacing is separate from worker count on purpose. Workers bound concurrency;
+configure(delay=...) bounds the RATE at which new addresses are started, which is
+the thing a WAF counts. The default is 2 seconds between starts.
+
 Plain module, NOT frame-gated - like runstate.py and sentinel.py. No Streamlit.
 Nothing here renders. EVERY public function swallows: a breach lookup must never
 be the reason a page dies.
 
-THE BROWSER BINARY  (v13.84)
-----------------------------
+THE BROWSER BINARY
+------------------
 The Playwright PACKAGE comes from requirements.txt, but the CHROMIUM BINARY does
 not - it is a ~150 MB download and no wheel carries it. ensure_browser() fetches
 it once, into <app>/.pw-browsers, guarded by a sentinel and a lock and run on a
@@ -53,14 +79,14 @@ the text - which is why the state is a value on the page and not a log line.
 
 ISOLATION
 ---------
-The cache resolves through auth.user_file(), so it is one file per user. The
-browser pool is per process (one Chromium) but its pages are shared round-robin,
-and every result is keyed by address in the caller's own dict. The binary is
-process-wide on purpose: it is the same bytes for everybody.
+The cache and the trace file resolve through auth.user_file(), so both are one
+file per user. The browser pool is per process (one Chromium) but its pages are
+shared round-robin, and every result is keyed by address in the caller's own
+dict. The binary is process-wide on purpose: it is the same bytes for everybody.
 
 USAGE
     import breach
-    breach.configure(pages=4)
+    breach.configure(pages=4, delay=2.0)
     breach.ensure_browser()                  # non-blocking, idempotent
     breach.browser_state()                   # for the page to show
     breach.available()                       # False -> HTTP only, no browser
@@ -68,6 +94,8 @@ USAGE
     all = breach.check_many(pairs, workers=8, progress=cb, cancel=ev)
     breach.score(all.values())               # old/new breakdown
     breach.parse_addresses(text)             # -> [(email, password)]
+    breach.trace_read(limit=100)             # what a page renders
+    breach.trace_dump()                      # what a page downloads
 
     python breach.py --selftest
     python breach.py --probe someone@example.com:hunter2
@@ -77,6 +105,7 @@ import concurrent.futures as _cf
 import json
 import os
 import queue
+import random
 import re
 import subprocess
 import sys
@@ -87,7 +116,7 @@ import urllib.parse
 import urllib.request
 from datetime import datetime
 
-BREACH_VERSION = "v13.84"
+BREACH_VERSION = "v13.85"
 
 # MUST be set before anything imports playwright. setdefault, not assignment, so
 # an operator who exports their own path keeps it.
@@ -115,6 +144,13 @@ CACHE_TTL = 6 * 3600.0
 CATALOGUE_TTL = 6 * 3600.0
 INSTALL_TIMEOUT = 900
 
+# Pacing. One new address may START every DELAY_DEFAULT seconds; workers bound
+# concurrency, delay bounds the rate. 0 = flood as fast as the pool allows.
+DELAY_DEFAULT = 2.0
+DELAY_MAX = 20.0
+BROWSER_SETTLE = 700      # ms to sit on a page before the in-page fetch
+BROWSER_JITTER = 500      # extra random ms, so two pages never fire together
+
 # Band thresholds in days. Change here and nowhere else.
 PW_NEW_MAX = 0          # 0 hits = unseen = NEW
 PW_PARTIAL_MAX = 9999
@@ -135,24 +171,39 @@ CHALLENGE_MARKS = (
 
 RANK = {"NEW": 0, "PARTIAL": 1, "OLD": 2}
 
-_cfg = {"pages": PAGES_DEFAULT, "timeout": 60.0}
+# Trace ring. Bounded in memory AND on disk - a page left open for a week must
+# not grow either one without limit.
+TRACE_MAX = 600
+TRACE_NAME = "breach_trace.jsonl"
+TRACE_FILE_MAX = 4000
+TRACE_DUMP_MAX = 500
+
+_cfg = {"pages": PAGES_DEFAULT, "timeout": 60.0, "delay": DELAY_DEFAULT}
 _lock = threading.Lock()
 _pool = None
 _pw_missing = ""
-_last = {"ts": 0.0, "email": "", "verdict": "", "via": "", "ms": 0, "error": ""}
+_last = {"ts": 0.0, "email": "", "verdict": "", "via": "", "ms": 0, "error": "",
+         "url": ""}
 
 _pw_lock = threading.Lock()
 _pw_thread = None
 _pw_state = {"state": "unknown", "error": "", "started": 0.0, "finished": 0.0}
 
+_trace_lock = threading.Lock()
+_trace_file_lock = threading.Lock()
+_trace = []
+_trace_seq = [0]
+_trace_writes = [0]
+
 _EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[A-Za-z]{2,}$")
+_MAILTO_RE = re.compile(r"^mailto:\s*", re.IGNORECASE)
 
 
 # ---------------------------------------------------------------------------
 # config
 # ---------------------------------------------------------------------------
-def configure(pages=None, timeout=None):
-    """Pool size and per-address budget. Never raises."""
+def configure(pages=None, timeout=None, delay=None):
+    """Pool size, per-address budget and start pacing. Never raises."""
     with _lock:
         if pages is not None:
             try:
@@ -164,11 +215,130 @@ def configure(pages=None, timeout=None):
                 _cfg["timeout"] = max(10.0, float(timeout))
             except Exception:
                 pass
+        if delay is not None:
+            try:
+                _cfg["delay"] = max(0.0, min(DELAY_MAX, float(delay)))
+            except Exception:
+                pass
 
 
 def _pages() -> int:
     with _lock:
         return int(_cfg["pages"])
+
+
+def _delay() -> float:
+    with _lock:
+        return float(_cfg["delay"])
+
+
+# ---------------------------------------------------------------------------
+# tracing
+# ---------------------------------------------------------------------------
+def _trace_path() -> str:
+    try:
+        import auth
+        return auth.user_file(TRACE_NAME)
+    except Exception:
+        return ""
+
+
+def _trace_to_file(ev):
+    """Append one JSON line and trim the file now and then. Never raises."""
+    p = _trace_path()
+    if not p:
+        return
+    try:
+        os.makedirs(os.path.dirname(p) or ".", exist_ok=True)
+        with _trace_file_lock:
+            with open(p, "a", encoding="utf-8") as fh:
+                fh.write(json.dumps(ev, ensure_ascii=False) + "\n")
+            _trace_writes[0] += 1
+            if _trace_writes[0] % 250:
+                return
+            with open(p, encoding="utf-8", errors="ignore") as fh:
+                lines = fh.readlines()
+            if len(lines) > TRACE_FILE_MAX:
+                with open(p, "w", encoding="utf-8") as fh:
+                    fh.writelines(lines[-TRACE_FILE_MAX:])
+    except Exception:
+        pass
+
+
+def trace(level, step, detail="", email=""):
+    """Record one step. Safe from any thread, swallows everything.
+
+    level is a short tag the page colours by - INFO / WARN / ERR / CLICK.
+    """
+    try:
+        now = time.time()
+        with _trace_lock:
+            _trace_seq[0] += 1
+            ev = {"seq": _trace_seq[0], "ts": round(now, 3),
+                  "clock": datetime.fromtimestamp(now).strftime("%H:%M:%S.%f")[:-3],
+                  "level": str(level or "INFO")[:8].upper(),
+                  "step": str(step or "")[:40],
+                  "email": str(email or "")[:120],
+                  "detail": str(detail or "")[:600]}
+            _trace.append(ev)
+            if len(_trace) > TRACE_MAX:
+                del _trace[:len(_trace) - TRACE_MAX]
+        _trace_to_file(ev)
+        return ev
+    except Exception:
+        return None
+
+
+def trace_seq() -> int:
+    with _trace_lock:
+        return _trace_seq[0]
+
+
+def trace_read(limit=200, since=0):
+    """Events newer than `since`, oldest first. Never raises."""
+    try:
+        n = max(1, min(TRACE_MAX, int(limit or 200)))
+        floor = int(since or 0)
+    except Exception:
+        n, floor = 200, 0
+    with _trace_lock:
+        got = [e for e in _trace if e.get("seq", 0) > floor]
+    return got[-n:]
+
+
+def trace_text(limit=200, since=0) -> str:
+    """The trace as fixed-width text, for st.code and for a download."""
+    rows = []
+    for e in trace_read(limit=limit, since=since):
+        rows.append("%s %-5s %-12s %-32s %s" % (
+            e.get("clock", ""), e.get("level", ""), e.get("step", ""),
+            e.get("email", "") or "-", e.get("detail", "")))
+    return "\n".join(rows) if rows else "(nothing traced yet)"
+
+
+def trace_dump() -> str:
+    """The file, capped, else the ring. For a download button."""
+    p = _trace_path()
+    try:
+        if p and os.path.exists(p):
+            with open(p, encoding="utf-8", errors="ignore") as fh:
+                lines = fh.readlines()
+            return "".join(lines[-TRACE_DUMP_MAX:])
+    except Exception:
+        pass
+    return trace_text(limit=TRACE_MAX) + "\n"
+
+
+def trace_clear():
+    p = _trace_path()
+    try:
+        if p and os.path.exists(p):
+            os.remove(p)
+    except Exception:
+        pass
+    with _trace_lock:
+        _trace.clear()
+        _trace_writes[0] = 0
 
 
 # ---------------------------------------------------------------------------
@@ -193,6 +363,7 @@ def _install_now():
     with _pw_lock:
         _pw_state = {"state": "installing", "error": "", "started": time.time(),
                      "finished": 0.0}
+    trace("INFO", "browser", "install started into %s" % _PW_DIR)
     try:
         os.makedirs(_PW_DIR, exist_ok=True)
         env = dict(os.environ)
@@ -207,18 +378,22 @@ def _install_now():
                 _pw_state = {"state": "failed", "error": _tail or "install exited %d"
                              % proc.returncode, "started": _pw_state["started"],
                              "finished": time.time()}
+            trace("ERR", "browser", "install failed: %s" % _tail[:300])
             return
         with open(_PW_SENTINEL, "w", encoding="utf-8") as fh:
             fh.write("ok\n")
         with _pw_lock:
             _pw_state = {"state": "ready", "error": "", "started": _pw_state["started"],
                          "finished": time.time()}
+        trace("INFO", "browser", "install finished in %ds"
+              % int(time.time() - _pw_state["started"]))
     except Exception as exc:
         with _pw_lock:
             _pw_state = {"state": "failed", "error": "%s: %s"
                          % (type(exc).__name__, exc),
                          "started": _pw_state.get("started", 0.0),
                          "finished": time.time()}
+        trace("ERR", "browser", "install raised %s: %s" % (type(exc).__name__, exc))
 
 
 def ensure_browser(force=False) -> str:
@@ -303,13 +478,40 @@ def _norm(addr) -> str:
     return str(addr or "").strip().strip("<>").strip().lower()
 
 
+def _email_only(addr) -> str:
+    """The bare address, with every pasted tail cut off. THE only thing HIBP sees.
+
+    A combo can arrive as "a@b.co:pw", "a@b.co | OLD", "mailto:a@b.co",
+    "<a@b.co>", "\"a@b.co\":pw", or a re-pasted bucket line. Each tail is legal
+    inside a URL path segment, so leaving one on does not raise - it silently
+    searches a different string. Everything funnels through here.
+
+    Order matters: the tails come off FIRST, then the wrapping quotes and angle
+    brackets, because "a@b.co":pw ends in the password, not in a quote, and a
+    strip before the split would leave the quote attached to the address.
+    """
+    s = str(addr or "").strip().lstrip("\ufeff").strip()
+    s = _MAILTO_RE.sub("", s).strip()
+    if "|" in s:
+        s = s.split("|", 1)[0]
+    if ":" in s:
+        s = s.split(":", 1)[0]
+    s = s.strip().strip("\"'").strip().strip("<>").strip()
+    return _norm(s)
+
+
 def is_email(addr) -> bool:
-    return bool(_EMAIL_RE.match(_norm(addr)))
+    return bool(_EMAIL_RE.match(_email_only(addr)))
 
 
 def domain_of(addr) -> str:
-    a = _norm(addr)
+    a = _email_only(addr)
     return a.split("@", 1)[1] if "@" in a else ""
+
+
+def unified_url(addr) -> str:
+    """The exact URL for an address. Quoted, and address-only by construction."""
+    return UNIFIED % urllib.parse.quote(_email_only(addr))
 
 
 def parse_addresses(text):
@@ -317,7 +519,9 @@ def parse_addresses(text):
 
     A line is cut at the FIRST '|' then the FIRST ':', and only the left part is
     kept as the address. A line with no password yields ("", password) so an
-    address-only list still works.
+    address-only list still works. The address goes through _email_only(), not
+    _norm(), so a quoted or bracketed line yields the same clean address the
+    request will carry.
     """
     out, seen = [], set()
     for raw in str(text or "").splitlines():
@@ -331,7 +535,7 @@ def parse_addresses(text):
             head, tail = s.split(":", 1)
             s = head.strip()
             pw = tail.strip()
-        s = _norm(s)
+        s = _email_only(s)
         if not s or s in seen or not is_email(s):
             continue
         seen.add(s)
@@ -363,7 +567,7 @@ def _is_corpus(breach) -> bool:
 
 
 def _blank(addr, pw="") -> dict:
-    return {"email": _norm(addr), "password_len": len(pw or ""), "verdict": "",
+    return {"email": _email_only(addr), "password_len": len(pw or ""), "verdict": "",
             "bucket": "", "reason": "", "breaches": [], "pastes": [],
             "pw_count": None, "corpora": 0, "sites": 0, "sensitive": 0,
             "newest_days": None, "count": None, "via": "",
@@ -420,6 +624,7 @@ def _fresh(entry, ttl) -> bool:
 
 def clear_cache() -> None:
     _save({})
+    trace("CLICK", "cache", "cleared by the page")
 
 
 # ---------------------------------------------------------------------------
@@ -446,16 +651,21 @@ def pwned_count(password, force=False):
     cache = _load()
     entry = (cache.get("pw") or {}).get(full)
     if not force and _fresh(entry, CACHE_TTL):
+        trace("INFO", "pw", "cache hit, %s hit(s)" % entry.get("n"))
         return entry.get("n")
 
     try:
         import requests
     except Exception:
+        trace("ERR", "pw", "requests not importable")
         return None
     n = None
     try:
+        trace("INFO", "pw", "GET %s (prefix %s, 35 chars kept local)"
+              % (PW_RANGE % prefix, prefix))
         r = requests.get(PW_RANGE % prefix, timeout=HTTP_TIMEOUT,
                          headers={"User-Agent": UA, "Add-Padding": "true"})
+        trace("INFO", "pw", "http %d, %d byte(s)" % (r.status_code, len(r.text or "")))
         if r.status_code == 200:
             for line in (r.text or "").splitlines():
                 if ":" not in line:
@@ -466,7 +676,8 @@ def pwned_count(password, force=False):
                     break
             if n is None:
                 n = 0
-    except Exception:
+    except Exception as exc:
+        trace("ERR", "pw", "%s: %s" % (type(exc).__name__, exc))
         return entry.get("n") if entry else None
 
     cache.setdefault("pw", {})[full] = {"ts": time.time(), "n": n}
@@ -538,40 +749,55 @@ def _parse_payload(addr, payload, via, started, pw) -> dict:
 
 
 def _http_search(addr, pw) -> dict:
+    addr = _email_only(addr)
+    url = unified_url(addr)
+    with _lock:
+        _last["url"] = url
     started = time.time()
+    trace("INFO", "http", "GET %s" % url, addr)
     req = urllib.request.Request(
-        UNIFIED % urllib.parse.quote(_norm(addr)),
-        headers={"Accept": "application/json", "Accept-Language": "en-GB,en;q=0.9",
-                 "User-Agent": UA, "Referer": HIBP_BASE + "/"})
+        url, headers={"Accept": "application/json",
+                      "Accept-Language": "en-GB,en;q=0.9",
+                      "User-Agent": UA, "Referer": HIBP_BASE + "/"})
     try:
         with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT) as resp:
             body = resp.read().decode("utf-8", "replace")
             status = resp.status
+            trace("INFO", "http", "http %d (%d byte(s))" % (status, len(body)), addr)
     except urllib.error.HTTPError as exc:
         try:
             body = exc.read().decode("utf-8", "replace")
         except Exception:
             body = ""
         status = exc.code
+        trace("WARN", "http", "http %d (%d byte(s))" % (status, len(body)), addr)
     except Exception as exc:
         rec = _blank(addr, pw)
         rec["via"] = "http"
         rec["error"] = "%s: %s" % (type(exc).__name__, exc)
+        trace("ERR", "http", "%s: %s" % (type(exc).__name__, exc), addr)
         return rec
 
     if status == 404:
+        trace("INFO", "http", "404 - address in no source", addr)
         rec = _blank(addr, pw)
         rec["via"] = "http"
         rec["count"] = 0
         return rec
     if _looks_like_challenge(status, body):
+        trace("WARN", "http", "challenge detected (http %d) - browser tier needed"
+              % status, addr)
         rec = _blank(addr, pw)
         rec["via"] = "http"
         rec["error"] = "challenge (http %d)" % status
         return rec
     try:
-        return _parse_payload(addr, json.loads(body or "{}"), "http", started, pw)
+        rec = _parse_payload(addr, json.loads(body or "{}"), "http", started, pw)
+        trace("INFO", "http", "parsed %s breach(es), %s paste(s)"
+              % (len(rec["breaches"]), len(rec["pastes"])), addr)
+        return rec
     except Exception as exc:
+        trace("ERR", "http", "unparsable: %s" % exc, addr)
         rec = _blank(addr, pw)
         rec["via"] = "http"
         rec["error"] = "unparsable: %s" % exc
@@ -613,6 +839,7 @@ class _BrowserPool:
         pw = browser = context = None
         try:
             from playwright.sync_api import sync_playwright
+            trace("INFO", "browser", "launching chromium (%d page(s))" % self._size)
             pw = sync_playwright().start()
             browser = pw.chromium.launch(
                 headless=True,
@@ -624,8 +851,10 @@ class _BrowserPool:
             context.add_init_script(
                 "Object.defineProperty(navigator,'webdriver',{get:()=>undefined});")
             context.set_default_timeout(NAV_TIMEOUT)
+            trace("INFO", "browser", "launched, context armed")
         except Exception as exc:
             self._boot_err = "%s: %s" % (type(exc).__name__, exc)
+            trace("ERR", "browser", "launch failed: %s" % self._boot_err)
             self._started.set()
             return
 
@@ -641,8 +870,11 @@ class _BrowserPool:
             page = None
             try:
                 page = self._take(context)
+                trace("INFO", "browser", "page taken", addr)
                 started = time.time()
                 status, body = self._search(page, addr)
+                trace("INFO", "browser", "in-page fetch http %d (%d byte(s))"
+                      % (status, len(body or "")), addr)
                 if status == 404:
                     rec = _blank(addr, pw_s)
                     rec["via"] = "browser"
@@ -651,14 +883,18 @@ class _BrowserPool:
                     rec = _blank(addr, pw_s)
                     rec["via"] = "browser"
                     rec["error"] = "challenge survived (http %d)" % status
+                    trace("WARN", "browser", "challenge survived", addr)
                 else:
                     try:
                         rec = _parse_payload(addr, json.loads(body or "{}"),
                                              "browser", started, pw_s)
+                        trace("INFO", "browser", "parsed %s breach(es)"
+                              % len(rec["breaches"]), addr)
                     except Exception as exc:
                         rec = _blank(addr, pw_s)
                         rec["via"] = "browser"
                         rec["error"] = "unparsable: %s" % exc
+                        trace("ERR", "browser", "unparsable: %s" % exc, addr)
                 if not fut.done():
                     fut.set_result(rec)
             except Exception as exc:
@@ -667,6 +903,7 @@ class _BrowserPool:
                     rec["via"] = "browser"
                     rec["error"] = "%s: %s" % (type(exc).__name__, exc)
                     fut.set_result(rec)
+                trace("ERR", "browser", "%s: %s" % (type(exc).__name__, exc), addr)
             finally:
                 if page is not None:
                     try:
@@ -686,6 +923,7 @@ class _BrowserPool:
             pw.stop()
         except Exception:
             pass
+        trace("INFO", "browser", "pool stopped")
 
     def _new_page(self, context):
         try:
@@ -707,6 +945,7 @@ class _BrowserPool:
 
     def _clear(self, page):
         """Land on the site and sit out the interstitial."""
+        trace("INFO", "browser", "landing on %s/ to clear" % HIBP_BASE)
         page.goto(HIBP_BASE + "/", wait_until="domcontentloaded", timeout=NAV_TIMEOUT)
         deadline = time.time() + CHALLENGE_WAIT
         while time.time() < deadline:
@@ -715,16 +954,26 @@ class _BrowserPool:
             except Exception:
                 title = ""
             if "pwned" in title and "moment" not in title:
+                trace("INFO", "browser", "clearance title: %r" % title[:60])
                 return True
+            trace("INFO", "browser", "interstitial title: %r" % title[:60])
             page.wait_for_timeout(1500 if any(m in title for m in CHALLENGE_MARKS) else 1200)
+        trace("WARN", "browser", "clearance wait expired")
         return True
 
     def _search(self, page, addr):
         """Fetch from inside the page so the clearance cookie is carried."""
+        addr = _email_only(addr)
         status, body = 0, ""
         for attempt in (0, 1):
             if "haveibeenpwned.com" not in (page.url or ""):
                 self._clear(page)
+            # Settle, so consecutive pages do not fire in lockstep. This is the
+            # "slow" part of the browser tier and it is deliberate.
+            try:
+                page.wait_for_timeout(BROWSER_SETTLE + random.randint(0, BROWSER_JITTER))
+            except Exception:
+                pass
             try:
                 out = page.evaluate(
                     """async (email) => {
@@ -732,10 +981,14 @@ class _BrowserPool:
                             encodeURIComponent(email),
                             {headers: {'Accept': 'application/json'}});
                         return {status: r.status, body: await r.text()};
-                    }""", _norm(addr))
+                    }""", addr)
                 status, body = int(out.get("status") or 0), out.get("body") or ""
-            except Exception:
+                trace("INFO", "browser", "attempt %d -> http %d" % (attempt + 1, status),
+                      addr)
+            except Exception as exc:
                 status, body = 0, ""
+                trace("WARN", "browser", "attempt %d raised %s"
+                      % (attempt + 1, type(exc).__name__), addr)
             if status and not _looks_like_challenge(status, body):
                 return status, body
             if attempt == 0:
@@ -743,8 +996,10 @@ class _BrowserPool:
         return status, body
 
     def submit(self, addr, pw):
+        addr = _email_only(addr)
         fut = _cf.Future()
-        self._q.put((_norm(addr), pw, fut))
+        self._q.put((addr, pw, fut))
+        trace("INFO", "browser", "queued in pool", addr)
         return fut
 
     def stop(self):
@@ -815,37 +1070,48 @@ _REASON = {
 # ---------------------------------------------------------------------------
 def check(addr, password="", force=False, allow_browser=True) -> dict:
     """One address. Pwned Passwords, then address exposure. Never raises."""
-    addr = _norm(addr)
+    raw = addr
+    addr = _email_only(addr)
     if not is_email(addr):
         rec = _blank(addr, password)
         rec["verdict"] = rec["bucket"] = "UNKNOWN"
         rec["reason"] = rec["error"] = "not an email address"
+        trace("WARN", "address", "rejected %r - not an email" % str(raw)[:80])
         return rec
+    trace("INFO", "address", "using %r, password %s"
+          % (addr, "kept (hash only)" if password else "absent"), addr)
 
     cache = _load()
     entry = (cache.get("address") or {}).get(addr)
     if not force and _fresh(entry, CACHE_TTL):
         got = dict(entry.get("report") or {})
         if got:
+            trace("INFO", "cache", "hit, verdict %s - no request sent"
+                  % got.get("verdict"), addr)
             return got
 
     rec = _blank(addr, password)
     rec["pw_count"] = pwned_count(password, force=force)
+    trace("INFO", "pw", "result: %s" % ("no password" if rec["pw_count"] is None
+                                        else "%d hit(s)" % rec["pw_count"]), addr)
 
     addr_rec = _http_search(addr, password)
     if addr_rec.get("error", "").startswith("challenge"):
         if allow_browser and available():
             try:
                 pool = _get_pool()
+                trace("INFO", "browser", "handing off to the browser tier", addr)
                 addr_rec = pool.submit(addr, password).result(timeout=_cfg["timeout"])
             except Exception as exc:
                 rec["error"] = "browser failed: %s: %s" % (type(exc).__name__, exc)
+                trace("ERR", "browser", rec["error"], addr)
         else:
             # Kick the install so the NEXT press has a browser, and say which of
             # the two reasons it was: a missing binary is not a blocked site.
             if allow_browser and not available():
                 ensure_browser()
             addr_rec["error"] += " | no browser (%s)" % browser_note()
+            trace("WARN", "browser", "not used: %s" % browser_note(), addr)
 
     rec["breaches"] = addr_rec.get("breaches") or []
     rec["pastes"] = addr_rec.get("pastes") or []
@@ -863,6 +1129,9 @@ def check(addr, password="", force=False, allow_browser=True) -> dict:
     rec["reason"] = _REASON.get(rec["bucket"], "")
     if rec["bucket"] == "UNKNOWN" and not rec["error"]:
         rec["error"] = "no readable answer"
+    trace("INFO", "band", "%s (%s) - pw %s, addr %s, %d ms"
+          % (rec["bucket"], rec["reason"] or "-", rec["pw_count"],
+             addr_rec.get("via") or "-", rec["elapsed_ms"]), addr)
 
     if rec["bucket"] != "UNKNOWN":
         cache.setdefault("address", {})[addr] = {"ts": time.time(), "report": rec}
@@ -878,20 +1147,37 @@ def _remember(rec):
                       "ms": rec.get("elapsed_ms", 0), "error": rec.get("error", "")})
 
 
-def check_many(pairs, workers=4, progress=None, cancel=None, force=False) -> dict:
-    """Check every (email, password) pair. Returns {email: record}."""
+def last_url() -> str:
+    """The exact address URL last put on the wire - the proof the tail was cut."""
+    with _lock:
+        return _last.get("url", "")
+
+
+def check_many(pairs, workers=4, progress=None, cancel=None, force=False,
+               delay=None) -> dict:
+    """Check every (email, password) pair. Returns {email: record}.
+
+    Paced on purpose: `workers` bounds concurrency, `delay` bounds the rate at
+    which NEW addresses are started. A pool of 8 that starts 8 at once is what a
+    WAF sees as a burst; a pool of 8 that starts one every two seconds is not.
+    """
     uniq, seen = [], set()
     for item in pairs or []:
         if isinstance(item, (tuple, list)) and item:
             em, pw = item[0], (item[1] if len(item) > 1 else "")
         else:
             em, pw = item, ""
-        em = _norm(em)
+        em = _email_only(em)
         if em and em not in seen:
             seen.add(em)
             uniq.append((em, str(pw or "")))
     out, guard, done = {}, threading.Lock(), [0]
     total = len(uniq)
+    pace = _delay() if delay is None else max(0.0, float(delay or 0.0))
+    trace("INFO", "run", "start: %d unique address(es), workers=%d, pace=%ss"
+          % (total, max(1, int(workers or 1)), pace))
+    if not total:
+        return out
 
     def one(item):
         em, pw = item
@@ -899,7 +1185,9 @@ def check_many(pairs, workers=4, progress=None, cancel=None, force=False) -> dic
             rec = _blank(em, pw)
             rec["verdict"] = rec["bucket"] = "UNKNOWN"
             rec["error"] = "cancelled"
+            trace("WARN", "cancel", "cancelled before the check", em)
         else:
+            trace("INFO", "start", "checking", em)
             rec = check(em, pw, force=force)
         with guard:
             out[em] = rec
@@ -911,12 +1199,27 @@ def check_many(pairs, workers=4, progress=None, cancel=None, force=False) -> dic
             except Exception:
                 pass
 
+    width = max(1, min(16, int(workers or 1)))
     try:
-        with _cf.ThreadPoolExecutor(max_workers=max(1, min(16, int(workers or 1)))) as ex:
-            list(ex.map(one, uniq))
-    except Exception:
+        with _cf.ThreadPoolExecutor(max_workers=width) as ex:
+            inflight = set()
+            for item in uniq:
+                inflight.add(ex.submit(one, item))
+                step = 0.0 if (cancel is not None and cancel.is_set()) else pace
+                if step:
+                    time.sleep(step)
+                if len(inflight) >= width:
+                    _done, inflight = _cf.wait(inflight,
+                                               return_when=_cf.FIRST_COMPLETED)
+            while inflight:
+                _done, inflight = _cf.wait(inflight,
+                                           return_when=_cf.FIRST_COMPLETED)
+    except Exception as exc:
+        trace("ERR", "run", "executor failed (%s), falling back to serial"
+              % type(exc).__name__)
         for item in uniq:
             out.setdefault(item[0], check(item[0], item[1], force=force))
+    trace("INFO", "run", "finished: %d record(s)" % len(out))
     return out
 
 
@@ -951,8 +1254,9 @@ def score(records) -> dict:
 def report() -> dict:
     return {"version": BREACH_VERSION, "browser": available(),
             "browser_state": browser_state().get("state", ""),
-            "browser_error": browser_note(), "pages": _pages(),
-            "pool": _pool is not None, "last": dict(_last)}
+            "browser_error": browser_note(), "pages": _pages(), "delay": _delay(),
+            "pool": _pool is not None, "last": dict(_last),
+            "trace_seq": trace_seq()}
 
 
 # ---------------------------------------------------------------------------
@@ -968,6 +1272,23 @@ def selftest(verbose=False) -> bool:
     add("not_email", not is_email("nope"))
     add("domain_of", domain_of("A@B.com") == "b.com")
     add("norm", _norm(" A@B.CO ") == "a@b.co")
+
+    # ---- the address funnel: nothing but the address may survive it ----
+    add("only_colon", _email_only("a@b.co:hunter2") == "a@b.co")
+    add("only_pipe", _email_only("a@b.co | OLD") == "a@b.co")
+    add("only_both", _email_only("a@b.co:hunter2 | OLD") == "a@b.co")
+    add("only_mailto", _email_only("mailto:a@b.co") == "a@b.co")
+    add("only_angle", _email_only("<a@b.co>") == "a@b.co")
+    add("only_quoted", _email_only("\"a@b.co\":pw") == "a@b.co")
+    add("only_bom", _email_only("\ufeffa@b.co") == "a@b.co")
+    add("only_upper", _email_only(" A@B.CO:pw ") == "a@b.co")
+    add("is_email_combo", is_email("a@b.co:hunter2"))
+    add("url_no_password", unified_url("a@b.co:hunter2") ==
+        HIBP_BASE + "/unifiedsearch/a%40b.co")
+    add("url_quotes", unified_url("a+b@c.co") == HIBP_BASE + "/unifiedsearch/a%2Bb%40c.co")
+    add("blank_email_only", _blank("a@b.co:pw")["email"] == "a@b.co")
+    add("parse_no_pw_in_addr", parse_addresses("a@b.co:pw")[0][0] == "a@b.co")
+    add("parse_quoted", parse_addresses("\"a@b.co\":pw")[0][0] == "a@b.co")
 
     pairs = parse_addresses("a@b.co:pw\n- c@d.co:pw2 | VALID\njunk\nA@B.co:x")
     add("parse_count", len(pairs) == 2)
@@ -1027,6 +1348,20 @@ def selftest(verbose=False) -> bool:
     add("note_is_str", isinstance(browser_note(), str))
     add("env_set", os.environ.get("PLAYWRIGHT_BROWSERS_PATH") == _PW_DIR)
 
+    # ---- pacing and tracing ----
+    configure(delay=3.5)
+    add("delay_set", _delay() == 3.5)
+    configure(delay=DELAY_DEFAULT)
+    add("delay_clamped", 0.0 <= _delay() <= DELAY_MAX)
+    add("delay_default_on", DELAY_DEFAULT > 0)
+
+    before = trace_seq()
+    trace("INFO", "selftest", "hello")
+    got = trace_read(limit=5, since=before)
+    add("trace_recorded", len(got) == 1 and got[0]["step"] == "selftest")
+    add("trace_text_shape", "selftest" in trace_text(limit=5, since=before))
+    add("trace_dump_shape", isinstance(trace_dump(), str))
+
     bad_names = [n for n, ok in checks if not ok]
     if bad_names:
         raise AssertionError("breach selftest failed: " + ", ".join(bad_names))
@@ -1054,8 +1389,10 @@ def main(argv=None) -> int:
         pairs = parse_addresses(target) or [(target, "")]
         print("browser available:", available(), browser_note())
         res = check(pairs[0][0], pairs[0][1], force=True)
+        print("url sent:", last_url())
         print(json.dumps({k: res.get(k) for k in ("email", "verdict", "pw_count",
                                                   "count", "via", "error")}, indent=2))
+        print(trace_text(limit=40))
         return 0 if res.get("verdict") else 1
     selftest(verbose=True)
     return 0
