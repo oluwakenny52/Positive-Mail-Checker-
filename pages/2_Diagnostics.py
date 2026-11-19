@@ -992,14 +992,14 @@ if st.button("📋 Build copy/paste bundle"):
 # 7. AI PROBE
 # ==========================================================================
 with tab_ai:
-    st.markdown("#### AI tail classifier - live probe")
+    st.markdown("#### AI tail classifier")
     st.caption(
         "aiassist.py is a classifier of LAST RESORT. `status.classify_error` runs "
         "first and only an UNKNOWN tail ever reaches a model, which may only name "
         "a better bucket from a closed list - never a verdict. Off unless "
         "`GEMINI_ENABLED` is the string `true` AND `GEMINI_API_KEY` is set. Only "
         "scrubbed text leaves the box: an address local part becomes `*`, a "
-        "credential pair becomes its host:port. A probe here counts against the "
+        "credential pair becomes its host:port. A call here counts against the "
         "same per-run and per-day budgets a live run uses, and the classifier "
         "trips itself after a few consecutive failures.")
 
@@ -1047,6 +1047,7 @@ with tab_ai:
                 {"Field": "Tripped", "Value": "yes" if _ai_rep.get("tripped") else "no"},
                 {"Field": "Cache entries", "Value": _ai_rep.get("cache_entries", 0)},
                 {"Field": "Queue", "Value": _ai_rep.get("queue", 0)},
+                {"Field": "Usage file", "Value": "yes" if _ai_rep.get("usage_file") else "no"},
                 {"Field": "Last status", "Value": _ai_rep.get("last_status") or "-"},
                 {"Field": "Last latency", "Value": f"{_ai_rep.get('last_latency_ms', 0)} ms"},
                 {"Field": "Last token", "Value": _ai_rep.get("last_token") or "-"},
@@ -1097,6 +1098,33 @@ with tab_ai:
                 _ai_lvl, _ai_msg = st.session_state["ai_selftest_msg"]
                 getattr(st, _ai_lvl, st.info)(_ai_msg)
                 st.session_state.pop("ai_selftest_msg", None)
+
+            # ---- v13.82: THE FUNCTION, MADE VISIBLE -------------------------
+            # Without a run, every counter above reads zero and the module looks
+            # inert. This is the one control that shows what it actually does:
+            # paste a raw line, get the bucket back. Same budgets, same closed
+            # whitelist, same scrubbing - and a line already cached costs nothing.
+            st.markdown("**Classify one line**")
+            st.caption("Paste a raw server or proxy error line. One blocking call; "
+                       "the answer is the bucket the model would give, or nothing "
+                       "if it cannot place it.")
+            st.text_area("Line to classify", key="ai_sample_box", height=90,
+                         placeholder="550 5.7.1 <bob@example.com> rejected by policy")
+            if st.button("⚡ Classify this line", key="ai_classify_go",
+                         width="stretch", disabled=not _ai_on,
+                         help="Disabled while the classifier is off - the row above "
+                              "says which of the two flags is missing."):
+                with st.spinner("One live call..."):
+                    st.session_state["ai_classify_out"] = aiassist.classify_now(
+                        st.session_state.get("ai_sample_box") or "")
+            if "ai_classify_out" in st.session_state:
+                _ai_tok = st.session_state["ai_classify_out"]
+                if _ai_tok:
+                    st.success(f"Bucket: **{_ai_tok}** - status.py and the ladder still "
+                               f"decide what happens next.")
+                else:
+                    st.warning("No bucket. Either the model named nothing on the "
+                               "whitelist, or the classifier is off / out of budget.")
 
             _ai_out = st.session_state.get("ai_probe_out")
             if _ai_out:
