@@ -1,7 +1,7 @@
-# @@FILE pages/8_Breach.py blocks=12 version=v13.84
+# @@FILE pages/8_Breach.py blocks=12 version=v13.85
 # @@BLOCK 000 FILE_HEADER deps=-
 """
-pages/8_Breach.py - breach exposure and combo freshness  (v13.84)
+pages/8_Breach.py - breach exposure and combo freshness  (v13.85)
 =================================================================
 What a list of combos has actually been in, from keyless sources, with the
 verdict about FRESHNESS rather than count.
@@ -20,6 +20,13 @@ WHAT EACH SOURCE IS
              only when Cloudflare challenges it.
   catalogue  the free breach list, matched locally by domain, as a fallback.
 
+WHAT LEAVES THE BOX  (v13.85)
+-----------------------------
+Only the ADDRESS. A pasted `email:password` is cut at the colon before the URL
+is built, so the password never reaches haveibeenpwned.com - which would not use
+it anyway. The password goes to exactly one place: the SHA-1 hash for Pwned
+Passwords, where 5 of the 40 characters leave and 35 are matched locally.
+
 THE BANDS
 ---------
   NEW       password unseen, or exposure inside 365 days
@@ -28,8 +35,17 @@ THE BANDS
   CLEAN     password unseen and address in no readable source
   UNKNOWN   nothing readable - the only honest answer when every tier failed
 
-THE BROWSER (v13.84)
---------------------
+TRACING AND PACING  (v13.85)
+----------------------------
+Section 4 is a trace of everything: each control you moved, each address started,
+the literal URL sent, the status, whether a challenge was detected, which tier
+took over, the band, and every error verbatim. It is shown live during a run,
+kept in a per-user file, and downloadable - so a run that goes wrong can be read
+afterwards instead of guessed at. The Delay control paces address starts; workers
+only bound concurrency. Both exist because HIBP's failures are quiet ones.
+
+THE BROWSER
+-----------
 The package comes from requirements.txt; the ~150 MB Chromium binary does not.
 The browser row in section 1 installs it once, on a background thread, and shows
 the state. A failed install prints its own error rather than pretending the site
@@ -38,10 +54,10 @@ address the site challenges.
 
 ISOLATION
 ---------
-The cache and the history resolve through auth.user_file(), so both are one
-file per user. Nothing on this page reads another user's data.
+The cache, the history and the trace resolve through auth.user_file(), so each is
+one file per user. Nothing on this page reads another user's data.
 
-Read-only except Run / Prepare browser / Clear history / downloads.
+Read-only except Run / Prepare browser / Clear history / Clear trace / downloads.
 """
 
 import importlib
@@ -191,6 +207,7 @@ _RUN_KEY = "_breach_run"
 _RES_KEY = "_breach_results"
 _QUAL_KEY = "_breach_quality"
 _MSG_KEY = "_breach_msg"
+_TRACE_SHOWN = "_breach_trace_shown"
 
 _BAND_CSS = {"NEW": "br-new", "PARTIAL": "br-partial", "OLD": "br-old",
              "CLEAN": "br-clean", "UNKNOWN": "br-unknown"}
@@ -293,12 +310,30 @@ def _csv(rows):
     return "\n".join(out) + "\n"
 
 
+def _watch(key, label):
+    """An on_change callback that traces the control. Never raises."""
+    def cb():
+        try:
+            breach.trace("CLICK", "control", "%s -> %r"
+                         % (label, st.session_state.get(key)))
+        except Exception:
+            pass
+    return cb
+
+
+def _trace_code(limit=200, since=0):
+    return breach.trace_text(limit=limit, since=since)
+
+
 # ---- owner gate: a second unlock in this tab must not inherit the last run ----
 _owner = os.path.basename(user_file("")) or ""
 if st.session_state.get(_OWNER_KEY) != _owner:
-    for k in (_RES_KEY, _RUN_KEY, _QUAL_KEY, _MSG_KEY, "_breach_text"):
+    for k in (_RES_KEY, _RUN_KEY, _QUAL_KEY, _MSG_KEY, "_breach_text", _TRACE_SHOWN):
         st.session_state.pop(k, None)
     st.session_state[_OWNER_KEY] = _owner
+    breach.trace("INFO", "page", "new owner in this tab, state cleared")
+
+breach.trace("INFO", "page", "loaded")
 # @@END 006 SOURCES
 
 # @@BLOCK 007 INPUT deps=006
@@ -312,15 +347,18 @@ with _t1:
         "One address per line. A pasted `email:pass` or `email | VERDICT` line is "
         "cut down to the address; the password is kept for the Pwned Passwords "
         "check, because how public the PASSWORD already is, is the real signal.",
-        height=200, key="_breach_text",
+        height=200, key="_breach_text", on_change=_watch("_breach_text", "text"),
         placeholder="someone@example.com:hunter2")
 with _t2:
     up = st.file_uploader("Upload a .txt list", type=["txt"], key="_breach_up")
     if up is not None:
         try:
             _text = up.getvalue().decode("utf-8", errors="ignore")
+            breach.trace("CLICK", "upload", "%s, %d byte(s)"
+                         % (getattr(up, "name", "?"), len(_text)))
         except Exception as e:
             st.error("Could not read that file: %s" % e)
+            breach.trace("ERR", "upload", str(e))
 
 _pairs = breach.parse_addresses(_text)
 _with_pw = sum(1 for _e, _p in _pairs if _p)
@@ -332,6 +370,11 @@ if _pairs:
                    "alone, which is the weaker half.")
 else:
     st.caption("Nothing queued.")
+
+st.caption("Only the address is sent to haveibeenpwned.com. A pasted "
+           "`email:password` is cut at the colon before the request is built - HIBP "
+           "does not use the password. The password only ever goes to the Pwned "
+           "Passwords hash check, and 5 of its 40 hash characters leave the box.")
 
 # ---- the browser, and its state ------------------------------------------------
 # Kicked on load so the first press already has one. Non-blocking and idempotent:
@@ -363,25 +406,37 @@ with _bst2:
         if st.button("\u2b07 Prepare browser", width="stretch",
                      help="Downloads Chromium once, into this repo, and keeps it. "
                           "About 150 MB - do it on wifi."):
+            breach.trace("CLICK", "browser", "Prepare browser pressed")
             breach.ensure_browser(force=True)
             st.rerun()
 
-_c1, _c2, _c3, _c4 = st.columns(4)
+_c1, _c2, _c3, _c4, _c5 = st.columns(5)
 with _c1:
-    _workers = st.slider("Workers", 1, 8, 4,
-                         help="Pwned Passwords is a different host and takes "
-                              "concurrency well. 4 is right for a phone.")
+    _workers = st.slider("Workers", 1, 8, 4, key="_breach_workers",
+                         on_change=_watch("_breach_workers", "workers"),
+                         help="How many addresses may be in flight at once. Pwned "
+                              "Passwords is a different host and takes concurrency "
+                              "well; the address endpoint is the slow side.")
 with _c2:
-    _pages = st.number_input("Browser pages", 1, 8, 4, 1,
+    _delay = st.slider("Delay (s)", 0.0, 10.0, 2.0, 0.5, key="_breach_delay",
+                       on_change=_watch("_breach_delay", "delay"),
+                       help="Seconds between STARTING addresses, regardless of "
+                            "worker count. This is the knob for being gentle - 2s "
+                            "trickles, 0 floods.")
+with _c3:
+    _pages = st.number_input("Browser pages", 1, 8, 4, 1, key="_breach_pages",
+                             on_change=_watch("_breach_pages", "pages"),
                              help="Chromium pages for addresses Cloudflare "
                                   "challenges. Only used when the browser is ready.")
-with _c3:
-    _force = st.checkbox("Ignore cache", value=False,
+with _c4:
+    _force = st.checkbox("Ignore cache", value=False, key="_breach_force",
+                         on_change=_watch("_breach_force", "ignore cache"),
                          help="A cached answer is served for 6 hours. Tick this to "
                               "re-check from the sources, which is what you want "
                               "straight after changing anything.")
-with _c4:
-    _http_only = st.checkbox("HTTP only", value=False,
+with _c5:
+    _http_only = st.checkbox("HTTP only", value=False, key="_breach_http_only",
+                             on_change=_watch("_breach_http_only", "http only"),
                              help="No browser. Faster, but a challenged address "
                                   "comes back UNKNOWN instead of resolved.")
 # @@END 007 INPUT
@@ -391,8 +446,13 @@ _run = st.button("\U0001f6e1 Check exposure", type="primary",
                  disabled=not _pairs, width="stretch")
 
 if _run and _pairs:
-    breach.configure(pages=int(_pages))
+    breach.trace("CLICK", "run", "pressed: %d address(es), workers=%d, delay=%s, "
+                 "browser=%s" % (len(_pairs), int(_workers), _delay,
+                                 "off" if _http_only else "on"))
+    breach.configure(pages=int(_pages), delay=float(_delay))
+    _since0 = breach.trace_seq()
     _bar = st.progress(0.0, text="0 / %d" % len(_pairs))
+    _live = st.empty()
     _cancel = threading.Event()
 
     def _tick(n, total, email, verdict):
@@ -401,15 +461,20 @@ if _run and _pairs:
                           text="%d / %d - %s" % (n, total, (verdict or "checking").lower()))
         except Exception:
             pass
+        try:
+            _live.code(_trace_code(limit=12, since=_since0), language="text")
+        except Exception:
+            pass
 
     try:
         _rows = list(breach.check_many(
             _pairs, workers=int(_workers), progress=_tick, cancel=_cancel,
-            force=bool(_force)).values())
+            force=bool(_force), delay=float(_delay)).values())
     except Exception as e:
         _rows = []
         st.session_state[_MSG_KEY] = ("error", "Run failed: %s: %s"
                                       % (type(e).__name__, e))
+        breach.trace("ERR", "run", "raised %s: %s" % (type(e).__name__, e))
     _bar.empty()
 
     if _rows:
@@ -425,6 +490,7 @@ if _run and _pairs:
         _msg = ("Checked %d. %d old, %d partially new, %d new, %d clean, "
                 "%d unresolved." % (len(_rows), _b["OLD"], _b["PARTIAL"],
                                     _b["NEW"], _b["CLEAN"], _b["UNKNOWN"]))
+        breach.trace("INFO", "run", "summary: " + _msg)
         # A message widget is REQUIRED here. Without one the ledger closes the
         # press as "NO RESULT | finished without reporting", which is exactly what
         # the 00:36:57 entry recorded.
@@ -491,7 +557,8 @@ if _rows:
 
     _view = st.radio("Show",
                      ["OLD", "PARTIAL", "NEW", "UNKNOWN", "CLEAN", "All"],
-                     horizontal=True, key="_breach_view")
+                     horizontal=True, key="_breach_view",
+                     on_change=_watch("_breach_view", "band filter"))
     _show = _rows if _view == "All" else [r for r in _rows if r.get("verdict") == _view]
 
     if not _show:
@@ -551,6 +618,35 @@ if _rows:
 
 # @@BLOCK 010 HISTORY deps=009
 st.markdown("---")
+st.markdown("### 4. Trace")
+st.caption("Everything that happened, newest last: each control moved, each address "
+           "started, the exact URL sent, the status, whether a challenge appeared, "
+           "which tier took over, the band and every error. `%s` carries only the "
+           "address - the password is never in it."
+           % (breach.last_url() or "https://haveibeenpwned.com/unifiedsearch/<address>"))
+
+_tevents = breach.trace_read(limit=250)
+if not _tevents:
+    st.caption("Nothing traced yet.")
+else:
+    st.code(breach.trace_text(limit=250), language="text")
+
+_td1, _td2, _td3 = st.columns(3)
+with _td1:
+    st.download_button("\u2b07 Download trace log",
+                       data=breach.trace_dump().encode("utf-8"),
+                       file_name="breach_trace_%s.log"
+                                 % datetime.now().strftime("%Y%m%d_%H%M%S"),
+                       mime="text/plain", width="stretch")
+with _td2:
+    if st.button("Clear trace", width="stretch"):
+        breach.trace_clear()
+        breach.trace("CLICK", "trace", "cleared")
+        st.rerun()
+with _td3:
+    st.caption("Last URL: `%s`" % (breach.last_url() or "-"))
+
+st.markdown("---")
 st.markdown("### History (yours, capped at %d)" % _HIST_MAX)
 
 _hist = _hist_read()
@@ -567,6 +663,7 @@ else:
           "pastes": len(h.get("pastes") or [])} for h in reversed(_hist[-100:])],
         width="stretch", height=260)
     if st.button("Clear my history"):
+        breach.trace("CLICK", "history", "cleared")
         _hist_clear()
         st.rerun()
 # @@END 010 HISTORY
@@ -593,7 +690,8 @@ with _n3:
         st.caption("Export Studio lives at pages/4_Downloads.py")
 
 st.caption("Sources: Pwned Passwords (k-anonymity - only 5 hash characters leave the "
-           "box), the HIBP address search and the free breach list. No API key. A CLEAN "
-           "verdict means not in those sources, not that the address was never exposed.")
+           "box), the HIBP address search and the free breach list. No API key. Only "
+           "the address is transmitted; a pasted password is never. A CLEAN verdict "
+           "means not in those sources, not that the address was never exposed.")
 # @@END 011 FOOTER
 # @@EOF
