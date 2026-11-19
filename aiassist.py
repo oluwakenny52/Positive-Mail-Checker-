@@ -29,6 +29,9 @@ Not in the hot path.  classify() is a cache read and returns None immediately on
 a miss; a miss is queued and drain() does the network, off a daemon thread, after
 the account.  Nothing here blocks a socket, a rung or a verdict.
 
+classify_now() is the one exception: it dials immediately, for a line a human is
+looking at.  Same budgets, same whitelist, same scrubbing.
+
 PER-USER, NOT PER-PROCESS
 -------------------------
 app.py is ONE process for every user, so a module-global counter would let one
@@ -36,6 +39,15 @@ user's tail eat another's allowance.  The day counter is a per-user file behind
 auth.user_file(); only the run counter and the cache are process state, and the
 cache is keyed by the scrubbed text so two sessions cannot read each other's
 numbers.
+
+THE USAGE PATH IS CAPTURED, NOT LOOKED UP LATE
+---------------------------------------------
+auth.user_file() reads the session, and drain() runs on a bare daemon thread
+with no ScriptRunContext - where that lookup answers with the ANONYMOUS prefix
+and logs a "missing ScriptRunContext" warning per call.  configure() therefore
+resolves the path once, on whatever thread called it (the main one), and every
+later thread uses that.  Without this the per-day counter could be written to a
+throwaway file and the allowance would leak between users.
 
 USAGE
     import aiassist
@@ -45,6 +57,7 @@ USAGE
     aiassist.reset_run()                      # once per run, not per account
     tok = aiassist.classify(raw_server_text)  # token, or None - never blocks
     aiassist.drain(limit=6)                   # do the network, later
+    tok = aiassist.classify_now(one_line)     # one blocking call, on demand
     aiassist.report()                         # counters dict for the diag bundle
 
     python aiassist.py --selftest     offline, canned payloads, no network
@@ -104,6 +117,7 @@ _cfg = {
     "max_per_run": 40,
     "max_per_day": 300,
     "stop_after_fails": 4,
+    "usage_path": "",
 }
 
 _lock = threading.Lock()
@@ -140,6 +154,10 @@ def configure(enabled=None, key=None, model=None, max_per_run=None,
     """Set the runtime config.  Any argument left None falls back to os.environ.
 
     Never raises: a bad int is coerced, a bad model string falls back.
+
+    Also RESOLVES THE USAGE PATH HERE, on this thread.  See the module
+    docstring - the drain thread has no session and would answer with the
+    anonymous prefix.
     """
     with _lock:
         if enabled is None:
@@ -160,6 +178,7 @@ def configure(enabled=None, key=None, model=None, max_per_run=None,
                 _cfg[name] = max(0, int(val))
             except Exception:
                 pass
+    _path_capture()
 
 
 def enabled() -> bool:
@@ -186,6 +205,24 @@ def _usage_path() -> str:
         return auth.user_file(USAGE_NAME) or ""
     except Exception:
         return ""
+
+
+def _path_capture():
+    """Resolve the usage path NOW and keep it.  Never raises."""
+    try:
+        got = _usage_path()
+    except Exception:
+        got = ""
+    if got:
+        with _lock:
+            _cfg["usage_path"] = got
+
+
+def _path() -> str:
+    """The captured path, or a live lookup if configure() never ran."""
+    with _lock:
+        got = _cfg.get("usage_path") or ""
+    return got or _usage_path()
 
 
 def _day_key() -> str:
@@ -247,7 +284,7 @@ def _budget_free() -> bool:
         limit = int(_cfg["max_per_day"])
     if limit <= 0:
         return True
-    return _day_count(_usage_path()) < limit
+    return _day_count(_path()) < limit
 
 
 # ---------------------------------------------------------------------------
@@ -360,6 +397,25 @@ def classify(text, defer=True):
     return None
 
 
+def classify_now(text):
+    """Token for this text, dialled NOW.  One blocking call.  Never raises.
+
+    classify() is a cache read; this is the tier a human uses on a line they are
+    looking at.  Same budgets, same closed whitelist, same scrubbing, and a
+    cached answer is still served without a call.
+    """
+    if not enabled() or _tripped or not _budget_free():
+        return None
+    body = _scrub(text)
+    if not body:
+        return None
+    key = _key(body)
+    tok = _cache_get(key)
+    if tok is not None:
+        return tok
+    return _one_call(body, key)
+
+
 def drain(limit=None) -> dict:
     """Spend calls on queued texts.  Returns {'tried','got','skipped'}.
 
@@ -451,7 +507,7 @@ def _one_call(body, key_cache=None):
                              "candidateCount": 1},
     }
     code, text, ms = _post(ENDPOINT % model, payload, api_key)
-    _day_bump(_usage_path())
+    _day_bump(_path())
 
     with _lock:
         _calls_run += 1
@@ -495,7 +551,7 @@ def _one_call(body, key_cache=None):
 def report() -> dict:
     """Counters for the diag bundle and the sidebar.  Never raises."""
     try:
-        path = _usage_path()
+        path = _path()
         with _lock:
             data = {
                 "version": AI_VERSION,
@@ -565,6 +621,7 @@ def selftest(verbose=False) -> bool:
     configure(enabled="false", key="")
     add("disabled_off", enabled() is False)
     add("disabled_classify_none", classify("anything") is None)
+    add("disabled_classify_now_none", classify_now("anything") is None)
 
     configure(enabled="true", key="")
     add("no_key_still_off", enabled() is False)
@@ -574,6 +631,7 @@ def selftest(verbose=False) -> bool:
     add("enabled_with_key", enabled() is True)
     add("model_set", report()["model"] == "m1")
     add("key_tail", report()["key_tail"] == "...-key")
+    add("path_is_str", isinstance(_path(), str))
 
     reset_run()
     add("enqueue_accepts", enqueue("first text") is True)
@@ -587,6 +645,7 @@ def selftest(verbose=False) -> bool:
         with _lock:
             _calls_run += 1
     add("budget_exhausted", _budget_free() is False)
+    add("classify_now_no_budget", classify_now("fresh text") is None)
     reset_run()
     add("budget_reset", _budget_free() is True)
 
