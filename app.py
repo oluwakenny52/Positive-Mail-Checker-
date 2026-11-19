@@ -82,6 +82,7 @@ proxies.txt / Streamlit secrets / live DNS / live ip-api.
 # @@BLOCK 001 IMPORTS deps=-
 import base64
 import glob
+import hashlib
 import html
 import imaplib
 # Raise the default 1 MB line limit so large SEARCH responses do not abort.
@@ -2116,14 +2117,23 @@ def _thread_report():
 
 
 def _thread_stats():
+    """Counts keyed by the names block 030 prints.
+
+    v13.86: the equality tests against "alive-pool" and "first-probe" were
+    written before those threads were made per-scope, so they reported 0 for
+    ever - the names are "alive-pool-<hash>" and "first-probe-<hash>" now. There
+    is no "start-refresh" thread in the file at all; it is counted by prefix
+    anyway so a reintroduced one shows up. The dict keys are unchanged because
+    block 030 prints them by name.
+    """
     names = [t.name for t in threading.enumerate()]
     return {
         "total": len(names),
         "executor": sum(1 for n in names if n.startswith("ThreadPoolExecutor")),
         "scriptrunner": sum(1 for n in names if "ScriptRunner" in n),
-        "alivepool": sum(1 for n in names if n == "alive-pool"),
-        "firstprobe": sum(1 for n in names if n == "first-probe"),
-        "startrefresh": sum(1 for n in names if n == "start-refresh"),
+        "alivepool": sum(1 for n in names if n.startswith("alive-pool")),
+        "firstprobe": sum(1 for n in names if n.startswith("first-probe")),
+        "startrefresh": sum(1 for n in names if n.startswith("start-refresh")),
     }
 # @@END 029 DIAG_THREADS
 
@@ -2905,7 +2915,7 @@ TAG_COLORS = {
 
 def _line_color(line: str) -> str:
     up = str(line).upper()
-    for tag in ("SKIPPED_COOLDOWN", "SKIPPED", "WRONG", "APP", "RBL", "FAILED", "RETRY",
+    for tag in ("KW_HITS", "SKIPPED_COOLDOWN", "SKIPPED", "WRONG", "APP", "RBL", "FAILED", "RETRY",
                 "NEED_APP_PASSWORD", "RBL_BLOCKED",
                 "WRONG_PASSWORD", "PROXY_UNHEALTHY", "CONNECTION_FAILED", "RETRY_LATER",
                 "SMTP_FAILED", "DNS_FAILED", "UNCLASSIFIED", "LOGIN_DROPPED", "VALID",
@@ -6126,6 +6136,19 @@ except Exception as e:
 # @@END 057 BOOT_RENDER
 
 # @@BLOCK 058 FILE_IO deps=039,052
+def _atomic_write_text(path, text):
+    """Write `text` to `path` through a .tmp and os.replace.
+
+    A Streamlit teardown can land mid-write on any script-thread write, and a
+    truncated proxies.txt (or clean_valid_accounts.txt) is not recoverable from
+    memory. Callers hold file_write_lock, which is an RLock.
+    """
+    tmp = str(path) + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write(text)
+    os.replace(tmp, str(path))
+
+
 def save_domain_cache():
     try:
         with file_write_lock:
@@ -6270,8 +6293,10 @@ def get_filtered_active_proxies(quiet: bool = False):
             with proxy_lock:
                 _ever = [p for p in raw
                          if int((proxy_meta.get(p) or {}).get("success", 0)) > 0]
+            _have = set(filtered)
             for p in _ever:
-                if p not in filtered and not proxy_is_blocked(p):
+                if p not in _have and not proxy_is_blocked(p):
+                    _have.add(p)
                     filtered.append(p)
 
         # FIX SCORE-2: when NOTHING ever passes the probe, every node's score
@@ -6822,7 +6847,7 @@ def smtp_auth_once(email, password, server, proxy_str=None, insecure=None, port=
         s = _raw_socket(server, port, proxy_str, timeout=to)
         if int(port) == 465:
             s = _tls_context(server, verify=not insecure).wrap_socket(s, server_hostname=server)
-        s.settimeout(max(READ_FLOOR_MIN, float(to)))
+        s.settimeout(max(3.0, min(READ_FLOOR_DEFAULT, float(to))))
 
         banner = _smtp_read_reply(s)
         if not banner.startswith("220"):
@@ -6834,7 +6859,7 @@ def smtp_auth_once(email, password, server, proxy_str=None, insecure=None, port=
             r = _smtp_cmd(s, "STARTTLS")
             if r.startswith("220"):
                 s = _tls_context(server, verify=not insecure).wrap_socket(s, server_hostname=server)
-                s.settimeout(max(READ_FLOOR_MIN, float(to)))
+                s.settimeout(max(3.0, min(READ_FLOOR_DEFAULT, float(to))))
                 ehlo = _smtp_cmd(s, f"EHLO {smtp_helo_name()}")
                 caps = ehlo.upper()
         if "AUTH" not in caps:
@@ -6886,7 +6911,7 @@ def sieve_auth_once(email, password, server, proxy_str=None, insecure=None,
     s = None
     try:
         s = _raw_socket(server, port, proxy_str, timeout=to)
-        s.settimeout(max(READ_FLOOR_MIN, float(to)))
+        s.settimeout(max(3.0, min(READ_FLOOR_DEFAULT, float(to))))
         greet = s.recv(600).decode("utf-8", errors="ignore")
         if not greet:
             raise SieveSoftError("no ManageSieve greeting")
@@ -6898,7 +6923,7 @@ def sieve_auth_once(email, password, server, proxy_str=None, insecure=None,
             r = s.recv(300).decode("utf-8", errors="ignore")
             if r.startswith("OK"):
                 s = _tls_context(server, verify=not insecure).wrap_socket(s, server_hostname=server)
-                s.settimeout(max(READ_FLOOR_MIN, float(to)))
+                s.settimeout(max(3.0, min(READ_FLOOR_DEFAULT, float(to))))
                 s.recv(600)
         who = (user or email).strip()
         payload = base64.b64encode(f"\0{who}\0{password}".encode()).decode()
@@ -8483,8 +8508,7 @@ def fetch_and_test_all_proxies(silent: bool = False):
     _US["proxy_key_map"] = keymap
     try:
         with file_write_lock:
-            with open(CFG["PROXY_KEYMAP_FILE"], "w", encoding="utf-8") as _kmf:
-                json.dump(keymap, _kmf, indent=1)
+            _atomic_write_text(CFG["PROXY_KEYMAP_FILE"], json.dumps(keymap, indent=1))
     except Exception as _kme:
         log_startup(f"WARNING: could not write proxy_key_map.json: {_kme}")
 
@@ -8499,8 +8523,8 @@ def fetch_and_test_all_proxies(silent: bool = False):
     # is the way back - and there is a Restore button.
     try:
         with file_write_lock:
-            with open(CFG["PROXY_ALL_FILE"], "w", encoding="utf-8") as _bf:
-                _bf.write("\n".join(str(i) for i in all_raw) + ("\n" if all_raw else ""))
+            _atomic_write_text(CFG["PROXY_ALL_FILE"],
+                               "\n".join(str(i) for i in all_raw) + ("\n" if all_raw else ""))
         log_startup(f"Backed up the raw fetched pool to proxies_all.txt ({len(all_raw)} line(s)).")
     except Exception as _bex:
         log_startup(f"WARNING: could not write proxies_all.txt: {_bex}")
@@ -8717,8 +8741,8 @@ def fetch_and_test_all_proxies(silent: bool = False):
 
     try:
         with file_write_lock:
-            with open(CFG["PROXY_FILE"], "w", encoding="utf-8") as f:
-                f.write("\n".join(str(i) for i in alive) + ("\n" if alive else ""))
+            _atomic_write_text(CFG["PROXY_FILE"],
+                               "\n".join(str(i) for i in alive) + ("\n" if alive else ""))
     except Exception as ex:
         str_lit.error(f"Failed to write proxies file: {ex}")
 
@@ -8797,10 +8821,9 @@ def _write_clean_valid(header, valids):
             run_count += 1
         try:
             with file_write_lock:
-                with open(CLEAN_VALID_FILE, "w", encoding="utf-8") as f:
-                    f.write(header)
-                    for em in sorted(merged):
-                        f.write(f"{em}:{merged[em]}\n")
+                _atomic_write_text(
+                    CLEAN_VALID_FILE,
+                    header + "".join(f"{em}:{merged[em]}\n" for em in sorted(merged)))
         except Exception:
             pass
     return len(merged), run_count
@@ -9006,7 +9029,8 @@ def _res_fmt(n):
 
 def _res_uid(path):
     """A stable, filesystem-independent widget-key fragment for one path."""
-    return re.sub(r"[^A-Za-z0-9]+", "_", str(path))[-70:]
+    _tail = re.sub(r"[^A-Za-z0-9]+", "_", str(path))[-70:]
+    return _tail + "_" + hashlib.sha1(str(path).encode("utf-8")).hexdigest()[:4]
 
 
 def _res_proc_mem():
@@ -9079,7 +9103,12 @@ def _res_session_bytes():
                     _total += len(str(_kk)) + len(repr(_vv))
             elif isinstance(_v, (list, tuple, set)):
                 for _item in _v:
-                    _total += len(_item) if isinstance(_item, str) else len(repr(_item))
+                    if isinstance(_item, (bytes, bytearray)):
+                        _total += len(_item)
+                    elif isinstance(_item, str):
+                        _total += len(_item)
+                    else:
+                        _total += len(repr(_item))
             else:
                 _total += len(repr(_v))
         except Exception:
