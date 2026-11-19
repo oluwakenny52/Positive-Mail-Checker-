@@ -247,7 +247,15 @@ if not st.session_state.get(_SEED_KEY):
     st.session_state["_ai_model"] = _rep.get("model") or "gemini-flash-latest"
     st.session_state["_ai_run"] = int(_rep.get("max_per_run") or 0)
     st.session_state["_ai_day"] = int(_rep.get("max_per_day") or 0)
-    st.session_state["_ai_fails"] = 4
+    # v13.86 FIX AI-SEED: THIS WAS A HARDCODED 4. report() had no such key, so the
+    # page always opened on 4 no matter what configure() had been given - and a
+    # user who set 2 and reloaded saw 4 again, then saved 4 back over it. The key
+    # exists in report() now and the seed is clamped to the widget's own range.
+    try:
+        _fails_seed = int(_rep.get("stop_after_fails") or 4)
+    except Exception:
+        _fails_seed = 4
+    st.session_state["_ai_fails"] = max(0, min(20, _fails_seed))
     st.session_state[_SEED_KEY] = True
 
 st.markdown("### 1. Configuration")
