@@ -38,7 +38,7 @@ import re
 import sys
 import tokenize
 
-__version__ = "v13.85"
+__version__ = "v13.86"
 
 BLOCKED_FILES = [
     "app.py",
@@ -77,11 +77,12 @@ BLOCKED_FILES = [
 #   v13.81  pages/2_Diagnostics.py +1 block (AI_PROBE)  files 0, blocks +1
 #   v13.85  +pages/9_AI.py              files +1, blocks +14
 #   v13.85  +pages/10_Debug.py          files +1, blocks +15
-# v13.85 is the version in the header above.  This comment used to carry the
+#   v13.86  pages/9_AI.py +2 blocks (DESCRIPTION, CHAT)  files 0, blocks +2
+# v13.86 is the version in the header above.  This comment used to carry the
 # breach page TWICE - once as v13.76 and once as v13.77, a version no file in the
 # tree has ever carried - so one event was recorded twice and half of it wrong.
 TARGET_FILES = 17
-TARGET_BLOCKS = 336
+TARGET_BLOCKS = 338
 
 FILE_RX = re.compile(r"^#\s*@@FILE\s+(\S+)\s+blocks=(\d+)\s+version=(\S+)\s*$")
 BLOCK_RX = re.compile(r"^#\s*@@BLOCK\s+(\d{3})\s+([A-Za-z0-9_]+)(?:\s+deps=(\S+))?\s*$")
