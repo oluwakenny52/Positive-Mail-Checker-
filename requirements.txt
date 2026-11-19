@@ -1,27 +1,22 @@
-# v13.37 build fix — pins that actually RESOLVE on the deploy runtime (Python 3.14.8).
+# v13.83 — playwright + greenlet added for the breach page's browser tier.
 #
-# WHAT WAS WRONG
-# --------------
-# The old pins (streamlit==1.66.0 / pandas==2.2.3 / requests==2.32.3 /
-# dnspython==2.7.0 / PySocks==1.7.1) are not what the box installed.  The deploy
-# log resolved pandas 3.1.0, streamlit 1.66.1, requests 2.34.2, dnspython 2.9.0,
-# because this file was edited three times inside the same ten minutes the box
-# was building (commits at 15:11, 15:31, 15:34).
+# THE PAIR IS THE POINT. greenlet below 3.2 has no cp314 wheel and its sources do
+# not compile against the 3.14 headers (Py_C_RECURSION_LIMIT removed), so an
+# unpinned install builds from source and fails. 3.5.6 ships a cp314 wheel.
+# playwright 1.55 is the first release that installs from wheels on 3.14.
 #
-# The pins below are the versions the deploy PROVED work on this runtime.
-# pandas 2.2.3 has no cp314 wheel, so pinning it makes every rebuild compile
-# pandas from source (minutes) or fail outright.
+# Nothing else imports playwright. breach.py guards the import and degrades to
+# HTTP-only, so if this ever fails to resolve the app still runs - it just cannot
+# resolve a Cloudflare-challenged address.
 #
-# WHY pyarrow IS PINNED HERE
-# --------------------------
-# Streamlit Cloud detects pyarrow 26.x and force-replaces it with <25
-# (apache/arrow#50471, segfault).  Pinning 24.0.0 up front skips that extra
-# resolve + uninstall + install pass and the window where the two disagree.
-#
-# To float, swap == for >= — but change one thing at a time.
+# THE ORIGINAL PINS, unchanged, for the reason recorded at v13.37:
+# pandas 2.2.3 has no cp314 wheel, and Streamlit Cloud force-replaces pyarrow
+# 26.x with <25 (apache/arrow#50471, segfault).
 streamlit==1.66.1
 pandas==3.1.0
 requests==2.34.2
 dnspython==2.9.0
 PySocks==1.7.1
 pyarrow==24.0.0
+playwright==1.55.0
+greenlet==3.5.6
