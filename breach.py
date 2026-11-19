@@ -1,64 +1,241 @@
-"""breach.py - breach exposure for one address, from FREE sources only.  v13.76
+"""breach.py - breach exposure and combo freshness.  v13.83
 
-NO API KEY, and that shapes the whole design.
+NO API KEY. Three keyless sources, in order of how much they prove:
 
-The per-account HIBP endpoint (/api/v3/breachedaccount) requires a paid key, so
-it is never called. Three keyless sources replace it:
+    passwords  api.pwnedpasswords.com/range/<5-hex> - k-anonymity, no key, no
+               challenge. Returns how many times the password appears in every
+               breach HIBP has ever loaded. THIS is the freshness signal for a
+               combo: 0 means the password is private, 40,000 means it is an old
+               bridge that has been circulating for years.
+    address    haveibeenpwned.com/unifiedsearch/<email> - the endpoint the site's
+               own search box uses. Plain HTTP first; a real browser only when
+               Cloudflare answers with the interstitial.
+    catalogue  /api/v3/breaches - one fetch, matched LOCALLY by domain. Kept as
+               a fallback for when the address tiers are blocked.
 
-    catalogue  /api/v3/breaches - the whole breach list, ONE fetch, cached per
-               user, then matched LOCALLY by domain. No per-address request at
-               all for the common case.
-    account    https://haveibeenpwned.com/account/<email> - scraped only when
-               the local match is thin, because it is HTML and rate-limited.
-    pastes     https://psbdmp.ws/api/search/<email> - paste dumps quoting the
-               address.
+WHY THE CATALOGUE ALONE COULD NEVER WORK
+----------------------------------------
+It matches by DOMAIN, and six of the seven breaches on a real address are
+stealer-log corpora that HIBP stores with an EMPTY domain - they are keyed by the
+site the password was typed into, not by a breach of one site. A domain match can
+never fire for them. The catalogue is a fallback now, not the method.
 
-THE VERDICT IS ABOUT FRESHNESS, NOT COUNT. "In 40 breaches from 2009" is noise;
-"in a breach added three weeks ago" is the thing you act on. The bands are
-derived from AddedDate, never from PwnCount.
+THE BANDS ARE ABOUT FRESHNESS, NOT COUNT
+----------------------------------------
+"In 40 breaches from 2009" is noise. "Password appeared 3 times, ever" is the
+thing you act on. Nothing here scores on PwnCount.
 
-Plain module, NOT frame-gated - like runstate.py, sentinel.py and mailsearch.py.
-Nothing here imports Streamlit and nothing here renders.
+    NEW       password unseen in Pwned Passwords, or address in a corpus < 365d
+    PARTIAL   password seen 1-9999 times, or address in a breach < 730d
+    OLD       password seen 10000+ times, or address only in breaches > 730d
+    CLEAN     password unseen AND address not in any source
+    UNKNOWN   nothing readable - the only honest answer when every tier failed
+
+A combo is only as good as its worse half, so the worse of the two halves wins.
+A unique password on a burned address is still burned.
+
+Plain module, NOT frame-gated - like runstate.py and sentinel.py. No Streamlit.
+Nothing here renders. EVERY public function swallows: a breach lookup must never
+be the reason a page dies.
 
 ISOLATION
 ---------
 The cache resolves through auth.user_file(), so it is one file per user. The
-catalogue is identical for everybody but is still cached per user, because a
-shared cache would need a lock and the fetch is cheap and rare.
+browser pool is per process (one Chromium) but its pages are shared round-robin,
+and every result is keyed by address in the caller's own dict.
 
-EVERY public function swallows. A breach lookup must never be the reason a page
-dies.
+USAGE
+    import breach
+    breach.configure(pages=4)
+    breach.available()                       # False -> HTTP only, no browser
+    rec = breach.check("a@b.com", password="hunter2")
+    all = breach.check_many(pairs, workers=8, progress=cb, cancel=ev)
+    breach.score(all.values())               # old/new breakdown
+    breach.parse_addresses(text)             # -> [(email, password)]
+
+    python breach.py --selftest
+    python breach.py --probe someone@example.com:hunter2
 """
 
+import concurrent.futures as _cf
 import json
 import os
+import queue
 import re
+import threading
 import time
+import urllib.error
+import urllib.parse
+import urllib.request
 from datetime import datetime
 
-USER_AGENT = "PositiveMailChecker/1.0 (+https://github.com/oluwakenny52)"
-HIBP_CATALOGUE = "https://haveibeenpwned.com/api/v3/breaches"
-HIBP_ACCOUNT = "https://haveibeenpwned.com/account/%s"
-PSBDMP_SEARCH = "https://psbdmp.ws/api/search/%s"
+BREACH_VERSION = "v13.83"
 
+HIBP_BASE = "https://haveibeenpwned.com"
+UNIFIED = HIBP_BASE + "/unifiedsearch/%s"
+CATALOGUE_URL = HIBP_BASE + "/api/v3/breaches"
+PW_RANGE = "https://api.pwnedpasswords.com/range/%s"
+
+UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+      "(KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36")
+
+HTTP_TIMEOUT = 12.0
+NAV_TIMEOUT = 30000
+CHALLENGE_WAIT = 30.0
+PAGES_DEFAULT = 4
+PAGES_MAX = 8
+DESC_MAX = 1200
 CACHE_NAME = "breach_cache.json"
+CACHE_TTL = 6 * 3600.0
 CATALOGUE_TTL = 6 * 3600.0
-ADDRESS_TTL = 6 * 3600.0
-PASTE_TTL = 3600.0
-# One HTML page every this many seconds, or HIBP throttles us.
-ACCOUNT_MIN_INTERVAL = 2.0
 
-NEW_DAYS = 90
-RECENT_DAYS = 365
+# Band thresholds in days. Change here and nowhere else.
+PW_NEW_MAX = 0          # 0 hits = unseen = NEW
+PW_PARTIAL_MAX = 9999
+CORPUS_NEW_DAYS = 365
+BREACH_PARTIAL_DAYS = 730
 
-_EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
-_COUNT_RE = re.compile(r"(\d[\d,]*)\s+(?:data\s+)?breach", re.I)
-_EMAIL = "_breach_last_call"
+CORPORA = frozenset({
+    "stealer logs", "synthient stealer log", "synthient credential stuffing",
+    "alien txtbase", "combolists posted to telegram", "naz.api", "collection #1",
+    "anti public", "exploit.in", "onliner spambot", "big combolist", "cit0day",
+    "emotet", "qakbot", "redline", "raccoon", "vidar", "lumma",
+})
+
+CHALLENGE_MARKS = (
+    "just a moment", "performing security verification", "checking your browser",
+    "cf-challenge", "attention required", "verify you are human",
+)
+
+RANK = {"NEW": 0, "PARTIAL": 1, "OLD": 2}
+
+_cfg = {"pages": PAGES_DEFAULT, "timeout": 60.0}
+_lock = threading.Lock()
+_pool = None
+_pw_missing = ""
+_last = {"ts": 0.0, "email": "", "verdict": "", "via": "", "ms": 0, "error": ""}
+
+_EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[A-Za-z]{2,}$")
+_LINE_SPLIT = re.compile(r"[|:\t]")
 
 
-# --------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# config
+# ---------------------------------------------------------------------------
+def configure(pages=None, timeout=None):
+    """Pool size and per-address budget. Never raises."""
+    with _lock:
+        if pages is not None:
+            try:
+                _cfg["pages"] = max(1, min(PAGES_MAX, int(pages)))
+            except Exception:
+                pass
+        if timeout is not None:
+            try:
+                _cfg["timeout"] = max(10.0, float(timeout))
+            except Exception:
+                pass
+
+
+def _pages() -> int:
+    with _lock:
+        return int(_cfg["pages"])
+
+
+def available() -> bool:
+    """True when Playwright imports. Cached - an import per address is waste."""
+    global _pw_missing
+    if _pw_missing:
+        return False
+    try:
+        import playwright.sync_api  # noqa: F401
+        return True
+    except Exception as exc:
+        _pw_missing = "%s: %s" % (type(exc).__name__, exc)
+        return False
+
+
+def browser_note() -> str:
+    return _pw_missing
+
+
+# ---------------------------------------------------------------------------
+# helpers
+# ---------------------------------------------------------------------------
+def _norm(addr) -> str:
+    return str(addr or "").strip().strip("<>").strip().lower()
+
+
+def is_email(addr) -> bool:
+    return bool(_EMAIL_RE.match(_norm(addr)))
+
+
+def domain_of(addr) -> str:
+    a = _norm(addr)
+    return a.split("@", 1)[1] if "@" in a else ""
+
+
+def parse_addresses(text):
+    """A pasted list -> [(email, password)]. Password may be empty.
+
+    A line is cut at the FIRST '|' then the FIRST ':', and only the left part is
+    kept as the address. A line with no password yields ("", password) so an
+    address-only list still works.
+    """
+    out, seen = [], set()
+    for raw in str(text or "").splitlines():
+        s = raw.strip().lstrip("\ufeff").strip("\"'").strip()
+        if not s or s.startswith("#"):
+            continue
+        if "|" in s:
+            s = s.split("|", 1)[0].strip()
+        pw = ""
+        if ":" in s:
+            head, tail = s.split(":", 1)
+            s = head.strip()
+            pw = tail.strip()
+        s = _norm(s)
+        if not s or s in seen or not is_email(s):
+            continue
+        seen.add(s)
+        out.append((s, pw))
+    return out
+
+
+def _days(date_str):
+    """Age in days of an ISO date, or None when unusable."""
+    if not date_str:
+        return None
+    txt = str(date_str)[:10]
+    try:
+        y, m, d = (int(p) for p in txt.split("-"))
+        stamp = time.mktime((y, m, d, 0, 0, 0, 0, 0, -1))
+        return max(0, int((time.time() - stamp) / 86400))
+    except Exception:
+        return None
+
+
+def _is_corpus(breach) -> bool:
+    name = str(breach.get("Name") or breach.get("Title") or "").strip().lower()
+    if name in CORPORA:
+        return True
+    if any(k in name for k in ("stealer", "combolist", "credential stuff",
+                               "txtbase", "naz.api")):
+        return True
+    return bool(breach.get("IsSpamList")) and not breach.get("Domain")
+
+
+def _blank(addr, pw="") -> dict:
+    return {"email": _norm(addr), "password_len": len(pw or ""), "verdict": "",
+            "bucket": "", "reason": "", "breaches": [], "pastes": [],
+            "pw_count": None, "corpora": 0, "sites": 0, "sensitive": 0,
+            "newest_days": None, "count": None, "via": "",
+            "checked_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"), "error": ""}
+
+
+# ---------------------------------------------------------------------------
 # cache
-# --------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 def _path() -> str:
     try:
         import auth
@@ -104,310 +281,632 @@ def _fresh(entry, ttl) -> bool:
         return False
 
 
-# --------------------------------------------------------------------------
-# helpers
-# --------------------------------------------------------------------------
-def _norm(addr) -> str:
-    return str(addr or "").strip().lower()
-
-
-def domain_of(addr) -> str:
-    a = _norm(addr)
-    return a.split("@", 1)[1] if "@" in a else ""
-
-
-def is_email(addr) -> bool:
-    return bool(_EMAIL_RE.match(_norm(addr)))
-
-
-def _throttle() -> None:
-    """One account-page request every ACCOUNT_MIN_INTERVAL, process-wide.
-
-    Module state is acceptable here: the limit belongs to the provider, not to a
-    user, so two sessions sharing it is correct behaviour rather than a leak.
-    """
-    g = globals()
-    last = g.get(_EMAIL, 0.0)
-    wait = ACCOUNT_MIN_INTERVAL - (time.time() - last)
-    if wait > 0:
-        time.sleep(min(wait, ACCOUNT_MIN_INTERVAL))
-    g[_EMAIL] = time.time()
-
-
-def _get(url, accept="application/json", timeout=10):
-    try:
-        import requests
-    except Exception:
-        return None
-    try:
-        r = requests.get(url, timeout=timeout, verify=False,
-                         headers={"User-Agent": USER_AGENT, "Accept": accept})
-    except Exception:
-        return None
-    if r.status_code != 200:
-        return None
-    return r
-
-
-def _days_ago(stamp) -> int:
-    """Days between an ISO date (or epoch) and now. -1 when unparseable."""
-    if stamp in (None, ""):
-        return -1
-    try:
-        if isinstance(stamp, (int, float)):
-            ts = float(stamp)
-        else:
-            ts = datetime.fromisoformat(str(stamp).replace("Z", "+00:00")).timestamp()
-        return max(0, int((time.time() - ts) / 86400.0))
-    except Exception:
-        return -1
-
-
-def _band(days: int) -> str:
-    if days < 0:
-        return "unknown"
-    if days <= NEW_DAYS:
-        return "new"
-    if days <= RECENT_DAYS:
-        return "recent"
-    return "old"
-
-
-# --------------------------------------------------------------------------
-# catalogue
-# --------------------------------------------------------------------------
-def catalogue(force: bool = False) -> list:
-    """The whole breach catalogue, cached. [] on failure.
-
-    One fetch serves every address: the local match is by domain, so a run over
-    500 addresses makes ONE request, not 500.
-    """
-    cache = _load()
-    entry = cache.get("catalogue")
-    if not force and _fresh(entry, CATALOGUE_TTL):
-        return entry.get("rows") or []
-
-    r = _get(HIBP_CATALOGUE)
-    if r is None:
-        return (entry or {}).get("rows") or []
-    try:
-        rows = r.json() or []
-    except Exception:
-        return (entry or {}).get("rows") or []
-    if not isinstance(rows, list):
-        return (entry or {}).get("rows") or []
-
-    keep = []
-    for b in rows:
-        if not isinstance(b, dict):
-            continue
-        dom = _norm(b.get("Domain"))
-        if not dom:
-            continue
-        keep.append({
-            "name": b.get("Name") or "",
-            "title": b.get("Title") or b.get("Name") or "",
-            "domain": dom,
-            "breach_date": b.get("BreachDate") or "",
-            "added": b.get("AddedDate") or "",
-            "pwn": int(b.get("PwnCount") or 0),
-            "classes": [str(c) for c in (b.get("DataClasses") or [])],
-            "verified": bool(b.get("IsVerified")),
-            "sensitive": bool(b.get("IsSensitive")),
-            "description": re.sub(r"<[^>]+>", " ", str(b.get("Description") or ""))[:400],
-        })
-    cache["catalogue"] = {"ts": time.time(), "rows": keep}
-    _save(cache)
-    return keep
-
-
-def _match(rows, domain) -> list:
-    """Breaches whose Domain is the address's domain or a parent of it."""
-    d = _norm(domain)
-    if not d:
-        return []
-    out = []
-    for b in rows:
-        bd = b.get("domain") or ""
-        if bd == d or d.endswith("." + bd) or bd.endswith("." + d):
-            out.append(b)
-    return out
-
-
-# --------------------------------------------------------------------------
-# account page
-# --------------------------------------------------------------------------
-def _account_count(addr) -> int:
-    """The breach count on the account page, or -1 when unreadable.
-
-    Defensive on purpose: the page is HTML and HIBP restyles it. A miss returns
-    -1 so the caller keeps whatever the local match found rather than reporting
-    a false zero.
-    """
-    _throttle()
-    r = _get(HIBP_ACCOUNT % _norm(addr), accept="text/html")
-    if r is None:
-        return -1
-    try:
-        body = r.text or ""
-    except Exception:
-        return -1
-    if "good news" in body.lower() and "pwned" in body.lower():
-        return 0
-    m = _COUNT_RE.search(body)
-    if m:
-        try:
-            return int(m.group(1).replace(",", ""))
-        except Exception:
-            return -1
-    return -1
-
-
-# --------------------------------------------------------------------------
-# pastes
-# --------------------------------------------------------------------------
-def pastes(addr, force: bool = False) -> list:
-    """Paste hits quoting the address. [] on failure."""
-    a = _norm(addr)
-    cache = _load()
-    entry = (cache.get("pastes") or {}).get(a)
-    if not force and _fresh(entry, PASTE_TTL):
-        return entry.get("rows") or []
-
-    r = _get(PSBDMP_SEARCH % a)
-    if r is None:
-        return (entry or {}).get("rows") or []
-    try:
-        data = r.json() or {}
-    except Exception:
-        return (entry or {}).get("rows") or []
-    rows = []
-    for d in (data.get("data") or [])[:50]:
-        if not isinstance(d, dict):
-            continue
-        rows.append({"id": str(d.get("id") or ""),
-                     "time": d.get("time") or "",
-                     "tags": d.get("tags") or "",
-                     "days": _days_ago(d.get("time"))})
-    cache.setdefault("pastes", {})[a] = {"ts": time.time(), "rows": rows}
-    _save(cache)
-    return rows
-
-
-# --------------------------------------------------------------------------
-# the verdict
-# --------------------------------------------------------------------------
-def _verdict(breaches, paste_rows, count):
-    """Freshness band -> verdict. Order of severity is NEW, RECENT, OLD, CLEAN."""
-    bands = [_band(b.get("added_days", -1)) for b in breaches]
-    fresh_paste = any((p.get("days", -1) >= 0 and p["days"] <= RECENT_DAYS)
-                      for p in paste_rows)
-
-    if "new" in bands:
-        return "ACT", "in a breach added within %d days" % NEW_DAYS
-    if fresh_paste:
-        return "ACT", "quoted in a paste from the last year"
-    if "recent" in bands:
-        return "REVIEW", "in a breach added within a year"
-    if breaches or paste_rows:
-        return "HISTORIC", "only old breaches or pastes - rotate anyway"
-    if count == 0:
-        return "CLEAN", "not in the catalogue"
-    if count < 0:
-        return "UNKNOWN", "no readable answer"
-    return "UNKNOWN", "count %d but no domain match" % count
-
-
-def check(addr, force: bool = False) -> dict:
-    """Full exposure report for ONE address. Never raises.
-
-    Shape:
-        {"email", "domain", "verdict", "reason", "count", "breaches",
-         "pastes", "checked_at", "error"}
-    """
-    out = {"email": _norm(addr), "domain": "", "verdict": "UNKNOWN",
-           "reason": "", "count": -1, "breaches": [], "pastes": [],
-           "checked_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"), "error": ""}
-    try:
-        if not is_email(addr):
-            out["reason"] = "not an email address"
-            return out
-        out["domain"] = domain_of(addr)
-
-        cache = _load()
-        entry = (cache.get("address") or {}).get(out["email"])
-        if not force and _fresh(entry, ADDRESS_TTL):
-            return dict(entry.get("report") or out)
-
-        rows = _match(catalogue(), out["domain"])
-        for b in rows:
-            b["added_days"] = _days_ago(b.get("added"))
-            b["breach_days"] = _days_ago(b.get("breach_date"))
-        rows.sort(key=lambda b: b.get("added_days", 10 ** 6))
-        out["breaches"] = rows
-
-        # The page is only worth a request when the local match is thin - the
-        # catalogue is matched by DOMAIN, so a personal domain usually misses.
-        count = -1
-        if len(rows) < 1:
-            count = _account_count(out["email"])
-        out["count"] = count if count >= 0 else len(rows)
-
-        try:
-            out["pastes"] = pastes(out["email"], force=force)
-        except Exception:
-            out["pastes"] = []
-
-        out["verdict"], out["reason"] = _verdict(rows, out["pastes"], count)
-
-        cache.setdefault("address", {})[out["email"]] = {
-            "ts": time.time(), "report": out}
-        _save(cache)
-        return out
-    except Exception as e:
-        out["error"] = "%s: %s" % (type(e).__name__, e)
-        return out
-
-
 def clear_cache() -> None:
     _save({})
 
 
-def selftest() -> bool:
-    """Offline: banding, matching and verdict precedence. No network."""
+# ---------------------------------------------------------------------------
+# tier 1 - Pwned Passwords (k-anonymity, keyless, unchallenged)
+# ---------------------------------------------------------------------------
+def _pw_hash(password) -> str:
+    import hashlib
+    return hashlib.sha1(str(password or "").encode("utf-8", "replace")).hexdigest().upper()
+
+
+def pwned_count(password, force=False):
+    """Times this password appears in Pwned Passwords, or None if unreadable.
+
+    Only the first five hex characters of the SHA-1 leave the box; the remaining
+    35 are matched locally. That is the whole point of k-anonymity and it means
+    the password itself is never transmitted.
+    """
+    pw = str(password or "")
+    if not pw:
+        return None
+    full = _pw_hash(pw)
+    prefix, suffix = full[:5], full[5:]
+
+    cache = _load()
+    entry = (cache.get("pw") or {}).get(full)
+    if not force and _fresh(entry, CACHE_TTL):
+        return entry.get("n")
+
+    try:
+        import requests
+    except Exception:
+        return None
+    n = None
+    try:
+        r = requests.get(PW_RANGE % prefix, timeout=HTTP_TIMEOUT,
+                         headers={"User-Agent": UA, "Add-Padding": "true"})
+        if r.status_code == 200:
+            for line in (r.text or "").splitlines():
+                if ":" not in line:
+                    continue
+                got, _, cnt = line.partition(":")
+                if got.strip().upper() == suffix:
+                    n = int(cnt.strip() or 0)
+                    break
+            if n is None:
+                n = 0
+    except Exception:
+        return entry.get("n") if entry else None
+
+    cache.setdefault("pw", {})[full] = {"ts": time.time(), "n": n}
+    _save(cache)
+    return n
+
+
+# ---------------------------------------------------------------------------
+# tier 2 - address exposure
+# ---------------------------------------------------------------------------
+def _looks_like_challenge(status, body) -> bool:
+    if status in (403, 429, 503):
+        return True
+    low = (body or "")[:4000].lower()
+    return any(m in low for m in CHALLENGE_MARKS)
+
+
+def _parse_payload(addr, payload, via, started, pw) -> dict:
+    """Normalised record from a unifiedsearch payload. Pure - used by selftest."""
+    rec = _blank(addr, pw)
+    rec["via"] = via
+    rec["elapsed_ms"] = int((time.time() - started) * 1000) if started else 0
+    if not isinstance(payload, dict):
+        rec["error"] = "payload not an object"
+        return rec
+
+    raw_b = payload.get("Breaches")
+    raw_p = payload.get("Pastes")
+    raw_b = raw_b if isinstance(raw_b, list) else []
+    raw_p = raw_p if isinstance(raw_p, list) else []
+
+    for b in raw_b:
+        if not isinstance(b, dict):
+            continue
+        corpus = _is_corpus(b)
+        days = _days(b.get("BreachDate") or b.get("AddedDate"))
+        rec["breaches"].append({
+            "name": str(b.get("Name") or ""),
+            "title": str(b.get("Title") or b.get("Name") or "Unnamed")[:160],
+            "domain": str(b.get("Domain") or ""),
+            "date": str(b.get("BreachDate") or "")[:10],
+            "pwn_count": int(b.get("PwnCount") or 0),
+            "classes": [str(c) for c in (b.get("DataClasses") or [])][:12],
+            "sensitive": bool(b.get("IsSensitive")),
+            "corpus": corpus,
+            "days": days,
+            "description": str(b.get("Description") or "")[:DESC_MAX],
+        })
+        if corpus:
+            rec["corpora"] += 1
+        else:
+            rec["sites"] += 1
+        if b.get("IsSensitive"):
+            rec["sensitive"] += 1
+        if days is not None:
+            if rec["newest_days"] is None or days < rec["newest_days"]:
+                rec["newest_days"] = days
+
+    for p in raw_p:
+        if not isinstance(p, dict):
+            continue
+        rec["pastes"].append({
+            "title": str(p.get("Title") or "Untitled")[:200],
+            "source": str(p.get("Source") or "")[:120],
+            "date": str(p.get("Date") or "")[:10],
+        })
+    rec["count"] = len(rec["breaches"]) + len(rec["pastes"])
+    return rec
+
+
+def _http_search(addr, pw) -> dict:
+    started = time.time()
+    req = urllib.request.Request(
+        UNIFIED % urllib.parse.quote(_norm(addr)),
+        headers={"Accept": "application/json", "Accept-Language": "en-GB,en;q=0.9",
+                 "User-Agent": UA, "Referer": HIBP_BASE + "/"})
+    try:
+        with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT) as resp:
+            body = resp.read().decode("utf-8", "replace")
+            status = resp.status
+    except urllib.error.HTTPError as exc:
+        try:
+            body = exc.read().decode("utf-8", "replace")
+        except Exception:
+            body = ""
+        status = exc.code
+    except Exception as exc:
+        rec = _blank(addr, pw)
+        rec["via"] = "http"
+        rec["error"] = "%s: %s" % (type(exc).__name__, exc)
+        return rec
+
+    if status == 404:
+        rec = _blank(addr, pw)
+        rec["via"] = "http"
+        rec["count"] = 0
+        return rec
+    if _looks_like_challenge(status, body):
+        rec = _blank(addr, pw)
+        rec["via"] = "http"
+        rec["error"] = "challenge (http %d)" % status
+        return rec
+    try:
+        return _parse_payload(addr, json.loads(body or "{}"), "http", started, pw)
+    except Exception as exc:
+        rec = _blank(addr, pw)
+        rec["via"] = "http"
+        rec["error"] = "unparsable: %s" % exc
+        return rec
+
+
+# ---------------------------------------------------------------------------
+# tier 3 - the browser pool (only reached on a challenge)
+# ---------------------------------------------------------------------------
+class _BrowserPool:
+    """One thread owns Playwright, one browser, one context, N reused pages.
+
+    Playwright's sync API is not thread safe, so the driver lives on its own
+    thread and callers wait on a Future. The context is shared so the clearance
+    cookie is too, which is the entire reason the tier works.
+    """
+
+    def __init__(self, size):
+        self._size = max(1, size)
+        self._q = queue.Queue()
+        self._free = queue.Queue()
+        self._thread = None
+        self._started = threading.Event()
+        self._boot_err = ""
+        self._closed = False
+
+    def start(self):
+        with _lock:
+            if self._thread is not None:
+                return
+            self._thread = threading.Thread(target=self._run, name="breach-browser",
+                                            daemon=True)
+            self._thread.start()
+        self._started.wait(90)
+        if self._boot_err:
+            raise RuntimeError(self._boot_err)
+
+    def _run(self):
+        pw = browser = context = None
+        try:
+            from playwright.sync_api import sync_playwright
+            pw = sync_playwright().start()
+            browser = pw.chromium.launch(
+                headless=True,
+                args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu",
+                      "--disable-blink-features=AutomationControlled"])
+            context = browser.new_context(
+                user_agent=UA, viewport={"width": 1366, "height": 900},
+                locale="en-GB", timezone_id="Europe/London")
+            context.add_init_script(
+                "Object.defineProperty(navigator,'webdriver',{get:()=>undefined});")
+            context.set_default_timeout(NAV_TIMEOUT)
+        except Exception as exc:
+            self._boot_err = "%s: %s" % (type(exc).__name__, exc)
+            self._started.set()
+            return
+
+        self._started.set()
+        while not self._closed:
+            try:
+                job = self._q.get(timeout=1.0)
+            except queue.Empty:
+                continue
+            if job is None:
+                break
+            addr, pw_s, fut = job
+            page = None
+            try:
+                page = self._take(context)
+                started = time.time()
+                status, body = self._search(page, addr)
+                if status == 404:
+                    rec = _blank(addr, pw_s)
+                    rec["via"] = "browser"
+                    rec["count"] = 0
+                elif _looks_like_challenge(status, body):
+                    rec = _blank(addr, pw_s)
+                    rec["via"] = "browser"
+                    rec["error"] = "challenge survived (http %d)" % status
+                else:
+                    try:
+                        rec = _parse_payload(addr, json.loads(body or "{}"),
+                                             "browser", started, pw_s)
+                    except Exception as exc:
+                        rec = _blank(addr, pw_s)
+                        rec["via"] = "browser"
+                        rec["error"] = "unparsable: %s" % exc
+                if not fut.done():
+                    fut.set_result(rec)
+            except Exception as exc:
+                if not fut.done():
+                    rec = _blank(addr, pw_s)
+                    rec["via"] = "browser"
+                    rec["error"] = "%s: %s" % (type(exc).__name__, exc)
+                    fut.set_result(rec)
+            finally:
+                if page is not None:
+                    try:
+                        if page.is_closed():
+                            page = self._new_page(context)
+                    except Exception:
+                        page = self._new_page(context)
+                    if page is not None:
+                        self._free.put(page)
+
+        for closer in (context, browser):
+            try:
+                closer.close()
+            except Exception:
+                pass
+        try:
+            pw.stop()
+        except Exception:
+            pass
+
+    def _new_page(self, context):
+        try:
+            return context.new_page()
+        except Exception:
+            return None
+
+    def _take(self, context):
+        try:
+            page = self._free.get_nowait()
+            if not page.is_closed():
+                return page
+        except queue.Empty:
+            pass
+        page = self._new_page(context)
+        if page is None:
+            raise RuntimeError("could not open a page")
+        return page
+
+    def _clear(self, page):
+        """Land on the site and sit out the interstitial."""
+        page.goto(HIBP_BASE + "/", wait_until="domcontentloaded", timeout=NAV_TIMEOUT)
+        deadline = time.time() + CHALLENGE_WAIT
+        while time.time() < deadline:
+            try:
+                title = (page.title() or "").lower()
+            except Exception:
+                title = ""
+            if "pwned" in title and "moment" not in title:
+                return True
+            page.wait_for_timeout(1500 if any(m in title for m in CHALLENGE_MARKS) else 1200)
+        return True
+
+    def _search(self, page, addr):
+        """Fetch from inside the page so the clearance cookie is carried."""
+        status, body = 0, ""
+        for attempt in (0, 1):
+            if "haveibeenpwned.com" not in (page.url or ""):
+                self._clear(page)
+            try:
+                out = page.evaluate(
+                    """async (email) => {
+                        const r = await fetch('/unifiedsearch/' +
+                            encodeURIComponent(email),
+                            {headers: {'Accept': 'application/json'}});
+                        return {status: r.status, body: await r.text()};
+                    }""", _norm(addr))
+                status, body = int(out.get("status") or 0), out.get("body") or ""
+            except Exception:
+                status, body = 0, ""
+            if status and not _looks_like_challenge(status, body):
+                return status, body
+            if attempt == 0:
+                self._clear(page)
+        return status, body
+
+    def submit(self, addr, pw):
+        fut = _cf.Future()
+        self._q.put((_norm(addr), pw, fut))
+        return fut
+
+    def stop(self):
+        self._closed = True
+        self._q.put(None)
+
+
+def _get_pool():
+    global _pool
+    with _lock:
+        if _pool is None:
+            _pool = _BrowserPool(_pages())
+        pool = _pool
+    pool.start()
+    return pool
+
+
+# ---------------------------------------------------------------------------
+# banding
+# ---------------------------------------------------------------------------
+def _pw_bucket(n):
+    if n is None:
+        return None
+    if n <= PW_NEW_MAX:
+        return "NEW"
+    if n <= PW_PARTIAL_MAX:
+        return "PARTIAL"
+    return "OLD"
+
+
+def _addr_bucket(rec):
+    if rec.get("error"):
+        return None
+    if not rec.get("count"):
+        return "CLEAN"
+    if rec.get("corpora"):
+        nd = rec.get("newest_days")
+        if nd is not None and nd <= CORPUS_NEW_DAYS:
+            return "NEW"
+        return "PARTIAL"
+    nd = rec.get("newest_days")
+    if nd is None:
+        return "PARTIAL"
+    return "PARTIAL" if nd <= BREACH_PARTIAL_DAYS else "OLD"
+
+
+def _combine(pw_b, addr_b):
+    """The worse half wins. CLEAN only when every readable half is CLEAN."""
+    known = [b for b in (pw_b, addr_b) if b in RANK]
+    if known:
+        return max(known, key=lambda b: RANK[b])
+    if pw_b == "CLEAN" or addr_b == "CLEAN":
+        return "CLEAN"
+    return "UNKNOWN"
+
+
+_REASON = {
+    "NEW": "password unseen in Pwned Passwords, or exposure inside %d days" % CORPUS_NEW_DAYS,
+    "PARTIAL": "password already circulating, or exposure inside %d days" % BREACH_PARTIAL_DAYS,
+    "OLD": "password has been public for years, or only old breaches",
+    "CLEAN": "password unseen and address in no readable source",
+    "UNKNOWN": "no readable answer - every source failed",
+}
+
+
+# ---------------------------------------------------------------------------
+# the check
+# ---------------------------------------------------------------------------
+def check(addr, password="", force=False, allow_browser=True) -> dict:
+    """One address. Pwned Passwords, then address exposure. Never raises."""
+    addr = _norm(addr)
+    if not is_email(addr):
+        rec = _blank(addr, password)
+        rec["verdict"] = rec["bucket"] = "UNKNOWN"
+        rec["reason"] = rec["error"] = "not an email address"
+        return rec
+
+    cache = _load()
+    entry = (cache.get("address") or {}).get(addr)
+    if not force and _fresh(entry, CACHE_TTL):
+        got = dict(entry.get("report") or {})
+        if got:
+            return got
+
+    rec = _blank(addr, password)
+    rec["pw_count"] = pwned_count(password, force=force)
+
+    addr_rec = _http_search(addr, password)
+    if addr_rec.get("error", "").startswith("challenge") and allow_browser and available():
+        try:
+            pool = _get_pool()
+            addr_rec = pool.submit(addr, password).result(timeout=_cfg["timeout"])
+        except Exception as exc:
+            rec["error"] = "browser failed: %s: %s" % (type(exc).__name__, exc)
+    elif addr_rec.get("error", "").startswith("challenge") and not available():
+        addr_rec["error"] += " | no browser (%s)" % (_pw_missing or "unavailable")
+
+    rec["breaches"] = addr_rec.get("breaches") or []
+    rec["pastes"] = addr_rec.get("pastes") or []
+    rec["corpora"] = addr_rec.get("corpora", 0)
+    rec["sites"] = addr_rec.get("sites", 0)
+    rec["sensitive"] = addr_rec.get("sensitive", 0)
+    rec["newest_days"] = addr_rec.get("newest_days")
+    rec["count"] = addr_rec.get("count")
+    rec["via"] = addr_rec.get("via", "")
+    rec["error"] = addr_rec.get("error", "")
+    rec["elapsed_ms"] = addr_rec.get("elapsed_ms", 0)
+
+    rec["bucket"] = _combine(_pw_bucket(rec["pw_count"]), _addr_bucket(addr_rec))
+    rec["verdict"] = rec["bucket"]
+    rec["reason"] = _REASON.get(rec["bucket"], "")
+    if rec["bucket"] == "UNKNOWN" and not rec["error"]:
+        rec["error"] = "no readable answer"
+
+    if rec["bucket"] != "UNKNOWN":
+        cache.setdefault("address", {})[addr] = {"ts": time.time(), "report": rec}
+        _save(cache)
+    _remember(rec)
+    return rec
+
+
+def _remember(rec):
+    with _lock:
+        _last.update({"ts": time.time(), "email": rec.get("email", ""),
+                      "verdict": rec.get("verdict", ""), "via": rec.get("via", ""),
+                      "ms": rec.get("elapsed_ms", 0), "error": rec.get("error", "")})
+
+
+def check_many(pairs, workers=4, progress=None, cancel=None, force=False) -> dict:
+    """Check every (email, password) pair. Returns {email: record}."""
+    uniq, seen = [], set()
+    for item in pairs or []:
+        if isinstance(item, (tuple, list)) and item:
+            em, pw = item[0], (item[1] if len(item) > 1 else "")
+        else:
+            em, pw = item, ""
+        em = _norm(em)
+        if em and em not in seen:
+            seen.add(em)
+            uniq.append((em, str(pw or "")))
+    out, guard, done = {}, threading.Lock(), [0]
+    total = len(uniq)
+
+    def one(item):
+        em, pw = item
+        if cancel is not None and cancel.is_set():
+            rec = _blank(em, pw)
+            rec["verdict"] = rec["bucket"] = "UNKNOWN"
+            rec["error"] = "cancelled"
+        else:
+            rec = check(em, pw, force=force)
+        with guard:
+            out[em] = rec
+            done[0] += 1
+            n = done[0]
+        if progress is not None:
+            try:
+                progress(n, total, em, rec.get("verdict", ""))
+            except Exception:
+                pass
+
+    try:
+        with _cf.ThreadPoolExecutor(max_workers=max(1, min(16, int(workers or 1)))) as ex:
+            list(ex.map(one, uniq))
+    except Exception:
+        for item in uniq:
+            out.setdefault(item[0], check(item[0], item[1], force=force))
+    return out
+
+
+# ---------------------------------------------------------------------------
+# scoring
+# ---------------------------------------------------------------------------
+WEIGHTS = {"NEW": 1.0, "PARTIAL": 0.5, "OLD": 0.15}
+
+
+def score(records) -> dict:
+    """Old/new breakdown and a quality figure for a set of records."""
+    buckets = {"NEW": 0, "PARTIAL": 0, "OLD": 0, "CLEAN": 0, "UNKNOWN": 0}
+    rows = []
+    for rec in records or []:
+        b = rec.get("verdict") or "UNKNOWN"
+        buckets[b] = buckets.get(b, 0) + 1
+        rows.append({"email": rec.get("email", ""), "bucket": b,
+                     "pw_count": rec.get("pw_count"),
+                     "breaches": len(rec.get("breaches") or [])})
+    total = sum(buckets.values())
+    scored = buckets["NEW"] + buckets["PARTIAL"] + buckets["OLD"]
+    pct = {k: (round(100.0 * v / total, 1) if total else 0.0) for k, v in buckets.items()}
+    quality = 0.0
+    if scored:
+        quality = 100.0 * sum(WEIGHTS[k] * buckets[k] for k in WEIGHTS) / scored
+    grade = ("A" if quality >= 85 else "B" if quality >= 70 else
+             "C" if quality >= 55 else "D" if quality >= 40 else "F")
+    return {"total": total, "scored": scored, "buckets": buckets, "pct": pct,
+            "quality": round(quality, 1), "grade": grade, "rows": rows}
+
+
+def report() -> dict:
+    return {"version": BREACH_VERSION, "browser": available(),
+            "browser_error": _pw_missing, "pages": _pages(),
+            "pool": _pool is not None, "last": dict(_last)}
+
+
+# ---------------------------------------------------------------------------
+# selftest / probe
+# ---------------------------------------------------------------------------
+def selftest(verbose=False) -> bool:
     checks = []
 
-    def add(name, ok):
-        checks.append((name, bool(ok)))
+    def add(n, ok):
+        checks.append((n, bool(ok)))
 
-    add("new_band", _band(3) == "new")
-    add("recent_band", _band(200) == "recent")
-    add("old_band", _band(4000) == "old")
-    add("unknown_band", _band(-1) == "unknown")
-
-    rows = [{"domain": "example.com", "added_days": 3},
-            {"domain": "mail.example.com", "added_days": 900}]
-    add("match_parent", len(_match(rows, "example.com")) == 2)
-    add("match_none", len(_match(rows, "elsewhere.org")) == 0)
-
-    add("v_new", _verdict([{"added_days": 3}], [], 1)[0] == "ACT")
-    add("v_recent", _verdict([{"added_days": 200}], [], 1)[0] == "REVIEW")
-    add("v_old", _verdict([{"added_days": 4000}], [], 1)[0] == "HISTORIC")
-    add("v_clean", _verdict([], [], 0)[0] == "CLEAN")
-    add("v_unknown", _verdict([], [], -1)[0] == "UNKNOWN")
-    add("v_paste", _verdict([], [{"days": 10}], 0)[0] == "ACT")
-
-    add("is_email", is_email("a@b.com"))
+    add("is_email", is_email("a.b@c.co"))
     add("not_email", not is_email("nope"))
     add("domain_of", domain_of("A@B.com") == "b.com")
+    add("norm", _norm(" A@B.CO ") == "a@b.co")
 
-    bad = [n for n, ok in checks if not ok]
-    if bad:
-        raise AssertionError("breach selftest failed: " + ", ".join(bad))
-    print("breach.py selftest: %d checks OK" % len(checks))
+    pairs = parse_addresses("a@b.co:pw\n- c@d.co:pw2 | VALID\njunk\nA@B.co:x")
+    add("parse_count", len(pairs) == 2)
+    add("parse_keeps_pw", pairs[0][1] == "pw")
+    add("parse_cuts_tail", pairs[1][1] == "pw2")
+    add("parse_dedupes", pairs[0][0] == "a@b.co")
+
+    add("pw_new", _pw_bucket(0) == "NEW")
+    add("pw_partial", _pw_bucket(500) == "PARTIAL")
+    add("pw_old", _pw_bucket(50000) == "OLD")
+    add("pw_none", _pw_bucket(None) is None)
+
+    add("combine_worst", _combine("NEW", "OLD") == "OLD")
+    add("combine_clean", _combine("CLEAN", "CLEAN") == "CLEAN")
+    add("combine_clean_old", _combine("CLEAN", "OLD") == "OLD")
+    add("combine_unknown", _combine(None, None) == "UNKNOWN")
+    add("combine_one_side", _combine("PARTIAL", None) == "PARTIAL")
+
+    pwn = {"Breaches": [
+        {"Name": "Stealer Logs", "Title": "Stealer Logs", "Domain": "",
+         "BreachDate": "2026-06-01", "DataClasses": ["Passwords"],
+         "IsSpamList": True, "Description": "d"},
+        {"Name": "MyFitnessPal", "Title": "MyFitnessPal", "Domain": "myfitnesspal.com",
+         "BreachDate": "2018-02-01", "DataClasses": ["Passwords"]}],
+        "Pastes": [{"Title": "dump.txt", "Source": "Pastebin"}]}
+    rec = _parse_payload("a@b.co", pwn, "http", time.time(), "pw")
+    add("corpus_split", rec["corpora"] == 1 and rec["sites"] == 1)
+    add("count_total", rec["count"] == 3)
+    add("paste_kept", len(rec["pastes"]) == 1)
+    add("addr_bucket_corpus_new", _addr_bucket(rec) == "NEW")
+
+    old = _parse_payload("a@b.co", {"Breaches": [
+        {"Name": "X", "Domain": "x.com", "BreachDate": "2015-01-01"}]}, "http", None, "")
+    add("addr_bucket_old", _addr_bucket(old) == "OLD")
+
+    clean = _parse_payload("a@b.co", {"Breaches": [], "Pastes": []}, "http", None, "")
+    add("addr_bucket_clean", _addr_bucket(clean) == "CLEAN")
+
+    bad = _blank("a@b.co")
+    bad["error"] = "challenge (http 403)"
+    add("addr_bucket_error_none", _addr_bucket(bad) is None)
+
+    add("days_ok", _days("2020-01-01") is not None)
+    add("days_bad", _days("") is None)
+
+    sc = score([{"verdict": "OLD"}, {"verdict": "NEW"}, {"verdict": "UNKNOWN"}])
+    add("score_total", sc["total"] == 3)
+    add("score_pct", sc["pct"]["UNKNOWN"] == 33.3)
+    add("score_grade", sc["grade"] in "ABCDF")
+
+    add("challenge_403", _looks_like_challenge(403, ""))
+    add("challenge_html", _looks_like_challenge(200, "<title>Just a moment...</title>"))
+    add("challenge_json", not _looks_like_challenge(200, '{"Breaches":[]}'))
+    add("pw_hash", len(_pw_hash("abc")) == 40)
+    add("report_shape", isinstance(report().get("browser"), bool))
+
+    bad_names = [n for n, ok in checks if not ok]
+    if bad_names:
+        raise AssertionError("breach selftest failed: " + ", ".join(bad_names))
+    if verbose:
+        print("breach.py selftest: %d checks OK" % len(checks))
     return True
 
 
-if __name__ == "__main__":
+def main(argv=None) -> int:
     import sys
-    sys.exit(0 if selftest() else 1)
+    argv = list(sys.argv[1:] if argv is None else argv)
+    if "--probe" in argv:
+        try:
+            target = argv[argv.index("--probe") + 1]
+        except Exception:
+            print("usage: breach.py --probe someone@example.com[:password]")
+            return 2
+        pairs = parse_addresses(target) or [(target, "")]
+        print("browser available:", available(), browser_note())
+        res = check(pairs[0][0], pairs[0][1], force=True)
+        print(json.dumps({k: res.get(k) for k in ("email", "verdict", "pw_count",
+                                                  "count", "via", "error")}, indent=2))
+        return 0 if res.get("verdict") else 1
+    selftest(verbose=True)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
