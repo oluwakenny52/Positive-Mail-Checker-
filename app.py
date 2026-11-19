@@ -16438,14 +16438,34 @@ if str_lit.session_state.engine_has_run or _persisted_valid:
         # FIX RS-4: the reason came from list_unfinished_runs(), so the TypeError
         # in block 083 degraded this to a bare warning with no cause and no
         # progress. It reads the watchdog record and remaining() directly now.
+        #
+        # v13.86 FIX COUNT-1: THE TWO FIGURES CAME FROM TWO FILES. `checked` was
+        # read from the watchdog record and the remainder from the live queue, and
+        # the two writers do not tick together - the 17:18 run printed "12/16"
+        # beside "7 still to check" on a 16-account run, which sums to 19. The
+        # queue is the authority because it is what Resume will actually re-run,
+        # so the checked figure is DERIVED from it and the pair closes by
+        # construction. The record's own count survives only as the fallback for
+        # a record that never carried a total, where there is nothing to derive
+        # from and a lone number cannot contradict itself.
         _rec = runstate.load() or {}
-        _left = runstate.remaining()
-        if _rec or _left:
+        _left = list(runstate.remaining() or [])
+        _left_n = len(_left)
+        try:
+            _total = int(_rec.get("total") or 0)
+        except Exception:
+            _total = 0
+        try:
+            _checked_rec = int(_rec.get("checked") or 0)
+        except Exception:
+            _checked_rec = 0
+        _checked = max(0, _total - _left_n) if _total else _checked_rec
+        if _rec or _left_n:
             str_lit.warning(
                 f"⚠ **Engine Stopped Unfinished:** Reason: "
                 f"*{_rec.get('reason') or _rec.get('cause') or 'Unknown'}* | "
-                f"Progress at stop: {_rec.get('checked', 0)}/{_rec.get('total', 0)} | "
-                f"**{len(_left)} account(s) still to check** - set Engine Action Mode "
+                f"Progress at stop: {_checked}/{_total or '?'} | "
+                f"**{_left_n} account(s) still to check** - set Engine Action Mode "
                 f"to 'Resume Unfinished' and press Start to continue.")
         else:
             str_lit.warning("⚠ **Engine Stopped Unfinished.**")
