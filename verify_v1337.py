@@ -753,7 +753,12 @@ def main():
 
     auth_api()
     page_numbers()
-    version_drift(["engine.py", "status.py", "verify_blocks.py", "ms_oauth.py"])
+    version_drift(["engine.py", "status.py", "verify_blocks.py", "ms_oauth.py",
+                   "auth.py", "hosts.py",
+                   "pages/1_Notifications.py", "pages/2_Diagnostics.py",
+                   "pages/3_Mailbox_Reader.py", "pages/4_Downloads.py",
+                   "pages/5_Blocks.py", "pages/6_User_Guide.py", "pages/7_Logs.py",
+                   "pages/8_Breach.py", "pages/9_AI.py", "pages/10_Debug.py"])
 
     print("=" * 62)
     print("PASSED %d   FAILED %d" % (len(PASSES), len(FAILS)))
