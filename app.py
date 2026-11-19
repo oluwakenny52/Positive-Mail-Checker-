@@ -16369,6 +16369,27 @@ if str_lit.session_state.engine_has_run or _persisted_valid:
                     + ("  ·  SMTP/ManageSieve were CONFIRM-ONLY"
                        if any(p in ("SMTP", "ManageSieve") for p in active_protocols()) else ""))
 
+    # v13.86 FIX COUNT-1: ONE derivation, used by BOTH the notification and the
+    # warning. The two figures used to come from two files - `checked` from the
+    # watchdog record, the remainder from the live queue - and the writers do not
+    # tick together, so the 17:18 run printed "12/16" beside "7 still to check"
+    # on a 16-account run. The queue is the authority because it is what Resume
+    # will actually re-run, so the checked figure is DERIVED from it and the pair
+    # closes by construction. The record's own count survives only as the
+    # fallback for a record that never carried a total.
+    _rec = runstate.load() or {}
+    _left = list(runstate.remaining() or [])
+    _left_n = len(_left)
+    try:
+        _total = int(_rec.get("total") or 0)
+    except Exception:
+        _total = 0
+    try:
+        _checked_rec = int(_rec.get("checked") or 0)
+    except Exception:
+        _checked_rec = 0
+    _checked = max(0, _total - _left_n) if _total else _checked_rec
+
     # v13.73: ONE notification per run. The key carries the run's own start
     # stamp, so every reload of this page is the same key and the 24h window
     # swallows the repeats - but the NEXT run is a new stamp and notifies again.
@@ -16383,12 +16404,11 @@ if str_lit.session_state.engine_has_run or _persisted_valid:
                     "Open the results summary to export the buckets.",
                     key="run-done-%s" % start_ts_copy, dedupe=86400.0)
             elif _completion_copy == "Unfinished":
-                _rec_n = runstate.load() or {}
                 notify.add(
                     "warn", "run",
                     "Run stopped unfinished: %s (%s/%s checked)."
-                    % (_rec_n.get("reason") or _rec_n.get("cause") or "unknown",
-                       _rec_n.get("checked", 0), _rec_n.get("total", 0)),
+                    % (_rec.get("reason") or _rec.get("cause") or "unknown",
+                       _checked, _total),
                     "Set Engine Action Mode to 'Resume Unfinished' and press Start.",
                     key="run-stop-%s" % start_ts_copy, dedupe=86400.0)
         except Exception:
@@ -16439,27 +16459,9 @@ if str_lit.session_state.engine_has_run or _persisted_valid:
         # in block 083 degraded this to a bare warning with no cause and no
         # progress. It reads the watchdog record and remaining() directly now.
         #
-        # v13.86 FIX COUNT-1: THE TWO FIGURES CAME FROM TWO FILES. `checked` was
-        # read from the watchdog record and the remainder from the live queue, and
-        # the two writers do not tick together - the 17:18 run printed "12/16"
-        # beside "7 still to check" on a 16-account run, which sums to 19. The
-        # queue is the authority because it is what Resume will actually re-run,
-        # so the checked figure is DERIVED from it and the pair closes by
-        # construction. The record's own count survives only as the fallback for
-        # a record that never carried a total, where there is nothing to derive
-        # from and a lone number cannot contradict itself.
-        _rec = runstate.load() or {}
-        _left = list(runstate.remaining() or [])
-        _left_n = len(_left)
-        try:
-            _total = int(_rec.get("total") or 0)
-        except Exception:
-            _total = 0
-        try:
-            _checked_rec = int(_rec.get("checked") or 0)
-        except Exception:
-            _checked_rec = 0
-        _checked = max(0, _total - _left_n) if _total else _checked_rec
+        # v13.86 FIX COUNT-1: the derivation itself lives ABOVE, beside the
+        # notification that needs the same two numbers - one source for both, so a
+        # stop can no longer be announced with one pair and reported with another.
         if _rec or _left_n:
             str_lit.warning(
                 f"⚠ **Engine Stopped Unfinished:** Reason: "
