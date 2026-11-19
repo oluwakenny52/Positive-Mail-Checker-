@@ -75,13 +75,13 @@ BLOCKED_FILES = [
 #   v13.70  +pages/1_Notifications.py   files +1, blocks +24
 #   v13.76  +pages/8_Breach.py          files +1, blocks +12  (its own frame is 12)
 #   v13.81  pages/2_Diagnostics.py +1 block (AI_PROBE)  files 0, blocks +1
-#   v13.85  +pages/9_AI.py              files +1, blocks +13
+#   v13.85  +pages/9_AI.py              files +1, blocks +14
 #   v13.85  +pages/10_Debug.py          files +1, blocks +15
-# v13.76 is the version in the header above.  This comment used to carry the
+# v13.85 is the version in the header above.  This comment used to carry the
 # breach page TWICE - once as v13.76 and once as v13.77, a version no file in the
 # tree has ever carried - so one event was recorded twice and half of it wrong.
 TARGET_FILES = 17
-TARGET_BLOCKS = 335
+TARGET_BLOCKS = 336
 
 FILE_RX = re.compile(r"^#\s*@@FILE\s+(\S+)\s+blocks=(\d+)\s+version=(\S+)\s*$")
 BLOCK_RX = re.compile(r"^#\s*@@BLOCK\s+(\d{3})\s+([A-Za-z0-9_]+)(?:\s+deps=(\S+))?\s*$")
