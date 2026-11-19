@@ -25,9 +25,9 @@ except Exception:
     #   v13.70  +pages/1_Notifications.py   files +1, blocks +24
     #   v13.76  +pages/8_Breach.py          files +1, blocks +12
     #   v13.81  pages/2_Diagnostics.py +1 block (AI_PROBE)  files 0, blocks +1
-    #   v13.85  +pages/9_AI.py              files +1, blocks +13
+    #   v13.85  +pages/9_AI.py              files +1, blocks +14
     #   v13.85  +pages/10_Debug.py          files +1, blocks +15
-    # 17 files, 335 blocks.  If you edit BLOCKED_FILES, edit this list in the
+    # 17 files, 336 blocks.  If you edit BLOCKED_FILES, edit this list in the
     # SAME commit - a mirror that disagrees with the thing it mirrors is worse
     # than no mirror.
     GATED = ["app.py", "auth.py", "engine.py", "hosts.py", "ms_oauth.py",
@@ -36,7 +36,7 @@ except Exception:
              "pages/4_Downloads.py", "pages/5_Blocks.py", "pages/6_User_Guide.py",
              "pages/7_Logs.py", "pages/8_Breach.py", "pages/9_AI.py",
              "pages/10_Debug.py"]
-    EXPECT_FILES, EXPECT_BLOCKS = 17, 335
+    EXPECT_FILES, EXPECT_BLOCKS = 17, 336
 
 FILE_RX  = re.compile(r"^#\s*@@FILE\s+(\S+)\s+blocks=(\d+)\s+version=(\S+)\s*$")
 BLOCK_RX = re.compile(r"^#\s*@@BLOCK\s+(\d{3})\s+([A-Za-z0-9_]+)(?:\s+deps=(\S+))?\s*$")
