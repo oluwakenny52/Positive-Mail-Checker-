@@ -852,7 +852,7 @@ with tab_proxy:
 
         c1, c2, c3, c4 = st.columns(4)
         c1.metric("Lines", len(lines))
-        c2.metric("Unique", len(uniq))
+        c2.metric("Unique lines", len(uniq))
         c3.metric("With credentials", with_creds)
         c4.metric("Unparsable", unparsable)
 
@@ -872,7 +872,7 @@ with tab_proxy:
                 dupes[k] = dupes.get(k, 0) + 1
         heavy = {k: v for k, v in dupes.items() if v > 1}
         if heavy:
-            st.markdown("**Repeated endpoints** (dedupe collapses these)")
+            st.markdown("**Repeated endpoints (collapses lines sharing host:port)**")
             st.code("\n".join(f"{k}  x{v}" for k, v in sorted(heavy.items(), key=lambda kv: -kv[1])[:30]),
                     language="text")
 
@@ -944,7 +944,7 @@ with tab_cache:
 # @@END 017 TAB_CACHE
 
 
-# @@BLOCK 018 FOOTER_BUNDLE deps=012
+# @@BLOCK 018 FOOTER_BUNDLE deps=011,012
 # ==========================================================================
 # footer bundle
 # ==========================================================================
