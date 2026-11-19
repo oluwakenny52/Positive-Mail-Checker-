@@ -664,6 +664,8 @@ _FIX_CHECKS = (
     ("pages/9_AI.py", 'aiassist.chat_stream(', 1, "the page dials the chat tier"),
     ("app.py", "_left_n = len(_left)", 1,
      "the remainder is counted once and the checked figure is derived from it"),
+    ("app.py", "_checked, _total),", 1,
+     "the notification reports the DERIVED pair, not the record's own count"),
 )
 
 # Needles that point at THIS file. want is the CODE-only count; the literal in
