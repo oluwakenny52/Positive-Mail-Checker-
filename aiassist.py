@@ -49,6 +49,13 @@ resolves the path once, on whatever thread called it (the main one), and every
 later thread uses that.  Without this the per-day counter could be written to a
 throwaway file and the allowance would leak between users.
 
+BOTH BUDGETS TREAT 0 AS UNLIMITED
+---------------------------------
+max_per_run=0 and max_per_day=0 both mean "no ceiling", not "no calls".  The
+selftest relies on that: a real per-user day file is not reset by reset_run(), so
+asserting against a small fixed number would fail on any day the app had already
+spent it.
+
 USAGE
     import aiassist
     aiassist.configure(enabled=os.getenv("GEMINI_ENABLED"),
@@ -60,8 +67,18 @@ USAGE
     tok = aiassist.classify_now(one_line)     # one blocking call, on demand
     aiassist.report()                         # counters dict for the diag bundle
 
-    python aiassist.py --selftest     offline, canned payloads, no network
+    python aiassist.py --selftest     offline; canned payloads
     python aiassist.py --probe        ONE live call; prints status and latency
+
+THE SELFTEST OWNS ITS STATE  (v13.85)
+-------------------------------------
+The selftest used to leak into the live process: it queued a fixed string and
+never removed it, and it checked a 5-call day budget against the user's real
+usage file.  Two runs in one process, or one run on a busy day, turned correct
+code red.  It now snapshots and restores the queue, the cache and the usage path,
+and drives the day budget against a tempfile so both the exhausted and the
+unlimited branch are provable.  A selftest that depends on what the app did
+earlier is not a selftest.
 """
 
 from __future__ import annotations
@@ -70,12 +87,14 @@ import hashlib
 import json
 import os
 import re
+import shutil
+import tempfile
 import threading
 import time
 import urllib.error
 import urllib.request
 
-AI_VERSION = "v13.76"
+AI_VERSION = "v13.85"
 
 ENDPOINT = ("https://generativelanguage.googleapis.com/v1beta/models/"
             "%s:generateContent")
@@ -153,7 +172,8 @@ def configure(enabled=None, key=None, model=None, max_per_run=None,
               max_per_day=None, stop_after_fails=None):
     """Set the runtime config.  Any argument left None falls back to os.environ.
 
-    Never raises: a bad int is coerced, a bad model string falls back.
+    Never raises: a bad int is coerced, a bad model string falls back.  A budget
+    of 0 means UNLIMITED for both max_per_run and max_per_day.
 
     Also RESOLVES THE USAGE PATH HERE, on this thread.  See the module
     docstring - the drain thread has no session and would answer with the
@@ -275,13 +295,20 @@ def _day_bump(path) -> None:
 
 
 def _budget_free() -> bool:
-    """True when this run and this user still have allowance.  Never raises."""
+    """True when this run and this user still have allowance.  Never raises.
+
+    A limit of 0 is UNLIMITED, not "no calls" - the run check is skipped at 0 and
+    the day check is skipped at 0.  (The run side was already skipped by
+    accident: `_calls_run >= 0` is always true.  Now it is deliberate.)
+    """
     if _tripped:
         return False
     with _lock:
-        if _calls_run >= int(_cfg["max_per_run"]):
-            return False
+        run_limit = int(_cfg["max_per_run"])
         limit = int(_cfg["max_per_day"])
+        used = _calls_run
+    if run_limit > 0 and used >= run_limit:
+        return False
     if limit <= 0:
         return True
     return _day_count(_path()) < limit
@@ -580,9 +607,16 @@ def report() -> dict:
 
 
 # ---------------------------------------------------------------------------
-# selftest - offline, canned payloads, no network
+# selftest - offline, canned payloads, no network needed
 # ---------------------------------------------------------------------------
 def selftest(verbose=False) -> bool:
+    """Offline checks.  Snapshots and restores every piece of global state.
+
+    Two things here used to make correct code fail: the queue was written to and
+    never restored, and the day budget was asserted against the user's REAL usage
+    file, which reset_run() does not touch.  Both are isolated now - the queue by
+    save/restore, the day budget by a tempfile and max_per_day=0.
+    """
     checks = []
 
     def add(name, ok):
@@ -633,33 +667,86 @@ def selftest(verbose=False) -> bool:
     add("key_tail", report()["key_tail"] == "...-key")
     add("path_is_str", isinstance(_path(), str))
 
-    reset_run()
-    add("enqueue_accepts", enqueue("first text") is True)
-    add("enqueue_dedupes", enqueue("first text") is False)
-    add("pending_one", pending() == 1)
-    add("classify_miss_none", classify("unseen text", defer=False) is None)
+    # ---- everything below touches globals: snapshot first, restore in finally --
+    with _lock:
+        _q_saved = list(_queue)
+        _qd_saved = set(_queued)
+        _tx_saved = dict(_texts)
+        _c_saved = dict(_cache)
+        _co_saved = list(_cache_order)
+        _path_saved = _cfg["usage_path"]
+        _dc_saved = dict(_day_cache)
+        _queue.clear()
+        _queued.clear()
+        _texts.clear()
+    _tmpdir = tempfile.mkdtemp(prefix="aiassist-selftest-")
+    _dayfile = os.path.join(_tmpdir, USAGE_NAME)
 
-    reset_run()
-    add("budget_run_start", _calls_run == 0)
-    for _ in range(2):
+    try:
         with _lock:
-            _calls_run += 1
-    add("budget_exhausted", _budget_free() is False)
-    add("classify_now_no_budget", classify_now("fresh text") is None)
-    reset_run()
-    add("budget_reset", _budget_free() is True)
+            _cfg["usage_path"] = _dayfile
+            _day_cache.clear()
 
-    with _lock:
-        _consec_fails = 9
-        _tripped = True
-    add("tripped_blocks", _budget_free() is False)
-    add("tripped_classify_none", classify("x") is None)
-    reset_run()
-    with _lock:
-        _tripped = False
+        reset_run()
+        add("enqueue_accepts", enqueue("first text") is True)
+        add("enqueue_dedupes", enqueue("first text") is False)
+        add("pending_one", pending() == 1)
+        _miss = "unseen text %d" % int(time.time() * 1000)
+        add("classify_miss_none", classify(_miss, defer=False) is None)
 
-    add("report_shape", isinstance(report().get("enabled"), bool))
-    add("drain_no_key_no_raise", isinstance(drain(limit=1), dict))
+        reset_run()
+        add("budget_run_start", _calls_run == 0)
+        for _ in range(2):
+            with _lock:
+                _calls_run += 1
+        add("budget_exhausted", _budget_free() is False)
+        add("classify_now_no_budget", classify_now("fresh text") is None)
+        reset_run()
+        add("budget_reset", _budget_free() is True)
+
+        # 0 is UNLIMITED.  The old fixed 5 was read against a real day file that
+        # a busy day could already have spent; the temp file below cannot.
+        configure(max_per_day=0)
+        add("day_zero_unlimited", _budget_free() is True)
+        configure(max_per_day=5)
+        for _ in range(5):
+            _day_bump(_dayfile)
+        add("day_exhausted", _budget_free() is False)
+        configure(max_per_day=0)
+        add("day_unlimited_again", _budget_free() is True)
+        add("day_file_written", os.path.exists(_dayfile))
+
+        with _lock:
+            _consec_fails = 9
+            _tripped = True
+        add("tripped_blocks", _budget_free() is False)
+        add("tripped_classify_none", classify("x") is None)
+        reset_run()
+        add("report_shape", isinstance(report().get("enabled"), bool))
+        add("report_day_int", isinstance(report().get("calls_day"), int))
+
+        # One real drain against the fake key.  Offline it is a transport error,
+        # online a 401 - either way it must return a dict and not raise, and the
+        # bump lands in the temp file rather than the user's allowance.
+        _drained = drain(limit=1)
+        add("drain_returns_dict", isinstance(_drained, dict))
+        add("drain_counted", _drained.get("tried") == 1)
+    finally:
+        with _lock:
+            _cfg["usage_path"] = _path_saved
+            _day_cache.clear()
+            _day_cache.update(_dc_saved)
+            _queue.clear()
+            _queue.extend(_q_saved)
+            _queued.clear()
+            _queued.update(_qd_saved)
+            _texts.clear()
+            _texts.update(_tx_saved)
+            _cache.clear()
+            _cache.update(_c_saved)
+            _cache_order[:] = _co_saved
+        shutil.rmtree(_tmpdir, ignore_errors=True)
+        reset_run()
 
     bad = [n for n, ok in checks if not ok]
     if bad:
