@@ -38,7 +38,7 @@ THE BANDS
 TRACING AND PACING  (v13.85)
 ----------------------------
 Section 4 is a trace of everything: each control you moved, each address started,
-the literal URL sent, the status, whether a challenge was detected, which tier
+the literal URL sent, the status, whether a challenge appeared, which tier
 took over, the band, and every error verbatim. It is shown live during a run,
 kept in a per-user file, and downloadable - so a run that goes wrong can be read
 afterwards instead of guessed at. The Delay control paces address starts; workers
@@ -183,8 +183,6 @@ if hasattr(audit_log, "install"):
 
 auth.require(st, "Unlock Breach Exposure")
 auth.fit(st)                        # CSS only, before the first widget
-
-auth.fit_panel(st)                  # the controls; collapsed until tapped
 
 # The first theme read ran before the gate, on the anonymous prefix. Now that
 # the passphrase is unlocked the owner's real file exists - re-read and repaint.
@@ -714,6 +712,9 @@ with _n3:
                      width="stretch")
     except Exception:
         st.caption("Export Studio lives at pages/4_Downloads.py")
+
+st.markdown("---")
+auth.fit_panel(st)
 
 st.caption("Sources: Pwned Passwords (k-anonymity - only 5 hash characters leave the "
            "box), the HIBP address search and the free breach list. No API key. Only "
