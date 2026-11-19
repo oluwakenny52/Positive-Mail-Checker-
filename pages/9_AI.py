@@ -405,7 +405,8 @@ _owner = _owner()
 if st.session_state.get(_OWNER_KEY) != _owner:
     st.session_state[_OWNER_KEY] = _owner
     for _k in (_LEDGER_KEY, _SEED_KEY, _CFG_KEY, _CHAT_KEY, "_ai_chat_seeded",
-               "_ai_model_applied", "_ai_prompt", "_ai_ctx_file"):
+               "_ai_model_applied", "_ai_prompt", "_ai_ctx_file", "_ai_send",
+               "_ai_queued"):
         st.session_state.pop(_k, None)
     st.session_state[_CHAT_KEY] = _chat_load()
 
@@ -531,75 +532,88 @@ else:
         with st.chat_message("user" if _t.get("role") == "user" else "assistant"):
             st.markdown(_t.get("text") or "")
 
+
+def _ai_on_ask():
+    """Ask. A callback runs BEFORE the widgets, so it may clear the key."""
+    _q0 = (st.session_state.get("_ai_prompt") or "").strip()
+    if not _q0:
+        return
+    st.session_state["_ai_queued"] = _q0
+    st.session_state["_ai_prompt"] = ""
+    st.session_state["_ai_send"] = True
+
+
+def _ai_on_new():
+    """New conversation - same reason the clear lives in a callback."""
+    _chat_clear()
+    st.session_state[_CHAT_KEY] = []
+    st.session_state["_ai_prompt"] = ""
+    st.session_state["_ai_send"] = False
+    st.session_state["_ai_queued"] = ""
+
+
 _prompt = st.text_area("Your question", key="_ai_prompt", height=110,
                        placeholder="Why does the Breach page crash at line 386?")
 _q1, _q2, _q3 = st.columns([0.5, 0.25, 0.25])
 with _q1:
-    _send = st.button("🧠 Ask", type="primary", width="stretch",
-                      disabled=not (_prompt or "").strip())
+    st.button("🧠 Ask", type="primary", width="stretch", on_click=_ai_on_ask,
+              disabled=not (_prompt or "").strip())
 with _q2:
-    _new = st.button("✚ New conversation", width="stretch",
-                     help="Clears this thread from the screen AND your record file.")
+    st.button("✚ New conversation", width="stretch", on_click=_ai_on_new,
+              help="Clears this thread from the screen AND your record file.")
 with _q3:
     st.download_button("⬇ Export thread", data=_chat_text().encode("utf-8"),
                        file_name="ai_chat_%s.txt"
                                  % datetime.now().strftime("%Y%m%d_%H%M%S"),
                        mime="text/plain", width="stretch", disabled=not _chat)
 
-if _new:
-    _chat_clear()
-    st.session_state[_CHAT_KEY] = []
-    st.session_state["_ai_prompt"] = ""
-    st.rerun()
+if st.session_state.pop("_ai_send", False):
+    _q = st.session_state.pop("_ai_queued", "") or ""
+    if _q:
+        _ctx = _ctx_pack(blocks=_ctx_blocks, pages=_ctx_pages,
+                         one_file="" if _ctx_file == "(none)" else _ctx_file,
+                         counters=_ctx_counters)
+        if _scrub_on:
+            _ctx = _light_scrub(_ctx, 24000)
+            _q = _light_scrub(_q, 8000)
+        _now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        _chat = list(st.session_state.get(_CHAT_KEY) or [])
+        _chat.append({"role": "user", "text": _q, "at": _now})
+        st.session_state[_CHAT_KEY] = _chat
+        _chat_append("user", _q)
 
-if _send and (_prompt or "").strip():
-    _q = _prompt.strip()
-    _ctx = _ctx_pack(blocks=_ctx_blocks, pages=_ctx_pages,
-                     one_file="" if _ctx_file == "(none)" else _ctx_file,
-                     counters=_ctx_counters)
-    if _scrub_on:
-        _ctx = _light_scrub(_ctx, 24000)
-        _q = _light_scrub(_q, 8000)
-    _now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    _chat = list(st.session_state.get(_CHAT_KEY) or [])
-    _chat.append({"role": "user", "text": _q, "at": _now})
-    st.session_state[_CHAT_KEY] = _chat
-    _chat_append("user", _q)
-    st.session_state["_ai_prompt"] = ""
+        _buf = ""
+        with st.chat_message("user"):
+            st.markdown(_q)
+        with st.chat_message("assistant"):
+            _slot = st.empty()
+            try:
+                for _d in aiassist.chat_stream(_chat[-_CHAT_TURNS:], _ctx, model=_model):
+                    _buf += _d
+                    _slot.markdown(_buf + " ▌")
+            except Exception as e:
+                _buf = _buf or "_stream raised: %s: %s_" % (type(e).__name__, e)
+            if _buf:
+                _slot.markdown(_buf)
+            else:
+                _rep2 = aiassist.report()
+                _why = _rep2.get("last_error") or "no answer"
+                if not _rep2.get("key_present"):
+                    _why = "no key - set GEMINI_ENABLED=true and GEMINI_API_KEY"
+                elif not _rep2.get("enabled"):
+                    _why = "the classifier is off - tick Enabled in section 3"
+                elif _rep2.get("tripped"):
+                    _why = "latched after %s consecutive failures" % _rep2.get(
+                        "consecutive_fails")
+                _slot.markdown("_no answer: %s_" % _why)
+                _buf = "_no answer: %s_" % _why
 
-    with st.chat_message("user"):
-        st.markdown(_q)
-
-    _buf = ""
-    with st.chat_message("assistant"):
-        _slot = st.empty()
-        try:
-            for _d in aiassist.chat_stream(_chat[-_CHAT_TURNS:], _ctx, model=_model):
-                _buf += _d
-                _slot.markdown(_buf + " ▌")
-        except Exception as e:
-            _buf = _buf or "_stream raised: %s: %s_" % (type(e).__name__, e)
-        if _buf:
-            _slot.markdown(_buf)
-        else:
-            _rep2 = aiassist.report()
-            _why = _rep2.get("last_error") or "no answer"
-            if not _rep2.get("key_present"):
-                _why = "no key - set GEMINI_ENABLED=true and GEMINI_API_KEY"
-            elif not _rep2.get("enabled"):
-                _why = "the classifier is off - tick Enabled in section 3"
-            elif _rep2.get("tripped"):
-                _why = "latched after %s consecutive failures" % _rep2.get(
-                    "consecutive_fails")
-            _slot.markdown("_no answer: %s_" % _why)
-            _buf = "_no answer: %s_" % _why
-
-    _chat.append({"role": "assistant", "text": _buf,
-                  "at": datetime.now().strftime("%Y-%m-%d %H:%M:%S")})
-    st.session_state[_CHAT_KEY] = _chat
-    _chat_append("assistant", _buf)
-    _ledger_add("chat", _q, "", 0, "%d chars back, model %s" % (len(_buf), _model))
-    st.rerun()
+        _chat.append({"role": "assistant", "text": _buf,
+                      "at": datetime.now().strftime("%Y-%m-%d %H:%M:%S")})
+        st.session_state[_CHAT_KEY] = _chat
+        _chat_append("assistant", _buf)
+        _ledger_add("chat", _q, "", 0, "%d chars back, model %s" % (len(_buf), _model))
+        st.rerun()
 # @@END 008 CHAT
 
 # @@BLOCK 009 CONFIG deps=008
@@ -633,6 +647,9 @@ with _g1:
     st.checkbox("Enabled", key="_ai_enabled",
                 help="Off means every classify() returns None and the caller keeps "
                      "its UNKNOWN. Nothing else changes.")
+    if not _rep.get("key_present"):
+        st.caption("⬆ Ticked but inert: no `GEMINI_API_KEY` is set, so every call "
+                   "still returns None.")
 with _g2:
     st.text_input("Model", key="_ai_model",
                   help="The API model id. `gemini-flash-latest` is the default and "
