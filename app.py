@@ -3154,16 +3154,23 @@ TAG_COLORS = {
     # their own - cyan, distinct from every status above, so a hit cannot be
     # mistaken for a WRONG or a RETRY at a glance.
     "KW_HITS": "#22d3ee",
+    # v13.86 FIX COLOUR-1: TWO TOKENS THE APP ACTUALLY EMITS HAD NO ENTRY and
+    # fell through to the neutral #cbd5e1 tail - so a SKIP line and a MIXED row
+    # read as "no verdict" rather than as themselves. SKIP is the same status as
+    # SKIPPED_COOLDOWN, so it takes the same violet; MIXED is mailsort's
+    # mixed-group token and takes the neutral slate on purpose.
+    "SKIP": "#a78bfa",
+    "MIXED": "#94a3b8",
 }
 
 
 def _line_color(line: str) -> str:
     up = str(line).upper()
-    for tag in ("KW_HITS", "SKIPPED_COOLDOWN", "SKIPPED", "WRONG", "APP", "RBL", "FAILED", "RETRY",
-                "NEED_APP_PASSWORD", "RBL_BLOCKED",
+    for tag in ("KW_HITS", "SKIPPED_COOLDOWN", "SKIPPED", "SKIP", "WRONG", "APP", "RBL",
+                "FAILED", "RETRY", "NEED_APP_PASSWORD", "RBL_BLOCKED",
                 "WRONG_PASSWORD", "PROXY_UNHEALTHY", "CONNECTION_FAILED", "RETRY_LATER",
                 "SMTP_FAILED", "DNS_FAILED", "UNCLASSIFIED", "LOGIN_DROPPED", "VALID",
-                "UNKNOWN", "EXCEPTION", "ERROR"):
+                "UNKNOWN", "MIXED", "EXCEPTION", "ERROR"):
         if f"[{tag}]" in up:
             return TAG_COLORS.get(tag, "#cbd5e1")
     if "[CLASSIFIED: VALID]" in up:
@@ -3295,7 +3302,15 @@ if str_lit.session_state.get(_RES_STATE_OWNER_KEY) != _res_state_owner:
     for _k in ("valid_results", "wrong_results", "need_app_results",
                "login_drop_results", "conn_results", "proxy_results",
                "retry_results", "rbl_results", "smtp_results", "dns_results",
-               "skip_results", "unknown_results", "report_entries", "log_lines",
+               "skip_results", "unknown_results",
+               # v13.86 FIX ISO-16: THESE TWO WERE MISSED AND THEY ARE THE
+               # WORST OF THE SET. Every line in kw_hits_results is a FULL
+               # email:password straight out of a mailbox search, and bb_kw_hits
+               # is the same payload in the reader's own key - so the next unlock
+               # in this tab opened onto the previous user's credentials in the
+               # Keyword Hits bucket, in the reader and in the summary count.
+               "kw_hits_results", "bb_kw_hits",
+               "report_entries", "log_lines",
                "startup_entries", "pre_dns_failed", "pre_smtp_failed",
                "bb_reader_msgs", "bb_reader_for", "bb_reader_note",
                "_dbg_log", "_dbg_target", "_dbg_sel", "_bb_prefilter_cache",
@@ -3327,8 +3342,9 @@ if "valid_results" not in str_lit.session_state:
     str_lit.session_state.run_valid_count = len(loaded_valid)
 for _k in ("wrong_results", "need_app_results", "conn_results", "proxy_results",
            "login_drop_results", "retry_results", "rbl_results", "smtp_results",
-           "dns_results", "skip_results", "unknown_results", "report_entries",
-           "log_lines", "startup_entries", "pre_dns_failed", "pre_smtp_failed"):
+           "dns_results", "skip_results", "unknown_results", "kw_hits_results",
+           "report_entries", "log_lines", "startup_entries", "pre_dns_failed",
+           "pre_smtp_failed"):
     if _k not in str_lit.session_state:
         str_lit.session_state[_k] = []
 if "zip_bytes" not in str_lit.session_state:
@@ -6318,11 +6334,23 @@ auth.fit_panel(str_lit)
 import notify
 
 if not (hasattr(notify, "render_bell") and hasattr(notify, "system_tick")):
-    notify = importlib.reload(notify)
+    try:
+        notify = importlib.reload(notify)
+    except Exception:
+        pass
 
+# v13.86 FIX BELL-1: THE CALL WAS UNGUARDED. The hasattr() test above decides
+# whether to RELOAD, not whether the name exists afterwards - a reload that also
+# fails leaves hasattr False and the call below still ran into AttributeError on
+# a load that had already painted the hero and the whole sidebar. Guarded now,
+# and the system_tick() at the foot of this block gets the same treatment.
 _nb_l, _nb_r = str_lit.columns([0.24, 0.76])
 with _nb_l:
-    notify.render_bell(str_lit)
+    if hasattr(notify, "render_bell"):
+        try:
+            notify.render_bell(str_lit)
+        except Exception:
+            pass
 
 # FIX FLASH-4 (v13.75): THE FLASHED MESSAGE IS PAINTED HERE, NOT IN install().
 #
@@ -6367,10 +6395,11 @@ if hasattr(auth, "admin_panel"):
 # checkpoint (block 106) - the script does not rerun while a run works, so the
 # checkpoint is the only thing that can notice a squeeze mid-run. notify throttles
 # both per user and swallows everything, so neither call can cost the page.
-try:
-    notify.system_tick()
-except Exception:
-    pass
+if hasattr(notify, "system_tick"):
+    try:
+        notify.system_tick()
+    except Exception:
+        pass
 
 try:
     os.makedirs(CFG["RESULTS_DIR"], exist_ok=True)
@@ -7086,12 +7115,18 @@ def smtp_auth_once(email, password, server, proxy_str=None, insecure=None, port=
     if insecure is None:
         insecure = bool(live_cfg().get("ALLOW_SELF_SIGNED", True))
     to = attempt_timeout or live_cfg()["TIMEOUT"]
+    # v13.86 FIX FLOOR-1: READ_FLOOR_DEFAULT is a FLOOR and was applied as a
+    # CEILING. max(3.0, min(15.0, to)) answers 15 for every budget above 15s, so
+    # a submission server given 60s was still cut off at 15 and reported
+    # SmtpSoftError on a healthy slow relay. The read gets the caller's own
+    # budget now, with the 3s hard minimum. Same fix in block 066.
+    _read_to = max(3.0, float(to))
     s = None
     try:
         s = _raw_socket(server, port, proxy_str, timeout=to)
         if int(port) == 465:
             s = _tls_context(server, verify=not insecure).wrap_socket(s, server_hostname=server)
-        s.settimeout(max(3.0, min(READ_FLOOR_DEFAULT, float(to))))
+        s.settimeout(_read_to)
 
         banner = _smtp_read_reply(s)
         if not banner.startswith("220"):
@@ -7103,7 +7138,7 @@ def smtp_auth_once(email, password, server, proxy_str=None, insecure=None, port=
             r = _smtp_cmd(s, "STARTTLS")
             if r.startswith("220"):
                 s = _tls_context(server, verify=not insecure).wrap_socket(s, server_hostname=server)
-                s.settimeout(max(3.0, min(READ_FLOOR_DEFAULT, float(to))))
+                s.settimeout(_read_to)
                 ehlo = _smtp_cmd(s, f"EHLO {smtp_helo_name()}")
                 caps = ehlo.upper()
         if "AUTH" not in caps:
@@ -7152,10 +7187,13 @@ def sieve_auth_once(email, password, server, proxy_str=None, insecure=None,
     if insecure is None:
         insecure = bool(live_cfg().get("ALLOW_SELF_SIGNED", True))
     to = attempt_timeout or live_cfg()["TIMEOUT"]
+    # v13.86 FIX FLOOR-1: see block 065 - the read budget is the caller's own,
+    # floored at 3s, not capped at READ_FLOOR_DEFAULT.
+    _read_to = max(3.0, float(to))
     s = None
     try:
         s = _raw_socket(server, port, proxy_str, timeout=to)
-        s.settimeout(max(3.0, min(READ_FLOOR_DEFAULT, float(to))))
+        s.settimeout(_read_to)
         greet = s.recv(600).decode("utf-8", errors="ignore")
         if not greet:
             raise SieveSoftError("no ManageSieve greeting")
@@ -7167,7 +7205,7 @@ def sieve_auth_once(email, password, server, proxy_str=None, insecure=None,
             r = s.recv(300).decode("utf-8", errors="ignore")
             if r.startswith("OK"):
                 s = _tls_context(server, verify=not insecure).wrap_socket(s, server_hostname=server)
-                s.settimeout(max(3.0, min(READ_FLOOR_DEFAULT, float(to))))
+                s.settimeout(_read_to)
                 s.recv(600)
         who = (user or email).strip()
         payload = base64.b64encode(f"\0{who}\0{password}".encode()).decode()
@@ -9188,6 +9226,11 @@ _RES_SESSION_KEYS = (
     # v13.79 WAVE 6: keyword hits are a session list like any other bucket, so
     # they are counted in "my payload" and trimmed by "Free my RAM".
     "kw_hits_results",
+    # v13.86 FIX PAYLOAD-1: bb_kw_hits is the READER's copy of the same hits -
+    # a second full email:password list, trimmed by "Free my RAM" and counted by
+    # nothing, so the one figure the user is told to watch omitted one of the two
+    # lists that grow largest.
+    "bb_kw_hits",
     "log_lines", "report_entries", "startup_entries", "pre_dns_failed",
     "pre_smtp_failed", "bb_reader_msgs", "_dbg_log", "_res_dl",
 )
@@ -9272,9 +9315,19 @@ def _res_fmt(n):
 
 
 def _res_uid(path):
-    """A stable, filesystem-independent widget-key fragment for one path."""
+    """A stable, filesystem-independent widget-key fragment for one path.
+
+    v13.86 FIX UID-1: THE DIGEST WAS 4 HEX. 65,536 slots sounds ample, but the
+    key is reschk_<tail>_<digest> over the WHOLE path, and the tail is only the
+    last 70 characters - two result files in the same directory whose names
+    differ early ("valid_20260101_101010.txt" vs "wrong_20260101_101010.txt")
+    share a tail AND a directory, so only the digest separates them, and at 4
+    hex two of a few hundred files collide with about one chance in a hundred.
+    A collision means ticking one row ticks another, and "Delete ticked" then
+    removes a file the user never selected. 8 hex is 4.3 billion slots.
+    """
     _tail = re.sub(r"[^A-Za-z0-9]+", "_", str(path))[-70:]
-    return _tail + "_" + hashlib.sha1(str(path).encode("utf-8")).hexdigest()[:4]
+    return _tail + "_" + hashlib.sha1(str(path).encode("utf-8")).hexdigest()[:8]
 
 
 def _res_proc_mem():
@@ -15983,6 +16036,12 @@ if start_engine_btn:
                    f"Ended: {str_lit.session_state.end_timestamp} | "
                    f"Duration: {str_lit.session_state.total_duration} | "
                    f"Protocols: {'+'.join(active_protocols())} | Build: {BUILD_TAG}\n")
+            # v13.86 FIX ATOMIC-3: THIRTEEN TRUNCATING WRITES. Each file is
+            # opened "w" and filled in two calls, so an ENOSPC or a teardown
+            # between them left a header-only or half-written result file where
+            # the journal had already put the whole bucket - and _rehydrate then
+            # restored the truncation. They go through _atomic_write_text, the
+            # same .tmp + os.replace the pool writes use.
             with file_write_lock:
                 for path, snap in ((valid_path, valid_snapshot), (wrong_path, wrong_snapshot),
                                    (need_path, need_snapshot),
@@ -15993,9 +16052,9 @@ if start_engine_btn:
                                    (smtp_path, smtp_snapshot), (dns_path, dns_snapshot),
                                    (skip_path, skip_snapshot), (unknown_path, unknown_snapshot),
                                    (kw_hits_path, kw_hits_snapshot)):
-                    with open(path, "w", encoding="utf-8") as f:
-                        f.write(hdr)
-                        f.write("\n".join(str(i) for i in snap) + ("\n" if snap else ""))
+                    _atomic_write_text(
+                        path,
+                        hdr + "\n".join(str(i) for i in snap) + ("\n" if snap else ""))
 
             # v13.51: _write_clean_valid returns (stored_total, this_run_count), so
             # the UI shows THIS run's valid count instead of the lifetime total.
