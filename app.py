@@ -8128,17 +8128,63 @@ def refresh_alive_pool(force: bool = False, budget: float = None):
 # @@END 074 REFRESH_POOL
 
 # @@BLOCK 075 ALIVE_THREAD deps=013,074
+# FIX PROBER-1 (v13.83): THE PROBER WAS A `while True` WITH NO EXIT, AND ITS
+# CADENCE KEY WAS PROCESS-WIDE.
+#
+# _any_run_active() reads STATE["runs_active"], which is ONE counter for every
+# session. Block 007's own comment admits a teardown never reaches block 106's
+# finally, so a single dead session can leave that counter at 1 - and from then
+# on EVERY scope's prober loops on PROBER_BUSY_SLEEP (10s) for the life of the
+# process, forever, with no way to stop. That is the "something constantly
+# running that never finishes".
+#
+# Three changes:
+#   1. The busy test is THIS SCOPE's own runs_active, not the process count. One
+#      user's leaked counter can no longer speed up anybody else's prober.
+#   2. The idle wait is served in ALIVE_IDLE_SLICE slices with a cheap check
+#      between them, so a Start does not wait out a full PROBER_IDLE_SLEEP.
+#   3. THE THREAD RETIRES. Every page load stamps last_seen on this scope; a
+#      thread whose scope has not been seen for ALIVE_IDLE_EXIT and has no run
+#      active breaks out of the loop and dies. start_alive_refresher() starts a
+#      fresh one on the next load of that scope, so nothing is lost - a retired
+#      thread is replaced, not lost.
+ALIVE_IDLE_SLICE = 15.0
+ALIVE_IDLE_EXIT = 900.0
+
+
+def _scope_run_active(scope=None) -> bool:
+    """True while THIS SCOPE has a run in flight. Never raises."""
+    try:
+        return int(_user_state(scope).get("runs_active", 0)) > 0
+    except Exception:
+        return False
+
+
+def _scope_seen(scope=None) -> float:
+    """The last time this scope loaded a page. 0.0 when never."""
+    try:
+        return float(_user_state(scope).get("last_seen") or 0.0)
+    except Exception:
+        return 0.0
+
+
 def start_alive_refresher():
-    """One prober thread PER SCOPE.
+    """One prober thread PER SCOPE, and it retires when the scope goes quiet.
 
     FIX ISO-6 (v13.59): there was one global "alive-pool" thread. Its tables are
     per-user now, so it would only ever have refreshed whoever happened to start
-    it, and the `any(t.name == "alive-pool")` guard made every later user a
-    no-op. The scope is pinned on the thread so _gate_scope(), _user_state() and
-    every gate resolve to the right owner for its whole life.
+    it, and the name guard made every later user a no-op. The scope is pinned on
+    the thread so _gate_scope(), _user_state() and every gate resolve to the
+    right owner for its whole life.
     """
     _who = _gate_scope()
     _name = "alive-pool-" + _who
+    # Stamp the load. This is what keeps the thread alive; without it every
+    # thread would retire after ALIVE_IDLE_EXIT even on an active session.
+    try:
+        _user_state(_who)["last_seen"] = time.time()
+    except Exception:
+        pass
     if any(t.name == _name for t in threading.enumerate()):
         return
 
@@ -8146,12 +8192,25 @@ def start_alive_refresher():
         _pin_gate_scope(_who)
         while True:
             try:
-                if _any_run_active():
+                if _scope_run_active(_who):
                     refresh_alive_pool()
                     time.sleep(PROBER_BUSY_SLEEP)
-                else:
-                    refresh_alive_pool()
-                    time.sleep(PROBER_IDLE_SLEEP)
+                    continue
+                # Idle. Retire if the scope has gone away entirely.
+                _seen = _scope_seen(_who)
+                if _seen and (time.time() - _seen) > ALIVE_IDLE_EXIT:
+                    log_probe_event(
+                        f"prober {_who[:8]} retiring - scope unseen for "
+                        f"{ALIVE_IDLE_EXIT:.0f}s and no run active")
+                    return
+                refresh_alive_pool()
+                # Sliced, so a Start does not wait out the whole idle period.
+                _slept = 0.0
+                while _slept < PROBER_IDLE_SLEEP:
+                    time.sleep(ALIVE_IDLE_SLICE)
+                    _slept += ALIVE_IDLE_SLICE
+                    if _scope_run_active(_who):
+                        break
             except Exception:
                 time.sleep(PROBER_BUSY_SLEEP)
 
@@ -10001,6 +10060,31 @@ with str_lit.sidebar:
 
     _p_ok, _p_auth, _p_plan, _p_to, _p_dead = probe_summary()
 
+    # FIX BANNER-1 (v13.83): THE READY BANNER WROTE AN ORPHAN LEDGER LINE ON EVERY
+    # LOAD, AND COULD CLOSE A PRESS THAT WAS NOT ITS OWN.
+    #
+    # _steal is `bool(_pend) and not _pend.get("outcome")`, and _PEND is only ever
+    # armed by a CLICK (audit_log._record_click). A STATE change - a toggle, a
+    # slider, the Deep Diagnostics checkbox in your own log - arms nothing, so
+    # _steal was False, the branch took str_lit.success(), and _close() fell
+    # through to its unattributed arm and wrote `OK | message | ✅ READY ...`.
+    # That single line is twelve of the forty-seven entries in the ledger and it
+    # buries the real outcomes.
+    #
+    # The banner also ANNOUNCED ON EVERY LOAD even when the pool had not changed,
+    # which is why it repeated identically at 00:44:02, 00:44:24, 00:45:17 and
+    # eight more times.
+    #
+    # So: it is a CAPTION by default - captions never close a press and never
+    # write a line - and it is promoted to success()/warning() only when the pool
+    # composition actually CHANGED since the last load, which is the one moment it
+    # is genuinely news. The signature is (alive, pass, plan) so a probe finishing
+    # or a fetch landing promotes it, and a plain rerun does not.
+    _banner_sig = (_alive_now, _p_ok, _p_plan)
+    _banner_changed = str_lit.session_state.get("_pool_banner_sig") != _banner_sig
+    str_lit.session_state["_pool_banner_sig"] = _banner_sig
+    _announce = _banner_changed and not _steal
+
     # FIX ISO-4: the bool used to be cleared by whichever run ended first, so one
     # user's exit hid another user's live run and this banner claimed READY
     # mid-run.
@@ -10018,24 +10102,27 @@ with str_lit.sidebar:
             _rtxt = (f"✅ READY - **{_p_ok}** validated node(s) armed. "
                      f"Paste your combos and press 🔥 Start Live Checking Engine. "
                      f"Nothing else to set.")
-            _rfunc = str_lit.caption if _steal else str_lit.success
+            _rfunc = str_lit.success if _announce else str_lit.caption
         elif _p_plan:
             _rtxt = (f"⚠ **{_p_plan}** node(s) answered **402 Payment Required** - the "
                      f"provider's bandwidth/plan is spent on those sub-users. They are "
                      f"alive and authenticate; they will work again when the plan resets. "
                      f"**{_alive_now}** node(s) are armed - press Start, or set Proxy Mode "
                      f"Engine = off (DIRECT).")
-            _rfunc = str_lit.caption if _steal else str_lit.warning
+            _rfunc = str_lit.warning if _announce else str_lit.caption
         else:
             _rtxt = (f"⚠ **{_alive_now}** node(s) armed but **0 passed the probe** - "
                      f"they will mostly 407. Set **Proxy Mode Engine = off** (DIRECT), "
                      f"or press ♻️ Lift 407 Quarantine.")
-            _rfunc = str_lit.caption if _steal else str_lit.warning
+            _rfunc = str_lit.warning if _announce else str_lit.caption
         _rfunc(_rtxt)
     elif not all_proxies and not WEBSHARE_KEYS:
-        (str_lit.caption if _steal else str_lit.info)(
-            "No proxies configured - press 📥 Fetch & Test All Proxies, or run "
-            "fully DIRECT.")
+        if _announce:
+            str_lit.info("No proxies configured - press 📥 Fetch & Test All Proxies, or "
+                         "run fully DIRECT.")
+        else:
+            str_lit.caption("No proxies configured - press 📥 Fetch & Test All Proxies, "
+                            "or run fully DIRECT.")
 
     str_lit.caption(
         f"Probe ({CFG.get('PROBE_TARGET', PROBE_TARGET_DEFAULT)}, {probe_timeout():.0f}s): "
