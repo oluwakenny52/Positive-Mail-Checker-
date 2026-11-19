@@ -2365,10 +2365,11 @@ def _thread_stats():
 
     v13.86: the equality tests against "alive-pool" and "first-probe" were
     written before those threads were made per-scope, so they reported 0 for
-    ever - the names are "alive-pool-<hash>" and "first-probe-<hash>" now. There
-    is no "start-refresh" thread in the file at all; it is counted by prefix
-    anyway so a reintroduced one shows up. The dict keys are unchanged because
-    block 030 prints them by name.
+    ever - the names are "alive-pool-<hash>" and "first-probe-<hash>" now, and
+    all three are counted BY PREFIX so a new scope needs no edit here. The
+    "start-refresh" thread block 105 starts on a changed probe target is counted
+    the same way. The dict keys are unchanged because block 030 prints them by
+    name.
     """
     names = [t.name for t in threading.enumerate()]
     return {
@@ -6423,11 +6424,18 @@ def _atomic_write_text(path, text):
 
 
 def save_domain_cache():
+    """v13.86 FIX ATOMIC-2: THIS WAS A TRUNCATING WRITE.
+
+    It opened CACHE_FILE "w" and json.dump()ed straight into it, so a teardown
+    or an ENOSPC mid-dump left a half file - and the next load's load_json()
+    swallowed the JSONDecodeError and started from {}, throwing away every
+    resolved domain. It goes through _atomic_write_text like the pool writes.
+    """
     try:
         with file_write_lock:
             with cache_lock:
-                with open(live_cfg()["CACHE_FILE"], "w", encoding="utf-8") as f:
-                    json.dump(domain_cache, f, indent=2)
+                _atomic_write_text(live_cfg()["CACHE_FILE"],
+                                   json.dumps(domain_cache, indent=2))
     except Exception as e:
         warnings.warn(f"Failed to save domain cache: {e}")
 
@@ -6533,6 +6541,14 @@ def get_filtered_active_proxies(quiet: bool = False):
         with proxy_lock:
             meta_snapshot = dict(proxy_meta)
 
+        # v13.86 FIX FILTER-COST: p.upper() WAS REBUILT ONCE PER CHOSEN COUNTRY
+        # PER LINE, so a 3000-line pool with a 12-country pick allocated 36,000
+        # upper-cased copies on every rerun - and this function runs on every
+        # load. The pick lists are upper-cased ONCE here and the line ONCE per
+        # iteration; the comparison is unchanged.
+        _cc_up = [str(c).upper() for c in (chosen_countries or []) if str(c).strip()]
+        _mx_up = [str(c).upper() for c in (chosen_mix or []) if str(c).strip()]
+
         for p in raw:
             if proxy_is_blocked(p):
                 continue
@@ -6549,10 +6565,12 @@ def get_filtered_active_proxies(quiet: bool = False):
                         or country.startswith("UNITED STATES")):
                     filtered.append(p)
             elif mode == "country":
-                if any(cc in country or cc in p.upper() for cc in chosen_countries):
+                _p_up = p.upper()
+                if any(cc in country or cc in _p_up for cc in _cc_up):
                     filtered.append(p)
             elif mode == "mix":
-                if any(mc in country or mc in p.upper() for mc in chosen_mix):
+                _p_up = p.upper()
+                if any(mc in country or mc in _p_up for mc in _mx_up):
                     filtered.append(p)
             else:
                 filtered.append(p)
@@ -11047,10 +11065,20 @@ with str_lit.sidebar:
             # FIX NOLIMIT-1 (v13.59): this was all_proxies[:200], so line 201 of a
             # 3000-line pool could not even be selected.
             _dbg_opts = [f"#{i + 1}  {p[:64]}" for i, p in enumerate(all_proxies)]
+            # v13.86 FIX DBG-SEL: THE CLAMP RAN AFTER THE WIDGET EXISTED. A keyed
+            # selectbox whose session value is not one of its options raises
+            # StreamlitAPIException at CREATION, so a stored index past the end of
+            # a pool that a fetch has since shrunk killed the whole block before
+            # `min(...)` could correct it - and block 037 pops _dbg_sel on an owner
+            # change but nothing corrects it on a pool change. The key is seeded
+            # legal BEFORE the widget is built now.
+            if (not isinstance(str_lit.session_state.get("_dbg_sel"), int)
+                    or not (0 <= str_lit.session_state.get("_dbg_sel", 0) < len(_dbg_opts))):
+                str_lit.session_state["_dbg_sel"] = 0
             _dbg_sel = str_lit.selectbox(
                 "Line to trace", range(len(_dbg_opts)),
                 format_func=lambda i: _dbg_opts[i], key="_dbg_sel")
-            _dbg_sel = min(_dbg_sel, len(_dbg_opts) - 1)
+            _dbg_sel = min(int(_dbg_sel), len(_dbg_opts) - 1)
             _dbg_line = all_proxies[_dbg_sel]
 
             try:
@@ -11213,8 +11241,18 @@ with str_lit.sidebar:
                 return f"Unexpected status {status}."
 
             def _dbg_run(kind):
-                thost, _, tport = _dbg_target.rpartition(":")
-                tport = int(tport or 993)
+                # v13.86 FIX DBG-PORT: int() ON A FREE TEXT FIELD. "imap.gmail.com"
+                # alone or "host:abc" raised ValueError straight out of the block,
+                # before a byte was dialled, because rpartition leaves tport empty
+                # or non-numeric. A bare host keeps the host and falls to 993; junk
+                # after the colon falls to 993 as well.
+                thost, _sep, tport_s = _dbg_target.strip().rpartition(":")
+                if not thost:
+                    thost, tport_s = _dbg_target.strip(), ""
+                try:
+                    tport = int(tport_s)
+                except Exception:
+                    tport = 993
                 log = [f"=== {kind} | {time.strftime('%H:%M:%S')} ==="]
                 if kind == "web-requests":
                     try:
@@ -11230,14 +11268,9 @@ with str_lit.sidebar:
                         log.append("Could not even reach the proxy with requests.")
                     return log
                 _mode = "noauth" if kind == "raw-noauth" else "auth"
-                if kind == "raw-noauth":
-                    _host, _port, _u, _pw = "", "", "", ""
-                    _q = parse_proxy(_dbg_line) or {}
-                    _host, _port = _q.get("host", ""), _q.get("port", 0)
-                else:
-                    _q = parse_proxy(_dbg_line) or {}
-                    _host, _port = _q.get("host", ""), _q.get("port", 0)
-                    _u, _pw = _man_user, _man_pw
+                _q = parse_proxy(_dbg_line) or {}
+                _host, _port = _q.get("host", ""), _q.get("port", 0)
+                _u, _pw = ("", "") if kind == "raw-noauth" else (_man_user, _man_pw)
                 if not _host:
                     return log + ["Could not parse host from the line."]
                 lines, status = _dbg_connect(_host, _port, thost, tport, _u, _pw, _mode)
@@ -11412,8 +11445,12 @@ def load_disposable_set():
             if r.ok and r.text:
                 found.update(x.strip().lower() for x in r.text.splitlines()
                              if x.strip() and not x.startswith("#"))
-                with open(DISPOSABLE_FILE, "w", encoding="utf-8") as f:
-                    f.write("\n".join(sorted(found)))
+                # v13.86 FIX ATOMIC-1: this was a plain truncating "w" write, so a
+                # teardown during it left a short or empty blocklist on disk - and
+                # the file's presence is what stops the background fetch running
+                # again, so the pool silently lost every fetched domain until the
+                # user deleted the file. _atomic_write_text is block 058's helper.
+                _atomic_write_text(DISPOSABLE_FILE, "\n".join(sorted(found)))
                 log_startup(f"Disposable blocklist loaded: {len(found)}")
         except Exception as e:
             log_startup(f"Disposable list fetch skipped: {e}")
