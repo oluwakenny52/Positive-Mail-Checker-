@@ -136,14 +136,15 @@ Display Fit (font size / content scale) is in every page's sidebar via
 before creating the widgets, and a second call in the same run raises
 `StreamlitWidgetAlreadyInstantiatedError` inside its own `try/except`.
 
-Pages guard the import with `hasattr(auth, "fit_panel")` +
+Every page guards the import with `hasattr(auth, "fit_panel")` +
 `importlib.reload(auth)`, never a bare `auth.fit_panel` expression inside a
 `try:`. The bare form is intercepted by Streamlit's magic-write, which routes it
 through `st.help` -> `ast.parse` and can raise `IndentationError` on the
 enclosing `try:`; the reload is what makes a module cached from before a redeploy
-safe. `pages/2_Diagnostics.py` is the one page without that guard - it calls
-`import auth` plain, so a stale cached module surfaces there as an
-`AttributeError` on `fit_panel` instead of a reload.
+safe. `pages/2_Diagnostics.py` was the last page without the guard and gained it
+in block 005 at v13.81 - without it, a redeploy with that page already open died
+on `AttributeError: module 'auth' has no attribute 'fit_panel'` before the hero
+could render.
 
 ## Layout
 
