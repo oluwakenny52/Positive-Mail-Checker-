@@ -344,7 +344,7 @@ else:
                   _rep.get("last_status") or "-", _rep.get("last_latency_ms"),
                   _rep.get("last_token") or "-"))
     if _rep.get("last_error"):
-        st.caption("last error: `%s`" % _str(_rep.get("last_error")))
+        st.caption("last error: `%s`" % _clip(_rep.get("last_error"), 300))
 # @@END 008 STATUS
 
 # @@BLOCK 009 CLASSIFY_NOW deps=008
