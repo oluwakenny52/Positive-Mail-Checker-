@@ -36,7 +36,7 @@ nothing checking it either time.
 
 import re
 
-STATUS_VERSION = "v13.76"
+STATUS_VERSION = "v13.86"
 STATUS_MODULE = "status"
 STATUS_BLOCKS = 13
 # @@END 000 HEADER
