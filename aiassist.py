@@ -21,7 +21,7 @@ CONTRACT
   * Only scrubbed server text leaves the box: no address local-part, no
     credential, no proxy string.
   * Budgeted twice: per run and per user per day, and it stops itself after N
-    consecutive failures.
+    consecutive failures.  Chat calls share those same run and day budgets.
 
 WHAT IT IS NOT
 --------------
@@ -65,6 +65,8 @@ USAGE
     tok = aiassist.classify(raw_server_text)  # token, or None - never blocks
     aiassist.drain(limit=6)                   # do the network, later
     tok = aiassist.classify_now(one_line)     # one blocking call, on demand
+    for chunk in aiassist.chat_stream(msgs, context=ctx):
+        ...
     aiassist.report()                         # counters dict for the diag bundle
 
     python aiassist.py --selftest     offline; canned payloads
@@ -131,6 +133,23 @@ INSTRUCTION = (
 )
 
 TIMEOUT = 8.0
+CHAT_TIMEOUT = 60.0
+CHAT_MAX_TOKENS = 1400
+CHAT_SYSTEM = (
+    "You are the assistant inside a Streamlit app called Mega Ultimate Mail "
+    "Checker. You help its owner understand it, find things in it and debug it.\n"
+    "Rules:\n"
+    "- Be concrete. When you point at code, name the file, the block id and the "
+    "function.\n"
+    "- The app is organised as @@BLOCK ... @@END sections with ascending ids. A "
+    "block is replaced whole, never edited inside.\n"
+    "- Never invent a block id, function, widget key or file. If it is not in the "
+    "context or the conversation, say you do not have it and ask.\n"
+    "- You cannot run anything or change a file. You read, explain and propose.\n"
+    "- The classifier's closed token list is a separate job. Do not answer a "
+    "classification in prose unless you are asked to explain one.\n"
+    "- Short paragraphs, tight snippets, no preamble."
+)
 MAX_CHARS = 600
 CACHE_MAX = 512
 QUEUE_MAX = 256
@@ -584,6 +603,125 @@ def _one_call(body, key_cache=None):
 
 
 # ---------------------------------------------------------------------------
+# chat - free-form, for a human reading the app
+# ---------------------------------------------------------------------------
+def _chat_payload(messages, context="", model=None) -> dict:
+    """Request body for a conversation.  Pure - used by the selftest.
+
+    A chat turn is NOT a classification: no whitelist, no 8-token cap, and the
+    closed instruction is replaced by a system instruction.  `role` accepts
+    user/assistant as well as Gemini's user/model, so a page can store its own
+    transcript shape.
+    """
+    contents = []
+    for m in messages or []:
+        if not isinstance(m, dict):
+            continue
+        text = str(m.get("text") or "").strip()
+        if not text:
+            continue
+        role = "model" if str(m.get("role") or "") in ("model", "assistant") else "user"
+        contents.append({"role": role, "parts": [{"text": text[:8000]}]})
+    if context:
+        contents.insert(0, {"role": "user",
+                            "parts": [{"text": "APP CONTEXT - read it, do not repeat "
+                                               "it back:\n\n" + str(context)[:24000]}]})
+    return {"systemInstruction": {"parts": [{"text": CHAT_SYSTEM}]},
+            "contents": contents,
+            "generationConfig": {"temperature": 0.35,
+                                 "maxOutputTokens": CHAT_MAX_TOKENS,
+                                 "candidateCount": 1}}
+
+
+def chat_stream(messages, context="", model=None):
+    """Yield reply text in deltas.  Never raises; ends on error.  SSE.
+
+    Counts against the SAME run and day budgets as the classifier, because a
+    chat turn is a real call and the key is the same key.  The outcome lands in
+    _last so a page can say why an empty answer came back instead of guessing.
+    """
+    global _calls_run, _consec_fails, _tripped
+    payload = _chat_payload(messages, context, model)
+    with _lock:
+        model_id = str(model or _cfg["model"] or DEFAULT_MODEL)
+        api_key = _cfg["key"]
+        stop_after = int(_cfg["stop_after_fails"])
+    if not api_key:
+        with _lock:
+            _last.update({"ts": time.time(), "status": "nokey", "error": "no key",
+                          "token": "", "latency_ms": 0})
+        return
+    if not _budget_free():
+        with _lock:
+            _last.update({"ts": time.time(), "status": "budget", "error": "budget spent",
+                          "token": "", "latency_ms": 0})
+        return
+
+    started = time.time()
+    data = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(
+        (ENDPOINT % model_id) + "?alt=sse", data=data, method="POST",
+        headers={"Content-Type": "application/json", "x-goog-api-key": api_key,
+                 "Accept": "text/event-stream",
+                 "User-Agent": "PositiveMailChecker/" + AI_VERSION})
+    code, got_any = 0, False
+    try:
+        with urllib.request.urlopen(req, timeout=CHAT_TIMEOUT) as resp:
+            code = resp.status
+            for raw in resp:
+                line = raw.decode("utf-8", "replace").strip()
+                if not line or line.startswith(":"):
+                    continue
+                if line.startswith("data:"):
+                    line = line[5:].strip()
+                if not line or line == "[DONE]":
+                    continue
+                try:
+                    obj = json.loads(line)
+                except Exception:
+                    continue
+                piece = _extract(obj)
+                if piece:
+                    got_any = True
+                    yield piece
+    except urllib.error.HTTPError as exc:
+        try:
+            body = exc.read().decode("utf-8", "replace")
+        except Exception:
+            body = ""
+        with _lock:
+            _consec_fails += 1
+            if stop_after and _consec_fails >= stop_after:
+                _tripped = True
+            _last.update({"ts": time.time(), "status": str(exc.code),
+                          "error": body[:400], "token": "",
+                          "latency_ms": int((time.time() - started) * 1000)})
+        _day_bump(_path())
+        return
+    except Exception as exc:
+        with _lock:
+            _consec_fails += 1
+            _last.update({"ts": time.time(), "status": "0",
+                          "error": "%s: %s" % (type(exc).__name__, exc), "token": "",
+                          "latency_ms": int((time.time() - started) * 1000)})
+        _day_bump(_path())
+        return
+
+    with _lock:
+        _calls_run += 1
+        _consec_fails = 0
+        _last.update({"ts": time.time(), "status": str(code), "token": "",
+                      "latency_ms": int((time.time() - started) * 1000),
+                      "error": "" if got_any else "empty stream"})
+    _day_bump(_path())
+
+
+def chat(messages, context="", model=None) -> str:
+    """The whole reply as one string.  For callers that cannot consume a stream."""
+    return "".join(chat_stream(messages, context, model))
+
+
+# ---------------------------------------------------------------------------
 # reporting
 # ---------------------------------------------------------------------------
 def report() -> dict:
@@ -695,6 +833,16 @@ def selftest(verbose=False) -> bool:
     # v13.86: report() must survive its own lock and must carry the fail budget.
     add("report_no_deadlock", isinstance(report().get("calls_run"), int))
     add("report_fails", report().get("stop_after_fails") == 2)
+
+    _p = _chat_payload([{"role": "user", "text": "hi"},
+                        {"role": "assistant", "text": "yo"},
+                        {"role": "user", "text": "  "}], "ctx")
+    add("chat_roles", [c["role"] for c in _p["contents"]] == ["user", "user", "model"])
+    add("chat_context_first", _p["contents"][0]["parts"][0]["text"].startswith("APP CONTEXT"))
+    add("chat_blank_skipped", len(_p["contents"]) == 3)
+    add("chat_system_set", "Mail Checker" in _p["systemInstruction"]["parts"][0]["text"])
+    add("chat_no_whitelist", _chat_payload([{"role": "user", "text": "x"}])
+        ["generationConfig"]["maxOutputTokens"] == CHAT_MAX_TOKENS)
 
     # ---- everything below touches globals: snapshot first, restore in finally --
     with _lock:
