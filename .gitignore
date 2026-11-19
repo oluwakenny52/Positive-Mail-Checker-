@@ -41,3 +41,5 @@ notify_seen.json
 # committed copy was stamped v13.40 and advertised a build that no longer existed.
 theme.json
 *_theme.json
+.pw-browsers/
+__pycache__/
