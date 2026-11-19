@@ -1,4 +1,4 @@
-"""breach.py - breach exposure and combo freshness.  v13.85
+"""breach.py - breach exposure and combo freshness.  v13.86
 
 NO API KEY. Three keyless sources, in order of how much they prove:
 
@@ -60,6 +60,21 @@ Pacing is separate from worker count on purpose. Workers bound concurrency;
 configure(delay=...) bounds the RATE at which new addresses are started, which is
 the thing a WAF counts. The default is 2 seconds between starts.
 
+THE TIER SWITCH  (v13.86)
+-------------------------
+Both address tiers are worth choosing deliberately, so the tier is configuration,
+not an accident: configure(http_only=True) or check(..., allow_browser=False)
+runs the address half over plain HTTP and never launches, installs or hands off
+to a browser. A challenged address then comes back UNKNOWN with the reason
+"http only - browser not tried", which is a different answer from "no browser
+installed" and must stay different: one is a choice, the other is a fault.
+Passwords are unaffected - Pwned Passwords is a plain HTTP API on a different
+host and is checked either way.
+
+check(allow_browser=...) defaults to the CONFIGURED tier. It used to default to
+True, and since no caller ever passed False the only way to run HTTP-only did
+not exist.
+
 Plain module, NOT frame-gated - like runstate.py and sentinel.py. No Streamlit.
 Nothing here renders. EVERY public function swallows: a breach lookup must never
 be the reason a page dies.
@@ -116,7 +131,7 @@ import urllib.parse
 import urllib.request
 from datetime import datetime
 
-BREACH_VERSION = "v13.85"
+BREACH_VERSION = "v13.86"
 
 # MUST be set before anything imports playwright. setdefault, not assignment, so
 # an operator who exports their own path keeps it.
@@ -178,7 +193,8 @@ TRACE_NAME = "breach_trace.jsonl"
 TRACE_FILE_MAX = 4000
 TRACE_DUMP_MAX = 500
 
-_cfg = {"pages": PAGES_DEFAULT, "timeout": 60.0, "delay": DELAY_DEFAULT}
+_cfg = {"pages": PAGES_DEFAULT, "timeout": 60.0, "delay": DELAY_DEFAULT,
+        "http_only": False}
 _lock = threading.Lock()
 _pool = None
 _pw_missing = ""
@@ -202,8 +218,12 @@ _MAILTO_RE = re.compile(r"^mailto:\s*", re.IGNORECASE)
 # ---------------------------------------------------------------------------
 # config
 # ---------------------------------------------------------------------------
-def configure(pages=None, timeout=None, delay=None):
-    """Pool size, per-address budget and start pacing. Never raises."""
+def configure(pages=None, timeout=None, delay=None, http_only=None):
+    """Pool size, per-address budget, start pacing and the address tier.
+
+    http_only=True disables the browser tier outright: no launch, no install, no
+    hand-off. A challenged address comes back UNKNOWN and says why. Never raises.
+    """
     with _lock:
         if pages is not None:
             try:
@@ -220,6 +240,8 @@ def configure(pages=None, timeout=None, delay=None):
                 _cfg["delay"] = max(0.0, min(DELAY_MAX, float(delay)))
             except Exception:
                 pass
+        if http_only is not None:
+            _cfg["http_only"] = bool(http_only)
 
 
 def _pages() -> int:
@@ -230,6 +252,11 @@ def _pages() -> int:
 def _delay() -> float:
     with _lock:
         return float(_cfg["delay"])
+
+
+def _http_only() -> bool:
+    with _lock:
+        return bool(_cfg.get("http_only"))
 
 
 # ---------------------------------------------------------------------------
@@ -1068,8 +1095,15 @@ _REASON = {
 # ---------------------------------------------------------------------------
 # the check
 # ---------------------------------------------------------------------------
-def check(addr, password="", force=False, allow_browser=True) -> dict:
-    """One address. Pwned Passwords, then address exposure. Never raises."""
+def check(addr, password="", force=False, allow_browser=None) -> dict:
+    """One address. Pwned Passwords, then address exposure. Never raises.
+
+    v13.86: allow_browser DEFAULTS TO THE CONFIGURED TIER. It defaulted to True
+    and no caller ever passed False, so configure(http_only=True) could not have
+    worked even once the page had a switch.
+    """
+    if allow_browser is None:
+        allow_browser = not _http_only()
     raw = addr
     addr = _email_only(addr)
     if not is_email(addr):
@@ -1078,8 +1112,9 @@ def check(addr, password="", force=False, allow_browser=True) -> dict:
         rec["reason"] = rec["error"] = "not an email address"
         trace("WARN", "address", "rejected %r - not an email" % str(raw)[:80])
         return rec
-    trace("INFO", "address", "using %r, password %s"
-          % (addr, "kept (hash only)" if password else "absent"), addr)
+    trace("INFO", "address", "using %r, password %s, tier %s"
+          % (addr, "kept (hash only)" if password else "absent",
+             "http+browser" if allow_browser else "http-only"), addr)
 
     cache = _load()
     entry = (cache.get("address") or {}).get(addr)
@@ -1105,10 +1140,15 @@ def check(addr, password="", force=False, allow_browser=True) -> dict:
             except Exception as exc:
                 rec["error"] = "browser failed: %s: %s" % (type(exc).__name__, exc)
                 trace("ERR", "browser", rec["error"], addr)
+        elif not allow_browser:
+            # A CHOICE, not a fault - and it must not read like one, so the
+            # marker is distinct from the missing-binary text below.
+            addr_rec["error"] += " | http only - browser not tried"
+            trace("WARN", "browser", "skipped by the tier switch (HTTP only)", addr)
         else:
             # Kick the install so the NEXT press has a browser, and say which of
             # the two reasons it was: a missing binary is not a blocked site.
-            if allow_browser and not available():
+            if not available():
                 ensure_browser()
             addr_rec["error"] += " | no browser (%s)" % browser_note()
             trace("WARN", "browser", "not used: %s" % browser_note(), addr)
@@ -1154,13 +1194,17 @@ def last_url() -> str:
 
 
 def check_many(pairs, workers=4, progress=None, cancel=None, force=False,
-               delay=None) -> dict:
+               delay=None, http_only=None) -> dict:
     """Check every (email, password) pair. Returns {email: record}.
 
     Paced on purpose: `workers` bounds concurrency, `delay` bounds the rate at
     which NEW addresses are started. A pool of 8 that starts 8 at once is what a
     WAF sees as a burst; a pool of 8 that starts one every two seconds is not.
+
+    v13.86: `http_only` reaches check() as allow_browser=False, and the tier is
+    written into the run line so a trace says how its rows were reached.
     """
+    ho = _http_only() if http_only is None else bool(http_only)
     uniq, seen = [], set()
     for item in pairs or []:
         if isinstance(item, (tuple, list)) and item:
@@ -1174,8 +1218,9 @@ def check_many(pairs, workers=4, progress=None, cancel=None, force=False,
     out, guard, done = {}, threading.Lock(), [0]
     total = len(uniq)
     pace = _delay() if delay is None else max(0.0, float(delay or 0.0))
-    trace("INFO", "run", "start: %d unique address(es), workers=%d, pace=%ss"
-          % (total, max(1, int(workers or 1)), pace))
+    trace("INFO", "run", "start: %d unique address(es), workers=%d, pace=%ss, tier=%s"
+          % (total, max(1, int(workers or 1)), pace,
+             "http-only" if ho else "http+browser"))
     if not total:
         return out
 
@@ -1188,7 +1233,7 @@ def check_many(pairs, workers=4, progress=None, cancel=None, force=False,
             trace("WARN", "cancel", "cancelled before the check", em)
         else:
             trace("INFO", "start", "checking", em)
-            rec = check(em, pw, force=force)
+            rec = check(em, pw, force=force, allow_browser=not ho)
         with guard:
             out[em] = rec
             done[0] += 1
@@ -1218,7 +1263,8 @@ def check_many(pairs, workers=4, progress=None, cancel=None, force=False,
         trace("ERR", "run", "executor failed (%s), falling back to serial"
               % type(exc).__name__)
         for item in uniq:
-            out.setdefault(item[0], check(item[0], item[1], force=force))
+            out.setdefault(item[0], check(item[0], item[1], force=force,
+                                          allow_browser=not ho))
     trace("INFO", "run", "finished: %d record(s)" % len(out))
     return out
 
@@ -1255,8 +1301,8 @@ def report() -> dict:
     return {"version": BREACH_VERSION, "browser": available(),
             "browser_state": browser_state().get("state", ""),
             "browser_error": browser_note(), "pages": _pages(), "delay": _delay(),
-            "pool": _pool is not None, "last": dict(_last),
-            "trace_seq": trace_seq()}
+            "http_only": _http_only(), "pool": _pool is not None,
+            "last": dict(_last), "trace_seq": trace_seq()}
 
 
 # ---------------------------------------------------------------------------
@@ -1355,6 +1401,18 @@ def selftest(verbose=False) -> bool:
     add("delay_clamped", 0.0 <= _delay() <= DELAY_MAX)
     add("delay_default_on", DELAY_DEFAULT > 0)
 
+    import inspect
+    add("configure_takes_http_only",
+        "http_only" in inspect.signature(configure).parameters)
+    add("check_many_takes_http_only",
+        "http_only" in inspect.signature(check_many).parameters)
+    configure(http_only=True)
+    add("http_only_on", _http_only() is True)
+    configure(http_only=False)
+    add("http_only_off", _http_only() is False)
+    configure(http_only=None)
+    add("http_only_untouched", _http_only() is False)
+
     before = trace_seq()
     trace("INFO", "selftest", "hello")
     got = trace_read(limit=5, since=before)
@@ -1384,9 +1442,13 @@ def main(argv=None) -> int:
         try:
             target = argv[argv.index("--probe") + 1]
         except Exception:
-            print("usage: breach.py --probe someone@example.com[:password]")
+            print("usage: breach.py --probe someone@example.com[:password] "
+                  "[--http-only]")
             return 2
+        only = "--http-only" in argv
+        configure(http_only=only)
         pairs = parse_addresses(target) or [(target, "")]
+        print("tier:", "http-only" if only else "http+browser")
         print("browser available:", available(), browser_note())
         res = check(pairs[0][0], pairs[0][1], force=True)
         print("url sent:", last_url())
