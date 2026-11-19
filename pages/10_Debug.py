@@ -24,6 +24,12 @@ WHAT IT DOES NOT DO
 It renders and it reads. It never edits a file, never runs a gate, and never
 touches another user's data - every path shown comes from auth.user_file().
 
+app.py IS READ, NOT IMPORTED
+----------------------------
+Importing app.py executes the whole shell, so every widget in the app would
+render a second time inside this page and the load would double. The version is
+taken from line 1 of the file instead, which is the only authority anyway.
+
 WHY THE IDENTITY PANEL MATTERS
 ------------------------------
 auth._anon_id() is the pre-unlock placeholder and it is NOT the identity. A page
@@ -156,7 +162,6 @@ st.markdown(_css(), unsafe_allow_html=True)
 
 # @@BLOCK 006 IDENTITY deps=005
 _SECRET_HINTS = ("key", "pass", "secret", "token", "cookie", "hash")
-_MASK_KEYS = ("GEMINI_API_KEY", "WEBSHARE_KEYS", "OXYLABS_BASE")
 
 
 def _mask(name, value, n=90):
@@ -174,13 +179,6 @@ def _owner():
         return os.path.basename(auth.user_file("")) or ""
     except Exception as e:
         return "UNRESOLVED (%s)" % type(e).__name__
-
-
-def _exists(path):
-    try:
-        return os.path.exists(path)
-    except Exception:
-        return False
 
 
 st.markdown("### 1. Identity")
@@ -210,7 +208,9 @@ st.caption("Python %s  |  %s  |  streamlit %s"
 # @@BLOCK 007 VERSIONS deps=006
 st.markdown("### 2. Versions")
 
-_MODULES = ("app", "auth", "engine", "status", "aiassist", "hosts", "ms_oauth",
+# app.py is NOT in this tuple: importing it runs the whole shell. Its version is
+# read from line 1 below instead, which is the only authority anyway.
+_MODULES = ("auth", "engine", "status", "aiassist", "hosts", "ms_oauth",
             "audit_log", "notify", "mailsearch", "mailview", "mailsort",
             "runstate", "sentinel", "breach", "verify_blocks", "audit_frame",
             "verify_v1337", "fix_end_names")
@@ -331,7 +331,7 @@ else:
 # @@END 010 CONFORMANCE
 
 # @@BLOCK 011 SESSION deps=010
-st.markdown("### 5b. Session state")
+st.markdown("### 6. Session state")
 st.caption("The live keys in THIS session, secrets masked. Nothing here is read "
            "from another user's session.")
 
@@ -351,7 +351,7 @@ st.dataframe(_sess, width="stretch", height=280)
 # @@END 011 SESSION
 
 # @@BLOCK 012 GATES deps=011
-st.markdown("### 6. Gates")
+st.markdown("### 7. Gates")
 st.caption("The eighteen, in order. All must be green before a commit, and the "
            "workflow step names in `.github/workflows/gates.yml` are the authority "
            "if a command here ever drifts.")
@@ -379,8 +379,9 @@ st.caption("Five more run as shell steps in the workflow: the blocks=N header "
 
 # @@BLOCK 013 BUNDLE deps=012
 st.markdown("---")
-st.markdown("### 7. Diag bundle")
+st.markdown("### 8. Diag bundle")
 st.caption("Everything above as one JSON file, for pasting into a report.")
+
 
 def _bundle():
     """The bundle dict. Never raises - a failing section is recorded as text."""
