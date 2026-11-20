@@ -74,7 +74,7 @@ thing already known. The failure is folded into addr_rec's error now, so it
 survives to the record.
 
 The per-address budget is 90s, not 45. One navigation (20s) + interstitial (25s)
-+ render (8s) + scrape does not fit in 45, and a cut call is indistinguishable
++ render (12s) + scrape does not fit in 45, and a cut call is indistinguishable
 from a broken site.
 
 WHY AN OPTIONAL KEY STILL EXISTS
@@ -233,15 +233,44 @@ UI_SEARCH_SELECTORS = (
     "input[type='email']",
     "input[type='text']",
 )
-RENDER_WAIT = 8.0
+# v13.86 FIX PARSE-1: the render wait is a CEILING now, not a fixed sleep, and
+# there is a second ceiling for the interstitial. A fresh __cf_chl_rt_tk is
+# minted per URL, so an account page can land challenged even though the root
+# page cleared - 8s of a flat loop cannot cover that, and the old code returned 0
+# either way.
+RENDER_WAIT = 12.0
+CHALLENGE_EXTRA = 25.0
+INTERSTITIAL_MARKS = ("just a moment", "checking your browser", "verify you are human",
+                      "performing security verification", "attention required",
+                      "cf-challenge")
 
 # Read the rendered page ONCE: the breach anchors, the visible text and the
 # markup. innerText, not textContent - innerText is what is actually laid out, so
 # a collapsed or hidden block cannot pad the scrape with template text.
+# v13.86 FIX PARSE-2: the anchors alone were the only selector and nothing forced
+# a lazy tile into the DOM. The anchors are still first because they are exact;
+# the class fallback only runs when they yield nothing, and the caller scrolls
+# before reading so a mounted-on-scroll tile is present.
 JS_READ = """() => {
-  const links = Array.from(document.querySelectorAll("a[href*='/breach/']"))
-    .map(a => ({t: (a.textContent || '').trim(), h: a.getAttribute('href') || ''}))
-    .filter(x => x.t);
+  const seen = new Set();
+  const links = [];
+  const push = (el, href) => {
+    if (!el) return;
+    const t = (el.textContent || '').trim();
+    if (!t || seen.has(t)) return;
+    seen.add(t);
+    links.push({t: t, h: href || ''});
+  };
+  Array.from(document.querySelectorAll("a[href*='/breach/']"))
+    .forEach(a => push(a, a.getAttribute('href') || ''));
+  if (!links.length) {
+    Array.from(document.querySelectorAll("[class*='pwned'], [class*='breach']"))
+      .forEach(el => {
+        if (el.querySelector("[class*='pwned'], [class*='breach']")) return;
+        const a = el.querySelector('a[href]');
+        push(el, a ? (a.getAttribute('href') || '') : '');
+      });
+  }
   const body = document.body;
   return {links: links,
           text: body ? (body.innerText || '') : '',
@@ -323,7 +352,7 @@ TRACE_NAME = "breach_trace.jsonl"
 TRACE_FILE_MAX = 4000
 TRACE_DUMP_MAX = 500
 
-# 90s, not 45: a navigation (20s) plus an interstitial (25s) plus a render (8s)
+# 90s, not 45: a navigation (20s) plus an interstitial (25s) plus a render (12s)
 # plus the scrape does not fit in 45, and a cut call is indistinguishable from a
 # broken site.
 _cfg = {"pages": PAGES_DEFAULT, "timeout": 90.0, "delay": DELAY_DEFAULT,
@@ -944,15 +973,19 @@ def _page_http(addr, kind="records") -> dict:
     return out
 
 
-def _page_from_record(rec, kind="records") -> dict:
+def _page_from_record(rec, kind="records", force=False) -> dict:
     """A text and an HTML view BUILT FROM the record. Never raises.
 
     Only used when a live page could not be read - a keyed run whose /account
     fetch was refused, or an address the browser could not render. Marked
     page_via "api": it is a report of what the source said, not a captured page,
     and it says so at the foot of the HTML.
+
+    force=True ignores page_wanted(), so a caller that has already decided this
+    record must carry a page can build one in fast mode where "records" is never
+    a captured kind.
     """
-    if not page_wanted(kind):
+    if not force and not page_wanted(kind):
         return _page_skip(kind)
     addr = _email_only(rec.get("email") or "")
     _pw = rec.get("pw_count")
@@ -1471,11 +1504,18 @@ class _BrowserPool:
                     rec["count"] = 0
                     got = self._read(page)
                 elif cap_status in (401, 403, 429, 503):
-                    rec = _blank(addr, pw_s)
-                    rec["via"] = "browser"
-                    rec["error"] = "challenge survived (http %d)" % cap_status
-                    trace("WARN", "browser", "challenge survived", addr)
-                    got = self._read(page)
+                    # THE JSON FAILING DOES NOT MEAN THE PAGE FAILED. The in-page
+                    # fetch hits the same wall the DOM already got past, so the
+                    # rendered page is read FIRST and the 401 is only the reason
+                    # when the DOM has nothing either. This is the branch that
+                    # discarded sportmedizin's rendered page.
+                    rec, got = self._dom_record(page, addr, pw_s)
+                    if rec.get("error"):
+                        rec["error"] = ("challenge survived (http %d) - %s"
+                                        % (cap_status, rec["error"]))
+                    trace("WARN", "browser",
+                          "json challenged (http %d), dom read: %s"
+                          % (cap_status, "empty" if rec.get("error") else "ok"), addr)
                 else:
                     rec, got = self._dom_record(page, addr, pw_s)
 
@@ -1535,19 +1575,29 @@ class _BrowserPool:
         """Land on the site and sit out the interstitial."""
         trace("INFO", "browser", "landing on %s/ to clear" % HIBP_BASE)
         page.goto(HIBP_BASE + "/", wait_until="domcontentloaded", timeout=NAV_TIMEOUT)
-        deadline = time.time() + CHALLENGE_WAIT
-        while time.time() < deadline:
+        self._settle(page, CHALLENGE_WAIT)
+
+    def _settle(self, page, budget):
+        """True once the page is not an interstitial. Never raises.
+
+        Used on ANY url, not just the root: the challenge token is minted per
+        navigation, so an account page can arrive walled. Returns False on expiry
+        so the caller can decide, rather than pretending it cleared.
+        """
+        deadline = time.time() + budget
+        while True:
             try:
                 title = (page.title() or "").lower()
             except Exception:
                 title = ""
-            if "pwned" in title and "moment" not in title:
-                trace("INFO", "browser", "clearance title: %r" % title[:60])
+            if not any(m in title for m in INTERSTITIAL_MARKS):
                 return True
-            trace("INFO", "browser", "interstitial title: %r" % title[:60])
-            page.wait_for_timeout(1500 if any(m in title for m in CHALLENGE_MARKS) else 1200)
-        trace("WARN", "browser", "clearance wait expired")
-        return True
+            if time.time() >= deadline:
+                return False
+            try:
+                page.wait_for_timeout(900)
+            except Exception:
+                time.sleep(0.9)
 
     def _read(self, page):
         """The rendered page as {links, text, html}. Never raises."""
@@ -1560,12 +1610,23 @@ class _BrowserPool:
     def _await_render(self, page):
         """Wait until the result is on the page. Returns the anchor count.
 
-        0 is a real answer - it means the page rendered the "no pwnage" copy, or
-        that nothing rendered in time. The caller distinguishes the two from the
-        text, so a slow page is never silently reported as clean.
+        A CHALLENGE ON THE ACCOUNT URL IS WAITED OUT, not counted as a failed
+        render - the interstitial has no anchors and no "no pwnage" copy, so the
+        flat 8s loop used to expire on a page that was still solving and report
+        zero. The render ceiling only starts once the page is real.
         """
-        deadline = time.time() + RENDER_WAIT
-        while time.time() < deadline:
+        hard = time.time() + RENDER_WAIT + CHALLENGE_EXTRA
+        while time.time() < hard:
+            try:
+                title = (page.title() or "").lower()
+            except Exception:
+                title = ""
+            if any(m in title for m in INTERSTITIAL_MARKS):
+                try:
+                    page.wait_for_timeout(900)
+                except Exception:
+                    time.sleep(0.9)
+                continue
             try:
                 n = page.evaluate(
                     "() => document.querySelectorAll(\"a[href*='/breach/']\").length")
@@ -1582,9 +1643,9 @@ class _BrowserPool:
             if any(m in low for m in CLEAN_MARKS):
                 return 0
             try:
-                page.wait_for_timeout(600)
+                page.wait_for_timeout(500)
             except Exception:
-                time.sleep(0.6)
+                time.sleep(0.5)
         return 0
 
     def _ui_search(self, page, addr):
@@ -1616,11 +1677,18 @@ class _BrowserPool:
         except Exception:
             pass
         try:
-            if "haveibeenpwned.com" not in (page.url or ""):
-                self._clear(page)
+            # ALWAYS, not only off-site. The pool hands back a page still sitting
+            # on the previous account URL, so the old guard skipped the clear and
+            # the box lookup ran against the last address's DOM - which is the
+            # 38 ms "no search box found" in every trace.
+            self._clear(page)
             box = None
             used = ""
             for sel in UI_SEARCH_SELECTORS:
+                try:
+                    page.wait_for_selector(sel, timeout=1200)
+                except Exception:
+                    pass
                 try:
                     box = page.query_selector(sel)
                 except Exception:
@@ -1678,6 +1746,12 @@ class _BrowserPool:
         """
         rec = _blank(addr, pw)
         rec["via"] = "browser"
+        try:
+            page.evaluate("() => window.scrollTo(0, document.body.scrollHeight)")
+            page.wait_for_timeout(400)
+            page.evaluate("() => window.scrollTo(0, 0)")
+        except Exception:
+            pass
         got = self._read(page)
         text = str(got.get("text") or "")
         url = page.url or ""
@@ -1853,6 +1927,14 @@ def check(addr, password="", force=False, allow_browser=None) -> dict:
                 pool = _get_pool()
                 trace("INFO", "browser", "handing off to the browser tier (UI)", addr)
                 addr_rec = pool.submit(addr, password).result(timeout=_cfg["timeout"])
+                # ONE retry on an empty read. A challenge that outlives the wait is
+                # transient; UNKNOWN for the whole cache TTL is not.
+                if not addr_rec.get("breaches") and addr_rec.get("error"):
+                    trace("WARN", "browser", "empty read - one retry", addr)
+                    _again = pool.submit(addr, password).result(
+                        timeout=_cfg["timeout"])
+                    if _again.get("breaches") or not _again.get("error"):
+                        addr_rec = _again
             except Exception as exc:
                 # FOLDED INTO addr_rec, not into rec. rec["error"] is overwritten
                 # from addr_rec a few lines below, so writing it here used to throw
@@ -1889,6 +1971,23 @@ def check(addr, password="", force=False, allow_browser=None) -> dict:
                "page_at"):
         if _k in addr_rec:
             rec[_k] = addr_rec[_k]
+
+    # v13.86 FIX PAGE-1: A RECORD WITH NO PAGE NOW GETS ONE. In fast mode
+    # "records" is not a captured kind, so a 10-breach address carried no page at
+    # all and block 009 had nothing to draw a Text/HTML toggle from. The page is
+    # built from the record itself - no extra request - and marked page_via "api"
+    # so it is never passed off as a captured page.
+    if not (rec.get("page_text") or rec.get("page_html")):
+        try:
+            _kind = ("records" if rec.get("count")
+                     else ("error" if rec.get("error") else "clean"))
+            _gen = _page_from_record(rec, _kind, force=True)
+            for _k in ("page_url", "page_html", "page_text", "page_via",
+                       "page_error", "page_at"):
+                if _gen.get(_k):
+                    rec[_k] = _gen[_k]
+        except Exception:
+            pass
 
     rec["bucket"] = _combine(_pw_bucket(rec["pw_count"]), _addr_bucket(addr_rec))
     rec["verdict"] = rec["bucket"]
@@ -2187,6 +2286,21 @@ def selftest(verbose=False) -> bool:
     add("ui_selector_id_first", UI_SEARCH_SELECTORS[0] == "input#searchInput")
     add("js_read_links", "breach/" in JS_READ)
     add("js_read_innertext", "innerText" in JS_READ)
+    add("js_read_dedupes", "seen" in JS_READ)
+    add("js_read_fallback", "class*='pwned'" in JS_READ)
+    add("render_ceiling_raised", RENDER_WAIT >= 12.0)
+    add("challenge_ceiling", CHALLENGE_EXTRA > 0)
+    add("interstitial_marks", "just a moment" in INTERSTITIAL_MARKS)
+    add("settle_exists", hasattr(_BrowserPool, "_settle"))
+    add("clear_unconditional", "if \"haveibeenpwned.com\" not in"
+        not in inspect.getsource(_BrowserPool._ui_search))
+    add("ui_waits_for_box", "wait_for_selector" in
+        inspect.getsource(_BrowserPool._ui_search))
+    add("dom_record_scrolls", "scrollTo" in inspect.getsource(_BrowserPool._dom_record))
+    add("dom_read_on_wall", "_dom_record(page, addr, pw_s)" in
+        inspect.getsource(_BrowserPool._run))
+    add("check_retries_once", "one retry" in inspect.getsource(check))
+    add("gen_force_param", "force" in inspect.signature(_page_from_record).parameters)
     add("key_optional", isinstance(_api_key(), str))
     add("keyed_account_url", "breachedaccount" in ACCOUNT_API and
         ACCOUNT_API.startswith(HIBP_BASE))
@@ -2203,6 +2317,7 @@ def selftest(verbose=False) -> bool:
     add("gen_html", "<table" in _gen["page_html"] and "2015-01-01" in _gen["page_html"])
     add("gen_marked", _gen["page_via"] == "api")
     add("gen_skipped", _page_from_record(_pr, "records")["page_text"] == "")
+    add("gen_forced", _page_from_record(_pr, "records", force=True)["page_text"] != "")
     add("esc", _esc("<a&b>") == "&lt;a&amp;b&gt;")
 
     # ---- pacing and tracing ----
