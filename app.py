@@ -15119,9 +15119,152 @@ if _AI is not None:
 # str_lit.empty() here would append a SECOND element further down the page and
 # leave the first one blank for ever. This block only defines the function and
 # gives it its first paint.
-active_proxy_pool = []
-_run_pool_box = []
-_batch_rest = []
+#
+# v13.86 FIX KW-2: AND THE PANEL NOW HAS A TARGET BESIDE THE TABS. _kw_live sits
+# under the keyword controls, hundreds of lines above the run tabs, so during a
+# run the hits were painted off-screen and after the run the tabs no longer
+# existed to paint into. The third tab below creates three elements of its own and
+# _kw_panel holds them; it is a MODULE value, so it resets every script run and
+# render_kw_panel() falls back to _kw_live whenever the tabs are not on screen.
+# Block 106 already calls render_kw_panel() after every scan, so the panel
+# repaints on the scan's own event and nothing else has to know it exists.
+_kw_panel = {"head": None, "hits": None, "trace": None}
+
+_KW_ROW_CAP = 60          # rows drawn at once; the bucket and the ZIP hold all
+_KW_TRACE_CAP = 40        # trace lines drawn at once
+_KW_SNIP = 170            # characters of body shown around a hit
+
+
+def _kw_snippet(body, keywords):
+    """A short window of body text AROUND the first hit. Never raises.
+
+    The point of the snippet is to show the keyword in context, not to show the
+    top of the message - a hit 4 KB into a body is invisible if the top is shown.
+    """
+    txt = " ".join(str(body or "").split())
+    if not txt:
+        return ""
+    low = txt.lower()
+    pos = -1
+    for k in keywords or []:
+        p = low.find(str(k).lower())
+        if p >= 0 and (pos < 0 or p < pos):
+            pos = p
+    if pos < 0:
+        return txt[:_KW_SNIP]
+    start = max(0, pos - (_KW_SNIP // 3))
+    return (("…" if start else "") + txt[start:start + _KW_SNIP]
+            + ("…" if start + _KW_SNIP < len(txt) else ""))
+
+
+def _kw_parse_line(line):
+    """A bucket line from mailsearch.hit_line() -> the fields it can carry.
+
+    The format is fixed by hit_line():
+
+        email:password | kw:a(2),b | folder:F | header|body | subject
+
+    The combo comes first and alone before the first " | " on purpose - the same
+    split the re-run path uses - so a password containing a pipe cannot break it.
+    """
+    out = {"email": "", "folder": "", "where": "", "subject": "",
+           "counts": {}, "total": 0}
+    try:
+        combo, _sep, rest = str(line).partition(" | ")
+        out["email"] = combo.split(":", 1)[0].strip()
+        bits = rest.split(" | ")
+        if len(bits) >= 4:
+            _kw = bits[0][3:] if bits[0].startswith("kw:") else bits[0]
+            for part in _kw.split(","):
+                part = part.strip()
+                if not part:
+                    continue
+                name, _sep2, num = part.partition("(")
+                try:
+                    n = int(num.rstrip(")"))
+                except Exception:
+                    n = 0
+                if name:
+                    out["counts"][name] = n
+                    out["total"] += n or 1
+            out["folder"] = (bits[1][7:] if bits[1].startswith("folder:")
+                             else bits[1])
+            out["where"] = bits[2]
+            out["subject"] = " | ".join(bits[3:])
+    except Exception:
+        pass
+    return out
+
+
+def _kw_rows():
+    """Newest rows, richest first, and no hit ever dropped.
+
+    TWO sources, because two paths write hits: the reader's manual search stores
+    the FULL hit dicts in kw_hits_detail, and the run path stores only the
+    hit_line() strings in kw_hits_results. A detail row renders every column; a
+    bare line still renders with the columns it carries and says which ones the
+    run path did not capture, so a hit can never be invisible.
+    """
+    try:
+        detail = list(str_lit.session_state.get("kw_hits_detail") or [])
+        lines = list(str_lit.session_state.get("kw_hits_results") or [])
+    except Exception:
+        return []
+    rows, seen = [], set()
+    for h in detail:
+        key = (str(h.get("email") or ""), str(h.get("folder") or ""),
+               str(h.get("subject") or ""))
+        seen.add(key)
+        counts = dict(h.get("counts") or {})
+        rows.append({
+            "email": h.get("email") or "", "folder": h.get("folder") or "",
+            "where": h.get("where") or "", "subject": h.get("subject") or "",
+            "from": h.get("from") or "", "to": h.get("to") or "",
+            "counts": counts,
+            "total": (sum(int(v or 0) for v in counts.values())
+                      or len(h.get("keywords") or [])),
+            "snippet": _kw_snippet(h.get("body"), h.get("keywords")),
+            "full": True,
+        })
+    for ln in lines:
+        p = _kw_parse_line(ln)
+        key = (p["email"], p["folder"], p["subject"])
+        if key in seen:
+            continue
+        seen.add(key)
+        p["from"] = ""
+        p["to"] = ""
+        p["snippet"] = ""
+        p["full"] = False
+        rows.append(p)
+    return rows
+
+
+def _kw_hit_html(row):
+    """One hit -> a wrapping block. Every value escaped, nothing truncated away."""
+    kw = ", ".join(("%s ×%d" % (k, v)) if v else str(k)
+                   for k, v in (row.get("counts") or {}).items()) or "?"
+    pairs = [
+        ("Account", row.get("email")),
+        ("Folder", row.get("folder")),
+        ("Hit count", "%s occurrence(s) of %s" % (row.get("total") or 0, kw)),
+        ("Matched in", row.get("where")),
+        ("Subject", row.get("subject")),
+        ("From", row.get("from") or ("(not captured by the run path)"
+                                     if not row.get("full") else "")),
+        ("To", row.get("to") or ("(not captured by the run path)"
+                                 if not row.get("full") else "")),
+        ("Around the hit", row.get("snippet")),
+    ]
+    body = "".join(
+        "<div style='font-size:11px;opacity:.72'>%s</div>"
+        "<div style='font-size:12px;white-space:pre-wrap;word-break:break-word;"
+        "overflow-wrap:anywhere;margin-bottom:5px'>%s</div>"
+        % (html.escape(lbl), html.escape(str(val or "-")))
+        for lbl, val in pairs if val)
+    return ("<div style='border-left:3px solid #8b5cf6;padding:6px 9px;"
+            "margin:0 0 8px 0;background:rgba(139,92,246,.07);"
+            "border-radius:6px'>%s</div>" % body)
 
 
 def render_kw_panel():
@@ -15131,34 +15274,61 @@ def render_kw_panel():
     keyword actually produced, and what the last scan did. Both are read from
     session_state, so the panel survives a rerun and is right on the first paint.
 
-    The element it draws into is block 087's _kw_live, made a block earlier.
+    It draws into the third run tab when that exists and into block 087's
+    _kw_live otherwise - see the FIX KW-2 note above.
     """
-    try:
-        _counts = dict(str_lit.session_state.get("kw_counts") or {})
-        _trace = list(str_lit.session_state.get("kw_trace") or [])
-        _hits = len(str_lit.session_state.get("kw_hits_results") or [])
-    except Exception:
-        _counts, _trace, _hits = {}, [], 0
-    if not _counts and not _trace and not _hits:
-        _kw_live.caption("No scans yet this session. Counts appear here as they land.")
+    head = _kw_panel.get("head")
+    hits_box = _kw_panel.get("hits")
+    trace_box = _kw_panel.get("trace")
+    target = head if head is not None else globals().get("_kw_live")
+    if target is None:
         return
-    _total = sum(_counts.values())
-    _kw_live.markdown(
-        f"**{_hits}** hit line(s) · **{_total}** occurrence(s) across "
-        f"**{len(_counts)}** keyword(s)")
-    if _counts:
-        _rows = sorted(_counts.items(), key=lambda kv: -kv[1])[:12]
-        _kw_live.markdown(
-            "| Keyword | Mails |\n|---|---|\n"
-            + "\n".join("| `%s` | %d |" % (k, v) for k, v in _rows))
-    if _trace:
-        with _kw_live.expander("Keyword scan trace", expanded=False):
-            str_lit.code("\n".join(_trace[-40:]), language="text")
+    try:
+        counts = dict(str_lit.session_state.get("kw_counts") or {})
+        trace = list(str_lit.session_state.get("kw_trace") or [])
+        rows = _kw_rows()
+    except Exception:
+        counts, trace, rows = {}, [], []
+    if not counts and not rows and not trace:
+        target.caption("No keyword scan yet this run. Hits appear here as they "
+                       "land, with the account, folder, count and headers.")
+        return
+
+    _occ = sum(int(v or 0) for v in counts.values()) or sum(r["total"] for r in rows)
+    _kws = counts or {k: 1 for r in rows for k in (r.get("counts") or {})}
+    target.markdown(
+        "**%d** hit message(s) · **%d** occurrence(s) across **%d** keyword(s)"
+        % (len(rows), _occ, len(_kws)))
+    if counts:
+        _top = sorted(counts.items(), key=lambda kv: -int(kv[1] or 0))[:12]
+        target.markdown("| Keyword | Mails hit |\n|---|---|\n"
+                        + "\n".join("| `%s` | %d |" % (html.escape(str(k)), int(v or 0))
+                                    for k, v in _top))
+
+    draw_into = hits_box if hits_box is not None else target
+    if rows:
+        draw_into.markdown(
+            "<div style='max-height:420px;overflow-y:auto;overflow-x:hidden;"
+            "max-width:100%'>"
+            + "".join(_kw_hit_html(r) for r in rows[-_KW_ROW_CAP:]) + "</div>",
+            unsafe_allow_html=True)
+        if len(rows) > _KW_ROW_CAP:
+            draw_into.caption("%d more - the Keyword Hits bucket and the ZIP carry "
+                              "all of them." % (len(rows) - _KW_ROW_CAP))
+    else:
+        draw_into.caption("No hit rows to show.")
+
+    if trace_box is not None:
+        if trace:
+            trace_box.code("\n".join(trace[-_KW_TRACE_CAP:]), language="text")
+        else:
+            trace_box.caption("No scan trace yet.")
 
 
 # The first paint. Block 087 could not make this call - the function did not
 # exist yet when it ran - so it is made here, immediately after the def, which is
-# the earliest legal point. Block 106 repaints the same element as hits land.
+# the earliest legal point. It paints into _kw_live, because the tabs below do not
+# exist yet either. Block 106 repaints as hits land.
 render_kw_panel()
 
 
@@ -15216,9 +15386,12 @@ if start_engine_btn:
     clear_proxy_quarantine()
     log_probe_event("run start: 407 quarantine cleared")
     # The keyword counters are per RUN, so they reset with the run - a stale
-    # total from the last run would read as progress this one never made.
+    # total from the last run would read as progress this one never made. The
+    # detail list resets with them, or the panel would open on the last run's
+    # hits and the first new one would look like a duplicate.
     str_lit.session_state["kw_counts"] = {}
     str_lit.session_state["kw_trace"] = []
+    str_lit.session_state["kw_hits_detail"] = []
     if _sentinel is not None:
         _sentinel.expect(
             "run", "The run finished without producing a single result",
@@ -15425,8 +15598,9 @@ if start_engine_btn:
             str_lit.session_state.end_timestamp = None
             str_lit.session_state.total_duration = None
 
-        exec_tab1, exec_tab2 = str_lit.tabs(["⚡ Live Execution Stream",
-                                             "📊 Live Report Log & Analytics"])
+        exec_tab1, exec_tab2, exec_tab3 = str_lit.tabs(
+            ["⚡ Live Execution Stream", "📊 Live Report Log & Analytics",
+             "🔎 Live Keywords Hit"])
         with exec_tab1:
             log_container = str_lit.empty()
         with exec_tab2:
@@ -15451,6 +15625,20 @@ if start_engine_btn:
                 with str_lit.expander(f"{_title}", expanded=False):
                     bucket_placeholders[_key] = str_lit.empty()
             report_log_container = str_lit.empty()
+        with exec_tab3:
+            # The elements the panel paints into. Kept in the module dict, not in
+            # session_state - a container belongs to ONE script run.
+            str_lit.caption(
+                "Every keyword hit as it lands: the account, the folder, how many "
+                "times the keyword hit, the headers and a window of the body around "
+                "it. The Keyword Hits bucket and the ZIP carry the full set, and the "
+                "bodies are on disk under mail_results/kw_hits_*.")
+            _kw_panel["head"] = str_lit.empty()
+            _kw_panel["hits"] = str_lit.empty()
+            _kw_panel["trace"] = str_lit.empty()
+        # First paint inside the tab, so it is populated before the first account
+        # is dispatched rather than after it.
+        render_kw_panel()
 
         _full_queue = (accounts_to_check[:CFG["MAX_ACCOUNTS"]]
                        if CFG["MAX_ACCOUNTS"] > 0 else list(accounts_to_check))
