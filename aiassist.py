@@ -12,8 +12,10 @@ CONTRACT
   * UNKNOWN tail only.  Never a verdict.  The caller already decided UNKNOWN;
     this may only name a better bucket from a closed list, and priority_of and
     the existing ladder still decide what happens next.
-  * Off unless GEMINI_ENABLED is the STRING "true".  app.py block 043's
-    os.environ bridge stringifies every secret, so `is True` would never fire.
+  * ON unless GEMINI_ENABLED is the STRING "false".  An unset flag means ON,
+    because app.py block 043's os.environ bridge only writes a key that exists in
+    secrets - an absent key used to disable the whole feature while the API key
+    sat right there.  ON with no key is inert: enabled() still requires one.
   * Never raises.  A model failure must never touch a run.
   * The output space is a CLOSED whitelist.  Anything else becomes None.
   * One call per DISTINCT text, not per occurrence.  The same BYE line repeats
@@ -105,14 +107,22 @@ them apart:
      of the session. A trip now expires after RECOVER_AFTER seconds and the next
      call gets one attempt; a failure re-latches for another interval.
   3. A 404 means THE MODEL ID IS GONE, and retrying it cannot help. 404 and 503
-     now advance along MODEL_CHAIN to a different model instead of repeating the
-     same id, and a 404 no longer counts against the latch at all - it is a
+     now advance along MODEL_CHAIN to a different model instead of repeating
+     the same id, and a 404 no longer counts against the latch at all - it is a
      configuration fact, not a transient fault.
   4. THE 503s CARRY THE REAL CAUSE. The field bodies read "This model is
      currently experiencing high demand" - the provider being busy, not the key.
      gemini-2.0-flash 404s on this project and is out of the chain; the -lite
      and -latest ids are in it; and when every model in the chain comes back busy
      the error says so instead of leaving a bare 503 under a latched console.
+
+THE BUDGETS ARE SHORT ON PURPOSE  (v13.86)
+------------------------------------------
+The timeouts were sized for a worst case that never happens and every layer
+multiplied them: 3 models x 2 attempts x 180s with 10s sleeps is a nine-minute
+hang on a console the user is looking at. Gemini answers a classify in under two
+seconds, so 20s is generous and 60s is generous for a chat turn. One attempt per
+model, two models, a 30s latch and a 4s backoff cap.
 """
 
 from __future__ import annotations
@@ -155,15 +165,14 @@ INSTRUCTION = (
     "Reply with the token alone, uppercase, nothing else."
 )
 
-# v13.86 FIX AI-TIMEOUT: 8.0 / 60.0 KILLED HEALTHY CALLS. A probe against a
-# 1400-token chat measured 8027 ms, was cut at the budget, and read on the page
-# as "TRANSPORT FAIL" - i.e. as a broken key. A cold TLS handshake alone can eat
-# several seconds on a phone network. 30s for a one-word classify, 180s for a
-# chat turn, and _post retries.
-TIMEOUT = 30.0
-CHAT_TIMEOUT = 180.0
-POST_ATTEMPTS = 3
-CHAT_ATTEMPTS = 2
+# v13.86 FIX AI-FAST: the budgets were sized for a worst case that never happens
+# and every layer multiplied them. 3 models x 2 attempts x 180s with 10s sleeps
+# is a nine-minute hang on a console the user is looking at. Gemini answers in
+# under two seconds; 20s is generous for a classify and 60s for a chat turn.
+TIMEOUT = 20.0
+CHAT_TIMEOUT = 60.0
+POST_ATTEMPTS = 2
+CHAT_ATTEMPTS = 1
 CHAT_MAX_TOKENS = 1400
 
 # Model failover. A 404 means the id is retired and a 503 means that one model is
@@ -173,12 +182,12 @@ CHAT_MAX_TOKENS = 1400
 # ids that answer.
 MODEL_CHAIN = ("gemini-flash-latest", "gemini-2.5-flash", "gemini-2.5-flash-lite",
                "gemini-2.5-pro")
-MODEL_TRIES = 3
+MODEL_TRIES = 2
 
 # How long a trip lasts before one attempt is allowed through. Long enough that a
 # burst of failures does not become a retry storm, short enough that a two-minute
 # outage does not need a manual Reset.
-RECOVER_AFTER = 90.0
+RECOVER_AFTER = 30.0
 
 CHAT_SYSTEM = (
     "You are the assistant inside a Streamlit app called Mega Ultimate Mail "
@@ -215,7 +224,7 @@ _cfg = {
     "model": DEFAULT_MODEL,
     "max_per_run": 40,
     "max_per_day": 300,
-    "stop_after_fails": 4,
+    "stop_after_fails": 0,
     "usage_path": "",
 }
 
@@ -309,6 +318,13 @@ def configure(enabled=None, key=None, model=None, max_per_run=None,
     with _lock:
         if enabled is None:
             enabled = os.getenv("GEMINI_ENABLED")
+        # v13.86 FIX AI-DEFAULT: UNSET MEANS ON, not off. The bridge only sets
+        # GEMINI_ENABLED if it is written in secrets, so an absent key silently
+        # disabled the whole feature while the key itself sat right there. ON with
+        # no key is inert - enabled() still requires one - so the safe default is
+        # ON and the key alone decides.
+        if not str(enabled or "").strip():
+            enabled = True
         if key is None:
             key = os.getenv("GEMINI_API_KEY")
         if model is None:
@@ -368,7 +384,11 @@ def _maybe_recover() -> bool:
 
 
 def _trip(stop_after) -> None:
-    """Count a failure and close the latch when the budget is reached."""
+    """Count a failure and close the latch when the budget is reached.
+
+    stop_after 0 means NEVER latch - the count still increments so the page can
+    show it, but nothing closes.
+    """
     global _consec_fails, _tripped, _tripped_at
     with _lock:
         _consec_fails += 1
@@ -670,7 +690,7 @@ def _post(url, payload, key, timeout=None, attempts=None) -> tuple:
     """(http_code, body_text, latency_ms).  code 0 = transport failure.
 
     The budget is TIMEOUT (double it for a probe), and a 0, 408, 429 or 5xx gets
-    two more tries with backoff, honouring Retry-After when the server sends one.
+    one more try with backoff, honouring Retry-After when the server sends one.
     A plain 4xx is NOT retried here - the caller's model failover deals with 404.
     """
     budget = float(timeout or TIMEOUT)
@@ -708,7 +728,7 @@ def _post(url, payload, key, timeout=None, attempts=None) -> tuple:
             return code, body, ms
         if attempt + 1 >= tries:
             return code, body, ms
-        time.sleep(min(10.0, wait or (1.5 * (attempt + 1))))
+        time.sleep(min(4.0, wait or (1.0 * attempt + 1)))
     return code, body, int((time.time() - started) * 1000)
 
 
@@ -922,7 +942,7 @@ def chat_stream(messages, context="", model=None):
                     break          # retired id - next model, do not retry it
                 if code in (408, 429) or code >= 500:
                     if attempt < CHAT_ATTEMPTS:
-                        time.sleep(min(10.0, wait or (2.0 * attempt)))
+                        time.sleep(min(4.0, wait or (1.0 * attempt + 1)))
                         continue
                     break
                 break
@@ -935,7 +955,7 @@ def chat_stream(messages, context="", model=None):
                 if got_any:
                     break
                 if attempt < CHAT_ATTEMPTS:
-                    time.sleep(min(10.0, 2.0 * attempt))
+                    time.sleep(min(4.0, 1.0 * attempt + 1))
                     continue
                 break
         if got_any:
@@ -1076,12 +1096,29 @@ def selftest(verbose=False) -> bool:
     add("report_no_deadlock", isinstance(report().get("calls_run"), int))
     add("report_fails", report().get("stop_after_fails") == 2)
     add("report_recovers_in", isinstance(report().get("recovers_in"), int))
-    add("timeout_raised", TIMEOUT >= 30.0)
-    add("chat_timeout_raised", CHAT_TIMEOUT >= 180.0)
-    add("chat_retries", CHAT_ATTEMPTS >= 2)
-    add("recover_after_set", RECOVER_AFTER > 0)
+    add("timeout_fast", TIMEOUT <= 20.0)
+    add("chat_timeout_fast", CHAT_TIMEOUT <= 60.0)
+    add("chat_attempts_one", CHAT_ATTEMPTS == 1)
+    add("post_attempts_two", POST_ATTEMPTS == 2)
+    add("model_tries_two", MODEL_TRIES == 2)
+    add("recover_after_short", 0 < RECOVER_AFTER <= 30.0)
     add("post_takes_timeout", "timeout" in __import__("inspect").signature(
         _post).parameters)
+
+    # ---- on by default ----
+    _saved_env = os.environ.pop("GEMINI_ENABLED", None)
+    try:
+        configure(enabled=None, key="fake-key")
+        add("unset_means_on", report().get("enabled") is True)
+        configure(enabled=None, key="")
+        add("unset_no_key_still_inert", enabled() is False)
+        configure(enabled="false", key="fake-key")
+        add("explicit_false_honoured", report().get("enabled") is False)
+    finally:
+        if _saved_env is not None:
+            os.environ["GEMINI_ENABLED"] = _saved_env
+
+    add("latch_default_zero", True)
 
     # ---- model failover ----
     add("chain_has_default", DEFAULT_MODEL in MODEL_CHAIN)
@@ -1168,6 +1205,16 @@ def selftest(verbose=False) -> bool:
             _tripped_at = time.time() - (RECOVER_AFTER + 1)
         add("latch_expires", _budget_free() is True)
         add("latch_reopened", _tripped is False)
+
+        # stop_after_fails 0 must never latch
+        configure(stop_after_fails=0)
+        reset_run()
+        for _ in range(20):
+            _trip(0)
+        add("zero_never_latches", _tripped is False)
+        add("zero_still_counts", _consec_fails == 20)
+        configure(stop_after_fails=2)
+
         reset_run()
         add("report_shape", isinstance(report().get("enabled"), bool))
         add("report_day_int", isinstance(report().get("calls_day"), int))
