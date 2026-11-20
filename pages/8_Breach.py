@@ -1,7 +1,7 @@
 # @@FILE pages/8_Breach.py blocks=12 version=v13.86
 # @@BLOCK 000 FILE_HEADER deps=-
 """
-pages/8_Breach.py - breach exposure and combo freshness  (v13.85)
+pages/8_Breach.py - breach exposure and combo freshness  (v13.86)
 =================================================================
 What a list of combos has actually been in, from keyless sources, with the
 verdict about FRESHNESS rather than count.
@@ -35,6 +35,22 @@ THE BANDS
   CLEAN     password unseen and address in no readable source
   UNKNOWN   nothing readable - the only honest answer when every tier failed
 
+THE RUN DOES NOT RUN IN THE SCRIPT  (v13.86, this pass)
+-------------------------------------------------------
+It used to. Streamlit holds the whole delta stream while a script run blocks, so
+a three-minute run greyed the page out and left the bar on 0 / 4 until the first
+address happened to finish, and the widget states were dead for the duration.
+The run is a THREAD now, its counters live in a session job dict, and this page
+polls them with st.rerun(). The bar and the live trace move per address, Stop
+works, and a refresh or a tab switch does not lose the run.
+
+READ, VERSUS ZERO  (v13.86, this pass)
+--------------------------------------
+A card that said "0 breaches" could mean the page was read and lists none, or
+that every tier failed and nothing was read. Those are opposite facts. Every
+record carries `read`; an unread address half is flagged on the card, marked "-"
+in History, marked `no` in the CSV, and counted in the run summary.
+
 TRACING AND PACING  (v13.85)
 ----------------------------
 Section 4 is a trace of everything: each control you moved, each address started,
@@ -57,7 +73,8 @@ ISOLATION
 The cache, the history and the trace resolve through auth.user_file(), so each is
 one file per user. Nothing on this page reads another user's data.
 
-Read-only except Run / Prepare browser / Clear history / Clear trace / downloads.
+Read-only except Run / Stop / Prepare browser / Clear history / Clear trace /
+downloads.
 """
 
 import importlib
@@ -66,6 +83,7 @@ import os
 import re
 import sys
 import threading
+import time
 from datetime import datetime
 
 import streamlit as st
@@ -201,8 +219,10 @@ import streamlit.components.v1 as components
 # and the page ran old code with no page_mode, no trace_read and no 401 handling.
 # page_wanted, trace_read and trace_clear exist only in the current module, so
 # testing those is a real version test and the reload actually happens.
+# record_view is the newest marker: a module without it builds no page at all
+# when the address tier fails, so it belongs in the same test.
 if not (hasattr(breach, "page_wanted") and hasattr(breach, "trace_read")
-        and hasattr(breach, "trace_clear")):
+        and hasattr(breach, "trace_clear") and hasattr(breach, "record_view")):
     breach = importlib.reload(breach)
     try:
         breach.trace("INFO", "page", "stale breach module replaced by reload")
@@ -215,6 +235,7 @@ _HIST_NAME = "breach_history.jsonl"
 _HIST_MAX = 2000
 _OWNER_KEY = "_breach_owner"
 _RUN_KEY = "_breach_run"
+_JOB_KEY = "_breach_job"
 _RES_KEY = "_breach_results"
 _QUAL_KEY = "_breach_quality"
 _MSG_KEY = "_breach_msg"
@@ -296,11 +317,115 @@ def _band_counts(rows):
     return c
 
 
+def _row_key(r):
+    """A stable widget-key stem from the address, not from hash().
+
+    hash() is salted per process, so the same address got different keys on every
+    run and the view choice never stuck. The address is unique in a run and
+    survives a re-render, which is what a widget key needs.
+    """
+    return (re.sub(r"[^a-z0-9]+", "_", str(r.get("email") or "").lower()).strip("_")
+            [:48] or "row")
+
+
+def _h_esc(v):
+    """Escape for the record view's HTML. Never raises on None."""
+    return (str(v if v is not None else "").replace("&", "&amp;")
+            .replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;"))
+
+
+def _record_page(r):
+    """(text, html) of a record, built here when no page was captured.
+
+    The card must ALWAYS be able to offer a Text and an HTML view. When the
+    address tier failed there is no captured page, and printing "no page
+    captured" with no toggle hides the only artefact left to inspect. This is a
+    view of the RECORD and says so in its own footer.
+    """
+    _read = bool(r.get("read"))
+    _e = str(r.get("email") or "")
+    _pw = r.get("pw_count")
+    _lines = ["address: " + _e,
+              "checked: " + str(r.get("checked_at") or ""),
+              "verdict: %s - %s" % (r.get("verdict") or "?", r.get("reason") or ""),
+              "address half: " + ("READ" if _read else "NOT READ"),
+              "password appearances: " + ("no password supplied" if _pw is None
+                                          else str(_pw)),
+              "source: " + str(r.get("via") or "-"),
+              "breaches: %d, pastes: %d" % (len(r.get("breaches") or []),
+                                           len(r.get("pastes") or []))]
+    if r.get("error"):
+        _lines.append("error: " + str(r["error"]))
+    _rows = []
+    for b in (r.get("breaches") or [])[:60]:
+        _rows.append(b)
+        _lines.append("")
+        _lines.append("- " + str(b.get("title") or "?"))
+        if b.get("date"):
+            _lines.append("  breach date: " + str(b["date"]))
+        if b.get("days") is not None:
+            _lines.append("  age: %d day(s)" % int(b["days"]))
+        _lines.append("  accounts: " + "{:,}".format(int(b.get("pwn_count") or 0)))
+        if b.get("classes"):
+            _lines.append("  data: " + ", ".join(b["classes"]))
+    for p in (r.get("pastes") or [])[:30]:
+        _lines.append("")
+        _lines.append("- paste: %s (%s) %s" % (p.get("title") or "?",
+                                               p.get("source") or "-",
+                                               p.get("date") or ""))
+    _text = "\n".join(_lines)[:30000]
+
+    _h = ["<!doctype html><html><head><meta charset='utf-8'><title>", _h_esc(_e),
+          "</title><style>body{font-family:system-ui,sans-serif;background:#0b1020;"
+          "color:#e6ebff;padding:16px}h1{font-size:1.05rem}"
+          "table{border-collapse:collapse;width:100%;font-size:.8rem}"
+          "td,th{border:1px solid #2a3350;padding:5px;text-align:left;"
+          "vertical-align:top}th{background:#141b30}.c{color:#fcd34d}"
+          "</style></head><body><h1>", _h_esc(_e), "</h1><p class='c'>",
+          _h_esc(r.get("verdict") or "?"), " - ", _h_esc(r.get("reason") or ""),
+          "</p><p>address half: " + ("READ" if _read else "NOT READ")
+          + "<br>password appearances: " + ("-" if _pw is None else _h_esc(_pw))
+          + "<br>source: " + _h_esc(r.get("via") or "-")
+          + "<br>checked: " + _h_esc(r.get("checked_at") or "") + "</p>"]
+    if r.get("error"):
+        _h.append("<p class='c'>error: " + _h_esc(r["error"]) + "</p>")
+    if _rows:
+        _h.append("<table><tr><th>Breach</th><th>Date</th><th>Age</th><th>Accounts</th>"
+                  "<th>Data classes</th></tr>")
+        for b in _rows:
+            _h.append("<tr><td>" + _h_esc(b.get("title") or "?") + "</td><td>"
+                      + _h_esc(b.get("date") or "-") + "</td><td>"
+                      + ("%d d" % int(b["days"]) if b.get("days") is not None else "-")
+                      + "</td><td>" + "{:,}".format(int(b.get("pwn_count") or 0))
+                      + "</td><td>" + _h_esc(", ".join(b.get("classes") or []) or "-")
+                      + "</td></tr>")
+        _h.append("</table>")
+    else:
+        _h.append("<p>" + ("No breach record could be read - see the error above."
+                           if r.get("error") else "No breach record for this address.")
+                  + "</p>")
+    if r.get("pastes"):
+        _h.append("<h2>Pastes</h2><ul>")
+        for p in (r.get("pastes") or [])[:30]:
+            _h.append("<li>" + _h_esc(p.get("title") or "?") + " ("
+                      + _h_esc(p.get("source") or "-") + ") "
+                      + _h_esc(p.get("date") or "") + "</li>")
+        _h.append("</ul>")
+    _h.append("<p><small>View built from the record, not a captured page.</small></p>"
+              "</body></html>")
+    return _text, "".join(_h)[:90000]
+
+
 def _csv(rows):
-    """CSV, first five columns unchanged so anything downstream still reads."""
+    """CSV, first five columns unchanged so anything downstream still reads.
+
+    `read` is appended LAST: yes means the address half answered (so the counts
+    are real, including a real zero), no means nothing was read and the counts
+    must not be taken as zero.
+    """
     head = ("verdict,email,breaches,pastes,pw_count,bucket,pw_hits,corpora,"
             "sites,sensitive,newest_breach_days,breach_names,data_classes,"
-            "paste_titles,via,reason,error,checked_at")
+            "paste_titles,via,reason,error,checked_at,read")
     out = [head]
     for r in rows:
         bs = r.get("breaches") or []
@@ -330,6 +455,7 @@ def _csv(rows):
             '"%s"' % str(r.get("reason") or "").replace('"', "'"),
             '"%s"' % str(r.get("error") or "").replace('"', "'"),
             str(r.get("checked_at") or ""),
+            "yes" if r.get("read") else "no",
         ]))
     return "\n".join(out) + "\n"
 
@@ -381,7 +507,8 @@ def _hibp_key():
 # ---- owner gate: a second unlock in this tab must not inherit the last run ----
 _owner = os.path.basename(user_file("")) or ""
 if st.session_state.get(_OWNER_KEY) != _owner:
-    for k in (_RES_KEY, _RUN_KEY, _QUAL_KEY, _MSG_KEY, "_breach_text", _TRACE_SHOWN):
+    for k in (_RES_KEY, _RUN_KEY, _JOB_KEY, _QUAL_KEY, _MSG_KEY, "_breach_text",
+              _TRACE_SHOWN):
         st.session_state.pop(k, None)
     st.session_state[_OWNER_KEY] = _owner
     breach.trace("INFO", "page", "new owner in this tab, state cleared")
@@ -543,10 +670,76 @@ if _page_mode == "fast" and not _page_on:
 # @@END 007 INPUT
 
 # @@BLOCK 008 RUN deps=007
-_run = st.button("\U0001f6e1 Check exposure", type="primary",
-                 disabled=not _pairs, width="stretch")
+_job = st.session_state.get(_JOB_KEY)
+if isinstance(_job, dict) and not _job.get("done"):
+    try:
+        # Watchdog: a thread that dies without its finally would otherwise leave
+        # the page polling for ever.
+        if time.time() - float(_job.get("started") or 0) > 1800.0:
+            _job["error"] = _job.get("error") or "watchdog: the run stopped reporting"
+            _job["done"] = True
+    except Exception:
+        pass
+_running = bool(isinstance(_job, dict) and not _job.get("done"))
 
-if _run and _pairs:
+_bc1, _bc2 = st.columns([0.72, 0.28])
+with _bc1:
+    _run = st.button("\U0001f6e1 Check exposure", type="primary",
+                     disabled=(not _pairs or _running), width="stretch")
+with _bc2:
+    _stop = st.button("\u23f9 Stop", width="stretch", disabled=not _running,
+                      help="Asks the workers to stop at the next address. Records "
+                           "already finished are kept.")
+
+
+def _job_start(tier):
+    """Start the run on a THREAD and hand back its job dict.
+
+    The run used to execute inside the script run itself, and Streamlit holds the
+    whole delta stream while a script run blocks: the page greyed out, the bar sat
+    on 0 / 4 until the first address happened to finish, and the widget states
+    were dead for the whole three minutes. The thread owns the work now, the job
+    dict owns the counters, and the script polls it with st.rerun(). Stop works, a
+    refresh or a tab switch does not lose the run, and the bar and the live trace
+    move per address instead of per run.
+    """
+    job = {"rows": {}, "done": False, "n": 0, "total": len(_pairs), "last": "",
+           "error": "", "cancel": threading.Event(), "started": time.time(),
+           "since0": breach.trace_seq(), "tier": tier, "mode": _page_mode,
+           "page_on": list(_page_on)}
+    st.session_state[_JOB_KEY] = job
+
+    def _tick(n, total, email, verdict):
+        try:
+            job["n"] = int(n or 0)
+            job["last"] = ("%s %s" % (email or "", (verdict or "").lower())).strip()
+        except Exception:
+            pass
+
+    def _body():
+        try:
+            try:
+                job["rows"] = breach.check_many(
+                    _pairs, workers=int(_workers), progress=_tick,
+                    cancel=job["cancel"], force=bool(_force), delay=float(_delay),
+                    http_only=bool(_http_only))
+            except TypeError:
+                breach.trace("WARN", "run", "check_many has no http_only argument - "
+                                            "re-running without it")
+                job["rows"] = breach.check_many(
+                    _pairs, workers=int(_workers), progress=_tick,
+                    cancel=job["cancel"], force=bool(_force), delay=float(_delay))
+        except Exception as e:
+            job["error"] = "%s: %s" % (type(e).__name__, e)
+            breach.trace("ERR", "run", "raised %s: %s" % (type(e).__name__, e))
+        finally:
+            job["done"] = True
+
+    threading.Thread(target=_body, name="breach-run", daemon=True).start()
+    return job
+
+
+if _run and _pairs and not _running:
     _tier = "http-only" if _http_only else "http+browser"
     breach.trace("CLICK", "run", "pressed: %d address(es), workers=%d, delay=%s, "
                  "tier=%s" % (len(_pairs), int(_workers), _delay, _tier))
@@ -567,89 +760,91 @@ if _run and _pairs:
             breach.trace("WARN", "run", "breach.configure has no http_only argument "
                                         "- the tier switch is NOT applied")
         breach.trace("WARN", "run", "breach.configure has no page_mode argument "
-                                    "- the capture switch is NOT applied, and a "
-                                    "breach.py predating it may also still 401")
+                                    "- the capture switch is NOT applied")
     breach.trace("INFO", "run", "pages: %s%s" % (
         _page_mode, (" (%s)" % ",".join(_page_on)) if _page_on else ""))
-    _since0 = breach.trace_seq()
-    _bar = st.progress(0.0, text="0 / %d" % len(_pairs))
+    _job = _job_start(_tier)
+    _running = True
+
+if isinstance(_job, dict):
+    _total = max(1, int(_job.get("total") or 0))
+    _n = int(_job.get("n") or 0)
+    st.progress(min(1.0, _n / _total),
+                text="%d / %d%s" % (_n, _total,
+                                    (" - " + _job["last"]) if _job.get("last") else ""))
     _live = st.empty()
-    _cancel = threading.Event()
-
-    def _tick(n, total, email, verdict):
-        try:
-            _bar.progress(min(1.0, n / max(1, total)),
-                          text="%d / %d - %s" % (n, total, (verdict or "checking").lower()))
-        except Exception:
-            pass
-        try:
-            _live.code(_trace_code(limit=12, since=_since0), language="text")
-        except Exception:
-            pass
-
-    _rows = []
     try:
-        try:
-            _rows = list(breach.check_many(
-                _pairs, workers=int(_workers), progress=_tick, cancel=_cancel,
-                force=bool(_force), delay=float(_delay),
-                http_only=bool(_http_only)).values())
-        except TypeError:
-            breach.trace("WARN", "run", "breach.check_many has no http_only argument - "
-                                        "re-running without it")
-            _rows = list(breach.check_many(
-                _pairs, workers=int(_workers), progress=_tick, cancel=_cancel,
-                force=bool(_force), delay=float(_delay)).values())
-    except Exception as e:
-        _rows = []
-        st.session_state[_MSG_KEY] = ("error", "Run failed: %s: %s"
-                                      % (type(e).__name__, e))
-        breach.trace("ERR", "run", "raised %s: %s" % (type(e).__name__, e))
-    _bar.empty()
+        _live.code(_trace_code(limit=14, since=int(_job.get("since0") or 0)),
+                   language="text")
+    except Exception:
+        pass
 
-    if _rows:
-        _rows.sort(key=lambda r: ({"OLD": 0, "PARTIAL": 1, "NEW": 2,
-                                   "UNKNOWN": 3, "CLEAN": 4}.get(
-                                       r.get("verdict") or "UNKNOWN", 5),
-                                  r.get("email") or ""))
-        _hist_add(_rows)
-        st.session_state[_RES_KEY] = _rows
-        st.session_state[_QUAL_KEY] = breach.score(_rows)
-        st.session_state[_RUN_KEY] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        _b = _band_counts(_rows)
-        # The tier is part of the summary, not a detail: UNKNOWN under HTTP only
-        # means "walled, not tried", and under http+browser it means the browser
-        # could not render it either. Those are different problems.
-        _msg = ("Checked %d via %s. %d old, %d partially new, %d new, %d clean, "
-                "%d unresolved. Pages kept: %s."
-                % (len(_rows), _tier, _b["OLD"], _b["PARTIAL"],
-                   _b["NEW"], _b["CLEAN"], _b["UNKNOWN"],
-                   ("off" if _page_mode == "off" else
-                    ("all" if _page_mode == "full" else (",".join(_page_on) or "none")))))
-        breach.trace("INFO", "run", "summary: " + _msg)
-        # A message widget is REQUIRED here. Without one the ledger closes the
-        # press as "NO RESULT | finished without reporting", which is exactly what
-        # the 00:36:57 entry recorded.
-        _bst_now = breach.browser_state().get("state")
-        if _b["UNKNOWN"] and _http_only:
-            st.session_state[_MSG_KEY] = (
-                "warning", _msg + " Unresolved ones were walled and HTTP only was "
-                                  "selected - untick HTTP only so the browser can read "
-                                  "them.")
-        elif _b["UNKNOWN"] and _bst_now != "ready":
-            st.session_state[_MSG_KEY] = (
-                "warning", _msg + " The browser is %s, and the browser IS the address "
-                                  "tier - press Prepare browser, then re-run."
-                                  % _bst_now)
-        elif _b["UNKNOWN"]:
-            st.session_state[_MSG_KEY] = (
-                "warning", _msg + " The browser reached the page but nothing readable "
-                                  "came back - open the trace, it names the step that "
-                                  "failed.")
+    if _running:
+        if _stop:
+            try:
+                _job["cancel"].set()
+            except Exception:
+                pass
+            breach.trace("CLICK", "run", "stop requested - workers stop at the "
+                                        "next address")
+        time.sleep(0.6)
+        st.rerun()
+    else:
+        st.session_state.pop(_JOB_KEY, None)
+        _rows = list((_job.get("rows") or {}).values())
+        _mode_used = str(_job.get("mode") or _page_mode)
+        _on_used = list(_job.get("page_on") or [])
+        _tier_used = str(_job.get("tier") or "-")
+        if _job.get("error"):
+            st.session_state[_MSG_KEY] = ("error", "Run failed: %s" % _job["error"])
+        elif not _rows:
+            st.session_state[_MSG_KEY] = ("warning", "Nothing was checked.")
         else:
-            st.session_state[_MSG_KEY] = ("success", _msg)
-    elif not st.session_state.get(_MSG_KEY):
-        st.session_state[_MSG_KEY] = ("warning", "Nothing was checked.")
+            _rows.sort(key=lambda r: ({"OLD": 0, "PARTIAL": 1, "NEW": 2,
+                                       "UNKNOWN": 3, "CLEAN": 4}.get(
+                                           r.get("verdict") or "UNKNOWN", 5),
+                                      r.get("email") or ""))
+            _hist_add(_rows)
+            st.session_state[_RES_KEY] = _rows
+            st.session_state[_QUAL_KEY] = breach.score(_rows)
+            st.session_state[_RUN_KEY] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            _b = _band_counts(_rows)
+            _unread = sum(1 for r in _rows if not r.get("read"))
+            # The tier is part of the summary, not a detail: UNKNOWN under HTTP
+            # only means "walled, not tried", and under http+browser it means the
+            # browser could not render it either. Those are different problems.
+            # The unread count is separate again: it is the addresses whose page
+            # nobody read, and their zeros are not zeros.
+            _msg = ("Checked %d via %s. %d old, %d partially new, %d new, %d clean, "
+                    "%d unresolved. %d address half(s) unread. Pages kept: %s."
+                    % (len(_rows), _tier_used, _b["OLD"], _b["PARTIAL"], _b["NEW"],
+                       _b["CLEAN"], _b["UNKNOWN"], _unread,
+                       ("off" if _mode_used == "off" else
+                        ("all" if _mode_used == "full"
+                         else (",".join(_on_used) or "none")))))
+            breach.trace("INFO", "run", "summary: " + _msg)
+            _tips = []
+            if _unread:
+                _tips.append("%d address half(s) could not be read - those verdicts "
+                             "rest on the password half alone and their breach and "
+                             "paste counts are UNREAD, not zero. The trace names the "
+                             "step that failed." % _unread)
+            _bst_now = breach.browser_state().get("state")
+            if _b["UNKNOWN"] and _http_only:
+                _tips.append("Unresolved ones were walled and HTTP only was selected - "
+                             "untick HTTP only so the browser can read them.")
+            elif _b["UNKNOWN"] and _bst_now != "ready":
+                _tips.append("The browser is %s, and the browser IS the address tier - "
+                             "press Prepare browser, then re-run." % _bst_now)
+            elif _b["UNKNOWN"]:
+                _tips.append("The browser reached the page but nothing readable came "
+                             "back - open the trace, it names the step that failed.")
+            # A message widget is REQUIRED here. Without one the ledger closes the
+            # press as "NO RESULT | finished without reporting", which is exactly
+            # what the 00:36:57 entry recorded.
+            _lvl = "warning" if (_unread or _b["UNKNOWN"]) else "success"
+            st.session_state[_MSG_KEY] = (
+                _lvl, _msg + ((" " + " ".join(_tips)) if _tips else ""))
 
 if st.session_state.get(_MSG_KEY):
     _lvl, _msg = st.session_state.pop(_MSG_KEY)
@@ -685,6 +880,13 @@ if _rows:
         "%s%% unresolved and excluded from the score."
         % (_q.get("pct", {}).get("OLD", 0), _q.get("pct", {}).get("PARTIAL", 0),
            _q.get("pct", {}).get("NEW", 0), _q.get("pct", {}).get("UNKNOWN", 0)))
+
+    _unread_rows = [r for r in _rows if not r.get("read")]
+    if _unread_rows:
+        st.caption("\u26a0 **%d of these %d address half(s) were never read.** Their "
+                   "breach and paste counts are UNREAD, not zero, and their verdict "
+                   "rests on the password half alone."
+                   % (len(_unread_rows), len(_rows)))
     st.bar_chart({"Band": list(_q.get("buckets", {}).keys()),
                   "Count": list(_q.get("buckets", {}).values())},
                  x="Band", y="Count", height=180)
@@ -712,14 +914,15 @@ if _rows:
     if not _show:
         st.info("Nothing in that band.")
     else:
-        for _ix, r in enumerate(_show):
+        for r in _show:
             _v = str(r.get("verdict") or "UNKNOWN")
             _bs = r.get("breaches") or []
             _ps = r.get("pastes") or []
-            _pg_t = str(r.get("page_text") or "")
-            _pg_h = str(r.get("page_html") or "")
-            _rid = abs(hash(r.get("email") or "")) % 100000000
-            with st.expander("%s  %s" % (r.get("email") or "?", _v), expanded=False):
+            _read = bool(r.get("read"))
+            _key = _row_key(r)
+            with st.expander("%s %s%s" % ("\u26a0" if not _read else "\u2022",
+                                          r.get("email") or "?", "  " + _v),
+                             expanded=False):
                 st.markdown('<span class="br-band %s">%s</span> &nbsp; %s'
                             % (_BAND_CSS.get(_v, "br-unknown"), _v,
                                r.get("reason") or ""), unsafe_allow_html=True)
@@ -730,6 +933,10 @@ if _rows:
                     st.caption("Password not supplied - address evidence only.")
                 if r.get("error"):
                     st.caption("error: %s" % r["error"])
+                if not _read:
+                    st.caption("\u26a0 **The address half was not read.** This verdict "
+                               "rests on the password half alone, and the breach and "
+                               "paste counts below are unread - they are not zeros.")
                 if _bs:
                     st.markdown("**Breaches on this address** - %d" % len(_bs))
                     for b in _bs[:25]:
@@ -746,6 +953,8 @@ if _rows:
                                        ", ".join(b.get("classes") or []) or "-"))
                         if b.get("description"):
                             st.caption(b["description"][:300])
+                elif _read:
+                    st.caption("No breach record - the page was read and lists none.")
                 elif r.get("error"):
                     st.caption("No breach record could be read - see the error above.")
                 else:
@@ -755,35 +964,58 @@ if _rows:
                     for p in _ps[:10]:
                         st.caption("%s  %s" % (p.get("title") or "?", p.get("date") or ""))
 
-                # ---- the captured page: text or HTML, whichever you want ----
+                # ---- the page: text or HTML, and ALWAYS one of them ----
+                # A missing captured page used to mean a missing toggle, so a
+                # failed run left the one thing worth inspecting unavailable. The
+                # view is built from the record when nothing was captured, and the
+                # caption says which of the three it is.
+                _pg_t = str(r.get("page_text") or "")
+                _pg_h = str(r.get("page_html") or "")
+                _pg_via = str(r.get("page_via") or "")
+                if not (_pg_t or _pg_h):
+                    _fn = getattr(breach, "record_view", None)
+                    if callable(_fn):
+                        try:
+                            _pg_t, _pg_h = _fn(r)
+                        except Exception:
+                            _pg_t, _pg_h = "", ""
+                    if not (_pg_t or _pg_h):
+                        _pg_t, _pg_h = _record_page(r)
+                    _src = "view built from the record - no page was captured"
+                elif _pg_via == "browser":
+                    _src = "page as the browser rendered it"
+                elif _pg_via == "http":
+                    _src = ("page as fetched over plain HTTP - not rendered, so it is "
+                            "often the challenge body itself")
+                else:
+                    _src = "view built from the record"
+
                 if _pg_t or _pg_h:
+                    st.caption(_src)
                     _opts = (["Text", "HTML"] if (_pg_t and _pg_h)
                              else (["Text"] if _pg_t else ["HTML"]))
                     _pv = st.radio("Page view", _opts, horizontal=True, index=0,
-                                   key="_pv_%d" % _rid,
-                                   help="What the site actually rendered for this "
+                                   key="_pv_%s" % _key,
+                                   help="What the source actually returned for this "
                                         "address, kept under your own prefix.")
                     if _pv == "Text":
                         st.code(_pg_t[:40000] or "(empty page)", language="text")
                         st.download_button(
                             "\u2b07 Download this page as text",
                             data=_pg_t.encode("utf-8"),
-                            file_name="page_%s.txt" % _rid,
+                            file_name="page_%s.txt" % _key,
                             mime="text/plain", width="stretch",
-                            key="_pvt_%d" % _rid)
+                            key="_pvt_%s" % _key)
                     else:
                         components.html(_pg_h, height=560, scrolling=True)
                         st.download_button(
                             "\u2b07 Download this page as HTML",
                             data=_pg_h.encode("utf-8"),
-                            file_name="page_%s.html" % _rid,
+                            file_name="page_%s.html" % _key,
                             mime="text/html", width="stretch",
-                            key="_pvh_%d" % _rid)
-                elif st.session_state.get(_CAP_MODE_KEY) != "off":
-                    st.caption("No page captured for this address - the capture mode "
-                               "or its outcome filter skipped it.")
+                            key="_pvh_%s" % _key)
 
-                st.caption("via %s · checked %s"
+                st.caption("via %s \u00b7 checked %s"
                            % (r.get("via") or "-", r.get("checked_at") or ""))
 
     st.markdown("### 3. Export")
@@ -841,13 +1073,20 @@ if not _hist:
 else:
     st.caption("%d stored report(s), newest last." % len(_hist))
     _hc = _band_counts(_hist)
-    st.caption("OLD %d · PARTIAL %d · NEW %d · CLEAN %d · UNKNOWN %d"
+    st.caption("OLD %d \u00b7 PARTIAL %d \u00b7 NEW %d \u00b7 CLEAN %d \u00b7 UNKNOWN %d"
                % (_hc["OLD"], _hc["PARTIAL"], _hc["NEW"], _hc["CLEAN"], _hc["UNKNOWN"]))
-    st.dataframe(
-        [{"checked": h.get("checked_at"), "verdict": h.get("verdict"),
-          "email": h.get("email"), "breaches": len(h.get("breaches") or []),
-          "pastes": len(h.get("pastes") or [])} for h in reversed(_hist[-100:])],
-        width="stretch", height=260)
+    _hrows = []
+    for h in reversed(_hist[-100:]):
+        _hr = h.get("read")
+        _hrows.append({"checked": h.get("checked_at"), "verdict": h.get("verdict"),
+                       "email": h.get("email"),
+                       "read": "yes" if _hr else ("no" if _hr is False else "?"),
+                       "breaches": (len(h.get("breaches") or []) if _hr else "-"),
+                       "pastes": (len(h.get("pastes") or []) if _hr else "-")})
+    st.dataframe(_hrows, width="stretch", height=260)
+    st.caption("`read` is whether the address half answered. A dash means it did not, "
+               "so the count beside it is unread - not zero. Rows written before this "
+               "column existed show `?`.")
     if st.button("Clear my history"):
         breach.trace("CLICK", "history", "cleared")
         _hist_clear()
@@ -881,6 +1120,8 @@ auth.fit_panel(st)
 st.caption("Sources: Pwned Passwords (k-anonymity - only 5 hash characters leave the "
            "box), the HIBP address search and the free breach list. No API key. Only "
            "the address is transmitted; a pasted password is never. A CLEAN verdict "
-           "means not in those sources, not that the address was never exposed.")
+           "means not in those sources, not that the address was never exposed - and "
+           "an address half that could not be read is flagged UNREAD rather than "
+           "reported as zero.")
 # @@END 011 FOOTER
 # @@EOF
