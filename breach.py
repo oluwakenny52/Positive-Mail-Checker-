@@ -73,9 +73,31 @@ why the browser had failed - it said the site had challenged, which is the one
 thing already known. The failure is folded into addr_rec's error now, so it
 survives to the record.
 
-The per-address budget is 90s, not 45. One navigation (20s) + interstitial (25s)
-+ render (12s) + scrape does not fit in 45, and a cut call is indistinguishable
-from a broken site.
+The per-address budget is 180s, not 45 and not 90. One navigation (20s) + a root
+interstitial (10s) + the box scan + a render ceiling (12s) + an interstitial
+ceiling (25s) does not fit in 90, and the budget also covers a spell in the queue
+behind the other workers. A cut call is indistinguishable from a broken site, and
+the old code answered it by re-queueing the same address and paying the whole
+thing twice.
+
+THE PAGE VIEW THAT NEVER EXISTED  (v13.86, this pass)
+-----------------------------------------------------
+_page_from_record() builds the Text and HTML view when a live page could not be
+read. It formatted its head with `%` while the head contained the CSS rule
+`width:100%`, and `%` followed by `;` is not a conversion - so EVERY call raised
+ValueError, the call site swallowed it, and every record came back with an empty
+page_text and page_html. The card then said "no page captured" and drew no
+Text/HTML toggle, which read as a capture-policy fault and was nothing of the
+kind. The CSS is a constant now, appended unformatted, and the selftest asserts a
+`100%` survives the round trip.
+
+READ, VERSUS ZERO  (v13.86, this pass)
+--------------------------------------
+count 0 and count None used to look identical: "0 breaches" whether the page had
+been read and listed none, or every tier had failed and nothing was read at all.
+Every record now carries `read` (the address half answered) and `partial_read`
+(only the password half answered). A record with read False is UNREAD, not clean,
+and the page, the history and the CSV all say so.
 
 WHY AN OPTIONAL KEY STILL EXISTS
 --------------------------------
@@ -180,6 +202,7 @@ USAGE
     breach.parse_addresses(text)             # -> [(email, password)]
     breach.trace_read(limit=100)             # what a page renders
     breach.trace_dump()                      # what a page downloads
+    breach.record_view(rec)                  # -> (text, html) of a record
 
     python breach.py --probe someone@example.com:hunter2
     python breach.py --selftest
@@ -295,12 +318,27 @@ PAGE_MODES = (PAGE_MODE_FAST, PAGE_MODE_FULL, PAGE_MODE_OFF)
 PAGE_KINDS = ("clean", "error")
 PAGE_ON_DEFAULT = ("clean", "error")
 
+# The stylesheet of a GENERATED page. It is a constant, appended to the head
+# WITHOUT %-formatting, because it contains `width:100%` and `%` followed by `;`
+# is not a conversion - the whole of _page_from_record() raised ValueError for as
+# long as the CSS sat inside the formatted string, and every record came back
+# with no page at all.
+_PAGE_CSS = ("<style>body{font-family:system-ui,sans-serif;background:#0b1020;"
+             "color:#e6ebff;padding:16px}h1{font-size:1.05rem}h2{font-size:.9rem}"
+             "table{border-collapse:collapse;width:100%;font-size:.8rem}"
+             "td,th{border:1px solid #2a3350;padding:5px;text-align:left;"
+             "vertical-align:top}th{background:#141b30}.c{color:#fcd34d}</style>")
+
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36")
 
 HTTP_TIMEOUT = 8.0
 NAV_TIMEOUT = 20000
 CHALLENGE_WAIT = 25.0
+# The root clear only has to re-establish a cookie the context already holds, so
+# it gets a short ceiling. The full CHALLENGE_WAIT is still spent where it
+# matters: on the account page itself, in _await_render.
+ROOT_SETTLE = 10.0
 BOOT_WAIT = 90.0
 BOOT_RETRY_AFTER = 60.0
 PAGES_DEFAULT = 2
@@ -352,10 +390,13 @@ TRACE_NAME = "breach_trace.jsonl"
 TRACE_FILE_MAX = 4000
 TRACE_DUMP_MAX = 500
 
-# 90s, not 45: a navigation (20s) plus an interstitial (25s) plus a render (12s)
-# plus the scrape does not fit in 45, and a cut call is indistinguishable from a
-# broken site.
-_cfg = {"pages": PAGES_DEFAULT, "timeout": 90.0, "delay": DELAY_DEFAULT,
+# 180s, not 45 and not 90. A navigation (20s) plus a root interstitial (10s) plus
+# the box scan plus a render ceiling (12s) plus an interstitial ceiling (25s)
+# does not fit in 90 - and the budget also has to cover time spent in the queue
+# behind the other workers, because the timeout is armed at submit, not at page
+# take. A cut call is indistinguishable from a broken site, and it used to be
+# answered by re-queueing the same address and paying the whole thing twice.
+_cfg = {"pages": PAGES_DEFAULT, "timeout": 180.0, "delay": DELAY_DEFAULT,
         "http_only": False, "page_mode": PAGE_MODE_FAST,
         "page_on": tuple(PAGE_ON_DEFAULT)}
 # RLock, NOT Lock. _get_pool() builds the pool while holding this and the builder
@@ -930,6 +971,7 @@ def _blank(addr, pw="") -> dict:
             "bucket": "", "reason": "", "breaches": [], "pastes": [],
             "pw_count": None, "corpora": 0, "sites": 0, "sensitive": 0,
             "newest_days": None, "count": None, "via": "",
+            "read": False, "partial_read": False,
             "page_url": "", "page_html": "", "page_text": "",
             "page_via": "", "page_error": "", "page_at": "",
             "checked_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"), "error": ""}
@@ -968,6 +1010,16 @@ def _page_http(addr, kind="records") -> dict:
             out["page_text"] = _TAG_RE.sub(" ", raw)[:PAGE_TEXT_MAX]
     except urllib.error.HTTPError as exc:
         out["page_error"] = "http %d" % exc.code
+        # The 401 body is 101 bytes and is still the only evidence of the wall,
+        # so it is read rather than dropped - a card with the wall in it beats an
+        # empty card that says the same thing as a clean address.
+        try:
+            raw = exc.read().decode("utf-8", "replace")
+            if raw:
+                out["page_html"] = raw[:PAGE_HTML_MAX]
+                out["page_text"] = _TAG_RE.sub(" ", raw)[:PAGE_TEXT_MAX]
+        except Exception:
+            pass
     except Exception as exc:
         out["page_error"] = "%s: %s" % (type(exc).__name__, exc)
     return out
@@ -984,6 +1036,11 @@ def _page_from_record(rec, kind="records", force=False) -> dict:
     force=True ignores page_wanted(), so a caller that has already decided this
     record must carry a page can build one in fast mode where "records" is never
     a captured kind.
+
+    THE CSS IS NOT IN THE FORMAT STRING. It contains `width:100%`, and `%`
+    followed by `;` is not a conversion, so formatting a head that carried the
+    stylesheet raised ValueError on EVERY call - the call site swallowed it and
+    every record came back with no page at all. _PAGE_CSS is appended as a value.
     """
     if not force and not page_wanted(kind):
         return _page_skip(kind)
@@ -992,11 +1049,14 @@ def _page_from_record(rec, kind="records", force=False) -> dict:
     lines = ["address: %s" % addr,
              "checked: %s" % (rec.get("checked_at") or ""),
              "verdict: %s - %s" % (rec.get("verdict") or "?", rec.get("reason") or ""),
+             "address half: %s" % ("READ" if rec.get("read") else "NOT READ"),
              "password appearances: %s" % (_pw if _pw is not None
                                            else "no password supplied"),
              "source: %s" % (rec.get("via") or "-"),
              "breaches: %d, pastes: %d" % (len(rec.get("breaches") or []),
                                           len(rec.get("pastes") or []))]
+    if rec.get("error"):
+        lines.append("error: %s" % rec["error"])
     rows = []
     for b in (rec.get("breaches") or [])[:60]:
         lines.append("")
@@ -1019,19 +1079,18 @@ def _page_from_record(rec, kind="records", force=False) -> dict:
                                               p.get("date") or ""))
     text = "\n".join(lines)[:PAGE_TEXT_MAX]
 
-    head = ("<html><head><meta charset='utf-8'><title>%s</title>"
-            "<style>body{font-family:system-ui,sans-serif;background:#0b1020;"
-            "color:#e6ebff;padding:16px}h1{font-size:1.05rem}h2{font-size:.9rem}"
-            "table{border-collapse:collapse;width:100%;font-size:.8rem}"
-            "td,th{border:1px solid #2a3350;padding:5px;text-align:left;"
-            "vertical-align:top}th{background:#141b30}.c{color:#fcd34d}</style>"
-            "</head><body><h1>%s</h1><p class='c'>%s - %s</p>"
-            "<p>password appearances: %s<br>source: %s<br>checked: %s</p>"
-            % (_esc(addr), _esc(addr), _esc(rec.get("verdict") or "?"),
+    head = ("<html><head><meta charset='utf-8'><title>%s</title>%s</head>"
+            "<body><h1>%s</h1><p class='c'>%s - %s</p>"
+            "<p>address half: %s<br>password appearances: %s<br>source: %s<br>"
+            "checked: %s</p>"
+            % (_esc(addr), _PAGE_CSS, _esc(addr), _esc(rec.get("verdict") or "?"),
                _esc(rec.get("reason") or ""),
+               "READ" if rec.get("read") else "NOT READ",
                _esc(_pw) if _pw is not None else "-", _esc(rec.get("via") or "-"),
                _esc(rec.get("checked_at") or "")))
     body = []
+    if rec.get("error"):
+        body.append("<p class='c'>error: %s</p>" % _esc(rec["error"]))
     if rows:
         body.append("<table><tr><th>Breach</th><th>Date</th><th>Age</th>"
                     "<th>Accounts</th><th>Data classes</th></tr>")
@@ -1046,7 +1105,9 @@ def _page_from_record(rec, kind="records", force=False) -> dict:
                    _esc(", ".join(b.get("classes") or []) or "-")))
         body.append("</table>")
     else:
-        body.append("<p>No breach record for this address.</p>")
+        body.append("<p>%s</p>"
+                    % ("No breach record could be read - see the error above."
+                       if rec.get("error") else "No breach record for this address."))
     if rec.get("pastes"):
         body.append("<h2>Pastes</h2><ul>")
         for p in (rec.get("pastes") or [])[:30]:
@@ -1060,6 +1121,20 @@ def _page_from_record(rec, kind="records", force=False) -> dict:
             "page_html": (head + "".join(body))[:PAGE_HTML_MAX],
             "page_text": text, "page_via": "api", "page_error": "",
             "page_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
+
+
+def record_view(rec):
+    """(text, html) of a record, for a page that must always offer a view.
+
+    Returns ("", "") rather than raising, so a caller can fall back to its own
+    builder without a try of its own.
+    """
+    try:
+        page = _page_from_record(rec or {}, "records", force=True)
+        return (str(page.get("page_text") or ""),
+                str(page.get("page_html") or ""))
+    except Exception:
+        return "", ""
 
 
 def _fill_page(page, got, addr, kind="records") -> dict:
@@ -1572,10 +1647,16 @@ class _BrowserPool:
         return page
 
     def _clear(self, page):
-        """Land on the site and sit out the interstitial."""
+        """Land on the site and sit out the interstitial.
+
+        The budget is ROOT_SETTLE, not CHALLENGE_WAIT: the context already holds
+        the clearance cookie, so the root normally loads first time and only a
+        genuinely re-challenged session spends the full window. The long window
+        is spent where it counts, on the account page in _await_render.
+        """
         trace("INFO", "browser", "landing on %s/ to clear" % HIBP_BASE)
         page.goto(HIBP_BASE + "/", wait_until="domcontentloaded", timeout=NAV_TIMEOUT)
-        self._settle(page, CHALLENGE_WAIT)
+        self._settle(page, ROOT_SETTLE)
 
     def _settle(self, page, budget):
         """True once the page is not an interstitial. Never raises.
@@ -1927,9 +2008,14 @@ def check(addr, password="", force=False, allow_browser=None) -> dict:
                 pool = _get_pool()
                 trace("INFO", "browser", "handing off to the browser tier (UI)", addr)
                 addr_rec = pool.submit(addr, password).result(timeout=_cfg["timeout"])
-                # ONE retry on an empty read. A challenge that outlives the wait is
-                # transient; UNKNOWN for the whole cache TTL is not.
-                if not addr_rec.get("breaches") and addr_rec.get("error"):
+                # ONE retry, and only for an EMPTY READ - a page that rendered and
+                # held nothing. A TimeoutError already means the pool was slower
+                # than the whole budget, so re-queueing it pays the same wait a
+                # second time behind the addresses still queued; the page the
+                # first job produced arrives later anyway.
+                _cut = "TimeoutError" in str(addr_rec.get("error") or "")
+                if (not addr_rec.get("breaches") and addr_rec.get("error")
+                        and not _cut):
                     trace("WARN", "browser", "empty read - one retry", addr)
                     _again = pool.submit(addr, password).result(
                         timeout=_cfg["timeout"])
@@ -1967,6 +2053,13 @@ def check(addr, password="", force=False, allow_browser=None) -> dict:
     rec["via"] = addr_rec.get("via", "")
     rec["error"] = addr_rec.get("error", "")
     rec["elapsed_ms"] = addr_rec.get("elapsed_ms", 0)
+    # READ, VERSUS ZERO. count 0 with no error is a page that was read and lists
+    # nothing; count None is a page nobody managed to read. They used to render
+    # identically as "0 breaches". partial_read marks a verdict that rests on the
+    # password half alone.
+    rec["read"] = bool(addr_rec.get("count") is not None
+                       and not addr_rec.get("error"))
+    rec["partial_read"] = bool(not rec["read"] and rec.get("pw_count") is not None)
     for _k in ("page_url", "page_html", "page_text", "page_via", "page_error",
                "page_at"):
         if _k in addr_rec:
@@ -1976,7 +2069,8 @@ def check(addr, password="", force=False, allow_browser=None) -> dict:
     # "records" is not a captured kind, so a 10-breach address carried no page at
     # all and block 009 had nothing to draw a Text/HTML toggle from. The page is
     # built from the record itself - no extra request - and marked page_via "api"
-    # so it is never passed off as a captured page.
+    # so it is never passed off as a captured page. This also covers a failed
+    # address tier, where the view is the only artefact left to inspect.
     if not (rec.get("page_text") or rec.get("page_html")):
         try:
             _kind = ("records" if rec.get("count")
@@ -2059,6 +2153,7 @@ def check_many(pairs, workers=2, progress=None, cancel=None, force=False,
 
     def one(item, position):
         em, pw = item
+        rec = None
         if cancel is not None and cancel.is_set():
             rec = _blank(em, pw)
             rec["verdict"] = rec["bucket"] = "UNKNOWN"
@@ -2068,7 +2163,16 @@ def check_many(pairs, workers=2, progress=None, cancel=None, force=False,
             trace("INFO", "start", "checking", em)
             # STARTED, not finished: the bar and the live trace move on dispatch.
             _tell(position, em, "starting")
-            rec = check(em, pw, force=force, allow_browser=not ho)
+            try:
+                rec = check(em, pw, force=force, allow_browser=not ho)
+            except Exception as exc:
+                # check() swallows everything itself, but nothing in this file
+                # calls future.result(), so an escape here would leave the record
+                # missing AND the counter stuck - the run would look hung at N.
+                rec = _blank(em, pw)
+                rec["verdict"] = rec["bucket"] = "UNKNOWN"
+                rec["error"] = "%s: %s" % (type(exc).__name__, exc)
+                trace("ERR", "run", "%s: %s" % (type(exc).__name__, exc), em)
         with guard:
             out[em] = rec
             done[0] += 1
@@ -2174,6 +2278,9 @@ def selftest(verbose=False) -> bool:
     add("url_quotes", unified_url("a+b@c.co") == HIBP_BASE + "/unifiedsearch/a%2Bb%40c.co")
     add("blank_email_only", _blank("a@b.co:pw")["email"] == "a@b.co")
     add("blank_has_page", "page_html" in _blank("a@b.co"))
+    # ---- READ, VERSUS ZERO ----
+    add("blank_read_false", _blank("a@b.co").get("read") is False)
+    add("blank_partial_false", _blank("a@b.co").get("partial_read") is False)
 
     configure(page_mode=PAGE_MODE_FAST, page_on=PAGE_KINDS)
     add("fast_default_on", _page_mode() == PAGE_MODE_FAST)
@@ -2290,6 +2397,7 @@ def selftest(verbose=False) -> bool:
     add("js_read_fallback", "class*='pwned'" in JS_READ)
     add("render_ceiling_raised", RENDER_WAIT >= 12.0)
     add("challenge_ceiling", CHALLENGE_EXTRA > 0)
+    add("root_settle_shorter", ROOT_SETTLE < CHALLENGE_WAIT)
     add("interstitial_marks", "just a moment" in INTERSTITIAL_MARKS)
     add("settle_exists", hasattr(_BrowserPool, "_settle"))
     add("clear_unconditional", "if \"haveibeenpwned.com\" not in"
@@ -2308,9 +2416,10 @@ def selftest(verbose=False) -> bool:
     add("keyed_truncate", "truncateResponse=false" in ACCOUNT_API)
     add("keyed_header_name", KEY_ENV == "HIBP_API_KEY")
     _pr = {"email": "a@b.co", "verdict": "OLD", "reason": "r", "via": "api",
-           "pw_count": 3, "breaches": [{"title": "X", "date": "2015-01-01",
-                                        "days": 4000, "pwn_count": 12,
-                                        "classes": ["Passwords"]}],
+           "read": True, "pw_count": 3,
+           "breaches": [{"title": "X", "date": "2015-01-01",
+                         "days": 4000, "pwn_count": 12,
+                         "classes": ["Passwords"]}],
            "pastes": [], "checked_at": "2026-01-01 00:00:00"}
     _gen = _page_from_record(_pr, "clean")
     add("gen_text", "breaches: 1" in _gen["page_text"] and "X" in _gen["page_text"])
@@ -2318,6 +2427,14 @@ def selftest(verbose=False) -> bool:
     add("gen_marked", _gen["page_via"] == "api")
     add("gen_skipped", _page_from_record(_pr, "records")["page_text"] == "")
     add("gen_forced", _page_from_record(_pr, "records", force=True)["page_text"] != "")
+    # ---- the CSS survives %-formatting: the bug that emptied every page ----
+    add("page_percent_css", "100%" in
+        _page_from_record({"email": "a@b.co"}, "clean")["page_html"])
+    add("page_on_error_text", "could be read" in
+        _page_from_record({"email": "a@b.co", "error": "challenge (http 401)"},
+                          "error", force=True)["page_text"])
+    add("record_view_pair", record_view({"email": "a@b.co"})[0] != "")
+    add("record_view_never_raises", record_view(None) == ("", ""))
     add("esc", _esc("<a&b>") == "&lt;a&amp;b&gt;")
 
     # ---- pacing and tracing ----
@@ -2357,6 +2474,10 @@ def selftest(verbose=False) -> bool:
     add("available_checks_boot", "_pool_boot_failed" in inspect.getsource(available))
     add("check_keeps_reason", "addr_rec[\"error\"] +=" in inspect.getsource(check))
     add("timeout_default_roomy", _cfg["timeout"] >= 90.0)
+    # ---- the budget covers a queue slot, not just one page ----
+    add("budget_covers_queue", _cfg["timeout"] >= 180.0)
+    add("retry_skips_cut_calls", "_cut" in inspect.getsource(check))
+    add("check_many_guards_one", "rec = check(em, pw" in inspect.getsource(check_many))
 
     before = trace_seq()
     trace("INFO", "selftest", "hello")
@@ -2399,7 +2520,8 @@ def main(argv=None) -> int:
         res = check(pairs[0][0], pairs[0][1], force=True)
         print("url sent:", last_url())
         print(json.dumps({k: res.get(k) for k in ("email", "verdict", "pw_count",
-                                                  "count", "via", "error")}, indent=2))
+                                                  "count", "read", "via", "error")},
+                         indent=2))
         print(trace_text(limit=40))
         return 0 if res.get("verdict") else 1
     selftest(verbose=True)
