@@ -16923,6 +16923,14 @@ else:
         # Every hit is a COMBO, so it lands in a real bucket that the engine can
         # re-run, and the body goes to disk under mail_results/kw_hits_<stamp>/
         # where block 079's file browser and block 107's ZIP both already look.
+        #
+        # FIX KW-3: THE FULL HIT IS STORED, NOT ONLY ITS BUCKET LINE. hit_line()
+        # carries the account, the keyword counts, the folder, where it matched
+        # and the subject - but no sender, no recipient and no body, so a panel
+        # built from the lines alone could not show them. Each hit also goes into
+        # kw_hits_detail as it LANDS (mailsearch's on_hit), which is what the
+        # live panel in block 105 reads, and which also means a scan that dies
+        # half way has already stored everything it found.
         # ==================================================================
         with str_lit.expander("🔎 Search this mailbox for keywords",
                               expanded=not _r_msgs):
@@ -17003,24 +17011,56 @@ else:
                             pass
 
                     try:
+                        _acc, _pw = _combo.split(":", 1)
+                    except Exception:
+                        _acc, _pw = _combo, ""
+                    _acc, _pw = _acc.strip(), _pw.strip()
+
+                    def _on_hit(_h):
+                        """Store the complete hit the moment it lands. Never raises.
+
+                        The account and folder are stamped here because mailsearch
+                        does not know them; the body is cut to 8000 characters,
+                        because 50 hits at the 200k readable cap is 10 MB of
+                        session_state for a view that slices to 4000 anyway.
+                        """
+                        try:
+                            _h["email"] = _acc
+                            _h["password"] = _pw
+                            _h["folder"] = _folder
+                            _row = dict((_k, _v) for _k, _v in _h.items()
+                                        if _k != "raw")
+                            _row["body"] = (_h.get("body") or "")[:8000]
+                            _cur = list(str_lit.session_state.get("kw_hits_detail") or [])
+                            _cur.append(_row)
+                            str_lit.session_state["kw_hits_detail"] = _cur[-120:]
+                        except Exception:
+                            pass
+
+                    def _on_trace(_lvl, _step, _det):
+                        try:
+                            _cur = list(str_lit.session_state.get("kw_trace") or [])
+                            _cur.append("%s %-5s %-10s %s"
+                                        % (datetime.now().strftime("%H:%M:%S"),
+                                           str(_lvl)[:5], str(_step)[:10],
+                                           str(_det)[:300]))
+                            str_lit.session_state["kw_trace"] = _cur[-200:]
+                        except Exception:
+                            pass
+
+                    try:
                         _hits, _note = mailsearch.search(_m, _folder, _words,
-                                                         on_progress=_prog)
+                                                         on_progress=_prog,
+                                                         on_hit=_on_hit,
+                                                         on_trace=_on_trace)
                     finally:
                         mailsearch.close(_m)
                         try:
                             _bar.empty()
                         except Exception:
                             pass
-                    try:
-                        _acc, _pw = _combo.split(":", 1)
-                    except Exception:
-                        _acc, _pw = _combo, ""
-                    _stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                    _stamp = datetime.now().strftime("%Y%m%d%H%M%S")
                     _kdir = os.path.join(user_file("mail_results"), f"kw_hits_{_stamp}")
-                    for _h in _hits:
-                        _h["email"] = _acc.strip()
-                        _h["password"] = _pw.strip()
-                        _h["folder"] = _folder
                     _ipath, _written = mailsearch.save_bodies(_kdir, _stamp, _hits)
                     _new = [mailsearch.hit_line(_h) for _h in _hits]
                     with session_state_lock:
@@ -17029,10 +17069,8 @@ else:
                             if _ln not in _cur:
                                 _cur.append(_ln)
                         str_lit.session_state["kw_hits_results"] = _cur
-                    # raw bytes are not kept in session - the body file has them.
-                    # v13.87: AND THE BODY IS CUT TO 8000 CHARACTERS. 50 hits at
-                    # the 200k readable cap was 10 MB of session_state for a view
-                    # that slices to 4000 anyway.
+                    # The raw bytes are not kept in session - the body file has
+                    # them, and kw_hits_detail already holds the cut body.
                     str_lit.session_state["bb_kw_hits"] = [
                         dict({_k: _v for _k, _v in _h.items() if _k != "raw"},
                              body=(_h.get("body") or "")[:8000])
