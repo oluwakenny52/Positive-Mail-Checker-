@@ -1,43 +1,50 @@
 """breach.py - breach exposure and combo freshness.  v13.86
 
-No API key NEEDED, and three sources in order of how much they prove:
+Three sources, in order of how much they prove:
 
     passwords  api.pwnedpasswords.com/range/<5-hex> - k-anonymity, no key, no
                challenge. Returns how many times the password appears in every
                breach HIBP has ever loaded. THIS is the freshness signal for a
                combo: 0 means the password is private, 40,000 means it is an old
                bridge that has been circulating for years.
-    address    the HIBP address lookup, keyed when a key is present:
-               /api/v3/breachedaccount and /api/v3/pasteaccount with the
-               hibp-api-key header, which return BreachDate, DataClasses and
-               PwnCount per record. Without a key it falls back to the site's own
-               search endpoint, plain HTTP first and a real browser only when
-               Cloudflare challenges it.
+    address    the SITE, DRIVEN LIKE A PERSON. A real Chromium lands on
+               haveibeenpwned.com, finds the search box, types the bare address
+               into it, presses Enter, waits for the account page, and reads the
+               rendered DOM - the breach names, their dates, the data classes and
+               the accounts figure - plus the page text and HTML from that same
+               read. The JSON the page fires on its own is caught and preferred
+               when it arrives, because it is exact; nothing depends on it.
     catalogue  /api/v3/breaches - one fetch, matched LOCALLY by domain. Kept as
                a fallback for when the address tiers are blocked.
 
-WHY THE KEYED TIER EXISTS  (v13.86)
------------------------------------
-haveibeenpwned.com/unifiedsearch/ now answers 401 to an anonymous urllib call.
-A 401 is not a Cloudflare interstitial, so the old code fell straight through to
+WHY THE UI, AND NOT AN ENDPOINT  (v13.86)
+-----------------------------------------
+haveibeenpwned.com/unifiedsearch/ answers 401 to an anonymous urllib call, and a
+401 is not a Cloudflare interstitial, so the old code fell through to
 json.loads("") and reported an EMPTY payload - the site listed ten breaches for
-the same address while this module said none. Two things fix it: 401 is now a
-wall like 403 and 429, so the browser tier can be sent at it, and the keyed API
-answers the same question without any of the ambiguity. The key is read from
-HIBP_API_KEY in the environment or in the app secrets and is only ever sent to
-haveibeenpwned.com.
+the same address while this module said none. Two things were wrong. The status
+list did not contain 401, so the browser was never sent at the wall; and the
+browser tier's own fetch was an in-page fetch of that same endpoint, so it hit the
+same wall. Both are fixed: 401 is a wall like 403, and the browser tier now drives
+the UI and scrapes what renders. No key, no quota, no bill - the page is the API.
+
+WHY AN OPTIONAL KEY STILL EXISTS
+--------------------------------
+If HIBP_API_KEY is set, /api/v3/breachedaccount is tried first because it is
+faster and returns exact dates. It is never required: absent, the keyed tier is
+simply skipped, and the key row on the page says so. Nothing pretends.
 
 WHAT IS ACTUALLY SENT  (v13.85)
 -------------------------------
-The address endpoint takes an EMAIL and nothing else. A pasted combo arrives as
-"a@b.co:hunter2" or "a@b.co | OLD" or "mailto:a@b.co", and every one of those
-tails has to come off before the URL is built - a colon is legal inside a path
-segment, so "unifiedsearch/a@b.co:hunter2" is a DIFFERENT search, not an error
-you would notice. _email_only() is the single funnel: check(), _http_search(),
-_blank(), parse_addresses() and the browser pool all pass through it, and the
-selftest asserts the transmitted URL equals the bare address. The password
-reaches exactly one place, the SHA-1 hash that is split for k-anonymity, and only
-5 hex characters of it leave the box.
+The address, and only the address. A pasted combo arrives as "a@b.co:hunter2" or
+"a@b.co | OLD" or "mailto:a@b.co", and every one of those tails has to come off
+before the request is built - a colon is legal inside a path segment, so
+"unifiedsearch/a@b.co:hunter2" is a DIFFERENT search, not an error you would
+notice. _email_only() is the single funnel: check(), _http_search(), _blank(),
+parse_addresses() and the browser pool all pass through it, and the selftest
+asserts the transmitted URL equals the bare address. The password reaches exactly
+one place, the SHA-1 hash that is split for k-anonymity, and only 5 hex characters
+of it leave the box.
 
 WHY THE CATALOGUE ALONE COULD NEVER WORK
 ----------------------------------------
@@ -106,6 +113,9 @@ The apt libraries Chromium links against come from packages.txt at build time.
 If they are missing, launch fails with a missing .so and browser_state() shows
 the text - which is why the state is a value on the page and not a log line.
 
+WITHOUT A BROWSER THERE IS NO ADDRESS TIER. With no key and no binary, every
+address comes back UNKNOWN, and browser_note() says exactly that.
+
 ISOLATION
 ---------
 The cache and the trace file resolve through auth.user_file(), so both are one
@@ -126,7 +136,7 @@ USAGE
     breach.trace_read(limit=100)             # what a page renders
     breach.trace_dump()                      # what a page downloads
 
-    HIBP_API_KEY=xxxx python breach.py --probe someone@example.com:hunter2
+    python breach.py --probe someone@example.com:hunter2
     python breach.py --selftest
 """
 
@@ -160,11 +170,38 @@ ACCOUNT = HIBP_BASE + "/account/%s"
 CATALOGUE_URL = HIBP_BASE + "/api/v3/breaches"
 PW_RANGE = "https://api.pwnedpasswords.com/range/%s"
 
-# The keyed tier. Same evidence as unifiedsearch, without the interstitial and
-# with the fields the site's own JSON drops.
+# The OPTIONAL keyed tier. Faster and exact, never required.
 ACCOUNT_API = HIBP_BASE + "/api/v3/breachedaccount/%s?truncateResponse=false"
 PASTE_API = HIBP_BASE + "/api/v3/pasteaccount/%s"
 KEY_ENV = "HIBP_API_KEY"
+
+# The UI tier. The site's own search box, tried in this order because the id has
+# moved before and a form layout has no id at all. If none is found the tier
+# navigates straight to the account page instead - the page renders the same
+# result, it just skips the typing.
+UI_SEARCH_SELECTORS = (
+    "input#searchInput",
+    "form input[type='email']",
+    "form input[type='search']",
+    "form input[type='text']",
+    "input[type='search']",
+    "input[type='email']",
+    "input[type='text']",
+)
+RENDER_WAIT = 12.0
+
+# Read the rendered page ONCE: the breach anchors, the visible text and the
+# markup. innerText, not textContent - innerText is what is actually laid out, so
+# a collapsed or hidden block cannot pad the scrape with template text.
+JS_READ = """() => {
+  const links = Array.from(document.querySelectorAll("a[href*='/breach/']"))
+    .map(a => ({t: (a.textContent || '').trim(), h: a.getAttribute('href') || ''}))
+    .filter(x => x.t);
+  const body = document.body;
+  return {links: links,
+          text: body ? (body.innerText || '') : '',
+          html: document.documentElement ? document.documentElement.outerHTML : ''};
+}"""
 
 PAGE_HTML_MAX = 90000
 PAGE_TEXT_MAX = 30000
@@ -223,6 +260,12 @@ CHALLENGE_MARKS = (
     "cf-challenge", "attention required", "verify you are human",
 )
 
+# What a rendered account page says when there is nothing to show. Checked on the
+# TEXT of the page, which is why the site's own wording is in here and not a CSS
+# class that a redesign would break.
+CLEAN_MARKS = ("no pwnage", "good news", "not been pwned", "no breaches found",
+               "hasn't been pwned", "has not been pwned")
+
 RANK = {"NEW": 0, "PARTIAL": 1, "OLD": 2}
 
 # Trace ring. Bounded in memory AND on disk - a page left open for a week must
@@ -256,6 +299,12 @@ _trace_writes = [0]
 _EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[A-Za-z]{2,}$")
 _MAILTO_RE = re.compile(r"^mailto:\s*", re.IGNORECASE)
 _TAG_RE = re.compile(r"<[^>]+>")
+_ISO_RE = re.compile(r"\b(\d{4})-(\d{2})-(\d{2})\b")
+_D_MONTH_Y = re.compile(r"\b(\d{1,2})\s+([A-Za-z]{3,9})\.?\s+(\d{4})\b")
+_CLASSES_RE = re.compile(r"compromised data:?\s*([^\n]{0,200})", re.IGNORECASE)
+_COUNT_RE = re.compile(r"([\d][\d,]{3,})\s+accounts", re.IGNORECASE)
+_MONTHS = {"jan": 1, "feb": 2, "mar": 3, "apr": 4, "may": 5, "jun": 6,
+           "jul": 7, "aug": 8, "sep": 9, "oct": 10, "nov": 11, "dec": 12}
 
 
 # ---------------------------------------------------------------------------
@@ -347,8 +396,8 @@ def page_wanted(kind) -> bool:
 def _api_key() -> str:
     """HIBP_API_KEY from the environment, else the app secrets. Never raises.
 
-    Read lazily and cached once found, so a key added to secrets does not need
-    the module reloaded twice - and a key never reaches the trace, only the URL.
+    Read lazily and cached once found. The key is OPTIONAL: empty means the keyed
+    tier is skipped entirely and the browser does the work.
     """
     try:
         k = str(os.environ.get(KEY_ENV) or "").strip()
@@ -629,6 +678,9 @@ def _email_only(addr) -> str:
     Order matters: the tails come off FIRST, then the wrapping quotes and angle
     brackets, because "a@b.co":pw ends in the password, not in a quote, and a
     strip before the split would leave the quote attached to the address.
+
+    In the UI tier this is also what gets TYPED into the box, so the guarantee is
+    the same one the URL carried: the address and nothing else.
     """
     s = str(addr or "").strip().lstrip("\ufeff").strip()
     s = _MAILTO_RE.sub("", s).strip()
@@ -706,6 +758,25 @@ def _days(date_str):
         return None
 
 
+def _any_date(text):
+    """The first date in a string, as ISO, or "". Reads both forms the site uses.
+
+    The account page prints a date as "4 October 2013"; the JSON carries
+    "2013-10-04". A rendered scrape only ever has the first, so it is parsed here
+    rather than being thrown away as unknown.
+    """
+    txt = str(text or "")
+    m = _ISO_RE.search(txt)
+    if m:
+        return "%s-%s-%s" % m.groups()
+    m = _D_MONTH_Y.search(txt)
+    if m:
+        mon = _MONTHS.get(m.group(2).strip().lower()[:3])
+        if mon:
+            return "%04d-%02d-%02d" % (int(m.group(3)), mon, int(m.group(1)))
+    return ""
+
+
 def _is_corpus(breach) -> bool:
     name = str(breach.get("Name") or breach.get("Title") or "").strip().lower()
     if name in CORPORA:
@@ -714,6 +785,49 @@ def _is_corpus(breach) -> bool:
                                "txtbase", "naz.api")):
         return True
     return bool(breach.get("IsSpamList")) and not breach.get("Domain")
+
+
+def _parse_rendered(text, links):
+    """Rendered page text + its /breach/ anchors -> (breaches, clean). PURE.
+
+    The anchors are the breach names, because the site links every one of them to
+    /breach/<Name>; nothing else on an account page points there. The dates, the
+    data classes and the accounts figure are read from the text that FOLLOWS the
+    name in the rendered layout, which is the order the site prints them in.
+
+    `clean` is only true when there are no anchors at all and the page says so in
+    words. A page that merely failed to render is not clean, and the caller can
+    tell the difference by the link count.
+    """
+    txt = str(text or "")
+    low = txt.lower()
+    out, seen = [], set()
+    for item in (links or [])[:80]:
+        name = str((item or {}).get("t") or "").strip()
+        if not name:
+            continue
+        key = name.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        idx = low.find(key)
+        window = txt[idx: idx + 600] if idx >= 0 else ""
+        date = _any_date(window)
+        cls = _CLASSES_RE.search(window)
+        cnt = _COUNT_RE.search(window)
+        classes = []
+        if cls:
+            classes = [c.strip() for c in cls.group(1).split(",") if c.strip()][:12]
+        out.append({
+            "name": name, "title": name[:160], "domain": "",
+            "date": date,
+            "pwn_count": int(cnt.group(1).replace(",", "")) if cnt else 0,
+            "classes": classes, "sensitive": False,
+            "corpus": _is_corpus({"Title": name}),
+            "days": _days(date), "description": "",
+        })
+    clean = (not out) and any(m in low for m in CLEAN_MARKS)
+    return out, clean
 
 
 def _blank(addr, pw="") -> dict:
@@ -737,14 +851,9 @@ def _page_skip(kind) -> dict:
 def _page_http(addr, kind="records") -> dict:
     """Best-effort plain-HTTP capture of /account/<email>. Never raises.
 
-    This is the page the site actually renders for an address - breach titles,
-    dates, data classes and the "no pwnage found" copy - as opposed to the JSON
-    the search box posts. Whether it is fetched at all is page_wanted()'s
-    decision, taken from the OUTCOME (clean / error / records) rather than from
-    the address, so fast mode can capture exactly the filtered half.
-
-    The page answers 401 to anonymous callers like everything else does now, so
-    an empty result here is normal and is why _page_from_record() exists.
+    The page answers 401 to anonymous callers, so an empty result here is normal
+    and is why the browser tier reads the DOM instead, and why
+    _page_from_record() exists as a last resort when a key is set.
     """
     if not page_wanted(kind):
         return _page_skip(kind)
@@ -772,10 +881,10 @@ def _page_http(addr, kind="records") -> dict:
 def _page_from_record(rec, kind="records") -> dict:
     """A text and an HTML view BUILT FROM the record. Never raises.
 
-    /account answers 401 to anonymous callers, so a keyed run frequently has no
-    page to render. The records are the same evidence, so the view is generated
-    from them and marked page_via "api" - it is a report of what the API said,
-    not a captured page, and it says so at the foot of the HTML.
+    Only used when a live page could not be read - a keyed run whose /account
+    fetch was refused, or an address the browser could not render. Marked
+    page_via "api": it is a report of what the source said, not a captured page,
+    and it says so at the foot of the HTML.
     """
     if not page_wanted(kind):
         return _page_skip(kind)
@@ -846,11 +955,32 @@ def _page_from_record(rec, kind="records") -> dict:
                         % (_esc(p.get("title") or "?"), _esc(p.get("source") or "-"),
                            _esc(p.get("date") or "")))
         body.append("</ul>")
-    body.append("<p><small>Generated from the API answer, not a captured "
+    body.append("<p><small>Generated from the answer, not a captured "
                 "page.</small></p></body></html>")
     return {"page_url": account_url(addr),
             "page_html": (head + "".join(body))[:PAGE_HTML_MAX],
             "page_text": text, "page_via": "api", "page_error": "",
+            "page_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
+
+
+def _fill_page(page, got, addr, kind="records") -> dict:
+    """The captured page fields from what the browser already rendered.
+
+    `got` is the JS_READ dict when the caller has one, else None and the page is
+    read here. No navigation: by this point the account page is already loaded,
+    so a second goto would double the round trips for the same markup.
+    """
+    if not page_wanted(kind):
+        return _page_skip(kind)
+    if got is None:
+        try:
+            got = page.evaluate(JS_READ) or {}
+        except Exception:
+            got = {}
+    return {"page_url": account_url(addr),
+            "page_html": str(got.get("html") or "")[:PAGE_HTML_MAX],
+            "page_text": str(got.get("text") or "")[:PAGE_TEXT_MAX],
+            "page_via": "browser", "page_error": "",
             "page_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
 
 
@@ -971,9 +1101,9 @@ def pwned_count(password, force=False):
 def _looks_like_challenge(status, body) -> bool:
     """Is this response a wall rather than an answer?
 
-    401 is in the list because the anonymous unifiedsearch endpoint now answers
-    401. It used to fall through to json.loads("") and parse as an EMPTY payload,
-    so an address with ten breaches was reported as having none - the quietest
+    401 is in the list because the anonymous unifiedsearch endpoint answers 401.
+    It used to fall through to json.loads("") and parse as an EMPTY payload, so
+    an address with ten breaches was reported as having none - the quietest
     possible failure. A 401 must reach the browser tier like a 403 does.
     """
     if status in (401, 403, 429, 503):
@@ -1098,20 +1228,14 @@ def _http_search(addr, pw) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# tier 2b - the keyed API (only when HIBP_API_KEY is set)
+# tier 2b - the OPTIONAL keyed API (only when HIBP_API_KEY is set)
 # ---------------------------------------------------------------------------
 def _keyed_search(addr, pw):
-    """The keyed API answer, or None to fall through to the keyless tier.
+    """The keyed API answer, or None to fall through to the keyless tiers.
 
     None means "this tier could not answer": no key, a rejected key, a rate
-    limit, an unreadable body or a transport error. The caller then does keyless
-    HTTP and, if that is challenged, the browser. A 404 is an ANSWER (no record)
-    and returns a normal record with count 0.
-
-    Both endpoints are asked, breached then paste, because the paste list is a
-    separate call in v3 and a combo whose address sits in a paste is not clean.
-    The two lists are merged into the unifiedsearch shape so _parse_payload, the
-    bands and the CSV need no knowledge of this tier at all.
+    limit, an unreadable body or a transport error. A 404 is an ANSWER (no
+    record) and returns a normal record with count 0.
     """
     key = _api_key()
     if not key:
@@ -1174,7 +1298,7 @@ def _keyed_search(addr, pw):
 
 
 # ---------------------------------------------------------------------------
-# tier 3 - the browser pool (only reached on a challenge)
+# tier 3 - the browser pool: THE UI, DRIVEN LIKE A PERSON
 # ---------------------------------------------------------------------------
 class _BrowserPool:
     """One thread owns Playwright, one browser, one context, N reused pages.
@@ -1241,33 +1365,37 @@ class _BrowserPool:
                 page = self._take(context)
                 trace("INFO", "browser", "page taken", addr)
                 started = time.time()
-                status, body = self._search(page, addr)
-                trace("INFO", "browser", "in-page fetch http %d (%d byte(s))"
-                      % (status, len(body or "")), addr)
-                if status == 404:
+                cap_status, cap_body = self._ui_search(page, addr)
+                got = None
+                if cap_status == 200 and cap_body:
+                    try:
+                        rec = _parse_payload(addr, json.loads(cap_body),
+                                             "browser", started, pw_s)
+                        trace("INFO", "browser", "json caught from the page: %s "
+                              "breach(es)" % len(rec["breaches"]), addr)
+                        got = self._read(page)
+                    except Exception as exc:
+                        trace("WARN", "browser", "caught json unparsable (%s) - "
+                              "scraping the DOM" % type(exc).__name__, addr)
+                        rec, got = self._dom_record(page, addr, pw_s)
+                elif cap_status == 404:
                     rec = _blank(addr, pw_s)
                     rec["via"] = "browser"
                     rec["count"] = 0
-                elif _looks_like_challenge(status, body):
+                    got = self._read(page)
+                elif cap_status in (401, 403, 429, 503):
                     rec = _blank(addr, pw_s)
                     rec["via"] = "browser"
-                    rec["error"] = "challenge survived (http %d)" % status
+                    rec["error"] = "challenge survived (http %d)" % cap_status
                     trace("WARN", "browser", "challenge survived", addr)
+                    got = self._read(page)
                 else:
-                    try:
-                        rec = _parse_payload(addr, json.loads(body or "{}"),
-                                             "browser", started, pw_s)
-                        trace("INFO", "browser", "parsed %s breach(es)"
-                              % len(rec["breaches"]), addr)
-                    except Exception as exc:
-                        rec = _blank(addr, pw_s)
-                        rec["via"] = "browser"
-                        rec["error"] = "unparsable: %s" % exc
-                        trace("ERR", "browser", "unparsable: %s" % exc, addr)
-                if not rec.get("error", "").startswith("unparsable"):
-                    _kind = "records" if rec.get("count") else (
-                        "error" if rec.get("error") else "clean")
-                    rec.update(self._grab(page, addr, _kind))
+                    rec, got = self._dom_record(page, addr, pw_s)
+
+                if rec.get("error") or rec.get("count") is not None:
+                    kind = ("records" if rec.get("count") else
+                            ("error" if rec.get("error") else "clean"))
+                    rec.update(_fill_page(page, got, addr, kind))
                 if not fut.done():
                     fut.set_result(rec)
             except Exception as exc:
@@ -1334,64 +1462,164 @@ class _BrowserPool:
         trace("WARN", "browser", "clearance wait expired")
         return True
 
-    def _search(self, page, addr):
-        """Fetch from inside the page so the clearance cookie is carried."""
-        addr = _email_only(addr)
-        status, body = 0, ""
-        for attempt in (0, 1):
-            if "haveibeenpwned.com" not in (page.url or ""):
-                self._clear(page)
-            # Settle, so consecutive pages do not fire in lockstep. This is the
-            # "slow" part of the browser tier and it is deliberate.
+    def _read(self, page):
+        """The rendered page as {links, text, html}. Never raises."""
+        try:
+            return page.evaluate(JS_READ) or {}
+        except Exception as exc:
+            trace("WARN", "browser", "read failed: %s" % type(exc).__name__)
+            return {}
+
+    def _await_render(self, page):
+        """Wait until the result is on the page. Returns the anchor count.
+
+        0 is a real answer - it means the page rendered the "no pwnage" copy, or
+        that nothing rendered in time. The caller distinguishes the two from the
+        text, so a slow page is never silently reported as clean.
+        """
+        deadline = time.time() + RENDER_WAIT
+        while time.time() < deadline:
             try:
-                page.wait_for_timeout(BROWSER_SETTLE + random.randint(0, BROWSER_JITTER))
+                n = page.evaluate(
+                    "() => document.querySelectorAll(\"a[href*='/breach/']\").length")
+            except Exception:
+                n = 0
+            if n:
+                return int(n)
+            try:
+                low = (page.evaluate(
+                    "() => document.body ? (document.body.innerText || '') : ''"
+                ) or "").lower()
+            except Exception:
+                low = ""
+            if any(m in low for m in CLEAN_MARKS):
+                return 0
+            try:
+                page.wait_for_timeout(700)
+            except Exception:
+                time.sleep(0.7)
+        return 0
+
+    def _ui_search(self, page, addr):
+        """Type the address into the site's own box and land on its page.
+
+        Returns (status, body) for the JSON response the page fired on its own, if
+        any was caught. status 0 means nothing was caught and the caller must read
+        the DOM instead - which is the normal path when the endpoint is walled.
+
+        The address typed is _email_only(), so the box receives the bare address
+        and never a combo tail. If no box can be found, or the click is swallowed
+        by a banner, it navigates straight to the account page: same page, same
+        render, just no typing.
+        """
+        addr = _email_only(addr)
+        cap = {}
+
+        def _on_response(resp):
+            try:
+                if "/unifiedsearch/" in resp.url and "status" not in cap:
+                    cap["status"] = resp.status
+                    if resp.status == 200:
+                        cap["body"] = resp.text()
             except Exception:
                 pass
-            try:
-                out = page.evaluate(
-                    """async (email) => {
-                        const r = await fetch('/unifiedsearch/' +
-                            encodeURIComponent(email),
-                            {headers: {'Accept': 'application/json'}});
-                        return {status: r.status, body: await r.text()};
-                    }""", addr)
-                status, body = int(out.get("status") or 0), out.get("body") or ""
-                trace("INFO", "browser", "attempt %d -> http %d" % (attempt + 1, status),
-                      addr)
-            except Exception as exc:
-                status, body = 0, ""
-                trace("WARN", "browser", "attempt %d raised %s"
-                      % (attempt + 1, type(exc).__name__), addr)
-            if status and not _looks_like_challenge(status, body):
-                return status, body
-            if attempt == 0:
-                self._clear(page)
-        return status, body
 
-    def _grab(self, page, addr, kind="records"):
-        """Navigate to the address's own page and keep the markup. Never raises.
-
-        The clearance cookie is already on this context, so the navigation is
-        the same tier as the fetch above it - and it is the only way to capture
-        the page on an address Cloudflare challenges. The kind gate is applied
-        before the navigation, so a skipped capture costs no round trip.
-        """
-        if not page_wanted(kind):
-            return _page_skip(kind)
-        addr = _email_only(addr)
-        url = account_url(addr)
-        out = {"page_url": url, "page_html": "", "page_text": "", "page_via": "browser",
-               "page_error": "",
-               "page_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
         try:
-            page.goto(url, wait_until="domcontentloaded",
-                      timeout=int(PAGE_TIMEOUT * 1000))
-            markup = page.content() or ""
-            out["page_html"] = markup[:PAGE_HTML_MAX]
-            out["page_text"] = _TAG_RE.sub(" ", markup)[:PAGE_TEXT_MAX]
+            page.on("response", _on_response)
+        except Exception:
+            pass
+        try:
+            if "haveibeenpwned.com" not in (page.url or ""):
+                self._clear(page)
+            box = None
+            used = ""
+            for sel in UI_SEARCH_SELECTORS:
+                try:
+                    box = page.query_selector(sel)
+                except Exception:
+                    box = None
+                if box is not None:
+                    used = sel
+                    break
+            if box is None:
+                trace("WARN", "ui", "no search box found - navigating directly", addr)
+                page.goto(account_url(addr), wait_until="domcontentloaded",
+                          timeout=NAV_TIMEOUT)
+            else:
+                trace("INFO", "ui", "typing the address into %s" % used, addr)
+                try:
+                    try:
+                        box.scroll_into_view_if_needed(timeout=4000)
+                    except Exception:
+                        pass
+                    box.click(timeout=8000)
+                    box.fill("")
+                    box.type(addr, delay=25)
+                    box.press("Enter")
+                except Exception as exc:
+                    trace("WARN", "ui", "box failed (%s) - navigating directly"
+                          % type(exc).__name__, addr)
+                    page.goto(account_url(addr), wait_until="domcontentloaded",
+                              timeout=NAV_TIMEOUT)
+                else:
+                    try:
+                        page.wait_for_url("**/account/**", timeout=NAV_TIMEOUT)
+                    except Exception:
+                        trace("WARN", "ui", "no navigation to an account page", addr)
+                        if "/account/" not in (page.url or ""):
+                            page.goto(account_url(addr),
+                                      wait_until="domcontentloaded",
+                                      timeout=NAV_TIMEOUT)
+            trace("INFO", "ui", "landed on %s" % (page.url or "-")[:140], addr)
+            n = self._await_render(page)
+            trace("INFO", "ui", "rendered %s breach link(s)" % n, addr)
         except Exception as exc:
-            out["page_error"] = "%s: %s" % (type(exc).__name__, exc)
-        return out
+            trace("ERR", "ui", "%s: %s" % (type(exc).__name__, exc), addr)
+        finally:
+            try:
+                page.remove_listener("response", _on_response)
+            except Exception:
+                pass
+        return int(cap.get("status") or 0), str(cap.get("body") or "")
+
+    def _dom_record(self, page, addr, pw):
+        """Build the record from what actually rendered. Returns (rec, got).
+
+        This is the path with no key and no caught JSON: the anchors are the
+        breach names, the text beside them carries the date, the data classes and
+        the accounts figure, and the same read supplies the text and HTML view.
+        """
+        rec = _blank(addr, pw)
+        rec["via"] = "browser"
+        got = self._read(page)
+        text = str(got.get("text") or "")
+        url = page.url or ""
+        if "/account/" not in url:
+            rec["error"] = "did not reach the account page (%s)" % (url[:80] or "-")
+            return rec, got
+        breaches, clean = _parse_rendered(text, got.get("links"))
+        if breaches:
+            rec["breaches"] = breaches
+            rec["count"] = len(breaches)
+            for b in breaches:
+                if b.get("corpus"):
+                    rec["corpora"] += 1
+                else:
+                    rec["sites"] += 1
+                d = b.get("days")
+                if d is not None and (rec["newest_days"] is None
+                                      or d < rec["newest_days"]):
+                    rec["newest_days"] = d
+            trace("INFO", "browser", "scraped %d breach(es) from the rendered page"
+                  % len(breaches), addr)
+            return rec, got
+        if clean:
+            rec["count"] = 0
+            trace("INFO", "browser", "rendered page says no pwnage", addr)
+            return rec, got
+        rec["error"] = "page rendered but no breach block was readable"
+        trace("WARN", "browser", rec["error"], addr)
+        return rec, got
 
     def submit(self, addr, pw):
         addr = _email_only(addr)
@@ -1473,9 +1701,10 @@ def check(addr, password="", force=False, allow_browser=None) -> dict:
     and no caller ever passed False, so configure(http_only=True) could not have
     worked even once the page had a switch.
 
-    The address half is tried in order of how much it proves: the keyed API when
-    a key is set, then the keyless endpoint, then the browser on a challenge. The
-    first two are the same evidence; the key only removes the ambiguity.
+    The address half is tried in order: the optional keyed API when a key exists,
+    the keyless endpoint, then the browser - which drives the site's own search
+    box and scrapes what renders. With no key the browser IS the method, not a
+    rescue.
     """
     if allow_browser is None:
         allow_browser = not _http_only()
@@ -1513,14 +1742,14 @@ def check(addr, password="", force=False, allow_browser=None) -> dict:
         if addr_rec is not None:
             trace("INFO", "api", "answered by the keyed tier", addr)
         else:
-            trace("WARN", "api", "keyed tier did not answer - keyless HTTP next", addr)
+            trace("WARN", "api", "keyed tier did not answer - keyless next", addr)
     if addr_rec is None:
         addr_rec = _http_search(addr, password)
     if addr_rec.get("error", "").startswith("challenge"):
         if allow_browser and available():
             try:
                 pool = _get_pool()
-                trace("INFO", "browser", "handing off to the browser tier", addr)
+                trace("INFO", "browser", "handing off to the browser tier (UI)", addr)
                 addr_rec = pool.submit(addr, password).result(timeout=_cfg["timeout"])
             except Exception as exc:
                 rec["error"] = "browser failed: %s: %s" % (type(exc).__name__, exc)
@@ -1691,7 +1920,7 @@ def report() -> dict:
             "browser_state": browser_state().get("state", ""),
             "browser_error": browser_note(), "pages": _pages(), "delay": _delay(),
             "http_only": _http_only(), "pool": _pool is not None,
-            "key": bool(_api_key()),
+            "key": bool(_api_key()), "tier": "ui",
             "page_mode": _page_mode(), "page_on": list(_page_on()),
             "last": dict(_last), "trace_seq": trace_seq()}
 
@@ -1791,6 +2020,28 @@ def selftest(verbose=False) -> bool:
     add("days_ok", _days("2020-01-01") is not None)
     add("days_bad", _days("") is None)
 
+    # ---- dates out of a rendered page ----
+    add("date_iso", _any_date("2015-01-02") == "2015-01-02")
+    add("date_long", _any_date("Breach date: 4 October 2013") == "2013-10-04")
+    add("date_none", _any_date("nothing here") == "")
+
+    # ---- scraping the rendered page ----
+    _txt = ("Adobe\nBreach date: 4 October 2013\nAccounts: 152,445,165\n"
+            "Compromised data: Email addresses, Passwords\n"
+            "Stealer Logs\nBreach date: 1 June 2026\nAccounts: 4,000\n"
+            "Compromised data: Passwords\n")
+    _links = [{"t": "Adobe", "h": "/breach/Adobe"}, {"t": "Stealer Logs", "h": "/breach/X"}]
+    _got_b, _got_clean = _parse_rendered(_txt, _links)
+    add("scrape_count", len(_got_b) == 2)
+    add("scrape_date", _got_b[0]["date"] == "2013-10-04")
+    add("scrape_days", _got_b[0]["days"] is not None)
+    add("scrape_classes", "Passwords" in _got_b[0]["classes"])
+    add("scrape_accounts", _got_b[0]["pwn_count"] == 152445165)
+    add("scrape_corpus", _got_b[1]["corpus"] is True)
+    add("scrape_not_clean", _got_clean is False)
+    add("scrape_clean", _parse_rendered("Good news - no pwnage found", [])[1] is True)
+    add("scrape_empty", _parse_rendered("", []) == ([], False))
+
     sc = score([{"verdict": "OLD"}, {"verdict": "NEW"}, {"verdict": "UNKNOWN"}])
     add("score_total", sc["total"] == 3)
     add("score_pct", sc["pct"]["UNKNOWN"] == 33.3)
@@ -1804,12 +2055,17 @@ def selftest(verbose=False) -> bool:
     add("challenge_json", not _looks_like_challenge(200, '{"Breaches":[]}'))
     add("pw_hash", len(_pw_hash("abc")) == 40)
     add("report_shape", isinstance(report().get("browser"), bool))
+    add("report_tier", report().get("tier") == "ui")
     add("state_shape", "state" in browser_state())
     add("note_is_str", isinstance(browser_note(), str))
     add("env_set", os.environ.get("PLAYWRIGHT_BROWSERS_PATH") == _PW_DIR)
 
-    # ---- the keyed tier ----
-    add("key_shape", isinstance(_api_key(), str))
+    # ---- the UI tier ----
+    add("ui_selectors", bool(UI_SEARCH_SELECTORS))
+    add("ui_selector_id_first", UI_SEARCH_SELECTORS[0] == "input#searchInput")
+    add("js_read_links", "breach/" in JS_READ)
+    add("js_read_innertext", "innerText" in JS_READ)
+    add("key_optional", isinstance(_api_key(), str))
     add("keyed_account_url", "breachedaccount" in ACCOUNT_API and
         ACCOUNT_API.startswith(HIBP_BASE))
     add("keyed_paste_url", "pasteaccount" in PASTE_API)
@@ -1887,8 +2143,8 @@ def main(argv=None) -> int:
         only = "--http-only" in argv
         configure(http_only=only)
         pairs = parse_addresses(target) or [(target, "")]
-        print("tier:", "http-only" if only else "http+browser")
-        print("key:", "present" if _api_key() else "absent")
+        print("tier:", "http-only" if only else "http+browser (UI)")
+        print("key:", "present" if _api_key() else "absent (browser does the work)")
         print("browser available:", available(), browser_note())
         res = check(pairs[0][0], pairs[0][1], force=True)
         print("url sent:", last_url())
