@@ -99,6 +99,35 @@ Every record now carries `read` (the address half answered) and `partial_read`
 (only the password half answered). A record with read False is UNREAD, not clean,
 and the page, the history and the CSV all say so.
 
+PER-USER ISOLATION, AND THE FOUR PLACES IT BROKE  (v13.86, this pass)
+---------------------------------------------------------------------
+The cache and the trace file were already per-user - auth.user_file() prefixes
+them with the unlocked hash - but the RESOLUTION of that identity was not
+isolated, and three pieces of shared state leaked or interfered:
+
+  1. _anon_id() reads st.session_state, and the run executes on a worker thread.
+     Off the script thread that falls back to the process-wide context, so with
+     two users running at once a cache or trace write could land in the other
+     one's prefix. FIXED by pinning the prefix per THREAD: set_owner() is called
+     once by the page and once per worker, and _user_file() builds from it. The
+     auth fallback is only for a thread nobody pinned (CLI, selftest).
+  2. _cfg was process-wide, and check() re-read the page mode per address, so a
+     second user pressing Run with capture Off silently turned capture off for
+     the first user's in-flight run. FIXED by a per-run snapshot: check_many()
+     pins it on the thread and every reader goes through _cfg_get().
+  3. The trace RING and _last were process-wide, so the page DISPLAYED other
+     people's addresses in section 4 and in the "Last URL" caption. FIXED: every
+     event carries an owner and trace_read() filters; _lasts is keyed by owner.
+  4. trace_clear() wiped the whole ring, and pool-thread lines had no owner at
+     all. FIXED: clear is per owner, and the pool thread pins the owner of the
+     job it is working on.
+
+What stays process-wide ON PURPOSE: the Chromium binary and its install state
+(same bytes for everybody), the browser pool and its shared context (one launch,
+round-robin pages, results keyed per call), the boot-failure cooldown, and the
+optional API key. The pool QUEUE is shared too, so a large run delays a second
+user - interference, not a leak.
+
 WHY AN OPTIONAL KEY STILL EXISTS
 --------------------------------
 If HIBP_API_KEY is set, /api/v3/breachedaccount is tried first because it is
@@ -146,7 +175,8 @@ launched. So every step is recorded: what was normalised, whether the cache
 answered, the exact URL put on the wire, the status, whether a challenge was
 detected, which tier took over, the band, the error. trace() is safe to call from
 any thread and swallows everything; trace_read() is what a page renders and
-trace_dump() is what it downloads. The ring is bounded and the file is capped.
+trace_dump() is what it downloads. The ring is bounded, the file is capped, and
+both are filtered to one owner.
 
 Pacing is separate from worker count on purpose. Workers bound concurrency;
 configure(delay=...) bounds the RATE at which new addresses are started, which is
@@ -185,14 +215,17 @@ address comes back UNKNOWN, and browser_note() says exactly that.
 
 ISOLATION
 ---------
-The cache and the trace file resolve through auth.user_file(), so both are one
-file per user. The browser pool is per process (one Chromium) but its pages are
-shared round-robin, and every result is keyed by address in the caller's own
-dict. The binary is process-wide on purpose: it is the same bytes for everybody.
+The cache and the trace file resolve through the PINNED owner (see above), which
+is the unlocked hash, so both are one file per user and a worker thread cannot
+pick up somebody else's session. The browser pool is per process (one Chromium)
+but its pages are shared round-robin, and every result is keyed by address in the
+caller's own dict. The binary is process-wide on purpose: it is the same bytes for
+everybody.
 
 USAGE
     import breach
     breach.configure(pages=2, delay=3.0)
+    breach.set_owner(auth.user_file(""))     # pin the per-user prefix
     breach.ensure_browser()                  # non-blocking, idempotent
     breach.browser_state()                   # for the page to show
     breach.available()                       # False -> HTTP only, no browser
@@ -408,8 +441,18 @@ _pool = None
 _pool_boot_failed = 0.0
 _pool_boot_err = ""
 _pw_missing = ""
-_last = {"ts": 0.0, "email": "", "verdict": "", "via": "", "ms": 0, "error": "",
-         "url": ""}
+
+# PER-THREAD state. _cfg above is the process DEFAULT; this holds what the
+# current thread is actually running with, so a second user's configure() cannot
+# retune a run already in flight. `owner` is the unlocked-hash prefix the cache
+# and trace paths are built from - resolved here rather than from
+# st.session_state, because st.session_state off the script thread falls back to
+# the process-wide context and can answer for somebody else's session.
+_tls = threading.local()
+
+# Last address per OWNER. One shared dict used to mean the page's "Last URL"
+# caption showed whichever user touched last.
+_lasts = {}
 
 _pw_lock = threading.Lock()
 _pw_thread = None
@@ -435,6 +478,42 @@ _MONTHS = {"jan": 1, "feb": 2, "mar": 3, "apr": 4, "may": 5, "jun": 6,
 
 
 # ---------------------------------------------------------------------------
+# owner - the per-user prefix, pinned per THREAD
+# ---------------------------------------------------------------------------
+def set_owner(prefix="") -> str:
+    """Pin the per-user prefix for the CALLING THREAD and return it.
+
+    Call it once from the page (script thread) and once per worker. It is what
+    makes the cache and trace paths safe from a background thread, where
+    st.session_state cannot be trusted to belong to this session.
+    """
+    _tls.owner = str(prefix or "")
+    return _tls.owner
+
+
+def owner() -> str:
+    """The prefix pinned for this thread, or "" when nobody pinned one."""
+    return str(getattr(_tls, "owner", "") or "")
+
+
+def _user_file(name) -> str:
+    """Per-user filename from the PINNED owner, else from auth.
+
+    The auth fallback is for a thread nobody pinned: the CLI, the selftest, and
+    the module-level import. auth.user_file() returns "<hash>_<name>", which is
+    the exact shape built here, so both agree.
+    """
+    p = owner()
+    if p:
+        return "%s_%s" % (p, name) if name else p
+    try:
+        import auth
+        return auth.user_file(name)
+    except Exception:
+        return name
+
+
+# ---------------------------------------------------------------------------
 # config
 # ---------------------------------------------------------------------------
 def configure(pages=None, timeout=None, delay=None, http_only=None,
@@ -448,6 +527,9 @@ def configure(pages=None, timeout=None, delay=None, http_only=None,
     ("clean", "error"). An unknown mode is ignored rather than coerced, so a
     typo leaves the previous setting alone instead of silently turning capture
     off.
+
+    This writes the PROCESS DEFAULT. A run that is already going keeps the
+    snapshot it pinned (see _snapshot_cfg), so another user cannot retune it.
     """
     with _lock:
         if pages is not None:
@@ -479,29 +561,74 @@ def configure(pages=None, timeout=None, delay=None, http_only=None,
                 pass
 
 
-def _pages() -> int:
+def _cfg_get(key, default=None):
+    """This thread's snapshot value, else the process default. Never raises."""
+    snap = getattr(_tls, "cfg", None)
+    if isinstance(snap, dict) and key in snap:
+        return snap[key]
     with _lock:
-        return int(_cfg["pages"])
+        return _cfg.get(key, default)
+
+
+def _snapshot_cfg(http_only=None) -> dict:
+    """Freeze the current settings for ONE run.
+
+    A run used to read _cfg live per address, so a second user pressing Run with
+    capture Off turned capture off halfway through the first user's run and their
+    later records came back as skipped pages. The snapshot is pinned on the
+    thread by check_many() and never re-read from the process dict.
+    """
+    with _lock:
+        snap = {"pages": int(_cfg["pages"]), "delay": float(_cfg["delay"]),
+                "timeout": float(_cfg["timeout"]),
+                "http_only": bool(_cfg.get("http_only")),
+                "page_mode": str(_cfg.get("page_mode") or PAGE_MODE_FAST),
+                "page_on": tuple(_cfg.get("page_on") or ())}
+    if http_only is not None:
+        snap["http_only"] = bool(http_only)
+    return snap
+
+
+def _pin_cfg(snap) -> None:
+    _tls.cfg = snap if isinstance(snap, dict) else None
+
+
+def _budget() -> float:
+    """The per-address budget for THIS run, never the process default."""
+    try:
+        return max(30.0, float(_cfg_get("timeout", 180.0)))
+    except Exception:
+        return 180.0
+
+
+def _pages() -> int:
+    try:
+        return max(1, int(_cfg_get("pages", PAGES_DEFAULT)))
+    except Exception:
+        return PAGES_DEFAULT
 
 
 def _delay() -> float:
-    with _lock:
-        return float(_cfg["delay"])
+    try:
+        return max(0.0, float(_cfg_get("delay", DELAY_DEFAULT)))
+    except Exception:
+        return DELAY_DEFAULT
 
 
 def _http_only() -> bool:
-    with _lock:
-        return bool(_cfg.get("http_only"))
+    return bool(_cfg_get("http_only", False))
 
 
 def _page_mode() -> str:
-    with _lock:
-        return str(_cfg.get("page_mode") or PAGE_MODE_FAST)
+    return str(_cfg_get("page_mode", PAGE_MODE_FAST) or PAGE_MODE_FAST)
 
 
 def _page_on() -> tuple:
-    with _lock:
-        return tuple(_cfg.get("page_on") or ())
+    got = _cfg_get("page_on", ())
+    try:
+        return tuple(got or ())
+    except Exception:
+        return ()
 
 
 def page_wanted(kind) -> bool:
@@ -552,11 +679,14 @@ def key_present() -> bool:
 # tracing
 # ---------------------------------------------------------------------------
 def _trace_path() -> str:
-    try:
-        import auth
-        return auth.user_file(TRACE_NAME)
-    except Exception:
+    p = _user_file(TRACE_NAME)
+    if not p:
         return ""
+    try:
+        os.makedirs(os.path.dirname(p) or ".", exist_ok=True)
+    except Exception:
+        pass
+    return p
 
 
 def _trace_to_file(ev):
@@ -585,6 +715,10 @@ def trace(level, step, detail="", email=""):
     """Record one step. Safe from any thread, swallows everything.
 
     level is a short tag the page colours by - INFO / WARN / ERR / CLICK.
+
+    The event is stamped with the caller's pinned owner. Without that the RING is
+    shared and a page renders every session's addresses; the FILE was already
+    per-user, but the ring was not, so section 4 leaked the other user's work.
     """
     try:
         now = time.time()
@@ -595,6 +729,7 @@ def trace(level, step, detail="", email=""):
                   "level": str(level or "INFO")[:8].upper(),
                   "step": str(step or "")[:40],
                   "email": str(email or "")[:120],
+                  "owner": owner(),
                   "detail": str(detail or "")[:600]}
             _trace.append(ev)
             if len(_trace) > TRACE_MAX:
@@ -611,14 +746,20 @@ def trace_seq() -> int:
 
 
 def trace_read(limit=200, since=0):
-    """Events newer than `since`, oldest first. Never raises."""
+    """Events newer than `since`, oldest first, for THIS owner. Never raises.
+
+    An unpinned thread (CLI, selftest) gets every owner, because there is nobody
+    to filter by and the ring is the only record.
+    """
     try:
         n = max(1, min(TRACE_MAX, int(limit or 200)))
         floor = int(since or 0)
     except Exception:
         n, floor = 200, 0
+    want = owner()
     with _trace_lock:
-        got = [e for e in _trace if e.get("seq", 0) > floor]
+        got = [e for e in _trace
+               if e.get("seq", 0) > floor and (not want or e.get("owner") == want)]
     return got[-n:]
 
 
@@ -646,14 +787,19 @@ def trace_dump() -> str:
 
 
 def trace_clear():
+    """Clear THIS owner's file and ring entries. Other users keep theirs."""
     p = _trace_path()
     try:
         if p and os.path.exists(p):
             os.remove(p)
     except Exception:
         pass
+    want = owner()
     with _trace_lock:
-        _trace.clear()
+        if want:
+            _trace[:] = [e for e in _trace if e.get("owner") != want]
+        else:
+            _trace.clear()
         _trace_writes[0] = 0
 
 
@@ -1162,10 +1308,9 @@ def _fill_page(page, got, addr, kind="records") -> dict:
 # cache
 # ---------------------------------------------------------------------------
 def _path() -> str:
-    try:
-        import auth
-        p = auth.user_file(CACHE_NAME)
-    except Exception:
+    """The per-user cache path for THIS thread's owner. Never bare."""
+    p = _user_file(CACHE_NAME)
+    if not p:
         return ""
     try:
         os.makedirs(os.path.dirname(p) or ".", exist_ok=True)
@@ -1342,8 +1487,7 @@ def _parse_payload(addr, payload, via, started, pw) -> dict:
 def _http_search(addr, pw) -> dict:
     addr = _email_only(addr)
     url = unified_url(addr)
-    with _lock:
-        _last["url"] = url
+    _remember({"email": addr, "url": url})
     started = time.time()
     trace("INFO", "http", "GET %s" % url, addr)
     req = urllib.request.Request(
@@ -1421,8 +1565,7 @@ def _keyed_search(addr, pw):
     payload = {"Breaches": [], "Pastes": []}
     for url, field in ((ACCOUNT_API % urllib.parse.quote(addr), "Breaches"),
                        (PASTE_API % urllib.parse.quote(addr), "Pastes")):
-        with _lock:
-            _last["url"] = url
+        _remember({"email": addr, "url": url})
         trace("INFO", "api", "GET %s" % url, addr)
         req = urllib.request.Request(url, headers=hdrs)
         try:
@@ -1480,6 +1623,10 @@ class _BrowserPool:
     Playwright's sync API is not thread safe, so the driver lives on its own
     thread and callers wait on a Future. The context is shared so the clearance
     cookie is too, which is the entire reason the tier works.
+
+    Each job carries its OWNER, and the driver pins it before it touches a page,
+    so a pool line lands in the right user's trace and the page a job takes can
+    never be handed to another job while it is in use.
     """
 
     def __init__(self, size):
@@ -1554,7 +1701,10 @@ class _BrowserPool:
                 continue
             if job is None:
                 break
-            addr, pw_s, fut = job
+            addr, pw_s, fut, job_owner = job
+            # Pin the job's owner on THIS thread before any trace call, so a
+            # pool line is written to the file of the user whose address it is.
+            set_owner(job_owner)
             page = None
             try:
                 page = self._take(context)
@@ -1863,10 +2013,10 @@ class _BrowserPool:
         trace("WARN", "browser", rec["error"], addr)
         return rec, got
 
-    def submit(self, addr, pw):
+    def submit(self, addr, pw, job_owner=None):
         addr = _email_only(addr)
         fut = _cf.Future()
-        self._q.put((addr, pw, fut))
+        self._q.put((addr, pw, fut, owner() if job_owner is None else job_owner))
         trace("INFO", "browser", "queued in pool", addr)
         return fut
 
@@ -1885,6 +2035,11 @@ def _get_pool():
 
     The lock is RELEASED before start(), because start() waits for a chromium
     launch and the workers take _lock too.
+
+    The pool is shared by every user on purpose - one Chromium, one clearance
+    cookie - and pages are created on demand, so a second user's addresses are
+    not capped by the first user's page count. They do share the QUEUE, so a
+    large run delays a small one.
     """
     global _pool, _pool_boot_failed
     size = _pages()
@@ -1962,6 +2117,10 @@ def check(addr, password="", force=False, allow_browser=None) -> dict:
     The address half is tried in order: the optional keyed API when a key exists,
     the keyless endpoint, then the browser - which drives the site's own search
     box and scrapes what renders. With no key the browser IS the method.
+
+    The OWNER and the CONFIG are taken from the calling thread, which check_many
+    pins before it dispatches. A direct call from an unpinned thread (CLI) falls
+    back to auth and to the process default, which is the same answer.
     """
     if allow_browser is None:
         allow_browser = not _http_only()
@@ -2007,7 +2166,7 @@ def check(addr, password="", force=False, allow_browser=None) -> dict:
             try:
                 pool = _get_pool()
                 trace("INFO", "browser", "handing off to the browser tier (UI)", addr)
-                addr_rec = pool.submit(addr, password).result(timeout=_cfg["timeout"])
+                addr_rec = pool.submit(addr, password).result(timeout=_budget())
                 # ONE retry, and only for an EMPTY READ - a page that rendered and
                 # held nothing. A TimeoutError already means the pool was slower
                 # than the whole budget, so re-queueing it pays the same wait a
@@ -2017,8 +2176,7 @@ def check(addr, password="", force=False, allow_browser=None) -> dict:
                 if (not addr_rec.get("breaches") and addr_rec.get("error")
                         and not _cut):
                     trace("WARN", "browser", "empty read - one retry", addr)
-                    _again = pool.submit(addr, password).result(
-                        timeout=_cfg["timeout"])
+                    _again = pool.submit(addr, password).result(timeout=_budget())
                     if _again.get("breaches") or not _again.get("error"):
                         addr_rec = _again
             except Exception as exc:
@@ -2100,20 +2258,30 @@ def check(addr, password="", force=False, allow_browser=None) -> dict:
 
 
 def _remember(rec):
+    """The last-address card, kept PER OWNER.
+
+    One shared dict meant the page's "Last URL" caption showed whichever user
+    touched the file last, which could be somebody else's address.
+    """
     with _lock:
-        _last.update({"ts": time.time(), "email": rec.get("email", ""),
-                      "verdict": rec.get("verdict", ""), "via": rec.get("via", ""),
-                      "ms": rec.get("elapsed_ms", 0), "error": rec.get("error", "")})
+        who = owner()
+        cur = _lasts.get(who) or {}
+        cur.update({"ts": time.time(), "email": rec.get("email", ""),
+                    "verdict": rec.get("verdict", ""), "via": rec.get("via", ""),
+                    "ms": rec.get("elapsed_ms", 0), "error": rec.get("error", ""),
+                    "url": rec.get("url") or cur.get("url", "")})
+        _lasts[who] = cur
 
 
 def last_url() -> str:
-    """The exact address URL last put on the wire - the proof the tail was cut."""
+    """The exact address URL last put on the wire by THIS owner - the proof the
+    tail was cut."""
     with _lock:
-        return _last.get("url", "")
+        return (_lasts.get(owner()) or {}).get("url", "")
 
 
 def check_many(pairs, workers=2, progress=None, cancel=None, force=False,
-               delay=None, http_only=None) -> dict:
+               delay=None, http_only=None, owner_prefix=None) -> dict:
     """Check every (email, password) pair. Returns {email: record}.
 
     Paced on purpose: `workers` bounds concurrency, `delay` bounds the rate at
@@ -2123,8 +2291,17 @@ def check_many(pairs, workers=2, progress=None, cancel=None, force=False,
     progress() is called on START as well as on finish, with the verdict "starting".
     Without the start call nothing on the page moves until the first address has
     finished, so a slow first address looks like a frozen app.
+
+    THE RUN IS PINNED: owner_prefix (else this thread's owner) and a config
+    snapshot are set on every worker before any address is dispatched, so a
+    second user's configure() or another unlock cannot retune or re-prefix a run
+    that is already going.
     """
-    ho = _http_only() if http_only is None else bool(http_only)
+    pin = owner() if owner_prefix is None else str(owner_prefix or "")
+    set_owner(pin)
+    snap = _snapshot_cfg(http_only)
+    _pin_cfg(snap)
+    ho = bool(snap.get("http_only"))
     uniq, seen = [], set()
     for item in pairs or []:
         if isinstance(item, (tuple, list)) and item:
@@ -2137,7 +2314,7 @@ def check_many(pairs, workers=2, progress=None, cancel=None, force=False,
             uniq.append((em, str(pw or "")))
     out, guard, done = {}, threading.Lock(), [0]
     total = len(uniq)
-    pace = _delay() if delay is None else max(0.0, float(delay or 0.0))
+    pace = float(snap.get("delay") if delay is None else max(0.0, float(delay or 0.0)))
     trace("INFO", "run", "start: %d unique address(es), workers=%d, pace=%ss, tier=%s"
           % (total, max(1, int(workers or 1)), pace,
              "http-only" if ho else "http+browser"))
@@ -2152,6 +2329,10 @@ def check_many(pairs, workers=2, progress=None, cancel=None, force=False,
                 pass
 
     def one(item, position):
+        # Each worker is its own thread and ThreadPoolExecutor reuses threads
+        # across runs, so the pin and the snapshot are re-applied per task.
+        set_owner(pin)
+        _pin_cfg(snap)
         em, pw = item
         rec = None
         if cancel is not None and cancel.is_set():
@@ -2234,15 +2415,17 @@ def score(records) -> dict:
 
 
 def report() -> dict:
+    with _lock:
+        mine = dict(_lasts.get(owner()) or {})
     return {"version": BREACH_VERSION, "browser": available(),
             "browser_state": browser_state().get("state", ""),
             "browser_error": browser_note(), "pages": _pages(), "delay": _delay(),
             "http_only": _http_only(), "pool": _pool is not None,
-            "key": bool(_api_key()), "tier": "ui",
+            "key": bool(_api_key()), "tier": "ui", "owner": owner(),
             "boot_failed_ago": (int(time.time() - _pool_boot_failed)
                                 if _pool_boot_failed else 0),
             "page_mode": _page_mode(), "page_on": list(_page_on()),
-            "last": dict(_last), "trace_seq": trace_seq()}
+            "last": mine, "trace_seq": trace_seq()}
 
 
 # ---------------------------------------------------------------------------
@@ -2281,6 +2464,71 @@ def selftest(verbose=False) -> bool:
     # ---- READ, VERSUS ZERO ----
     add("blank_read_false", _blank("a@b.co").get("read") is False)
     add("blank_partial_false", _blank("a@b.co").get("partial_read") is False)
+
+    # ---- ISOLATION: the owner pins the paths, and does not survive a thread --
+    _was_owner = owner()
+    set_owner("aaaa1111")
+    add("owner_pins", owner() == "aaaa1111")
+    add("user_file_prefixed", _user_file(CACHE_NAME) == "aaaa1111_" + CACHE_NAME)
+    add("cache_path_prefixed", _path().endswith("aaaa1111_" + CACHE_NAME))
+    add("trace_path_prefixed", _trace_path().endswith("aaaa1111_" + TRACE_NAME))
+    set_owner("bbbb2222")
+    add("owner_switches", _path().endswith("bbbb2222_" + CACHE_NAME))
+    add("two_users_differ", _user_file("x") != "aaaa1111_x")
+    set_owner("")
+    add("owner_empty_falls_back", bool(_user_file(CACHE_NAME)))
+    add("owner_empty_not_prefixed", not _user_file("x").startswith("bbbb2222_"))
+
+    # ---- ISOLATION: a snapshot beats another user's configure() ----
+    _saved_cfg = dict(_cfg)
+    configure(page_mode=PAGE_MODE_FULL, page_on=("clean", "error"), delay=1.0)
+    _mine = _snapshot_cfg(False)
+    _pin_cfg(_mine)
+    configure(page_mode=PAGE_MODE_OFF, page_on=(), delay=9.0)
+    add("snapshot_keeps_mode", _page_mode() == PAGE_MODE_FULL)
+    add("snapshot_keeps_on", _page_on() == ("clean", "error"))
+    add("snapshot_keeps_delay", _delay() == 1.0)
+    add("snapshot_still_wants", page_wanted("clean") and page_wanted("records"))
+    _pin_cfg(None)
+    add("no_snapshot_reads_default", _page_mode() == PAGE_MODE_OFF)
+    with _lock:
+        _cfg.clear()
+        _cfg.update(_saved_cfg)
+
+    # ---- ISOLATION: the ring and the last-address card are per owner ----
+    set_owner("aaaa1111")
+    _seq_a = trace_seq()
+    trace("INFO", "selftest", "mine a", "a@b.co")
+    _mine_a = [e for e in trace_read(limit=50, since=_seq_a)]
+    set_owner("bbbb2222")
+    add("ring_other_owner_empty", trace_read(limit=50, since=_seq_a) == [])
+    _seq_b = trace_seq()
+    trace("INFO", "selftest", "mine b", "b@b.co")
+    add("ring_own_visible", len(trace_read(limit=50, since=_seq_b)) == 1)
+    set_owner("aaaa1111")
+    add("ring_a_still_there", len(_mine_a) == 1)
+    add("ring_a_not_b", all(e.get("owner") == "aaaa1111" for e in _mine_a))
+
+    set_owner("aaaa1111")
+    _remember({"email": "a@b.co", "url": "u-a"})
+    set_owner("bbbb2222")
+    _remember({"email": "b@b.co", "url": "u-b"})
+    add("last_url_own", last_url() == "u-b")
+    set_owner("aaaa1111")
+    add("last_url_other_kept", last_url() == "u-a")
+    add("report_owner", report().get("owner") == "aaaa1111")
+
+    # ---- clearing the ring must not wipe another owner ----
+    set_owner("aaaa1111")
+    _seq_c = trace_seq()
+    trace("INFO", "selftest", "c", "c@b.co")
+    set_owner("bbbb2222")
+    _b_before = len(trace_read(limit=200, since=_seq_c - 1))
+    set_owner("aaaa1111")
+    trace_clear()
+    set_owner("bbbb2222")
+    add("clear_kept_other", len(trace_read(limit=200, since=_seq_c - 1)) == _b_before)
+    set_owner(_was_owner)
 
     configure(page_mode=PAGE_MODE_FAST, page_on=PAGE_KINDS)
     add("fast_default_on", _page_mode() == PAGE_MODE_FAST)
@@ -2453,6 +2701,12 @@ def selftest(verbose=False) -> bool:
         "page_on" in inspect.signature(configure).parameters)
     add("check_many_takes_http_only",
         "http_only" in inspect.signature(check_many).parameters)
+    add("check_many_takes_owner",
+        "owner_prefix" in inspect.signature(check_many).parameters)
+    add("submit_takes_owner", "job_owner" in inspect.signature(
+        _BrowserPool.submit).parameters)
+    add("run_pins_owner", "set_owner(job_owner)" in
+        inspect.getsource(_BrowserPool._run))
     add("ensure_browser_declares_pw_state",
         "_pw_state" in inspect.getsource(ensure_browser).split("\n")[1])
     configure(http_only=True)
@@ -2476,6 +2730,8 @@ def selftest(verbose=False) -> bool:
     add("timeout_default_roomy", _cfg["timeout"] >= 90.0)
     # ---- the budget covers a queue slot, not just one page ----
     add("budget_covers_queue", _cfg["timeout"] >= 180.0)
+    add("budget_from_snapshot", "one retry" in inspect.getsource(check)
+        and "_budget()" in inspect.getsource(check))
     add("retry_skips_cut_calls", "_cut" in inspect.getsource(check))
     add("check_many_guards_one", "rec = check(em, pw" in inspect.getsource(check_many))
 
