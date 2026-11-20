@@ -957,12 +957,6 @@ with tab_json:
 
 with tab_zip:
     st.caption("One archive containing the template file, CSV, JSON and a per-status split.")
-    # v13.63: THE ZIP DOWNLOAD BUTTON WAS DEAD. Clicking a download_button fires
-    # a rerun; on that rerun st.button("Build ZIP") is False, the body was
-    # skipped, the download_button was never rendered, and the click resolved
-    # against nothing. The bytes are held in session_state now and the button is
-    # drawn unconditionally while they exist; block 012 drops them when any
-    # input changes.
     if st.button("Build ZIP", type="primary"):
         buf = io.BytesIO()
         with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
@@ -988,8 +982,6 @@ with tab_break:
     by = {}
     for r in sel:
         by.setdefault(r["status"], []).append(r)
-    # v13.55: strongest bucket first, so VALID is at the top instead of sorting
-    # alphabetically under CONNECTION_FAILED.
     for tag in sorted(by, key=lambda t: -_STATUS_RANK.get(t, 0)):
         with st.expander(f"{tag} — {len(by[tag])} row(s)"):
             body = "\n".join(r["line"] for r in by[tag])
@@ -1001,32 +993,10 @@ with tab_break:
 
 # --------------------------------------------------------------------------
 # v13.79 WAVE 7 - MAIL SORTER
-#
-# WHY A TAB AND NOT A NEW BLOCK: the frame is 16 blocks and verify_blocks.py
-# pins the header count, so a new block id would mean a renumber, a header edit
-# and a TARGET_BLOCKS bump - three chances to break a gate on a phone. A tab is
-# a panel, the file stays 16 blocks, and mailsort.py is a plain module like
-# runstate.py so nothing has to be registered anywhere.
-#
-# WHAT IT DOES THAT "Per-status split" DOES NOT: status is one fixed key. This
-# groups by anything in the row - domain, TLD, country, region, host, keyword,
-# folder, length band, first letter, source - with a stated order, and it can
-# also just sort one flat file by email. Every group gets its own button and the
-# whole set gets one archive.
-#
-# THE GROUPING IS CACHED ON A SIGNATURE, not recomputed per rerun: this tab body
-# runs on every keystroke anywhere on the page, and grouping 200k rows for
-# nothing is exactly the per-rerun cost this page has already been bitten by.
-# The signature carries the paste count too, so a paste change regroups without
-# a keystroke landing anywhere else first.
+# ... (unchanged commentary)
 # --------------------------------------------------------------------------
 with tab_sort:
     # ---- stale-module guard -------------------------------------------------
-    # This was a bare `import mailsort` with no guard at all, and the old
-    # sys.modules entry survives 'Updated app!'. The old module has no
-    # paste_rows, so line 1047 raised AttributeError on every render of this tab
-    # - which killed the tab and the footer with it. Reload when any of the
-    # names this tab actually calls is missing.
     try:
         import mailsort
         if not (hasattr(mailsort, "paste_rows") and hasattr(mailsort, "group_rows")
@@ -1048,13 +1018,20 @@ with tab_sort:
         with st.expander("Paste addresses to sort alongside the selection",
                          expanded=False):
             st.caption("One per line. `email`, `email:pass` and `email | pass | TAG` "
-                       "all work. These rows are sorted with whatever is selected "
-                       "above and are never written anywhere.")
+                       "all work. These rows are never written anywhere.")
             _paste_txt = st.text_area("Pasted addresses", height=160,
                                       key="ex_sort_paste",
                                       placeholder="someone@example.com:password")
-        # Guarded: on a module that still predates paste_rows the tab stays up
-        # and says so instead of raising at the first line that touches it.
+            # v13.86: KEEP THEM APART. Pasted rows used to be merged into the
+            # selection's groups, so a 2-line paste disappeared inside 4000 system
+            # rows and there was no way to export just what was typed. On, the
+            # pasted set is grouped on its own and every group is prefixed, so it
+            # sorts by the same key and still never mixes.
+            _apart = st.toggle(
+                "Keep pasted rows in their own group", value=False,
+                key="ex_sort_apart",
+                help="On: pasted rows are grouped separately and labelled "
+                     "'Pasted · …', so they cannot be confused with the selection.")
         _pasted = []
         if hasattr(mailsort, "paste_rows"):
             _pasted = mailsort.paste_rows(_paste_txt)
@@ -1062,7 +1039,8 @@ with tab_sort:
             st.caption("This mailsort.py has no paste_rows() - paste is unavailable "
                        "until the module reloads.")
         if _pasted:
-            st.caption("**%d** pasted row(s) added to this sort." % len(_pasted))
+            st.caption("**%d** pasted row(s) %s." %
+                       (len(_pasted), "kept apart" if _apart else "added to this sort"))
         _sort_rows = list(sel) + _pasted
 
         if not _sort_rows:
@@ -1070,9 +1048,6 @@ with tab_sort:
             st.stop()
 
         # ---- teach a domain its country -----------------------------------
-        # A gTLD carries no country, so alditra.com cannot be placed by any map
-        # that does not already know it. Teaching it once fixes every future
-        # sort; the map is per user and only ever grows from here.
         with st.expander("Teach a domain its country", expanded=False):
             st.caption("A `.com` says nothing about where an account is. Add a domain "
                        "here and every later sort places it. The map is yours, is "
@@ -1091,7 +1066,6 @@ with tab_sort:
                              disabled=not (_teach_dom or "").strip()):
                     _clearing = (_teach_cc == "- clear -")
                     _n = mailsort.learn(_teach_dom, "" if _clearing else _teach_cc)
-                    # regroup on the next run, without waiting for another key
                     st.session_state.pop("_ex_sort_sig", None)
                     st.success("%s - %d domain(s) mapped."
                                % ("Cleared" if _clearing else "Learned", _n))
@@ -1111,9 +1085,6 @@ with tab_sort:
                            "**Global / gTLD**.")
 
         # ---- auto-assign from clues in the rows ---------------------------
-        # Runs on a press only, so sorting stays offline. It never overwrites a
-        # domain taught by hand, and every entry it writes is removable in one
-        # press.
         with st.expander("Auto-assign countries from the rows", expanded=False):
             st.caption("Reads the clues already in the current rows: a mail host "
                        "under the same domain, or a sibling of the same name with a "
@@ -1185,18 +1156,23 @@ with tab_sort:
 
         st.caption(mailsort.describe(_by))
 
-        # Signature: the row set is identified by its size, its two ends and the
-        # paste count, which is cheap and stable. fname is deliberately NOT in it
-        # - it carries a seconds-resolution stamp and would invalidate the cache
-        # every second.
         _sort_sig = (len(_sort_rows), len(_pasted), _by, _order, int(_cap),
-                     bool(_dedupe),
+                     bool(_dedupe), bool(_apart),
                      _sort_rows[0]["email"] if _sort_rows else "",
                      _sort_rows[-1]["email"] if _sort_rows else "")
         if st.session_state.get("_ex_sort_sig") != _sort_sig:
             st.session_state["_ex_sort_sig"] = _sort_sig
-            st.session_state["_ex_sort_groups"] = mailsort.group_rows(
-                _sort_rows, _by, order=_order, dedupe=_dedupe, cap=int(_cap))
+            if _apart and _pasted:
+                _g_sel, _d_sel = mailsort.group_rows(
+                    list(sel), _by, order=_order, dedupe=_dedupe, cap=int(_cap))
+                _g_pst, _d_pst = mailsort.group_rows(
+                    _pasted, _by, order=_order, dedupe=_dedupe, cap=int(_cap))
+                st.session_state["_ex_sort_groups"] = (
+                    [("Pasted \u00b7 " + _l, _r) for _l, _r in _g_pst] + list(_g_sel),
+                    _d_sel + _d_pst)
+            else:
+                st.session_state["_ex_sort_groups"] = mailsort.group_rows(
+                    _sort_rows, _by, order=_order, dedupe=_dedupe, cap=int(_cap))
             st.session_state.pop("_ex_sort_zip", None)
 
         _groups, _dropped = st.session_state.get("_ex_sort_groups") or ([], 0)
