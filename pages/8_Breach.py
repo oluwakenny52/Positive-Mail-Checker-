@@ -479,19 +479,19 @@ else:
 
 _c1, _c2, _c3, _c4, _c5 = st.columns(5)
 with _c1:
-    _workers = st.slider("Workers", 1, 8, 4, key="_breach_workers",
+    _workers = st.slider("Workers", 1, 8, 2, key="_breach_workers",
                          on_change=_watch("_breach_workers", "workers"),
-                         help="How many addresses may be in flight at once. Pwned "
-                              "Passwords is a different host and takes concurrency "
-                              "well; the site is the slow side.")
+                         help="How many addresses may be in flight at once. Each one "
+                              "is a whole page load, so 2 is the honest default on a "
+                              "small container - raise it only if runs feel slow.")
 with _c2:
-    _delay = st.slider("Delay (s)", 0.0, 10.0, 2.0, 0.5, key="_breach_delay",
+    _delay = st.slider("Delay (s)", 0.0, 10.0, 3.0, 0.5, key="_breach_delay",
                        on_change=_watch("_breach_delay", "delay"),
                        help="Seconds between STARTING addresses, regardless of "
-                            "worker count. This is the knob for being gentle - 2s "
+                            "worker count. This is the knob for being gentle - 3s "
                             "trickles, 0 floods.")
 with _c3:
-    _pages = st.number_input("Browser pages", 1, 8, 4, 1, key="_breach_pages",
+    _pages = st.number_input("Browser pages", 1, 8, 2, 1, key="_breach_pages",
                              on_change=_watch("_breach_pages", "pages"),
                              help="Chromium tabs for addresses. Each is reused, and "
                                   "recreated if it dies.")
