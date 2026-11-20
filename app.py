@@ -15690,7 +15690,9 @@ if start_engine_btn:
                 except Exception:
                     pass
 
-        def check_task(line, _box=_run_pool_box):
+        def check_task(line, _box=None):
+            if _box is None:
+                _box = _run_pool_box
             try:
                 seed_task_cfg(_run_cfg)
                 _pin_gate_scope(_run_scope)
