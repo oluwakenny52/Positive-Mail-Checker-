@@ -1,17 +1,31 @@
 """breach.py - breach exposure and combo freshness.  v13.86
 
-NO API KEY. Three keyless sources, in order of how much they prove:
+No API key NEEDED, and three sources in order of how much they prove:
 
     passwords  api.pwnedpasswords.com/range/<5-hex> - k-anonymity, no key, no
                challenge. Returns how many times the password appears in every
                breach HIBP has ever loaded. THIS is the freshness signal for a
                combo: 0 means the password is private, 40,000 means it is an old
                bridge that has been circulating for years.
-    address    haveibeenpwned.com/unifiedsearch/<email> - the endpoint the site's
-               own search box uses. Plain HTTP first; a real browser only when
-               Cloudflare answers with the interstitial.
+    address    the HIBP address lookup, keyed when a key is present:
+               /api/v3/breachedaccount and /api/v3/pasteaccount with the
+               hibp-api-key header, which return BreachDate, DataClasses and
+               PwnCount per record. Without a key it falls back to the site's own
+               search endpoint, plain HTTP first and a real browser only when
+               Cloudflare challenges it.
     catalogue  /api/v3/breaches - one fetch, matched LOCALLY by domain. Kept as
                a fallback for when the address tiers are blocked.
+
+WHY THE KEYED TIER EXISTS  (v13.86)
+-----------------------------------
+haveibeenpwned.com/unifiedsearch/ now answers 401 to an anonymous urllib call.
+A 401 is not a Cloudflare interstitial, so the old code fell straight through to
+json.loads("") and reported an EMPTY payload - the site listed ten breaches for
+the same address while this module said none. Two things fix it: 401 is now a
+wall like 403 and 429, so the browser tier can be sent at it, and the keyed API
+answers the same question without any of the ambiguity. The key is read from
+HIBP_API_KEY in the environment or in the app secrets and is only ever sent to
+haveibeenpwned.com.
 
 WHAT IS ACTUALLY SENT  (v13.85)
 -------------------------------
@@ -112,8 +126,8 @@ USAGE
     breach.trace_read(limit=100)             # what a page renders
     breach.trace_dump()                      # what a page downloads
 
+    HIBP_API_KEY=xxxx python breach.py --probe someone@example.com:hunter2
     python breach.py --selftest
-    python breach.py --probe someone@example.com:hunter2
 """
 
 import concurrent.futures as _cf
@@ -145,6 +159,12 @@ UNIFIED = HIBP_BASE + "/unifiedsearch/%s"
 ACCOUNT = HIBP_BASE + "/account/%s"
 CATALOGUE_URL = HIBP_BASE + "/api/v3/breaches"
 PW_RANGE = "https://api.pwnedpasswords.com/range/%s"
+
+# The keyed tier. Same evidence as unifiedsearch, without the interstitial and
+# with the fields the site's own JSON drops.
+ACCOUNT_API = HIBP_BASE + "/api/v3/breachedaccount/%s?truncateResponse=false"
+PASTE_API = HIBP_BASE + "/api/v3/pasteaccount/%s"
+KEY_ENV = "HIBP_API_KEY"
 
 PAGE_HTML_MAX = 90000
 PAGE_TEXT_MAX = 30000
@@ -224,6 +244,8 @@ _last = {"ts": 0.0, "email": "", "verdict": "", "via": "", "ms": 0, "error": "",
 _pw_lock = threading.Lock()
 _pw_thread = None
 _pw_state = {"state": "unknown", "error": "", "started": 0.0, "finished": 0.0}
+
+_key_cache = [""]
 
 _trace_lock = threading.Lock()
 _trace_file_lock = threading.Lock()
@@ -320,6 +342,34 @@ def page_wanted(kind) -> bool:
     if mode == PAGE_MODE_FULL:
         return True
     return str(kind or "") in _page_on()
+
+
+def _api_key() -> str:
+    """HIBP_API_KEY from the environment, else the app secrets. Never raises.
+
+    Read lazily and cached once found, so a key added to secrets does not need
+    the module reloaded twice - and a key never reaches the trace, only the URL.
+    """
+    try:
+        k = str(os.environ.get(KEY_ENV) or "").strip()
+    except Exception:
+        k = ""
+    if k:
+        return k
+    if _key_cache[0]:
+        return _key_cache[0]
+    try:
+        import streamlit as st
+        k = str(st.secrets.get(KEY_ENV) or "").strip()
+    except Exception:
+        k = ""
+    if k:
+        _key_cache[0] = k
+    return k
+
+
+def key_present() -> bool:
+    return bool(_api_key())
 
 
 # ---------------------------------------------------------------------------
@@ -608,6 +658,12 @@ def account_url(addr) -> str:
     return ACCOUNT % urllib.parse.quote(_email_only(addr))
 
 
+def _esc(v) -> str:
+    """Minimal HTML escape for the generated view."""
+    return (str(v or "").replace("&", "&amp;").replace("<", "&lt;")
+            .replace(">", "&gt;").replace('"', "&quot;"))
+
+
 def parse_addresses(text):
     """A pasted list -> [(email, password)]. Password may be empty.
 
@@ -686,6 +742,9 @@ def _page_http(addr, kind="records") -> dict:
     the search box posts. Whether it is fetched at all is page_wanted()'s
     decision, taken from the OUTCOME (clean / error / records) rather than from
     the address, so fast mode can capture exactly the filtered half.
+
+    The page answers 401 to anonymous callers like everything else does now, so
+    an empty result here is normal and is why _page_from_record() exists.
     """
     if not page_wanted(kind):
         return _page_skip(kind)
@@ -708,6 +767,91 @@ def _page_http(addr, kind="records") -> dict:
     except Exception as exc:
         out["page_error"] = "%s: %s" % (type(exc).__name__, exc)
     return out
+
+
+def _page_from_record(rec, kind="records") -> dict:
+    """A text and an HTML view BUILT FROM the record. Never raises.
+
+    /account answers 401 to anonymous callers, so a keyed run frequently has no
+    page to render. The records are the same evidence, so the view is generated
+    from them and marked page_via "api" - it is a report of what the API said,
+    not a captured page, and it says so at the foot of the HTML.
+    """
+    if not page_wanted(kind):
+        return _page_skip(kind)
+    addr = _email_only(rec.get("email") or "")
+    _pw = rec.get("pw_count")
+    lines = ["address: %s" % addr,
+             "checked: %s" % (rec.get("checked_at") or ""),
+             "verdict: %s - %s" % (rec.get("verdict") or "?", rec.get("reason") or ""),
+             "password appearances: %s" % (_pw if _pw is not None
+                                           else "no password supplied"),
+             "source: %s" % (rec.get("via") or "-"),
+             "breaches: %d, pastes: %d" % (len(rec.get("breaches") or []),
+                                          len(rec.get("pastes") or []))]
+    rows = []
+    for b in (rec.get("breaches") or [])[:60]:
+        lines.append("")
+        lines.append("- %s%s" % (b.get("title") or "?",
+                                 " [stealer corpus]" if b.get("corpus") else ""))
+        if b.get("date"):
+            lines.append("  breach date: %s" % b["date"])
+        if b.get("days") is not None:
+            lines.append("  age: %d day(s)" % int(b["days"]))
+        lines.append("  accounts: %s" % "{:,}".format(int(b.get("pwn_count") or 0)))
+        if b.get("classes"):
+            lines.append("  data: %s" % ", ".join(b["classes"]))
+        if b.get("description"):
+            lines.append("  %s" % str(b["description"])[:400])
+        rows.append(b)
+    for p in (rec.get("pastes") or [])[:30]:
+        lines.append("")
+        lines.append("- paste: %s (%s) %s" % (p.get("title") or "?",
+                                              p.get("source") or "-",
+                                              p.get("date") or ""))
+    text = "\n".join(lines)[:PAGE_TEXT_MAX]
+
+    head = ("<html><head><meta charset='utf-8'><title>%s</title>"
+            "<style>body{font-family:system-ui,sans-serif;background:#0b1020;"
+            "color:#e6ebff;padding:16px}h1{font-size:1.05rem}h2{font-size:.9rem}"
+            "table{border-collapse:collapse;width:100%;font-size:.8rem}"
+            "td,th{border:1px solid #2a3350;padding:5px;text-align:left;"
+            "vertical-align:top}th{background:#141b30}.c{color:#fcd34d}</style>"
+            "</head><body><h1>%s</h1><p class='c'>%s - %s</p>"
+            "<p>password appearances: %s<br>source: %s<br>checked: %s</p>"
+            % (_esc(addr), _esc(addr), _esc(rec.get("verdict") or "?"),
+               _esc(rec.get("reason") or ""),
+               _esc(_pw) if _pw is not None else "-", _esc(rec.get("via") or "-"),
+               _esc(rec.get("checked_at") or "")))
+    body = []
+    if rows:
+        body.append("<table><tr><th>Breach</th><th>Date</th><th>Age</th>"
+                    "<th>Accounts</th><th>Data classes</th></tr>")
+        for b in rows:
+            body.append(
+                "<tr><td>%s%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td></tr>"
+                % (_esc(b.get("title") or "?"),
+                   " (stealer corpus)" if b.get("corpus") else "",
+                   _esc(b.get("date") or "-"),
+                   "%d d" % int(b["days"]) if b.get("days") is not None else "-",
+                   "{:,}".format(int(b.get("pwn_count") or 0)),
+                   _esc(", ".join(b.get("classes") or []) or "-")))
+        body.append("</table>")
+    else:
+        body.append("<p>No breach record for this address.</p>")
+    if rec.get("pastes"):
+        body.append("<h2>Pastes</h2><ul>")
+        for p in (rec.get("pastes") or [])[:30]:
+            body.append("<li>%s (%s) %s</li>"
+                        % (_esc(p.get("title") or "?"), _esc(p.get("source") or "-"),
+                           _esc(p.get("date") or "")))
+        body.append("</ul>")
+    body.append("<p><small>Generated from the API answer, not a captured "
+                "page.</small></p></body></html>")
+    return {"page_url": account_url(addr),
+            "page_html": (head + "".join(body))[:PAGE_HTML_MAX],
+            "page_text": text, "page_via": "api", "page_error": "",
+            "page_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
 
 
 # ---------------------------------------------------------------------------
@@ -825,7 +969,14 @@ def pwned_count(password, force=False):
 # tier 2 - address exposure
 # ---------------------------------------------------------------------------
 def _looks_like_challenge(status, body) -> bool:
-    if status in (403, 429, 503):
+    """Is this response a wall rather than an answer?
+
+    401 is in the list because the anonymous unifiedsearch endpoint now answers
+    401. It used to fall through to json.loads("") and parse as an EMPTY payload,
+    so an address with ten breaches was reported as having none - the quietest
+    possible failure. A 401 must reach the browser tier like a 403 does.
+    """
+    if status in (401, 403, 429, 503):
         return True
     low = (body or "")[:4000].lower()
     return any(m in low for m in CHALLENGE_MARKS)
@@ -944,6 +1095,82 @@ def _http_search(addr, pw) -> dict:
         rec["error"] = "unparsable: %s" % exc
         rec.update(_page_http(addr, "error"))
         return rec
+
+
+# ---------------------------------------------------------------------------
+# tier 2b - the keyed API (only when HIBP_API_KEY is set)
+# ---------------------------------------------------------------------------
+def _keyed_search(addr, pw):
+    """The keyed API answer, or None to fall through to the keyless tier.
+
+    None means "this tier could not answer": no key, a rejected key, a rate
+    limit, an unreadable body or a transport error. The caller then does keyless
+    HTTP and, if that is challenged, the browser. A 404 is an ANSWER (no record)
+    and returns a normal record with count 0.
+
+    Both endpoints are asked, breached then paste, because the paste list is a
+    separate call in v3 and a combo whose address sits in a paste is not clean.
+    The two lists are merged into the unifiedsearch shape so _parse_payload, the
+    bands and the CSV need no knowledge of this tier at all.
+    """
+    key = _api_key()
+    if not key:
+        return None
+    addr = _email_only(addr)
+    started = time.time()
+    hdrs = {"Accept": "application/json", "User-Agent": UA,
+            "Accept-Language": "en-GB,en;q=0.9", "hibp-api-key": key}
+    payload = {"Breaches": [], "Pastes": []}
+    for url, field in ((ACCOUNT_API % urllib.parse.quote(addr), "Breaches"),
+                       (PASTE_API % urllib.parse.quote(addr), "Pastes")):
+        with _lock:
+            _last["url"] = url
+        trace("INFO", "api", "GET %s" % url, addr)
+        req = urllib.request.Request(url, headers=hdrs)
+        try:
+            with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT) as resp:
+                body = resp.read().decode("utf-8", "replace")
+                status = resp.status
+                trace("INFO", "api", "http %d (%d byte(s))"
+                      % (status, len(body)), addr)
+        except urllib.error.HTTPError as exc:
+            status, body = exc.code, ""
+            trace("WARN", "api", "http %d" % status, addr)
+        except Exception as exc:
+            trace("ERR", "api", "%s: %s - falling back"
+                  % (type(exc).__name__, exc), addr)
+            return None
+        if status == 404:
+            continue
+        if status in (401, 403):
+            trace("WARN", "api", "key rejected (http %d) - keyless next" % status, addr)
+            return None
+        if status == 429:
+            trace("WARN", "api", "rate limited (429) - keyless next", addr)
+            return None
+        if status != 200:
+            trace("WARN", "api", "http %d - keyless next" % status, addr)
+            return None
+        try:
+            got = json.loads(body or "[]")
+        except Exception as exc:
+            trace("ERR", "api", "unparsable: %s" % exc, addr)
+            return None
+        if isinstance(got, list):
+            payload[field] = got
+
+    rec = _parse_payload(addr, payload, "api", started, pw)
+    trace("INFO", "api", "keyed answer: %s breach(es), %s paste(s)"
+          % (len(rec["breaches"]), len(rec["pastes"])), addr)
+    kind = "records" if rec.get("count") else "clean"
+    page = _page_http(addr, kind)
+    if not (page.get("page_html") or page.get("page_text")):
+        _gen = _page_from_record(rec, kind)
+        if _gen.get("page_text") or _gen.get("page_html"):
+            _gen["page_error"] = page.get("page_error") or ""
+            page = _gen
+    rec.update(page)
+    return rec
 
 
 # ---------------------------------------------------------------------------
@@ -1245,6 +1472,10 @@ def check(addr, password="", force=False, allow_browser=None) -> dict:
     v13.86: allow_browser DEFAULTS TO THE CONFIGURED TIER. It defaulted to True
     and no caller ever passed False, so configure(http_only=True) could not have
     worked even once the page had a switch.
+
+    The address half is tried in order of how much it proves: the keyed API when
+    a key is set, then the keyless endpoint, then the browser on a challenge. The
+    first two are the same evidence; the key only removes the ambiguity.
     """
     if allow_browser is None:
         allow_browser = not _http_only()
@@ -1276,7 +1507,15 @@ def check(addr, password="", force=False, allow_browser=None) -> dict:
     trace("INFO", "pw", "result: %s" % ("no password" if rec["pw_count"] is None
                                         else "%d hit(s)" % rec["pw_count"]), addr)
 
-    addr_rec = _http_search(addr, password)
+    addr_rec = None
+    if _api_key():
+        addr_rec = _keyed_search(addr, password)
+        if addr_rec is not None:
+            trace("INFO", "api", "answered by the keyed tier", addr)
+        else:
+            trace("WARN", "api", "keyed tier did not answer - keyless HTTP next", addr)
+    if addr_rec is None:
+        addr_rec = _http_search(addr, password)
     if addr_rec.get("error", "").startswith("challenge"):
         if allow_browser and available():
             try:
@@ -1309,6 +1548,10 @@ def check(addr, password="", force=False, allow_browser=None) -> dict:
     rec["via"] = addr_rec.get("via", "")
     rec["error"] = addr_rec.get("error", "")
     rec["elapsed_ms"] = addr_rec.get("elapsed_ms", 0)
+    for _k in ("page_url", "page_html", "page_text", "page_via", "page_error",
+               "page_at"):
+        if _k in addr_rec:
+            rec[_k] = addr_rec[_k]
 
     rec["bucket"] = _combine(_pw_bucket(rec["pw_count"]), _addr_bucket(addr_rec))
     rec["verdict"] = rec["bucket"]
@@ -1448,6 +1691,7 @@ def report() -> dict:
             "browser_state": browser_state().get("state", ""),
             "browser_error": browser_note(), "pages": _pages(), "delay": _delay(),
             "http_only": _http_only(), "pool": _pool is not None,
+            "key": bool(_api_key()),
             "page_mode": _page_mode(), "page_on": list(_page_on()),
             "last": dict(_last), "trace_seq": trace_seq()}
 
@@ -1553,6 +1797,9 @@ def selftest(verbose=False) -> bool:
     add("score_grade", sc["grade"] in "ABCDF")
 
     add("challenge_403", _looks_like_challenge(403, ""))
+    add("challenge_401", _looks_like_challenge(401, ""))
+    add("challenge_401_json", _looks_like_challenge(401, '{"Breaches":[]}'))
+    add("challenge_404_clear", not _looks_like_challenge(404, ""))
     add("challenge_html", _looks_like_challenge(200, "<title>Just a moment...</title>"))
     add("challenge_json", not _looks_like_challenge(200, '{"Breaches":[]}'))
     add("pw_hash", len(_pw_hash("abc")) == 40)
@@ -1560,6 +1807,25 @@ def selftest(verbose=False) -> bool:
     add("state_shape", "state" in browser_state())
     add("note_is_str", isinstance(browser_note(), str))
     add("env_set", os.environ.get("PLAYWRIGHT_BROWSERS_PATH") == _PW_DIR)
+
+    # ---- the keyed tier ----
+    add("key_shape", isinstance(_api_key(), str))
+    add("keyed_account_url", "breachedaccount" in ACCOUNT_API and
+        ACCOUNT_API.startswith(HIBP_BASE))
+    add("keyed_paste_url", "pasteaccount" in PASTE_API)
+    add("keyed_truncate", "truncateResponse=false" in ACCOUNT_API)
+    add("keyed_header_name", KEY_ENV == "HIBP_API_KEY")
+    _pr = {"email": "a@b.co", "verdict": "OLD", "reason": "r", "via": "api",
+           "pw_count": 3, "breaches": [{"title": "X", "date": "2015-01-01",
+                                        "days": 4000, "pwn_count": 12,
+                                        "classes": ["Passwords"]}],
+           "pastes": [], "checked_at": "2026-01-01 00:00:00"}
+    _gen = _page_from_record(_pr, "clean")
+    add("gen_text", "breaches: 1" in _gen["page_text"] and "X" in _gen["page_text"])
+    add("gen_html", "<table" in _gen["page_html"] and "2015-01-01" in _gen["page_html"])
+    add("gen_marked", _gen["page_via"] == "api")
+    add("gen_skipped", _page_from_record(_pr, "records")["page_text"] == "")
+    add("esc", _esc("<a&b>") == "&lt;a&amp;b&gt;")
 
     # ---- pacing and tracing ----
     configure(delay=3.5)
@@ -1571,6 +1837,10 @@ def selftest(verbose=False) -> bool:
     import inspect
     add("configure_takes_http_only",
         "http_only" in inspect.signature(configure).parameters)
+    add("configure_takes_page_mode",
+        "page_mode" in inspect.signature(configure).parameters)
+    add("configure_takes_page_on",
+        "page_on" in inspect.signature(configure).parameters)
     add("check_many_takes_http_only",
         "http_only" in inspect.signature(check_many).parameters)
     add("ensure_browser_declares_pw_state",
@@ -1618,6 +1888,7 @@ def main(argv=None) -> int:
         configure(http_only=only)
         pairs = parse_addresses(target) or [(target, "")]
         print("tier:", "http-only" if only else "http+browser")
+        print("key:", "present" if _api_key() else "absent")
         print("browser available:", available(), browser_note())
         res = check(pairs[0][0], pairs[0][1], force=True)
         print("url sent:", last_url())
