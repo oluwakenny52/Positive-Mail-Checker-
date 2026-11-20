@@ -44,6 +44,39 @@ trace. It only appeared without a key, because that is the only path that ever
 reaches _get_pool(). The lock is an RLock now AND the page count is read before
 the lock is taken, so either fix alone would have held.
 
+THE BOOT PATH, SECOND PASS  (v13.86)
+------------------------------------
+Clearing the deadlock was not enough, because the boot path had three faults of
+its own:
+
+  1. start() did `with _lock:` and then waited up to 90s on the launch, and every
+     worker's _http_search takes _lock to record the URL - so one worker's launch
+     stalled the other three for its whole duration. The wait is outside the lock:
+     the thread is spawned under it, the event is waited on after it.
+  2. A failed boot left _pool non-None with a DEAD thread, so start() returned at
+     once on every later call and re-raised the stale error for the life of the
+     process. start() respawns when the thread is dead, clears the old error
+     first, and keeps the message in _pool_boot_err so the page can print the
+     real reason.
+  3. available() answered True whenever _pool was non-None - including during a
+     boot-failure cooldown - so check() took the browser branch and paid a
+     certain failure instead of the honest "no browser" branch. It is False for
+     the cooldown now, and browser_note() names the launch failure rather than
+     saying "not installed".
+
+A FOURTH FAULT: THE REASON WAS THROWN AWAY
+------------------------------------------
+check() wrote `rec["error"] = "browser failed: ..."` inside its except and then
+overwrote it three lines later with `rec["error"] = addr_rec.get("error", "")`,
+which still held the plain "challenge (http 403)". The page therefore never said
+why the browser had failed - it said the site had challenged, which is the one
+thing already known. The failure is folded into addr_rec's error now, so it
+survives to the record.
+
+The per-address budget is 90s, not 45. One navigation (20s) + interstitial (25s)
++ render (8s) + scrape does not fit in 45, and a cut call is indistinguishable
+from a broken site.
+
 WHY AN OPTIONAL KEY STILL EXISTS
 --------------------------------
 If HIBP_API_KEY is set, /api/v3/breachedaccount is tried first because it is
@@ -77,7 +110,7 @@ thing you act on. Nothing here scores on PwnCount.
     NEW       password unseen in Pwned Passwords, or address in a corpus < 365d
     PARTIAL   password seen 1-9999 times, or address in a breach < 730d
     OLD       password seen 10000+ times, or address only in breaches > 730d
-    CLEAN     password unseen AND address not in any source
+    CLEAN     password unseen AND address in no source
     UNKNOWN   nothing readable - the only honest answer when every tier failed
 
 A combo is only as good as its worse half, so the worse of the two halves wins.
@@ -239,6 +272,7 @@ UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
 HTTP_TIMEOUT = 8.0
 NAV_TIMEOUT = 20000
 CHALLENGE_WAIT = 25.0
+BOOT_WAIT = 90.0
 BOOT_RETRY_AFTER = 60.0
 PAGES_DEFAULT = 2
 PAGES_MAX = 8
@@ -289,7 +323,10 @@ TRACE_NAME = "breach_trace.jsonl"
 TRACE_FILE_MAX = 4000
 TRACE_DUMP_MAX = 500
 
-_cfg = {"pages": PAGES_DEFAULT, "timeout": 45.0, "delay": DELAY_DEFAULT,
+# 90s, not 45: a navigation (20s) plus an interstitial (25s) plus a render (8s)
+# plus the scrape does not fit in 45, and a cut call is indistinguishable from a
+# broken site.
+_cfg = {"pages": PAGES_DEFAULT, "timeout": 90.0, "delay": DELAY_DEFAULT,
         "http_only": False, "page_mode": PAGE_MODE_FAST,
         "page_on": tuple(PAGE_ON_DEFAULT)}
 # RLock, NOT Lock. _get_pool() builds the pool while holding this and the builder
@@ -299,6 +336,7 @@ _cfg = {"pages": PAGES_DEFAULT, "timeout": 45.0, "delay": DELAY_DEFAULT,
 _lock = threading.RLock()
 _pool = None
 _pool_boot_failed = 0.0
+_pool_boot_err = ""
 _pw_missing = ""
 _last = {"ts": 0.0, "email": "", "verdict": "", "via": "", "ms": 0, "error": "",
          "url": ""}
@@ -349,7 +387,7 @@ def configure(pages=None, timeout=None, delay=None, http_only=None,
                 pass
         if timeout is not None:
             try:
-                _cfg["timeout"] = max(10.0, float(timeout))
+                _cfg["timeout"] = max(30.0, float(timeout))
             except Exception:
                 pass
         if delay is not None:
@@ -651,9 +689,14 @@ def available() -> bool:
 
     Cached on the import side. The binary check is a listdir, so it is cached too
     once it succeeds - a pool that is already up cannot lose its browser.
+
+    A pool whose last boot FAILED is not available: the cooldown would otherwise
+    be invisible and every address would pay a 90s launch attempt that is certain
+    to raise. False here sends check() down the "no browser" branch, which is the
+    truthful answer and costs nothing.
     """
     global _pw_missing
-    if _pool is not None:
+    if _pool is not None and not _pool_boot_failed:
         return True
     if not _installed():
         return False
@@ -669,6 +712,10 @@ def available() -> bool:
 
 def browser_note() -> str:
     """Why the browser tier is unavailable, in words the page can print."""
+    if _pool_boot_failed:
+        return ("chromium launch failed %ds ago (%s) - not retried yet"
+                % (int(time.time() - _pool_boot_failed),
+                   _pool_boot_err or "see trace"))
     if _installed() and _pw_missing:
         return _pw_missing
     st = browser_state()
@@ -1337,17 +1384,36 @@ class _BrowserPool:
         self._closed = False
 
     def start(self):
+        """Spawn the driver thread and wait for the boot. Raises on boot failure.
+
+        THE WAIT IS OUTSIDE _lock. Every worker's _http_search takes _lock to
+        record the URL, so a wait held under it stalls the other workers for the
+        whole launch - a slower version of the deadlock it replaced.
+
+        A DEAD THREAD IS RESPAWNED. Previously _pool stayed non-None after a
+        failed boot, so this method returned at once on every later call and
+        re-raised the stale error for the life of the process: one bad launch
+        took the address tier out until a redeploy. The error is cleared before
+        the new thread starts, and kept in _pool_boot_err for the page.
+        """
+        global _pool_boot_err
         with _lock:
-            if self._thread is not None:
-                return
-            self._thread = threading.Thread(target=self._run, name="breach-browser",
-                                            daemon=True)
-            self._thread.start()
-        self._started.wait(90)
+            alive = self._thread is not None and self._thread.is_alive()
+            if not alive:
+                self._boot_err = ""
+                self._closed = False
+                self._started.clear()
+                self._thread = threading.Thread(target=self._run,
+                                                name="breach-browser", daemon=True)
+                self._thread.start()
+            started = self._started
+        started.wait(BOOT_WAIT)
         if self._boot_err:
+            _pool_boot_err = self._boot_err
             raise RuntimeError(self._boot_err)
 
     def _run(self):
+        global _pool_boot_err
         pw = browser = context = None
         try:
             from playwright.sync_api import sync_playwright
@@ -1366,10 +1432,12 @@ class _BrowserPool:
             trace("INFO", "browser", "launched, context armed")
         except Exception as exc:
             self._boot_err = "%s: %s" % (type(exc).__name__, exc)
+            _pool_boot_err = self._boot_err
             trace("ERR", "browser", "launch failed: %s" % self._boot_err)
             self._started.set()
             return
 
+        _pool_boot_err = ""
         self._started.set()
         while not self._closed:
             try:
@@ -1659,6 +1727,9 @@ def _get_pool():
     reading it inside the with-block on a non-reentrant lock would block for ever
     - which is exactly what froze every keyless run. _lock is an RLock as well,
     so either half of the fix holds on its own.
+
+    The lock is RELEASED before start(), because start() waits for a chromium
+    launch and the workers take _lock too.
     """
     global _pool, _pool_boot_failed
     size = _pages()
@@ -1666,9 +1737,10 @@ def _get_pool():
         if _pool is None:
             _pool = _BrowserPool(size)
         pool = _pool
-    if _pool_boot_failed and (time.time() - _pool_boot_failed) < BOOT_RETRY_AFTER:
+    failed_ago = (time.time() - _pool_boot_failed) if _pool_boot_failed else 0.0
+    if failed_ago and failed_ago < BOOT_RETRY_AFTER:
         raise RuntimeError("browser boot failed %ds ago - not retried yet"
-                           % int(time.time() - _pool_boot_failed))
+                           % int(failed_ago))
     try:
         pool.start()
     except Exception:
@@ -1782,8 +1854,14 @@ def check(addr, password="", force=False, allow_browser=None) -> dict:
                 trace("INFO", "browser", "handing off to the browser tier (UI)", addr)
                 addr_rec = pool.submit(addr, password).result(timeout=_cfg["timeout"])
             except Exception as exc:
-                rec["error"] = "browser failed: %s: %s" % (type(exc).__name__, exc)
-                trace("ERR", "browser", rec["error"], addr)
+                # FOLDED INTO addr_rec, not into rec. rec["error"] is overwritten
+                # from addr_rec a few lines below, so writing it here used to throw
+                # the reason away and leave only the bare "challenge (http NNN)" -
+                # the page never said why the browser had failed.
+                addr_rec["error"] += (" | browser failed: %s: %s"
+                                      % (type(exc).__name__, exc))
+                trace("ERR", "browser", "browser failed: %s: %s"
+                      % (type(exc).__name__, exc), addr)
         elif not allow_browser:
             # A CHOICE, not a fault - and it must not read like one, so the
             # marker is distinct from the missing-binary text below.
@@ -2151,6 +2229,19 @@ def selftest(verbose=False) -> bool:
     add("http_only_off", _http_only() is False)
     configure(http_only=None)
     add("http_only_untouched", _http_only() is False)
+
+    # ---- the boot path, second pass ----
+    add("boot_waits_outside_lock", "started.wait" in inspect.getsource(_BrowserPool.start))
+    add("boot_respawns_dead_thread", "is_alive" in inspect.getsource(_BrowserPool.start))
+    add("boot_clears_error", "_boot_err = \"\"" in inspect.getsource(_BrowserPool.start))
+    add("boot_releases_before_start",
+        inspect.getsource(_get_pool).index("with _lock") <
+        inspect.getsource(_get_pool).index("pool.start"))
+    add("boot_error_kept", "_pool_boot_err" in inspect.getsource(_BrowserPool.start))
+    add("note_reports_boot", "_pool_boot_err" in inspect.getsource(browser_note))
+    add("available_checks_boot", "_pool_boot_failed" in inspect.getsource(available))
+    add("check_keeps_reason", "addr_rec[\"error\"] +=" in inspect.getsource(check))
+    add("timeout_default_roomy", _cfg["timeout"] >= 90.0)
 
     before = trace_seq()
     trace("INFO", "selftest", "hello")
