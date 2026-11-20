@@ -1009,13 +1009,29 @@ with tab_sort:
 
     if mailsort is None:
         st.info("The sorter needs mailsort.py next to this page.")
-    elif not sel:
-        st.info("Nothing to sort yet - pick a source above.")
     else:
         st.caption("Sorts what is ALREADY selected above into named groups. It writes "
                    "nothing on its own: every group has its own button, and the whole "
                    "set has one archive. Grouping by 'None' simply sorts one flat file "
                    "by email, which is the useful thing when you only want order.")
+
+        # ---- paste a quick list, independent of the sources above ----------
+        with st.expander("Paste addresses to sort alongside the selection",
+                         expanded=False):
+            st.caption("One per line. `email`, `email:pass` and `email | pass | TAG` "
+                       "all work. These rows are sorted with whatever is selected "
+                       "above and are never written anywhere.")
+            _paste_txt = st.text_area("Pasted addresses", height=160,
+                                      key="ex_sort_paste",
+                                      placeholder="someone@example.com:password")
+        _pasted = mailsort.paste_rows(_paste_txt)
+        if _pasted:
+            st.caption("**%d** pasted row(s) added to this sort." % len(_pasted))
+        _sort_rows = list(sel) + _pasted
+
+        if not _sort_rows:
+            st.info("Nothing to sort yet - pick a source above, or paste a list here.")
+            st.stop()
 
         for _k, _v in (("ex_sort_by", mailsort.KEY_LABELS[0]),
                        ("ex_sort_order", mailsort.ORDERS[0]),
@@ -1038,12 +1054,14 @@ with tab_sort:
         # Signature: the row set is identified by its size and its two ends, which
         # is cheap and stable. fname is deliberately NOT in it - it carries a
         # seconds-resolution stamp and would invalidate the cache every second.
-        _sort_sig = (len(sel), _by, _order, int(_cap), bool(_dedupe),
-                     sel[0]["email"] if sel else "", sel[-1]["email"] if sel else "")
+        _sort_sig = (len(_sort_rows), len(_pasted), _by, _order, int(_cap),
+                     bool(_dedupe),
+                     _sort_rows[0]["email"] if _sort_rows else "",
+                     _sort_rows[-1]["email"] if _sort_rows else "")
         if st.session_state.get("_ex_sort_sig") != _sort_sig:
             st.session_state["_ex_sort_sig"] = _sort_sig
             st.session_state["_ex_sort_groups"] = mailsort.group_rows(
-                sel, _by, order=_order, dedupe=_dedupe, cap=int(_cap))
+                _sort_rows, _by, order=_order, dedupe=_dedupe, cap=int(_cap))
             st.session_state.pop("_ex_sort_zip", None)
 
         _groups, _dropped = st.session_state.get("_ex_sort_groups") or ([], 0)
@@ -1058,7 +1076,8 @@ with tab_sort:
                        f"Raise it to take them.")
 
         if not _groups:
-            st.info("Nothing grouped - the selection is empty.")
+            st.info("Nothing grouped - the selection and the paste box are both "
+                    "empty.")
         else:
             st.caption("Group sizes, in the order they would be written:")
             st.dataframe(
