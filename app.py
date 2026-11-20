@@ -12400,6 +12400,11 @@ _kw_live = str_lit.empty()
 
 KW_TRACE_MAX = 400
 KW_COUNT_MAX = 60
+# v13.86 FIX KW-3: the detail list had NO writer and NO cap. It is written by
+# run_keyword_scan() below now, and bounded, because each entry carries a slice of
+# a message body and an unbounded run would hold megabytes in the session.
+KW_DETAIL_MAX = 300
+KW_DETAIL_BODY = 2000
 
 
 def _kw_trace(level, step, detail=""):
@@ -12445,6 +12450,13 @@ def run_keyword_scan(combo):
     looked identical on the page. The hit count per keyword is recorded too, so
     the panel can say how many mails a word actually produced instead of only
     that one did.
+
+    v13.86 FIX KW-3: THE FULL HIT DICTS ARE KEPT NOW. Only hit_line() strings were
+    stored, and kw_hits_detail - the list that carries From, To and the body
+    snippet - was reset at run start and written by nothing, so the panel could
+    only ever draw a bare line with those three columns blank. The dicts are
+    appended here, body cut to KW_DETAIL_BODY and the list capped, because the
+    snippet is cut from the body and the body is the expensive part.
     """
     if not keyword_hits_wanted():
         return 0
@@ -12521,11 +12533,18 @@ def run_keyword_scan(combo):
         pass
     with session_state_lock:
         _cur = list(str_lit.session_state.get("kw_hits_results") or [])
+        _det = list(str_lit.session_state.get("kw_hits_detail") or [])
         for _h in _hits:
             _ln = mailsearch.hit_line(_h)
             if _ln not in _cur:
                 _cur.append(_ln)
+            # FIX KW-3: the dict the line was cut from, body truncated. The panel
+            # needs From / To / body to draw a full row; the line alone cannot.
+            _d = dict(_h)
+            _d["body"] = str(_d.get("body") or "")[:KW_DETAIL_BODY]
+            _det.append(_d)
         str_lit.session_state["kw_hits_results"] = _cur
+        str_lit.session_state["kw_hits_detail"] = _det[-KW_DETAIL_MAX:]
     _kw_trace("INFO", "hit", "%d hit(s) for %s in %s"
               % (len(_hits), _e, ",".join(_folders)))
     log_probe_event(f"keyword scan: {len(_hits)} hit(s) for {_e} in {_folders}")
@@ -15768,6 +15787,13 @@ if start_engine_btn:
             with report_metrics_placeholder.container():
                 _metric_phs = [c.empty() for c in metric_grid(_metric_labels, per_row=3)]
 
+            # v13.86 FIX RUNBOX-1: _run_pool_box IS NEVER ASSIGNED ANYWHERE ELSE.
+            # It is read in block 105 (`_box = _run_pool_box`) and extended here,
+            # so the extend raised NameError before the executor was even built -
+            # the run died on the first submit. It is a plain list, seeded above
+            # the extend, and check_task's `_box or active_proxy_pool` fallback
+            # stays as the second line of defence.
+            _run_pool_box = []
             _run_pool_box.extend(active_proxy_pool)
             executor = ThreadPoolExecutor(max_workers=current_workers)
             try:
