@@ -8,7 +8,7 @@ never has to know how to log in, how to proxy, or how to pick a host.
 
 WHAT IT DOES, and in this order, because it is the cheapest order:
 
-  1. SELECT the folder READ-ONLY, so no \Seen flag is touched anywhere.
+  1. SELECT the folder READ-ONLY, so no \\Seen flag is touched anywhere.
   2. SEARCH ALL and take the newest `scan_limit` ids. The window is bounded on
      purpose: a 40,000-message folder cannot be swept per keystroke.
   3. FETCH HEADERS ONLY in chunks and match the keywords against Subject + From.
@@ -57,7 +57,7 @@ def _s(x):
 
 
 def _unquote_folder(line):
-    """`(\HasNoChildren) "/" "Sent Items"` -> `Sent Items`. Never raises."""
+    """`(\\HasNoChildren) "/" "Sent Items"` -> `Sent Items`. Never raises."""
     m = re.search(r'"([^"]*)"\s*$', line or "")
     if m:
         return m.group(1)
