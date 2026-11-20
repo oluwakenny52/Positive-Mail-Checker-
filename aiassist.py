@@ -91,21 +91,24 @@ logged; the page simply stopped.  report() is reached from app.py block 105
 (the sidebar counter), block 030 (the diagnostic bundle), pages/9 block 007 and
 pages/10 block 013, so the whole app froze on its first load with a key present.
 
-A CHAT TURN RETRIES, AND THE LATCH HEALS  (v13.86)
---------------------------------------------------
-Two separate reasons the console felt dead, both of which read on the page as
-"no answer":
+A DEAD MODEL ID FAILS OVER, AND THE LATCH HEALS  (v13.86)
+---------------------------------------------------------
+Three separate reasons the console looked dead, and the page had no way to tell
+them apart:
 
   1. chat_stream had NO retry. classify had three attempts and chat had one, so
      a single dropped connection on a phone network ended the turn and counted
-     against the latch. It now retries CHAT_ATTEMPTS times, but ONLY while
-     nothing has been shown yet - a retry after half a reply is printed would
-     duplicate it.
-  2. The latch was permanent. Four failures and _tripped stayed True until
+     against the latch. It now retries while nothing has been yielded yet - a
+     retry after half a reply is printed would duplicate it.
+  2. The latch was permanent. Five failures and _tripped stayed True until
      somebody pressed Reset, so a brief outage took the console out for the rest
      of the session. A trip now expires after RECOVER_AFTER seconds and the next
-     call gets one attempt; if that fails, it latches again for another interval.
-     A hard trip is still available - reset_run().
+     call gets one attempt; a failure re-latches for another interval.
+  3. A 404 means THE MODEL ID IS GONE, and retrying it cannot help. 404 and 503
+     now advance along MODEL_CHAIN to a different model instead of repeating the
+     same id, and a 404 no longer counts against the latch at all - it is a
+     configuration fact, not a transient fault. That was the "http 404 (final)"
+     followed by a latched console.
 """
 
 from __future__ import annotations
@@ -159,9 +162,15 @@ POST_ATTEMPTS = 3
 CHAT_ATTEMPTS = 2
 CHAT_MAX_TOKENS = 1400
 
-# How long a trip lasts before one probe attempt is allowed through. Long enough
-# that a burst of failures does not turn into a retry storm, short enough that a
-# two-minute outage does not need a manual Reset.
+# Model failover. A 404 means the id is retired and a 503 means that one model is
+# overloaded, so neither is worth repeating - the next entry is tried instead.
+MODEL_CHAIN = ("gemini-flash-latest", "gemini-2.5-flash", "gemini-2.5-pro",
+               "gemini-2.0-flash")
+MODEL_TRIES = 3
+
+# How long a trip lasts before one attempt is allowed through. Long enough that a
+# burst of failures does not become a retry storm, short enough that a two-minute
+# outage does not need a manual Reset.
 RECOVER_AFTER = 90.0
 
 CHAT_SYSTEM = (
@@ -351,6 +360,32 @@ def _maybe_recover() -> bool:
     return True
 
 
+def _trip(stop_after) -> None:
+    """Count a failure and close the latch when the budget is reached."""
+    global _consec_fails, _tripped, _tripped_at
+    with _lock:
+        _consec_fails += 1
+        if stop_after and _consec_fails >= stop_after:
+            _tripped = True
+            _tripped_at = time.time()
+
+
+def _candidates(model) -> list:
+    """Models to try, starting with this one. 404/503 advance along MODEL_CHAIN.
+
+    Capped at MODEL_TRIES so a totally broken account cannot walk the whole chain
+    for every single call.
+    """
+    first = str(model or "").strip()
+    out = []
+    if first:
+        out.append(first)
+    for m in MODEL_CHAIN:
+        if m not in out:
+            out.append(m)
+    return out[:max(1, int(MODEL_TRIES))]
+
+
 # ---------------------------------------------------------------------------
 # per-user day budget
 # ---------------------------------------------------------------------------
@@ -451,16 +486,6 @@ def _budget_free() -> bool:
     if limit <= 0:
         return True
     return _day_count(_path()) < limit
-
-
-def _trip(stop_after) -> None:
-    """Count a failure and close the latch when the budget is reached."""
-    global _consec_fails, _tripped, _tripped_at
-    with _lock:
-        _consec_fails += 1
-        if stop_after and _consec_fails >= stop_after:
-            _tripped = True
-            _tripped_at = time.time()
 
 
 # ---------------------------------------------------------------------------
@@ -637,12 +662,9 @@ def _retry_after(exc) -> float:
 def _post(url, payload, key, timeout=None, attempts=None) -> tuple:
     """(http_code, body_text, latency_ms).  code 0 = transport failure.
 
-    v13.86 FIX AI-TIMEOUT: ONE SHOT AT 8 SECONDS WAS NOT ENOUGH. A healthy call
-    on a slow network was cut and reported as a transport failure, which reads
-    as a bad key. The budget is TIMEOUT (double it for a probe), and a 0, 408,
-    429 or 5xx gets two more tries with backoff, honouring Retry-After when the
-    server sends one. A plain 4xx is NOT retried - the key or the model id is
-    wrong and a second call cannot fix either.
+    The budget is TIMEOUT (double it for a probe), and a 0, 408, 429 or 5xx gets
+    two more tries with backoff, honouring Retry-After when the server sends one.
+    A plain 4xx is NOT retried here - the caller's model failover deals with 404.
     """
     budget = float(timeout or TIMEOUT)
     tries = max(1, int(attempts or POST_ATTEMPTS))
@@ -702,7 +724,13 @@ def _parse(payload):
 
 
 def _one_call(body, key_cache=None):
-    """One live call for one scrubbed text.  Token or None.  Never raises."""
+    """One live call for one scrubbed text.  Token or None.  Never raises.
+
+    404 and 503 advance to the next model: a retired id and an overloaded model
+    are both worth stepping past rather than repeating. A 404 does not count
+    against the latch, because a wrong id is a configuration fact and no amount
+    of waiting fixes it.
+    """
     global _calls_run, _resolved_model
     with _lock:
         model = _cfg["model"]
@@ -717,7 +745,17 @@ def _one_call(body, key_cache=None):
         "generationConfig": {"temperature": 0.0, "maxOutputTokens": 8,
                              "candidateCount": 1},
     }
-    code, text, ms = _post(ENDPOINT % model, payload, api_key)
+    code, text, ms = 0, "", 0
+    for cand in _candidates(model):
+        code, text, ms = _post(ENDPOINT % cand, payload, api_key)
+        if code and code < 400:
+            with _lock:
+                _cfg["model"] = cand if _cfg["model"] == model else _cfg["model"]
+            break
+        if code in (404, 503):
+            trace("WARN", "model", "%s -> http %d, next model" % (cand, code))
+            continue
+        break
     _day_bump(_path())
 
     with _lock:
@@ -726,7 +764,8 @@ def _one_call(body, key_cache=None):
                       "token": "", "latency_ms": ms, "error": ""})
 
     if code == 0 or code >= 400:
-        _trip(stop_after)
+        if code != 404:
+            _trip(stop_after)
         with _lock:
             _last["error"] = (text or "")[:180]
         return None
@@ -792,16 +831,14 @@ def chat_stream(messages, context="", model=None):
     chat turn is a real call and the key is the same key.  The outcome lands in
     _last so a page can say why an empty answer came back instead of guessing.
 
-    v13.86: A DROPPED CONNECTION IS RETRIED. It had one attempt where classify
-    had three, so one transport hiccup on a phone network ended the turn and
-    counted against the latch - which is what "sometimes it answers, sometimes it
-    doesn't" actually was. The retry only happens while NOTHING has been yielded
-    yet, because re-running after half a reply would print it twice.
+    A DROPPED CONNECTION IS RETRIED, and a dead model id is stepped past. The
+    retry only happens while NOTHING has been yielded yet - re-running after half
+    a reply would print it twice.
     """
     global _calls_run, _tripped, _tripped_at
     payload = _chat_payload(messages, context, model)
     with _lock:
-        model_id = str(model or _cfg["model"] or DEFAULT_MODEL)
+        start_model = str(model or _cfg["model"] or DEFAULT_MODEL)
         api_key = _cfg["key"]
         stop_after = int(_cfg["stop_after_fails"])
     if not api_key:
@@ -819,77 +856,89 @@ def chat_stream(messages, context="", model=None):
     started = time.time()
     data = json.dumps(payload).encode("utf-8")
     code, got_any = 0, False
-    tries = max(1, int(CHAT_ATTEMPTS))
-    for attempt in range(1, tries + 1):
-        trace("INFO", "chat", "attempt %d/%d, model %s, %d turn(s), budget %ss"
-              % (attempt, tries, model_id, len(payload.get("contents") or []),
-                 int(CHAT_TIMEOUT)))
-        req = urllib.request.Request(
-            (ENDPOINT % model_id) + "?alt=sse", data=data, method="POST",
-            headers={"Content-Type": "application/json",
-                     "x-goog-api-key": api_key,
-                     "Accept": "text/event-stream",
-                     "User-Agent": "PositiveMailChecker/" + AI_VERSION})
-        wait = 0.0
-        try:
-            with urllib.request.urlopen(req, timeout=CHAT_TIMEOUT) as resp:
-                code = resp.status
-                for raw in resp:
-                    line = raw.decode("utf-8", "replace").strip()
-                    if not line or line.startswith(":"):
-                        continue
-                    if line.startswith("data:"):
-                        line = line[5:].strip()
-                    if not line or line == "[DONE]":
-                        continue
-                    try:
-                        obj = json.loads(line)
-                    except Exception:
-                        continue
-                    piece = _extract(obj)
-                    if piece:
-                        got_any = True
-                        yield piece
-            break
-        except urllib.error.HTTPError as exc:
+    final_code, final_err = 0, ""
+    cands = _candidates(start_model)
+    for cand in cands:
+        for attempt in range(1, max(1, int(CHAT_ATTEMPTS)) + 1):
+            trace("INFO", "chat", "attempt %d, model %s, %d turn(s), budget %ss"
+                  % (attempt, cand, len(payload.get("contents") or []),
+                     int(CHAT_TIMEOUT)))
+            req = urllib.request.Request(
+                (ENDPOINT % cand) + "?alt=sse", data=data, method="POST",
+                headers={"Content-Type": "application/json",
+                         "x-goog-api-key": api_key,
+                         "Accept": "text/event-stream",
+                         "User-Agent": "PositiveMailChecker/" + AI_VERSION})
+            wait = 0.0
             try:
-                body = exc.read().decode("utf-8", "replace")
-            except Exception:
-                body = ""
-            code = exc.code
-            wait = _retry_after(exc)
-            retryable = exc.code in (408, 429) or exc.code >= 500
-            trace("WARN", "chat", "attempt %d -> http %d%s"
-                  % (attempt, code, "" if retryable else " (final)"))
-            if got_any or not retryable or attempt >= tries:
-                _trip(stop_after)
-                with _lock:
-                    _last.update({"ts": time.time(), "status": str(code),
-                                  "error": body[:400], "token": "",
-                                  "latency_ms": int((time.time() - started) * 1000)})
-                _day_bump(_path())
-                return
-            time.sleep(min(10.0, wait or (2.0 * attempt)))
-        except Exception as exc:
-            trace("WARN", "chat", "attempt %d raised %s: %s"
-                  % (attempt, type(exc).__name__, exc))
-            if got_any or attempt >= tries:
-                _trip(stop_after)
-                with _lock:
-                    _last.update({"ts": time.time(), "status": "0",
-                                  "error": "%s: %s" % (type(exc).__name__, exc),
-                                  "token": "",
-                                  "latency_ms": int((time.time() - started) * 1000)})
-                _day_bump(_path())
-                return
-            time.sleep(min(10.0, 2.0 * attempt))
+                with urllib.request.urlopen(req, timeout=CHAT_TIMEOUT) as resp:
+                    code = resp.status
+                    for raw in resp:
+                        line = raw.decode("utf-8", "replace").strip()
+                        if not line or line.startswith(":"):
+                            continue
+                        if line.startswith("data:"):
+                            line = line[5:].strip()
+                        if not line or line == "[DONE]":
+                            continue
+                        try:
+                            obj = json.loads(line)
+                        except Exception:
+                            continue
+                        piece = _extract(obj)
+                        if piece:
+                            got_any = True
+                            yield piece
+                final_code, final_err = code, "" if got_any else "empty stream"
+                if got_any:
+                    break
+                break
+            except urllib.error.HTTPError as exc:
+                try:
+                    body = exc.read().decode("utf-8", "replace")
+                except Exception:
+                    body = ""
+                code = exc.code
+                wait = _retry_after(exc)
+                final_code, final_err = code, body[:400]
+                trace("WARN", "chat", "model %s attempt %d -> http %d"
+                      % (cand, attempt, code))
+                if got_any:
+                    break
+                if code == 404:
+                    break          # retired id - next model, do not retry it
+                if code in (408, 429) or code >= 500:
+                    if attempt < CHAT_ATTEMPTS:
+                        time.sleep(min(10.0, wait or (2.0 * attempt)))
+                        continue
+                    break
+                break
+            except Exception as exc:
+                code = 0
+                final_code = 0
+                final_err = "%s: %s" % (type(exc).__name__, exc)
+                trace("WARN", "chat", "model %s attempt %d raised %s: %s"
+                      % (cand, attempt, type(exc).__name__, exc))
+                if got_any:
+                    break
+                if attempt < CHAT_ATTEMPTS:
+                    time.sleep(min(10.0, 2.0 * attempt))
+                    continue
+                break
+        if got_any:
+            break
 
     with _lock:
         _calls_run += 1
-        _consec_fails = 0
-        _last.update({"ts": time.time(), "status": str(code), "token": "",
-                      "latency_ms": int((time.time() - started) * 1000),
-                      "error": "" if got_any else "empty stream"})
+        _last.update({"ts": time.time(), "status": str(final_code),
+                      "token": "", "error": final_err,
+                      "latency_ms": int((time.time() - started) * 1000)})
+    if final_code == 0 or final_code >= 400:
+        if final_code != 404:
+            _trip(stop_after)
+    else:
+        with _lock:
+            _consec_fails = 0
     _day_bump(_path())
 
 
@@ -904,18 +953,12 @@ def chat(messages, context="", model=None) -> str:
 def report() -> dict:
     """Counters for the diag bundle and the sidebar.  Never raises.
 
-    v13.86 FIX AI-DEADLOCK: THE WHOLE APP FROZE HERE. _lock was a plain Lock and
-    `_day_count()` re-acquires it, so the first call nested the same lock twice
-    and blocked for ever - on the script thread, reached from app.py block 105,
-    block 030's bundle, pages/9 and pages/10. Nothing raised and nothing logged.
-    The lock is an RLock now, and the day count - which also does a FILE READ -
-    is taken BEFORE the lock is held, so the critical section is a dict build and
-    no other thread waits on the disk.
+    _lock is an RLock because _day_count() takes it too, and the day count -
+    which also does a FILE READ - is taken BEFORE the lock is held, so the
+    critical section is a dict build and no other thread waits on the disk.
 
-    "stop_after_fails" is reported too: pages/9 seeded its widget from a
-    hardcoded 4 because this dict had no such key, so a configured 2 was lost on
-    every reload. "recovers_in" says how many seconds the latch has left before
-    it re-opens by itself, so a latched console is never a mystery.
+    "recovers_in" says how many seconds the latch has left before it re-opens by
+    itself, so a latched console is never a mystery.
     """
     try:
         path = _path()
@@ -930,6 +973,7 @@ def report() -> dict:
                 "key_present": bool(_cfg["key"]),
                 "key_tail": ("..." + _cfg["key"][-4:]) if _cfg["key"] else "",
                 "model": _cfg["model"],
+                "chain": list(MODEL_CHAIN),
                 "resolved_model": _resolved_model or "(not resolved yet)",
                 "calls_run": _calls_run,
                 "calls_day": _day,
@@ -1012,7 +1056,6 @@ def selftest(verbose=False) -> bool:
     add("model_set", report()["model"] == "m1")
     add("key_tail", report()["key_tail"] == "...-key")
     add("path_is_str", isinstance(_path(), str))
-    # v13.86: report() must survive its own lock and must carry the fail budget.
     add("report_no_deadlock", isinstance(report().get("calls_run"), int))
     add("report_fails", report().get("stop_after_fails") == 2)
     add("report_recovers_in", isinstance(report().get("recovers_in"), int))
@@ -1022,7 +1065,16 @@ def selftest(verbose=False) -> bool:
     add("recover_after_set", RECOVER_AFTER > 0)
     add("post_takes_timeout", "timeout" in __import__("inspect").signature(
         _post).parameters)
-    add("trace_ring", "hello" in trace_text(limit=1) or True)
+
+    # ---- model failover ----
+    add("chain_has_default", DEFAULT_MODEL in MODEL_CHAIN)
+    add("cand_starts_with_asked", _candidates("gemini-2.5-pro")[0] == "gemini-2.5-pro")
+    add("cand_dedupes", len(_candidates("gemini-flash-latest")) ==
+        len(set(_candidates("gemini-flash-latest"))))
+    add("cand_capped", len(_candidates("x-model")) <= MODEL_TRIES)
+    add("cand_includes_chain", "gemini-2.5-flash" in _candidates("x-model"))
+    add("report_chain", isinstance(report().get("chain"), list))
+
     _t0 = trace_seq()
     trace("INFO", "selftest", "ring")
     add("trace_records", len(trace_read(limit=5, since=_t0)) == 1)
@@ -1076,8 +1128,6 @@ def selftest(verbose=False) -> bool:
         reset_run()
         add("budget_reset", _budget_free() is True)
 
-        # 0 is UNLIMITED.  The old fixed 5 was read against a real day file that
-        # a busy day could already have spent; the temp file below cannot.
         configure(max_per_day=0)
         add("day_zero_unlimited", _budget_free() is True)
         configure(max_per_day=5)
@@ -1088,7 +1138,7 @@ def selftest(verbose=False) -> bool:
         add("day_unlimited_again", _budget_free() is True)
         add("day_file_written", os.path.exists(_dayfile))
 
-        # v13.86: a closed latch must expire, not wait for a human press.
+        # a closed latch must expire, not wait for a human press
         with _lock:
             _consec_fails = 9
             _tripped = True
@@ -1103,9 +1153,6 @@ def selftest(verbose=False) -> bool:
         add("report_shape", isinstance(report().get("enabled"), bool))
         add("report_day_int", isinstance(report().get("calls_day"), int))
 
-        # One real drain against the fake key.  Offline it is a transport error,
-        # online a 401 - either way it must return a dict and not raise, and the
-        # bump lands in the temp file rather than the user's allowance.
         _drained = drain(limit=1)
         add("drain_returns_dict", isinstance(_drained, dict))
         add("drain_counted", _drained.get("tried") == 1)
@@ -1139,7 +1186,7 @@ def selftest(verbose=False) -> bool:
 # live probe - the ONLY tier that proves the key
 # ---------------------------------------------------------------------------
 def probe() -> dict:
-    """One live call.  Returns the diagnosis: http code, latency, token, model."""
+    """One live call, with model failover.  Returns the diagnosis."""
     configure()
     out = {"enabled": enabled(), "model": _cfg["model"], "http_code": 0,
            "latency_ms": 0, "token": "", "resolved_model": "", "verdict": "",
@@ -1149,33 +1196,40 @@ def probe() -> dict:
         return out
     body = "Socket error: 535 authentication rejected by provider"
     _since = trace_seq()
-    trace("CLICK", "probe", "live call, model %s, budget %ss x%d"
-          % (_cfg["model"], int(TIMEOUT * 2), 2))
-    code, text, ms = _post(ENDPOINT % _cfg["model"],
-                           {"contents": [{"role": "user",
-                                          "parts": [{"text": INSTRUCTION +
-                                                     "\n\n---\n" + body}]}],
-                            "generationConfig": {"temperature": 0.0,
-                                                 "maxOutputTokens": 8}},
-                           _cfg["key"], timeout=TIMEOUT * 2, attempts=2)
+    code, text, ms = 0, "", 0
+    for cand in _candidates(_cfg["model"]):
+        trace("CLICK", "probe", "live call, model %s, budget %ss x2"
+              % (cand, int(TIMEOUT * 2)))
+        code, text, ms = _post(ENDPOINT % cand,
+                               {"contents": [{"role": "user",
+                                              "parts": [{"text": INSTRUCTION +
+                                                         "\n\n---\n" + body}]}],
+                                "generationConfig": {"temperature": 0.0,
+                                                     "maxOutputTokens": 8}},
+                               _cfg["key"], timeout=TIMEOUT * 2, attempts=2)
+        if code and code < 400:
+            out["model"] = cand
+            break
+        if code in (404, 503):
+            continue
+        break
     out.update({"http_code": code, "latency_ms": ms,
                 "trace": trace_text(limit=40, since=_since)})
     if code == 0:
-        # The real exception text is in the trace now, so this verdict says the
-        # budget that was actually spent instead of a bare TRANSPORT FAIL.
         out["verdict"] = ("TRANSPORT FAIL - no HTTP answer in %d ms (budget %ss, "
-                          "2 attempts)" % (ms, int(TIMEOUT * 2)))
+                          "2 attempts, %d model(s))"
+                          % (ms, int(TIMEOUT * 2), len(_candidates(_cfg["model"]))))
         out["error"] = text[:200]
         return out
     if code >= 400:
         out["verdict"] = {400: "BAD REQUEST - model name wrong",
                           401: "UNAUTHORIZED - key not accepted",
                           403: "FORBIDDEN - key lacks access",
-                          404: "NOT FOUND - model id wrong",
+                          404: "NOT FOUND - every model id in the chain is retired",
                           429: "QUOTA - rate or day limit hit",
                           500: "PROVIDER ERROR",
-                          503: "PROVIDER UNAVAILABLE"}.get(
-                              code, "HTTP %d" % code)
+                          503: "UNAVAILABLE - every model in the chain is overloaded"
+                          }.get(code, "HTTP %d" % code)
         out["error"] = text[:200]
         return out
     try:
