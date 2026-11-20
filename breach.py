@@ -142,8 +142,27 @@ os.environ.setdefault("PLAYWRIGHT_BROWSERS_PATH", _PW_DIR)
 
 HIBP_BASE = "https://haveibeenpwned.com"
 UNIFIED = HIBP_BASE + "/unifiedsearch/%s"
+ACCOUNT = HIBP_BASE + "/account/%s"
 CATALOGUE_URL = HIBP_BASE + "/api/v3/breaches"
 PW_RANGE = "https://api.pwnedpasswords.com/range/%s"
+
+PAGE_HTML_MAX = 90000
+PAGE_TEXT_MAX = 30000
+PAGE_TIMEOUT = 20.0
+
+# WHEN a page is captured. Two modes, because a page costs a second request per
+# address and 500 addresses is twice the run.
+#   fast  capture only the outcomes named in page_on - "clean" and/or "error"
+#   full  capture every address that is checked, records or not
+#   off   capture nothing
+# page_on is a set of kinds, and "records" is always skipped in fast mode because
+# the JSON already carries those titles, dates and data classes.
+PAGE_MODE_FAST = "fast"
+PAGE_MODE_FULL = "full"
+PAGE_MODE_OFF = "off"
+PAGE_MODES = (PAGE_MODE_FAST, PAGE_MODE_FULL, PAGE_MODE_OFF)
+PAGE_KINDS = ("clean", "error")
+PAGE_ON_DEFAULT = ("clean", "error")
 
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36")
@@ -194,7 +213,8 @@ TRACE_FILE_MAX = 4000
 TRACE_DUMP_MAX = 500
 
 _cfg = {"pages": PAGES_DEFAULT, "timeout": 60.0, "delay": DELAY_DEFAULT,
-        "http_only": False}
+        "http_only": False, "page_mode": PAGE_MODE_FAST,
+        "page_on": tuple(PAGE_ON_DEFAULT)}
 _lock = threading.Lock()
 _pool = None
 _pw_missing = ""
@@ -213,16 +233,23 @@ _trace_writes = [0]
 
 _EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[A-Za-z]{2,}$")
 _MAILTO_RE = re.compile(r"^mailto:\s*", re.IGNORECASE)
+_TAG_RE = re.compile(r"<[^>]+>")
 
 
 # ---------------------------------------------------------------------------
 # config
 # ---------------------------------------------------------------------------
-def configure(pages=None, timeout=None, delay=None, http_only=None):
-    """Pool size, per-address budget, start pacing and the address tier.
+def configure(pages=None, timeout=None, delay=None, http_only=None,
+              page_mode=None, page_on=None):
+    """Pool size, per-address budget, start pacing, the tier and the page mode.
 
     http_only=True disables the browser tier outright: no launch, no install, no
     hand-off. A challenged address comes back UNKNOWN and says why. Never raises.
+
+    page_mode is fast / full / off and page_on names the fast-mode kinds
+    ("clean", "error"). An unknown mode is ignored rather than coerced, so a
+    typo leaves the previous setting alone instead of silently turning capture
+    off.
     """
     with _lock:
         if pages is not None:
@@ -242,6 +269,16 @@ def configure(pages=None, timeout=None, delay=None, http_only=None):
                 pass
         if http_only is not None:
             _cfg["http_only"] = bool(http_only)
+        if page_mode is not None:
+            _mode = str(page_mode or "").strip().lower()
+            if _mode in PAGE_MODES:
+                _cfg["page_mode"] = _mode
+        if page_on is not None:
+            try:
+                _want = [str(x).strip().lower() for x in page_on]
+                _cfg["page_on"] = tuple(k for k in PAGE_KINDS if k in _want)
+            except Exception:
+                pass
 
 
 def _pages() -> int:
@@ -257,6 +294,32 @@ def _delay() -> float:
 def _http_only() -> bool:
     with _lock:
         return bool(_cfg.get("http_only"))
+
+
+def _page_mode() -> str:
+    with _lock:
+        return str(_cfg.get("page_mode") or PAGE_MODE_FAST)
+
+
+def _page_on() -> tuple:
+    with _lock:
+        return tuple(_cfg.get("page_on") or ())
+
+
+def page_wanted(kind) -> bool:
+    """True when an outcome of this kind should be captured.
+
+    kind is "clean", "error" or "records". Full captures everything, off
+    captures nothing, and fast captures only what the page ticked. A fast run
+    with nothing ticked therefore behaves like off, which is the honest reading
+    of an empty selection.
+    """
+    mode = _page_mode()
+    if mode == PAGE_MODE_OFF:
+        return False
+    if mode == PAGE_MODE_FULL:
+        return True
+    return str(kind or "") in _page_on()
 
 
 # ---------------------------------------------------------------------------
@@ -541,6 +604,10 @@ def unified_url(addr) -> str:
     return UNIFIED % urllib.parse.quote(_email_only(addr))
 
 
+def account_url(addr) -> str:
+    return ACCOUNT % urllib.parse.quote(_email_only(addr))
+
+
 def parse_addresses(text):
     """A pasted list -> [(email, password)]. Password may be empty.
 
@@ -598,7 +665,49 @@ def _blank(addr, pw="") -> dict:
             "bucket": "", "reason": "", "breaches": [], "pastes": [],
             "pw_count": None, "corpora": 0, "sites": 0, "sensitive": 0,
             "newest_days": None, "count": None, "via": "",
+            "page_url": "", "page_html": "", "page_text": "",
+            "page_via": "", "page_error": "", "page_at": "",
             "checked_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"), "error": ""}
+
+
+def _page_skip(kind) -> dict:
+    """The empty page fields for an address whose kind was not selected."""
+    return {"page_html": "", "page_text": "", "page_via": "",
+            "page_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "page_error": "not captured - %s mode, %s not selected"
+                          % (_page_mode(), kind)}
+
+
+def _page_http(addr, kind="records") -> dict:
+    """Best-effort plain-HTTP capture of /account/<email>. Never raises.
+
+    This is the page the site actually renders for an address - breach titles,
+    dates, data classes and the "no pwnage found" copy - as opposed to the JSON
+    the search box posts. Whether it is fetched at all is page_wanted()'s
+    decision, taken from the OUTCOME (clean / error / records) rather than from
+    the address, so fast mode can capture exactly the filtered half.
+    """
+    if not page_wanted(kind):
+        return _page_skip(kind)
+    addr = _email_only(addr)
+    url = account_url(addr)
+    out = {"page_url": url, "page_html": "", "page_text": "", "page_via": "http",
+           "page_error": "",
+           "page_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
+    req = urllib.request.Request(
+        url, headers={"Accept": "text/html,application/xhtml+xml",
+                      "Accept-Language": "en-GB,en;q=0.9",
+                      "User-Agent": UA, "Referer": HIBP_BASE + "/"})
+    try:
+        with urllib.request.urlopen(req, timeout=PAGE_TIMEOUT) as resp:
+            raw = resp.read().decode("utf-8", "replace")
+            out["page_html"] = raw[:PAGE_HTML_MAX]
+            out["page_text"] = _TAG_RE.sub(" ", raw)[:PAGE_TEXT_MAX]
+    except urllib.error.HTTPError as exc:
+        out["page_error"] = "http %d" % exc.code
+    except Exception as exc:
+        out["page_error"] = "%s: %s" % (type(exc).__name__, exc)
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -810,6 +919,7 @@ def _http_search(addr, pw) -> dict:
         rec = _blank(addr, pw)
         rec["via"] = "http"
         rec["count"] = 0
+        rec.update(_page_http(addr, "clean"))
         return rec
     if _looks_like_challenge(status, body):
         trace("WARN", "http", "challenge detected (http %d) - browser tier needed"
@@ -817,17 +927,22 @@ def _http_search(addr, pw) -> dict:
         rec = _blank(addr, pw)
         rec["via"] = "http"
         rec["error"] = "challenge (http %d)" % status
+        # The challenged page is still worth keeping: it is the proof the wall
+        # exists, and it is what the viewer shows when the tier switch is on.
+        rec.update(_page_http(addr, "error"))
         return rec
     try:
         rec = _parse_payload(addr, json.loads(body or "{}"), "http", started, pw)
         trace("INFO", "http", "parsed %s breach(es), %s paste(s)"
               % (len(rec["breaches"]), len(rec["pastes"])), addr)
+        rec.update(_page_http(addr, "records" if rec.get("count") else "clean"))
         return rec
     except Exception as exc:
         trace("ERR", "http", "unparsable: %s" % exc, addr)
         rec = _blank(addr, pw)
         rec["via"] = "http"
         rec["error"] = "unparsable: %s" % exc
+        rec.update(_page_http(addr, "error"))
         return rec
 
 
@@ -922,6 +1037,10 @@ class _BrowserPool:
                         rec["via"] = "browser"
                         rec["error"] = "unparsable: %s" % exc
                         trace("ERR", "browser", "unparsable: %s" % exc, addr)
+                if not rec.get("error", "").startswith("unparsable"):
+                    _kind = "records" if rec.get("count") else (
+                        "error" if rec.get("error") else "clean")
+                    rec.update(self._grab(page, addr, _kind))
                 if not fut.done():
                     fut.set_result(rec)
             except Exception as exc:
@@ -1022,6 +1141,31 @@ class _BrowserPool:
                 self._clear(page)
         return status, body
 
+    def _grab(self, page, addr, kind="records"):
+        """Navigate to the address's own page and keep the markup. Never raises.
+
+        The clearance cookie is already on this context, so the navigation is
+        the same tier as the fetch above it - and it is the only way to capture
+        the page on an address Cloudflare challenges. The kind gate is applied
+        before the navigation, so a skipped capture costs no round trip.
+        """
+        if not page_wanted(kind):
+            return _page_skip(kind)
+        addr = _email_only(addr)
+        url = account_url(addr)
+        out = {"page_url": url, "page_html": "", "page_text": "", "page_via": "browser",
+               "page_error": "",
+               "page_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
+        try:
+            page.goto(url, wait_until="domcontentloaded",
+                      timeout=int(PAGE_TIMEOUT * 1000))
+            markup = page.content() or ""
+            out["page_html"] = markup[:PAGE_HTML_MAX]
+            out["page_text"] = _TAG_RE.sub(" ", markup)[:PAGE_TEXT_MAX]
+        except Exception as exc:
+            out["page_error"] = "%s: %s" % (type(exc).__name__, exc)
+        return out
+
     def submit(self, addr, pw):
         addr = _email_only(addr)
         fut = _cf.Future()
@@ -1112,9 +1256,11 @@ def check(addr, password="", force=False, allow_browser=None) -> dict:
         rec["reason"] = rec["error"] = "not an email address"
         trace("WARN", "address", "rejected %r - not an email" % str(raw)[:80])
         return rec
-    trace("INFO", "address", "using %r, password %s, tier %s"
+    trace("INFO", "address", "using %r, password %s, tier %s, pages %s"
           % (addr, "kept (hash only)" if password else "absent",
-             "http+browser" if allow_browser else "http-only"), addr)
+             "http+browser" if allow_browser else "http-only",
+             _page_mode() if _page_mode() != PAGE_MODE_FAST
+             else "fast(%s)" % (",".join(_page_on()) or "none")), addr)
 
     cache = _load()
     entry = (cache.get("address") or {}).get(addr)
@@ -1302,6 +1448,7 @@ def report() -> dict:
             "browser_state": browser_state().get("state", ""),
             "browser_error": browser_note(), "pages": _pages(), "delay": _delay(),
             "http_only": _http_only(), "pool": _pool is not None,
+            "page_mode": _page_mode(), "page_on": list(_page_on()),
             "last": dict(_last), "trace_seq": trace_seq()}
 
 
@@ -1333,6 +1480,26 @@ def selftest(verbose=False) -> bool:
         HIBP_BASE + "/unifiedsearch/a%40b.co")
     add("url_quotes", unified_url("a+b@c.co") == HIBP_BASE + "/unifiedsearch/a%2Bb%40c.co")
     add("blank_email_only", _blank("a@b.co:pw")["email"] == "a@b.co")
+    add("blank_has_page", "page_html" in _blank("a@b.co"))
+
+    configure(page_mode=PAGE_MODE_FAST, page_on=PAGE_KINDS)
+    add("fast_default_on", _page_mode() == PAGE_MODE_FAST)
+    add("fast_captures_clean", page_wanted("clean"))
+    add("fast_captures_error", page_wanted("error"))
+    add("fast_skips_records", not page_wanted("records"))
+    configure(page_on=("clean",))
+    add("fast_clean_only", page_wanted("clean") and not page_wanted("error"))
+    configure(page_on=())
+    add("fast_nothing", not page_wanted("clean") and not page_wanted("error"))
+    add("skip_is_note", "not captured" in _page_skip("clean")["page_error"])
+    configure(page_mode=PAGE_MODE_FULL)
+    add("full_everything", page_wanted("records") and page_wanted("clean"))
+    configure(page_mode=PAGE_MODE_OFF)
+    add("off_nothing", not page_wanted("records"))
+    configure(page_mode="nonsense")
+    add("mode_ignored", _page_mode() == PAGE_MODE_OFF)
+    configure(page_mode=PAGE_MODE_FAST, page_on=PAGE_ON_DEFAULT)
+
     add("parse_no_pw_in_addr", parse_addresses("a@b.co:pw")[0][0] == "a@b.co")
     add("parse_quoted", parse_addresses("\"a@b.co\":pw")[0][0] == "a@b.co")
 
