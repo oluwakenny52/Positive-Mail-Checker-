@@ -11973,12 +11973,63 @@ BUCKET_TAGS = {
     "kw_hits_results": "KW_HITS",
 }
 
+# ==========================================================================
+# v13.63 - THE PASTE BOX AND THE INSPECTOR CHOICE NOW SURVIVE A REFRESH
+#
+# key="bb_raw_text" / key="bb_inspect_cat" only ever made the two widgets
+# survive a RERUN. A refresh, a tab close, a reaped session or a redeploy handed
+# both back at their defaults, and a 3000-line paste is the most expensive thing
+# on this page to retype.
+#
+# Both are per-user FILES now (the unlocked prefix, exactly like every other
+# per-user file), seeded BEFORE the widget is created and rewritten from an
+# on_change callback - a callback runs BEFORE the script body, so no widget key
+# is ever touched after the widget has been instantiated.
+#
+# v13.71: THE CAP WAS 2 MB AND THE WRITE WAS UNCONDITIONAL.
+#   * 2 MB is ~65,000 lines, and MAX_ACCOUNTS at 0 no longer cuts a long list,
+#     so a 5 MB paste is now a real thing to support: 5 MB is ~160,000 lines.
+#   * _on_paste_change() rewrote the WHOLE file on every commit, even when the
+#     text was byte-identical - so clicking into the box and straight back out
+#     wrote 5 MB to disk for nothing. The signature is compared first now and an
+#     unchanged commit costs one hash.
+#
+# THE COST, stated plainly: the restored text lives in session_state as one
+# string, so a full 5 MB paste holds 5 MB of the container. That is why the cap
+# exists at all and why the resource monitor's "my session payload" is the number
+# to watch. The truncation note below names the exact cap and the exact size.
+# ==========================================================================
 _PASTE_FILE = user_file("paste_accounts.txt")
 _INSPECT_FILE = user_file("inspect_cat.txt")
 _PASTE_MAX = 5 * 1024 * 1024
 _INPUT_OWNER_KEY = "_input_owner"
 _PASTE_LIMIT_NOTE = ""
 
+# ==========================================================================
+# v13.75 FIX PASTE-1 - A PASTE FROM THE OUTSIDE IS NOT A COLON LIST
+#
+# process_accounts() split each line on ":" and took part 0 as the email, so a
+# list pasted out of a spreadsheet, a chat message, a note app or THIS APP'S OWN
+# bucket output was thrown away almost in full:
+#
+#   - a@b.com:pw          ok
+#   - a@b.com:pw          a bullet made the address "- a@b.com"
+#   1. a@b.com:pw         a numbered list made it "1. a@b.com"
+#   • a@b.com:pw          ditto, with a bullet glyph
+#   mailto:a@b.com:pw     a mailto: prefix made it "mailto:a@b.com"
+#   "a@b.com:pw"          quotes kept, so the address carried them
+#   a@b.com:pw | VALID    a re-pasted bucket line kept "pw | VALID" as the password
+#
+# The last one matters most: the app's own bucket lines are the obvious thing to
+# paste back in for a re-run, and block 105's _raw_of() already cuts them at "|"
+# on the RE-RUN path - the paste path had no equivalent, so the password carried
+# the whole verdict sentence and every account failed.
+#
+# The normaliser runs on the PREFILTER path only. The box itself keeps exactly
+# what was pasted, so nothing is silently rewritten under the user, and the
+# fingerprint is still taken from the raw text - a normalisation change cannot
+# make a cached result look stale.
+# ==========================================================================
 _BULLET_RE = re.compile(r"^[\s\u2022\u00b7\u25cf\u2043\-\*>]+")
 _NUM_RE = re.compile(r"^\d{1,4}[.)]\s+")
 _MAILTO_RE = re.compile(r"^mailto:\s*", re.IGNORECASE)
@@ -12038,6 +12089,14 @@ def _read_paste():
 
 
 def _on_paste_change():
+    """Persist the box - but only when the text actually changed.
+
+    v13.71: the callback rewrote the entire file on every commit. A 5 MB paste
+    made every click into and out of the box a 5 MB disk write for no new
+    information. The (length, hash) signature is checked first, so an unchanged
+    commit is one hash and no write at all. The upload path below already uses
+    the same key, so an upload followed by a commit cannot double-write either.
+    """
     _txt = str_lit.session_state.get("bb_raw_text", "")
     _sig = (len(_txt), hash(_txt))
     if str_lit.session_state.get("_paste_saved_sig") == _sig:
@@ -12052,7 +12111,43 @@ def _on_paste_clear():
     _write_text_file(_PASTE_FILE, "")
 
 
+# ==========================================================================
+# v13.77 FIX INSPECT-2 - THE INSPECTOR'S CALLBACK DID NOT EXIST
+#
+# Block 087 passed _on_inspect_change as on_change= on the category selectbox
+# and NO BLOCK IN app.py DEFINED IT. on_change= is evaluated when the widget is
+# created, so the panel died on that line itself - app.py:11111 in the deployed
+# traceback - with
+#
+#     NameError: name '_on_inspect_change' is not defined
+#
+# before a single item was listed. _INSPECT_FILE made it worse: it was READ at
+# every load and written by NOTHING, so the "restored" choice was always "" and
+# the panel always fell back to the first option. The persistence the v13.63
+# comment block above describes for this widget was half-built and never closed.
+#
+# WHY NO GATE CAUGHT IT: pages/5_Blocks.py counts the CALL SITE only, and
+# nothing counted the DEFINITION - and verify_v1337.py has no block-087 needle
+# at all. A green fix-check proved only that the call was still spelled that
+# way. The matching row is added to pages/5_Blocks.py with this fix.
+#
+# NOTE FOR THE NEXT EDITOR: that row is a raw substring count over app.py with
+# comments included, so the QUOTED form of the selectbox line must not be
+# repeated anywhere in a comment - it makes the row read got 2 want 1 on correct
+# code. That is exactly how this block failed its first gate run, and why the
+# quoted form is not used above.
+#
+# The function has to be defined ABOVE the selectbox - the module executes top
+# to bottom - and it must touch nothing but the file and the key it owns.
+# ==========================================================================
 def _on_inspect_change():
+    """Persist the chosen category.
+
+    A callback runs BEFORE the script body, so no widget key is touched after
+    its widget exists, and session_state already holds the NEW value here. The
+    file is compared first, so re-picking what is already stored costs one small
+    read and no write - the same shape _on_paste_change() uses.
+    """
     _val = str(str_lit.session_state.get("bb_inspect_cat") or "").strip()
     if _read_text_file(_INSPECT_FILE, 200).strip() == _val:
         return
@@ -12064,6 +12159,17 @@ def _insp_safe(label):
     return re.sub(r"[^a-z0-9]+", "_", str(label).lower()).strip("_") or "items"
 
 
+# ---- owner gate: a second unlock in this tab must not inherit the last one ----
+# v13.76 FIX ISO-8: _bb_prefilter_cache is NOT popped here before. The cached
+# data is derived from the previous owner's paste AND from the previous owner's
+# valid files, so the next unlock in the same tab rendered the last user's
+# Ready/Skip numbers. It is popped with the rest of the input state now, and the
+# fingerprint below carries the owner as well, so a stale entry can never be a
+# hit even if a future edit forgets the pop.
+#
+# v13.77: _INSPECT_FILE is resolved ABOVE this gate (the block runs after
+# auth.require() in 007), so the reseed two lines below already reads the NEW
+# owner's file. The pop and the reseed are therefore in the right order.
 _input_owner = _cache_owner()
 if str_lit.session_state.get(_INPUT_OWNER_KEY) != _input_owner:
     str_lit.session_state.pop("bb_raw_text", None)
@@ -12097,7 +12203,7 @@ with input_tab1:
         str_lit.caption(_PASTE_LIMIT_NOTE)
 with input_tab2:
     uploaded_file = str_lit.file_uploader("Upload .txt combo file", type=["txt"],
-                                          key="bb_upload")
+                                          key="bb_upload")   # FIX P1-2
     if uploaded_file is not None:
         try:
             file_bytes = uploaded_file.getvalue()
@@ -12105,11 +12211,16 @@ with input_tab2:
                 str_lit.warning("Uploaded file is empty.")
                 raw_text = ""
             else:
+                # v13.76: decode under a spinner, so picking a big file answers
+                # before the prefilter bar below takes over.
                 with str_lit.spinner(f"Reading {uploaded_file.name}..."):
                     try:
                         raw_text = file_bytes.decode("utf-8", errors="ignore")
                     except Exception:
                         raw_text = file_bytes.decode("latin-1", errors="ignore")
+                # v13.63: the upload is written to the paste file too, so the
+                # numbers do not vanish on the next refresh. Guarded by a
+                # signature so a 3000-line file is not rewritten on every rerun.
                 _up_sig = (len(raw_text), hash(raw_text))
                 if str_lit.session_state.get("_paste_saved_sig") != _up_sig:
                     _write_text_file(_PASTE_FILE, raw_text)
@@ -12124,6 +12235,9 @@ with input_tab2:
 
 clean_lines = []
 disp, typo, resume, app_skip, custom_skipped, dns_skipped, smtp_skipped = [], [], [], [], [], [], []
+# v13.66: this checkbox had NO key, so it was re-created with value=True on
+# every rerun and unticking it was undone by the next click anywhere. Seeded,
+# then created with key= only.
 _seed_widget("bb_skip_prev", dflt=True)
 skip_previous = str_lit.checkbox(
     "Skip previously valid", key="bb_skip_prev",
@@ -12140,13 +12254,28 @@ if raw_text:
     )
     _pf_cache = str_lit.session_state.get("_bb_prefilter_cache") or {}
     _pf_data = _pf_cache.get("data") if _pf_cache.get("fp") == _pf_fp else None
+    # FIX PASTE-1: normalise ONCE, on the prefilter path, and feed every consumer
+    # from the normalised text - the counts, the SMTP domain scan and the queue.
     _pf_text = _normalise_paste(raw_text)
     if _pf_data is None:
+        # v13.76 FIX LOAD-1: a 5 MB paste is ~160,000 lines and this prefilter is
+        # the slowest thing on the page, but it ran behind a blank screen - a long
+        # list looked like a dead app until the metrics finally appeared. The bar
+        # is drawn BEFORE the work, is driven from inside process_accounts, and
+        # covers the SMTP pre-check, which is the phase that really hangs. It is
+        # created on a cache MISS only, so a rerun that changes nothing is silent.
         _pf_bar = str_lit.progress(0.0, text="0% - reading the paste...")
         _pf_t0 = time.time()
         _pf_throttle = {"t": 0.0}
 
         def _pf_progress(_phase, _done, _total):
+            """phase, done, total -> one throttled bar update. Never raises.
+
+            Throttled to ~8 updates a second: 160,000 lines at a tick every 25
+            is 6,400 updates, which is more websocket traffic than the bar can
+            show. The element is a per-run local, so two users in two tabs each
+            drive their own bar and neither can repaint the other's.
+            """
             try:
                 _now = time.time()
                 if _now - _pf_throttle["t"] < 0.12:
@@ -12189,6 +12318,10 @@ if raw_text:
     str_lit.session_state.pre_dns_failed = list(dns_skipped)
     str_lit.session_state.pre_smtp_failed = list(smtp_skipped)
 
+    # FIX RS-2: this counted FILES (there is only ever one) and read a glob that
+    # raised TypeError, so it read 0 no matter what was on disk. It now counts
+    # the resumable LINES, which is what the label promises and what the row of
+    # neighbouring account counts means.
     unfinished_count = unfinished_remaining_count()
     _pf_metrics = [
         ("Ready to Check", len(clean_lines)),
@@ -12204,6 +12337,15 @@ if raw_text:
     for _pc, (_pl, _pv) in zip(metric_grid(_pf_metrics, per_row=3), _pf_metrics):
         _pc.metric(_pl, _pv)
 
+# ==========================================================================
+# v13.86 - KEYWORD HITS, IN PLAIN SIGHT
+#
+# The input existed only inside the Mailbox Reader, three conditions deep, so
+# there was nowhere to type a keyword before a run. This is the top-level
+# control: switch, words, folder, depth. Hits land in the same kw_hits_results
+# bucket the reader fills and block 087's BUCKETS table already carries, so a hit
+# re-runs like any other combo.
+# ==========================================================================
 section_title("🔎", "Keyword Hits",
               "find words you care about in every valid inbox, as the run goes")
 
@@ -12249,7 +12391,7 @@ if _kw_run_on:
         str_lit.caption("Hits land in the 🔎 Keyword Hits bucket and in the ZIP under "
                         "`keyword_bodies/`, with an occurrence count per keyword.")
 
-    render_kw_panel()
+render_kw_panel()
 
 
 KW_TRACE_MAX = 400
@@ -12386,10 +12528,46 @@ def run_keyword_scan(combo):
     return len(_hits)
 
 
+# --------------------------------------------------------------------------
+# INSPECTOR - v13.63, re-cut v13.76, v13.77
+#
+#   * it lived inside `if raw_text:`, so with an empty paste box the result
+#     buckets could not be inspected at all. It is module level now.
+#   * the list was an uncapped st.code, so 3445 rows pushed the selectbox off
+#     the top of the screen. It is a fixed-height scroller (420px) now.
+#   * the choice was session-only. It is a per-user file, validated against the
+#     CURRENT option list so a retired value can never raise.
+#
+# v13.76 FIX INSPECT-1: THE PANEL KEPT SHUTTING. It was an expander, and an
+# expander collapses on every rerun - a tick anywhere, a download, a slider, the
+# refresh of the panel above, and it was gone; the category then had to be
+# re-opened and re-picked before the next look. The opener is a keyed CHECKBOX
+# now, which is a widget with its own state: it stays ticked until it is
+# unticked, and nothing but unticking it can close the panel. The CATEGORY
+# inside it is still a plain selectbox - that part was never the problem.
+#
+# v13.76 FIX COMBO-2: THE PANEL PRINTED THE WHOLE LINE. The list showed
+# "email:pass | direct | 35.185.209.55 | Oregon | United States | VPN OFF (auto)
+# IMAP | Host: ... | Port: 993", so the password sat in the middle of a
+# sentence. Display and download are _combo_only() now.
+#
+# v13.77 FIX INSPECT-2: the callback existed nowhere - see the note above
+# _on_inspect_change(). FIX INSPECT-3: the per-rerun work moved inside the
+# checkbox. list_unfinished_runs() is a glob plus a json.load() per record, and
+# the category_map copied all twelve buckets, and BOTH ran on every rerun of
+# every load whether the panel was open or not - twelve list copies of up to
+# 3000 entries apiece for a panel nobody had opened. FIX INSPECT-4: the
+# `if not filter_category_choice:` branch was dead - a selectbox always returns
+# one of its options - so it is gone.
+# --------------------------------------------------------------------------
 inspect_options = list(PREFILTER_LABELS) + [label for label, _ in BUCKETS]
 
 if "bb_inspect_cat" not in str_lit.session_state:
     str_lit.session_state["bb_inspect_cat"] = _read_text_file(_INSPECT_FILE, 200).strip()
+# A keyed selectbox raises if its value is not one of its options, and the file
+# can hold a label a later version no longer ships. The checkbox row allowed ""
+# as a resting value; a selectbox does not, so the resting value is the first
+# category instead.
 if str_lit.session_state.get("bb_inspect_cat") not in inspect_options:
     str_lit.session_state["bb_inspect_cat"] = inspect_options[0]
 
@@ -12403,6 +12581,9 @@ if str_lit.checkbox("🔍 Inspect the contents of one category",
         "Select category to inspect contents:", options=inspect_options,
         key="bb_inspect_cat", on_change=_on_inspect_change)
 
+    # FIX RS-3: the preview used to append a metadata line per run into the SAME
+    # list as the account lines, so "Showing N items" counted headers too. The
+    # metadata is a caption now and the list holds account lines only.
     unfinished_runs = list_unfinished_runs()
     unfinished_preview = []
     for run in unfinished_runs:
@@ -12432,6 +12613,7 @@ if str_lit.checkbox("🔍 Inspect the contents of one category",
     if not selected_list_items:
         str_lit.info(f"No items in **{filter_category_choice}**.")
     else:
+        # FIX COMBO-2: combo only, on screen AND in the download.
         _clean_items = [_combo_only(i) for i in selected_list_items]
         _ih1, _ih2 = str_lit.columns([0.6, 0.4])
         with _ih1:
@@ -14822,6 +15004,11 @@ def _check_account_core(email, password, conf, domain, proxy_pool, thread_state,
 section_title("🚀", "Execute Live Checking Engine",
               "proxy-backed, post-auth verified, resumable")
 
+# v13.80 WAVE 8: THE SWEEP LIVES HERE because this block is module level and runs
+# on EVERY load of the app - which is exactly the cadence a "did it deliver"
+# watchdog needs. Anything armed by the last load and not satisfied by the time
+# this one starts is reported to the bell as kind="watch". It fires once per
+# window, so a rerun loop cannot turn one dead fetch into fifty notifications.
 try:
     import sentinel as _sentinel
 except Exception:
@@ -14829,6 +15016,19 @@ except Exception:
 if _sentinel is not None:
     _sentinel.sweep()
 
+# v13.81 WAVE 13: THE LAST-RESORT CLASSIFIER IS CONFIGURED HERE, once, from the
+# GEMINI_* keys block 043 bridged into os.environ. This block is module level and
+# runs on every load, which is the only cadence a configure() has - block 067
+# calls classify() from worker threads long after any script run has ended.
+#
+# The drain is a DAEMON THREAD and runs once per session: block 067 has already
+# queued whatever it could not place, the account that produced it is long gone,
+# and the next account that sees the same text gets the cached token. Nothing
+# here can block the script thread, the ladder or a verdict.
+#
+# `_AI` is the same module object block 067 imported. Re-binding the name to the
+# same object (or to None on the same failure) is harmless because 067 looks the
+# global up at call time.
 try:
     import aiassist as _AI
 except Exception:
@@ -14848,6 +15048,10 @@ if _AI is not None:
 RESULT_ACTION_MODES = BUCKETS
 ACTION_OPTIONS = list(PREFILTER_LABELS) + [label for label, _ in BUCKETS]
 
+# v13.71: THE SELECTOR SITS BETWEEN THE HEADING AND THE BUTTONS. It used to be
+# squeezed into a 0.35 column beside Start/Stop, so on a phone the thing that
+# decides WHICH queue runs was the smallest control on the page. It is now read
+# before the button that acts on it.
 _seed_widget("bb_action_mode", choices=ACTION_OPTIONS, dflt=ACTION_OPTIONS[0])
 engine_action_mode = str_lit.selectbox(
     "Engine Action Mode:", options=ACTION_OPTIONS,
@@ -14856,6 +15060,8 @@ engine_action_mode = str_lit.selectbox(
          "previous result bucket to re-run."
 )
 if engine_action_mode == "Resume Unfinished":
+    # runstate.summary() reads the watchdog record, so this is the truth about
+    # whether anything is actually resumable - not a glob that always matched.
     _rs_lines = runstate.summary()
     if _rs_lines:
         for _rs_line in _rs_lines:
@@ -14872,6 +15078,8 @@ with col_action1:
              "reason on the run record FIRST, then reruns, so the next page load "
              "reports 'Stopped by user' and leaves the queue resumable.")
 with col_action2:
+    # v13.71: batch state, read straight from session_state so no Apply Settings is
+    # needed. It is published as text only - the engine never reads it.
     _batch_on = bool(str_lit.session_state.get("bb_batch_on"))
     try:
         _batch_size = max(0, int(str_lit.session_state.get("bb_batch_size") or 0))
@@ -14884,6 +15092,9 @@ with col_action2:
     else:
         str_lit.caption("Batch off")
 
+# v13.81: THE CAPS ARE VISIBLE. A budget nobody can see is a budget nobody
+# believes, and the failure mode of an unbounded classifier is a silent quota
+# bill. Read from report(), which never raises.
 if _AI is not None:
     try:
         _ai_rep = _AI.report()
@@ -14963,6 +15174,7 @@ status_text = _NullUI()
 
 
 def _bucket_combo_html(line, col):
+    """One bucket line -> the combo in bold, wrapping. Verdict tail dropped."""
     combo, _sep, detail = str(line).partition(" | ")
     combo = combo.strip() or str(line).strip()
     return ("<div style='font-family:ui-monospace,monospace;font-size:12px;"
