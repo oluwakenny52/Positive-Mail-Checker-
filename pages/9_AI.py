@@ -663,21 +663,28 @@ try:
 except Exception as e:
     _rep = {"error": "%s: %s" % (type(e).__name__, e)}
 
-if not st.session_state.get(_SEED_KEY):
+# v13.86 FIX AI-SEED-2: seeded PER KEY, not behind one marker. _SEED_KEY stays
+# True for the life of the session, so a key that got popped was never put back
+# by this block - which is the KeyError class the chat picker kept throwing.
+if "_ai_enabled" not in st.session_state:
     st.session_state["_ai_enabled"] = bool(_rep.get("enabled"))
+if "_ai_model" not in st.session_state:
     st.session_state["_ai_model"] = _rep.get("model") or "gemini-flash-latest"
+if "_ai_run" not in st.session_state:
     st.session_state["_ai_run"] = int(_rep.get("max_per_run") or 0)
+if "_ai_day" not in st.session_state:
     st.session_state["_ai_day"] = int(_rep.get("max_per_day") or 0)
+if "_ai_fails" not in st.session_state:
     # v13.86 FIX AI-SEED: THIS WAS A HARDCODED 4. report() had no such key, so the
     # page always opened on 4 no matter what configure() had been given - and a
     # user who set 2 and reloaded saw 4 again, then saved 4 back over it. The key
     # exists in report() now and the seed is clamped to the widget's own range.
     try:
-        _fails_seed = int(_rep.get("stop_after_fails") or 4)
+        _fails_seed = int(_rep.get("stop_after_fails") or 0)
     except Exception:
-        _fails_seed = 4
+        _fails_seed = 0
     st.session_state["_ai_fails"] = max(0, min(20, _fails_seed))
-    st.session_state[_SEED_KEY] = True
+st.session_state[_SEED_KEY] = True
 
 st.markdown("### 3. Configuration")
 st.caption("A budget of 0 means UNLIMITED, not zero calls. The key itself comes "
