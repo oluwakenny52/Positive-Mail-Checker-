@@ -503,8 +503,11 @@ _repc = aiassist.report()
 if _CHAT_KEY not in st.session_state:
     st.session_state[_CHAT_KEY] = _chat_load()
 
-_MODELS = ("gemini-flash-latest", "gemini-2.5-flash", "gemini-2.5-pro",
-           "gemini-2.0-flash")
+# gemini-2.0-flash 404s on this project, so it is out of the picker as well as
+# out of the failover chain - a model you can select and that always 404s is a
+# dead option.
+_MODELS = ("gemini-flash-latest", "gemini-2.5-flash", "gemini-2.5-flash-lite",
+           "gemini-2.5-pro")
 
 # v13.86 FIX AI-KEYERROR: THE SEED WAS GATED ON A FLAG THAT OUTLIVED THE KEY.
 # _ai_chat_model is a WIDGET key and Streamlit garbage-collects widget keys that a
