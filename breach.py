@@ -28,6 +28,22 @@ browser tier's own fetch was an in-page fetch of that same endpoint, so it hit t
 same wall. Both are fixed: 401 is a wall like 403, and the browser tier now drives
 the UI and scrapes what renders. No key, no quota, no bill - the page is the API.
 
+THE DEADLOCK THAT FROZE EVERY RUN  (v13.86)
+-------------------------------------------
+_lock was a plain threading.Lock, and _get_pool() called _pages() INSIDE a
+with-block on it:
+
+    with _lock:
+        if _pool is None:
+            _pool = _BrowserPool(_pages())   # _pages() takes _lock again
+
+A non-reentrant lock taken twice by the same thread blocks for ever. The first
+worker to reach the browser tier froze, the other workers froze behind it on the
+same lock, nothing ever returned, and the page sat on "0 / 3" with no further
+trace. It only appeared without a key, because that is the only path that ever
+reaches _get_pool(). The lock is an RLock now AND the page count is read before
+the lock is taken, so either fix alone would have held.
+
 WHY AN OPTIONAL KEY STILL EXISTS
 --------------------------------
 If HIBP_API_KEY is set, /api/v3/breachedaccount is tried first because it is
@@ -79,7 +95,8 @@ trace_dump() is what it downloads. The ring is bounded and the file is capped.
 
 Pacing is separate from worker count on purpose. Workers bound concurrency;
 configure(delay=...) bounds the RATE at which new addresses are started, which is
-the thing a WAF counts. The default is 2 seconds between starts.
+the thing a WAF counts. The default is 3 seconds between starts, because the
+address tier is a full page load per address.
 
 THE TIER SWITCH  (v13.86)
 -------------------------
@@ -91,10 +108,6 @@ to a browser. A challenged address then comes back UNKNOWN with the reason
 installed" and must stay different: one is a choice, the other is a fault.
 Passwords are unaffected - Pwned Passwords is a plain HTTP API on a different
 host and is checked either way.
-
-check(allow_browser=...) defaults to the CONFIGURED tier. It used to default to
-True, and since no caller ever passed False the only way to run HTTP-only did
-not exist.
 
 Plain module, NOT frame-gated - like runstate.py and sentinel.py. No Streamlit.
 Nothing here renders. EVERY public function swallows: a breach lookup must never
@@ -109,9 +122,8 @@ daemon thread so the page never blocks on it. PLAYWRIGHT_BROWSERS_PATH is set at
 IMPORT, before anything can import playwright, because the driver reads it at
 launch time and a late assignment is simply ignored.
 
-The apt libraries Chromium links against come from packages.txt at build time.
-If they are missing, launch fails with a missing .so and browser_state() shows
-the text - which is why the state is a value on the page and not a log line.
+A boot that fails is remembered for BOOT_RETRY_AFTER seconds, so a run of ten
+addresses does not pay ten separate 90-second waits for the same broken binary.
 
 WITHOUT A BROWSER THERE IS NO ADDRESS TIER. With no key and no binary, every
 address comes back UNKNOWN, and browser_note() says exactly that.
@@ -125,12 +137,12 @@ dict. The binary is process-wide on purpose: it is the same bytes for everybody.
 
 USAGE
     import breach
-    breach.configure(pages=4, delay=2.0)
+    breach.configure(pages=2, delay=3.0)
     breach.ensure_browser()                  # non-blocking, idempotent
     breach.browser_state()                   # for the page to show
     breach.available()                       # False -> HTTP only, no browser
     rec = breach.check("a@b.com", password="hunter2")
-    all = breach.check_many(pairs, workers=8, progress=cb, cancel=ev)
+    all = breach.check_many(pairs, workers=2, progress=cb, cancel=ev)
     breach.score(all.values())               # old/new breakdown
     breach.parse_addresses(text)             # -> [(email, password)]
     breach.trace_read(limit=100)             # what a page renders
@@ -188,7 +200,7 @@ UI_SEARCH_SELECTORS = (
     "input[type='email']",
     "input[type='text']",
 )
-RENDER_WAIT = 12.0
+RENDER_WAIT = 8.0
 
 # Read the rendered page ONCE: the breach anchors, the visible text and the
 # markup. innerText, not textContent - innerText is what is actually laid out, so
@@ -205,7 +217,7 @@ JS_READ = """() => {
 
 PAGE_HTML_MAX = 90000
 PAGE_TEXT_MAX = 30000
-PAGE_TIMEOUT = 20.0
+PAGE_TIMEOUT = 12.0
 
 # WHEN a page is captured. Two modes, because a page costs a second request per
 # address and 500 addresses is twice the run.
@@ -224,10 +236,11 @@ PAGE_ON_DEFAULT = ("clean", "error")
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36")
 
-HTTP_TIMEOUT = 12.0
-NAV_TIMEOUT = 30000
-CHALLENGE_WAIT = 30.0
-PAGES_DEFAULT = 4
+HTTP_TIMEOUT = 8.0
+NAV_TIMEOUT = 20000
+CHALLENGE_WAIT = 25.0
+BOOT_RETRY_AFTER = 60.0
+PAGES_DEFAULT = 2
 PAGES_MAX = 8
 DESC_MAX = 1200
 CACHE_NAME = "breach_cache.json"
@@ -236,11 +249,12 @@ CATALOGUE_TTL = 6 * 3600.0
 INSTALL_TIMEOUT = 900
 
 # Pacing. One new address may START every DELAY_DEFAULT seconds; workers bound
-# concurrency, delay bounds the rate. 0 = flood as fast as the pool allows.
-DELAY_DEFAULT = 2.0
+# concurrency, delay bounds the rate. 0 = flood as fast as the pool allows. The
+# address tier is a whole page load, so the defaults are deliberately small.
+DELAY_DEFAULT = 3.0
 DELAY_MAX = 20.0
-BROWSER_SETTLE = 700      # ms to sit on a page before the in-page fetch
-BROWSER_JITTER = 500      # extra random ms, so two pages never fire together
+BROWSER_SETTLE = 500      # ms to sit on a page before reading it
+BROWSER_JITTER = 400      # extra random ms, so two pages never fire together
 
 # Band thresholds in days. Change here and nowhere else.
 PW_NEW_MAX = 0          # 0 hits = unseen = NEW
@@ -275,11 +289,16 @@ TRACE_NAME = "breach_trace.jsonl"
 TRACE_FILE_MAX = 4000
 TRACE_DUMP_MAX = 500
 
-_cfg = {"pages": PAGES_DEFAULT, "timeout": 60.0, "delay": DELAY_DEFAULT,
+_cfg = {"pages": PAGES_DEFAULT, "timeout": 45.0, "delay": DELAY_DEFAULT,
         "http_only": False, "page_mode": PAGE_MODE_FAST,
         "page_on": tuple(PAGE_ON_DEFAULT)}
-_lock = threading.Lock()
+# RLock, NOT Lock. _get_pool() builds the pool while holding this and the builder
+# reads the page count through _pages(), which takes it again - a plain Lock
+# blocked for ever on the first address that reached the browser tier, and took
+# every worker with it.
+_lock = threading.RLock()
 _pool = None
+_pool_boot_failed = 0.0
 _pw_missing = ""
 _last = {"ts": 0.0, "email": "", "verdict": "", "via": "", "ms": 0, "error": "",
          "url": ""}
@@ -1495,9 +1514,9 @@ class _BrowserPool:
             if any(m in low for m in CLEAN_MARKS):
                 return 0
             try:
-                page.wait_for_timeout(700)
+                page.wait_for_timeout(600)
             except Exception:
-                time.sleep(0.7)
+                time.sleep(0.6)
         return 0
 
     def _ui_search(self, page, addr):
@@ -1552,9 +1571,9 @@ class _BrowserPool:
                         box.scroll_into_view_if_needed(timeout=4000)
                     except Exception:
                         pass
-                    box.click(timeout=8000)
+                    box.click(timeout=6000)
                     box.fill("")
-                    box.type(addr, delay=25)
+                    box.type(addr, delay=20)
                     box.press("Enter")
                 except Exception as exc:
                     trace("WARN", "ui", "box failed (%s) - navigating directly"
@@ -1634,12 +1653,28 @@ class _BrowserPool:
 
 
 def _get_pool():
-    global _pool
+    """The process pool, started once.
+
+    The page count is read BEFORE the lock: _pages() takes the same lock, so
+    reading it inside the with-block on a non-reentrant lock would block for ever
+    - which is exactly what froze every keyless run. _lock is an RLock as well,
+    so either half of the fix holds on its own.
+    """
+    global _pool, _pool_boot_failed
+    size = _pages()
     with _lock:
         if _pool is None:
-            _pool = _BrowserPool(_pages())
+            _pool = _BrowserPool(size)
         pool = _pool
-    pool.start()
+    if _pool_boot_failed and (time.time() - _pool_boot_failed) < BOOT_RETRY_AFTER:
+        raise RuntimeError("browser boot failed %ds ago - not retried yet"
+                           % int(time.time() - _pool_boot_failed))
+    try:
+        pool.start()
+    except Exception:
+        _pool_boot_failed = time.time()
+        raise
+    _pool_boot_failed = 0.0
     return pool
 
 
@@ -1697,14 +1732,9 @@ _REASON = {
 def check(addr, password="", force=False, allow_browser=None) -> dict:
     """One address. Pwned Passwords, then address exposure. Never raises.
 
-    v13.86: allow_browser DEFAULTS TO THE CONFIGURED TIER. It defaulted to True
-    and no caller ever passed False, so configure(http_only=True) could not have
-    worked even once the page had a switch.
-
     The address half is tried in order: the optional keyed API when a key exists,
     the keyless endpoint, then the browser - which drives the site's own search
-    box and scrapes what renders. With no key the browser IS the method, not a
-    rescue.
+    box and scrapes what renders. With no key the browser IS the method.
     """
     if allow_browser is None:
         allow_browser = not _http_only()
@@ -1811,16 +1841,17 @@ def last_url() -> str:
         return _last.get("url", "")
 
 
-def check_many(pairs, workers=4, progress=None, cancel=None, force=False,
+def check_many(pairs, workers=2, progress=None, cancel=None, force=False,
                delay=None, http_only=None) -> dict:
     """Check every (email, password) pair. Returns {email: record}.
 
     Paced on purpose: `workers` bounds concurrency, `delay` bounds the rate at
-    which NEW addresses are started. A pool of 8 that starts 8 at once is what a
-    WAF sees as a burst; a pool of 8 that starts one every two seconds is not.
+    which NEW addresses are started. Each address is a whole page load, so the
+    defaults are 2 and 3s rather than 8 and 0.
 
-    v13.86: `http_only` reaches check() as allow_browser=False, and the tier is
-    written into the run line so a trace says how its rows were reached.
+    progress() is called on START as well as on finish, with the verdict "starting".
+    Without the start call nothing on the page moves until the first address has
+    finished, so a slow first address looks like a frozen app.
     """
     ho = _http_only() if http_only is None else bool(http_only)
     uniq, seen = [], set()
@@ -1842,7 +1873,14 @@ def check_many(pairs, workers=4, progress=None, cancel=None, force=False,
     if not total:
         return out
 
-    def one(item):
+    def _tell(n, em, verdict):
+        if progress is not None:
+            try:
+                progress(n, total, em, verdict)
+            except Exception:
+                pass
+
+    def one(item, position):
         em, pw = item
         if cancel is not None and cancel.is_set():
             rec = _blank(em, pw)
@@ -1851,23 +1889,21 @@ def check_many(pairs, workers=4, progress=None, cancel=None, force=False,
             trace("WARN", "cancel", "cancelled before the check", em)
         else:
             trace("INFO", "start", "checking", em)
+            # STARTED, not finished: the bar and the live trace move on dispatch.
+            _tell(position, em, "starting")
             rec = check(em, pw, force=force, allow_browser=not ho)
         with guard:
             out[em] = rec
             done[0] += 1
             n = done[0]
-        if progress is not None:
-            try:
-                progress(n, total, em, rec.get("verdict", ""))
-            except Exception:
-                pass
+        _tell(n, em, rec.get("verdict", ""))
 
     width = max(1, min(16, int(workers or 1)))
     try:
         with _cf.ThreadPoolExecutor(max_workers=width) as ex:
             inflight = set()
-            for item in uniq:
-                inflight.add(ex.submit(one, item))
+            for position, item in enumerate(uniq, 1):
+                inflight.add(ex.submit(one, item, position))
                 step = 0.0 if (cancel is not None and cancel.is_set()) else pace
                 if step:
                     time.sleep(step)
@@ -1880,9 +1916,10 @@ def check_many(pairs, workers=4, progress=None, cancel=None, force=False,
     except Exception as exc:
         trace("ERR", "run", "executor failed (%s), falling back to serial"
               % type(exc).__name__)
-        for item in uniq:
+        for position, item in enumerate(uniq, 1):
             out.setdefault(item[0], check(item[0], item[1], force=force,
                                           allow_browser=not ho))
+            _tell(position, item[0], out[item[0]].get("verdict", ""))
     trace("INFO", "run", "finished: %d record(s)" % len(out))
     return out
 
@@ -1921,6 +1958,8 @@ def report() -> dict:
             "browser_error": browser_note(), "pages": _pages(), "delay": _delay(),
             "http_only": _http_only(), "pool": _pool is not None,
             "key": bool(_api_key()), "tier": "ui",
+            "boot_failed_ago": (int(time.time() - _pool_boot_failed)
+                                if _pool_boot_failed else 0),
             "page_mode": _page_mode(), "page_on": list(_page_on()),
             "last": dict(_last), "trace_seq": trace_seq()}
 
@@ -1933,6 +1972,10 @@ def selftest(verbose=False) -> bool:
 
     def add(n, ok):
         checks.append((n, bool(ok)))
+
+    # ---- the deadlock that froze every keyless run ----
+    add("lock_reentrant", type(_lock).__name__ == "RLock")
+    add("pages_under_lock", _pages() >= 1)
 
     add("is_email", is_email("a.b@c.co"))
     add("not_email", not is_email("nope"))
@@ -2056,6 +2099,7 @@ def selftest(verbose=False) -> bool:
     add("pw_hash", len(_pw_hash("abc")) == 40)
     add("report_shape", isinstance(report().get("browser"), bool))
     add("report_tier", report().get("tier") == "ui")
+    add("report_boot", isinstance(report().get("boot_failed_ago"), int))
     add("state_shape", "state" in browser_state())
     add("note_is_str", isinstance(browser_note(), str))
     add("env_set", os.environ.get("PLAYWRIGHT_BROWSERS_PATH") == _PW_DIR)
