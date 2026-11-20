@@ -500,21 +500,31 @@ st.caption("Ask about the app, paste a traceback, or have a block drafted. "
            "Follow-ups keep the thread. Every turn is recorded to your own file.")
 
 _repc = aiassist.report()
-if not st.session_state.get("_ai_chat_seeded"):
-    st.session_state["_ai_chat_model"] = _repc.get("model") or "gemini-flash-latest"
-    st.session_state["_ai_chat_seeded"] = True
 if _CHAT_KEY not in st.session_state:
     st.session_state[_CHAT_KEY] = _chat_load()
 
 _MODELS = ("gemini-flash-latest", "gemini-2.5-flash", "gemini-2.5-pro",
            "gemini-2.0-flash")
 
+# v13.86 FIX AI-KEYERROR: THE SEED WAS GATED ON A FLAG THAT OUTLIVED THE KEY.
+# _ai_chat_model is a WIDGET key and Streamlit garbage-collects widget keys that a
+# run does not create; _ai_chat_seeded is an ordinary key and survives. So after
+# one crash the seed was skipped, the key was gone, and every later load died at
+# the selectbox with KeyError - a page that could not be opened at all. The seed
+# now runs whenever the value is missing OR is a model the list no longer carries,
+# and never relies on the flag.
+_chat_model_now = str(st.session_state.get("_ai_chat_model") or "").strip()
+if not _chat_model_now or _chat_model_now not in _MODELS:
+    _chat_model_now = str(_repc.get("model") or "").strip()
+    if _chat_model_now not in _MODELS:
+        _chat_model_now = _MODELS[0]
+    st.session_state["_ai_chat_model"] = _chat_model_now
+st.session_state["_ai_chat_seeded"] = True
+_model_opts = [_chat_model_now] + [m for m in _MODELS if m != _chat_model_now]
+
 _cm1, _cm2 = st.columns([0.42, 0.58])
 with _cm1:
-    _model = st.selectbox("Model", options=[st.session_state["_ai_chat_model"]]
-                          + [m for m in _MODELS
-                             if m != st.session_state["_ai_chat_model"]],
-                          key="_ai_chat_model")
+    _model = st.selectbox("Model", options=_model_opts, key="_ai_chat_model")
 with _cm2:
     st.caption("Budget: **%s** of %s today, **%s** of %s this run (0 = unlimited). "
                "Chat and classification share both."
@@ -629,8 +639,10 @@ if st.session_state.pop("_ai_send", False):
                 elif not _rep2.get("enabled"):
                     _why = "the classifier is off - tick Enabled in section 3"
                 elif _rep2.get("tripped"):
-                    _why = "latched after %s consecutive failures" % _rep2.get(
-                        "consecutive_fails")
+                    _why = ("latched after %s consecutive failures - it re-opens by "
+                            "itself in %ss, or press Reset run counters"
+                            % (_rep2.get("consecutive_fails"),
+                               _rep2.get("recovers_in") or 0))
                 _slot.markdown("_no answer: %s_" % _why)
                 _buf = "_no answer: %s_" % _why
 
