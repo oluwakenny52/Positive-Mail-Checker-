@@ -11925,6 +11925,16 @@ def process_accounts(text, previous_valid, progress=None):
 # @@END 086 PROCESS_ACCOUNTS
 
 # @@BLOCK 087 INPUT_UI deps=019,034,035,039,055,082,083,085,086
+# v13.86 FIX KW-5: mailsearch IS IMPORTED HERE, not only in block 109.
+# keyword_hits_wanted() and run_keyword_scan() below read this name, and block
+# 109 executes AFTER block 106's run loop - so during every run the name was
+# unbound, the NameError was swallowed and no scan ever ran. Optional module:
+# a missing file degrades to "the scan stays idle", never to a dead page.
+try:
+    import mailsearch
+except Exception:
+    mailsearch = None
+
 # ---- single BUCKET table (was RESULT_INSPECT + RESULT_ACTION_MODES duplicated) ----
 PREFILTER_LABELS = [
     "Ready to Check", "Resume Unfinished", "Disposables", "Typos",
@@ -12325,12 +12335,78 @@ if raw_text:
 #
 # The input existed only inside the Mailbox Reader, three conditions deep, so
 # there was nowhere to type a keyword before a run. This is the top-level
-# control: switch, words, folder, depth. Hits land in the same kw_hits_results
-# bucket the reader fills and block 087's BUCKETS table already carries, so a hit
-# re-runs like any other combo.
+# control: switch, words, folder scope, depth. Hits land in the same
+# kw_hits_results bucket the reader fills and block 087's BUCKETS table already
+# carries, so a hit re-runs like any other combo.
+#
+# v13.86 FIX KW-5 - THE SCAN COULD NEVER RUN. keyword_hits_wanted() and
+# run_keyword_scan() below read the global name `mailsearch`, and mailsearch was
+# imported in block 109 - which executes AFTER block 106's run loop has already
+# finished. Every call therefore raised NameError inside keyword_hits_wanted()'s
+# own try, which answers False, so the run never scanned once, never wrote one
+# trace line, and the panel correctly said "No keyword scan yet this run" on an
+# account full of Amazon and Coinbase mail. The import is here now, above both
+# functions and long before any run. Block 109's copy stays as the second
+# binding for the rest of the page.
+#
+# v13.86 FIX KW-6 - FOLDER SCOPE IS A CHOICE, NOT A TYPED LIST. The old control
+# was a free-text box of folder names, so "scan my inbox" and "scan everything"
+# were both manual, and the second one meant typing every folder by hand.
+# bb_kw_run_folder is a two-option select now:
+#     Inbox       -> INBOX only. Cheap, and the case almost everybody wants.
+#     All Folders -> every selectable folder the server lists for the account,
+#                    capped at KW_FOLDER_CAP, each opened READ-ONLY in turn.
+# A stale value from an older build ("INBOX") is re-seeded to "Inbox" before the
+# widget exists, so an inherited key can never make the selectbox raise.
 # ==========================================================================
+KW_SCOPES = ("Inbox", "All Folders")
+KW_SCOPE_INBOX = KW_SCOPES[0]
+KW_SCOPE_ALL = KW_SCOPES[1]
+KW_DEPTHS = ("Newest N messages", "Whole folder")
+KW_DEPTH_NEWEST = KW_DEPTHS[0]
+KW_FIELD_LABELS = ("Subject", "From", "To", "Body")
+KW_FOLDER_INBOX = "INBOX"
+KW_FOLDER_CAP = 12
+KW_HIT_CAP = 200
+KW_WINDOW_ALL = 200
+
 section_title("🔎", "Keyword Hits",
               "find words you care about in every valid inbox, as the run goes")
+
+# ---- owner gate: a second unlock must not inherit the last user's words ----
+# The run keys are NOT in block 037's pop list and NOT in block 109's, because
+# both run before this widget set exists and popping a live widget key after the
+# widget is built makes the value read by the run one run stale. This gate runs
+# before every widget below, so popping here is legal and complete.
+_kw_run_owner = _cache_owner()
+if str_lit.session_state.get("_kw_run_owner") != _kw_run_owner:
+    for _k in ("bb_kw_run_on", "bb_kw_run_words", "bb_kw_run_folder",
+               "bb_kw_run_fields", "bb_kw_run_scope", "bb_kw_run_limit",
+               "kw_trace", "kw_counts", "kw_hits_detail"):
+        str_lit.session_state.pop(_k, None)
+    str_lit.session_state["_kw_run_owner"] = _kw_run_owner
+
+# Seeded, never defaulted: every widget below is created with key= ONLY, so a
+# saved value survives and Streamlit does not warn about a default plus a state.
+for _k, _v in (("bb_kw_run_on", False), ("bb_kw_run_words", ""),
+               ("bb_kw_run_folder", KW_SCOPE_INBOX),
+               ("bb_kw_run_fields", list(KW_FIELD_LABELS)),
+               ("bb_kw_run_scope", KW_DEPTH_NEWEST),
+               ("bb_kw_run_limit", 20)):
+    if _k not in str_lit.session_state:
+        str_lit.session_state[_k] = list(_v) if isinstance(_v, list) else _v
+
+# A key restored from an older build, or from a build that renamed an option,
+# must be legal before its widget is created.
+if str_lit.session_state.get("bb_kw_run_folder") not in KW_SCOPES:
+    str_lit.session_state["bb_kw_run_folder"] = KW_SCOPE_INBOX
+if str_lit.session_state.get("bb_kw_run_scope") not in KW_DEPTHS:
+    str_lit.session_state["bb_kw_run_scope"] = KW_DEPTH_NEWEST
+if not isinstance(str_lit.session_state.get("bb_kw_run_limit"), int):
+    str_lit.session_state["bb_kw_run_limit"] = 20
+_kw_fields_saved = [f for f in (str_lit.session_state.get("bb_kw_run_fields") or [])
+                    if f in KW_FIELD_LABELS]
+str_lit.session_state["bb_kw_run_fields"] = _kw_fields_saved or list(KW_FIELD_LABELS)
 
 _kw_run_on = str_lit.checkbox("Find keyword hits while the engine runs",
                               key="bb_kw_run_on",
@@ -12340,36 +12416,39 @@ _kw_run_on = str_lit.checkbox("Find keyword hits while the engine runs",
                                    "untouched and nothing extra is dialled.")
 
 if _kw_run_on:
-    _kwr1, _kwr2 = str_lit.columns([0.6, 0.4])
+    _kwr1, _kwr2 = str_lit.columns([0.58, 0.42])
     with _kwr1:
         str_lit.text_input("Keywords (commas separate them)", key="bb_kw_run_words",
                            placeholder="invoice, receipt, statement",
                            help="Case-insensitive. A hit records how many times the "
                                 "word occurs in the message.")
     with _kwr2:
-        str_lit.text_input("Folders (commas separate them)", value="INBOX",
-                           key="bb_kw_run_folder",
-                           help="Each folder is opened READ-ONLY in turn. INBOX is the "
-                                "default; Sent, Archive and Spam are legal too.")
+        str_lit.selectbox("Folder scope", list(KW_SCOPES), key="bb_kw_run_folder",
+                          help="Inbox scans INBOX only. All Folders lists every "
+                               f"selectable folder on the account and scans each one "
+                               f"read-only, up to {KW_FOLDER_CAP} folders - it is "
+                               f"thorough and it is slower.")
     _kwr3, _kwr4, _kwr5 = str_lit.columns([0.42, 0.29, 0.29])
     with _kwr3:
         _kw_fields = str_lit.multiselect(
-            "Search in", ["Subject", "From", "To", "Body"],
-            default=["Subject", "From", "To", "Body"], key="bb_kw_run_fields",
+            "Search in", list(KW_FIELD_LABELS), key="bb_kw_run_fields",
             help="Which parts of a message count as a match. Dropping Body makes the "
                  "pass much cheaper - the body pass is the slow half.")
     with _kwr4:
-        str_lit.selectbox("Scope", ["Newest N messages", "Whole folder"],
-                          key="bb_kw_run_scope",
-                          help="Whole folder scans up to 2000 newest ids; Newest N "
-                               "scans only the N below.")
+        str_lit.selectbox("Depth", list(KW_DEPTHS), key="bb_kw_run_scope",
+                          help="Whole folder scans up to 2000 newest ids per folder; "
+                               "Newest N scans only the N below.")
     with _kwr5:
-        str_lit.number_input("Messages to scan", 1, 2000, 20, 5,
-                             key="bb_kw_run_limit",
+        str_lit.number_input("Messages per folder", 1, 2000, key="bb_kw_run_limit",
                              help="Newest N per folder, per account. Each hit's body "
                                   "is written to your own results directory.")
     if not (str_lit.session_state.get("bb_kw_run_words") or "").strip():
         str_lit.caption("No keywords yet - the scan stays idle until you type some.")
+    elif str_lit.session_state.get("bb_kw_run_folder") == KW_SCOPE_ALL:
+        str_lit.caption(f"Scope: **every folder** the account lists (up to "
+                        f"{KW_FOLDER_CAP}), {KW_WINDOW_ALL} newest messages each. Hits "
+                        f"land in the 🔎 Keyword Hits bucket and the ZIP under "
+                        f"`keyword_bodies/`.")
     else:
         str_lit.caption("Hits land in the 🔎 Keyword Hits bucket and in the ZIP under "
                         "`keyword_bodies/`, with an occurrence count per keyword.")
@@ -12419,19 +12498,6 @@ def _kw_trace(level, step, detail=""):
         pass
 
 
-def _kw_count(words, n):
-    """Add n occurrences for each keyword into the live counter."""
-    try:
-        cur = dict(str_lit.session_state.get("kw_counts") or {})
-        for w in words:
-            cur[str(w)] = int(cur.get(str(w)) or 0) + int(n or 0)
-        if len(cur) > KW_COUNT_MAX:
-            cur = dict(sorted(cur.items(), key=lambda kv: -kv[1])[:KW_COUNT_MAX])
-        str_lit.session_state["kw_counts"] = cur
-    except Exception:
-        pass
-
-
 def keyword_hits_wanted() -> bool:
     """True when a run should scan, and there is something to scan for."""
     try:
@@ -12442,14 +12508,36 @@ def keyword_hits_wanted() -> bool:
         return False
 
 
+def _kw_folders_for(mail, mode):
+    """(folders, note) for this scan. Never raises.
+
+    All Folders asks the SERVER, so it can only ever name a folder that exists
+    on this account - there is no guessed list. A server that will not list
+    falls back to INBOX rather than scanning nothing.
+    """
+    if mode != KW_SCOPE_ALL:
+        return [KW_FOLDER_INBOX], ""
+    try:
+        found, note = mailsearch.list_folders(mail)
+    except Exception as e:
+        return [KW_FOLDER_INBOX], f"folder list failed ({type(e).__name__}) - INBOX only"
+    found = [f for f in (found or []) if str(f).strip()]
+    if not found:
+        return [KW_FOLDER_INBOX], (note or "no folder listed") + " - INBOX only"
+    if len(found) > KW_FOLDER_CAP:
+        return found[:KW_FOLDER_CAP], f"capped at {KW_FOLDER_CAP} of {len(found)} folder(s)"
+    return found, ""
+
+
 def run_keyword_scan(combo):
     """One read-only scan of one just-verified inbox. Never raises. Returns hits.
 
     v13.86: EVERY PATH TRACES. It used to return 0 in five different places with
     nothing recorded, so a scan that found nothing and a scan that never ran
-    looked identical on the page. The hit count per keyword is recorded too, so
-    the panel can say how many mails a word actually produced instead of only
-    that one did.
+    looked identical on the page - and with the mailsearch NameError above, EVERY
+    scan was the second kind. The hit count per keyword is recorded too, so the
+    panel can say how many mails a word actually produced instead of only that
+    one did.
 
     v13.86 FIX KW-3: THE FULL HIT DICTS ARE KEPT, and kept AS THEY LAND. Only
     hit_line() strings were stored and kw_hits_detail had no writer at all, so the
@@ -12457,29 +12545,34 @@ def run_keyword_scan(combo):
     already fires on_hit() the moment a hit is complete - that is what it is for -
     and it is wired here, so a row appears while the pass is still running instead
     of all of them at the end.
+
+    v13.86 FIX KW-6: THE SCOPE IS THE CONTROL, NOT A TYPED LIST. Inbox scans
+    INBOX; All Folders lists the account's own folders and hands the whole list
+    to the module, which opens each READ-ONLY in turn. The per-folder window is
+    capped in All Folders mode because the window is multiplied by the folder
+    count.
     """
     if not keyword_hits_wanted():
         return 0
     _words = str_lit.session_state.get("bb_kw_run_words") or ""
-    _folders = [f.strip() for f in
-                (str_lit.session_state.get("bb_kw_run_folder") or "INBOX").split(",")
-                if f.strip()] or ["INBOX"]
+    _mode = str_lit.session_state.get("bb_kw_run_folder") or KW_SCOPE_INBOX
     _fields = [str(f).lower() for f in
-               (str_lit.session_state.get("bb_kw_run_fields")
-                or ["Subject", "From", "To", "Body"])]
-    _scope = str_lit.session_state.get("bb_kw_run_scope") or "Newest N messages"
+               (str_lit.session_state.get("bb_kw_run_fields") or list(KW_FIELD_LABELS))]
+    _scope = str_lit.session_state.get("bb_kw_run_scope") or KW_DEPTH_NEWEST
     try:
         _limit = int(str_lit.session_state.get("bb_kw_run_limit") or 20)
     except Exception:
         _limit = 20
-    _scan = 2000 if _scope == "Whole folder" else _limit
+    _scan = 2000 if _scope == KW_DEPTHS[1] else _limit
+    if _mode == KW_SCOPE_ALL:
+        _scan = min(_scan, KW_WINDOW_ALL)
     try:
         _e, _p = str(combo).split(":", 1)
     except Exception:
         _kw_trace("WARN", "combo", "%r has no colon" % str(combo)[:80])
         return 0
     _e, _p = _e.strip(), _p.strip()
-    _kw_trace("INFO", "start", "%s in %s" % (_e, ",".join(_folders)))
+    _kw_trace("INFO", "start", "%s scope=%s window=%s" % (_e, _mode, _scan))
     _hosts = get_servers(_e).get("imap", [])
     if not _hosts:
         _kw_trace("WARN", "hosts", "no IMAP host for %s" % _e.split("@")[-1])
@@ -12487,6 +12580,7 @@ def run_keyword_scan(combo):
     _px = sample_alive_proxy(domain=_e.split("@")[-1]) if use_proxy else None
     _m = None
     _hits = []
+    _folders = [KW_FOLDER_INBOX]
 
     def _on_hit_store(_h):
         """One completed hit -> the panel, now. Never raises.
@@ -12514,6 +12608,11 @@ def run_keyword_scan(combo):
         if not _ok or not _m:
             _kw_trace("WARN", "connect", "%s did not connect (%s)" % (_e, str(_h)[:120]))
             return 0
+        _folders, _fnote = _kw_folders_for(_m, _mode)
+        if _fnote:
+            _kw_trace("WARN", "folders", _fnote)
+        _kw_trace("INFO", "folders", "%d folder(s): %s"
+                  % (len(_folders), ",".join(_folders)))
         _hits, _note = mailsearch.search(
             _m, _folders[0], _words, scan_limit=_scan, body_scan=_scan,
             fields=_fields, folders=_folders, on_trace=_kw_trace,
@@ -12530,9 +12629,11 @@ def run_keyword_scan(combo):
                 mailsearch.close(_m)
         except Exception:
             pass
-    _hits = (_hits or [])[:_limit]
+    # The window is per folder, so a multi-folder pass legitimately outruns the
+    # per-folder N. It is capped on the total instead of on the window.
+    _hits = (_hits or [])[:KW_HIT_CAP]
     if not _hits:
-        _kw_trace("INFO", "zero", "no hit for %s" % _e)
+        _kw_trace("INFO", "zero", "no hit for %s in %s" % (_e, ",".join(_folders)))
         return 0
     _stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     # The stamp is second-resolution, so two accounts scanned in the same second
@@ -12556,6 +12657,9 @@ def run_keyword_scan(combo):
         _cur_counts = dict(str_lit.session_state.get("kw_counts") or {})
         for _w, _n in _per_word.items():
             _cur_counts[_w] = int(_cur_counts.get(_w) or 0) + int(_n)
+        if len(_cur_counts) > KW_COUNT_MAX:
+            _cur_counts = dict(sorted(_cur_counts.items(),
+                                      key=lambda kv: -int(kv[1] or 0))[:KW_COUNT_MAX])
         str_lit.session_state["kw_counts"] = _cur_counts
     except Exception:
         pass
@@ -15170,6 +15274,12 @@ if _AI is not None:
 # render_kw_panel() falls back to _kw_live whenever the tabs are not on screen.
 # Block 106 already calls render_kw_panel() after every scan, so the panel
 # repaints on the scan's own event and nothing else has to know it exists.
+#
+# v13.86 FIX KW-4: AND IT PAINTS THE SUMMARY INTO BOTH SURFACES. Before this, the
+# slot above the controls was written once per load - before any scan - so it sat
+# on "No keyword scan yet this run" for the whole run while the hits landed in
+# the tab. The counts line and the per-keyword table go to both surfaces on every
+# repaint; the rows and the trace go to the tab when there is one.
 _kw_panel = {"head": None, "hits": None, "trace": None}
 
 _KW_ROW_CAP = 60          # rows drawn at once; the bucket and the ZIP hold all
@@ -15316,14 +15426,18 @@ def render_kw_panel():
     keyword actually produced, and what the last scan did. Both are read from
     session_state, so the panel survives a rerun and is right on the first paint.
 
-    It draws into the third run tab when that exists and into block 087's
-    _kw_live otherwise - see the FIX KW-2 note above.
+    v13.86 FIX KW-4: BOTH SURFACES. `heads` is the slot under the keyword
+    controls (always present) plus the tab header when the tabs exist. The
+    summary and the per-keyword table go to BOTH, so the slot above the controls
+    is never left saying "no scan yet" while hits are landing; the rows go to the
+    tab when there is one and to the slot when there is not.
     """
-    head = _kw_panel.get("head")
-    hits_box = _kw_panel.get("hits")
-    trace_box = _kw_panel.get("trace")
-    target = head if head is not None else globals().get("_kw_live")
-    if target is None:
+    tab_head = _kw_panel.get("head")
+    tab_hits = _kw_panel.get("hits")
+    tab_trace = _kw_panel.get("trace")
+    live = globals().get("_kw_live")
+    heads = [s for s in (live, tab_head) if s is not None]
+    if not heads:
         return
     try:
         counts = dict(str_lit.session_state.get("kw_counts") or {})
@@ -15332,39 +15446,45 @@ def render_kw_panel():
     except Exception:
         counts, trace, rows = {}, [], []
     if not counts and not rows and not trace:
-        target.caption("No keyword scan yet this run. Hits appear here as they "
+        for _s in heads:
+            _s.caption("No keyword scan yet this run. Hits appear here as they "
                        "land, with the account, folder, count and headers.")
         return
 
     _occ = sum(int(v or 0) for v in counts.values()) or sum(r["total"] for r in rows)
     _kws = counts or {k: 1 for r in rows for k in (r.get("counts") or {})}
-    target.markdown(
-        "**%d** hit message(s) · **%d** occurrence(s) across **%d** keyword(s)"
-        % (len(rows), _occ, len(_kws)))
+    _line = ("**%d** hit message(s) · **%d** occurrence(s) across **%d** keyword(s)"
+             % (len(rows), _occ, len(_kws)))
+    for _s in heads:
+        _s.markdown(_line)
     if counts:
         _top = sorted(counts.items(), key=lambda kv: -int(kv[1] or 0))[:12]
-        target.markdown("| Keyword | Mails hit |\n|---|---|\n"
-                        + "\n".join("| `%s` | %d |" % (html.escape(str(k)), int(v or 0))
-                                    for k, v in _top))
+        _tbl = ("| Keyword | Mails hit |\n|---|---|\n"
+                + "\n".join("| `%s` | %d |" % (html.escape(str(k)), int(v or 0))
+                            for k, v in _top))
+        for _s in heads:
+            _s.markdown(_tbl)
 
-    draw_into = hits_box if hits_box is not None else target
-    if rows:
-        draw_into.markdown(
-            "<div style='max-height:420px;overflow-y:auto;overflow-x:hidden;"
-            "max-width:100%'>"
-            + "".join(_kw_hit_html(r) for r in rows[-_KW_ROW_CAP:]) + "</div>",
-            unsafe_allow_html=True)
-        if len(rows) > _KW_ROW_CAP:
-            draw_into.caption("%d more - the Keyword Hits bucket and the ZIP carry "
-                              "all of them." % (len(rows) - _KW_ROW_CAP))
-    else:
-        draw_into.caption("No hit rows to show.")
-
-    if trace_box is not None:
-        if trace:
-            trace_box.code("\n".join(trace[-_KW_TRACE_CAP:]), language="text")
+    draw_into = tab_hits if tab_hits is not None else live
+    if draw_into is not None:
+        if rows:
+            draw_into.markdown(
+                "<div style='max-height:420px;overflow-y:auto;overflow-x:hidden;"
+                "max-width:100%'>"
+                + "".join(_kw_hit_html(r) for r in rows[-_KW_ROW_CAP:]) + "</div>",
+                unsafe_allow_html=True)
+            if len(rows) > _KW_ROW_CAP:
+                draw_into.caption("%d more - the Keyword Hits bucket and the ZIP carry "
+                                  "all of them." % (len(rows) - _KW_ROW_CAP))
         else:
-            trace_box.caption("No scan trace yet.")
+            draw_into.caption("No hit rows to show.")
+
+    trace_into = tab_trace if tab_trace is not None else live
+    if trace_into is not None:
+        if trace:
+            trace_into.code("\n".join(trace[-_KW_TRACE_CAP:]), language="text")
+        elif tab_trace is not None:
+            trace_into.caption("No scan trace yet.")
 
 
 # The first paint. Block 087 could not make this call - the function did not
@@ -16745,8 +16865,10 @@ try:
 except Exception:
     mailview = None
 
-# v13.79 WAVE 6: keyword search. Also optional - the panel degrades to a caption
-# if the module is missing from the deployment, exactly like mailview above.
+# v13.86: mailsearch is imported in block 087 now, because the RUN path needs it
+# long before this block executes. The binding is kept here as well so the name
+# is defined for anything after this point even if block 087's import failed -
+# a failed import degrades to "the keyword scan stays idle", never to a dead page.
 try:
     import mailsearch
 except Exception:
@@ -16790,6 +16912,17 @@ except Exception:
 # statement, and both are cleared together on a failed read. `ok_read` is still
 # what the API returns; `success_read` is the local the branch tests, so the two
 # can never drift.
+#
+# v13.86 FIX KW-7: THE "Search this mailbox for keywords" EXPANDER IS GONE FROM
+# THIS PAGE. It duplicated the Deep Keyword Search the Mailbox Reader page
+# (pages/3_Mailbox_Reader.py) already ships, complete with folder scope, field
+# choice and its own pagers, and it sat three conditions deep here so it was
+# unusable without a selected account. The one keyword surface on this page is
+# the LIVE one - block 087's controls, the panel under them and the third run tab
+# - which is the only one that can scan as the engine runs. Everything the
+# expander owned (bb_kw_folders / bb_kw_folder / bb_kw_words / bb_kw_hits /
+# bb_kw_note / bb_kw_on) is still popped on an owner change below, so nothing is
+# left behind; they are simply not read any more.
 # ==========================================================================
 _READER_STATE_NAME = "reader_state.json"
 _READER_OWNER_KEY = "_reader_owner"
@@ -16959,216 +17092,6 @@ else:
         _r_msgs = str_lit.session_state.get("bb_reader_msgs") or []
         _r_for = str_lit.session_state.get("bb_reader_for") or ""
         _r_note = str_lit.session_state.get("bb_reader_note") or ""
-
-        # ==================================================================
-        # v13.79 WAVE 6 - KEYWORD SEARCH
-        #
-        # THE FOLDER IS A PROMPT WITH NOTHING SELECTED. It used to be implied
-        # (098 hard-codes INBOX), so a keyword in Sent, Archive or Spam could not
-        # be looked for at all - and the obvious fix, defaulting the box to
-        # INBOX, is the wrong one: a search run against a folder the user did not
-        # choose is a result they did not ask for. `index=None` plus a
-        # placeholder means the Search button refuses until a folder is picked,
-        # and the list is only populated by an explicit connect.
-        #
-        # Every hit is a COMBO, so it lands in a real bucket that the engine can
-        # re-run, and the body goes to disk under mail_results/kw_hits_<stamp>/
-        # where block 079's file browser and block 107's ZIP both already look.
-        #
-        # FIX KW-3: THE FULL HIT IS STORED, NOT ONLY ITS BUCKET LINE. hit_line()
-        # carries the account, the keyword counts, the folder, where it matched
-        # and the subject - but no sender, no recipient and no body, so a panel
-        # built from the lines alone could not show them. Each hit also goes into
-        # kw_hits_detail as it LANDS (mailsearch's on_hit), which is what the
-        # live panel in block 105 reads, and which also means a scan that dies
-        # half way has already stored everything it found.
-        # ==================================================================
-        with str_lit.expander("🔎 Search this mailbox for keywords",
-                              expanded=not _r_msgs):
-            if mailsearch is None:
-                str_lit.caption("mailsearch.py is missing from this deployment - "
-                                "keyword search is unavailable.")
-            elif not selected_combo or ":" not in selected_combo:
-                str_lit.caption("The selected line carries no password, so it cannot be "
-                                "opened.")
-            else:
-                str_lit.caption(
-                    "Connect once to list the folders, pick ONE, then type keywords. "
-                    "Nothing is selected for you. Matching is case-insensitive across "
-                    "Subject, From and body, and it reads READ-ONLY so no message is "
-                    "marked seen. Bodies are written to your own results directory and "
-                    "included in the ZIP.")
-
-                if "bb_kw_folders" not in str_lit.session_state:
-                    str_lit.session_state["bb_kw_folders"] = []
-
-                def _kw_connect(combo):
-                    """Open a verified session. Returns (mail, host_or_error)."""
-                    try:
-                        _e, _p = combo.split(":", 1)
-                    except Exception:
-                        return None, "the selected line has no password"
-                    _e, _p = _e.strip(), _p.strip()
-                    _hosts = get_servers(_e).get("imap", [])
-                    if not _hosts:
-                        return None, "no IMAP host for this domain"
-                    _px = sample_alive_proxy(domain=_e.split("@")[-1]) if use_proxy else None
-                    _ok, _mail, _h = verify_and_connect(_e, _p, _hosts, proxy_str=_px)
-                    if not _ok or not _mail:
-                        return None, "credential verification failed"
-                    return _mail, _h
-
-                def _kw_list_folders():
-                    _combo = str_lit.session_state.get("bb_reader_acct") or ""
-                    _m, _err = _kw_connect(_combo)
-                    if not _m:
-                        str_lit.session_state["bb_kw_folders"] = []
-                        str_lit.session_state["bb_kw_note"] = _err
-                        return
-                    try:
-                        _f, _e2 = mailsearch.list_folders(_m)
-                    finally:
-                        mailsearch.close(_m)
-                    str_lit.session_state["bb_kw_folders"] = _f
-                    str_lit.session_state["bb_kw_note"] = (
-                        _e2 or f"{len(_f)} folder(s) - pick one, then type keywords.")
-                    # Popped, not assigned: the widget does not exist yet in a
-                    # callback, so this is the safe direction and it forces the
-                    # prompt back to "nothing selected".
-                    str_lit.session_state.pop("bb_kw_folder", None)
-
-                def _kw_search():
-                    _combo = str_lit.session_state.get("bb_reader_acct") or ""
-                    _folder = str_lit.session_state.get("bb_kw_folder") or ""
-                    _words = str_lit.session_state.get("bb_kw_words") or ""
-                    if not _folder:
-                        str_lit.session_state["bb_kw_note"] = (
-                            "pick a folder first - nothing is selected for you")
-                        return
-                    if not _words.strip():
-                        str_lit.session_state["bb_kw_note"] = "type at least one keyword"
-                        return
-                    _m, _err = _kw_connect(_combo)
-                    if not _m:
-                        str_lit.session_state["bb_kw_note"] = _err
-                        return
-                    _bar = str_lit.progress(0.0, text="searching...")
-
-                    def _prog(done, total, phase):
-                        try:
-                            _bar.progress(min(1.0, done / max(1, total)),
-                                          text=f"{phase} {done}/{total}")
-                        except Exception:
-                            pass
-
-                    try:
-                        _acc, _pw = _combo.split(":", 1)
-                    except Exception:
-                        _acc, _pw = _combo, ""
-                    _acc, _pw = _acc.strip(), _pw.strip()
-
-                    def _on_hit(_h):
-                        """Store the complete hit the moment it lands. Never raises.
-
-                        The account and folder are stamped here because mailsearch
-                        does not know them; the body is cut to 8000 characters,
-                        because 50 hits at the 200k readable cap is 10 MB of
-                        session_state for a view that slices to 4000 anyway.
-                        """
-                        try:
-                            _h["email"] = _acc
-                            _h["password"] = _pw
-                            _h["folder"] = _folder
-                            _row = dict((_k, _v) for _k, _v in _h.items()
-                                        if _k != "raw")
-                            _row["body"] = (_h.get("body") or "")[:8000]
-                            _cur = list(str_lit.session_state.get("kw_hits_detail") or [])
-                            _cur.append(_row)
-                            str_lit.session_state["kw_hits_detail"] = _cur[-120:]
-                        except Exception:
-                            pass
-
-                    def _on_trace(_lvl, _step, _det):
-                        try:
-                            _cur = list(str_lit.session_state.get("kw_trace") or [])
-                            _cur.append("%s %-5s %-10s %s"
-                                        % (datetime.now().strftime("%H:%M:%S"),
-                                           str(_lvl)[:5], str(_step)[:10],
-                                           str(_det)[:300]))
-                            str_lit.session_state["kw_trace"] = _cur[-200:]
-                        except Exception:
-                            pass
-
-                    try:
-                        _hits, _note = mailsearch.search(_m, _folder, _words,
-                                                         on_progress=_prog,
-                                                         on_hit=_on_hit,
-                                                         on_trace=_on_trace)
-                    finally:
-                        mailsearch.close(_m)
-                        try:
-                            _bar.empty()
-                        except Exception:
-                            pass
-                    _stamp = datetime.now().strftime("%Y%m%d%H%M%S")
-                    _kdir = os.path.join(user_file("mail_results"), f"kw_hits_{_stamp}")
-                    _ipath, _written = mailsearch.save_bodies(_kdir, _stamp, _hits)
-                    _new = [mailsearch.hit_line(_h) for _h in _hits]
-                    with session_state_lock:
-                        _cur = list(str_lit.session_state.get("kw_hits_results") or [])
-                        for _ln in _new:
-                            if _ln not in _cur:
-                                _cur.append(_ln)
-                        str_lit.session_state["kw_hits_results"] = _cur
-                    # The raw bytes are not kept in session - the body file has
-                    # them, and kw_hits_detail already holds the cut body.
-                    str_lit.session_state["bb_kw_hits"] = [
-                        dict({_k: _v for _k, _v in _h.items() if _k != "raw"},
-                             body=(_h.get("body") or "")[:8000])
-                        for _h in _hits[:50]]
-                    _msg = (f"{len(_hits)} hit(s) in {_folder}; {_written} body file(s) "
-                            f"written to {os.path.basename(_kdir)}.")
-                    if _note:
-                        _msg += f" {_note}"
-                    str_lit.session_state["bb_kw_note"] = _msg
-                    log_probe_event(f"keyword search: {len(_hits)} hit(s) for "
-                                    f"{_acc} in {_folder}")
-
-                if str_lit.checkbox("Enable keyword search", value=True, key="bb_kw_on"):
-                    str_lit.button("📁 Connect & list folders", width="stretch",
-                                   on_click=_kw_list_folders)
-
-                    _kw_folders = str_lit.session_state.get("bb_kw_folders") or []
-                    if _kw_folders:
-                        str_lit.selectbox(
-                            "Folder to search (nothing is selected for you)",
-                            options=_kw_folders, index=None, key="bb_kw_folder",
-                            placeholder="— pick a folder —")
-                    str_lit.text_input("Keywords (commas separate them)", key="bb_kw_words",
-                                       placeholder="invoice, receipt, statement")
-                    str_lit.button("🔎 Search this folder", width="stretch",
-                                   on_click=_kw_search)
-
-                _kw_note = str_lit.session_state.get("bb_kw_note") or ""
-                if _kw_note:
-                    str_lit.caption(_kw_note)
-                _kw_hits = str_lit.session_state.get("bb_kw_hits") or []
-                if _kw_hits:
-                    str_lit.caption(f"Showing the first {len(_kw_hits)} of this pass. "
-                                    f"Every hit is also in the 🔎 Keyword Hits bucket.")
-                    for _h in _kw_hits:
-                        with str_lit.expander(f"{(_h.get('subject') or '')[:70]} - "
-                                              f"{(_h.get('from') or '')[:40]}",
-                                              expanded=False):
-                            str_lit.caption(
-                                f"{_h.get('folder')} · {_h.get('date')} · matched in "
-                                f"**{_h.get('where')}** on "
-                                f"{', '.join(_h.get('keywords') or [])}")
-                            str_lit.markdown(
-                                "<div style='white-space:pre-wrap;"
-                                "font-family:ui-monospace,monospace;font-size:12px'>"
-                                + html.escape((_h.get("body") or "")[:4000])
-                                + "</div>", unsafe_allow_html=True)
 
         def _reader_do_fetch(combo, limit, page=1):
             """Fetch ONE PAGE of one inbox into session state. Never raises."""
