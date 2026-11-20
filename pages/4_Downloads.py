@@ -1,8 +1,8 @@
 # @@FILE pages/4_Downloads.py blocks=16 version=v13.86
 # @@BLOCK 000 FILE_HEADER deps=-
 """
-pages/4_Downloads.py — Bobito Export Studio  (v13.55)
-=====================================================
+pages/4_Downloads.py — Bobito Export Studio
+===========================================
 Pick WHAT to download, pick HOW it is written, preview it, take it.
 
 Pure reader: no mailbox connection, no proxy credit. Sources are the result
@@ -40,6 +40,19 @@ v13.55 fixes on this page
   status actually exported.
 * _delim_map[delim] raised KeyError on any preset carrying an unknown separator.
 * A 200k row cap with a visible note keeps a runaway export off the phone.
+
+v13.86 on this page
+-------------------
+* PASTE BOX: a list can be typed straight into the sorter, independent of the
+  sources above, so a quick 20-line job needs no result file first. Those rows
+  live only in the sort.
+* COUNTRY AND REGION: two new grouping keys, both read from the domain through
+  mailsort. Neither guesses from a gTLD.
+* TEACH A DOMAIN: `alditra.com` is Indonesian and `.com` cannot say so. A domain
+  taught here is remembered in a per-user map that is read BEFORE the TLD, and
+  the map can be downloaded.
+* The sorter no longer stops the page when nothing is selected, and the empty
+  message names both sources of rows.
 """
 
 import os
@@ -991,14 +1004,16 @@ with tab_break:
 # runstate.py so nothing has to be registered anywhere.
 #
 # WHAT IT DOES THAT "Per-status split" DOES NOT: status is one fixed key. This
-# groups by anything in the row - domain, TLD, host, keyword, folder, length
-# band, first letter, source - with a stated order, and it can also just sort
-# one flat file by email. Every group gets its own button and the whole set gets
-# one archive.
+# groups by anything in the row - domain, TLD, country, region, host, keyword,
+# folder, length band, first letter, source - with a stated order, and it can
+# also just sort one flat file by email. Every group gets its own button and the
+# whole set gets one archive.
 #
 # THE GROUPING IS CACHED ON A SIGNATURE, not recomputed per rerun: this tab body
 # runs on every keystroke anywhere on the page, and grouping 200k rows for
 # nothing is exactly the per-rerun cost this page has already been bitten by.
+# The signature carries the paste count too, so a paste change regroups without
+# a keystroke landing anywhere else first.
 # --------------------------------------------------------------------------
 with tab_sort:
     try:
@@ -1033,6 +1048,47 @@ with tab_sort:
             st.info("Nothing to sort yet - pick a source above, or paste a list here.")
             st.stop()
 
+        # ---- teach a domain its country -----------------------------------
+        # A gTLD carries no country, so alditra.com cannot be placed by any map
+        # that does not already know it. Teaching it once fixes every future
+        # sort; the map is per user and only ever grows from here.
+        with st.expander("Teach a domain its country", expanded=False):
+            st.caption("A `.com` says nothing about where an account is. Add a domain "
+                       "here and every later sort places it. The map is yours, is "
+                       "read before the TLD, and never leaves your files.")
+            _tc1, _tc2 = st.columns([0.55, 0.45])
+            with _tc1:
+                _teach_dom = st.text_input("Domain", key="ex_teach_dom",
+                                           placeholder="alditra.com")
+            with _tc2:
+                _teach_cc = st.selectbox(
+                    "Country", ["- clear -"] + sorted(set(mailsort._TLD_COUNTRY.values())),
+                    key="ex_teach_cc")
+            _tm1, _tm2 = st.columns(2)
+            with _tm1:
+                if st.button("Teach it", width="stretch",
+                             disabled=not (_teach_dom or "").strip()):
+                    _clearing = (_teach_cc == "- clear -")
+                    _n = mailsort.learn(_teach_dom, "" if _clearing else _teach_cc)
+                    # regroup on the next run, without waiting for another key
+                    st.session_state.pop("_ex_sort_sig", None)
+                    st.success("%s - %d domain(s) mapped."
+                               % ("Cleared" if _clearing else "Learned", _n))
+                    st.rerun()
+            with _tm2:
+                _cmap_now = mailsort.custom_map()
+                st.download_button(
+                    "\u2b07 Download map",
+                    data=json.dumps(_cmap_now, indent=2, sort_keys=True).encode("utf-8"),
+                    file_name="domain_countries.json", mime="application/json",
+                    width="stretch", disabled=not _cmap_now)
+            if _cmap_now:
+                st.caption("%d domain(s) mapped. Unplaced gTLDs group under "
+                           "**Global / gTLD**." % len(_cmap_now))
+            else:
+                st.caption("No domains mapped yet. Unplaced gTLDs group under "
+                           "**Global / gTLD**.")
+
         for _k, _v in (("ex_sort_by", mailsort.KEY_LABELS[0]),
                        ("ex_sort_order", mailsort.ORDERS[0]),
                        ("ex_sort_cap", mailsort.CAP_DEFAULT),
@@ -1051,9 +1107,10 @@ with tab_sort:
 
         st.caption(mailsort.describe(_by))
 
-        # Signature: the row set is identified by its size and its two ends, which
-        # is cheap and stable. fname is deliberately NOT in it - it carries a
-        # seconds-resolution stamp and would invalidate the cache every second.
+        # Signature: the row set is identified by its size, its two ends and the
+        # paste count, which is cheap and stable. fname is deliberately NOT in it
+        # - it carries a seconds-resolution stamp and would invalidate the cache
+        # every second.
         _sort_sig = (len(_sort_rows), len(_pasted), _by, _order, int(_cap),
                      bool(_dedupe),
                      _sort_rows[0]["email"] if _sort_rows else "",
