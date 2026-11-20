@@ -1021,8 +1021,17 @@ with tab_break:
 # a keystroke landing anywhere else first.
 # --------------------------------------------------------------------------
 with tab_sort:
+    # ---- stale-module guard -------------------------------------------------
+    # This was a bare `import mailsort` with no guard at all, and the old
+    # sys.modules entry survives 'Updated app!'. The old module has no
+    # paste_rows, so line 1047 raised AttributeError on every render of this tab
+    # - which killed the tab and the footer with it. Reload when any of the
+    # names this tab actually calls is missing.
     try:
         import mailsort
+        if not (hasattr(mailsort, "paste_rows") and hasattr(mailsort, "group_rows")
+                and hasattr(mailsort, "auto_teach") and hasattr(mailsort, "undo_auto")):
+            mailsort = importlib.reload(mailsort)
     except Exception as _ms_err:
         mailsort = None
         st.caption(f"mailsort.py is missing from this deployment: {_ms_err}")
@@ -1044,7 +1053,14 @@ with tab_sort:
             _paste_txt = st.text_area("Pasted addresses", height=160,
                                       key="ex_sort_paste",
                                       placeholder="someone@example.com:password")
-        _pasted = mailsort.paste_rows(_paste_txt)
+        # Guarded: on a module that still predates paste_rows the tab stays up
+        # and says so instead of raising at the first line that touches it.
+        _pasted = []
+        if hasattr(mailsort, "paste_rows"):
+            _pasted = mailsort.paste_rows(_paste_txt)
+        else:
+            st.caption("This mailsort.py has no paste_rows() - paste is unavailable "
+                       "until the module reloads.")
         if _pasted:
             st.caption("**%d** pasted row(s) added to this sort." % len(_pasted))
         _sort_rows = list(sel) + _pasted
