@@ -8,7 +8,7 @@ never has to know how to log in, how to proxy, or how to pick a host.
 
 WHAT IT DOES, and in this order, because it is the cheapest order:
 
-  1. SELECT the folder READ-ONLY, so no \\Seen flag is touched anywhere.
+  1. SELECT the folder READ-ONLY, so no \Seen flag is touched anywhere.
   2. SEARCH ALL and take the newest `scan_limit` ids. The window is bounded on
      purpose: a 40,000-message folder cannot be swept per keystroke.
   3. FETCH HEADERS ONLY in chunks and match the keywords against Subject + From.
@@ -48,7 +48,7 @@ def _s(x):
 
 
 def _unquote_folder(line):
-    """`(\\HasNoChildren) "/" "Sent Items"` -> `Sent Items`. Never raises."""
+    """`(\HasNoChildren) "/" "Sent Items"` -> `Sent Items`. Never raises."""
     m = re.search(r'"([^"]*)"\s*$', line or "")
     if m:
         return m.group(1)
@@ -90,11 +90,11 @@ def list_folders(mail):
 
 
 def _heads_from_bytes(payload):
-    """Header block -> {subject, from, date}. Empty strings on any failure."""
-    heads = {"subject": "", "from": "", "date": ""}
+    """Header block -> {subject, from, to, date}. Empty strings on any failure."""
+    heads = {"subject": "", "from": "", "to": "", "date": ""}
     try:
         msg = _mfb(payload)
-        for key in ("Subject", "From", "Date"):
+        for key in ("Subject", "From", "To", "Date"):
             value = msg.get(key) or ""
             if value:
                 try:
@@ -108,10 +108,10 @@ def _heads_from_bytes(payload):
 
 
 def _headers_of(mail, mid):
-    """One message -> {subject, from, date}. Empty strings on any failure."""
-    heads = {"subject": "", "from": "", "date": ""}
+    """One message -> {subject, from, to, date}. Empty strings on any failure."""
+    heads = {"subject": "", "from": "", "to": "", "date": ""}
     try:
-        typ, data = mail.fetch(mid, "(BODY.PEEK[HEADER.FIELDS (SUBJECT FROM DATE)])")
+        typ, data = mail.fetch(mid, "(BODY.PEEK[HEADER.FIELDS (SUBJECT FROM TO DATE)])")
         if typ != "OK":
             return heads
         for rp in (data or []):
@@ -140,7 +140,7 @@ def _fetch_headers(mail, ids):
         try:
             typ, data = mail.fetch(
                 ",".join(_s(x) for x in part),
-                "(BODY.PEEK[HEADER.FIELDS (SUBJECT FROM DATE)])")
+                "(BODY.PEEK[HEADER.FIELDS (SUBJECT FROM TO DATE)])")
             if typ == "OK":
                 for rp in (data or []):
                     if not isinstance(rp, tuple) or not rp[1]:
@@ -216,27 +216,67 @@ def _readable(raw):
     return text[:BODY_SHOW]
 
 
-def _make_hit(mail, mid, folder, heads, keywords, where, raw=None):
-    """One hit. `raw` is reused when the caller already has the body bytes."""
+def _counts(blob, keywords):
+    """{keyword: occurrences in blob}. Zero entries are dropped."""
+    low = (blob or "").lower()
+    out = {}
+    for k in keywords or []:
+        n = low.count(str(k).lower())
+        if n:
+            out[str(k)] = n
+    return out
+
+
+def _make_hit(mail, mid, folder, heads, keywords, where, raw=None, counts=None):
+    """One hit. `raw` is reused when the caller already has the body bytes.
+
+    `counts` is {keyword: occurrences} for this message, so the bucket line can
+    say HOW MANY mails a keyword produced rather than only that one did.
+    """
     if raw is None:
         raw = _raw_of(mail, mid)
     return {"id": _s(mid), "folder": folder,
             "subject": heads.get("subject") or "(no subject)",
             "from": heads.get("from") or "(unknown sender)",
+            "to": heads.get("to") or "",
             "date": heads.get("date") or "(no date)",
-            "keywords": list(keywords), "where": where,
-            "body": _readable(raw)}
+            "keywords": list(keywords), "counts": dict(counts or {}),
+            "where": where, "body": _readable(raw)}
+
+
+FIELD_LABELS = ("Subject", "From", "To", "Body")
+FIELDS_DEFAULT = ("subject", "from", "to", "body")
+
+
+def _blob(heads, fields):
+    """The header text a hit is matched against, from the chosen fields only."""
+    out = []
+    if "subject" in fields:
+        out.append(heads.get("subject") or "")
+    if "from" in fields:
+        out.append(heads.get("from") or "")
+    if "to" in fields:
+        out.append(heads.get("to") or "")
+    return " ".join(out).lower()
 
 
 def search(mail, folder, words, scan_limit=MAX_SCAN, body_scan=MAX_BODY_SCAN,
-           hit_limit=MAX_HITS, on_progress=None):
-    """(hits, note). Never raises. `on_progress(done, total, phase)` is optional."""
+           hit_limit=MAX_HITS, on_progress=None, fields=None, folders=None,
+           on_trace=None):
+    """(hits, note). Never raises.
+
+    `fields` is any of subject / from / to / body - the header blob is built
+    from the chosen header fields and the body pass only runs when "body" is
+    chosen. `folders` is a list; each is selected READ-ONLY in turn and the
+    single `folder` is used when it is empty.
+
+    `on_trace(level, step, detail)` is called on EVERY path, including the
+    zero-hit ones, so a pass that finds nothing is still readable afterwards
+    instead of looking like a pass that never ran.
+    """
     hits = []
     kws = _keywords(words)
-    if not kws:
-        return hits, "no keyword given"
-    if not folder:
-        return hits, "no folder selected"
+    _t = on_trace or (lambda *a: None)
 
     def _tick(done, total, phase):
         if on_progress is None:
@@ -246,75 +286,105 @@ def search(mail, folder, words, scan_limit=MAX_SCAN, body_scan=MAX_BODY_SCAN,
         except Exception:
             pass
 
+    if not kws:
+        _t("WARN", "search", "no keyword given")
+        return hits, "no keyword given"
+
+    _fields = [str(f).lower() for f in (fields or FIELDS_DEFAULT)]
+    _fields = [f for f in _fields if f in FIELDS_DEFAULT] or list(FIELDS_DEFAULT)
+    _want_body = "body" in _fields
+    _folders = [str(f).strip() for f in (folders or []) if str(f).strip()]
+    if not _folders and folder:
+        _folders = [str(folder)]
+    if not _folders:
+        _t("WARN", "search", "no folder selected")
+        return hits, "no folder selected"
+
+    _t("INFO", "search", "words %r, fields %s, folders %s, window %s"
+       % (kws, ",".join(_fields), ",".join(_folders), scan_limit))
+
     try:
-        quoted = '"%s"' % str(folder).replace('"', "")
-        typ, _ = mail.select(quoted, readonly=True)
-        if typ != "OK":
-            return hits, f"the server refused the folder {folder}"
-        typ, data = mail.search(None, "ALL")
-        if typ != "OK":
-            return hits, "the folder could not be searched"
-        ids = (data[0].split() if data and data[0] else [])
-        if not ids:
-            return hits, "the folder is empty"
-
-        try:
-            scan_limit = max(1, int(scan_limit))
-        except Exception:
-            scan_limit = MAX_SCAN
-        window = ids[-scan_limit:]
-        total = len(window)
-        seen = set()
-
-        for i in range(0, len(window), _FETCH_CHUNK):
-            part = window[i:i + _FETCH_CHUNK]
-            got = _fetch_headers(mail, part)
-            for mid in part:
-                heads = got.get(_s(mid)) or {"subject": "", "from": "", "date": ""}
-                blob = (heads.get("subject", "") + " " + heads.get("from", "")).lower()
-                hit_kw = [k for k in kws if k.lower() in blob]
-                if hit_kw:
-                    seen.add(_s(mid))
-                    hits.append(_make_hit(mail, mid, folder, heads, hit_kw,
-                                          "subject/from"))
-                    if len(hits) >= hit_limit:
-                        break
-            _tick(min(total, i + len(part)), total, "headers")
+        for _f_i, _fname in enumerate(_folders, 1):
             if len(hits) >= hit_limit:
                 break
+            quoted = '"%s"' % _fname.replace('"', "")
+            typ, _ = mail.select(quoted, readonly=True)
+            if typ != "OK":
+                _t("WARN", "folder", "%s refused by the server" % _fname)
+                continue
+            typ, data = mail.search(None, "ALL")
+            if typ != "OK":
+                _t("WARN", "folder", "%s could not be searched" % _fname)
+                continue
+            ids = (data[0].split() if data and data[0] else [])
+            if not ids:
+                _t("INFO", "folder", "%s is empty" % _fname)
+                continue
 
-        if len(hits) < hit_limit:
             try:
-                body_scan = max(0, int(body_scan))
+                _limit = max(1, int(scan_limit))
             except Exception:
-                body_scan = MAX_BODY_SCAN
-            for n, mid in enumerate(reversed(window)):
-                if n >= body_scan:
-                    break
-                if _s(mid) in seen:
-                    continue
-                raw = _raw_of(mail, mid)
-                low = _readable(raw).lower()
-                if not low:
-                    continue
-                hit_kw = [k for k in kws if k.lower() in low]
-                if hit_kw:
-                    heads = _headers_of(mail, mid)
-                    # The body is already in hand from the match, so it is
-                    # reused - _make_hit used to fetch the same message a
-                    # second time for every single body hit.
-                    hits.append(_make_hit(mail, mid, folder, heads, hit_kw, "body",
-                                          raw=raw))
-                    if len(hits) >= hit_limit:
-                        break
-                if n and n % 10 == 0:
-                    _tick(total, total, "bodies")
+                _limit = MAX_SCAN
+            window = ids[-_limit:]
+            total = len(window)
+            seen = set()
+            _t("INFO", "folder", "%s: %d message(s) in the window"
+               % (_fname, total))
 
-        _tick(total, total, "done")
+            for i in range(0, len(window), _FETCH_CHUNK):
+                part = window[i:i + _FETCH_CHUNK]
+                got = _fetch_headers(mail, part)
+                for mid in part:
+                    heads = got.get(_s(mid)) or {"subject": "", "from": "",
+                                                 "to": "", "date": ""}
+                    blob = _blob(heads, _fields)
+                    hit_kw = [k for k in kws if k.lower() in blob]
+                    if hit_kw:
+                        seen.add(_s(mid))
+                        hits.append(_make_hit(mail, mid, _fname, heads, hit_kw,
+                                              "header", counts=_counts(blob, hit_kw)))
+                        if len(hits) >= hit_limit:
+                            break
+                _tick(min(total, i + len(part)), total, "headers")
+                if len(hits) >= hit_limit:
+                    break
+
+            if _want_body and len(hits) < hit_limit:
+                try:
+                    body_scan = max(0, int(body_scan))
+                except Exception:
+                    body_scan = MAX_BODY_SCAN
+                for n, mid in enumerate(reversed(window)):
+                    if n >= body_scan:
+                        break
+                    if _s(mid) in seen:
+                        continue
+                    raw = _raw_of(mail, mid)
+                    low = _readable(raw).lower()
+                    if not low:
+                        continue
+                    hit_kw = [k for k in kws if k.lower() in low]
+                    if hit_kw:
+                        heads = _headers_of(mail, mid)
+                        hits.append(_make_hit(mail, mid, _fname, heads, hit_kw,
+                                              "body", raw=raw,
+                                              counts=_counts(low, hit_kw)))
+                        if len(hits) >= hit_limit:
+                            break
+                    if n and n % 10 == 0:
+                        _tick(total, total, "bodies")
+            _t("INFO", "folder", "%s done: %d hit(s) so far, %d/%d folder(s)"
+               % (_fname, len(hits), _f_i, len(_folders)))
+
+        _tick(1, 1, "done")
         if not hits:
+            _t("INFO", "search", "zero hits - the keywords are not in the scanned "
+                                 "window of %s" % ",".join(_folders))
             return hits, "no keyword matched in the scanned window"
+        _t("INFO", "search", "%d hit(s) total" % len(hits))
         return hits, ""
     except Exception as e:
+        _t("ERR", "search", "%s: %s" % (type(e).__name__, e))
         return hits, f"{type(e).__name__}: {e}"
 
 
@@ -324,10 +394,15 @@ def hit_line(hit):
     The combo comes first and alone before the first " | " on purpose: the
     re-run path cuts there, and every renderer shows only that much.
     """
+    _kw = []
+    _counts_ = hit.get("counts") or {}
+    for _k in hit.get("keywords") or []:
+        _n = int(_counts_.get(_k) or 0)
+        _kw.append("%s(%d)" % (_k, _n) if _n else str(_k))
     return ("%s:%s | kw:%s | folder:%s | %s | %s"
-            % (hit.get("email", ""), hit.get("password", ""),
-               ",".join(hit.get("keywords") or []), hit.get("folder", ""),
-               hit.get("where", ""), (hit.get("subject") or "")[:90]))
+            % (hit.get("email", ""), hit.get("password", ""), ",".join(_kw),
+               hit.get("folder", ""), hit.get("where", ""),
+               (hit.get("subject") or "")[:90]))
 
 
 def save_bodies(directory, stamp, hits, max_files=MAX_HITS):
