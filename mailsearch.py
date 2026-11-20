@@ -24,6 +24,15 @@ everywhere.
 
 Every function returns rather than raises. A search that dies half way still
 returns the hits it already found, with the reason attached.
+
+THE HIT CALLBACK
+----------------
+`on_hit(hit)` fires the moment a hit is COMPLETE - body read, counts worked out -
+so a caller can store it as it lands instead of waiting for the whole pass. A
+long scan over a big folder then shows progress per hit, and a scan that dies
+half way has already handed over everything it found. It is optional and it is
+called inside the same try as everything else, so a raising callback cannot take
+the pass down.
 """
 
 import os
@@ -125,12 +134,12 @@ def _headers_of(mail, mid):
 def _fetch_headers(mail, ids):
     """Chunked header fetch -> {str(mid): heads}. One FETCH per _FETCH_CHUNK ids.
 
-    v13.87: THE CHUNKING WAS A LIE. _FETCH_CHUNK was declared and the loop then
-    fetched one id at a time, so a 200-id window was 200 round trips per folder
-    pass. A set is fetched in one command here; the server answers one tuple per
-    message, prefixed with its id. Any id that comes back unparsed - a pedantic
-    server, a partial answer - falls back to its own single fetch, so the
-    optimisation can only ever cost a round trip, never a message.
+    THE CHUNKING WAS A LIE. _FETCH_CHUNK was declared and the loop then fetched
+    one id at a time, so a 200-id window was 200 round trips per folder pass. A
+    set is fetched in one command here; the server answers one tuple per message,
+    prefixed with its id. Any id that comes back unparsed - a pedantic server, a
+    partial answer - falls back to its own single fetch, so the optimisation can
+    only ever cost a round trip, never a message.
     """
     out = {}
     ids = list(ids)
@@ -262,7 +271,7 @@ def _blob(heads, fields):
 
 def search(mail, folder, words, scan_limit=MAX_SCAN, body_scan=MAX_BODY_SCAN,
            hit_limit=MAX_HITS, on_progress=None, fields=None, folders=None,
-           on_trace=None):
+           on_trace=None, on_hit=None):
     """(hits, note). Never raises.
 
     `fields` is any of subject / from / to / body - the header blob is built
@@ -273,6 +282,9 @@ def search(mail, folder, words, scan_limit=MAX_SCAN, body_scan=MAX_BODY_SCAN,
     `on_trace(level, step, detail)` is called on EVERY path, including the
     zero-hit ones, so a pass that finds nothing is still readable afterwards
     instead of looking like a pass that never ran.
+
+    `on_hit(hit)` is called as each hit is completed, so a caller can store it
+    while the pass is still running. A raising callback is swallowed.
     """
     hits = []
     kws = _keywords(words)
@@ -285,6 +297,16 @@ def search(mail, folder, words, scan_limit=MAX_SCAN, body_scan=MAX_BODY_SCAN,
             on_progress(done, total, phase)
         except Exception:
             pass
+
+    def _keep(hit):
+        """Append and hand over in one place, so on_hit can never be forgotten."""
+        hits.append(hit)
+        if on_hit is not None:
+            try:
+                on_hit(hit)
+            except Exception:
+                pass
+        return len(hits)
 
     if not kws:
         _t("WARN", "search", "no keyword given")
@@ -341,8 +363,8 @@ def search(mail, folder, words, scan_limit=MAX_SCAN, body_scan=MAX_BODY_SCAN,
                     hit_kw = [k for k in kws if k.lower() in blob]
                     if hit_kw:
                         seen.add(_s(mid))
-                        hits.append(_make_hit(mail, mid, _fname, heads, hit_kw,
-                                              "header", counts=_counts(blob, hit_kw)))
+                        _keep(_make_hit(mail, mid, _fname, heads, hit_kw,
+                                        "header", counts=_counts(blob, hit_kw)))
                         if len(hits) >= hit_limit:
                             break
                 _tick(min(total, i + len(part)), total, "headers")
@@ -366,9 +388,9 @@ def search(mail, folder, words, scan_limit=MAX_SCAN, body_scan=MAX_BODY_SCAN,
                     hit_kw = [k for k in kws if k.lower() in low]
                     if hit_kw:
                         heads = _headers_of(mail, mid)
-                        hits.append(_make_hit(mail, mid, _fname, heads, hit_kw,
-                                              "body", raw=raw,
-                                              counts=_counts(low, hit_kw)))
+                        _keep(_make_hit(mail, mid, _fname, heads, hit_kw,
+                                        "body", raw=raw,
+                                        counts=_counts(low, hit_kw)))
                         if len(hits) >= hit_limit:
                             break
                     if n and n % 10 == 0:
