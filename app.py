@@ -2614,7 +2614,7 @@ def build_diagnostics_text():
             _ai_rep = {"error": "%s: %s" % (type(_aie).__name__, _aie)}
         for _k in sorted(_ai_rep):
             A(f"  {_k:20}: {_ai_rep.get(_k)}")
-        A(f"  GEMINI_ENABLED raw  : {os.getenv('GEMINI_ENABLED')!r}   <-- must be the STRING true")
+        A(f"  GEMINI_ENABLED raw  : {os.getenv('GEMINI_ENABLED')!r}   <-- unset = ON when a key is set")
         A(f"  GEMINI_API_KEY      : {'set' if os.getenv('GEMINI_API_KEY') else 'ABSENT'}")
         if str(_ai_rep.get("resolved_model") or "").startswith("(not"):
             A("  *** the alias has not been resolved yet this process - a -latest alias")
@@ -12451,12 +12451,12 @@ def run_keyword_scan(combo):
     the panel can say how many mails a word actually produced instead of only
     that one did.
 
-    v13.86 FIX KW-3: THE FULL HIT DICTS ARE KEPT NOW. Only hit_line() strings were
-    stored, and kw_hits_detail - the list that carries From, To and the body
-    snippet - was reset at run start and written by nothing, so the panel could
-    only ever draw a bare line with those three columns blank. The dicts are
-    appended here, body cut to KW_DETAIL_BODY and the list capped, because the
-    snippet is cut from the body and the body is the expensive part.
+    v13.86 FIX KW-3: THE FULL HIT DICTS ARE KEPT, and kept AS THEY LAND. Only
+    hit_line() strings were stored and kw_hits_detail had no writer at all, so the
+    panel could only draw a bare line with From / To / snippet blank. The module
+    already fires on_hit() the moment a hit is complete - that is what it is for -
+    and it is wired here, so a row appears while the pass is still running instead
+    of all of them at the end.
     """
     if not keyword_hits_wanted():
         return 0
@@ -12487,6 +12487,28 @@ def run_keyword_scan(combo):
     _px = sample_alive_proxy(domain=_e.split("@")[-1]) if use_proxy else None
     _m = None
     _hits = []
+
+    def _on_hit_store(_h):
+        """One completed hit -> the panel, now. Never raises.
+
+        The combo is stamped onto the dict the module handed over, so the object
+        still in `_hits` carries it and hit_line() works later without a second
+        pass over the list.
+        """
+        try:
+            _h["email"], _h["password"] = _e, _p
+            _d = dict(_h)
+            _d["body"] = str(_d.get("body") or "")[:KW_DETAIL_BODY]
+            with session_state_lock:
+                _cur = list(str_lit.session_state.get("kw_hits_detail") or [])
+                _cur.append(_d)
+                str_lit.session_state["kw_hits_detail"] = _cur[-KW_DETAIL_MAX:]
+            _paint = globals().get("render_kw_panel")
+            if _paint is not None:
+                _paint()
+        except Exception:
+            pass
+
     try:
         _ok, _m, _h = verify_and_connect(_e, _p, _hosts, proxy_str=_px)
         if not _ok or not _m:
@@ -12494,7 +12516,8 @@ def run_keyword_scan(combo):
             return 0
         _hits, _note = mailsearch.search(
             _m, _folders[0], _words, scan_limit=_scan, body_scan=_scan,
-            fields=_fields, folders=_folders, on_trace=_kw_trace)
+            fields=_fields, folders=_folders, on_trace=_kw_trace,
+            on_hit=_on_hit_store)
         if _note:
             _kw_trace("WARN", "note", _note)
     except Exception as _kw_err:
@@ -12512,9 +12535,14 @@ def run_keyword_scan(combo):
         _kw_trace("INFO", "zero", "no hit for %s" % _e)
         return 0
     _stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    _kdir = os.path.join(user_file("mail_results"), f"kw_hits_{_stamp}")
+    # The stamp is second-resolution, so two accounts scanned in the same second
+    # shared one directory and the second _index.txt overwrote the first. The
+    # address slug makes it unique per account.
+    _slug = re.sub(r"[^A-Za-z0-9]+", "_", _e).strip("_")[:40] or "acct"
+    _kdir = os.path.join(user_file("mail_results"), f"kw_hits_{_stamp}_{_slug}")
     for _h in _hits:
-        _h["email"], _h["password"] = _e, _p
+        _h.setdefault("email", _e)
+        _h.setdefault("password", _p)
     try:
         mailsearch.save_bodies(_kdir, _stamp, _hits)
     except Exception:
@@ -12523,7 +12551,7 @@ def run_keyword_scan(combo):
     for _h in _hits:
         for _w, _n in (_h.get("counts") or {}).items():
             _per_word[_w] = _per_word.get(_w, 0) + int(_n or 0)
-    _kw_count(_per_word.keys(), 0)
+    # One counter pass, not the old seed-then-add pair.
     try:
         _cur_counts = dict(str_lit.session_state.get("kw_counts") or {})
         for _w, _n in _per_word.items():
@@ -12531,20 +12559,15 @@ def run_keyword_scan(combo):
         str_lit.session_state["kw_counts"] = _cur_counts
     except Exception:
         pass
+    # The DETAILS are already stored per hit above; only the bucket LINES are
+    # written here, so nothing is appended twice.
     with session_state_lock:
         _cur = list(str_lit.session_state.get("kw_hits_results") or [])
-        _det = list(str_lit.session_state.get("kw_hits_detail") or [])
         for _h in _hits:
             _ln = mailsearch.hit_line(_h)
             if _ln not in _cur:
                 _cur.append(_ln)
-            # FIX KW-3: the dict the line was cut from, body truncated. The panel
-            # needs From / To / body to draw a full row; the line alone cannot.
-            _d = dict(_h)
-            _d["body"] = str(_d.get("body") or "")[:KW_DETAIL_BODY]
-            _det.append(_d)
         str_lit.session_state["kw_hits_results"] = _cur
-        str_lit.session_state["kw_hits_detail"] = _det[-KW_DETAIL_MAX:]
     _kw_trace("INFO", "hit", "%d hit(s) for %s in %s"
               % (len(_hits), _e, ",".join(_folders)))
     log_probe_event(f"keyword scan: {len(_hits)} hit(s) for {_e} in {_folders}")
@@ -16474,7 +16497,7 @@ if str_lit.session_state.engine_has_run or _persisted_valid:
                                            list(str_lit.session_state.get("pre_smtp_failed", []))),
             "⏭ Skipped / Filtered": ("SKIPPED", list(str_lit.session_state.skip_results)),
             "❓ Unclassified": ("UNCLASSIFIED", list(str_lit.session_state.unknown_results)),
-            "🔎 Keyword Hits Found (from the Mailbox Reader)":
+            "🔎 Keyword Hits Found":
                 ("KW_HITS", list(str_lit.session_state.get("kw_hits_results", []))),
         }
 
@@ -16636,9 +16659,9 @@ if str_lit.session_state.engine_has_run or _persisted_valid:
             f"Skipped bucket and the ZIP.")
     if kw_hits_len_val:
         str_lit.caption(
-            f"🔎 **{kw_hits_len_val} keyword hit(s)** came from the Mailbox Reader, not from "
-            f"this run. The message bodies are on disk under `mail_results/kw_hits_*` and in "
-            f"the ZIP under `keyword_bodies/`. Set Engine Action Mode to '🔎 Keyword Hits "
+            f"🔎 **{kw_hits_len_val} keyword hit(s)** came from THIS run's keyword pass. "
+            f"The message bodies are on disk under `mail_results/kw_hits_*` and in the "
+            f"ZIP under `keyword_bodies/`. Set Engine Action Mode to '🔎 Keyword Hits "
             f"Found' to run these accounts through the checker.")
     if wrong_len_val and CFG.get("CONFIRM_WRONG_ACROSS_HOSTS", True):
         str_lit.caption(
