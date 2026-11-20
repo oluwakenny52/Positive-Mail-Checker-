@@ -93,7 +93,7 @@ pages/10 block 013, so the whole app froze on its first load with a key present.
 
 A DEAD MODEL ID FAILS OVER, AND THE LATCH HEALS  (v13.86)
 ---------------------------------------------------------
-Three separate reasons the console looked dead, and the page had no way to tell
+Four separate reasons the console looked dead, and the page had no way to tell
 them apart:
 
   1. chat_stream had NO retry. classify had three attempts and chat had one, so
@@ -107,8 +107,12 @@ them apart:
   3. A 404 means THE MODEL ID IS GONE, and retrying it cannot help. 404 and 503
      now advance along MODEL_CHAIN to a different model instead of repeating the
      same id, and a 404 no longer counts against the latch at all - it is a
-     configuration fact, not a transient fault. That was the "http 404 (final)"
-     followed by a latched console.
+     configuration fact, not a transient fault.
+  4. THE 503s CARRY THE REAL CAUSE. The field bodies read "This model is
+     currently experiencing high demand" - the provider being busy, not the key.
+     gemini-2.0-flash 404s on this project and is out of the chain; the -lite
+     and -latest ids are in it; and when every model in the chain comes back busy
+     the error says so instead of leaving a bare 503 under a latched console.
 """
 
 from __future__ import annotations
@@ -164,8 +168,11 @@ CHAT_MAX_TOKENS = 1400
 
 # Model failover. A 404 means the id is retired and a 503 means that one model is
 # overloaded, so neither is worth repeating - the next entry is tried instead.
-MODEL_CHAIN = ("gemini-flash-latest", "gemini-2.5-flash", "gemini-2.5-pro",
-               "gemini-2.0-flash")
+# gemini-2.0-flash 404s on this project; the -latest alias stays FIRST because it
+# tracks whatever Google currently serves, and the 2.5 family behind it are the
+# ids that answer.
+MODEL_CHAIN = ("gemini-flash-latest", "gemini-2.5-flash", "gemini-2.5-flash-lite",
+               "gemini-2.5-pro")
 MODEL_TRIES = 3
 
 # How long a trip lasts before one attempt is allowed through. Long enough that a
@@ -834,6 +841,10 @@ def chat_stream(messages, context="", model=None):
     A DROPPED CONNECTION IS RETRIED, and a dead model id is stepped past. The
     retry only happens while NOTHING has been yielded yet - re-running after half
     a reply would print it twice.
+
+    When every model in the chain comes back busy the error says so in words.
+    "http 503" on its own reads as a broken key; the body says the model is
+    overloaded and that is what the page should show.
     """
     global _calls_run, _tripped, _tripped_at
     payload = _chat_payload(messages, context, model)
@@ -857,9 +868,11 @@ def chat_stream(messages, context="", model=None):
     data = json.dumps(payload).encode("utf-8")
     code, got_any = 0, False
     final_code, final_err = 0, ""
+    tried = 0
     cands = _candidates(start_model)
     for cand in cands:
         for attempt in range(1, max(1, int(CHAT_ATTEMPTS)) + 1):
+            tried += 1
             trace("INFO", "chat", "attempt %d, model %s, %d turn(s), budget %ss"
                   % (attempt, cand, len(payload.get("contents") or []),
                      int(CHAT_TIMEOUT)))
@@ -927,6 +940,10 @@ def chat_stream(messages, context="", model=None):
                 break
         if got_any:
             break
+
+    if not got_any and final_code == 503:
+        final_err = ("every model in the chain is overloaded (503 after %d "
+                     "attempt(s)) - the key is fine, retry in a minute" % tried)
 
     with _lock:
         _calls_run += 1
@@ -1068,6 +1085,8 @@ def selftest(verbose=False) -> bool:
 
     # ---- model failover ----
     add("chain_has_default", DEFAULT_MODEL in MODEL_CHAIN)
+    add("chain_no_retired_2_0", "gemini-2.0-flash" not in MODEL_CHAIN)
+    add("chain_has_lite", "gemini-2.5-flash-lite" in MODEL_CHAIN)
     add("cand_starts_with_asked", _candidates("gemini-2.5-pro")[0] == "gemini-2.5-pro")
     add("cand_dedupes", len(_candidates("gemini-flash-latest")) ==
         len(set(_candidates("gemini-flash-latest"))))
