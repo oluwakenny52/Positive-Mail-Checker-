@@ -193,8 +193,20 @@ st.markdown(_css(), unsafe_allow_html=True)
 # @@BLOCK 006 SOURCES deps=005
 import breach
 
-if not (hasattr(breach, "ensure_browser") and hasattr(breach, "check_many")):
+# ---- stale-module guard -------------------------------------------------------
+# Streamlit Cloud keeps this process alive across 'Updated app!', so sys.modules
+# keeps serving whichever copy was imported first. The old guard tested
+# ensure_browser/check_many, which the OLD module already had, so it never fired
+# and the page ran old code with no page_mode, no trace_read and no 401 handling.
+# page_wanted, trace_read and trace_clear exist only in the current module, so
+# testing those is a real version test and the reload actually happens.
+if not (hasattr(breach, "page_wanted") and hasattr(breach, "trace_read")
+        and hasattr(breach, "trace_clear")):
     breach = importlib.reload(breach)
+    try:
+        breach.trace("INFO", "page", "stale breach module replaced by reload")
+    except Exception:
+        pass
 
 from auth import user_file
 
@@ -292,6 +304,11 @@ def _csv(rows):
     for r in rows:
         bs = r.get("breaches") or []
         ps = r.get("pastes") or []
+        # The record key is newest_days - reading newest_breach_days left this
+        # column blank on every row, whatever the run had actually found.
+        _newest = r.get("newest_days")
+        if _newest is None:
+            _newest = r.get("newest_breach_days")
         out.append(",".join([
             str(r.get("verdict") or ""),
             str(r.get("email") or ""),
@@ -303,7 +320,7 @@ def _csv(rows):
             str(r.get("corpora", 0)),
             str(r.get("sites", 0)),
             str(r.get("sensitive", 0)),
-            str(r.get("newest_breach_days") if r.get("newest_breach_days") is not None else ""),
+            str(_newest) if _newest is not None else "",
             '"%s"' % "; ".join(b.get("title") or "" for b in bs[:12]).replace('"', "'"),
             '"%s"' % "; ".join(sorted({c for b in bs
                                        for c in (b.get("classes") or [])})).replace('"', "'"),
@@ -329,6 +346,35 @@ def _watch(key, label):
 
 def _trace_code(limit=200, since=0):
     return breach.trace_text(limit=limit, since=since)
+
+
+def _trace_read(limit=250):
+    """Structured events where the module has them, else a stand-in from text.
+
+    Keeps section 4 working against a module that predates trace_read instead of
+    dying on an AttributeError after a run has already been paid for.
+    """
+    fn = getattr(breach, "trace_read", None)
+    if callable(fn):
+        try:
+            return list(fn(limit=limit))
+        except Exception:
+            return []
+    try:
+        return [1] if breach.trace_text(limit=limit) else []
+    except Exception:
+        return []
+
+
+def _hibp_key():
+    """True when HIBP_API_KEY is set. Read here only to say whether it is on."""
+    k = os.environ.get("HIBP_API_KEY") or ""
+    if not k:
+        try:
+            k = str(st.secrets.get("HIBP_API_KEY") or "")
+        except Exception:
+            k = ""
+    return bool(k.strip())
 
 
 # ---- owner gate: a second unlock in this tab must not inherit the last run ----
@@ -416,6 +462,22 @@ with _bst2:
             breach.ensure_browser(force=True)
             st.rerun()
 
+# ---- the address tier: keyed, or keyless and challenged ------------------------
+# The keyless unifiedsearch endpoint answers 401 to anonymous callers now, and a
+# 401 is not a wall the browser can be sent at - it reads as "no record", which
+# is why counts sat at 0 while the site itself listed the breaches. With a key
+# the tier goes to /api/v3/breachedaccount and /api/v3/pasteaccount, which is the
+# only reliable path left for addresses.
+if _hibp_key():
+    st.caption("\U0001f511 HIBP_API_KEY is set - addresses are read from the keyed API "
+               "(/api/v3/breachedaccount, /api/v3/pasteaccount) with the hibp-api-key "
+               "header. The key never leaves this server.")
+else:
+    st.caption("\u26a0 No HIBP_API_KEY set. The keyless address tier answers 401, so "
+               "addresses come back UNKNOWN and the counts read 0. Put HIBP_API_KEY in "
+               "the app secrets, or leave the browser tier on so a challenged address "
+               "is resolved from the page instead.")
+
 _c1, _c2, _c3, _c4, _c5 = st.columns(5)
 with _c1:
     _workers = st.slider("Workers", 1, 8, 4, key="_breach_workers",
@@ -490,13 +552,14 @@ if _run and _pairs:
     _tier = "http-only" if _http_only else "http+browser"
     breach.trace("CLICK", "run", "pressed: %d address(es), workers=%d, delay=%s, "
                  "tier=%s" % (len(_pairs), int(_workers), _delay, _tier))
-    # v13.87: THE TIER IS PASSED. Both calls take it; the except is only for a
-    # breach.py that has not caught up yet, and it says so in the trace rather
-    # than silently running the old way.
+    # THE TIER AND THE CAPTURE SWITCH ARE PASSED. Both calls take them; the
+    # fallbacks are only for a breach.py that has not caught up, and they say so
+    # in the trace rather than silently running the old way.
     try:
         breach.configure(pages=int(_pages), delay=float(_delay),
                          http_only=bool(_http_only),
                          page_mode=_page_mode, page_on=_page_on)
+        breach.trace("INFO", "run", "configure: tier + capture switch accepted")
     except TypeError:
         try:
             breach.configure(pages=int(_pages), delay=float(_delay),
@@ -506,7 +569,8 @@ if _run and _pairs:
             breach.trace("WARN", "run", "breach.configure has no http_only argument "
                                         "- the tier switch is NOT applied")
         breach.trace("WARN", "run", "breach.configure has no page_mode argument "
-                                    "- the capture switch is NOT applied")
+                                    "- the capture switch is NOT applied, and a "
+                                    "breach.py predating it may also still 401")
     breach.trace("INFO", "run", "pages: %s%s" % (
         _page_mode, (" (%s)" % ",".join(_page_on)) if _page_on else ""))
     _since0 = breach.trace_seq()
@@ -568,7 +632,12 @@ if _run and _pairs:
         # A message widget is REQUIRED here. Without one the ledger closes the
         # press as "NO RESULT | finished without reporting", which is exactly what
         # the 00:36:57 entry recorded.
-        if _b["UNKNOWN"] and _http_only:
+        if _b["UNKNOWN"] and not _hibp_key():
+            st.session_state[_MSG_KEY] = (
+                "warning", _msg + " No HIBP_API_KEY is set, and the keyless address "
+                                  "tier answers 401 - the unresolved ones are that, "
+                                  "not clean addresses.")
+        elif _b["UNKNOWN"] and _http_only:
             st.session_state[_MSG_KEY] = (
                 "warning", _msg + " Unresolved ones were challenged and HTTP only was "
                                   "selected - switch the tier to HTTP then browser to "
@@ -643,10 +712,13 @@ if _rows:
     if not _show:
         st.info("Nothing in that band.")
     else:
-        for r in _show:
+        for _ix, r in enumerate(_show):
             _v = str(r.get("verdict") or "UNKNOWN")
             _bs = r.get("breaches") or []
             _ps = r.get("pastes") or []
+            _pg_t = str(r.get("page_text") or "")
+            _pg_h = str(r.get("page_html") or "")
+            _rid = abs(hash(r.get("email") or "")) % 100000000
             with st.expander("%s  %s" % (r.get("email") or "?", _v), expanded=False):
                 st.markdown('<span class="br-band %s">%s</span> &nbsp; %s'
                             % (_BAND_CSS.get(_v, "br-unknown"), _v,
@@ -659,23 +731,58 @@ if _rows:
                 if r.get("error"):
                     st.caption("error: %s" % r["error"])
                 if _bs:
-                    st.markdown("**Breaches on this address**")
+                    st.markdown("**Breaches on this address** - %d" % len(_bs))
                     for b in _bs[:25]:
                         _d = b.get("days")
-                        _age = "%d day(s) ago" % _d if _d is not None else "date unknown"
+                        # Prefer the real date when the record carries one, and keep
+                        # the age as the fallback for records that only have days.
+                        _when = (b.get("date") or b.get("breach_date")
+                                 or ("%d day(s) ago" % _d if _d is not None
+                                     else "date unknown"))
                         st.markdown("- **%s**%s - %s, %s record(s), classes: %s"
                                     % (b.get("title") or "?",
                                        " _(stealer corpus)_" if b.get("corpus") else "",
-                                       _age, "{:,}".format(int(b.get("pwn_count") or 0)),
+                                       _when, "{:,}".format(int(b.get("pwn_count") or 0)),
                                        ", ".join(b.get("classes") or []) or "-"))
                         if b.get("description"):
                             st.caption(b["description"][:300])
+                elif r.get("error"):
+                    st.caption("No breach record could be read - see the error above.")
                 else:
                     st.caption("No breach record for this address.")
                 if _ps:
                     st.markdown("**Pastes quoting the address:** %d" % len(_ps))
                     for p in _ps[:10]:
                         st.caption("%s  %s" % (p.get("title") or "?", p.get("date") or ""))
+
+                # ---- the captured page: text or HTML, whichever you want ----
+                if _pg_t or _pg_h:
+                    _opts = (["Text", "HTML"] if (_pg_t and _pg_h)
+                             else (["Text"] if _pg_t else ["HTML"]))
+                    _pv = st.radio("Page view", _opts, horizontal=True, index=0,
+                                   key="_pv_%d" % _rid,
+                                   help="What the site actually rendered for this "
+                                        "address, kept under your own prefix.")
+                    if _pv == "Text":
+                        st.code(_pg_t[:40000] or "(empty page)", language="text")
+                        st.download_button(
+                            "\u2b07 Download this page as text",
+                            data=_pg_t.encode("utf-8"),
+                            file_name="page_%s.txt" % _rid,
+                            mime="text/plain", width="stretch",
+                            key="_pvt_%d" % _rid)
+                    else:
+                        components.html(_pg_h, height=560, scrolling=True)
+                        st.download_button(
+                            "\u2b07 Download this page as HTML",
+                            data=_pg_h.encode("utf-8"),
+                            file_name="page_%s.html" % _rid,
+                            mime="text/html", width="stretch",
+                            key="_pvh_%d" % _rid)
+                elif st.session_state.get(_CAP_MODE_KEY) != "off":
+                    st.caption("No page captured for this address - the capture mode "
+                               "or its outcome filter skipped it.")
+
                 st.caption("via %s · checked %s"
                            % (r.get("via") or "-", r.get("checked_at") or ""))
 
@@ -704,7 +811,7 @@ st.caption("Everything that happened, newest last: each control moved, each addr
            "address - the password is never in it."
            % (breach.last_url() or "https://haveibeenpwned.com/unifiedsearch/<address>"))
 
-_tevents = breach.trace_read(limit=250)
+_tevents = _trace_read(limit=250)
 if not _tevents:
     st.caption("Nothing traced yet.")
 else:
