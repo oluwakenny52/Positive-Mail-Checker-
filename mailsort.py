@@ -17,11 +17,29 @@ one. A domain with a slash or a colon in it must not become a path.
 
 Ordering is explicit and always applied - "A-Z" is the default, not "whatever
 order the dict came out in" - so the same input produces the same archive twice.
+
+COUNTRY AND REGION  (v13.86)
+----------------------------
+A ccTLD is a country by definition, but a bare `.com` says nothing about where
+an account is - `alditra.com` is Indonesian and no TLD-only rule can know that.
+So the lookup never guesses from a gTLD. It goes, in order:
+
+    1. the owner's own map, which always wins and is taught from the page
+    2. a seed map of free-mail providers and big brands
+    3. a real ccTLD, two-label ones like co.uk included
+    4. a generic TLD -> the Global / gTLD bucket
+    5. anything else -> unknown
+
+`.io` and `.tv` are technically the British Indian Ocean Territory and Tuvalu,
+but nobody groups by that, so they sit in GENERIC_TLDS and land in the Global
+bucket. The custom map is a per-user JSON file and is the only tier that grows.
 """
 
+import io
+import json
+import os
 import re
 import zipfile
-import io
 
 # Local rank, so ordering never depends on the page's table.
 _RANK = {
@@ -74,11 +92,6 @@ def _first(local):
 
 # ---------------------------------------------------------------------------
 # country / region
-#
-# DERIVED FROM THE TLD, offline, no geo API and no per-row lookup. A ccTLD is a
-# country by definition; a handful of gTLDs carry one too (`.co.uk` is the UK,
-# `.com.au` is Australia). Everything else is "(unknown)" on purpose - guessing
-# a country from an arbitrary gTLD would put real domains in the wrong bucket.
 # ---------------------------------------------------------------------------
 _TLD_COUNTRY = {
     "uk": "United Kingdom", "co.uk": "United Kingdom", "org.uk": "United Kingdom",
@@ -163,22 +176,182 @@ _REGION_OF = {
 
 NO_COUNTRY = "(unknown country)"
 NO_REGION = "(unknown region)"
+COUNTRY_GENERIC = "Global / gTLD"
+REGION_GENERIC = "Global"
+
+# TLDs bought for meaning rather than for a country. `.io` is technically the
+# British Indian Ocean Territory and `.tv` is Tuvalu, but nobody groups by that,
+# so these land in the Global bucket instead of a country nobody recognises.
+GENERIC_TLDS = frozenset({
+    "com", "net", "org", "info", "biz", "edu", "gov", "mil", "int",
+    "io", "co", "me", "tv", "ai", "cc", "ws", "to", "fm", "am", "nu", "sh",
+    "ac", "la", "ly", "gg", "im", "vc", "bz", "gs", "ms", "tk", "cx",
+    "app", "dev", "xyz", "online", "site", "shop", "store", "cloud", "email",
+    "tech", "pro", "link", "live", "life", "world", "today", "digital",
+    "agency", "media", "group", "network", "solutions", "services", "systems",
+    "global", "one", "run", "page", "blog", "design", "studio", "works",
+    "space", "website", "press", "finance", "capital", "fund", "ventures",
+    "company", "host", "art", "cafe", "fun", "icu", "top", "vip", "wiki",
+    "zone", "codes", "tools", "plus", "team", "work", "care", "click",
+})
+
+# Known providers and brands, checked BEFORE the generic bucket. Without this a
+# gmail.com row is "Global", which is true of the TLD and false of the account.
+SEED_DOMAINS = {
+    "gmail.com": "United States", "googlemail.com": "United States",
+    "outlook.com": "United States", "hotmail.com": "United States",
+    "live.com": "United States", "msn.com": "United States",
+    "yahoo.com": "United States", "aol.com": "United States",
+    "icloud.com": "United States", "me.com": "United States",
+    "proton.me": "Switzerland", "protonmail.com": "Switzerland",
+    "gmx.net": "Germany", "gmx.de": "Germany", "web.de": "Germany",
+    "t-online.de": "Germany", "freenet.de": "Germany",
+    "orange.fr": "France", "free.fr": "France", "laposte.net": "France",
+    "libero.it": "Italy", "virgilio.it": "Italy",
+    "mail.ru": "Russia", "yandex.ru": "Russia", "rambler.ru": "Russia",
+    "qq.com": "China", "163.com": "China", "126.com": "China", "sina.com": "China",
+    "naver.com": "South Korea", "daum.net": "South Korea",
+    "seznam.cz": "Czechia", "wp.pl": "Poland", "o2.pl": "Poland",
+    "interia.pl": "Poland", "onet.pl": "Poland",
+    "abv.bg": "Bulgaria", "mail.bg": "Bulgaria",
+    "ukr.net": "Ukraine", "i.ua": "Ukraine",
+    "bigpond.com": "Australia", "optusnet.com.au": "Australia",
+    "xtra.co.nz": "New Zealand",
+    "shaw.ca": "Canada", "rogers.com": "Canada", "telus.net": "Canada",
+    "uol.com.br": "Brazil", "bol.com.br": "Brazil", "terra.com.br": "Brazil",
+    "yahoo.co.jp": "Japan", "docomo.ne.jp": "Japan", "ezweb.ne.jp": "Japan",
+    "hanmail.net": "South Korea", "nate.com": "South Korea",
+    "rediffmail.com": "India", "sify.com": "India",
+    "btinternet.com": "United Kingdom", "sky.com": "United Kingdom",
+    "virginmedia.com": "United Kingdom", "ntlworld.com": "United Kingdom",
+    "talktalk.net": "United Kingdom",
+}
+
+CUSTOM_NAME = "domain_countries.json"
+_CUSTOM = {"mtime": None, "map": {}}
+
+
+def _custom_path() -> str:
+    try:
+        import auth
+        return auth.user_file(CUSTOM_NAME)
+    except Exception:
+        return ""
+
+
+def custom_map() -> dict:
+    """The owner's domain -> country map, re-read when the file moves.
+
+    Memoised on mtime, so a sort of 5000 rows is one stat and no re-read.
+    """
+    p = _custom_path()
+    if not p:
+        return dict(_CUSTOM["map"])
+    try:
+        mt = os.path.getmtime(p) if os.path.exists(p) else None
+    except Exception:
+        mt = None
+    if _CUSTOM["mtime"] == mt and _CUSTOM["map"]:
+        return dict(_CUSTOM["map"])
+    out = {}
+    try:
+        if p and os.path.exists(p):
+            with open(p, encoding="utf-8", errors="ignore") as fh:
+                data = json.load(fh)
+            if isinstance(data, dict):
+                out = {str(k).strip().lower(): str(v).strip()
+                       for k, v in data.items()
+                       if str(k).strip() and str(v).strip()}
+    except Exception:
+        out = dict(_CUSTOM["map"])
+    _CUSTOM["mtime"] = mt
+    _CUSTOM["map"] = out
+    return dict(out)
+
+
+def custom_save(mapping) -> int:
+    """Write the map back. Returns how many entries are stored."""
+    p = _custom_path()
+    clean = {str(k).strip().lower(): str(v).strip()
+             for k, v in (mapping or {}).items()
+             if str(k).strip() and str(v).strip()}
+    if p:
+        try:
+            os.makedirs(os.path.dirname(p) or ".", exist_ok=True)
+            tmp = p + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as fh:
+                json.dump(clean, fh, indent=2, sort_keys=True)
+            os.replace(tmp, p)
+        except Exception:
+            pass
+    _CUSTOM["mtime"] = None
+    _CUSTOM["map"] = clean
+    return len(clean)
+
+
+def learn(domain, country) -> int:
+    """Teach one domain, or clear it when `country` is empty. New map size."""
+    d = (domain or "").strip().lower().lstrip("@")
+    if d.startswith("www."):
+        d = d[4:]
+    cur = custom_map()
+    if not d:
+        return len(cur)
+    if country:
+        cur[d] = str(country).strip()
+    else:
+        cur.pop(d, None)
+    return custom_save(cur)
+
+
+def _tlds_of(domain) -> tuple:
+    """(full domain, two-label tail, single tld). Any may be empty."""
+    d = (domain or "").strip().lower().rstrip(".")
+    if not d or "." not in d:
+        return d, "", ""
+    parts = d.split(".")
+    two = ".".join(parts[-2:]) if len(parts) >= 2 else ""
+    return d, two, parts[-1]
 
 
 def country_of(domain) -> str:
-    """Country from a domain's TLD, or NO_COUNTRY. Never raises."""
-    d = (domain or "").strip().lower().rstrip(".")
-    if not d:
+    """Country for a domain, in this order - never a guess from a gTLD.
+
+      1. the owner's own map, which always wins
+      2. the seed map (free mail and big brands)
+      3. a real ccTLD, including two-label ones like co.uk
+      4. a generic TLD -> the Global bucket
+      5. anything else -> unknown
+
+    Never raises.
+    """
+    full, two, tld = _tlds_of(domain)
+    if not full:
         return NO_COUNTRY
-    for cand in (d, d.rsplit(".", 1)[-1] if "." in d else ""):
-        if cand and cand in _TLD_COUNTRY:
-            return _TLD_COUNTRY[cand]
+    cur = custom_map()
+    if full in cur:
+        return cur[full]
+    if two and two in cur:
+        return cur[two]
+    if full in SEED_DOMAINS:
+        return SEED_DOMAINS[full]
+    if two and two in _TLD_COUNTRY:
+        return _TLD_COUNTRY[two]
+    if tld in GENERIC_TLDS:
+        return COUNTRY_GENERIC
+    if tld in _TLD_COUNTRY:
+        return _TLD_COUNTRY[tld]
     return NO_COUNTRY
 
 
 def region_of(domain) -> str:
-    """Region from the domain's TLD country, or NO_REGION. Never raises."""
-    return _REGION_OF.get(country_of(domain), NO_REGION)
+    """Region for a domain. A Global-bucket country is its own region."""
+    c = country_of(domain)
+    if c == COUNTRY_GENERIC:
+        return REGION_GENERIC
+    if c == NO_COUNTRY:
+        return NO_REGION
+    return _REGION_OF.get(c, NO_REGION)
 
 
 SORT_KEYS = {
@@ -205,13 +378,13 @@ def describe(label):
         "Domain (after the @)": "One group per recipient domain - the usual choice.",
         "Status (the verdict)": "One group per verdict, so a whole verdict can go alone.",
         "TLD": "One group per top-level domain, e.g. every .de in one file.",
-        "Country (from the domain TLD)": "One group per country, read from the TLD. "
-                                         "A .de lands in Germany and a .co.uk in the "
-                                         "United Kingdom; a bare .com cannot be placed "
-                                         "and lands in the unknown group.",
+        "Country (from the domain TLD)": "One group per country. Your own domain map "
+                                         "is read first, then known providers, then "
+                                         "the TLD. A bare .com that nothing places "
+                                         "lands in Global / gTLD, not in unknown.",
         "Region (from the domain TLD)": "One group per continent - Europe, Asia, "
                                         "Africa, the Americas, Oceania, the Middle "
-                                        "East - rolled up from the same TLD map.",
+                                        "East - plus a Global bucket for gTLDs.",
         "Mail host": "One group per resolved mail server.",
         "Keyword (from a keyword hit)": "One group per keyword that matched - only "
                                         "meaningful on keyword-hit rows.",
