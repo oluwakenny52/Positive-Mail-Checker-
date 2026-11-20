@@ -854,11 +854,45 @@ if st.button("\U0001f50c Probe the endpoint", width="stretch"):
                   _p.get("resolved_model") or "-"))
     if _p.get("error"):
         st.caption("error: `%s`" % _clip(_p.get("error"), 300))
+    if _p.get("trace"):
+        with st.expander("Attempts for this probe", expanded=not _p.get("token")):
+            st.code(_p["trace"], language="text")
 # @@END 013 PROBE
 
 # @@BLOCK 014 LEDGER deps=013
 st.markdown("---")
-st.markdown("### 8. Session ledger")
+st.markdown("### 8. Call trace")
+st.caption("Every attempt, its status and its latency, newest last. Budget: **%ss** "
+           "for a classify and a **%ss** probe, %d attempts with backoff. A 4xx is "
+           "not retried. Cleared when the owner changes."
+           % (int(aiassist.TIMEOUT), int(aiassist.TIMEOUT * 2),
+              int(getattr(aiassist, "POST_ATTEMPTS", 3))))
+
+if not st.session_state.get("_ai_trace_seeded"):
+    aiassist.trace_clear()
+    st.session_state["_ai_trace_seeded"] = True
+
+_tev = aiassist.trace_read(limit=200)
+if not _tev:
+    st.caption("Nothing traced yet - press Probe in section 7, or Classify now in "
+               "section 5.")
+else:
+    st.code(aiassist.trace_text(limit=200), language="text")
+
+_tr1, _tr2 = st.columns(2)
+with _tr1:
+    st.download_button("\u2b07 Download trace",
+                       data=(aiassist.trace_text(limit=200) + "\n").encode("utf-8"),
+                       file_name="ai_trace_%s.log"
+                                 % datetime.now().strftime("%Y%m%d_%H%M%S"),
+                       mime="text/plain", width="stretch")
+with _tr2:
+    if st.button("Clear trace", width="stretch"):
+        aiassist.trace_clear()
+        st.rerun()
+
+st.markdown("---")
+st.markdown("### 9. Session ledger")
 st.caption("Everything this page did in this session, newest last. Cleared when "
            "the owner changes.")
 
