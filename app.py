@@ -12377,9 +12377,28 @@ if raw_text:
 # v13.88 FIX KW-10 - THE TRACE WENT NOWHERE THE USER WAS LOOKING. Every line was
 # written to the keyword panel only. It is ALSO spliced into the account's own
 # row in the Live Report Log & Analytics "Under-The-Hood Background Trace" now,
-# because that is where a run's reasoning is read. The report entry for an
-# account is appended immediately before the scan is called, so it is the last
-# entry and this writes into it directly - block 106 needs no change for it.
+# because that is where a run's reasoning is read.
+#
+# v13.89 FIX KW-11 - THE SCAN WAS BLOCKING THE RUN. It ran on the SCRIPT THREAD
+# inside the loop, so while one VALID account was being scanned no other future
+# could be consumed and every VALID account serialised the whole run - and the
+# body pass (up to `body_scan` single-message fetches, one at a time) was the
+# worst of it. Scans now run on their own 3-thread pool: the loop only SUBMITS,
+# and finished scans are DRAINED on the UI tick. The loop never waits for a
+# scan. Two things make the work itself smaller as well - the body pass is
+# capped at KW_BODY_SCAN_CAP while the header pass keeps the whole window
+# (sender/subject is what a Coinbase or Amazon hit actually is, and the header
+# pass is chunked at 25 messages a round trip), and the queue is capped so a
+# 5000-account run cannot pile up thousands of pending scans.
+#
+# ALL Streamlit interaction stays on the script thread: the worker threads only
+# do network work and disk writes and hand back a finished dict through a queue,
+# and kw_drain() does every session_state write and the repaint.
+#
+# v13.89 FIX KW-12 - AND THE HITS DID NOT SURVIVE A RELOAD. Nothing wrote the
+# bucket to a file that reload rehydration reads. kw_hits_{stamp}.txt is already
+# written by the export block; it is now READ BACK on a fresh session, gated on a
+# real run record so a cold load does not invent one.
 # ==========================================================================
 KW_SCOPES = ("Inbox", "All Folders")
 KW_SCOPE_INBOX = KW_SCOPES[0]
@@ -12391,12 +12410,17 @@ KW_FOLDER_INBOX = "INBOX"
 KW_FOLDER_CAP = 12
 KW_HIT_CAP = 200
 KW_WINDOW_ALL = 200
-# v13.88: connect budget. The scan runs on the SCRIPT thread inside the run loop,
-# so an unbounded reconnect would stall every other account. 8s per attempt, 25s
-# for the whole open, and the POP path gets its own short budget.
+# v13.88: connect budget. 8s per attempt, 25s for the whole open, and the POP
+# path gets its own short budget, so one dead host cannot hold a worker.
 KW_CONNECT_TIMEOUT = 8
 KW_OPEN_BUDGET = 25.0
 KW_POP_BUDGET = 18.0
+# v13.89: the pool and the body cap. 3 workers is enough to overlap scans with a
+# 12-account run without doubling the connection count; 40 bodies per account is
+# where the returns flatten out.
+KW_SCAN_WORKERS = 3
+KW_SCAN_QUEUE_MAX = 300
+KW_BODY_SCAN_CAP = 40
 
 section_title("🔎", "Keyword Hits",
               "find words you care about in every valid inbox, as the run goes")
@@ -12410,9 +12434,31 @@ _kw_run_owner = _cache_owner()
 if str_lit.session_state.get("_kw_run_owner") != _kw_run_owner:
     for _k in ("bb_kw_run_on", "bb_kw_run_words", "bb_kw_run_folder",
                "bb_kw_run_fields", "bb_kw_run_scope", "bb_kw_run_limit",
-               "kw_trace", "kw_counts", "kw_hits_detail"):
+               "kw_trace", "kw_counts", "kw_hits_detail", "_kw_rehydrated"):
         str_lit.session_state.pop(_k, None)
     str_lit.session_state["_kw_run_owner"] = _kw_run_owner
+
+# ---- FIX KW-12: the hits come back after a reload ----------------------
+# One attempt per session, only when the bucket is empty AND a run record was
+# rehydrated, so a cold load cannot invent hits. The newest kw_hits_*.txt is the
+# one the export block wrote for the newest run stamp.
+if not str_lit.session_state.get("_kw_rehydrated"):
+    str_lit.session_state["_kw_rehydrated"] = True
+    if (not (str_lit.session_state.get("kw_hits_results") or [])
+            and str_lit.session_state.get("engine_has_run")):
+        try:
+            _kwf = sorted(glob.glob(os.path.join(user_file("mail_results"),
+                                                 "kw_hits_*.txt")), reverse=True)
+            for _kwp in _kwf[:1]:
+                with open(_kwp, encoding="utf-8", errors="ignore") as _kwfh:
+                    _kwrows = [l.rstrip("\n") for l in _kwfh
+                               if l.strip() and not l.startswith("#")]
+                if _kwrows:
+                    str_lit.session_state["kw_hits_results"] = _kwrows
+                    log_startup(f"Keyword hits restored from "
+                                f"{os.path.basename(_kwp)} ({len(_kwrows)} line(s)).")
+        except Exception as _kwre:
+            warnings.warn(f"keyword hits not restored: {_kwre}")
 
 # Seeded, never defaulted: every widget below is created with key= ONLY, so a
 # saved value survives and Streamlit does not warn about a default plus a state.
@@ -12441,8 +12487,8 @@ _kw_run_on = str_lit.checkbox("Find keyword hits while the engine runs",
                               help="On: every account that comes back VALID gets one "
                                    "read-only pass looking for these words - IMAP, or "
                                    "POP3 when the account's IMAP is what is broken. "
-                                   "Nothing is marked seen. Off: the engine is "
-                                   "untouched and nothing extra is dialled.")
+                                   "The scans run in the background, so they no longer "
+                                   "slow the checking down. Nothing is marked seen.")
 
 if _kw_run_on:
     _kwr1, _kwr2 = str_lit.columns([0.58, 0.42])
@@ -12463,7 +12509,8 @@ if _kw_run_on:
         _kw_fields = str_lit.multiselect(
             "Search in", list(KW_FIELD_LABELS), key="bb_kw_run_fields",
             help="Which parts of a message count as a match. Dropping Body makes the "
-                 "pass much cheaper - the body pass is the slow half.")
+                 "pass much cheaper - the body pass is the slow half and is capped at "
+                 f"{KW_BODY_SCAN_CAP} messages whatever the window is.")
     with _kwr4:
         str_lit.selectbox("Depth", list(KW_DEPTHS), key="bb_kw_run_scope",
                           help="Whole folder scans up to 2000 newest ids per folder; "
@@ -12511,22 +12558,30 @@ _kw_live = str_lit.empty()
 KW_TRACE_MAX = 400
 KW_COUNT_MAX = 60
 # v13.86 FIX KW-3: the detail list had NO writer and NO cap. It is written by
-# run_keyword_scan() below now, and bounded, because each entry carries a slice of
-# a message body and an unbounded run would hold megabytes in the session.
+# kw_drain() below now, and bounded, because each entry carries a slice of a
+# message body and an unbounded run would hold megabytes in the session.
 KW_DETAIL_MAX = 300
 KW_DETAIL_BODY = 2000
 
+# v13.89: pool state. A plain dict for the counter so the worker can decrement it
+# without a `global`; _kw_done is the handover queue.
+_kw_pool = None
+_kw_pool_lock = threading.Lock()
+_kw_done = deque()
+_kw_done_lock = threading.Lock()
+_KW_ST = {"inflight": 0, "run_mark": ""}
 
-def _kw_trace(level, step, detail=""):
-    """One keyword-scan trace line. Bounded, per user, never raises.
 
-    Returns the formatted line so a caller can mirror it somewhere else without
-    formatting it a second time - run_keyword_scan() puts the same text into the
-    account's report row.
-    """
-    line = "%s %-5s %-9s %s" % (datetime.now().strftime("%H:%M:%S"),
+def _kw_fmt(level, step, detail=""):
+    """The ONE trace line format. Pure - touches no state, safe on a worker."""
+    return "%s %-5s %-9s %s" % (datetime.now().strftime("%H:%M:%S"),
                                 str(level or "INFO").upper()[:5],
                                 str(step or "")[:9], str(detail or "")[:300])
+
+
+def _kw_trace(level, step, detail=""):
+    """One keyword-scan trace line into the panel. Script thread. Never raises."""
+    line = _kw_fmt(level, step, detail)
     try:
         rows = list(str_lit.session_state.get("kw_trace") or [])
         rows.append(line)
@@ -12537,13 +12592,43 @@ def _kw_trace(level, step, detail=""):
 
 
 def keyword_hits_wanted() -> bool:
-    """True when the run should call the scan: the switch is on and the module
-    loaded. Whether any KEYWORD was typed is decided inside run_keyword_scan(),
-    so an empty box still leaves a trace line instead of silence."""
+    """True when the run should SUBMIT a scan: the switch is on and the module
+    loaded. Whether any KEYWORD was typed is decided inside the worker, so an
+    empty box still leaves a trace line instead of silence."""
     try:
         return bool(str_lit.session_state.get("bb_kw_run_on")) and mailsearch is not None
     except Exception:
         return False
+
+
+def _kw_pool_get():
+    """The scan pool, created once per process. Never raises."""
+    global _kw_pool
+    with _kw_pool_lock:
+        if _kw_pool is None:
+            _kw_pool = ThreadPoolExecutor(max_workers=KW_SCAN_WORKERS,
+                                          thread_name_prefix="kw-scan")
+        return _kw_pool
+
+
+def kw_pending() -> int:
+    """How many scans are still in flight. Cheap, lock-guarded."""
+    with _kw_pool_lock:
+        return int(_KW_ST.get("inflight", 0))
+
+
+def _kw_scan_window() -> int:
+    """The per-folder window from the controls, honouring Whole folder and the
+    All Folders cap. Script thread - it reads widget keys."""
+    try:
+        limit = int(str_lit.session_state.get("bb_kw_run_limit") or 100)
+    except Exception:
+        limit = 100
+    if str_lit.session_state.get("bb_kw_run_scope") == KW_DEPTHS[1]:
+        limit = 2000
+    if str_lit.session_state.get("bb_kw_run_folder") == KW_SCOPE_ALL:
+        limit = min(limit, KW_WINDOW_ALL)
+    return max(1, limit)
 
 
 def _kw_folders_for(mail, mode):
@@ -12567,16 +12652,15 @@ def _kw_folders_for(mail, mode):
     return found, ""
 
 
-def _kw_imap_open(email, password, hosts, proxy, trace):
+def _kw_imap_open(email, password, hosts, proxy, trace, ins):
     """One authenticated IMAP session for the scan -> (mail, note).
 
     Bounded on purpose: one attempt per host and mode, KW_CONNECT_TIMEOUT each,
     KW_OPEN_BUDGET for the whole thing. verify_and_connect() is not used here
     because it walks every mode x every host x every username candidate with a
     fixed 10s timeout and no ceiling - on a host whose 993 is firewalled that is
-    minutes on the script thread, in the middle of a run.
+    minutes.
     """
-    _ins = bool(CFG.get("ALLOW_SELF_SIGNED", True))
     deadline = time.time() + KW_OPEN_BUDGET
     for host in [h for h in (hosts or []) if h][:3]:
         for mode, port in (("ssl", 993), ("starttls", 143)):
@@ -12587,11 +12671,11 @@ def _kw_imap_open(email, password, hosts, proxy, trace):
             try:
                 if mode == "ssl":
                     mail = ProxyIMAP4SSL(host, port, timeout=KW_CONNECT_TIMEOUT,
-                                         proxy_str=proxy, insecure=_ins)
+                                         proxy_str=proxy, insecure=ins)
                 else:
                     mail = ProxyIMAP4(host, port, timeout=KW_CONNECT_TIMEOUT,
                                       proxy_str=proxy)
-                    mail.starttls(ssl_context=_tls_context(host, verify=not _ins))
+                    mail.starttls(ssl_context=_tls_context(host, verify=not ins))
                 _imap_auth(mail, email, password)
                 trace("INFO", "imap", "logged in on %s:%d" % (host, port))
                 return mail, ""
@@ -12605,7 +12689,7 @@ def _kw_imap_open(email, password, hosts, proxy, trace):
     return None, "no IMAP host accepted the login"
 
 
-def _kw_pop_open(email, password, hosts, proxy, trace):
+def _kw_pop_open(email, password, hosts, proxy, trace, ins):
     """One authenticated POP3 session for the scan -> (mail, note).
 
     The fallback that matters: an account can be perfectly VALID and still have
@@ -12613,7 +12697,6 @@ def _kw_pop_open(email, password, hosts, proxy, trace):
     where every 993 rung timed out and only 995 answered. Without this path the
     scan simply cannot read such a mailbox.
     """
-    _ins = bool(CFG.get("ALLOW_SELF_SIGNED", True))
     deadline = time.time() + KW_POP_BUDGET
     for host in [h for h in (hosts or []) if h][:2]:
         if time.time() > deadline:
@@ -12622,7 +12705,7 @@ def _kw_pop_open(email, password, hosts, proxy, trace):
         mail = None
         try:
             mail = ProxyPOP3SSL(host, 995, timeout=KW_CONNECT_TIMEOUT,
-                                proxy_str=proxy, insecure=_ins)
+                                proxy_str=proxy, insecure=ins)
             if not pop3_ok(mail.getwelcome()):
                 raise RuntimeError("POP3 invalid welcome banner")
             if not pop3_ok(mail.user(email.strip())):
@@ -12642,7 +12725,7 @@ def _kw_pop_open(email, password, hosts, proxy, trace):
     return None, "no POP3 host accepted the login"
 
 
-def _kw_pop_scan(mail, words, limit, fields, trace, on_hit=None):
+def _kw_pop_scan(mail, words, limit, fields, trace):
     """POP3 has no folders and no SEARCH: RETR the newest `limit` messages.
 
     Matching is done with mailsearch's own helpers (_heads_from_bytes, _blob,
@@ -12703,19 +12786,13 @@ def _kw_pop_scan(mail, words, limit, fields, trace, on_hit=None):
             continue
         if not body_txt:
             body_txt = mailsearch._readable(raw)
-        hit = {"id": str(mid), "folder": KW_FOLDER_INBOX,
-               "subject": heads.get("subject") or "(no subject)",
-               "from": heads.get("from") or "(unknown sender)",
-               "to": heads.get("to") or "",
-               "date": heads.get("date") or "(no date)",
-               "keywords": hit_kw, "counts": mailsearch._counts(blob, hit_kw),
-               "where": where, "body": body_txt}
-        hits.append(hit)
-        if on_hit is not None:
-            try:
-                on_hit(hit)
-            except Exception:
-                pass
+        hits.append({"id": str(mid), "folder": KW_FOLDER_INBOX,
+                     "subject": heads.get("subject") or "(no subject)",
+                     "from": heads.get("from") or "(unknown sender)",
+                     "to": heads.get("to") or "",
+                     "date": heads.get("date") or "(no date)",
+                     "keywords": hit_kw, "counts": mailsearch._counts(blob, hit_kw),
+                     "where": where, "body": body_txt})
     trace("INFO", "folder", "POP3 INBOX done: %d hit(s)" % len(hits))
     if not hits:
         trace("INFO", "search", "zero hits - the keywords are not in the newest "
@@ -12724,218 +12801,269 @@ def _kw_pop_scan(mail, words, limit, fields, trace, on_hit=None):
     return hits, ""
 
 
-def _kw_report_trace(lines, hits_n):
-    """Splice the scan trace into the CURRENT account's report row.
+def _kw_scan_pure(combo, cfg, out):
+    """The whole scan, on a WORKER thread. Touches no session_state.
 
-    The report entry is appended by block 106 immediately before the scan is
-    called, so it is the last entry. Writing here is why block 106 needs no
-    change to satisfy the Under-The-Hood requirement.
+    Everything it needs was captured on the script thread into `cfg`, and it
+    fills `out` with the trace lines and the hits. Body files are written here
+    because that is disk work, not UI work.
     """
-    if not lines:
+    def trace(level, step, detail=""):
+        out["trace"].append(_kw_fmt(level, step, detail))
+
+    if mailsearch is None:
+        trace("ERR", "module", "mailsearch.py is missing - the scan cannot run")
         return
+
+    words = cfg.get("words") or ""
+    if not words.strip():
+        trace("WARN", "start", "no keywords set - nothing to look for")
+        return
+    mode = cfg.get("mode") or KW_SCOPE_INBOX
+    fields = cfg.get("fields") or list(KW_FIELD_LABELS)
+    scan = int(cfg.get("scan") or 100)
+    body_scan = int(cfg.get("body_scan") or 25)
+    ins = bool(cfg.get("ins", True))
+    results_dir = cfg.get("results_dir") or ""
+
     try:
-        with session_state_lock:
-            ents = str_lit.session_state.get("report_entries")
-            if not ents:
-                return
-            ent = ents[-1]
-            prev = ent.get("Under-The-Hood Background Trace") or ""
-            ent["Under-The-Hood Background Trace"] = (
-                prev + "\n\nKeyword scan -> %d hit(s):\n  \u21b3 " % hits_n
-                + "\n  \u21b3 ".join(lines))
+        email, password = str(combo).split(":", 1)
+    except Exception:
+        trace("WARN", "combo", "%r has no colon" % str(combo)[:80])
+        return
+    email, password = email.strip(), password.strip()
+    out["email"] = email
+
+    trace("INFO", "start", "%s scope=%s window=%s body<=%s fields=%s"
+          % (email, mode, scan, body_scan, ",".join(fields) or "-"))
+
+    try:
+        conf = get_servers(email) or {}
+    except Exception as e:
+        trace("ERR", "hosts", "%s: %s" % (type(e).__name__, e))
+        return
+    imap_hosts = [h for h in (conf.get("imap") or []) if h]
+    pop_hosts = [h for h in ((conf.get("pop") or []) + (conf.get("pop3") or [])) if h]
+    pop_hosts = list(dict.fromkeys(pop_hosts))
+    trace("INFO", "hosts", "IMAP %s | POP3 %s"
+          % (",".join(imap_hosts[:3]) or "-", ",".join(pop_hosts[:2]) or "-"))
+
+    px = None
+    if cfg.get("use_proxy"):
+        try:
+            px = sample_alive_proxy(domain=email.split("@")[-1])
+        except Exception:
+            px = None
+    trace("INFO", "proxy", px_tag(px) if px else "direct")
+
+    mail = None
+    folders = [KW_FOLDER_INBOX]
+    proto = "imap"
+    try:
+        if imap_hosts:
+            mail, note = _kw_imap_open(email, password, imap_hosts, px, trace, ins)
+        else:
+            note = "no IMAP host discovered"
+            trace("WARN", "imap", note)
+        if mail is None:
+            trace("INFO", "fallback", "IMAP unavailable (%s) -> trying POP3" % note)
+            if pop_hosts:
+                mail, note = _kw_pop_open(email, password, pop_hosts, px, trace, ins)
+                proto = "pop"
+            else:
+                trace("WARN", "pop", "no POP3 host discovered either")
+        if mail is None:
+            trace("ERR", "connect", "%s could not be opened over IMAP or POP3" % email)
+            return
+
+        if proto == "pop":
+            trace("INFO", "proto", "POP3 session - there are no folders, INBOX only")
+            out["hits"], note = _kw_pop_scan(mail, words, body_scan, fields, trace)
+            if note:
+                trace("WARN", "note", note)
+        else:
+            folders, fnote = _kw_folders_for(mail, mode)
+            if fnote:
+                trace("WARN", "folders", fnote)
+            trace("INFO", "folders", "%d folder(s): %s"
+                  % (len(folders), ",".join(folders)))
+            out["hits"], note = mailsearch.search(
+                mail, folders[0], words, scan_limit=scan, body_scan=body_scan,
+                fields=fields, folders=folders, on_trace=trace)
+            if note:
+                trace("WARN", "note", note)
+    except Exception as e:
+        trace("ERR", "scan", "%s: %s" % (type(e).__name__, e))
+    finally:
+        try:
+            if mail is not None:
+                mailsearch.close(mail)
+        except Exception:
+            pass
+
+    out["hits"] = (out.get("hits") or [])[:KW_HIT_CAP]
+    if not out["hits"]:
+        trace("INFO", "zero", "no hit for %s in %s" % (email, ",".join(folders)))
+        return
+
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    slug = re.sub(r"[^A-Za-z0-9]+", "_", email).strip("_")[:40] or "acct"
+    kdir = os.path.join(results_dir or ".", f"kw_hits_{stamp}_{slug}")
+    for h in out["hits"]:
+        h.setdefault("email", email)
+        h.setdefault("password", password)
+    try:
+        mailsearch.save_bodies(kdir, stamp, out["hits"])
+    except Exception:
+        pass
+    trace("INFO", "hit", "%d hit(s) for %s in %s"
+          % (len(out["hits"]), email, ",".join(folders)))
+    try:
+        log_probe_event(f"keyword scan: {len(out['hits'])} hit(s) for {email}")
     except Exception:
         pass
 
 
-def _kw_on_hit_for(email, password, trace=None):
-    """A per-hit store callback bound to ONE account. Never raises."""
-    def _store(hit):
-        try:
-            hit["email"], hit["password"] = email, password
-            d = dict(hit)
-            d["body"] = str(d.get("body") or "")[:KW_DETAIL_BODY]
-            with session_state_lock:
-                cur = list(str_lit.session_state.get("kw_hits_detail") or [])
-                cur.append(d)
-                str_lit.session_state["kw_hits_detail"] = cur[-KW_DETAIL_MAX:]
-            paint = globals().get("render_kw_panel")
-            if paint is not None:
-                paint()
-            if trace is not None:
-                trace("INFO", "hit!", "%s | %s"
-                      % (str(hit.get("folder") or "")[:20],
-                         str(hit.get("subject") or "")[:70]))
-        except Exception:
-            pass
-    return _store
-
-
-def run_keyword_scan(combo):
-    """One read-only scan of one just-verified mailbox. Never raises. Returns hits.
-
-    v13.86: EVERY PATH TRACES. It used to return 0 in five different places with
-    nothing recorded, so a scan that found nothing and a scan that never ran
-    looked identical on the page - and with the mailsearch NameError above, EVERY
-    scan was the second kind.
-
-    v13.88: the trace goes to TWO places now - the keyword panel, and the
-    account's own Under-The-Hood row in the Live Report Log & Analytics tab.
-    Both are fed by one local `trace()` so they can never disagree.
-    """
-    _scan_trace = []
-    _hits = []
-    _mail = None
-    _folders = [KW_FOLDER_INBOX]
-
-    def trace(level, step, detail=""):
-        _scan_trace.append(_kw_trace(level, step, detail))
-
-    def _run():
-        nonlocal _hits, _mail, _folders
-        if mailsearch is None:
-            trace("ERR", "module", "mailsearch.py is missing - the scan cannot run")
-            return 0
-
-        _words = str_lit.session_state.get("bb_kw_run_words") or ""
-        if not _words.strip():
-            trace("WARN", "start", "no keywords set - nothing to look for")
-            return 0
-
-        _mode = str_lit.session_state.get("bb_kw_run_folder") or KW_SCOPE_INBOX
-        _fields = [str(f).lower() for f in
-                   (str_lit.session_state.get("bb_kw_run_fields")
-                    or list(KW_FIELD_LABELS))]
-        _scope = str_lit.session_state.get("bb_kw_run_scope") or KW_DEPTH_NEWEST
-        try:
-            _limit = int(str_lit.session_state.get("bb_kw_run_limit") or 100)
-        except Exception:
-            _limit = 100
-        _scan = 2000 if _scope == KW_DEPTHS[1] else _limit
-        if _mode == KW_SCOPE_ALL:
-            _scan = min(_scan, KW_WINDOW_ALL)
-
-        try:
-            _e, _p = str(combo).split(":", 1)
-        except Exception:
-            trace("WARN", "combo", "%r has no colon" % str(combo)[:80])
-            return 0
-        _e, _p = _e.strip(), _p.strip()
-
-        trace("INFO", "start", "%s scope=%s window=%s fields=%s"
-              % (_e, _mode, _scan, ",".join(_fields) or "-"))
-
-        try:
-            _conf = get_servers(_e) or {}
-        except Exception as e:
-            trace("ERR", "hosts", "%s: %s" % (type(e).__name__, e))
-            return 0
-        _imap_hosts = [h for h in (_conf.get("imap") or []) if h]
-        _pop_hosts = [h for h in ((_conf.get("pop") or []) + (_conf.get("pop3") or []))
-                      if h]
-        _pop_hosts = list(dict.fromkeys(_pop_hosts))
-        trace("INFO", "hosts", "IMAP %s | POP3 %s"
-              % (",".join(_imap_hosts[:3]) or "-", ",".join(_pop_hosts[:2]) or "-"))
-
-        _px = None
-        if use_proxy:
-            try:
-                _px = sample_alive_proxy(domain=_e.split("@")[-1])
-            except Exception:
-                _px = None
-        trace("INFO", "proxy", px_tag(_px) if _px else "direct")
-
-        if _imap_hosts:
-            _mail, _note = _kw_imap_open(_e, _p, _imap_hosts, _px, trace)
-        else:
-            _note = "no IMAP host discovered"
-            trace("WARN", "imap", _note)
-
-        _proto = "imap"
-        if _mail is None:
-            trace("INFO", "fallback", "IMAP unavailable (%s) -> trying POP3" % _note)
-            if _pop_hosts:
-                _mail, _note = _kw_pop_open(_e, _p, _pop_hosts, _px, trace)
-                _proto = "pop"
-            else:
-                trace("WARN", "pop", "no POP3 host discovered either")
-        if _mail is None:
-            trace("ERR", "connect", "%s could not be opened over IMAP or POP3" % _e)
-            return 0
-
-        if _proto == "pop":
-            trace("INFO", "proto", "POP3 session - there are no folders, INBOX only")
-            _hits, _note = _kw_pop_scan(_mail, _words, _scan, _fields, trace,
-                                        on_hit=_kw_on_hit_for(_e, _p, trace))
-            if _note:
-                trace("WARN", "note", _note)
-        else:
-            _folders, _fnote = _kw_folders_for(_mail, _mode)
-            if _fnote:
-                trace("WARN", "folders", _fnote)
-            trace("INFO", "folders", "%d folder(s): %s"
-                  % (len(_folders), ",".join(_folders)))
-            _hits, _note = mailsearch.search(
-                _mail, _folders[0], _words, scan_limit=_scan, body_scan=_scan,
-                fields=_fields, folders=_folders, on_trace=trace,
-                on_hit=_kw_on_hit_for(_e, _p, trace))
-            if _note:
-                trace("WARN", "note", _note)
-
-        _hits = (_hits or [])[:KW_HIT_CAP]
-        if not _hits:
-            trace("INFO", "zero", "no hit for %s in %s" % (_e, ",".join(_folders)))
-            return 0
-
-        _stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        _slug = re.sub(r"[^A-Za-z0-9]+", "_", _e).strip("_")[:40] or "acct"
-        _kdir = os.path.join(user_file("mail_results"), f"kw_hits_{_stamp}_{_slug}")
-        for _h in _hits:
-            _h.setdefault("email", _e)
-            _h.setdefault("password", _p)
-        try:
-            mailsearch.save_bodies(_kdir, _stamp, _hits)
-        except Exception:
-            pass
-        _per_word = {}
-        for _h in _hits:
-            for _w, _n in (_h.get("counts") or {}).items():
-                _per_word[_w] = _per_word.get(_w, 0) + int(_n or 0)
-        try:
-            _cur_counts = dict(str_lit.session_state.get("kw_counts") or {})
-            for _w, _n in _per_word.items():
-                _cur_counts[_w] = int(_cur_counts.get(_w) or 0) + int(_n)
-            if len(_cur_counts) > KW_COUNT_MAX:
-                _cur_counts = dict(sorted(_cur_counts.items(),
-                                          key=lambda kv: -int(kv[1] or 0))[:KW_COUNT_MAX])
-            str_lit.session_state["kw_counts"] = _cur_counts
-        except Exception:
-            pass
-        with session_state_lock:
-            _cur = list(str_lit.session_state.get("kw_hits_results") or [])
-            for _h in _hits:
-                _ln = mailsearch.hit_line(_h)
-                if _ln not in _cur:
-                    _cur.append(_ln)
-            str_lit.session_state["kw_hits_results"] = _cur
-        trace("INFO", "hit", "%d hit(s) for %s in %s"
-              % (len(_hits), _e, ",".join(_folders)))
-        log_probe_event(f"keyword scan: {len(_hits)} hit(s) for {_e} in {_folders}")
-        return len(_hits)
-
+def _kw_scan_worker(combo, cfg, entry):
+    """Pool body: run the scan, hand the result over, always decrement."""
+    res = {"email": "", "hits": [], "trace": [], "entry": entry}
     try:
-        _n = _run()
-    except Exception as _kw_err:
-        trace("ERR", "scan", "%s: %s" % (type(_kw_err).__name__, _kw_err))
-        log_probe_event(f"keyword scan failed: {type(_kw_err).__name__}")
-        _n = 0
+        _kw_scan_pure(combo, cfg, res)
+    except Exception as e:
+        res["trace"].append(_kw_fmt("ERR", "worker",
+                                    "%s: %s" % (type(e).__name__, e)))
     finally:
+        with _kw_done_lock:
+            _kw_done.append(res)
+        with _kw_pool_lock:
+            _KW_ST["inflight"] = max(0, int(_KW_ST.get("inflight", 0)) - 1)
+
+
+def kw_scan_submit(combo, entry=None):
+    """Queue one scan. SCRIPT THREAD. Returns True when it was queued.
+
+    The config is captured HERE, from the live widgets, so the worker never has
+    to read session_state from another thread.
+    """
+    if not keyword_hits_wanted():
+        return False
+    _mark = str(str_lit.session_state.get("start_timestamp") or "")
+    if _KW_ST.get("run_mark") != _mark:
+        _KW_ST["run_mark"] = _mark
+        with _kw_done_lock:
+            _kw_done.clear()
+    pending = kw_pending()
+    if pending >= KW_SCAN_QUEUE_MAX:
+        _kw_trace("WARN", "queue", "%d scan(s) pending - skipped %s"
+                  % (pending, str(combo).split(":")[0][:40]))
+        return False
+    scan = _kw_scan_window()
+    cfg = {
+        "words": str_lit.session_state.get("bb_kw_run_words") or "",
+        "mode": str_lit.session_state.get("bb_kw_run_folder") or KW_SCOPE_INBOX,
+        "fields": [str(f).lower() for f in
+                   (str_lit.session_state.get("bb_kw_run_fields")
+                    or list(KW_FIELD_LABELS))],
+        "scan": scan,
+        "body_scan": max(10, min(scan, KW_BODY_SCAN_CAP)),
+        "ins": bool(CFG.get("ALLOW_SELF_SIGNED", True)),
+        "use_proxy": bool(use_proxy),
+        "results_dir": user_file("mail_results"),
+    }
+    with _kw_pool_lock:
+        _KW_ST["inflight"] = int(_KW_ST.get("inflight", 0)) + 1
+    try:
+        _kw_pool_get().submit(_kw_scan_worker, combo, cfg, entry)
+    except Exception as e:
+        with _kw_pool_lock:
+            _KW_ST["inflight"] = max(0, int(_KW_ST.get("inflight", 0)) - 1)
+        _kw_trace("ERR", "submit", "%s: %s" % (type(e).__name__, e))
+        return False
+    return True
+
+
+def _kw_apply(item):
+    """Move ONE finished scan into the session. SCRIPT THREAD. Never raises."""
+    hits = item.get("hits") or []
+    lines = item.get("trace") or []
+    entry = item.get("entry")
+    try:
+        if lines:
+            rows = list(str_lit.session_state.get("kw_trace") or [])
+            rows.extend(lines)
+            str_lit.session_state["kw_trace"] = rows[-KW_TRACE_MAX:]
+    except Exception:
+        pass
+    # The Under-The-Hood row for THIS account. `entry` is the dict block 106
+    # appended just before the submit, so it is the right row even if other
+    # accounts have finished in the meantime.
+    if entry is not None and lines:
         try:
-            if _mail is not None:
-                mailsearch.close(_mail)
+            prev = entry.get("Under-The-Hood Background Trace") or ""
+            entry["Under-The-Hood Background Trace"] = (
+                prev + "\n\nKeyword scan -> %d hit(s):\n  \u21b3 " % len(hits)
+                + "\n  \u21b3 ".join(lines))
         except Exception:
             pass
-        _kw_report_trace(_scan_trace, len(_hits))
-    return _n
+    if not hits:
+        return
+    try:
+        cur_d = list(str_lit.session_state.get("kw_hits_detail") or [])
+        for h in hits:
+            d = dict(h)
+            d["body"] = str(d.get("body") or "")[:KW_DETAIL_BODY]
+            cur_d.append(d)
+        str_lit.session_state["kw_hits_detail"] = cur_d[-KW_DETAIL_MAX:]
+    except Exception:
+        pass
+    per_word = {}
+    for h in hits:
+        for w, n in (h.get("counts") or {}).items():
+            per_word[w] = per_word.get(w, 0) + int(n or 0)
+    try:
+        cur_c = dict(str_lit.session_state.get("kw_counts") or {})
+        for w, n in per_word.items():
+            cur_c[w] = int(cur_c.get(w) or 0) + int(n)
+        if len(cur_c) > KW_COUNT_MAX:
+            cur_c = dict(sorted(cur_c.items(), key=lambda kv: -int(kv[1] or 0))[:KW_COUNT_MAX])
+        str_lit.session_state["kw_counts"] = cur_c
+    except Exception:
+        pass
+    try:
+        cur_l = list(str_lit.session_state.get("kw_hits_results") or [])
+        for h in hits:
+            ln = mailsearch.hit_line(h)
+            if ln not in cur_l:
+                cur_l.append(ln)
+        str_lit.session_state["kw_hits_results"] = cur_l
+    except Exception:
+        pass
+
+
+def kw_drain(wait=0.0):
+    """Take every finished scan into the session. SCRIPT THREAD ONLY.
+
+    `wait` seconds lets the tail of a run collect its last scans before the
+    report is finalised. Repaints once per batch, not once per hit.
+    """
+    deadline = time.time() + float(wait or 0)
+    moved = 0
+    while True:
+        with _kw_done_lock:
+            item = _kw_done.popleft() if _kw_done else None
+        if item is None:
+            if wait and time.time() < deadline and kw_pending() > 0:
+                time.sleep(0.15)
+                continue
+            break
+        _kw_apply(item)
+        moved += 1
+    if moved:
+        try:
+            render_kw_panel()
+        except Exception:
+            pass
+    return moved
 
 
 # --------------------------------------------------------------------------
@@ -14738,7 +14866,7 @@ def _check_account_core(email, password, conf, domain, proxy_pool, thread_state,
                             # 403'd every rung - the CONNECT never got to the mail host
                             # at all. saw_server is now left alone; saw_port_block is
                             # its own flag, and had_net / net_failed_hosts are set so
-                            # block 103's direct_reason sees a reason to run DIRECT.
+                            # block 103's direct_reason sees a reason to run DIRECT
                             err_text = str(pblk)
                             flags["saw_nonproxy"] = True
                             flags["saw_port_block"] = True
@@ -16245,6 +16373,7 @@ if start_engine_btn:
                                                 >= BUCKET_MIN_INTERVAL))
 
                             _kw_scan_line = None
+                            _kw_entry = None
                             with session_state_lock:
                                 if em_val:
                                     str_lit.session_state.checked_emails_set.add(em_val)
@@ -16311,6 +16440,14 @@ if start_engine_btn:
                                     except AttributeError:
                                         del str_lit.session_state.report_entries[
                                             :-REPORT_ENTRIES_MAX]
+                                # v13.89: the row just appended is the one the scan
+                                # writes its trace into. Held by reference, so it is
+                                # right even after other accounts finish.
+                                if _kw_scan_line:
+                                    try:
+                                        _kw_entry = str_lit.session_state.report_entries[-1]
+                                    except Exception:
+                                        _kw_entry = None
 
                                 valid_len = len(str_lit.session_state.valid_results)
                                 wrong_len = len(str_lit.session_state.wrong_results)
@@ -16341,18 +16478,23 @@ if start_engine_btn:
                                         bucket_snapshot[_bk] = (
                                             len(_bv), list(_bv)[-BUCKET_SNAPSHOT_TAIL:])
 
+                            # v13.89 FIX KW-11: SUBMIT, do not call. The scan used
+                            # to run right here on this thread, so the loop stood
+                            # still for the whole scan and every VALID account
+                            # serialised the run. The pool does the work now and
+                            # kw_drain() below moves the results in.
                             if _kw_scan_line:
                                 try:
-                                    run_keyword_scan(_kw_scan_line)
+                                    kw_scan_submit(_kw_scan_line, _kw_entry)
                                 except Exception as _kwe:
-                                    _kw_trace("ERR", "scan", str(_kwe)[:200])
-                                # Repaint on the scan's OWN event, not on the UI
-                                # tick: a hit is the only thing that changes these
-                                # numbers, so this is the cheapest possible moment.
-                                try:
-                                    render_kw_panel()
-                                except Exception:
-                                    pass
+                                    _kw_trace("ERR", "submit", str(_kwe)[:200])
+
+                            # Drain finished scans every account, so hits land
+                            # within a tick of completing instead of in one burst.
+                            try:
+                                kw_drain()
+                            except Exception:
+                                pass
 
                             if _tick:
                                 _last_ui_ts = _now_ui
@@ -16504,6 +16646,13 @@ if start_engine_btn:
                         detected_stop_reason = f"Unexpected Error / Interruption: {be}"
             runstate.note(detected_stop_reason)
         finally:
+            # v13.89: the tail of the scans. Bounded, so a hung host cannot hold
+            # the export for ever, and drained BEFORE the journal closes so the
+            # hits land in the same session the run wrote its results into.
+            try:
+                kw_drain(wait=25.0)
+            except Exception:
+                pass
             live_journal_close(_journal_scope)
             try:
                 import sentinel as _s8
@@ -17183,10 +17332,30 @@ except Exception:
 # expander owned (bb_kw_folders / bb_kw_folder / bb_kw_words / bb_kw_hits /
 # bb_kw_note / bb_kw_on) is still popped on an owner change below, so nothing is
 # left behind; they are simply not read any more.
+#
+# v13.89 FIX RD-1: "RE-OPEN AFTER A RELOAD" RE-FETCHED INSTEAD OF RESTORING.
+# bb_reader_msgs is session_state, so after a reload the list was empty, the
+# restore branch saw `not _r_msgs` and did the only thing it could: connected
+# and fetched the whole page again. That is a full IMAP login and up to `max`
+# message fetches for a page the user had already read, and it defeats the
+# point of the switch. The fetched page is written to a per-user file now and
+# read back on a restore, so the switch restores what it says it restores. The
+# cache carries the combo, so a different account never shows the last one's
+# mail, and the raw bytes are dropped past an 8 MB budget - the text body still
+# renders, only inline images go without on a very large page.
 # ==========================================================================
 _READER_STATE_NAME = "reader_state.json"
+_READER_CACHE_NAME = "reader_cache.json"
+_READER_CACHE_BYTES = 8000000
 _READER_OWNER_KEY = "_reader_owner"
 _READER_DEFAULTS = {"acct": "", "max": 10, "remote": False, "auto": True}
+
+# v13.89: it is a reader artefact, not a rebuildable cache entry, so a "Delete my
+# cache files" sweep should leave it alone.
+try:
+    _RES_KEEP_SUFFIX = tuple(_RES_KEEP_SUFFIX) + (_READER_CACHE_NAME,)
+except Exception:
+    pass
 
 
 def _reader_path() -> str:
@@ -17194,6 +17363,13 @@ def _reader_path() -> str:
         return user_file(_READER_STATE_NAME)
     except Exception:
         return _READER_STATE_NAME
+
+
+def _reader_cache_path() -> str:
+    try:
+        return user_file(_READER_CACHE_NAME)
+    except Exception:
+        return _READER_CACHE_NAME
 
 
 def _reader_load() -> dict:
@@ -17233,6 +17409,72 @@ def _reader_save(vals) -> dict:
     except Exception as e:
         warnings.warn(f"could not save reader state: {e}")
     return cur
+
+
+def _reader_cache_save(combo, msgs, total, page):
+    """Persist ONE fetched page so a reload can SHOW it. Never raises.
+
+    `raw` is base64 and is dropped once the budget is gone, so the file cannot
+    grow without limit; the readable body is always kept, and mailview falls
+    back to text when there are no raw bytes.
+    """
+    try:
+        rows, budget = [], _READER_CACHE_BYTES
+        for m in (msgs or []):
+            raw = m.get("raw") or b""
+            b64 = ""
+            if raw:
+                try:
+                    b64 = base64.b64encode(raw).decode()
+                except Exception:
+                    b64 = ""
+            if len(b64) > budget:
+                b64 = ""
+            budget -= len(b64)
+            rows.append({"id": m.get("id") or "",
+                         "subject": m.get("subject") or "",
+                         "from": m.get("from") or "",
+                         "date": m.get("date") or "",
+                         "body": str(m.get("body") or "")[:120000],
+                         "raw_b64": b64})
+        payload = {"combo": combo, "total": int(total or 0), "page": int(page or 1),
+                   "saved_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                   "msgs": rows}
+        p = _reader_cache_path()
+        tmp = p + ".tmp"
+        with file_write_lock:
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(payload, f, separators=(",", ":"))
+            os.replace(tmp, p)
+    except Exception as e:
+        warnings.warn(f"reader cache save failed: {e}")
+
+
+def _reader_cache_load(combo):
+    """The saved page for `combo` -> (msgs, total, page), or (None, 0, 1)."""
+    p = _reader_cache_path()
+    if not os.path.exists(p):
+        return None, 0, 1
+    try:
+        with open(p, encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception:
+        return None, 0, 1
+    if not isinstance(data, dict) or data.get("combo") != combo:
+        return None, 0, 1
+    out = []
+    for m in (data.get("msgs") or []):
+        b64 = m.get("raw_b64") or ""
+        try:
+            raw = base64.b64decode(b64) if b64 else b""
+        except Exception:
+            raw = b""
+        out.append({"id": m.get("id") or "", "subject": m.get("subject") or "",
+                    "from": m.get("from") or "", "date": m.get("date") or "",
+                    "body": m.get("body") or "", "raw": raw})
+    if not out:
+        return None, 0, 1
+    return out, int(data.get("total") or 0), int(data.get("page") or 1)
 
 
 def _on_reader_change():
@@ -17335,13 +17577,16 @@ else:
         # v13.67: the re-open switch. Off does NOT forget the account - the picker
         # still restores, the inbox just waits for the button. It is saved with
         # everything else, so it survives the reload it is about.
+        # v13.89: and ON now restores the SAVED messages instead of fetching them
+        # again. The fetch only happens when nothing was saved for that account.
         allow_auto = str_lit.checkbox(
             "Re-open this inbox automatically after a reload", key="bb_reader_auto",
             on_change=_on_reader_change,
-            help="On: reloading the page restores the account AND re-fetches its inbox "
-                 "once. Off: the account is still remembered, but nothing connects "
-                 "until you press Read Inbox Messages. Off saves one IMAP login per "
-                 "reload and keeps provider connect counters quiet.")
+            help="On: reloading the page restores the account AND the messages it "
+                 "already showed, with no new connection. Off: the account is still "
+                 "remembered, but nothing is shown or connected until you press Read "
+                 "Inbox Messages. Off saves one IMAP login per reload and keeps "
+                 "provider connect counters quiet.")
 
         # v13.56: which mailview is actually deployed. Silent on v13.55+.
         _mv_ver = getattr(mailview, "__version__", "unknown") if mailview else "missing"
@@ -17400,6 +17645,10 @@ else:
                     # button was False, the branch was skipped and the whole
                     # message list disappeared - the reader "reset" itself.
                     str_lit.session_state["bb_reader_msgs"] = fetched_msgs
+                    # v13.89: and to disk, so the next reload can show this page
+                    # instead of dialling the mailbox for it again.
+                    _reader_cache_save(combo, fetched_msgs,
+                                       _info.get("total"), _info.get("page"))
                 else:
                     str_lit.session_state["bb_reader_note"] = note or "unknown reason"
             except Exception as _rf_err:
@@ -17414,12 +17663,24 @@ else:
             if selected_combo:
                 _reader_do_fetch(selected_combo, max_msgs, 1)
         elif _restored and _pick and not _r_msgs and not _r_note:
-            # ONE attempt, only on a restore, and only when the switch is on. A
-            # refresh re-opens the inbox the user was in instead of showing an
-            # empty page - unless they turned that off.
+            # ONE attempt, only on a restore, and only when the switch is on.
+            # v13.89: the saved page wins. Only an account with nothing saved
+            # falls back to a real fetch, so the switch no longer costs a login.
             if allow_auto:
-                str_lit.caption("↩ Restored your last account - re-opening its inbox...")
-                _reader_do_fetch(_pick, max_msgs, 1)
+                _c_msgs, _c_total, _c_page = _reader_cache_load(_pick)
+                if _c_msgs:
+                    str_lit.session_state["bb_reader_msgs"] = _c_msgs
+                    str_lit.session_state["bb_reader_for"] = _pick.split(":", 1)[0].strip()
+                    str_lit.session_state["bb_reader_combo"] = _pick
+                    str_lit.session_state["bb_reader_total"] = _c_total
+                    str_lit.session_state["bb_reader_page"] = _c_page
+                    str_lit.session_state["bb_reader_note"] = ""
+                    str_lit.caption("↩ Restored the messages saved before the reload - "
+                                    "nothing was re-fetched. Press Read Inbox Messages "
+                                    "for a fresh copy.")
+                else:
+                    str_lit.caption("↩ Restored your last account - re-opening its inbox...")
+                    _reader_do_fetch(_pick, max_msgs, 1)
             else:
                 str_lit.caption("↩ Restored your last account - auto re-open is off, so "
                                 "nothing was fetched. Press Read Inbox Messages when you "
@@ -17494,6 +17755,8 @@ else:
             # v13.55 render(st, raw, key, fallback, allow_remote), and the body is
             # seeded here so the text box fills either way. A TypeError from any
             # future mismatch degrades to a plain text area instead of a red page.
+            # v13.89: a restored page has no raw bytes once the cache budget is
+            # gone, so the seeded text is the guaranteed view either way.
             for idx, m in enumerate(_r_msgs, 1):
                 _subj = (m.get("subject") or "(no subject)").strip()
                 _from = (m.get("from") or "(unknown sender)").strip()
@@ -17505,7 +17768,7 @@ else:
                     _mv_body = m.get("body") or "(no readable body)"
                     if _mv_key not in str_lit.session_state:
                         str_lit.session_state[_mv_key] = _mv_body
-                    if mailview is not None and hasattr(mailview, "render"):
+                    if mailview is not None and hasattr(mailview, "render") and m.get("raw"):
                         try:
                             mailview.render(str_lit, m.get("raw") or b"", _mv_key,
                                             allow_remote=allow_remote)
