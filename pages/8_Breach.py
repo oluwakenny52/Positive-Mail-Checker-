@@ -206,6 +206,14 @@ _RES_KEY = "_breach_results"
 _QUAL_KEY = "_breach_quality"
 _MSG_KEY = "_breach_msg"
 _TRACE_SHOWN = "_breach_trace_shown"
+_CAP_VIEW_KEY = "_breach_cap_view"
+_CAP_MODE_KEY = "_breach_page_mode"
+_CAP_ON_KEY = "_breach_page_on"
+_MODE_LABELS = {
+    "Fast - only what I filter for": "fast",
+    "Full - every address checked": "full",
+    "Off - capture no pages": "off",
+}
 
 _BAND_CSS = {"NEW": "br-new", "PARTIAL": "br-partial", "OLD": "br-old",
              "CLEAN": "br-clean", "UNKNOWN": "br-unknown"}
@@ -295,7 +303,7 @@ def _csv(rows):
             str(r.get("corpora", 0)),
             str(r.get("sites", 0)),
             str(r.get("sensitive", 0)),
-            str(r.get("newest_days") if r.get("newest_days") is not None else ""),
+            str(r.get("newest_breach_days") if r.get("newest_breach_days") is not None else ""),
             '"%s"' % "; ".join(b.get("title") or "" for b in bs[:12]).replace('"', "'"),
             '"%s"' % "; ".join(sorted({c for b in bs
                                        for c in (b.get("classes") or [])})).replace('"', "'"),
@@ -437,6 +445,41 @@ with _c5:
                              on_change=_watch("_breach_http_only", "http only"),
                              help="No browser. Faster, but a challenged address "
                                   "comes back UNKNOWN instead of resolved.")
+
+# ---- page capture, and how much of it ------------------------------------
+# A captured page is a SECOND request per address, so the mode is a real cost
+# switch and not a preference. Fast is the default and captures only the
+# outcomes ticked beside it; full doubles the run to keep every page.
+st.markdown("##### Captured pages")
+_cm1, _cm2 = st.columns([0.58, 0.42])
+with _cm1:
+    _mode_label = st.radio(
+        "Capture", list(_MODE_LABELS.keys()), horizontal=False, key=_CAP_MODE_KEY,
+        on_change=_watch(_CAP_MODE_KEY, "capture mode"),
+        help="The page is what the site actually renders for an address - titles, "
+             "dates, data classes, or the 'no pwnage' copy. It is kept per address "
+             "under your own prefix and can be wiped at the bottom of the page.")
+_page_mode = _MODE_LABELS.get(_mode_label, "fast")
+with _cm2:
+    if _page_mode == "fast":
+        _on_labels = st.multiselect(
+            "Capture which outcomes", ["CLEAN", "Errored"],
+            default=["CLEAN", "Errored"], key=_CAP_ON_KEY,
+            on_change=_watch(_CAP_ON_KEY, "capture outcomes"),
+            help="Only these are fetched. A breached address keeps its records and "
+                 "gets no page - the JSON already has the titles and dates.")
+        _page_on = [x.lower() for x in _on_labels]
+    elif _page_mode == "full":
+        st.caption("Every checked address is captured, records or not. This is the "
+                   "slow one - roughly two requests per address.")
+        _page_on = ["clean", "error"]
+    else:
+        st.caption("No pages are captured. Records, verdicts and exports are "
+                   "unaffected.")
+        _page_on = []
+
+if _page_mode == "fast" and not _page_on:
+    st.caption("Fast mode with nothing ticked captures nothing - the same as Off.")
 # @@END 007 INPUT
 
 # @@BLOCK 008 RUN deps=007
@@ -452,11 +495,20 @@ if _run and _pairs:
     # than silently running the old way.
     try:
         breach.configure(pages=int(_pages), delay=float(_delay),
-                         http_only=bool(_http_only))
+                         http_only=bool(_http_only),
+                         page_mode=_page_mode, page_on=_page_on)
     except TypeError:
-        breach.configure(pages=int(_pages), delay=float(_delay))
-        breach.trace("WARN", "run", "breach.configure has no http_only argument - "
-                                    "the tier switch is NOT applied")
+        try:
+            breach.configure(pages=int(_pages), delay=float(_delay),
+                             http_only=bool(_http_only))
+        except TypeError:
+            breach.configure(pages=int(_pages), delay=float(_delay))
+            breach.trace("WARN", "run", "breach.configure has no http_only argument "
+                                        "- the tier switch is NOT applied")
+        breach.trace("WARN", "run", "breach.configure has no page_mode argument "
+                                    "- the capture switch is NOT applied")
+    breach.trace("INFO", "run", "pages: %s%s" % (
+        _page_mode, (" (%s)" % ",".join(_page_on)) if _page_on else ""))
     _since0 = breach.trace_seq()
     _bar = st.progress(0.0, text="0 / %d" % len(_pairs))
     _live = st.empty()
@@ -507,8 +559,11 @@ if _run and _pairs:
         # means "challenged, not tried", and under http+browser it means the
         # browser failed too. Those are different problems.
         _msg = ("Checked %d via %s. %d old, %d partially new, %d new, %d clean, "
-                "%d unresolved." % (len(_rows), _tier, _b["OLD"], _b["PARTIAL"],
-                                    _b["NEW"], _b["CLEAN"], _b["UNKNOWN"]))
+                "%d unresolved. Pages captured: %s."
+                % (len(_rows), _tier, _b["OLD"], _b["PARTIAL"],
+                   _b["NEW"], _b["CLEAN"], _b["UNKNOWN"],
+                   ("off" if _page_mode == "off" else
+                    ("all" if _page_mode == "full" else (",".join(_page_on) or "none")))))
         breach.trace("INFO", "run", "summary: " + _msg)
         # A message widget is REQUIRED here. Without one the ledger closes the
         # press as "NO RESULT | finished without reporting", which is exactly what
