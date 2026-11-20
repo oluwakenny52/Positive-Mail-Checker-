@@ -24,7 +24,7 @@ A ccTLD is a country by definition, but a bare `.com` says nothing about where
 an account is - `alditra.com` is Indonesian and no TLD-only rule can know that.
 So the lookup never guesses from a gTLD. It goes, in order:
 
-    1. the owner's own map, which always wins and is taught from the page
+    1. the owner's own map, which always wins
     2. a seed map of free-mail providers and big brands
     3. a real ccTLD, two-label ones like co.uk included
     4. a generic TLD -> the Global / gTLD bucket
@@ -33,6 +33,20 @@ So the lookup never guesses from a gTLD. It goes, in order:
 `.io` and `.tv` are technically the British Indian Ocean Territory and Tuvalu,
 but nobody groups by that, so they sit in GENERIC_TLDS and land in the Global
 bucket. The custom map is a per-user JSON file and is the only tier that grows.
+
+AUTO-TEACH  (v13.86)
+--------------------
+The map can fill itself. auto_teach() reads clues that are ALREADY IN THE ROWS -
+a mail host under the same registrable label, or a sibling domain of the same
+name carrying a real ccTLD - and writes what it is sure of. An optional, paced,
+capped network tier exists for what the free clues miss.
+
+The important part is that group_rows() stays a pure per-row function. The clue
+pass is a separate call made on a button press, so sorting never waits on it,
+and the map is snapshotted ONCE per pass instead of copied per row.
+
+Provenance is kept in a sidecar file: a domain taught by hand is never
+overwritten by a clue, and undo_auto() removes exactly the clue-written ones.
 """
 
 import io
@@ -228,7 +242,53 @@ SEED_DOMAINS = {
 }
 
 CUSTOM_NAME = "domain_countries.json"
+META_NAME = "domain_countries_meta.json"
 _CUSTOM = {"mtime": None, "map": {}}
+_META = {"mtime": None, "map": {}}
+
+# The map a group_rows() pass is currently reading. country_of() is called once
+# per row, so without this a 200k sort copied the map 200k times. group_rows
+# snapshots once into here and clears it in a finally.
+_ACTIVE = {"map": None}
+
+CLUE_TAUGHT = "taught by hand"
+CLUE_HOST = "host ccTLD"
+CLUE_SIBLING = "sibling domain"
+CLUE_NET = "network lookup"
+
+AUTO_CAP_DEFAULT = 300
+AUTO_NET_CAP_DEFAULT = 40
+
+# Suffixes where the registrable label is the THIRD label from the right.
+_TWO_PART = frozenset({
+    "co.uk", "org.uk", "me.uk", "ltd.uk", "ac.uk", "com.au", "co.nz", "com.br",
+    "co.za", "co.jp", "co.kr", "co.in", "com.mx", "com.tr", "com.sg", "com.my",
+    "co.id", "co.il", "com.ar", "com.co", "com.pe", "com.ve", "co.th", "com.ph",
+    "com.vn", "com.tw", "com.hk", "com.cn", "co.ke", "com.ng", "com.eg",
+    "com.sa", "com.qa", "com.ua", "com.pl", "co.at", "or.at",
+})
+
+
+def registrable(domain) -> str:
+    """The label a domain is registered under: alditra.com -> alditra.
+
+    Never raises. Empty for anything without a dot.
+    """
+    d = (domain or "").strip().lower().rstrip(".")
+    if "." not in d:
+        return d
+    parts = d.split(".")
+    if len(parts) >= 3 and ".".join(parts[-2:]) in _TWO_PART:
+        return parts[-3]
+    return parts[-2]
+
+
+def _map_for_read() -> dict:
+    """The live map, no copy. For country_of() and nothing else."""
+    m = _ACTIVE["map"]
+    if m is not None:
+        return m
+    return _CUSTOM["map"]
 
 
 def _custom_path() -> str:
@@ -239,10 +299,21 @@ def _custom_path() -> str:
         return ""
 
 
+def _meta_path() -> str:
+    try:
+        import auth
+        return auth.user_file(META_NAME)
+    except Exception:
+        return ""
+
+
 def custom_map() -> dict:
     """The owner's domain -> country map, re-read when the file moves.
 
-    Memoised on mtime, so a sort of 5000 rows is one stat and no re-read.
+    Memoised on mtime, so a sort of 5000 rows is one stat and no re-read. The
+    memo hit returns the live dict WITHOUT copying - country_of() reaches this
+    once per row. The contract is still "do not mutate what you get back", and
+    every writer replaces the dict wholesale through custom_save().
     """
     p = _custom_path()
     if not p:
@@ -252,7 +323,7 @@ def custom_map() -> dict:
     except Exception:
         mt = None
     if _CUSTOM["mtime"] == mt and _CUSTOM["map"]:
-        return dict(_CUSTOM["map"])
+        return _CUSTOM["map"]
     out = {}
     try:
         if p and os.path.exists(p):
@@ -266,7 +337,7 @@ def custom_map() -> dict:
         out = dict(_CUSTOM["map"])
     _CUSTOM["mtime"] = mt
     _CUSTOM["map"] = out
-    return dict(out)
+    return out
 
 
 def custom_save(mapping) -> int:
@@ -289,19 +360,79 @@ def custom_save(mapping) -> int:
     return len(clean)
 
 
+def meta_map() -> dict:
+    """domain -> {src, at}. Provenance only; the grouping never reads it."""
+    p = _meta_path()
+    if not p:
+        return _META["map"]
+    try:
+        mt = os.path.getmtime(p) if os.path.exists(p) else None
+    except Exception:
+        mt = None
+    if _META["mtime"] == mt:
+        return _META["map"]
+    out = {}
+    try:
+        if os.path.exists(p):
+            with open(p, encoding="utf-8", errors="ignore") as fh:
+                data = json.load(fh)
+            if isinstance(data, dict):
+                out = {str(k).strip().lower(): v for k, v in data.items()
+                       if isinstance(v, dict)}
+    except Exception:
+        out = _META["map"]
+    _META["mtime"] = mt
+    _META["map"] = out
+    return out
+
+
+def _meta_write(mapping) -> None:
+    p = _meta_path()
+    _META["map"] = mapping
+    _META["mtime"] = None
+    if not p:
+        return
+    try:
+        os.makedirs(os.path.dirname(p) or ".", exist_ok=True)
+        tmp = p + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(mapping, fh, indent=2, sort_keys=True)
+        os.replace(tmp, p)
+    except Exception:
+        pass
+
+
 def learn(domain, country) -> int:
-    """Teach one domain, or clear it when `country` is empty. New map size."""
+    """Teach one domain, or clear it when `country` is empty. New map size.
+
+    A taught entry is recorded as by-hand, so undo_auto() will never remove it.
+    """
     d = (domain or "").strip().lower().lstrip("@")
     if d.startswith("www."):
         d = d[4:]
     cur = custom_map()
     if not d:
         return len(cur)
+    meta = dict(meta_map())
     if country:
         cur[d] = str(country).strip()
+        meta[d] = {"src": CLUE_TAUGHT, "at": ""}
     else:
         cur.pop(d, None)
+        meta.pop(d, None)
+    _meta_write(meta)
     return custom_save(cur)
+
+
+def country_source(domain) -> str:
+    """How a domain got its country: a clue, by hand, or not at all."""
+    d = (domain or "").strip().lower()
+    hit = meta_map().get(d)
+    if isinstance(hit, dict):
+        return str(hit.get("src") or CLUE_TAUGHT)
+    if d in custom_map():
+        return CLUE_TAUGHT
+    return ""
 
 
 def _tlds_of(domain) -> tuple:
@@ -328,7 +459,7 @@ def country_of(domain) -> str:
     full, two, tld = _tlds_of(domain)
     if not full:
         return NO_COUNTRY
-    cur = custom_map()
+    cur = _map_for_read()
     if full in cur:
         return cur[full]
     if two and two in cur:
@@ -352,6 +483,168 @@ def region_of(domain) -> str:
     if c == NO_COUNTRY:
         return NO_REGION
     return _REGION_OF.get(c, NO_REGION)
+
+
+def _net_country(domain, timeout=4.0) -> tuple:
+    """(country, error). Country only when it is in the region table.
+
+    The A record, not a mailbox connection - one lookup per domain, no IMAP.
+    """
+    try:
+        import socket
+        import requests
+    except Exception:
+        return "", "no socket/requests"
+    try:
+        infos = socket.getaddrinfo(domain, None, socket.AF_INET)
+        ip = infos[0][4][0] if infos else ""
+    except Exception as exc:
+        return "", "dns %s" % type(exc).__name__
+    if not ip:
+        return "", "no address"
+    try:
+        r = requests.get("http://ip-api.com/json/%s?fields=status,country" % ip,
+                         timeout=timeout)
+        data = r.json() if r.status_code == 200 else {}
+    except Exception as exc:
+        return "", "http %s" % type(exc).__name__
+    if not isinstance(data, dict) or data.get("status") != "success":
+        return "", "no answer"
+    c = str(data.get("country") or "").strip()
+    if c not in _REGION_OF:
+        return "", "country %r has no region" % c
+    return c, ""
+
+
+def auto_teach(rows, net=False, cap=AUTO_CAP_DEFAULT,
+               net_cap=AUTO_NET_CAP_DEFAULT, on_progress=None) -> dict:
+    """Resolve unmapped gTLD domains from clues already in the rows.
+
+    Writes only domains that are NOT already in the map, so nothing taught by
+    hand can be overwritten. Everything it does write carries a source, and
+    undo_auto() removes exactly those.
+
+    Offline by default. `net=True` adds one paced A-record lookup per domain the
+    free clues could not place, capped separately because the geo service is
+    rate limited.
+
+    Returns {"candidates","host","sibling","net","left","error"} - a report, not
+    a group set. group_rows() is untouched, so sorting never waits on this.
+    """
+    rep = {"candidates": 0, "host": 0, "sibling": 0, "net": 0, "left": 0,
+           "error": ""}
+    try:
+        import time as _time
+    except Exception:
+        _time = None
+
+    # ---- 1. what is actually unresolved, and the hosts the rows carry ------
+    hosts = {}
+    unresolved = {}
+    for r in rows or []:
+        d = (r.get("domain") or "").strip().lower()
+        if not d:
+            continue
+        h = str(r.get("host") or "").strip().lower()
+        if h:
+            hosts.setdefault(d, []).append(h)
+        if d not in unresolved and country_of(d) == COUNTRY_GENERIC:
+            unresolved[d] = True
+    if not unresolved:
+        rep["error"] = "nothing to place - no unmapped gTLD domain in the rows"
+        return rep
+    cands = sorted(unresolved)[:max(1, int(cap))]
+    rep["candidates"] = len(cands)
+
+    # ---- 2. siblings: another domain under the same label with a ccTLD -----
+    # Only a UNANIMOUS sibling answer counts. Two siblings disagreeing leaves
+    # the domain alone rather than picking one.
+    by_label = {}
+    for r in rows or []:
+        d = (r.get("domain") or "").strip().lower()
+        if not d:
+            continue
+        c = country_of(d)
+        if c not in (COUNTRY_GENERIC, NO_COUNTRY):
+            by_label.setdefault(registrable(d), set()).add(c)
+
+    found = {}
+    for d in cands:
+        sib = by_label.get(registrable(d)) or set()
+        if len(sib) == 1:
+            found[d] = (list(sib)[0], CLUE_SIBLING)
+
+    # ---- 3. host: only when the host is under the SAME label --------------
+    # smtp.gmail.com says nothing about alditra.com, so a shared provider host
+    # is rejected unless the registrable label matches.
+    for d in cands:
+        if d in found:
+            continue
+        for h in hosts.get(d) or []:
+            if registrable(h) != registrable(d):
+                continue
+            c = country_of(h)
+            if c not in (COUNTRY_GENERIC, NO_COUNTRY):
+                found[d] = (c, CLUE_HOST)
+                break
+
+    # ---- 4. optional network, paced and capped ---------------------------
+    if net:
+        left = [d for d in cands if d not in found][:max(0, int(net_cap))]
+        for n, d in enumerate(left, 1):
+            c, _err = _net_country(d)
+            if c:
+                found[d] = (c, CLUE_NET)
+            if on_progress is not None:
+                try:
+                    on_progress(n, len(left), d, bool(c))
+                except Exception:
+                    pass
+            if _time is not None and n < len(left):
+                _time.sleep(0.25)
+
+    # ---- 5. write, never over an existing entry --------------------------
+    if found:
+        cur = custom_map()
+        meta = dict(meta_map())
+        stamp = ""
+        try:
+            from datetime import datetime as _dt
+            stamp = _dt.now().strftime("%Y-%m-%d %H:%M:%S")
+        except Exception:
+            pass
+        for d, (c, src) in found.items():
+            if d in cur:
+                continue
+            cur[d] = c
+            meta[d] = {"src": src, "at": stamp}
+            if src == CLUE_HOST:
+                rep["host"] += 1
+            elif src == CLUE_SIBLING:
+                rep["sibling"] += 1
+            else:
+                rep["net"] += 1
+        custom_save(cur)
+        _meta_write(meta)
+    rep["left"] = len(cands) - (rep["host"] + rep["sibling"] + rep["net"])
+    return rep
+
+
+def undo_auto() -> int:
+    """Remove every auto-assigned domain, keep everything taught by hand."""
+    cur = custom_map()
+    meta = dict(meta_map())
+    removed = 0
+    for d, info in list(meta.items()):
+        if str((info or {}).get("src") or "") == CLUE_TAUGHT:
+            continue
+        if cur.pop(d, None) is not None:
+            removed += 1
+        meta.pop(d, None)
+    if removed:
+        custom_save(cur)
+        _meta_write(meta)
+    return removed
 
 
 SORT_KEYS = {
@@ -407,18 +700,25 @@ def group_rows(rows, label, order="A-Z", dedupe=True, cap=CAP_DEFAULT):
 
     `dropped` counts rows cut by `cap`, so the page can say so instead of
     silently shipping a truncated file.
+
+    The custom map is snapshotted ONCE into _ACTIVE for the whole pass, so a
+    country or region grouping costs one read and no per-row copy.
     """
     fn = SORT_KEYS.get(label)
     if fn is None:
         fn = SORT_KEYS["None - one single group"]
     buckets = {}
-    for r in rows or []:
-        try:
-            key = fn(r)
-        except Exception:
-            key = "(error)"
-        key = str(key or "(none)")
-        buckets.setdefault(key, []).append(r)
+    _ACTIVE["map"] = custom_map()
+    try:
+        for r in rows or []:
+            try:
+                key = fn(r)
+            except Exception:
+                key = "(error)"
+            key = str(key or "(none)")
+            buckets.setdefault(key, []).append(r)
+    finally:
+        _ACTIVE["map"] = None
 
     groups = []
     dropped = 0
