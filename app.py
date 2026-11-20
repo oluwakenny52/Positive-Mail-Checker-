@@ -14822,11 +14822,6 @@ def _check_account_core(email, password, conf, domain, proxy_pool, thread_state,
 section_title("🚀", "Execute Live Checking Engine",
               "proxy-backed, post-auth verified, resumable")
 
-# v13.80 WAVE 8: THE SWEEP LIVES HERE because this block is module level and runs
-# on EVERY load of the app - which is exactly the cadence a "did it deliver"
-# watchdog needs. Anything armed by the last load and not satisfied by the time
-# this one starts is reported to the bell as kind="watch". It fires once per
-# window, so a rerun loop cannot turn one dead fetch into fifty notifications.
 try:
     import sentinel as _sentinel
 except Exception:
@@ -14834,19 +14829,6 @@ except Exception:
 if _sentinel is not None:
     _sentinel.sweep()
 
-# v13.81 WAVE 13: THE LAST-RESORT CLASSIFIER IS CONFIGURED HERE, once, from the
-# GEMINI_* keys block 043 bridged into os.environ. This block is module level and
-# runs on every load, which is the only cadence a configure() has - block 067
-# calls classify() from worker threads long after any script run has ended.
-#
-# The drain is a DAEMON THREAD and runs once per session: block 067 has already
-# queued whatever it could not place, the account that produced it is long gone,
-# and the next account that sees the same text gets the cached token. Nothing
-# here can block the script thread, the ladder or a verdict.
-#
-# `_AI` is the same module object block 067 imported. Re-binding the name to the
-# same object (or to None on the same failure) is harmless because 067 looks the
-# global up at call time.
 try:
     import aiassist as _AI
 except Exception:
@@ -14866,10 +14848,6 @@ if _AI is not None:
 RESULT_ACTION_MODES = BUCKETS
 ACTION_OPTIONS = list(PREFILTER_LABELS) + [label for label, _ in BUCKETS]
 
-# v13.71: THE SELECTOR SITS BETWEEN THE HEADING AND THE BUTTONS. It used to be
-# squeezed into a 0.35 column beside Start/Stop, so on a phone the thing that
-# decides WHICH queue runs was the smallest control on the page. It is now read
-# before the button that acts on it.
 _seed_widget("bb_action_mode", choices=ACTION_OPTIONS, dflt=ACTION_OPTIONS[0])
 engine_action_mode = str_lit.selectbox(
     "Engine Action Mode:", options=ACTION_OPTIONS,
@@ -14878,8 +14856,6 @@ engine_action_mode = str_lit.selectbox(
          "previous result bucket to re-run."
 )
 if engine_action_mode == "Resume Unfinished":
-    # runstate.summary() reads the watchdog record, so this is the truth about
-    # whether anything is actually resumable - not a glob that always matched.
     _rs_lines = runstate.summary()
     if _rs_lines:
         for _rs_line in _rs_lines:
@@ -14896,8 +14872,6 @@ with col_action1:
              "reason on the run record FIRST, then reruns, so the next page load "
              "reports 'Stopped by user' and leaves the queue resumable.")
 with col_action2:
-    # v13.71: batch state, read straight from session_state so no Apply Settings is
-    # needed. It is published as text only - the engine never reads it.
     _batch_on = bool(str_lit.session_state.get("bb_batch_on"))
     try:
         _batch_size = max(0, int(str_lit.session_state.get("bb_batch_size") or 0))
@@ -14910,9 +14884,6 @@ with col_action2:
     else:
         str_lit.caption("Batch off")
 
-# v13.81: THE CAPS ARE VISIBLE. A budget nobody can see is a budget nobody
-# believes, and the failure mode of an unbounded classifier is a silent quota
-# bill. Read from report(), which never raises.
 if _AI is not None:
     try:
         _ai_rep = _AI.report()
@@ -14928,38 +14899,42 @@ if _AI is not None:
     else:
         str_lit.caption("🤖 Unknown-tail classifier: off (GEMINI_ENABLED or key absent).")
 
-# FIX SPEED-8: this used to run at MODULE level on every rerun - a full read and
-# filter of proxies.txt for a value only the start path below ever consumes. The
-# sidebar (block 080) already computes its own filtered_pool for display.
-#
-# v13.70 ISO-9: AND IT IS A CROSS-SESSION HAZARD. It is a module global, it is
-# reset to [] on EVERY rerun of EVERY session, and check_task used to read it
-# from globals at call time. So any rerun anywhere - the other tab of the same
-# person, another user loading the page - emptied the pool out from under a live
-# run and every remaining account silently fell through to DIRECT with no proxy.
-#
-# _run_pool_box is the fix: a fresh list per run, captured by check_task as a
-# DEFAULT ARGUMENT (so it binds the object, not the name) and filled once by
-# block 106 before the first future exists. A rerun rebinding the module name
-# cannot reach the list the live closure already holds. The submit call stays
-# exactly `executor.submit(check_task, line)`, which verify_v1337.py gates.
 active_proxy_pool = []
 _run_pool_box = []
-# v13.71: batch state for block 106 and block 108. Bound here, unconditionally,
-# so neither of them ever reads an unbound name.
-# v13.72: `_batch_active` WAS HERE AND IS GONE. It was bound here and set True /
-# False in the start path below, and no block ever read it - block 106 decides
-# the batch boundary from `_batch_rest` and block 108 from `_batch_hit`, both of
-# which are real. Three assignments to a name nobody consults.
 _batch_rest = []
+_kw_live = str_lit.empty()
 
 
-# v13.53: progress_bar / status_text are bound at MODULE scope behind a null shim.
-# They are only ever CREATED on the start path, yet block 107 writes to both and
-# block 108 runs on EVERY page load - so on any load that never entered the start
-# branch both names were unbound, every write raised NameError, and the surrounding
-# try/except swallowed it. That is exactly why the screen sat frozen on the last
-# line instead of reporting what it was doing. The shim absorbs the calls instead.
+def render_kw_panel():
+    """The live hit panel. Cheap, module level, repainted by block 106.
+
+    Two numbers matter and neither was on the page before: how many mails each
+    keyword actually produced, and what the last scan did. Both are read from
+    session_state, so the panel survives a rerun and is right on the first paint.
+    """
+    try:
+        _counts = dict(str_lit.session_state.get("kw_counts") or {})
+        _trace = list(str_lit.session_state.get("kw_trace") or [])
+        _hits = len(str_lit.session_state.get("kw_hits_results") or [])
+    except Exception:
+        _counts, _trace, _hits = {}, [], 0
+    if not _counts and not _trace and not _hits:
+        _kw_live.caption("No scans yet this session. Counts appear here as they land.")
+        return
+    _total = sum(_counts.values())
+    _kw_live.markdown(
+        f"**{_hits}** hit line(s) · **{_total}** occurrence(s) across "
+        f"**{len(_counts)}** keyword(s)")
+    if _counts:
+        _rows = sorted(_counts.items(), key=lambda kv: -kv[1])[:12]
+        _kw_live.markdown(
+            "| Keyword | Mails |\n|---|---|\n"
+            + "\n".join("| `%s` | %d |" % (k, v) for k, v in _rows))
+    if _trace:
+        with _kw_live.expander("Keyword scan trace", expanded=False):
+            str_lit.code("\n".join(_trace[-40:]), language="text")
+
+
 class _NullUI:
     def progress(self, *a, **k):
         return self
@@ -14986,30 +14961,8 @@ class _NullUI:
 progress_bar = _NullUI()
 status_text = _NullUI()
 
-# ==========================================================================
-# FIX COMBO-1 (v13.75) - THE EMAIL:PASSWORD WAS THERE AND COULD NOT BE SEEN
-#
-# The run loop builds every bucket line as
-#
-#     f"{email}:{password} | {detail}"
-#
-# so the combo is in the line, in the file and in the ZIP. The renderers threw
-# the visibility away, not the data.
-#
-# v13.76 FIX COMBO-2: AND THE TAIL IS GONE FROM THE LINE ITSELF. Cutting it in
-# the renderer still left it in the .txt files, in the ZIP, in every download
-# button and in the inspector, so a list exported from the app was not a list
-# you could paste back into it. check_task() emits `email:password` only now;
-# `detail` travels in its own key, which is what the report table and the
-# under-the-hood trace read. Nothing diagnostic is lost - it is just no longer
-# glued to the password.
-#
-# The renderer therefore draws the combo alone. The partition is kept (the gate
-# in pages/5_Blocks.py pins that exact line) and detail is simply not drawn, so
-# a bucket rehydrated from an older file still renders clean.
-# ==========================================================================
+
 def _bucket_combo_html(line, col):
-    """One bucket line -> the combo in bold, wrapping. Verdict tail dropped."""
     combo, _sep, detail = str(line).partition(" | ")
     combo = combo.strip() or str(line).strip()
     return ("<div style='font-family:ui-monospace,monospace;font-size:12px;"
@@ -15018,24 +14971,15 @@ def _bucket_combo_html(line, col):
             % (col, html.escape(combo)))
 
 
-# v13.71: CONTINUE. The batch banner in block 108 parks the remaining queue here
-# and reruns; this is what turns that rerun back into a start. Consumed with pop
-# so a plain refresh cannot re-trigger it.
 _autostart = str_lit.session_state.pop("_batch_autostart", None)
 if _autostart:
     start_engine_btn = True
 
-# The stop is a rerun with a reason attached: the click tears the loop down
-# before anything below executes, so the stamp has to happen here and the
-# interrupt itself is performed by block 007 on the next load.
 if stop_engine_btn and STATE.get("run_active"):
     runstate.note("Stopped by user (Stop button)")
     str_lit.rerun()
 
 if start_engine_btn:
-    # v13.81: the run counter and the trip latch are per RUN, so they clear here
-    # and not on a load. A latch left armed by the previous run would keep the
-    # classifier silent for the whole of this one.
     if _AI is not None:
         try:
             _AI.reset_run()
@@ -15043,10 +14987,10 @@ if start_engine_btn:
             pass
     clear_proxy_quarantine()
     log_probe_event("run start: 407 quarantine cleared")
-    # v13.80 WAVE 8: armed here, satisfied by block 106 when a single result
-    # lands. A run that checks accounts and buckets nothing is the failure mode
-    # that reads as success on screen - 0 valid, 0 wrong, 0 everything - and it
-    # is worth a bell because nobody is watching by then.
+    # The keyword counters are per RUN, so they reset with the run - a stale
+    # total from the last run would read as progress this one never made.
+    str_lit.session_state["kw_counts"] = {}
+    str_lit.session_state["kw_trace"] = []
     if _sentinel is not None:
         _sentinel.expect(
             "run", "The run finished without producing a single result",
@@ -15107,11 +15051,9 @@ if start_engine_btn:
 
     accounts_to_check = category_queue_map.get(engine_action_mode, [])
 
-    # v13.71: a Continue carries its own queue and overrides the category.
     if _autostart:
         accounts_to_check = [str(x) for x in _autostart if str(x).strip()]
         log_startup(f"BATCH CONTINUE -> {len(accounts_to_check)} account(s) carried over.")
-    # A banner from the previous batch must not survive into this run.
     str_lit.session_state.pop("_batch_hit", None)
 
     if not accounts_to_check:
@@ -15125,18 +15067,9 @@ if start_engine_btn:
                 f"reason={_rec.get('reason') or _rec.get('cause') or 'none'} | "
                 f"remaining file={'present' if runstate.remaining() else 'empty/absent'}")
     else:
-        # The pool is filtered HERE, once, on the start path only.
         active_proxy_pool = get_filtered_active_proxies()
         filtered_pool[:] = active_proxy_pool
 
-        # FIX ISO-4 (v13.49) put the counter here; v13.53 moves it into block 106's
-        # try. Claimed here it sat OUTSIDE any finally, so a throw in the cold-pool
-        # wait, the tab build or the bucket placeholders below left runs_active
-        # permanently +1 and the deployment believed a run was live forever.
-        # Claimed inside the try it is always paired with the release.
-
-        # v13.70 ISO-10: the comparison reads THIS session's own target, not the
-        # process mirror - STATE is written by whoever started a run last.
         try:
             _prev_tg = list(_user_state().get("probe_targets_override") or [])
         except Exception:
@@ -15150,12 +15083,6 @@ if start_engine_btn:
             _pool_warm = bool(alive_pool)
 
         if not _pool_warm:
-            # FIX SPEED-2: this used to wait up to PROBE_BUDGET_START + 10 (130s)
-            # for the probe lock and then run a FULL 120s forced probe before the
-            # first account was even submitted. On Resume Unfinished that is
-            # minutes of spinner with nothing happening. Wait briefly, then start
-            # on whatever exists - the per-account ladder falls through to DIRECT
-            # by itself when the pool is empty.
             with str_lit.spinner("Cold pool - brief wait for the probe, then starting..."):
                 _t0 = time.time()
                 while _PROBE_OWNER_LOCK.locked() and (time.time() - _t0) < 20.0:
@@ -15176,13 +15103,6 @@ if start_engine_btn:
             log_probe_event("start: pool warm, target changed -> background refresh, "
                             "run starts immediately")
 
-        # ---- THE ARMED POOL, AND IT SAYS WHAT IT ARMED -----------------------
-        # FIX PLAN-2 (v13.64): the pool was copied wholesale and the run began
-        # without a word about its composition, so a pool that was half spent read
-        # exactly like a healthy one until the first account's ladder collapsed into
-        # DIRECT. _pool_tiers() is the same three-tier split block 069 draws from:
-        # A passed, B 402-only, C everything else. The counts are logged and a
-        # plan-only pool warns BEFORE the first account is submitted.
         _armed_plan = 0
         if alive_pool:
             active_proxy_pool = list(alive_pool)
@@ -15219,7 +15139,6 @@ if start_engine_btn:
             f"alive={len(alive_pool)} quarantined={quarantine_size()}"
         )
         _msr = STATE.get("mail_spot") or {}
-        # v13.54: only my own spot check - see block 073.
         if _msr.get("user") and _msr.get("user") != _gate_scope():
             _msr = {}
         if _msr.get("auth") and not _msr.get("ok") and _msr.get("n"):
@@ -15233,7 +15152,6 @@ if start_engine_btn:
                 f"passwords are untested - set **Proxy Mode Engine = off** (DIRECT)."
             )
         elif _msr.get("plan") and not _msr.get("ok") and _msr.get("n"):
-            # v13.64: the 402 case had no start-path banner at all.
             str_lit.warning(
                 f"⚠ **The mail-destination spot check answered 402 Payment Required on "
                 f"{_msr['plan']}/{_msr['n']} sampled node(s)** against "
@@ -15265,15 +15183,6 @@ if start_engine_btn:
             str_lit.session_state.dns_results = list(str_lit.session_state.get("pre_dns_failed", []))
             str_lit.session_state.skip_results = []
             str_lit.session_state.unknown_results = []
-            # v13.79 WAVE 6: kw_hits_results is deliberately NOT reset here. It
-            # comes from the Mailbox Reader's search, not from a run, so a re-run
-            # must not wipe a set of hits the user just collected.
-            # FIX LAG-7 (v13.67): both of these were plain lists and the run loop
-            # trimmed them with pop(0) / del[:-N] on EVERY result. After the cap
-            # was reached that is a 5,000-element shift and a 20,000-element slice
-            # copy per account - roughly 2.4 billion element moves across a
-            # 120,000-account run, on the same thread that feeds the UI. A deque
-            # with maxlen trims in O(1).
             log_cap = LOG_CAP_DEBUG if CFG.get("DEBUG", False) else LOG_CAP_QUIET
             str_lit.session_state.report_entries = deque(maxlen=REPORT_ENTRIES_MAX)
             str_lit.session_state.log_lines = deque(maxlen=log_cap)
@@ -15283,10 +15192,6 @@ if start_engine_btn:
             str_lit.session_state.run_completion_status = "Unfinished"
 
             start_dt = datetime.now()
-            # FIX SURVIVE-1 (v13.67): ONE stamp for the whole run. The bucket
-            # journal opens on it here and the export block re-uses it, so the live
-            # files and the exported files are the same files - a fresh stamp at
-            # export time would orphan every line written during the run.
             _run_stamp = start_dt.strftime("%Y%m%d_%H%M%S")
             str_lit.session_state.start_timestamp = start_dt.strftime("%Y-%m-%d %H:%M:%S")
             str_lit.session_state.end_timestamp = None
@@ -15312,8 +15217,6 @@ if start_engine_btn:
                 ("dns_results", "🛰 DNS Failed (pre-check)"),
                 ("skip_results", "⏭ Skipped / Filtered"),
                 ("unknown_results", "❓ Unclassified"),
-                # v13.79 WAVE 6: the box exists so hits collected in the reader
-                # before a run still have a place on this screen.
                 ("kw_hits_results", "🔎 Keyword Hits"),
             ]
             for _key, _title in BUCKET_SPEC:
@@ -15321,11 +15224,6 @@ if start_engine_btn:
                     bucket_placeholders[_key] = str_lit.empty()
             report_log_container = str_lit.empty()
 
-        # v13.71: MAX_ACCOUNTS 0 = all, then the batch slice. THE SLICE HAPPENS
-        # BEFORE SUBMIT, not by counting completions: every future handed to the
-        # executor is collected, and executor.shutdown(wait=False) lets stragglers
-        # finish after the loop - so a batch counted inside the loop would run the
-        # whole queue and simply not report it.
         _full_queue = (accounts_to_check[:CFG["MAX_ACCOUNTS"]]
                        if CFG["MAX_ACCOUNTS"] > 0 else list(accounts_to_check))
         if _batch_on and _batch_size > 0 and len(_full_queue) > _batch_size:
@@ -15338,13 +15236,8 @@ if start_engine_btn:
             _batch_rest = []
         total_accs = len(all_target_accounts)
         checked_count = 0
-        # The queue is final and counted - open the run record here.
         _rs_path = runstate.begin(total_accs)
         thread_local = threading.local()
-        # FIX SCOPE-1 (v13.57): the run's gate scope and its config are captured
-        # HERE, on the script thread, before a single future exists. Every task pins
-        # both on its own worker, so a rerun in another tab (or this one) can no
-        # longer swap the scope under a live account or hand it another user's CFG.
         _run_scope = _gate_scope()
         _run_cfg = _cfg_snapshot()
         _last_ui_ts = 0.0
@@ -15354,32 +15247,6 @@ if start_engine_btn:
         _net_streak = 0
 
         def render_buckets(snapshot):
-            """ONE markdown call per bucket, not one per account line.
-
-            FIX DELTA-1 (v13.67): this opened a fresh `.container()` on the
-            placeholder and then emitted a separate widget for every line, on
-            every tick. Twelve buckets x up to 2000 lines is up to 24,000 widgets
-            per tick at 8.3 ticks a second - the delta stream outran the socket
-            and the browser answered "Failed to process a Websocket message.
-            RangeError: index out of range", after which it stopped applying
-            deltas and the page looked hung while the run carried on.
-
-            The bucket is a single HTML block now, capped at BUCKET_LIVE_TAIL.
-            The summary block still shows the full set.
-
-            v13.72 MEM-2: THE VALUES ARE (TRUE TOTAL, TAIL) NOW. The caller cuts
-            each bucket to BUCKET_SNAPSHOT_TAIL before handing it over, so the
-            copy in the live loop stopped being the whole bucket - and len() of an
-            already-cut list would have understated every bucket above the cap and
-            silently dropped the "+N more" line. The total travels with the tail.
-            A plain list is still accepted, so a shape mismatch degrades to a
-            short count instead of a blank box.
-
-            FIX COMBO-1 / COMBO-2 (v13.75 / v13.76): each line is drawn through
-            _bucket_combo_html(), which is combo-only and wraps. The line used to
-            be one unwrapped div carrying the whole verdict sentence, so the combo
-            - the only part anybody wants - was the part off screen.
-            """
             for key, _title in BUCKET_SPEC:
                 ph = bucket_placeholders.get(key)
                 if ph is None:
@@ -15408,25 +15275,7 @@ if start_engine_btn:
                     pass
 
         def check_task(line, _box=_run_pool_box):
-            """One account. `_box` is this RUN's captured proxy list.
-
-            v13.70 ISO-9: the pool used to be read from the module global
-            active_proxy_pool, which any rerun in any session resets to []. It is
-            bound as a DEFAULT ARGUMENT, so the closure holds the LIST OBJECT and a
-            rerun rebinding the module name cannot reach it. Block 106 fills the
-            box once, before the first future exists.
-
-            The default also keeps the submit call exactly
-            `executor.submit(check_task, line)`, which verify_v1337.py gates.
-
-            FIX COMBO-2: `line` is the combo ALONE now. The verdict detail is
-            returned in its own `detail` key, which block 106 files into the
-            report table and the trace. Every bucket, every journal write, every
-            result file, the ZIP and every download button therefore carry
-            `email:password` and nothing else.
-            """
             try:
-                # Pin BEFORE anything reads live_cfg() or asks for a gate.
                 seed_task_cfg(_run_cfg)
                 _pin_gate_scope(_run_scope)
                 _pool = _box or active_proxy_pool
@@ -15453,10 +15302,6 @@ if start_engine_btn:
                 return {"line": _combo_only(line), "email": line, "password": "",
                         "status": FAILED, "detail": str(ex), "trace": [str(ex)]}
             finally:
-                # v13.51: the whole per-thread dict was cleared, so the
-                # `sticky_proxy` that PROXY_MODE = "sticky" stores in it died after
-                # ONE account and sticky was never sticky. Everything else is
-                # per-account and still goes; sticky is kept.
                 if hasattr(thread_local, "state"):
                     try:
                         _keep = thread_local.state.get("sticky_proxy")
@@ -15474,64 +15319,19 @@ if start_engine_btn:
         _orig_deadline = CFG.get("ACCOUNT_DEADLINE")
         _orig_retries = CFG.get("SAME_HOST_RETRIES")
         _orig_rot = CFG.get("MAX_ROTATIONS")
-        # FIX CLOCK-SEED (v13.68) - THIS IS THE CRASH THAT LEFT checked=1/15.
-        #
-        # Block 105 seeds five clocks (_last_ui_ts, _last_df_ts, _last_ck_ts,
-        # _last_clean_ts, _net_streak) but this block reads SEVEN. It also reads
-        # _last_bucket_ts and _last_heavy_ck_ts, and both were only ever ASSIGNED
-        # further down inside the loop - so on the first completed account they
-        # were still unbound.
-        #
-        # The damage was two-stage:
-        #   * _last_bucket_ts is read in the UI-tick block, which sits INSIDE the
-        #     per-account try/except -> NameError swallowed, logged as
-        #     "[EXCEPTION] name '_last_bucket_ts' is not defined", tick aborted.
-        #   * _last_heavy_ck_ts is read in the CHECKPOINT, which sits OUTSIDE
-        #     that try -> the NameError escaped to `except BaseException` and
-        #     ENDED THE RUN on account 1, leaving checked=1/15 and 14 left.
-        #
-        # Both are seeded here, on the start path, before the try, in the same
-        # scope the reads happen in. 0.0 is the correct sentinel and NOT "now":
-        # it forces the first bucket render and the first heavy checkpoint
-        # immediately, so unfinished_live.json exists after the first result
-        # instead of thirty seconds later.
         _last_bucket_ts = 0.0
         _last_heavy_ck_ts = 0.0
-        # FIX SURVIVE-1: the journal scope is captured here, beside the originals,
-        # so the finally below can always close the right handles even if the try
-        # throws before the journal is opened.
         _journal_scope = _gate_scope()
         try:
-            # FIX ISO-5 (v13.53): the run counter is claimed HERE, as the first
-            # statement inside the try, and released in the finally. Block 105 used
-            # to claim it before the cold-pool wait, the tab build and the bucket
-            # placeholders - all outside any finally - so any throw in that stretch
-            # left runs_active permanently +1 and the deployment believed a run was
-            # live forever.
-            # FIX ISO-6 (v13.59): the count is PER USER now. One shared count meant
-            # user B's page could not tell whether user A's run was live, so the
-            # READY banner and the prober cadence were decided for the wrong person.
-            # It is resolved through _user_state() rather than the bare _US alias,
-            # because a prober thread in another tab rebinds _US.
             _us_run = _user_state()
             _us_run["runs_active"] = int(_us_run.get("runs_active", 0)) + 1
             STATE["runs_active"] = int(STATE.get("runs_active", 0)) + 1
             STATE["run_active"] = True
             str_lit.session_state["run_active"] = True
-            # FIX SURVIVE-1 (v13.67): every bucket gets a live file from here, so a
-            # teardown at ANY point leaves the run on disk and the reload restores
-            # it. Before this, the twelve bucket files were written only by the
-            # export block, which sits below this loop - so a teardown left nothing
-            # but the valid list, which has its own incremental writer.
             live_journal_open(_run_stamp, _journal_scope)
 
             current_workers = CFG["MAX_WORKERS_START"]
             if CFG.get("DYNAMIC_WORKER_SCALING", False):
-                # FIX SPEED-3: the small-queue branch CAPPED the count at 5, so a
-                # 10-line resume ran 5 workers even when the slider said 50 - the
-                # slider was ignored exactly where it looked most useful, and
-                # raising it appeared to do nothing. Scaling may only ever RAISE
-                # the count above what was asked, never clamp it below.
                 if total_accs > 500:
                     current_workers = max(
                         CFG["MAX_WORKERS_START"],
@@ -15540,16 +15340,6 @@ if start_engine_btn:
                 elif total_accs < 20:
                     current_workers = max(2, min(CFG["MAX_WORKERS_START"], total_accs))
 
-            # FIX LAG-2: the metric cells are built ONCE, here. Rebuilding 14
-            # st.columns inside every 0.12s tick was the single biggest per-tick
-            # cost, and that cost grew with the result set - so it was at its
-            # worst exactly when the queue was at its shortest.
-            # FIX LAG-6: the labels are their own list. The first version paired
-            # the placeholders with a list of INTEGERS but kept the old
-            # `(_ml, _mv)` double-unpack, so every tick raised "cannot unpack
-            # non-iterable int object" inside the per-account try/except. It was
-            # swallowed, and it aborted the checkpoint, the progress bar and the
-            # bucket render on every tick while looking like a harmless log line.
             _metric_labels = [
                 "✅ Valid", "❌ Wrong", "🔑 AppPass/2FA",
                 "🚪 Login Dropped", "🔌 Conn Failed", "🩹 Proxy Dead",
@@ -15560,13 +15350,6 @@ if start_engine_btn:
             with report_metrics_placeholder.container():
                 _metric_phs = [c.empty() for c in metric_grid(_metric_labels, per_row=3)]
 
-            # FIX LAG-3: an explicit executor, not `with`. ThreadPoolExecutor's
-            # __exit__ calls shutdown(wait=True), so a teardown mid-run blocked
-            # until EVERY queued account finished before the page could come back.
-            # v13.70 ISO-9: AND THE POOL IS CAPTURED HERE, ONCE, INTO THE BOX that
-            # check_task already holds as a default argument. extend() MUTATES it,
-            # it is not rebound, so the live closure keeps pointing at this run's
-            # own list even if a rerun elsewhere rebinds the module name.
             _run_pool_box.extend(active_proxy_pool)
             executor = ThreadPoolExecutor(max_workers=current_workers)
             try:
@@ -15575,23 +15358,6 @@ if start_engine_btn:
 
                 for index, future in enumerate(as_completed(future_to_line), 1):
                     checked_count += 1
-                    # FIX LAG-4: the tail is the slowest work by construction -
-                    # everything still queued has already exhausted most of its
-                    # ladder. Once only one worker-cohort is left, strip the tail.
-                    # FIX SPEED-9: capping ACCOUNT_DEADLINE alone did nothing,
-                    # because the per-account work floor lifted it straight back
-                    # up. The retries and the rotations are the other two pure
-                    # tail costs, so they go to zero for the tail only and all
-                    # three are restored in the finally.
-                    #
-                    # v13.66: IT BIT FROM ACCOUNT 1 ON EVERY SHORT QUEUE. The test
-                    # is against the WORKER COUNT, so a 15-account list on 50
-                    # workers satisfied it at once (14 <= 50) and the WHOLE run got
-                    # a 30s deadline with retries and rotations zeroed - not just
-                    # the last cohort. With auto-scaling ON the count can equal the
-                    # queue length, so it fired every single time. The extra guard
-                    # keeps the optimisation for what it was written for: the last
-                    # cohort of a queue that actually has more than one cohort.
                     _tail_left = total_accs - checked_count
                     if (_tail_left and _tail_left <= current_workers
                             and total_accs > current_workers):
@@ -15609,9 +15375,6 @@ if start_engine_btn:
                             st_val = res["status"]
                             em_val = res.get('email', '').strip().lower()
 
-                            # Connection-loss evidence: consecutive transport-ish
-                            # verdicts. One bad host is normal; eight in a row is
-                            # not, so stamp it on the record while it is happening.
                             if st_val in (CONNECTION_FAILED, PROXY_UNHEALTHY,
                                           DNS_FAILED, RETRY):
                                 _net_streak += 1
@@ -15625,14 +15388,11 @@ if start_engine_btn:
                             else:
                                 _net_streak = 0
 
-                            # FIX LAG-1: decide the UI tick BEFORE doing any list copies.
                             _now_ui = time.time()
                             _tick = (checked_count >= total_accs) or \
                                     ((_now_ui - _last_ui_ts) >= UI_MIN_INTERVAL)
                             _df_tick = ((checked_count >= total_accs)
                                         or ((_now_ui - _last_df_ts) >= REPORT_DF_MIN_INTERVAL))
-                            # FIX DELTA-1 (v13.67): buckets redraw on their own,
-                            # slower clock - they are the expensive part.
                             _bucket_tick = ((checked_count >= total_accs)
                                             or ((_now_ui - _last_bucket_ts)
                                                 >= BUCKET_MIN_INTERVAL))
@@ -15672,8 +15432,6 @@ if start_engine_btn:
                                 else:
                                     str_lit.session_state.conn_results.append(res["line"])
 
-                                # FIX SURVIVE-1 (v13.67): the result lands on disk
-                                # HERE, not at export time.
                                 _jtag = _BUCKET_TAG_BY_STATUS.get(st_val)
                                 if _jtag:
                                     live_journal_append(_jtag, res["line"],
@@ -15682,10 +15440,6 @@ if start_engine_btn:
                                 str_lit.session_state.log_lines.append(
                                     f"[{st_val.upper()}] {res.get('email', '')} -> "
                                     f"{res.get('detail', '')}")
-                                # FIX LAG-7: O(1) trim. popleft() covers the deque;
-                                # the pop(0) fallback covers a plain list, which is
-                                # what "Free my RAM" leaves behind if it is pressed
-                                # mid-run - the cap must not stop applying then.
                                 if len(str_lit.session_state.log_lines) > log_cap:
                                     try:
                                         str_lit.session_state.log_lines.popleft()
@@ -15724,24 +15478,9 @@ if start_engine_btn:
                                 unknown_len = len(str_lit.session_state.unknown_results)
                                 current_logs = (list(str_lit.session_state.log_lines)
                                                 if _tick else [])
-                                # FIX LAG-5: up to 2000 entries were copied on every
-                                # tick; they are only needed when the table redraws.
-                                # v13.72 MEM-1: AND IT COPIED ALL 3000 OF THEM. The
-                                # ring was cut to REPORT_ENTRIES_MAX=3000 and this
-                                # still copied the whole ring into a list, then a
-                                # dataframe, then an Arrow buffer, once a second, for
-                                # the entire run. _DF_TAIL_LIVE was declared for
-                                # exactly this and read nowhere. The table takes the
-                                # newest N now; the ZIP, the .txt export and the Full
-                                # Log page still carry every row.
                                 current_reports = (
                                     list(str_lit.session_state.report_entries)[-_DF_TAIL_LIVE:]
                                     if _df_tick else [])
-                                # v13.72 MEM-2: same story per bucket, and the true
-                                # count travels WITH the tail so render_buckets can
-                                # keep the "+N more" line honest. Capping the copy
-                                # without the count would have understated every
-                                # bucket above 250 lines.
                                 bucket_snapshot = {}
                                 if _bucket_tick:
                                     for _bk in ("valid_results", "wrong_results",
@@ -15750,9 +15489,6 @@ if start_engine_btn:
                                                 "retry_results", "rbl_results",
                                                 "smtp_results", "dns_results",
                                                 "skip_results", "unknown_results",
-                                                # v13.79 WAVE 6: read-only here - the
-                                                # run never writes this bucket, it is
-                                                # only redrawn so hits stay visible.
                                                 "kw_hits_results"):
                                         _bv = str_lit.session_state.get(_bk) or []
                                         bucket_snapshot[_bk] = (
@@ -15761,27 +15497,19 @@ if start_engine_btn:
                             if _kw_scan_line:
                                 try:
                                     run_keyword_scan(_kw_scan_line)
+                                except Exception as _kwe:
+                                    _kw_trace("ERR", "scan", str(_kwe)[:200])
+                                # Repaint on the scan's OWN event, not on the UI
+                                # tick: a hit is the only thing that changes these
+                                # numbers, so this is the cheapest possible moment.
+                                try:
+                                    render_kw_panel()
                                 except Exception:
                                     pass
 
                             if _tick:
                                 _last_ui_ts = _now_ui
-                                # FIX UI-GUARD (v13.69): THE REPAINT IS GUARDED ON
-                                # ITS OWN NOW. Everything below draws into a delta
-                                # the teardown may already have destroyed, and it
-                                # used to sit directly in the per-account try - so a
-                                # paint failure on account 7 was caught by the
-                                # handler meant for the CHECK, was appended to
-                                # conn_results as "[EXCEPTION] ...", and cost that
-                                # account its metrics and its bucket repaint even
-                                # though the result itself was fine. The result is
-                                # already recorded and journalled above this line,
-                                # so a repaint fault is now only a log line. Both
-                                # stamps are set before the try so a broken paint
-                                # backs off instead of retrying every account.
                                 try:
-                                    # FIX DELTA-1: the log tail is 150 lines, not 300,
-                                    # and a torn-down delta can no longer kill the loop.
                                     try:
                                         if str_lit.session_state.get("colorize_logs", True):
                                             log_container.markdown(
@@ -15831,35 +15559,12 @@ if start_engine_btn:
                         except Exception:
                             pass
 
-                    # Checkpoint on TIME as well as on count. The counter alone
-                    # meant a 47-account run never reached a checkpoint before a
-                    # teardown: checked stayed 0, the heartbeat went stale and
-                    # unfinished_live.json was never written, so Resume was empty
-                    # and the stop had no reason.
                     _now_ck = time.time()
                     if ((checked_count % 100 == 0) or (checked_count == total_accs)
                             or (_now_ck - _last_ck_ts) >= CHECKPOINT_SECONDS):
                         _last_ck_ts = _now_ck
-                        # FIX CK-GUARD (v13.68): THE WHOLE CHECKPOINT IS GUARDED
-                        # NOW. It runs on the script thread and every part of it
-                        # touches the disk, so one ENOSPC or one unreadable record
-                        # used to end the run exactly the way the missing clock
-                        # did. Both stamps are set BEFORE the try, so a failing
-                        # checkpoint backs off instead of retrying every account.
                         try:
-                            # Heartbeat first and cheap: this is what stops tick()
-                            # from calling a healthy long run interrupted on the
-                            # next load.
                             runstate.progress(checked_count, total_accs)
-                            # FIX SURVIVE-2 (v13.67): THE HEAVY PART MOVED OFF THE
-                            # 5s CLOCK. Rebuilding `left` is one str.split() per
-                            # queued account - 120,056 of them on a real list - and
-                            # save_unfinished() then writes a ~5 MB JSON of the
-                            # whole remaining queue: twelve times a minute, on the
-                            # script thread, for a file only the stop path ever
-                            # reads. The heartbeat above keeps the watchdog honest;
-                            # a queue snapshot every 30s is still far finer than
-                            # any teardown.
                             if ((checked_count >= total_accs)
                                     or (_now_ck - _last_heavy_ck_ts) >= HEAVY_CHECKPOINT_SECONDS):
                                 _last_heavy_ck_ts = _now_ck
@@ -15872,18 +15577,10 @@ if start_engine_btn:
                                           if ":" in raw else raw)
                                     if em not in done:
                                         left.append(raw)
-                                # v13.71: at a batch boundary the queue snapshot
-                                # must carry the HELD lines too, or a refresh
-                                # during a batch leaves the rest unreachable.
                                 if left or _batch_rest:
                                     save_unfinished("In Progress (Running)",
                                                     left + list(_batch_rest),
                                                     checked_count, total_accs)
-                                # FIX SPEED-4: clean_valid_accounts.txt is read and
-                                # fully rewritten by _write_clean_valid(). Doing that
-                                # on the 5s checkpoint put a whole-file read+write on
-                                # the script thread twelve times a minute for no new
-                                # information.
                                 if ((checked_count >= total_accs)
                                         or ((_now_ck - _last_clean_ts) >= CLEAN_SYNC_SECONDS)):
                                     _last_clean_ts = _now_ck
@@ -15941,11 +15638,6 @@ if start_engine_btn:
         except BaseException as be:
             run_interrupted = True
             if isinstance(be, (SystemExit, KeyboardInterrupt)):
-                # v13.53: NOT re-raised any more. `raise be` here skipped blocks 107
-                # and 108 outright, so a shutdown wrote no result files and no
-                # bundle while the run record had already been stamped - the one
-                # case where the export matters most. The loop has already broken,
-                # so carrying on costs about a second and saves the results.
                 detected_stop_reason = "System Shutdown / Interruption"
                 log_probe_event("run stopped by SystemExit/KeyboardInterrupt - "
                                 "exporting what is already checked")
@@ -15965,13 +15657,7 @@ if start_engine_btn:
                         detected_stop_reason = f"Unexpected Error / Interruption: {be}"
             runstate.note(detected_stop_reason)
         finally:
-            # FIX SURVIVE-1 (v13.67): flush and close THIS run's bucket handles
-            # before anything else can touch those files.
             live_journal_close(_journal_scope)
-            # v13.80 WAVE 8: the run delivered something, so the watchdog stands
-            # down. Checked over the buckets rather than over checked_count,
-            # because a run that checks everything and buckets nothing is the
-            # case being watched for. Guarded - a bell must never fail a run.
             try:
                 import sentinel as _s8
                 if any(str_lit.session_state.get(_k) for _k in
@@ -15982,43 +15668,24 @@ if start_engine_btn:
                     _s8.satisfy("run", f"{checked_count} checked")
             except Exception:
                 pass
-            # Restore the slider's own values so the sidebar does not report
-            # unapplied settings after a run that used the tail caps.
             if _orig_deadline is not None:
                 CFG["ACCOUNT_DEADLINE"] = _orig_deadline
             if _orig_retries is not None:
                 CFG["SAME_HOST_RETRIES"] = _orig_retries
             if _orig_rot is not None:
                 CFG["MAX_ROTATIONS"] = _orig_rot
-            # FIX ISO-4 (v13.49): decrement the count and DERIVE the bool, so a
-            # second user's run is not told the deployment went idle when this one
-            # ends. max(0, ...) keeps a double release from going negative.
-            # FIX ISO-6 (v13.59): the count is per user; the process counter is
-            # only a mirror for anything that needs "any run anywhere".
             _us_run = _user_state()
             _us_run["runs_active"] = max(0, int(_us_run.get("runs_active", 0)) - 1)
             STATE["runs_active"] = max(0, int(STATE.get("runs_active", 0)) - 1)
             STATE["run_active"] = STATE["runs_active"] > 0
             str_lit.session_state["run_active"] = False
-            # FIX FIN-GUARD (v13.68): A RAISE IN THIS finally SKIPPED BLOCKS 107
-            # AND 108 ENTIRELY. Both sit AFTER the try/finally in the same branch,
-            # so a disk error here meant no result files, no ZIP and no summary -
-            # and a raise inside a finally also masks the exception that got us
-            # here. The bookkeeping is guarded; the export is not optional.
             try:
                 with session_state_lock:
                     done = set(str_lit.session_state.checked_emails_set)
                 left = [raw for raw in all_target_accounts
                         if (raw.split(":", 1)[0].strip().lower()
                             if ":" in raw else raw) not in done]
-                # v13.71: A BATCH BOUNDARY IS NOT A FINISH. runstate.finish() and
-                # clear_unfinished() would throw the held lines away, and the
-                # banner in block 108 is what carries them forward.
                 if _batch_rest and checked_count >= total_accs and not run_interrupted:
-                    # FIX BATCH-CARRY: the banner carries the HELD lines AND any
-                    # in-batch line that produced no result, so Continue can never
-                    # skip an account that raised. They go first because they are
-                    # the ones that need re-checking soonest.
                     _batch_carry = left + list(_batch_rest)
                     str_lit.session_state["_batch_hit"] = list(_batch_carry)
                     runstate.note(f"Batch boundary: {checked_count} checked, "
@@ -16026,14 +15693,8 @@ if start_engine_btn:
                     save_unfinished("Batch boundary - press Continue for the next batch",
                                     _batch_carry, checked_count, total_accs)
                 elif checked_count >= total_accs and not run_interrupted:
-                    # Clean completion: close the watchdog record, then drop the data.
                     runstate.finish()
                     clear_unfinished()
-                # FIX BATCH-RESUME: an INTERRUPTED batch must keep the held lines
-                # too. `left` alone overwrote the last heavy checkpoint - which did
-                # carry them - with only the in-batch leftovers, so stopping a
-                # batch at account 1 of 2 with 8 held left ONE resumable line
-                # instead of nine.
                 elif left or _batch_rest:
                     save_unfinished(detected_stop_reason, left + list(_batch_rest),
                                     checked_count, total_accs)
@@ -16044,8 +15705,6 @@ if start_engine_btn:
         duration = end_dt - start_dt
 
         with session_state_lock:
-            # v13.71: a completed batch is its own outcome - not "Successful" (the
-            # queue is not done) and not "Unfinished" (nothing went wrong).
             str_lit.session_state.run_completion_status = (
                 "Batch complete"
                 if (_batch_rest and checked_count >= total_accs and not run_interrupted)
