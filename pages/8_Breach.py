@@ -430,10 +430,10 @@ st.caption("Only the address is sent to haveibeenpwned.com. A pasted "
            "Passwords hash check, and 5 of its 40 hash characters leave the box.")
 
 # ---- the browser, and its state ------------------------------------------------
-# Kicked on load so the first press already has one. Non-blocking and idempotent:
-# a sentinel means done, a live thread means running, a previous failure stays
-# failed until the button is pressed. The install is ~150 MB, so it is never
-# retried on its own.
+# This is not a rescue any more, it is the address tier: a real Chromium types the
+# address into the site's own search box and reads the rendered page. No key, no
+# quota, no bill. Without the binary there is no address half at all, which is why
+# the install is kicked here and its state is a value on the page.
 _bst = breach.browser_state()
 if _bst.get("state") == "unknown":
     breach.ensure_browser()
@@ -442,42 +442,40 @@ if _bst.get("state") == "unknown":
 _bst1, _bst2 = st.columns([0.72, 0.28])
 with _bst1:
     if _bst.get("state") == "ready":
-        st.caption("\u2705 Browser ready - a challenged address is resolved in place.")
+        st.caption("\u2705 Browser ready - addresses are typed into the site's search "
+                   "box and the rendered page is read.")
     elif _bst.get("state") == "installing":
         st.caption("\u23f3 Browser installing (%ss). Passwords are checked either way; "
-                   "a challenged address comes back UNKNOWN until it finishes."
+                   "addresses come back UNKNOWN until it finishes."
                    % _bst.get("seconds", 0))
     elif _bst.get("state") == "failed":
-        st.caption("\u26a0 Browser install FAILED. Passwords still work; a challenged "
-                   "address comes back UNKNOWN. Error: `%s`"
+        st.caption("\u26a0 Browser install FAILED. Passwords still work; addresses "
+                   "come back UNKNOWN. Error: `%s`"
                    % (_bst.get("error") or "unknown")[:300])
     else:
-        st.caption("Browser not installed. Passwords are checked either way; a "
-                   "challenged address comes back UNKNOWN without one.")
+        st.caption("Browser not installed. Passwords are checked either way; "
+                   "addresses come back UNKNOWN without one.")
 with _bst2:
     if _bst.get("state") != "ready" and _bst.get("state") != "installing":
         if st.button("\u2b07 Prepare browser", width="stretch",
                      help="Downloads Chromium once, into this repo, and keeps it. "
-                          "About 150 MB - do it on wifi."):
+                          "About 150 MB - do it on wifi. This is what reads the "
+                          "address pages."):
             breach.trace("CLICK", "browser", "Prepare browser pressed")
             breach.ensure_browser(force=True)
             st.rerun()
 
-# ---- the address tier: keyed, or keyless and challenged ------------------------
-# The keyless unifiedsearch endpoint answers 401 to anonymous callers now, and a
-# 401 is not a wall the browser can be sent at - it reads as "no record", which
-# is why counts sat at 0 while the site itself listed the breaches. With a key
-# the tier goes to /api/v3/breachedaccount and /api/v3/pasteaccount, which is the
-# only reliable path left for addresses.
-if _hibp_key():
-    st.caption("\U0001f511 HIBP_API_KEY is set - addresses are read from the keyed API "
-               "(/api/v3/breachedaccount, /api/v3/pasteaccount) with the hibp-api-key "
-               "header. The key never leaves this server.")
+# ---- the address tier: the UI, keyless ----------------------------------------
+# No key is needed and none is faked. The page is the API: the address goes into
+# the site's own search box, the result is scraped from what renders, and the page
+# text and HTML are kept from that same read. A key only makes it faster.
+if breach.key_present():
+    st.caption("\U0001f511 HIBP_API_KEY is set - the keyed API is tried first because "
+               "it is faster and exact. The browser is still the fallback.")
 else:
-    st.caption("\u26a0 No HIBP_API_KEY set. The keyless address tier answers 401, so "
-               "addresses come back UNKNOWN and the counts read 0. Put HIBP_API_KEY in "
-               "the app secrets, or leave the browser tier on so a challenged address "
-               "is resolved from the page instead.")
+    st.caption("\U0001f5b1 No API key, and none needed. The address is typed into the "
+               "site's own search box and the rendered page is scraped for the breach "
+               "names, dates and classes. Slower than an API call, and free.")
 
 _c1, _c2, _c3, _c4, _c5 = st.columns(5)
 with _c1:
@@ -485,7 +483,7 @@ with _c1:
                          on_change=_watch("_breach_workers", "workers"),
                          help="How many addresses may be in flight at once. Pwned "
                               "Passwords is a different host and takes concurrency "
-                              "well; the address endpoint is the slow side.")
+                              "well; the site is the slow side.")
 with _c2:
     _delay = st.slider("Delay (s)", 0.0, 10.0, 2.0, 0.5, key="_breach_delay",
                        on_change=_watch("_breach_delay", "delay"),
@@ -495,8 +493,8 @@ with _c2:
 with _c3:
     _pages = st.number_input("Browser pages", 1, 8, 4, 1, key="_breach_pages",
                              on_change=_watch("_breach_pages", "pages"),
-                             help="Chromium pages for addresses Cloudflare "
-                                  "challenges. Only used when the browser is ready.")
+                             help="Chromium tabs for addresses. Each is reused, and "
+                                  "recreated if it dies.")
 with _c4:
     _force = st.checkbox("Ignore cache", value=False, key="_breach_force",
                          on_change=_watch("_breach_force", "ignore cache"),
@@ -506,20 +504,20 @@ with _c4:
 with _c5:
     _http_only = st.checkbox("HTTP only", value=False, key="_breach_http_only",
                              on_change=_watch("_breach_http_only", "http only"),
-                             help="No browser. Faster, but a challenged address "
-                                  "comes back UNKNOWN instead of resolved.")
+                             help="No browser. Faster, but a walled address comes "
+                                  "back UNKNOWN instead of resolved.")
 
 # ---- page capture, and how much of it ------------------------------------
-# A captured page is a SECOND request per address, so the mode is a real cost
-# switch and not a preference. Fast is the default and captures only the
-# outcomes ticked beside it; full doubles the run to keep every page.
+# The page read and the search are the SAME visit now, so capture costs almost
+# nothing - the text and HTML are already in hand. The mode decides which
+# outcomes keep them.
 st.markdown("##### Captured pages")
 _cm1, _cm2 = st.columns([0.58, 0.42])
 with _cm1:
     _mode_label = st.radio(
         "Capture", list(_MODE_LABELS.keys()), horizontal=False, key=_CAP_MODE_KEY,
         on_change=_watch(_CAP_MODE_KEY, "capture mode"),
-        help="The page is what the site actually renders for an address - titles, "
+        help="The page is what the site actually rendered for an address - titles, "
              "dates, data classes, or the 'no pwnage' copy. It is kept per address "
              "under your own prefix and can be wiped at the bottom of the page.")
 _page_mode = _MODE_LABELS.get(_mode_label, "fast")
@@ -530,19 +528,18 @@ with _cm2:
             default=["CLEAN", "Errored"], key=_CAP_ON_KEY,
             on_change=_watch(_CAP_ON_KEY, "capture outcomes"),
             help="Only these are fetched. A breached address keeps its records and "
-                 "gets no page - the JSON already has the titles and dates.")
+                 "gets no page - the scrape already has the titles and dates.")
         _page_on = [x.lower() for x in _on_labels]
     elif _page_mode == "full":
-        st.caption("Every checked address is captured, records or not. This is the "
-                   "slow one - roughly two requests per address.")
+        st.caption("Every checked address keeps its page, records or not.")
         _page_on = ["clean", "error"]
     else:
-        st.caption("No pages are captured. Records, verdicts and exports are "
+        st.caption("No pages are kept. Records, verdicts and exports are "
                    "unaffected.")
         _page_on = []
 
 if _page_mode == "fast" and not _page_on:
-    st.caption("Fast mode with nothing ticked captures nothing - the same as Off.")
+    st.caption("Fast mode with nothing ticked keeps nothing - the same as Off.")
 # @@END 007 INPUT
 
 # @@BLOCK 008 RUN deps=007
@@ -621,10 +618,10 @@ if _run and _pairs:
         st.session_state[_RUN_KEY] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         _b = _band_counts(_rows)
         # The tier is part of the summary, not a detail: UNKNOWN under HTTP only
-        # means "challenged, not tried", and under http+browser it means the
-        # browser failed too. Those are different problems.
+        # means "walled, not tried", and under http+browser it means the browser
+        # could not render it either. Those are different problems.
         _msg = ("Checked %d via %s. %d old, %d partially new, %d new, %d clean, "
-                "%d unresolved. Pages captured: %s."
+                "%d unresolved. Pages kept: %s."
                 % (len(_rows), _tier, _b["OLD"], _b["PARTIAL"],
                    _b["NEW"], _b["CLEAN"], _b["UNKNOWN"],
                    ("off" if _page_mode == "off" else
@@ -633,20 +630,22 @@ if _run and _pairs:
         # A message widget is REQUIRED here. Without one the ledger closes the
         # press as "NO RESULT | finished without reporting", which is exactly what
         # the 00:36:57 entry recorded.
-        if _b["UNKNOWN"] and not _hibp_key():
+        _bst_now = breach.browser_state().get("state")
+        if _b["UNKNOWN"] and _http_only:
             st.session_state[_MSG_KEY] = (
-                "warning", _msg + " No HIBP_API_KEY is set, and the keyless address "
-                                  "tier answers 401 - the unresolved ones are that, "
-                                  "not clean addresses.")
-        elif _b["UNKNOWN"] and _http_only:
+                "warning", _msg + " Unresolved ones were walled and HTTP only was "
+                                  "selected - untick HTTP only so the browser can read "
+                                  "them.")
+        elif _b["UNKNOWN"] and _bst_now != "ready":
             st.session_state[_MSG_KEY] = (
-                "warning", _msg + " Unresolved ones were challenged and HTTP only was "
-                                  "selected - switch the tier to HTTP then browser to "
-                                  "resolve them.")
+                "warning", _msg + " The browser is %s, and the browser IS the address "
+                                  "tier - press Prepare browser, then re-run."
+                                  % _bst_now)
         elif _b["UNKNOWN"]:
             st.session_state[_MSG_KEY] = (
-                "warning", _msg + " The unresolved ones could not be read by either "
-                                  "tier - see the trace for the exact error.")
+                "warning", _msg + " The browser reached the page but nothing readable "
+                                  "came back - open the trace, it names the step that "
+                                  "failed.")
         else:
             st.session_state[_MSG_KEY] = ("success", _msg)
     elif not st.session_state.get(_MSG_KEY):
