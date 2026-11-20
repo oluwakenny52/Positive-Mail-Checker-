@@ -90,6 +90,22 @@ twice and blocked for ever, on the script thread.  Nothing raised and nothing
 logged; the page simply stopped.  report() is reached from app.py block 105
 (the sidebar counter), block 030 (the diagnostic bundle), pages/9 block 007 and
 pages/10 block 013, so the whole app froze on its first load with a key present.
+
+A CHAT TURN RETRIES, AND THE LATCH HEALS  (v13.86)
+--------------------------------------------------
+Two separate reasons the console felt dead, both of which read on the page as
+"no answer":
+
+  1. chat_stream had NO retry. classify had three attempts and chat had one, so
+     a single dropped connection on a phone network ended the turn and counted
+     against the latch. It now retries CHAT_ATTEMPTS times, but ONLY while
+     nothing has been shown yet - a retry after half a reply is printed would
+     duplicate it.
+  2. The latch was permanent. Four failures and _tripped stayed True until
+     somebody pressed Reset, so a brief outage took the console out for the rest
+     of the session. A trip now expires after RECOVER_AFTER seconds and the next
+     call gets one attempt; if that fails, it latches again for another interval.
+     A hard trip is still available - reset_run().
 """
 
 from __future__ import annotations
@@ -140,7 +156,14 @@ INSTRUCTION = (
 TIMEOUT = 30.0
 CHAT_TIMEOUT = 180.0
 POST_ATTEMPTS = 3
+CHAT_ATTEMPTS = 2
 CHAT_MAX_TOKENS = 1400
+
+# How long a trip lasts before one probe attempt is allowed through. Long enough
+# that a burst of failures does not turn into a retry storm, short enough that a
+# two-minute outage does not need a manual Reset.
+RECOVER_AFTER = 90.0
+
 CHAT_SYSTEM = (
     "You are the assistant inside a Streamlit app called Mega Ultimate Mail "
     "Checker. You help its owner understand it, find things in it and debug it.\n"
@@ -193,6 +216,7 @@ _resolved_model = ""
 _calls_run = 0
 _consec_fails = 0
 _tripped = False
+_tripped_at = 0.0    # when the latch closed; 0 = just tripped, never recovered
 _last = {"ts": 0.0, "status": "", "token": "", "latency_ms": 0, "error": ""}
 
 _EMAIL_RE = re.compile(r"([A-Za-z0-9._%+\-]+)@([A-Za-z0-9.\-]+\.[A-Za-z]{2,})")
@@ -295,12 +319,36 @@ def enabled() -> bool:
 
 
 def reset_run():
-    """Clear the per-run counter and the trip latch.  Call once per run."""
-    global _calls_run, _consec_fails, _tripped
+    """Clear the per-run counter, the trip latch and its clock."""
+    global _calls_run, _consec_fails, _tripped, _tripped_at
     with _lock:
         _calls_run = 0
         _consec_fails = 0
         _tripped = False
+        _tripped_at = 0.0
+
+
+def _maybe_recover() -> bool:
+    """Re-open a closed latch once RECOVER_AFTER has passed. True if it did.
+
+    Called from _budget_free() only. A latch that never expires needs a human
+    press to clear, so a two-minute network wobble took the console out for the
+    rest of the session - which is the "sometimes it answers, sometimes it
+    doesn't" symptom. One attempt is let through; a second failure re-latches
+    with a fresh clock.
+    """
+    global _tripped, _consec_fails, _tripped_at
+    with _lock:
+        if not _tripped or not _tripped_at:
+            return False
+        if (time.time() - _tripped_at) < RECOVER_AFTER:
+            return False
+        _tripped = False
+        _tripped_at = 0.0
+        _consec_fails = 0
+    trace("INFO", "recover", "latch expired after %ds - one attempt allowed"
+          % int(RECOVER_AFTER))
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -385,9 +433,13 @@ def _budget_free() -> bool:
     """True when this run and this user still have allowance.  Never raises.
 
     A limit of 0 is UNLIMITED, not "no calls" - the run check is skipped at 0 and
-    the day check is skipped at 0.  (The run side was already skipped by
-    accident: `_calls_run >= 0` is always true.  Now it is deliberate.)
+    the day check is skipped at 0.
+
+    A closed latch is re-opened once RECOVER_AFTER has passed, so the caller is
+    not stuck behind a trip nobody cleared.
     """
+    if _tripped:
+        _maybe_recover()
     if _tripped:
         return False
     with _lock:
@@ -399,6 +451,16 @@ def _budget_free() -> bool:
     if limit <= 0:
         return True
     return _day_count(_path()) < limit
+
+
+def _trip(stop_after) -> None:
+    """Count a failure and close the latch when the budget is reached."""
+    global _consec_fails, _tripped, _tripped_at
+    with _lock:
+        _consec_fails += 1
+        if stop_after and _consec_fails >= stop_after:
+            _tripped = True
+            _tripped_at = time.time()
 
 
 # ---------------------------------------------------------------------------
@@ -518,7 +580,7 @@ def classify_now(text):
     looking at.  Same budgets, same closed whitelist, same scrubbing, and a
     cached answer is still served without a call.
     """
-    if not enabled() or _tripped or not _budget_free():
+    if not enabled() or not _budget_free():
         return None
     body = _scrub(text)
     if not body:
@@ -542,7 +604,7 @@ def drain(limit=None) -> dict:
     except Exception:
         limit = 0
     while out["tried"] < max(0, limit):
-        if not enabled() or _tripped or not _budget_free():
+        if not enabled() or not _budget_free():
             out["skipped"] += 1
             break
         with _lock:
@@ -641,7 +703,7 @@ def _parse(payload):
 
 def _one_call(body, key_cache=None):
     """One live call for one scrubbed text.  Token or None.  Never raises."""
-    global _calls_run, _consec_fails, _tripped, _resolved_model
+    global _calls_run, _resolved_model
     with _lock:
         model = _cfg["model"]
         api_key = _cfg["key"]
@@ -664,10 +726,8 @@ def _one_call(body, key_cache=None):
                       "token": "", "latency_ms": ms, "error": ""})
 
     if code == 0 or code >= 400:
+        _trip(stop_after)
         with _lock:
-            _consec_fails += 1
-            if stop_after and _consec_fails >= stop_after:
-                _tripped = True
             _last["error"] = (text or "")[:180]
         return None
 
@@ -731,8 +791,14 @@ def chat_stream(messages, context="", model=None):
     Counts against the SAME run and day budgets as the classifier, because a
     chat turn is a real call and the key is the same key.  The outcome lands in
     _last so a page can say why an empty answer came back instead of guessing.
+
+    v13.86: A DROPPED CONNECTION IS RETRIED. It had one attempt where classify
+    had three, so one transport hiccup on a phone network ended the turn and
+    counted against the latch - which is what "sometimes it answers, sometimes it
+    doesn't" actually was. The retry only happens while NOTHING has been yielded
+    yet, because re-running after half a reply would print it twice.
     """
-    global _calls_run, _consec_fails, _tripped
+    global _calls_run, _tripped, _tripped_at
     payload = _chat_payload(messages, context, model)
     with _lock:
         model_id = str(model or _cfg["model"] or DEFAULT_MODEL)
@@ -745,61 +811,78 @@ def chat_stream(messages, context="", model=None):
         return
     if not _budget_free():
         with _lock:
-            _last.update({"ts": time.time(), "status": "budget", "error": "budget spent",
-                          "token": "", "latency_ms": 0})
+            _last.update({"ts": time.time(), "status": "budget",
+                          "error": "budget spent or latched", "token": "",
+                          "latency_ms": 0})
         return
 
     started = time.time()
-    trace("INFO", "chat", "stream start, model %s, %d turn(s), budget %ss"
-          % (model_id, len(payload.get("contents") or []), int(CHAT_TIMEOUT)))
     data = json.dumps(payload).encode("utf-8")
-    req = urllib.request.Request(
-        (ENDPOINT % model_id) + "?alt=sse", data=data, method="POST",
-        headers={"Content-Type": "application/json", "x-goog-api-key": api_key,
-                 "Accept": "text/event-stream",
-                 "User-Agent": "PositiveMailChecker/" + AI_VERSION})
     code, got_any = 0, False
-    try:
-        with urllib.request.urlopen(req, timeout=CHAT_TIMEOUT) as resp:
-            code = resp.status
-            for raw in resp:
-                line = raw.decode("utf-8", "replace").strip()
-                if not line or line.startswith(":"):
-                    continue
-                if line.startswith("data:"):
-                    line = line[5:].strip()
-                if not line or line == "[DONE]":
-                    continue
-                try:
-                    obj = json.loads(line)
-                except Exception:
-                    continue
-                piece = _extract(obj)
-                if piece:
-                    got_any = True
-                    yield piece
-    except urllib.error.HTTPError as exc:
+    tries = max(1, int(CHAT_ATTEMPTS))
+    for attempt in range(1, tries + 1):
+        trace("INFO", "chat", "attempt %d/%d, model %s, %d turn(s), budget %ss"
+              % (attempt, tries, model_id, len(payload.get("contents") or []),
+                 int(CHAT_TIMEOUT)))
+        req = urllib.request.Request(
+            (ENDPOINT % model_id) + "?alt=sse", data=data, method="POST",
+            headers={"Content-Type": "application/json",
+                     "x-goog-api-key": api_key,
+                     "Accept": "text/event-stream",
+                     "User-Agent": "PositiveMailChecker/" + AI_VERSION})
+        wait = 0.0
         try:
-            body = exc.read().decode("utf-8", "replace")
-        except Exception:
-            body = ""
-        with _lock:
-            _consec_fails += 1
-            if stop_after and _consec_fails >= stop_after:
-                _tripped = True
-            _last.update({"ts": time.time(), "status": str(exc.code),
-                          "error": body[:400], "token": "",
-                          "latency_ms": int((time.time() - started) * 1000)})
-        _day_bump(_path())
-        return
-    except Exception as exc:
-        with _lock:
-            _consec_fails += 1
-            _last.update({"ts": time.time(), "status": "0",
-                          "error": "%s: %s" % (type(exc).__name__, exc), "token": "",
-                          "latency_ms": int((time.time() - started) * 1000)})
-        _day_bump(_path())
-        return
+            with urllib.request.urlopen(req, timeout=CHAT_TIMEOUT) as resp:
+                code = resp.status
+                for raw in resp:
+                    line = raw.decode("utf-8", "replace").strip()
+                    if not line or line.startswith(":"):
+                        continue
+                    if line.startswith("data:"):
+                        line = line[5:].strip()
+                    if not line or line == "[DONE]":
+                        continue
+                    try:
+                        obj = json.loads(line)
+                    except Exception:
+                        continue
+                    piece = _extract(obj)
+                    if piece:
+                        got_any = True
+                        yield piece
+            break
+        except urllib.error.HTTPError as exc:
+            try:
+                body = exc.read().decode("utf-8", "replace")
+            except Exception:
+                body = ""
+            code = exc.code
+            wait = _retry_after(exc)
+            retryable = exc.code in (408, 429) or exc.code >= 500
+            trace("WARN", "chat", "attempt %d -> http %d%s"
+                  % (attempt, code, "" if retryable else " (final)"))
+            if got_any or not retryable or attempt >= tries:
+                _trip(stop_after)
+                with _lock:
+                    _last.update({"ts": time.time(), "status": str(code),
+                                  "error": body[:400], "token": "",
+                                  "latency_ms": int((time.time() - started) * 1000)})
+                _day_bump(_path())
+                return
+            time.sleep(min(10.0, wait or (2.0 * attempt)))
+        except Exception as exc:
+            trace("WARN", "chat", "attempt %d raised %s: %s"
+                  % (attempt, type(exc).__name__, exc))
+            if got_any or attempt >= tries:
+                _trip(stop_after)
+                with _lock:
+                    _last.update({"ts": time.time(), "status": "0",
+                                  "error": "%s: %s" % (type(exc).__name__, exc),
+                                  "token": "",
+                                  "latency_ms": int((time.time() - started) * 1000)})
+                _day_bump(_path())
+                return
+            time.sleep(min(10.0, 2.0 * attempt))
 
     with _lock:
         _calls_run += 1
@@ -831,12 +914,16 @@ def report() -> dict:
 
     "stop_after_fails" is reported too: pages/9 seeded its widget from a
     hardcoded 4 because this dict had no such key, so a configured 2 was lost on
-    every reload.
+    every reload. "recovers_in" says how many seconds the latch has left before
+    it re-opens by itself, so a latched console is never a mystery.
     """
     try:
         path = _path()
         _day = _day_count(path) if path else "(no auth)"
         with _lock:
+            _left = 0
+            if _tripped and _tripped_at:
+                _left = max(0, int(RECOVER_AFTER - (time.time() - _tripped_at)))
             data = {
                 "version": AI_VERSION,
                 "enabled": bool(_cfg["enabled"]),
@@ -851,6 +938,7 @@ def report() -> dict:
                 "stop_after_fails": _cfg["stop_after_fails"],
                 "consecutive_fails": _consec_fails,
                 "tripped": _tripped,
+                "recovers_in": _left,
                 "cache_entries": len(_cache),
                 "queue": len(_queue),
                 "last_status": _last["status"],
@@ -927,8 +1015,11 @@ def selftest(verbose=False) -> bool:
     # v13.86: report() must survive its own lock and must carry the fail budget.
     add("report_no_deadlock", isinstance(report().get("calls_run"), int))
     add("report_fails", report().get("stop_after_fails") == 2)
+    add("report_recovers_in", isinstance(report().get("recovers_in"), int))
     add("timeout_raised", TIMEOUT >= 30.0)
     add("chat_timeout_raised", CHAT_TIMEOUT >= 180.0)
+    add("chat_retries", CHAT_ATTEMPTS >= 2)
+    add("recover_after_set", RECOVER_AFTER > 0)
     add("post_takes_timeout", "timeout" in __import__("inspect").signature(
         _post).parameters)
     add("trace_ring", "hello" in trace_text(limit=1) or True)
@@ -947,6 +1038,7 @@ def selftest(verbose=False) -> bool:
         ["generationConfig"]["maxOutputTokens"] == CHAT_MAX_TOKENS)
 
     # ---- everything below touches globals: snapshot first, restore in finally --
+    global _tripped_at
     with _lock:
         _q_saved = list(_queue)
         _qd_saved = set(_queued)
@@ -955,6 +1047,7 @@ def selftest(verbose=False) -> bool:
         _co_saved = list(_cache_order)
         _path_saved = _cfg["usage_path"]
         _dc_saved = dict(_day_cache)
+        _ta_saved = _tripped_at
         _queue.clear()
         _queued.clear()
         _texts.clear()
@@ -995,11 +1088,17 @@ def selftest(verbose=False) -> bool:
         add("day_unlimited_again", _budget_free() is True)
         add("day_file_written", os.path.exists(_dayfile))
 
+        # v13.86: a closed latch must expire, not wait for a human press.
         with _lock:
             _consec_fails = 9
             _tripped = True
+            _tripped_at = time.time()
         add("tripped_blocks", _budget_free() is False)
         add("tripped_classify_none", classify("x") is None)
+        with _lock:
+            _tripped_at = time.time() - (RECOVER_AFTER + 1)
+        add("latch_expires", _budget_free() is True)
+        add("latch_reopened", _tripped is False)
         reset_run()
         add("report_shape", isinstance(report().get("enabled"), bool))
         add("report_day_int", isinstance(report().get("calls_day"), int))
@@ -1024,6 +1123,7 @@ def selftest(verbose=False) -> bool:
             _cache.clear()
             _cache.update(_c_saved)
             _cache_order[:] = _co_saved
+            _tripped_at = _ta_saved
         shutil.rmtree(_tmpdir, ignore_errors=True)
         reset_run()
 
