@@ -12070,6 +12070,9 @@ def _write_text_file(path, text):
 
 def _read_paste():
     global _PASTE_LIMIT_NOTE
+    # v13.91 FIX ISO-KW-4: this is a MODULE global, so a note left by one user
+    # rendered under another user's box. Reset on every read.
+    _PASTE_LIMIT_NOTE = ""
     try:
         if os.path.exists(_PASTE_FILE):
             _sz = os.path.getsize(_PASTE_FILE)
@@ -12409,6 +12412,40 @@ if raw_text:
 # written to disk by save_bodies() by then, and the panel only ever showed 2000
 # characters anyway. The bucket also gets a ceiling now, because it was the one
 # list in the run with no cap at all.
+#
+# v13.91 FIX MEM-KW-1 - THE SCAN HELD 300 FULL BODIES PER ACCOUNT, IN MEMORY, ON
+# THREE THREADS AT ONCE. mailsearch.search() defaults to hit_limit=MAX_HITS (300)
+# and BODY_SHOW is 200,000 characters, so a single scan peaked at ~60 MB before
+# the 4000-character queue trim ever ran - three workers, 180 MB worst case, on a
+# 1 GB container. KW_HIT_LIVE is passed down as hit_limit now: 60 hits is a real
+# result set for ONE mailbox, the full text of every one of them still goes to
+# disk in save_bodies() before the queue copy is cut, and the detail ring comes
+# down to match.
+#
+# v13.91 FIX ISO-KW-1 - AND THE SCAN POOL WAS NOT ISOLATED. Three process-wide
+# structures, none of them per user:
+#
+#   _kw_done     ONE deque for every scope. kw_drain() popped whatever was at the
+#                head and _kw_apply() wrote it into the CALLER's session_state,
+#                so user B's finished scan - full email:password included -
+#                landed in user A's keyword bucket. Nothing checked the owner.
+#   _KW_ST       ONE dict, so `run_mark` was a single process value: user B
+#                pressing Start CLEARED user A's pending handover queue and A's
+#                in-flight scans vanished with no trace. `inflight` was shared
+#                too, so the 300-scan queue cap and the 25s tail drain were both
+#                measured against other people's work.
+#   the worker   ran with NO scope pin and NO config snapshot, so
+#                sample_alive_proxy() inside it called _rebind_scope(), which
+#                resolved _gate_scope() to whichever session reran LAST - and
+#                sampled a proxy from THAT user's pool, read THEIR quarantine and
+#                rotation settings, and wrote score updates into THEIR
+#                proxy_meta.json.
+#
+# Both structures are keyed by _gate_scope() now, the scope and the config are
+# captured on the script thread in kw_scan_submit and PINNED on the worker, the
+# run-mark reset only clears its own scope, and idle scopes are evicted past
+# _KW_SCOPE_MAX so a forgotten key cannot hold a queue for the life of the
+# process.
 # ==========================================================================
 KW_SCOPES = ("Inbox", "All Folders")
 KW_SCOPE_INBOX = KW_SCOPES[0]
@@ -12435,6 +12472,8 @@ KW_BODY_SCAN_CAP = 40
 KW_QUEUE_BODY = 4000
 # v13.90: and the bucket gets the ceiling it never had.
 KW_BUCKET_MAX = 5000
+# v13.91: hits held in memory per account, passed to mailsearch as hit_limit.
+KW_HIT_LIVE = 60
 
 section_title("🔎", "Keyword Hits",
               "find words you care about in every valid inbox, as the run goes")
@@ -12574,16 +12613,20 @@ KW_COUNT_MAX = 60
 # v13.86 FIX KW-3: the detail list had NO writer and NO cap. It is written by
 # kw_drain() below now, and bounded, because each entry carries a slice of a
 # message body and an unbounded run would hold megabytes in the session.
-KW_DETAIL_MAX = 300
+# v13.91: 300 -> 120, to match the 60 hits a scan can now produce and to keep the
+# list from being copied whole on every batch.
+KW_DETAIL_MAX = 120
 KW_DETAIL_BODY = 2000
 
 # v13.89: pool state. A plain dict for the counter so the worker can decrement it
 # without a `global`; _kw_done is the handover queue.
+# v13.91: BOTH ARE KEYED BY SCOPE now - see ISO-KW-1 above. One lock covers the
+# pair and the pool handle, because all three are read and written together.
 _kw_pool = None
-_kw_pool_lock = threading.Lock()
-_kw_done = deque()
-_kw_done_lock = threading.Lock()
-_KW_ST = {"inflight": 0, "run_mark": ""}
+_kw_lock = threading.Lock()
+_kw_done = {}       # scope -> deque of finished scans
+_KW_ST = {}         # scope -> {"inflight": int, "run_mark": str}
+_KW_SCOPE_MAX = 32
 
 
 def _kw_fmt(level, step, detail=""):
@@ -12605,6 +12648,43 @@ def _kw_trace(level, step, detail=""):
     return line
 
 
+def _kw_scope() -> str:
+    """The calling thread's scope. Pinned on a worker, live on the script thread."""
+    try:
+        return str(_gate_scope()) or "anon"
+    except Exception:
+        return "anon"
+
+
+def _kw_dq(scope):
+    """This scope's handover deque, created on demand. Call under _kw_lock.
+
+    Eviction is oldest-first over scopes OTHER than the one asking, so the
+    caller's own queue can never be dropped by its own allocation. A forgotten
+    passkey or a reaped tab therefore cannot hold a deque for the life of the
+    process.
+    """
+    d = _kw_done.get(scope)
+    if d is None:
+        d = deque()
+        _kw_done[scope] = d
+        if len(_kw_done) > _KW_SCOPE_MAX:
+            for _k in [k for k in list(_kw_done) if k != scope][
+                    :len(_kw_done) - _KW_SCOPE_MAX]:
+                _kw_done.pop(_k, None)
+                _KW_ST.pop(_k, None)
+    return d
+
+
+def _kw_st(scope):
+    """This scope's counters, created on demand. Call under _kw_lock."""
+    s = _KW_ST.get(scope)
+    if s is None:
+        s = {"inflight": 0, "run_mark": ""}
+        _KW_ST[scope] = s
+    return s
+
+
 def keyword_hits_wanted() -> bool:
     """True when the run should SUBMIT a scan: the switch is on and the module
     loaded. Whether any KEYWORD was typed is decided inside the worker, so an
@@ -12616,19 +12696,23 @@ def keyword_hits_wanted() -> bool:
 
 
 def _kw_pool_get():
-    """The scan pool, created once per process. Never raises."""
+    """The scan pool, created once per process. Never raises.
+
+    The POOL is deliberately process-wide - it is three threads and its work is
+    already scoped by the queue - but every handle it hands back is keyed.
+    """
     global _kw_pool
-    with _kw_pool_lock:
+    with _kw_lock:
         if _kw_pool is None:
             _kw_pool = ThreadPoolExecutor(max_workers=KW_SCAN_WORKERS,
                                           thread_name_prefix="kw-scan")
         return _kw_pool
 
 
-def kw_pending() -> int:
-    """How many scans are still in flight. Cheap, lock-guarded."""
-    with _kw_pool_lock:
-        return int(_KW_ST.get("inflight", 0))
+def kw_pending(scope=None) -> int:
+    """How many of THIS scope's scans are still in flight. Cheap, lock-guarded."""
+    with _kw_lock:
+        return int((_KW_ST.get(scope or _kw_scope()) or {}).get("inflight", 0))
 
 
 def _kw_scan_window() -> int:
@@ -12903,7 +12987,8 @@ def _kw_scan_pure(combo, cfg, out):
                   % (len(folders), ",".join(folders)))
             out["hits"], note = mailsearch.search(
                 mail, folders[0], words, scan_limit=scan, body_scan=body_scan,
-                fields=fields, folders=folders, on_trace=trace)
+                hit_limit=KW_HIT_LIVE, fields=fields, folders=folders,
+                on_trace=trace)
             if note:
                 trace("WARN", "note", note)
     except Exception as e:
@@ -12942,35 +13027,53 @@ def _kw_scan_pure(combo, cfg, out):
         pass
 
 
-def _kw_scan_worker(combo, cfg, entry):
-    """Pool body: run the scan, hand the result over, always decrement."""
-    res = {"email": "", "hits": [], "trace": [], "entry": entry}
+def _kw_scan_worker(combo, cfg, entry, scope, task_cfg):
+    """Pool body: pin the OWNER, run the scan, hand the result over, decrement.
+
+    FIX ISO-KW-1: the pin is the whole point. _gate_scope() is thread-local, so
+    without it every _rebind_scope() inside the scan resolved to whichever
+    session reran last - and the scan sampled a proxy from that user's pool, read
+    their quarantine and rotation settings and wrote scores into their
+    proxy_meta. seed_task_cfg() does the same for the config: live_cfg() reads
+    the thread snapshot first, and STATE["cfg"] is whatever the last rerun of ANY
+    session left behind.
+    """
+    res = {"email": "", "hits": [], "trace": [], "entry": entry, "scope": scope}
     try:
+        _pin_gate_scope(scope)
+        seed_task_cfg(task_cfg)
         _kw_scan_pure(combo, cfg, res)
     except Exception as e:
         res["trace"].append(_kw_fmt("ERR", "worker",
                                     "%s: %s" % (type(e).__name__, e)))
     finally:
-        with _kw_done_lock:
-            _kw_done.append(res)
-        with _kw_pool_lock:
-            _KW_ST["inflight"] = max(0, int(_KW_ST.get("inflight", 0)) - 1)
+        clear_task_cfg()
+        with _kw_lock:
+            _kw_dq(scope).append(res)
+            _st = _kw_st(scope)
+            _st["inflight"] = max(0, int(_st.get("inflight", 0)) - 1)
 
 
 def kw_scan_submit(combo, entry=None):
     """Queue one scan. SCRIPT THREAD. Returns True when it was queued.
 
-    The config is captured HERE, from the live widgets, so the worker never has
-    to read session_state from another thread.
+    The config AND the owner are captured HERE, from the live widgets and the
+    calling thread, so the worker never has to read session_state from another
+    thread and can never resolve to another user.
     """
     if not keyword_hits_wanted():
         return False
+    scope = _kw_scope()
     _mark = str(str_lit.session_state.get("start_timestamp") or "")
-    if _KW_ST.get("run_mark") != _mark:
-        _KW_ST["run_mark"] = _mark
-        with _kw_done_lock:
-            _kw_done.clear()
-    pending = kw_pending()
+    with _kw_lock:
+        _st = _kw_st(scope)
+        if _st.get("run_mark") != _mark:
+            # FIX ISO-KW-1: THIS SCOPE's queue only. It used to clear the single
+            # shared deque, so one user pressing Start wiped another's pending
+            # hits before they could be drained.
+            _st["run_mark"] = _mark
+            _kw_dq(scope).clear()
+        pending = int(_st.get("inflight", 0))
     if pending >= KW_SCAN_QUEUE_MAX:
         _kw_trace("WARN", "queue", "%d scan(s) pending - skipped %s"
                   % (pending, str(combo).split(":")[0][:40]))
@@ -12988,13 +13091,15 @@ def kw_scan_submit(combo, entry=None):
         "use_proxy": bool(use_proxy),
         "results_dir": user_file("mail_results"),
     }
-    with _kw_pool_lock:
-        _KW_ST["inflight"] = int(_KW_ST.get("inflight", 0)) + 1
+    _task_cfg = _cfg_snapshot()
+    with _kw_lock:
+        _kw_st(scope)["inflight"] = int(_kw_st(scope).get("inflight", 0)) + 1
     try:
-        _kw_pool_get().submit(_kw_scan_worker, combo, cfg, entry)
+        _kw_pool_get().submit(_kw_scan_worker, combo, cfg, entry, scope, _task_cfg)
     except Exception as e:
-        with _kw_pool_lock:
-            _KW_ST["inflight"] = max(0, int(_KW_ST.get("inflight", 0)) - 1)
+        with _kw_lock:
+            _st = _kw_st(scope)
+            _st["inflight"] = max(0, int(_st.get("inflight", 0)) - 1)
         _kw_trace("ERR", "submit", "%s: %s" % (type(e).__name__, e))
         return False
     return True
@@ -13062,18 +13167,24 @@ def _kw_apply(item):
 
 
 def kw_drain(wait=0.0):
-    """Take every finished scan into the session. SCRIPT THREAD ONLY.
+    """Take every finished scan of THIS SCOPE into the session. SCRIPT THREAD ONLY.
+
+    FIX ISO-KW-1: it drains its own queue now. It used to pop the head of one
+    shared deque, so it applied other users' hits into the caller's buckets and
+    left its own behind.
 
     `wait` seconds lets the tail of a run collect its last scans before the
     report is finalised. Repaints once per batch, not once per hit.
     """
+    scope = _kw_scope()
     deadline = time.time() + float(wait or 0)
     moved = 0
     while True:
-        with _kw_done_lock:
-            item = _kw_done.popleft() if _kw_done else None
+        with _kw_lock:
+            _d = _kw_done.get(scope)
+            item = _d.popleft() if _d else None
         if item is None:
-            if wait and time.time() < deadline and kw_pending() > 0:
+            if wait and time.time() < deadline and kw_pending(scope) > 0:
                 time.sleep(0.15)
                 continue
             break
@@ -13941,8 +14052,29 @@ def verify_and_connect(target_email, target_pass, hosts, proxy_str=None):
 #     off mid-sentence. 120000 is a full message for practically everything, and
 #     the raw bytes were already capped at 700 KB per message and held anyway, so
 #     the text cap was the cheaper half of a cost already being paid.
-_BODY_SHOW_CHARS = 120000
+#
+# v13.91 FIX MEM-READ-1 - THE READER WAS THE SINGLE BIGGEST HEAP HOLD IN THE APP.
+# At the 50-message slider this returned 50 x 700 KB of raw MIME plus 50 x 120000
+# characters of text, every one of them held in session_state for the rest of the
+# session: ~41 MB, on a 1 GB container, for a page of mail.
+#
+# Three changes, and none of them loses a message:
+#   * _BODY_SHOW_CHARS 120000 -> 40000. 40000 characters is a full newsletter,
+#     and it is a THIRD of the text.
+#   * _RAW_PAGE_BUDGET - the raw bytes are a RENDERING AID, not data. mailview
+#     already falls back to the readable text when `raw` is empty, which is
+#     exactly what it does for a restored page whose cache budget was spent. So
+#     the page keeps raw only until 1.5 MB of it has been collected and then
+#     stops: the first few messages still render as HTML, the rest render as
+#     text, and the heap cost of a full page is ~1.5 MB instead of 35 MB.
+#   * the budget is spent in NEWEST-FIRST order, so the messages most likely to
+#     be opened are the ones that keep their HTML.
+_BODY_SHOW_CHARS = 40000
 _RAW_CAP = 700 * 1024
+# v13.91: total raw bytes one PAGE may hold. Chosen at 1.5 MB because that is
+# about two full-size messages - enough for the message the user actually opened
+# the page for, small enough that a 50-message page is not a 35 MB allocation.
+_RAW_PAGE_BUDGET = 1500000
 
 
 def _hdr_text(raw):
@@ -14069,6 +14201,9 @@ def read_mailbox_messages(email, password, server, proxy_str=None, limit=10, pag
             return False, [], "the inbox is empty"
 
         out = []
+        # FIX MEM-READ-1: how much raw MIME this page is allowed to hold. Spent
+        # newest-first, so the messages at the top of the page keep their HTML.
+        _raw_spent = 0
         for mid in reversed(window):
             heads = {"subject": "", "from": "", "date": ""}
             typ, hdr = mail.fetch(mid, "(BODY.PEEK[HEADER.FIELDS (SUBJECT FROM DATE)])")
@@ -14091,11 +14226,20 @@ def read_mailbox_messages(email, password, server, proxy_str=None, limit=10, pag
                     if isinstance(rp, tuple) and rp[1]:
                         raw_body = rp[1][:_RAW_CAP]
                         break
+            _text = _body_text(raw_body)
+            # FIX MEM-READ-1: the text is always kept. The raw bytes are dropped
+            # once the page budget is gone - mailview falls back to the text, and
+            # the raw bytes are still in the reader cache file for this page if
+            # it was small enough to fit there.
+            if raw_body and (_raw_spent + len(raw_body)) > _RAW_PAGE_BUDGET:
+                raw_body = b""
+            else:
+                _raw_spent += len(raw_body)
             out.append({"id": mid.decode() if isinstance(mid, bytes) else str(mid),
                         "subject": heads.get("subject") or "(no subject)",
                         "from": heads.get("from") or "(unknown sender)",
                         "date": heads.get("date") or "(no date)",
-                        "body": _body_text(raw_body),
+                        "body": _text,
                         "raw": raw_body})
         try:
             mail.logout()
@@ -17370,6 +17514,18 @@ except Exception:
 # mostly discarded - a real spike on a 1 GB container, on the page whose whole
 # purpose is a large page of mail. The estimated encoded size is compared to the
 # budget FIRST now and the encode is skipped when it will not fit.
+#
+# v13.91 FIX MEM-READ-2 - AND THE LIST ITSELF NEVER SHRANK.
+# bb_reader_msgs held every message of the last page for the life of the session,
+# and switching account REPLACED it only when the next fetch succeeded - so the
+# previous account's 40 MB sat there while a new one was selected, and a reload
+# restored a page that block 098 had already budgeted but this block then loaded
+# WHOLE. Two fixes:
+#   * switching account clears the list immediately, before anything is fetched,
+#     so two accounts' pages are never resident together;
+#   * a restored page honours the same _RAW_PAGE_BUDGET block 098 uses, newest
+#     first, and drops the raw bytes past it exactly the way a live fetch does.
+# The readable text is never dropped either way - only the rendering aid is.
 # ==========================================================================
 _READER_STATE_NAME = "reader_state.json"
 _READER_CACHE_NAME = "reader_cache.json"
@@ -17462,7 +17618,7 @@ def _reader_cache_save(combo, msgs, total, page):
                          "subject": m.get("subject") or "",
                          "from": m.get("from") or "",
                          "date": m.get("date") or "",
-                         "body": str(m.get("body") or "")[:120000],
+                         "body": str(m.get("body") or "")[:_BODY_SHOW_CHARS],
                          "raw_b64": b64})
         payload = {"combo": combo, "total": int(total or 0), "page": int(page or 1),
                    "saved_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -17478,7 +17634,12 @@ def _reader_cache_save(combo, msgs, total, page):
 
 
 def _reader_cache_load(combo):
-    """The saved page for `combo` -> (msgs, total, page), or (None, 0, 1)."""
+    """The saved page for `combo` -> (msgs, total, page), or (None, 0, 1).
+
+    FIX MEM-READ-2: the raw bytes are re-read under _RAW_PAGE_BUDGET, newest
+    first, and dropped past it - the same rule a live fetch applies. A restored
+    page therefore costs the same as a fetched one instead of the whole file.
+    """
     p = _reader_cache_path()
     if not os.path.exists(p):
         return None, 0, 1
@@ -17490,12 +17651,18 @@ def _reader_cache_load(combo):
     if not isinstance(data, dict) or data.get("combo") != combo:
         return None, 0, 1
     out = []
+    _raw_spent = 0
     for m in (data.get("msgs") or []):
         b64 = m.get("raw_b64") or ""
-        try:
-            raw = base64.b64decode(b64) if b64 else b""
-        except Exception:
-            raw = b""
+        raw = b""
+        if b64 and _raw_spent < _RAW_PAGE_BUDGET:
+            try:
+                _try = base64.b64decode(b64)
+            except Exception:
+                _try = b""
+            if _try and (_raw_spent + len(_try)) <= _RAW_PAGE_BUDGET:
+                raw = _try
+                _raw_spent += len(_try)
         out.append({"id": m.get("id") or "", "subject": m.get("subject") or "",
                     "from": m.get("from") or "", "date": m.get("date") or "",
                     "body": m.get("body") or "", "raw": raw})
@@ -17589,6 +17756,18 @@ else:
         selected_combo = str_lit.selectbox("Select Valid Account to Read:",
                                            options=valid_combo_options, key="bb_reader_acct",
                                            on_change=_on_reader_change)
+        # FIX MEM-READ-2: SWITCHING ACCOUNT DROPS THE PREVIOUS PAGE NOW. It used
+        # to survive until the next fetch succeeded, so the last account's raw
+        # bytes sat in the heap while a different inbox was selected. Cleared
+        # here, before the list is read, so nothing below can see it.
+        _sel_email = selected_combo.split(":", 1)[0].strip()
+        _held_for = str(str_lit.session_state.get("bb_reader_for") or "")
+        if _held_for and _held_for != _sel_email:
+            for _k in ("bb_reader_msgs", "bb_reader_note", "bb_reader_total",
+                       "bb_reader_page", "bb_reader_combo"):
+                str_lit.session_state.pop(_k, None)
+            str_lit.session_state["bb_reader_msgs"] = []
+
         # FIX W-3 (v13.67): positional default removed - _seed_widget() has
         # already written the key, and passing both warned on every load.
         _seed_widget("bb_reader_max", lo=1, hi=50, dflt=10)
