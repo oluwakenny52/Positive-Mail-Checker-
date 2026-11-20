@@ -510,6 +510,20 @@ with st.expander("🛠 Canonicalise @@END names (no terminal needed)", expanded=
 # renders a paragraph and never dials is the exact shape this row set exists to
 # catch. All five are _self False, so the literals in this table cannot inflate
 # them - not even `with tab_ai:`, which this comment itself contains.
+#
+# v13.91 THE BODY CAP ROW MOVED WITH THE VALUE. It pinned
+# `_BODY_SHOW_CHARS = 120000` and block 098 now defines 40000, so the row read
+# got 0 want 1 on correct code - the same class of break as the DNS/SMTP colon.
+# The cap's own label is "not 20000 any more", which 40000 still satisfies; the
+# needle is only the carrier, so it tracks the value.
+#
+# v13.91 AND THE SCAN POOL GETS AN OWNER ROW. The keyword scan runs on three
+# process-wide worker threads, and the whole isolation contract is that a worker
+# PINS the scope it was handed before it touches the pool, the quarantine or
+# proxy_meta. Without that pin every _rebind_scope() inside a scan resolves to
+# whichever session reran last, so one user's scan samples another user's nodes
+# and writes their scores. A row on the definition alone is not enough - the
+# CALL is what does the work - so both are gated, adjacent, and both want 1.
 _FIX_CHECKS = (
     ("status.py", "_PROXY_BLOCKED", 2, "proxy-blocked classifies as CONNECTION_FAILED"),
     ("status.py", "best = None", 1, "worse_of no longer seeds with UNKNOWN"),
@@ -624,7 +638,12 @@ _FIX_CHECKS = (
     ("app.py", "limit=limit, page=page, info=_info)", 1, "the reader passes a page"),
     ("app.py", 'key="bb_reader_next"', 1, "the reader has forward paging"),
     ("app.py", 'key="bb_reader_prev"', 1, "the reader has back paging"),
-    ("app.py", "_BODY_SHOW_CHARS = 120000", 1, "the body cap is not 20000 any more"),
+    ("app.py", "_BODY_SHOW_CHARS = 40000", 1, "the body cap is 40000, not 20000"),
+    # ---- v13.91 the scan pool's owner pin: definition AND call ----
+    ("app.py", "def _kw_scope() -> str:", 1,
+     "the scan pool resolves an explicit owner scope"),
+    ("app.py", "_pin_gate_scope(scope)", 1,
+     "the scan worker PINS its owner before touching the pool"),
     ("pages/3_Mailbox_Reader.py", "return [THEME_FILE]", 1,
      "the reader theme has one source"),
     ("pages/6_User_Guide.py", "return [_a.user_file(\"theme.json\")]", 1,
