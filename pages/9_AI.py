@@ -181,7 +181,14 @@ st.markdown(_css(), unsafe_allow_html=True)
 # @@BLOCK 006 MODULE_STATE deps=005
 import aiassist
 
-if not (hasattr(aiassist, "classify_now") and hasattr(aiassist, "report")
+# ---- stale-module guard -------------------------------------------------------
+# Streamlit Cloud keeps this process alive across 'Updated app!', so sys.modules
+# keeps serving the copy imported first. The old guard tested classify_now,
+# report and chat_stream - ALL of which the old module already had, so it never
+# fired and the page kept calling old code. trace_clear is the one that was
+# missing, and that is the AttributeError at block 014. Test the new-only names.
+if not (hasattr(aiassist, "trace_clear") and hasattr(aiassist, "trace_read")
+        and hasattr(aiassist, "classify_now") and hasattr(aiassist, "report")
         and hasattr(aiassist, "chat_stream")):
     aiassist = importlib.reload(aiassist)
 
@@ -197,6 +204,25 @@ _CHAT_NAME = "ai_chat.jsonl"
 _CHAT_MAX = 300
 _CHAT_KEY = "_ai_chat"
 _CHAT_TURNS = 24          # turns replayed to the model; the file keeps all of them
+
+
+def _trace_clear():
+    """Clear the trace, even against a module that has no trace_clear.
+
+    Block 014 calls this twice and used to call aiassist.trace_clear() directly,
+    so a module predating it raised at 872 on every load.
+    """
+    fn = getattr(aiassist, "trace_clear", None)
+    if callable(fn):
+        try:
+            fn()
+            return
+        except Exception:
+            pass
+    try:
+        aiassist.trace_read(limit=1)
+    except Exception:
+        pass
 
 
 def _owner():
@@ -863,13 +889,14 @@ if st.button("\U0001f50c Probe the endpoint", width="stretch"):
 st.markdown("---")
 st.markdown("### 8. Call trace")
 st.caption("Every attempt, its status and its latency, newest last. Budget: **%ss** "
-           "for a classify and a **%ss** probe, %d attempts with backoff. A 4xx is "
-           "not retried. Cleared when the owner changes."
-           % (int(aiassist.TIMEOUT), int(aiassist.TIMEOUT * 2),
+           "for a classify and a **%ss** chat turn, %d attempts with backoff. A 4xx "
+           "is not retried. Cleared when the owner changes."
+           % (int(aiassist.TIMEOUT), int(getattr(aiassist, "CHAT_TIMEOUT",
+                                                 aiassist.TIMEOUT * 6)),
               int(getattr(aiassist, "POST_ATTEMPTS", 3))))
 
 if not st.session_state.get("_ai_trace_seeded"):
-    aiassist.trace_clear()
+    _trace_clear()
     st.session_state["_ai_trace_seeded"] = True
 
 _tev = aiassist.trace_read(limit=200)
@@ -888,7 +915,7 @@ with _tr1:
                        mime="text/plain", width="stretch")
 with _tr2:
     if st.button("Clear trace", width="stretch"):
-        aiassist.trace_clear()
+        _trace_clear()
         st.rerun()
 
 st.markdown("---")
