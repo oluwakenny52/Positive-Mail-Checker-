@@ -192,6 +192,7 @@ st.markdown(_css(), unsafe_allow_html=True)
 
 # @@BLOCK 006 SOURCES deps=005
 import breach
+import streamlit.components.v1 as components
 
 # ---- stale-module guard -------------------------------------------------------
 # Streamlit Cloud keeps this process alive across 'Updated app!', so sys.modules
