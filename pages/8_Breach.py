@@ -219,10 +219,13 @@ import streamlit.components.v1 as components
 # and the page ran old code with no page_mode, no trace_read and no 401 handling.
 # page_wanted, trace_read and trace_clear exist only in the current module, so
 # testing those is a real version test and the reload actually happens.
-# record_view is the newest marker: a module without it builds no page at all
-# when the address tier fails, so it belongs in the same test.
+# record_view and set_owner are the newest markers: a module without set_owner
+# resolves identity from st.session_state on a worker thread and can cross
+# prefixes, and a module without record_view builds no page at all when the
+# address tier fails. Both belong in the same test.
 if not (hasattr(breach, "page_wanted") and hasattr(breach, "trace_read")
-        and hasattr(breach, "trace_clear") and hasattr(breach, "record_view")):
+        and hasattr(breach, "trace_clear") and hasattr(breach, "record_view")
+        and hasattr(breach, "set_owner")):
     breach = importlib.reload(breach)
     try:
         breach.trace("INFO", "page", "stale breach module replaced by reload")
@@ -252,8 +255,21 @@ _MODE_LABELS = {
 _BAND_CSS = {"NEW": "br-new", "PARTIAL": "br-partial", "OLD": "br-old",
              "CLEAN": "br-clean", "UNKNOWN": "br-unknown"}
 
+# THE OWNER. One value, resolved once on the script thread where session_state
+# is trustworthy, then PINNED into the module for this thread. Everything below
+# builds from it: the history path, the cache and trace paths, and the tag on
+# every trace event. A worker thread never has to ask st.session_state who it is,
+# which is what used to let a concurrent run write into the other user's prefix.
+_OWNER = os.path.basename(user_file("")) or ""
+_pin_owner = getattr(breach, "set_owner", None)
+if callable(_pin_owner):
+    _pin_owner(_OWNER)
+
 
 def _hist_path():
+    """This user's history file, built from the pinned owner - never bare."""
+    if _OWNER:
+        return "%s_%s" % (_OWNER, _HIST_NAME)
     try:
         return user_file(_HIST_NAME)
     except Exception:
@@ -505,12 +521,11 @@ def _hibp_key():
 
 
 # ---- owner gate: a second unlock in this tab must not inherit the last run ----
-_owner = os.path.basename(user_file("")) or ""
-if st.session_state.get(_OWNER_KEY) != _owner:
+if st.session_state.get(_OWNER_KEY) != _OWNER:
     for k in (_RES_KEY, _RUN_KEY, _JOB_KEY, _QUAL_KEY, _MSG_KEY, "_breach_text",
               _TRACE_SHOWN):
         st.session_state.pop(k, None)
-    st.session_state[_OWNER_KEY] = _owner
+    st.session_state[_OWNER_KEY] = _OWNER
     breach.trace("INFO", "page", "new owner in this tab, state cleared")
 
 breach.trace("INFO", "page", "loaded")
@@ -702,11 +717,16 @@ def _job_start(tier):
     dict owns the counters, and the script polls it with st.rerun(). Stop works, a
     refresh or a tab switch does not lose the run, and the bar and the live trace
     move per address instead of per run.
+
+    The thread has no st.session_state, so _OWNER travels WITH the job: it is
+    handed to check_many, which pins it on every worker. Without that the cache
+    and trace paths would fall back to the process-wide context and a concurrent
+    user could collect this run's files.
     """
     job = {"rows": {}, "done": False, "n": 0, "total": len(_pairs), "last": "",
            "error": "", "cancel": threading.Event(), "started": time.time(),
            "since0": breach.trace_seq(), "tier": tier, "mode": _page_mode,
-           "page_on": list(_page_on)}
+           "page_on": list(_page_on), "owner": _OWNER}
     st.session_state[_JOB_KEY] = job
 
     def _tick(n, total, email, verdict):
@@ -722,13 +742,14 @@ def _job_start(tier):
                 job["rows"] = breach.check_many(
                     _pairs, workers=int(_workers), progress=_tick,
                     cancel=job["cancel"], force=bool(_force), delay=float(_delay),
-                    http_only=bool(_http_only))
+                    http_only=bool(_http_only), owner_prefix=_OWNER)
             except TypeError:
                 breach.trace("WARN", "run", "check_many has no http_only argument - "
                                             "re-running without it")
                 job["rows"] = breach.check_many(
                     _pairs, workers=int(_workers), progress=_tick,
-                    cancel=job["cancel"], force=bool(_force), delay=float(_delay))
+                    cancel=job["cancel"], force=bool(_force), delay=float(_delay),
+                    owner_prefix=_OWNER)
         except Exception as e:
             job["error"] = "%s: %s" % (type(e).__name__, e)
             breach.trace("ERR", "run", "raised %s: %s" % (type(e).__name__, e))
