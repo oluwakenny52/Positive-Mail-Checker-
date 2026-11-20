@@ -1026,9 +1026,9 @@ with tab_sort:
             # selection's groups, so a 2-line paste disappeared inside 4000 system
             # rows and there was no way to export just what was typed. On, the
             # pasted set is grouped on its own and every group is prefixed, so it
-            # sorts by the same key and still never mixes.
+            # sorts by the same key and still never mixes. ON is the default now.
             _apart = st.toggle(
-                "Keep pasted rows in their own group", value=False,
+                "Keep pasted rows in their own group", value=True,
                 key="ex_sort_apart",
                 help="On: pasted rows are grouped separately and labelled "
                      "'Pasted · …', so they cannot be confused with the selection.")
