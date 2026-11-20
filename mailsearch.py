@@ -1,4 +1,4 @@
-"""mailsearch.py - keyword search over ONE already-verified mailbox.
+r"""mailsearch.py - keyword search over ONE already-verified mailbox.
 
 PLAIN MODULE, like runstate.py: no @@BLOCK frame, no gate rows, nothing to
 renumber. app.py block 109 imports it and passes in a connection that has
@@ -8,7 +8,7 @@ never has to know how to log in, how to proxy, or how to pick a host.
 
 WHAT IT DOES, and in this order, because it is the cheapest order:
 
-  1. SELECT the folder READ-ONLY, so no \\Seen flag is touched anywhere.
+  1. SELECT the folder READ-ONLY, so no \Seen flag is touched anywhere.
   2. SEARCH ALL and take the newest `scan_limit` ids. The window is bounded on
      purpose: a 40,000-message folder cannot be swept per keystroke.
   3. FETCH HEADERS ONLY in chunks and match the keywords against Subject + From.
@@ -57,7 +57,7 @@ def _s(x):
 
 
 def _unquote_folder(line):
-    """`(\\HasNoChildren) "/" "Sent Items"` -> `Sent Items`. Never raises."""
+    r"""`(\HasNoChildren) "/" "Sent Items"` -> `Sent Items`. Never raises."""
     m = re.search(r'"([^"]*)"\s*$', line or "")
     if m:
         return m.group(1)
@@ -80,7 +80,7 @@ def _keywords(words):
 
 
 def list_folders(mail):
-    """(folders, note). \\Noselect containers are dropped - they cannot be selected."""
+    r"""(folders, note). \Noselect containers are dropped - they cannot be selected."""
     out = []
     try:
         typ, data = mail.list()
