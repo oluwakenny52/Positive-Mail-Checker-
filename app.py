@@ -739,61 +739,44 @@ PROBER_IDLE_ENABLED_DEFAULT = False
 PROBE_SECOND_SCHEME_DEFAULT = False
 PROBE_MAX_TARGETS_DEFAULT = 1
 
-# v13.86 FIX PAGES-2: THE PAGE TABLE IS GONE FROM HERE. It listed all eleven
-# pages in full, and pages/6_User_Guide.py block 013 TAB_PAGES carries the same
-# table verbatim - so the same rows were rendered twice, once above the hero on
-# the main page where nobody needs them, and once where they belong. The link
-# below replaces it: the guide is one tap away and is the only copy now.
-def _pages_tab():
-    return globals().get("_t6") or str_lit.container()
-
-
-def _pages_h(title):
-    _fn = globals().get("ug_h")
-    if callable(_fn):
-        try:
-            return _fn(title)
-        except Exception:
-            pass
-    return str_lit.subheader(title)
-
-
-with _pages_tab():
-    str_lit.markdown(
-        "**Every page, with what it costs, lives on the User Guide** - "
-        "`pages/6_User_Guide.py`, open it from the sidebar. Breach Exposure, the "
-        "AI Console, the Debug console and the Block Inspector are all described "
-        "there, including which of them spend proxy credit and which do not."
-    )
-
-    _pages_h("Breach Exposure, in more detail")
-    str_lit.markdown(
-        """
-Breach Exposure never touches a mailbox, so it is safe to run on addresses you
-have already discarded.
-
-It uses three free sources and **no API key**:
-
-* the public breach catalogue, fetched once and matched locally by domain, so a
-  list of 500 addresses makes one request, not 500;
-* the account page on haveibeenpwned, fetched only when the local match found
-  nothing, at one request every two seconds because it is throttled;
-* `psbdmp.ws`, for pastes quoting the address.
-
-Read the verdict as urgency, not as a score:
-
-| Verdict | Meaning |
-|---|---|
-| **ACT** | a breach added inside 90 days, or a paste from the last year |
-| **REVIEW** | a breach added inside a year |
-| **HISTORIC** | only old exposure - rotate anyway, nothing is urgent |
-| **CLEAN** | not in those sources, which is not the same as never exposed |
-| **UNKNOWN** | no readable answer - usually a throttle |
-
-Nothing on that page is written outside your own files, and the history is yours
-alone.
-"""
-    )
+# ==========================================================================
+# v13.86 FIX PAGES-3 - THE GUIDE NO LONGER RENDERS INSIDE app.py
+#
+# This block used to end with a `with _pages_tab():` body that painted a
+# paragraph naming pages/6_User_Guide.py, a subheader and the whole "Breach
+# Exposure, in more detail" table onto the MAIN page. Because the block runs at
+# import time, all of it landed ABOVE the hero - a page of guide prose over the
+# title, on every load, for content that already exists in the guide and is one
+# sidebar tap away.
+#
+# The page table had already been taken out of here at PAGES-2 for exactly the
+# same reason. This is the rest of it.
+#
+# WHAT WENT, AND WHY NOTHING BREAKS:
+#   * _pages_tab()  - its body was globals().get("_t6"), and _t6 is never bound
+#     in app.py at all, so it always answered a fresh st.container() here.
+#   * _pages_h()    - its body was globals().get("ug_h"), and ug_h is defined in
+#     the GUIDE, not in app.py, so it always fell through to st.subheader().
+#     Two helpers, two lookups that could never hit, one purpose: draw the
+#     guide inside app.py.
+#   * the two str_lit.markdown() calls that used them.
+#
+# Nothing else in app.py referenced either helper - they were created here and
+# died here - so they are gone rather than left as dead code.
+#
+# THE GUIDE IS STILL REACHABLE, AND STILL A PAGE. It stays in pages/, so
+# Streamlit keeps it in the sidebar nav exactly like Diagnostics, Logs and the
+# rest, and block 110's footer link still resolves. It is still gated by
+# verify_blocks.py and verify_v1337.py, so its frame and its build identity are
+# still audited. The ONLY change is that app.py stops showing a copy of it.
+#
+# THE SIX CONSTANTS BELOW STAY. PROBER_IDLE_SLEEP and PROBER_BUSY_SLEEP are read
+# by block 075's prober loop, PROBER_STALE_WHILE_RUNNING by block 074,
+# PROBER_IDLE_ENABLED_DEFAULT / PROBE_SECOND_SCHEME_DEFAULT /
+# PROBE_MAX_TARGETS_DEFAULT by blocks 019, 020, 055, 070 and 074. None of them
+# had anything to do with the guide; the block name was already a lie and it is
+# left alone because renaming it would move an @@END name for no gain.
+# ==========================================================================
 # @@END 013 FRUGALITY_CONSTANTS
 
 # @@BLOCK 014 UI_RENDER_CONSTANTS deps=-
@@ -12391,7 +12374,28 @@ if _kw_run_on:
         str_lit.caption("Hits land in the 🔎 Keyword Hits bucket and in the ZIP under "
                         "`keyword_bodies/`, with an occurrence count per keyword.")
 
-render_kw_panel()
+# ==========================================================================
+# v13.86 FIX KW-1 - THE PANEL WAS PAINTED BEFORE IT EXISTED
+#
+# This block ended with render_kw_panel(), and BOTH halves of the panel live in
+# block 105: the function, and the slot it draws into. Block 087 executes first,
+# so the call reached a name that had not been bound yet and the page died on
+# this line with
+#
+#     NameError: name 'render_kw_panel' is not defined
+#
+# before the inspector or the engine were drawn at all.
+#
+# The slot is reserved HERE, which is where the panel belongs - immediately under
+# the keyword controls it reports on - and the function paints into that slot on
+# its way past its own definition in block 105, then repaints it from block 106
+# as hits land. One element, created once per load, at a fixed position.
+#
+# _kw_live is created in exactly one place now. A second str_lit.empty() in 105
+# would make a SECOND element lower down the page and the first would stay blank
+# for ever.
+# ==========================================================================
+_kw_live = str_lit.empty()
 
 
 KW_TRACE_MAX = 400
@@ -15110,10 +15114,14 @@ if _AI is not None:
     else:
         str_lit.caption("🤖 Unknown-tail classifier: off (GEMINI_ENABLED or key absent).")
 
+# v13.86 FIX KW-1: _kw_live IS NOT CREATED HERE ANY MORE. Block 087 already made
+# the slot, under the keyword controls, before this block ran - a second
+# str_lit.empty() here would append a SECOND element further down the page and
+# leave the first one blank for ever. This block only defines the function and
+# gives it its first paint.
 active_proxy_pool = []
 _run_pool_box = []
 _batch_rest = []
-_kw_live = str_lit.empty()
 
 
 def render_kw_panel():
@@ -15122,6 +15130,8 @@ def render_kw_panel():
     Two numbers matter and neither was on the page before: how many mails each
     keyword actually produced, and what the last scan did. Both are read from
     session_state, so the panel survives a rerun and is right on the first paint.
+
+    The element it draws into is block 087's _kw_live, made a block earlier.
     """
     try:
         _counts = dict(str_lit.session_state.get("kw_counts") or {})
@@ -15144,6 +15154,12 @@ def render_kw_panel():
     if _trace:
         with _kw_live.expander("Keyword scan trace", expanded=False):
             str_lit.code("\n".join(_trace[-40:]), language="text")
+
+
+# The first paint. Block 087 could not make this call - the function did not
+# exist yet when it ran - so it is made here, immediately after the def, which is
+# the earliest legal point. Block 106 repaints the same element as hits land.
+render_kw_panel()
 
 
 class _NullUI:
