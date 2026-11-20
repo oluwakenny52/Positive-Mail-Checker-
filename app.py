@@ -12399,6 +12399,16 @@ if raw_text:
 # bucket to a file that reload rehydration reads. kw_hits_{stamp}.txt is already
 # written by the export block; it is now READ BACK on a fresh session, gated on a
 # real run record so a cold load does not invent one.
+#
+# v13.90 FIX KW-13 - THE QUEUE CARRIED FULL MESSAGE BODIES. mailsearch hands back
+# a hit with up to 200 KB of readable body, and up to 200 hits per account sat in
+# the handover queue at that size until drained - the single largest new memory
+# consumer, and on a 1 GB container an OOM kill looks exactly like an automatic
+# restart (no traceback, "Your app is in the oven", a fresh clone). The body is
+# truncated to KW_QUEUE_BODY before it is queued; the FULL body has already been
+# written to disk by save_bodies() by then, and the panel only ever showed 2000
+# characters anyway. The bucket also gets a ceiling now, because it was the one
+# list in the run with no cap at all.
 # ==========================================================================
 KW_SCOPES = ("Inbox", "All Folders")
 KW_SCOPE_INBOX = KW_SCOPES[0]
@@ -12421,6 +12431,10 @@ KW_POP_BUDGET = 18.0
 KW_SCAN_WORKERS = 3
 KW_SCAN_QUEUE_MAX = 300
 KW_BODY_SCAN_CAP = 40
+# v13.90: what a QUEUED hit keeps. The full body is on disk already.
+KW_QUEUE_BODY = 4000
+# v13.90: and the bucket gets the ceiling it never had.
+KW_BUCKET_MAX = 5000
 
 section_title("🔎", "Keyword Hits",
               "find words you care about in every valid inbox, as the run goes")
@@ -12916,6 +12930,10 @@ def _kw_scan_pure(combo, cfg, out):
         mailsearch.save_bodies(kdir, stamp, out["hits"])
     except Exception:
         pass
+    # FIX KW-13: the FULL body is on disk now, so the queued copy is cut down.
+    # This is the memory that made an OOM kill likely on a 1 GB container.
+    for h in out["hits"]:
+        h["body"] = str(h.get("body") or "")[:KW_QUEUE_BODY]
     trace("INFO", "hit", "%d hit(s) for %s in %s"
           % (len(out["hits"]), email, ",".join(folders)))
     try:
@@ -13035,6 +13053,9 @@ def _kw_apply(item):
             ln = mailsearch.hit_line(h)
             if ln not in cur_l:
                 cur_l.append(ln)
+        # FIX KW-13: the bucket had no ceiling at all.
+        if len(cur_l) > KW_BUCKET_MAX:
+            cur_l = cur_l[-KW_BUCKET_MAX:]
         str_lit.session_state["kw_hits_results"] = cur_l
     except Exception:
         pass
@@ -17341,8 +17362,14 @@ except Exception:
 # point of the switch. The fetched page is written to a per-user file now and
 # read back on a restore, so the switch restores what it says it restores. The
 # cache carries the combo, so a different account never shows the last one's
-# mail, and the raw bytes are dropped past an 8 MB budget - the text body still
-# renders, only inline images go without on a very large page.
+# mail.
+#
+# v13.90 FIX RD-2: AND THE CACHE BUILT ITS BASE64 BEFORE CHECKING THE BUDGET.
+# Every message was encoded first and only then tested against the remaining
+# budget, so a 50-message page allocated ~35 MB of base64 strings that were
+# mostly discarded - a real spike on a 1 GB container, on the page whose whole
+# purpose is a large page of mail. The estimated encoded size is compared to the
+# budget FIRST now and the encode is skipped when it will not fit.
 # ==========================================================================
 _READER_STATE_NAME = "reader_state.json"
 _READER_CACHE_NAME = "reader_cache.json"
@@ -17424,12 +17451,12 @@ def _reader_cache_save(combo, msgs, total, page):
             raw = m.get("raw") or b""
             b64 = ""
             if raw:
-                try:
-                    b64 = base64.b64encode(raw).decode()
-                except Exception:
-                    b64 = ""
-            if len(b64) > budget:
-                b64 = ""
+                # FIX RD-2: size test BEFORE the encode, not after it.
+                if ((len(raw) * 4) // 3 + 4) <= budget:
+                    try:
+                        b64 = base64.b64encode(raw).decode()
+                    except Exception:
+                        b64 = ""
             budget -= len(b64)
             rows.append({"id": m.get("id") or "",
                          "subject": m.get("subject") or "",
