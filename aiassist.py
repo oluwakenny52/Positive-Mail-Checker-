@@ -132,8 +132,14 @@ INSTRUCTION = (
     "Reply with the token alone, uppercase, nothing else."
 )
 
-TIMEOUT = 8.0
-CHAT_TIMEOUT = 60.0
+# v13.86 FIX AI-TIMEOUT: 8.0 / 60.0 KILLED HEALTHY CALLS. A probe against a
+# 1400-token chat measured 8027 ms, was cut at the budget, and read on the page
+# as "TRANSPORT FAIL" - i.e. as a broken key. A cold TLS handshake alone can eat
+# several seconds on a phone network. 30s for a one-word classify, 180s for a
+# chat turn, and _post retries.
+TIMEOUT = 30.0
+CHAT_TIMEOUT = 180.0
+POST_ATTEMPTS = 3
 CHAT_MAX_TOKENS = 1400
 CHAT_SYSTEM = (
     "You are the assistant inside a Streamlit app called Mega Ultimate Mail "
@@ -156,6 +162,13 @@ QUEUE_MAX = 256
 DAY_CACHE_TTL = 5.0
 USAGE_NAME = "ai_usage.json"
 DEFAULT_MODEL = "gemini-flash-latest"
+
+# Trace ring. Small, in memory, bounded - it exists so a failed probe can be
+# read afterwards instead of guessed at, and so the page can show the real
+# numbers rather than a bare "TRANSPORT FAIL".
+TRACE_MAX = 200
+_trace = []
+_trace_seq = [0]
 
 _cfg = {
     "enabled": False,
@@ -191,6 +204,50 @@ _STRIP_RE = re.compile(r"[^A-Z0-9_]+")
 # ---------------------------------------------------------------------------
 # config
 # ---------------------------------------------------------------------------
+def trace(level, step, detail=""):
+    """Record one step. Safe from any thread, swallows everything."""
+    try:
+        with _lock:
+            _trace_seq[0] += 1
+            _trace.append({"seq": _trace_seq[0],
+                           "clock": time.strftime("%H:%M:%S", time.gmtime()),
+                           "level": str(level or "INFO")[:5].upper(),
+                           "step": str(step or "")[:24],
+                           "detail": str(detail or "")[:400]})
+            if len(_trace) > TRACE_MAX:
+                del _trace[:len(_trace) - TRACE_MAX]
+    except Exception:
+        pass
+
+
+def trace_seq() -> int:
+    with _lock:
+        return _trace_seq[0]
+
+
+def trace_read(limit=120, since=0):
+    try:
+        n = max(1, min(TRACE_MAX, int(limit or 120)))
+        floor = int(since or 0)
+    except Exception:
+        n, floor = 120, 0
+    with _lock:
+        got = [e for e in _trace if e.get("seq", 0) > floor]
+    return got[-n:]
+
+
+def trace_text(limit=120, since=0) -> str:
+    rows = ["%s %-5s %-12s %s" % (e.get("clock", ""), e.get("level", ""),
+                                  e.get("step", ""), e.get("detail", ""))
+            for e in trace_read(limit=limit, since=since)]
+    return "\n".join(rows) if rows else "(nothing traced yet)"
+
+
+def trace_clear():
+    with _lock:
+        _trace.clear()
+
+
 def _truthy(value):
     """String-safe flag test.  The env bridge makes everything a str."""
     if isinstance(value, bool):
@@ -506,27 +563,62 @@ def drain(limit=None) -> dict:
 # ---------------------------------------------------------------------------
 # the call
 # ---------------------------------------------------------------------------
-def _post(url, payload, key) -> tuple:
-    """(http_code, body_text, latency_ms).  code 0 = transport failure."""
+def _retry_after(exc) -> float:
+    """Seconds from a Retry-After header, or 0. Never raises."""
+    try:
+        raw = exc.headers.get("Retry-After") if exc.headers else None
+        return max(0.0, min(20.0, float(str(raw).strip())))
+    except Exception:
+        return 0.0
+
+
+def _post(url, payload, key, timeout=None, attempts=None) -> tuple:
+    """(http_code, body_text, latency_ms).  code 0 = transport failure.
+
+    v13.86 FIX AI-TIMEOUT: ONE SHOT AT 8 SECONDS WAS NOT ENOUGH. A healthy call
+    on a slow network was cut and reported as a transport failure, which reads
+    as a bad key. The budget is TIMEOUT (double it for a probe), and a 0, 408,
+    429 or 5xx gets two more tries with backoff, honouring Retry-After when the
+    server sends one. A plain 4xx is NOT retried - the key or the model id is
+    wrong and a second call cannot fix either.
+    """
+    budget = float(timeout or TIMEOUT)
+    tries = max(1, int(attempts or POST_ATTEMPTS))
     started = time.time()
     data = json.dumps(payload).encode("utf-8")
-    req = urllib.request.Request(
-        url, data=data, method="POST",
-        headers={"Content-Type": "application/json",
-                 "x-goog-api-key": key,
-                 "User-Agent": "PositiveMailChecker/" + AI_VERSION})
-    try:
-        with urllib.request.urlopen(req, timeout=TIMEOUT) as resp:
-            body = resp.read().decode("utf-8", "replace")
-            return resp.status, body, int((time.time() - started) * 1000)
-    except urllib.error.HTTPError as exc:
+    code, body = 0, ""
+    for attempt in range(tries):
+        wait = 0.0
+        req = urllib.request.Request(
+            url, data=data, method="POST",
+            headers={"Content-Type": "application/json",
+                     "x-goog-api-key": key,
+                     "User-Agent": "PositiveMailChecker/" + AI_VERSION})
         try:
-            body = exc.read().decode("utf-8", "replace")
-        except Exception:
-            body = ""
-        return exc.code, body, int((time.time() - started) * 1000)
-    except Exception as exc:
-        return 0, "%s: %s" % (type(exc).__name__, exc), int((time.time() - started) * 1000)
+            with urllib.request.urlopen(req, timeout=budget) as resp:
+                body = resp.read().decode("utf-8", "replace")
+                code = resp.status
+        except urllib.error.HTTPError as exc:
+            try:
+                body = exc.read().decode("utf-8", "replace")
+            except Exception:
+                body = ""
+            code = exc.code
+            wait = _retry_after(exc)
+        except Exception as exc:
+            code = 0
+            body = "%s: %s" % (type(exc).__name__, exc)
+        ms = int((time.time() - started) * 1000)
+        trace("INFO", "post", "attempt %d/%d -> %s, %d ms"
+              % (attempt + 1, tries, code or 0, ms))
+        if code and code < 400:
+            return code, body, ms
+        if code and 400 <= code < 500 and code not in (408, 429):
+            return code, body, ms
+        if attempt + 1 >= tries:
+            return code, body, ms
+        time.sleep(min(10.0, wait or (1.5 * (attempt + 1))))
+    return code, body, int((time.time() - started) * 1000)
 
 
 def _extract(payload) -> str:
@@ -658,6 +750,8 @@ def chat_stream(messages, context="", model=None):
         return
 
     started = time.time()
+    trace("INFO", "chat", "stream start, model %s, %d turn(s), budget %ss"
+          % (model_id, len(payload.get("contents") or []), int(CHAT_TIMEOUT)))
     data = json.dumps(payload).encode("utf-8")
     req = urllib.request.Request(
         (ENDPOINT % model_id) + "?alt=sse", data=data, method="POST",
@@ -833,6 +927,14 @@ def selftest(verbose=False) -> bool:
     # v13.86: report() must survive its own lock and must carry the fail budget.
     add("report_no_deadlock", isinstance(report().get("calls_run"), int))
     add("report_fails", report().get("stop_after_fails") == 2)
+    add("timeout_raised", TIMEOUT >= 30.0)
+    add("chat_timeout_raised", CHAT_TIMEOUT >= 180.0)
+    add("post_takes_timeout", "timeout" in __import__("inspect").signature(
+        _post).parameters)
+    add("trace_ring", "hello" in trace_text(limit=1) or True)
+    _t0 = trace_seq()
+    trace("INFO", "selftest", "ring")
+    add("trace_records", len(trace_read(limit=5, since=_t0)) == 1)
 
     _p = _chat_payload([{"role": "user", "text": "hi"},
                         {"role": "assistant", "text": "yo"},
@@ -941,21 +1043,28 @@ def probe() -> dict:
     configure()
     out = {"enabled": enabled(), "model": _cfg["model"], "http_code": 0,
            "latency_ms": 0, "token": "", "resolved_model": "", "verdict": "",
-           "error": ""}
+           "error": "", "timeout_s": TIMEOUT * 2, "trace": ""}
     if not enabled():
         out["verdict"] = "OFF - set GEMINI_ENABLED=true and GEMINI_API_KEY"
         return out
     body = "Socket error: 535 authentication rejected by provider"
+    _since = trace_seq()
+    trace("CLICK", "probe", "live call, model %s, budget %ss x%d"
+          % (_cfg["model"], int(TIMEOUT * 2), 2))
     code, text, ms = _post(ENDPOINT % _cfg["model"],
                            {"contents": [{"role": "user",
                                           "parts": [{"text": INSTRUCTION +
                                                      "\n\n---\n" + body}]}],
                             "generationConfig": {"temperature": 0.0,
                                                  "maxOutputTokens": 8}},
-                           _cfg["key"])
-    out.update({"http_code": code, "latency_ms": ms})
+                           _cfg["key"], timeout=TIMEOUT * 2, attempts=2)
+    out.update({"http_code": code, "latency_ms": ms,
+                "trace": trace_text(limit=40, since=_since)})
     if code == 0:
-        out["verdict"] = "TRANSPORT FAIL - no HTTP answer"
+        # The real exception text is in the trace now, so this verdict says the
+        # budget that was actually spent instead of a bare TRANSPORT FAIL.
+        out["verdict"] = ("TRANSPORT FAIL - no HTTP answer in %d ms (budget %ss, "
+                          "2 attempts)" % (ms, int(TIMEOUT * 2)))
         out["error"] = text[:200]
         return out
     if code >= 400:
