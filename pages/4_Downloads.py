@@ -51,6 +51,11 @@ v13.86 on this page
 * TEACH A DOMAIN: `alditra.com` is Indonesian and `.com` cannot say so. A domain
   taught here is remembered in a per-user map that is read BEFORE the TLD, and
   the map can be downloaded.
+* AUTO-ASSIGN: the map can also fill itself from clues already in the rows - a
+  host under the same domain, or a sibling with a real ccTLD - with an optional
+  paced network tier. It runs on a press, so sorting stays offline, and it never
+  overwrites a domain taught by hand. Anything it writes can be undone in one
+  press.
 * The sorter no longer stops the page when nothing is selected, and the empty
   message names both sources of rows.
 """
@@ -1088,6 +1093,63 @@ with tab_sort:
             else:
                 st.caption("No domains mapped yet. Unplaced gTLDs group under "
                            "**Global / gTLD**.")
+
+        # ---- auto-assign from clues in the rows ---------------------------
+        # Runs on a press only, so sorting stays offline. It never overwrites a
+        # domain taught by hand, and every entry it writes is removable in one
+        # press.
+        with st.expander("Auto-assign countries from the rows", expanded=False):
+            st.caption("Reads the clues already in the current rows: a mail host "
+                       "under the same domain, or a sibling of the same name with a "
+                       "real country TLD. `alditra.com` beside `alditra.id` is "
+                       "Indonesia with no network at all. Anything unplaced stays in "
+                       "**Global / gTLD**.")
+            _net_on = st.checkbox(
+                "Also ask the network for what the clues missed", value=False,
+                key="ex_auto_net",
+                help="One A-record lookup per domain, paced at 4 a second, capped "
+                     "below. Slower, and it is the only tier that leaves the box.")
+            _auto_cap = st.number_input(
+                "Most domains to try per press", 1, 2000, 300, 50, key="ex_auto_cap")
+            _net_cap = st.number_input(
+                "Network lookups per press", 0, 200, 40, 10, key="ex_auto_netcap")
+            _aa1, _aa2 = st.columns(2)
+            with _aa1:
+                if st.button("Run auto-assign", width="stretch"):
+                    _bar = st.progress(0.0, text="working")
+
+                    def _aprog(n, total, dom, ok):
+                        _bar.progress(min(1.0, n / max(1, total)),
+                                      text="%d / %d - %s" % (n, total, dom))
+
+                    _rep = mailsort.auto_teach(
+                        _sort_rows, net=bool(_net_on), cap=int(_auto_cap),
+                        net_cap=int(_net_cap), on_progress=_aprog)
+                    _bar.empty()
+                    if _rep.get("error"):
+                        st.info(_rep["error"])
+                    else:
+                        st.success(
+                            "Placed %d of %d candidate(s) - %d from a host, %d from a "
+                            "sibling, %d from the network. %d left in Global / gTLD."
+                            % (_rep["host"] + _rep["sibling"] + _rep["net"],
+                               _rep["candidates"], _rep["host"], _rep["sibling"],
+                               _rep["net"], _rep["left"]))
+                    st.session_state.pop("_ex_sort_sig", None)
+                    st.rerun()
+            with _aa2:
+                _meta_now = mailsort.meta_map()
+                _auto_n = sum(1 for _d in _meta_now
+                              if str((_meta_now.get(_d) or {}).get("src") or "")
+                              != mailsort.CLUE_TAUGHT)
+                if st.button("Undo auto-assignments", width="stretch",
+                             disabled=not _auto_n):
+                    _rem = mailsort.undo_auto()
+                    st.session_state.pop("_ex_sort_sig", None)
+                    st.success("Removed %d auto-assigned domain(s)." % _rem)
+                    st.rerun()
+                st.caption("%d auto-assigned, %d by hand."
+                           % (_auto_n, len(mailsort.custom_map()) - _auto_n))
 
         for _k, _v in (("ex_sort_by", mailsort.KEY_LABELS[0]),
                        ("ex_sort_order", mailsort.ORDERS[0]),
