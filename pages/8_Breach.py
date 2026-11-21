@@ -3,8 +3,8 @@
 """
 pages/8_Breach.py - breach exposure and combo freshness  (v13.86)
 =================================================================
-What a list of combos has actually been in, from keyless sources, with the
-verdict about FRESHNESS rather than count.
+What a list of combos has actually been in, with the verdict about FRESHNESS
+rather than count.
 
 WHY A PAGE AND NOT A RUN STEP
 -----------------------------
@@ -12,12 +12,24 @@ A breach lookup is slow and rate-limited, and its answer never changes a mail
 verdict. Putting it in the checker would spend ladder time on it. Here it is a
 separate queue you point at a list when you want it.
 
+THE KEY IS THE PRIMARY PATH  (this pass)
+----------------------------------------
+A free HIBP API key answers the address half with two small JSON calls - exact,
+milliseconds, no page to render and nothing to challenge. It is tried FIRST,
+before anything is opened.
+
+The browser is demoted to a fallback and it has a switch. "Browser fallback" off
+means API-only: fast, and an address the API refuses stops at UNREAD instead of
+paying for a page. It is on by default because without a key there is no other
+way to read the address at all, and the trace says which tier answered.
+
 WHAT EACH SOURCE IS
 -------------------
   passwords  Pwned Passwords k-anonymity. Keyless, un-challenged, and the real
              signal - it says how public this exact password already is.
-  address    the HIBP site's own search endpoint. Plain HTTP first, a browser
-             only when Cloudflare challenges it.
+  address    the HIBP API when a key is set. Without a key, or when the key is
+             refused, the site's own search endpoint - and only then, and only
+             with the fallback switched on, a browser page.
   catalogue  the free breach list, matched locally by domain, as a fallback.
 
 WHAT LEAVES THE BOX  (v13.85)
@@ -44,14 +56,14 @@ The run is a THREAD now, its counters live in a session job dict, and this page
 polls them with st.rerun(). The bar and the live trace move per address, Stop
 works, and a refresh or a tab switch does not lose the run.
 
-THE PAGE COUNT IS THE CONCURRENCY  (this pass)
-----------------------------------------------
-The Workers slider is gone. "Browser pages" now opens exactly that many tabs and
-checks exactly that many addresses at the same time - five addresses on five
-pages start together instead of two at a time. The delay only paces the starts.
+THE PAGE COUNT IS THE CONCURRENCY  (earlier pass)
+-------------------------------------------------
+The Workers slider was gone once; it is back. WORKERS is how many addresses are
+in flight. PAGES is how many tabs exist, one per worker slot. The delay only
+paces the starts.
 
-THE PAGE OPENS, AND YOU SCROLL IT  (this pass)
-----------------------------------------------
+THE PAGE OPENS, AND YOU SCROLL IT  (earlier pass)
+-------------------------------------------------
 Every captured address carries a FULL-LENGTH screenshot of what the browser
 rendered, shown first in a scrollable box, so the breach cards, their dates and
 their data classes can be read exactly as the site prints them - even when the
@@ -76,9 +88,8 @@ THE BROWSER
 -----------
 The package comes from requirements.txt; the ~150 MB Chromium binary does not.
 The browser row in section 1 installs it once, on a background thread, and shows
-the state. A failed install prints its own error rather than pretending the site
-was blocked. Passwords work with no browser at all - the browser only rescues an
-address the site challenges.
+the state. It is only needed when the fallback is on and a key is missing or
+refused. Passwords work with no browser at all.
 
 ISOLATION
 ---------
@@ -192,8 +203,9 @@ st.markdown(_css(), unsafe_allow_html=True)
 # @@BLOCK 005 HERO_GATE deps=004
 st.markdown(
     '<div class="br-hero"><h1>\U0001f6e1 Breach Exposure</h1>'
-    '<p>Point this at a list of combos. Keyless sources only - no API key, no '
-    'per-address charge. The verdict is about how RECENT the exposure is.</p></div>',
+    '<p>Point this at a list of combos. The HIBP API key answers first; a browser '
+    'page is only a fallback, and it has its own switch. The verdict is about how '
+    'RECENT the exposure is.</p></div>',
     unsafe_allow_html=True)
 
 import auth
@@ -241,6 +253,7 @@ if not (hasattr(breach, "page_wanted") and hasattr(breach, "trace_read")
         and hasattr(breach, "trace_clear") and hasattr(breach, "record_view")
         and hasattr(breach, "set_owner") and hasattr(breach, "RESULT_WAIT")
         and hasattr(breach, "_await_future") and hasattr(breach, "_Slot")
+        and hasattr(breach, "key_present") and hasattr(breach, "key_hint")
         and hasattr(breach, "JS_FETCH")):
     breach = importlib.reload(breach)
     try:
@@ -263,6 +276,7 @@ _MSG_KEY = "_breach_msg"
 _TRACE_SHOWN = "_breach_trace_shown"
 _CAP_MODE_KEY = "_breach_page_mode"
 _CAP_ON_KEY = "_breach_page_on"
+_FALLBACK_KEY = "_breach_fallback"
 _MODE_LABELS = {
     "Fast - only what I filter for": "fast",
     "Full - every address checked": "full",
@@ -321,7 +335,7 @@ def _state_save(rows, quality, stamp):
                     "pages": int(st.session_state.get("_breach_pages", 2)),
                     "delay": float(st.session_state.get("_breach_delay", 1.0)),
                     "force": bool(st.session_state.get("_breach_force", False)),
-                    "http_only": bool(st.session_state.get("_breach_http_only", False)),
+                    "fallback": bool(st.session_state.get(_FALLBACK_KEY, True)),
                     "mode": st.session_state.get(_CAP_MODE_KEY, "Fast - only what I filter for"),
                     "on": list(st.session_state.get(_CAP_ON_KEY) or []),
                     "view": st.session_state.get("_breach_view", "All")},
@@ -342,7 +356,7 @@ def _state_apply():
              ("_breach_pages", setts.get("pages")),
              ("_breach_delay", setts.get("delay")),
              ("_breach_force", setts.get("force")),
-             ("_breach_http_only", setts.get("http_only")),
+             (_FALLBACK_KEY, setts.get("fallback")),
              (_CAP_MODE_KEY, setts.get("mode")),
              (_CAP_ON_KEY, setts.get("on")),
              ("_breach_view", setts.get("view")))
@@ -351,6 +365,9 @@ def _state_apply():
             continue
         if key not in st.session_state:
             st.session_state[key] = val
+    # Files written before this pass stored the inverse (`http_only`). Honour it.
+    if _FALLBACK_KEY not in st.session_state and setts.get("http_only") is not None:
+        st.session_state[_FALLBACK_KEY] = not bool(setts.get("http_only"))
     if not st.session_state.get(_RES_KEY) and st_.get("results"):
         st.session_state[_RES_KEY] = st_["results"]
         st.session_state[_QUAL_KEY] = st_.get("quality") or {}
@@ -690,20 +707,25 @@ with _bst2:
             breach.ensure_browser(force=True)
             st.rerun()
 
-# ---- the address tier: the UI, keyless ----------------------------------------
+# ---- the address tier: THE KEY, with the browser behind a switch --------------
+# Order is fixed in breach.check(): passwords, key, keyless endpoint, browser.
+# The key is what makes a 500-address run cheap; the browser is the rescue.
 if breach.key_present():
-    st.caption("\U0001f511 HIBP_API_KEY is set - the keyed API is tried first because "
-               "it is faster and exact. The browser is still the fallback.")
+    st.caption("\U0001f511 **Key set (%s) - the keyed API is the primary path.** "
+               "Each address is answered by two small API calls before any page is "
+               "opened, so a run costs seconds, not minutes."
+               % breach.key_hint())
 else:
-    st.caption("\U0001f5b1 No API key, and none needed. The address is typed into the "
-               "site's own search box and the rendered page is scraped for the breach "
-               "names, dates and classes. Slower than an API call, and free.")
+    st.warning("\U0001f5dd **No HIBP_API_KEY set - the fast path is switched off.** "
+               "Add `HIBP_API_KEY` in the app's secrets (Streamlit Cloud \u2192 "
+               "Settings \u2192 Secrets) or as an environment variable, then reload "
+               "this page. Until then the keyless site search runs, and any address "
+               "it refuses needs the browser fallback below.")
 
-# ---- workers, pages, pacing ----------------------------------------------------
+# ---- workers, pages, pacing, fallback ------------------------------------------
 # WORKERS is how many addresses are in flight. PAGES is how many tabs exist to run
 # them on; each worker takes a tab and keeps it, so a worker count above the page
-# count just queues. They are separate because a worker can be waiting on a
-# challenge without needing a second tab for it.
+# count just queues. With a key and no wall, tabs are barely used at all.
 _c1, _c2, _c3, _c4, _c5 = st.columns(5)
 with _c1:
     _workers = st.slider("Workers", 1, 8, 3, key="_breach_workers",
@@ -719,22 +741,30 @@ with _c2:
 with _c3:
     _delay = st.slider("Delay (s)", 0.0, 10.0, 1.0, 0.5, key="_breach_delay",
                        on_change=_watch("_breach_delay", "delay"),
-                       help="Seconds between STARTING addresses. 1s is fine now that "
-                            "the tabs are reused; raise it if you get walled.")
+                       help="Seconds between STARTING addresses. Drop it to 0 with a "
+                            "key - only the browser fallback needs pacing.")
 with _c4:
     _force = st.checkbox("Ignore cache", value=False, key="_breach_force",
                          on_change=_watch("_breach_force", "ignore cache"),
                          help="A cached answer is served for 6 hours. Tick this to "
                               "re-check from the sources.")
 with _c5:
-    _http_only = st.checkbox("HTTP only", value=False, key="_breach_http_only",
-                             on_change=_watch("_breach_http_only", "http only"),
-                             help="No browser. Faster, but a walled address comes "
-                                  "back UNKNOWN instead of resolved.")
+    _fallback = st.checkbox("Browser fallback", value=True, key=_FALLBACK_KEY,
+                            on_change=_watch(_FALLBACK_KEY, "browser fallback"),
+                            help="When the key cannot answer (or no key is set), open "
+                                 "a page and read the site instead. Off = API-only: "
+                                 "faster, and a refused address comes back UNREAD "
+                                 "instead of resolved.")
+_http_only = not _fallback
 
-st.caption("**%d** worker(s) on **%d** reused tab(s). Tabs are not closed between "
-           "addresses and the clearance cookie is kept, so only the first check pays "
-           "the security verification." % (int(_workers), int(_pages)))
+if _fallback:
+    st.caption("**%d** worker(s) on **%d** reused tab(s). Tabs are not closed between "
+               "addresses and the clearance cookie is kept, so only the first check "
+               "pays the security verification." % (int(_workers), int(_pages)))
+else:
+    st.caption("**%d** worker(s), no browser. The key and the keyless endpoint only - "
+               "a refused address is reported UNREAD and nothing is opened."
+               % int(_workers))
 
 # ---- page capture ---------------------------------------------------------------
 st.markdown("##### Captured pages")
@@ -810,13 +840,21 @@ def _job_start(tier):
                 job["rows"] = breach.check_many(
                     _pairs, workers=int(_workers), progress=_tick,
                     cancel=job["cancel"], force=bool(_force), delay=float(_delay),
-                    http_only=bool(_http_only), owner_prefix=_OWNER)
-            except TypeError:
-                breach.trace("WARN", "run", "check_many has no http_only argument")
-                job["rows"] = breach.check_many(
-                    _pairs, workers=int(_workers), progress=_tick,
-                    cancel=job["cancel"], force=bool(_force), delay=float(_delay),
+                    http_only=bool(_http_only), fallback=bool(_fallback),
                     owner_prefix=_OWNER)
+            except TypeError:
+                try:
+                    job["rows"] = breach.check_many(
+                        _pairs, workers=int(_workers), progress=_tick,
+                        cancel=job["cancel"], force=bool(_force),
+                        delay=float(_delay), http_only=bool(_http_only),
+                        owner_prefix=_OWNER)
+                except TypeError:
+                    breach.trace("WARN", "run", "check_many has no tier argument")
+                    job["rows"] = breach.check_many(
+                        _pairs, workers=int(_workers), progress=_tick,
+                        cancel=job["cancel"], force=bool(_force),
+                        delay=float(_delay), owner_prefix=_OWNER)
         except Exception as e:
             job["error"] = "%s: %s" % (type(e).__name__, e)
             breach.trace("ERR", "run", "raised %s: %s" % (type(e).__name__, e))
@@ -828,22 +866,24 @@ def _job_start(tier):
 
 
 if _run and _pairs and not _running:
-    _tier = "http-only" if _http_only else "http+browser"
+    _tier = ("key" if breach.key_present() else "keyless") + (
+        "+browser" if _fallback else " (no fallback)")
     breach.trace("CLICK", "run", "pressed: %d address(es), workers=%d, pages=%d, "
-                 "delay=%s, tier=%s"
-                 % (len(_pairs), int(_workers), int(_pages), _delay, _tier))
+                 "delay=%s, tier=%s, key=%s"
+                 % (len(_pairs), int(_workers), int(_pages), _delay, _tier,
+                    breach.key_hint()))
     try:
         breach.configure(pages=int(_pages), delay=float(_delay),
-                         http_only=bool(_http_only),
+                         http_only=bool(_http_only), fallback=bool(_fallback),
                          page_mode=_page_mode, page_on=_page_on)
         breach.trace("INFO", "run", "configure: tier + capture switch accepted")
     except TypeError:
         try:
             breach.configure(pages=int(_pages), delay=float(_delay),
-                             http_only=bool(_http_only))
+                             http_only=bool(_http_only), fallback=bool(_fallback))
         except TypeError:
             breach.configure(pages=int(_pages), delay=float(_delay))
-            breach.trace("WARN", "run", "breach.configure has no http_only argument")
+            breach.trace("WARN", "run", "breach.configure has no tier arguments")
         breach.trace("WARN", "run", "breach.configure has no page_mode argument")
     breach.trace("INFO", "run", "pages: %s%s" % (
         _page_mode, (" (%s)" % ",".join(_page_on)) if _page_on else ""))
@@ -913,8 +953,13 @@ if isinstance(_job, dict):
             if _unread:
                 _tips.append("%d address half(s) are UNREAD, not zero." % _unread)
             if _b["UNKNOWN"]:
-                _tips.append("Re-run the unresolved ones - the tab and its clearance "
-                             "cookie are reused, so the second pass usually passes.")
+                if _fallback:
+                    _tips.append("Re-run the unresolved ones - the tab and its "
+                                 "clearance cookie are reused, so the second pass "
+                                 "usually passes.")
+                else:
+                    _tips.append("Re-run the unresolved ones with the browser "
+                                 "fallback on, or check the key.")
             _lvl = "warning" if (_unread or _b["UNKNOWN"]) else "success"
             st.session_state[_MSG_KEY] = (
                 _lvl, _msg + ((" " + " ".join(_tips)) if _tips else ""))
@@ -926,6 +971,9 @@ if st.session_state.get(_MSG_KEY):
 
 # @@BLOCK 009 DASHBOARD deps=008
 _rows = st.session_state.get(_RES_KEY) or []
+# A 500-address run cannot draw 500 expanders on a phone in one go. The band
+# filter narrows it; this caps what an unfiltered view paints.
+_CARD_MAX = 150
 
 if _rows:
     _b = _band_counts(_rows)
@@ -952,7 +1000,8 @@ if _rows:
     _unread_rows = [r for r in _rows if not r.get("read")]
     if _unread_rows:
         st.caption("\u26a0 **%d of these %d address half(s) were never read.** Their "
-                   "counts are UNREAD, not zero."
+                   "counts are UNREAD, not zero, and a verdict on one of them comes "
+                   "from the password half alone."
                    % (len(_unread_rows), len(_rows)))
     st.bar_chart({"Band": list(_q.get("buckets", {}).keys()),
                   "Count": list(_q.get("buckets", {}).values())},
@@ -981,29 +1030,46 @@ if _rows:
     if not _show:
         st.info("Nothing in that band.")
     else:
-        for r in _show:
+        if len(_show) > _CARD_MAX:
+            st.caption("Showing the first **%d** of **%d**. Use the band filter to "
+                       "narrow it, or the CSV export for the rest."
+                       % (_CARD_MAX, len(_show)))
+        for r in _show[:_CARD_MAX]:
             _v = str(r.get("verdict") or "UNKNOWN")
             _bs = r.get("breaches") or []
             _ps = r.get("pastes") or []
             _read = bool(r.get("read"))
+            # No password supplied -> the ADDRESS is the verdict, so that is what
+            # the header shows. With a password the badge is the combo verdict and
+            # both halves are printed inside.
+            _head_v = _v if r.get("pw_band") != "none" else str(r.get("addr_verdict") or _v)
             _key = _row_key(r)
             with st.expander("%s %s%s" % ("\u26a0" if not _read else "\u2022",
-                                          r.get("email") or "?", "  " + _v),
+                                          r.get("email") or "?", "  " + _head_v),
                              expanded=False):
-                st.markdown('<span class="br-band %s">%s</span> &nbsp; %s'
-                            % (_BAND_CSS.get(_v, "br-unknown"), _v,
-                               r.get("reason") or ""), unsafe_allow_html=True)
+                # ---- BOTH HALVES, so nothing is misread ----
+                _av = str(r.get("addr_verdict") or "UNREAD")
+                _pb = str(r.get("pw_band") or "none")
+                st.markdown(
+                    '<span class="br-band %s">address %s</span> &nbsp; '
+                    '<span class="br-band %s">password %s</span> &nbsp; %s'
+                    % (_BAND_CSS.get(_av, "br-unknown"), _av,
+                       _BAND_CSS.get(_pb, "br-unknown"), _pb,
+                       r.get("reason") or ""), unsafe_allow_html=True)
+                st.caption("Combo verdict **%s** - the worse of the two halves. "
+                           "Address half: **%s**. Password half: **%s**."
+                           % (_v, _av, _pb))
                 if r.get("pw_count") is not None:
                     st.caption("Password appears **%s** time(s) in Pwned Passwords."
                                % "{:,}".format(int(r["pw_count"])))
                 else:
-                    st.caption("Password not supplied - address evidence only.")
+                    st.caption("Password not supplied - the address half IS the "
+                               "verdict.")
                 if r.get("error"):
                     st.caption("error: %s" % r["error"])
                 if not _read:
-                    st.caption("\u26a0 **The address half was not read.** This verdict "
-                               "rests on the password half alone; the counts below are "
-                               "unread, not zero.")
+                    st.caption("\u26a0 **The address half was not read.** The counts "
+                               "below are unread, not zero.")
                 if _bs:
                     st.markdown("**Breaches on this address** - %d" % len(_bs))
                     for b in _bs[:25]:
@@ -1029,9 +1095,6 @@ if _rows:
                     for p in _ps[:10]:
                         st.caption("%s  %s" % (p.get("title") or "?", p.get("date") or ""))
 
-                # ---- the page: image from disk, then text, then HTML ----
-                # The record holds a PATH, not base64: st.image streams the file,
-                # so a 9-record run no longer re-sends megabytes every rerun.
                 _pg_f = str(r.get("page_shot_file") or "")
                 _pg_t = str(r.get("page_text") or "")
                 _pg_h = str(r.get("page_html") or "")
@@ -1206,10 +1269,11 @@ st.markdown("---")
 auth.fit_panel(st)
 
 st.caption("Sources: Pwned Passwords (k-anonymity - only 5 hash characters leave the "
-           "box), the HIBP address search and the free breach list. No API key. Only "
-           "the address is transmitted; a pasted password is never. A CLEAN verdict "
-           "means not in those sources, not that the address was never exposed - and "
-           "an address half that could not be read is flagged UNREAD rather than "
-           "reported as zero.")
+           "box), the HIBP API when a key is set, then the keyless site search, then "
+           "a browser page only if the fallback is on. Only the address is "
+           "transmitted; a pasted password is never. A CLEAN verdict means not in "
+           "those sources, not that the address was never exposed - and an address "
+           "half that could not be read is flagged UNREAD rather than reported as "
+           "zero.")
 # @@END 011 FOOTER
 # @@EOF
