@@ -239,14 +239,13 @@ import streamlit.components.v1 as components
 # and the page ran old code with no page_mode, no trace_read and no 401 handling.
 # page_wanted, trace_read and trace_clear exist only in the current module, so
 # testing those is a real version test and the reload actually happens.
-# record_view, set_owner and _wait_result are the newest markers: a module
-# without set_owner resolves identity from st.session_state on a worker thread
-# and can cross prefixes, a module without record_view builds no page at all when
-# the address tier fails, and a module without _wait_result still blocks 20s on a
-# URL glob and calls every wall a failed render.
+# _await_future and _Slot are the newest markers: a module without them still has
+# one driver thread that runs every scrape in series and a Stop that only stops
+# dispatch.
 if not (hasattr(breach, "page_wanted") and hasattr(breach, "trace_read")
         and hasattr(breach, "trace_clear") and hasattr(breach, "record_view")
-        and hasattr(breach, "set_owner") and hasattr(breach, "RESULT_WAIT")):
+        and hasattr(breach, "set_owner") and hasattr(breach, "RESULT_WAIT")
+        and hasattr(breach, "_await_future") and hasattr(breach, "_Slot")):
     breach = importlib.reload(breach)
     try:
         breach.trace("INFO", "page", "stale breach module replaced by reload")
@@ -279,8 +278,7 @@ _BAND_CSS = {"NEW": "br-new", "PARTIAL": "br-partial", "OLD": "br-old",
 # THE OWNER. One value, resolved once on the script thread where session_state
 # is trustworthy, then PINNED into the module for this thread. Everything below
 # builds from it: the history path, the cache and trace paths, and the tag on
-# every trace event. A worker thread never has to ask st.session_state who it is,
-# which is what used to let a concurrent run write into the other user's prefix.
+# every trace event.
 _OWNER = os.path.basename(user_file("")) or ""
 _pin_owner = getattr(breach, "set_owner", None)
 if callable(_pin_owner):
@@ -300,9 +298,9 @@ def _hist_path():
 def _hist_add(rows):
     """Append reports, then trim the file to _HIST_MAX. Never raises.
 
-    The full-page screenshot is dropped here. It is a base64 data URI of 1-4MB
-    and a hundred of them would make the ledger unreadable and the file useless;
-    the text and HTML views are kept, so the row still describes itself.
+    The full-page screenshot is dropped here: it is a base64 data URI of 1-4MB
+    and a hundred of them would make the ledger unreadable and the file useless.
+    The text and HTML views are kept, so the row still describes itself.
     """
     p = _hist_path()
     if not p:
@@ -362,28 +360,18 @@ def _band_counts(rows):
 
 
 def _row_key(r):
-    """A stable widget-key stem from the address, not from hash().
-
-    hash() is salted per process, so the same address got different keys on every
-    run and the view choice never stuck. The address is unique in a run and
-    survives a re-render, which is what a widget key needs.
-    """
+    """A stable widget-key stem from the address, not from hash()."""
     return (re.sub(r"[^a-z0-9]+", "_", str(r.get("email") or "").lower()).strip("_")
             [:48] or "row")
 
 
 def _h_esc(v):
-    """Escape for the record view's HTML. Never raises on None."""
     return (str(v if v is not None else "").replace("&", "&amp;")
             .replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;"))
 
 
 def _record_page(r):
-    """(text, html) of a record, built here when no page was captured.
-
-    The card must ALWAYS be able to offer a view. When the address tier failed
-    and no screenshot exists either, this is the only artefact left to inspect.
-    """
+    """(text, html) of a record, built here when nothing was captured."""
     _read = bool(r.get("read"))
     _e = str(r.get("email") or "")
     _pw = r.get("pw_count")
@@ -459,12 +447,7 @@ def _record_page(r):
 
 
 def _csv(rows):
-    """CSV, first five columns unchanged so anything downstream still reads.
-
-    `read` is appended LAST: yes means the address half answered (so the counts
-    are real, including a real zero), no means nothing was read and the counts
-    must not be taken as zero.
-    """
+    """CSV, first five columns unchanged. `read` is appended LAST."""
     head = ("verdict,email,breaches,pastes,pw_count,bucket,pw_hits,corpora,"
             "sites,sensitive,newest_breach_days,breach_names,data_classes,"
             "paste_titles,via,reason,error,checked_at,read")
@@ -472,8 +455,6 @@ def _csv(rows):
     for r in rows:
         bs = r.get("breaches") or []
         ps = r.get("pastes") or []
-        # The record key is newest_days - reading newest_breach_days left this
-        # column blank on every row, whatever the run had actually found.
         _newest = r.get("newest_days")
         if _newest is None:
             _newest = r.get("newest_breach_days")
@@ -503,7 +484,6 @@ def _csv(rows):
 
 
 def _watch(key, label):
-    """An on_change callback that traces the control. Never raises."""
     def cb():
         try:
             breach.trace("CLICK", "control", "%s -> %r"
@@ -513,20 +493,20 @@ def _watch(key, label):
     return cb
 
 
-def _trace_code(limit=200, since=0):
-    return breach.trace_text(limit=limit, since=since)
+def _trace_code(limit=200, since=0, skip=None):
+    return breach.trace_text(limit=limit, since=since, skip=skip)
 
 
-def _trace_read(limit=250):
-    """Structured events where the module has them, else a stand-in from text.
-
-    Keeps section 4 working against a module that predates trace_read instead of
-    dying on an AttributeError after a run has already been paid for.
-    """
+def _trace_read(limit=250, skip=None):
     fn = getattr(breach, "trace_read", None)
     if callable(fn):
         try:
-            return list(fn(limit=limit))
+            return list(fn(limit=limit, skip=skip))
+        except TypeError:
+            try:
+                return list(fn(limit=limit))
+            except Exception:
+                return []
         except Exception:
             return []
     try:
@@ -536,7 +516,6 @@ def _trace_read(limit=250):
 
 
 def _hibp_key():
-    """True when HIBP_API_KEY is set. Read here only to say whether it is on."""
     k = os.environ.get("HIBP_API_KEY") or ""
     if not k:
         try:
@@ -598,10 +577,6 @@ st.caption("Only the address is sent to haveibeenpwned.com. A pasted "
            "Passwords hash check, and 5 of its 40 hash characters leave the box.")
 
 # ---- the browser, and its state ------------------------------------------------
-# This is not a rescue any more, it is the address tier: a real Chromium types the
-# address into the site's own search box and reads the rendered page. No key, no
-# quota, no bill. Without the binary there is no address half at all, which is why
-# the install is kicked here and its state is a value on the page.
 _bst = breach.browser_state()
 if _bst.get("state") == "unknown":
     breach.ensure_browser()
@@ -611,7 +586,8 @@ _bst1, _bst2 = st.columns([0.72, 0.28])
 with _bst1:
     if _bst.get("state") == "ready":
         st.caption("\u2705 Browser ready - addresses are typed into the site's search "
-                   "box and the rendered page is read.")
+                   "box and the rendered page is read. Tabs are reused and the "
+                   "clearance cookie is kept, so re-checks are much faster.")
     elif _bst.get("state") == "installing":
         st.caption("\u23f3 Browser installing (%ss). Passwords are checked either way; "
                    "addresses come back UNKNOWN until it finishes."
@@ -634,9 +610,6 @@ with _bst2:
             st.rerun()
 
 # ---- the address tier: the UI, keyless ----------------------------------------
-# No key is needed and none is faked. The page is the API: the address goes into
-# the site's own search box, the result is scraped from what renders, and the page
-# is photographed full length so it can be read even when the scrape finds nothing.
 if breach.key_present():
     st.caption("\U0001f511 HIBP_API_KEY is set - the keyed API is tried first because "
                "it is faster and exact. The browser is still the fallback.")
@@ -645,56 +618,53 @@ else:
                "site's own search box and the rendered page is scraped for the breach "
                "names, dates and classes. Slower than an API call, and free.")
 
-# ---- pages IS the concurrency --------------------------------------------------
-# The Workers slider is gone. It and this number both bounded in-flight addresses,
-# so they contradicted each other: "2 pages" opened two tabs and then still checked
-# two at a time whatever Workers said. One knob now - N pages means N tabs and N
-# addresses at once.
-_c1, _c2, _c3, _c4 = st.columns(4)
+# ---- workers, pages, pacing ----------------------------------------------------
+# WORKERS is how many addresses are in flight. PAGES is how many tabs exist to run
+# them on; each worker takes a tab and keeps it, so a worker count above the page
+# count just queues. They are separate because a worker can be waiting on a
+# challenge without needing a second tab for it.
+_c1, _c2, _c3, _c4, _c5 = st.columns(5)
 with _c1:
-    _pages = st.number_input("Browser pages (at once)", 1, 8, 2, 1,
-                             key="_breach_pages",
-                             on_change=_watch("_breach_pages", "pages"),
-                             help="How many tabs, and therefore how many addresses, "
-                                  "run at the same time. Five addresses on five pages "
-                                  "start together instead of two at a time.")
+    _workers = st.slider("Workers", 1, 8, 3, key="_breach_workers",
+                         on_change=_watch("_breach_workers", "workers"),
+                         help="How many addresses are worked on at the same time. "
+                              "This is the speed control.")
 with _c2:
-    _delay = st.slider("Delay (s)", 0.0, 10.0, 3.0, 0.5, key="_breach_delay",
-                       on_change=_watch("_breach_delay", "delay"),
-                       help="Seconds between STARTING addresses, regardless of the "
-                            "page count. This is the knob for being gentle - 3s "
-                            "trickles, 0 floods.")
+    _pages = st.number_input("Browser pages", 1, 8, 3, 1, key="_breach_pages",
+                             on_change=_watch("_breach_pages", "pages"),
+                             help="How many tabs exist, one per worker slot. Each tab "
+                                  "is reused for every address it handles - a new tab "
+                                  "per check would re-trigger the security check.")
 with _c3:
+    _delay = st.slider("Delay (s)", 0.0, 10.0, 1.0, 0.5, key="_breach_delay",
+                       on_change=_watch("_breach_delay", "delay"),
+                       help="Seconds between STARTING addresses. 1s is fine now that "
+                            "the tabs are reused; raise it if you get walled.")
+with _c4:
     _force = st.checkbox("Ignore cache", value=False, key="_breach_force",
                          on_change=_watch("_breach_force", "ignore cache"),
                          help="A cached answer is served for 6 hours. Tick this to "
-                              "re-check from the sources, which is what you want "
-                              "straight after changing anything.")
-with _c4:
+                              "re-check from the sources.")
+with _c5:
     _http_only = st.checkbox("HTTP only", value=False, key="_breach_http_only",
                              on_change=_watch("_breach_http_only", "http only"),
                              help="No browser. Faster, but a walled address comes "
                                   "back UNKNOWN instead of resolved.")
 
-# Derived, not separate: the pool is resized to this and the workers are this.
-_workers = int(_pages)
-st.caption("**%d** address(es) are checked at the same time, one tab each. The delay "
-           "only paces when a new one starts." % _workers)
+st.caption("**%d** worker(s) on **%d** reused tab(s). Tabs are not closed between "
+           "addresses and the clearance cookie is kept, so only the first check pays "
+           "the security verification." % (int(_workers), int(_pages)))
 
-# ---- page capture, and how much of it ------------------------------------
-# The page read and the search are the SAME visit now, so capture costs almost
-# nothing - the screenshot, the text and the HTML are already in hand. The mode
-# decides which outcomes keep them.
+# ---- page capture ---------------------------------------------------------------
 st.markdown("##### Captured pages")
 _cm1, _cm2 = st.columns([0.58, 0.42])
 with _cm1:
     _mode_label = st.radio(
         "Capture", list(_MODE_LABELS.keys()), horizontal=False, key=_CAP_MODE_KEY,
         on_change=_watch(_CAP_MODE_KEY, "capture mode"),
-        help="The page is what the site actually rendered for an address - titles, "
-             "dates, data classes, or the 'no pwnage' copy. It is kept as a "
-             "full-length image, plus text and HTML, under your own prefix, and can "
-             "be wiped at the bottom of the page.")
+        help="The page is what the site actually rendered - titles, dates, data "
+             "classes, or the 'no pwnage' copy. It is kept as a full-length image, "
+             "plus text and HTML, under your own prefix.")
 _page_mode = _MODE_LABELS.get(_mode_label, "fast")
 with _cm2:
     if _page_mode == "fast":
@@ -736,25 +706,20 @@ with _bc1:
                      disabled=(not _pairs or _running), width="stretch")
 with _bc2:
     _stop = st.button("\u23f9 Stop", width="stretch", disabled=not _running,
-                      help="Asks the workers to stop at the next address. Records "
-                           "already finished are kept.")
+                      help="Cancels the run. Workers stop mid-address and queued "
+                           "addresses are dropped; finished records are kept.")
 
 
 def _job_start(tier):
     """Start the run on a THREAD and hand back its job dict.
 
     The run used to execute inside the script run itself, and Streamlit holds the
-    whole delta stream while a script run blocks: the page greyed out, the bar sat
-    on 0 / 4 until the first address happened to finish, and the widget states
-    were dead for the whole three minutes. The thread owns the work now, the job
-    dict owns the counters, and the script polls it with st.rerun(). Stop works, a
-    refresh or a tab switch does not lose the run, and the bar and the live trace
-    move per address instead of per run.
+    whole delta stream while a script run blocks: the page greyed out and the bar
+    sat on 0 / 4. The thread owns the work, the job dict owns the counters, and
+    the script polls it with st.rerun().
 
-    The thread has no st.session_state, so _OWNER travels WITH the job: it is
-    handed to check_many, which pins it on every worker. Without that the cache
-    and trace paths would fall back to the process-wide context and a concurrent
-    user could collect this run's files.
+    The cancel event travels INTO check_many, so Stop interrupts an address that
+    is already in the browser instead of only skipping the ones not yet started.
     """
     job = {"rows": {}, "done": False, "n": 0, "total": len(_pairs), "last": "",
            "error": "", "cancel": threading.Event(), "started": time.time(),
@@ -795,11 +760,9 @@ def _job_start(tier):
 
 if _run and _pairs and not _running:
     _tier = "http-only" if _http_only else "http+browser"
-    breach.trace("CLICK", "run", "pressed: %d address(es), workers=%d, delay=%s, "
-                 "tier=%s" % (len(_pairs), int(_workers), _delay, _tier))
-    # THE TIER AND THE CAPTURE SWITCH ARE PASSED. Both calls take them; the
-    # fallbacks are only for a breach.py that has not caught up, and they say so
-    # in the trace rather than silently running the old way.
+    breach.trace("CLICK", "run", "pressed: %d address(es), workers=%d, pages=%d, "
+                 "delay=%s, tier=%s"
+                 % (len(_pairs), int(_workers), int(_pages), _delay, _tier))
     try:
         breach.configure(pages=int(_pages), delay=float(_delay),
                          http_only=bool(_http_only),
@@ -823,13 +786,18 @@ if _run and _pairs and not _running:
 if isinstance(_job, dict):
     _total = max(1, int(_job.get("total") or 0))
     _n = int(_job.get("n") or 0)
+    _cancelling = bool(_job.get("cancel") is not None
+                       and _job["cancel"].is_set())
     st.progress(min(1.0, _n / _total),
-                text="%d / %d%s" % (_n, _total,
-                                    (" - " + _job["last"]) if _job.get("last") else ""))
+                text="%d / %d%s%s" % (_n, _total,
+                                      " - stopping" if _cancelling else "",
+                                      (" - " + _job["last"]) if _job.get("last") else ""))
     _live = st.empty()
     try:
-        _live.code(_trace_code(limit=14, since=int(_job.get("since0") or 0)),
-                   language="text")
+        # skip=("page",): the heartbeat fires on every poll rerun and would
+        # otherwise be the only thing in the panel.
+        _live.code(_trace_code(limit=14, since=int(_job.get("since0") or 0),
+                               skip=("page",)), language="text")
     except Exception:
         pass
 
@@ -839,9 +807,9 @@ if isinstance(_job, dict):
                 _job["cancel"].set()
             except Exception:
                 pass
-            breach.trace("CLICK", "run", "stop requested - workers stop at the "
-                                        "next address")
-        time.sleep(0.6)
+            breach.trace("CLICK", "run", "stop requested - workers stop at the next "
+                                        "address")
+        time.sleep(1.0)
         st.rerun()
     else:
         st.session_state.pop(_JOB_KEY, None)
@@ -864,15 +832,12 @@ if isinstance(_job, dict):
             st.session_state[_RUN_KEY] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             _b = _band_counts(_rows)
             _unread = sum(1 for r in _rows if not r.get("read"))
-            # The tier is part of the summary, not a detail: UNKNOWN under HTTP
-            # only means "walled, not tried", and under http+browser it means the
-            # browser could not render it either. Those are different problems.
-            # The unread count is separate again: it is the addresses whose page
-            # nobody read, and their zeros are not zeros.
+            _cancel_n = sum(1 for r in _rows if "cancel" in str(r.get("error") or ""))
             _msg = ("Checked %d via %s. %d old, %d partially new, %d new, %d clean, "
-                    "%d unresolved. %d address half(s) unread. Pages kept: %s."
+                    "%d unresolved. %d address half(s) unread. %d cancelled. "
+                    "Pages kept: %s."
                     % (len(_rows), _tier_used, _b["OLD"], _b["PARTIAL"], _b["NEW"],
-                       _b["CLEAN"], _b["UNKNOWN"], _unread,
+                       _b["CLEAN"], _b["UNKNOWN"], _unread, _cancel_n,
                        ("off" if _mode_used == "off" else
                         ("all" if _mode_used == "full"
                          else (",".join(_on_used) or "none")))))
@@ -881,21 +846,14 @@ if isinstance(_job, dict):
             if _unread:
                 _tips.append("%d address half(s) could not be read - those verdicts "
                              "rest on the password half alone and their breach and "
-                             "paste counts are UNREAD, not zero. The trace names the "
-                             "step that failed." % _unread)
-            _bst_now = breach.browser_state().get("state")
+                             "paste counts are UNREAD, not zero." % _unread)
             if _b["UNKNOWN"] and _http_only:
                 _tips.append("Unresolved ones were walled and HTTP only was selected - "
                              "untick HTTP only so the browser can read them.")
-            elif _b["UNKNOWN"] and _bst_now != "ready":
-                _tips.append("The browser is %s, and the browser IS the address tier - "
-                             "press Prepare browser, then re-run." % _bst_now)
             elif _b["UNKNOWN"]:
-                _tips.append("The browser reached the page but nothing readable came "
-                             "back - open the trace, it names the step that failed.")
-            # A message widget is REQUIRED here. Without one the ledger closes the
-            # press as "NO RESULT | finished without reporting", which is exactly
-            # what the 00:36:57 entry recorded.
+                _tips.append("A wall that will not clear means the security check won "
+                             "the round - re-run; the tab and its clearance cookie are "
+                             "reused, so the second pass usually goes through.")
             _lvl = "warning" if (_unread or _b["UNKNOWN"]) else "success"
             st.session_state[_MSG_KEY] = (
                 _lvl, _msg + ((" " + " ".join(_tips)) if _tips else ""))
@@ -1113,16 +1071,17 @@ if _rows:
 st.markdown("---")
 st.markdown("### 4. Trace")
 st.caption("Everything that happened, newest last: each control moved, each address "
-           "started, the exact URL sent, the status, whether a challenge appeared, "
-           "which tier took over, the band and every error. `%s` carries only the "
-           "address - the password is never in it."
+           "started, the exact URL sent, the status, whether a wall appeared, which "
+           "tier took over, the band and every error. `%s` carries only the address - "
+           "the password is never in it. The page's own `page loaded` heartbeat is "
+           "hidden here."
            % (breach.last_url() or "https://haveibeenpwned.com/unifiedsearch/<address>"))
 
-_tevents = _trace_read(limit=250)
+_tevents = _trace_read(limit=250, skip=("page",))
 if not _tevents:
     st.caption("Nothing traced yet.")
 else:
-    st.code(breach.trace_text(limit=250), language="text")
+    st.code(breach.trace_text(limit=250, skip=("page",)), language="text")
 
 _td1, _td2, _td3 = st.columns(3)
 with _td1:
