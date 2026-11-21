@@ -15,8 +15,8 @@ capture pipeline are gone (Browser pages, Ignore cache, Browser fallback, captur
 mode), and the cache and the history have their own monitor and clear buttons on
 this page and in the app's Resources panel.
 
-PAGES FOLLOW WORKERS  (this pass)
----------------------------------
+PAGES FOLLOW WORKERS
+--------------------
 There is no page-count control and no fixed number. If Workers is N the run keeps
 at most N pages, one per worker slot, and REUSES them: a slot serves item after
 item, blanked and with its cookies dropped between them, and it is only rebuilt
@@ -25,12 +25,19 @@ launched once per worker for the whole batch, so 500 items cost N browsers, not
 500. Recycling is local, so a stuck or challenged page can never lose a record
 that is already written and can never hold the queue.
 
-THE DRAW IS RANDOM  (this pass)
--------------------------------
+THE DRAW IS RANDOM
+------------------
 Each attempt draws a RANDOM node from the whole pool, never one already tried for
 that item, and skips a node that has failed twice. `Random proxy per attempt`
 turns that off and walks the tier order instead. DIRECT is the last attempt in
 both modes, never the first.
+
+HTML IS WRITTEN AS \x3c ESCAPES
+------------------------------
+Every angle bracket in a string literal is \x3c / \x3e and every entity is built
+from chr(38). A paste that strips tags out of literals leaves both forms alone,
+so the page view and the hero survive a paste that would otherwise turn a raw tag
+into a bare newline.
 
 WHAT EACH INPUT LINE IS
 -----------------------
@@ -137,8 +144,39 @@ _TH = _theme()
 # @@END 003 THEME
 
 # @@BLOCK 004 CSS deps=003
+# The tags are \x3c / \x3e so a tag-stripping paste cannot empty the sheet.
 _CSS_TMPL = """
-
+\x3cstyle\x3e
+    .br-hero {
+        background: linear-gradient(135deg, __G1__ 0%, __G2__ 100%);
+        padding: 18px 24px; border-radius: 14px; margin-bottom: 14px;
+        border: 1px solid rgba(255,255,255,.12);
+    }
+    .br-hero h1 { color: #fff !important; margin: 0; font-size: 1.45rem;
+                  font-weight: 800; }
+    .br-hero p { color: rgba(255,255,255,.93) !important; margin: 6px 0 0 0;
+                 font-size: .84rem; }
+    .br-band { display:inline-block; padding:2px 9px; border-radius:999px;
+               font-size:.7rem; font-weight:800; letter-spacing:.03em; }
+    .br-new      { background:#22c55e33; color:#86efac; border:1px solid #22c55e66; }
+    .br-partial  { background:#f59e0b33; color:#fcd34d; border:1px solid #f59e0b66; }
+    .br-old      { background:#ef444433; color:#fca5a5; border:1px solid #ef444466; }
+    .br-clean    { background:#64748b33; color:#cbd5e1; border:1px solid #64748b66; }
+    .br-unknown  { background:#a78bfa33; color:#ddd6fe; border:1px solid #a78bfa66; }
+    .br-mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+               font-size: .8rem; word-break: break-all; }
+    .block-container, [data-testid="stMainBlockContainer"] {
+        padding-top: 1.2rem !important; padding-bottom: 2rem !important;
+        max-width: 1100px !important;
+    }
+    @media (max-width: 820px) {
+        .block-container, [data-testid="stMainBlockContainer"] {
+            padding-top: .55rem !important; padding-left: .7rem !important;
+            padding-right: .7rem !important;
+        }
+        .br-hero h1 { font-size: 1.15rem !important; }
+    }
+\x3c/style\x3e
 """
 
 
@@ -152,15 +190,11 @@ st.markdown(_css(), unsafe_allow_html=True)
 
 # @@BLOCK 005 HERO_GATE deps=004
 st.markdown(
-    '
-\U0001f6e1 Breach Exposure
-'
-    '
-Point this at a list of combos, addresses or passwords. The address half is '
-    'read by a real browser through your own proxy pool; the password half is a local '
-    'SHA-1 and a k-anonymity lookup. The verdict is about how RECENT the exposure is.'
-    '
-',
+    "\x3cdiv class='br-hero'\x3e\x3ch1\x3e\U0001f6e1 Breach Exposure\x3c/h1\x3e"
+    "\x3cp\x3ePoint this at a list of combos, addresses or passwords. The address "
+    "half is read by a real browser through your own proxy pool; the password half "
+    "is a local SHA-1 and a k-anonymity lookup. The verdict is about how RECENT the "
+    "exposure is.\x3c/p\x3e\x3c/div\x3e",
     unsafe_allow_html=True)
 
 import auth
@@ -227,6 +261,11 @@ _TRACE_SHOWN = "_breach_trace_shown"
 
 _BAND_CSS = {"NEW": "br-new", "PARTIAL": "br-partial", "OLD": "br-old",
              "CLEAN": "br-clean", "UNKNOWN": "br-unknown"}
+
+_AMP = chr(38) + "amp;"
+_LT = chr(38) + "lt;"
+_GT = chr(38) + "gt;"
+_QUOT = chr(38) + "quot;"
 
 _OWNER = os.path.basename(user_file("")) or ""
 _pin_owner = getattr(breach, "set_owner", None)
@@ -391,8 +430,8 @@ def _row_key(r):
 
 
 def _h_esc(v):
-    return (str(v if v is not None else "").replace("&", "&")
-            .replace("<", "<").replace(">", ">").replace('"', """))
+    return (str(v if v is not None else "").replace(chr(38), _AMP)
+            .replace(chr(60), _LT).replace(chr(62), _GT).replace(chr(34), _QUOT))
 
 
 def _label(r):
@@ -413,9 +452,8 @@ def _record_page(r):
             pass
     _text = ("kind: %s\naddress: %s\nverdict: %s\n"
              % (r.get("kind") or "?", _label(r), r.get("verdict") or "?"))
-    return _text, ("
-" + _h_esc(_text) + "
-")
+    return _text, ("\x3chtml\x3e\x3cbody\x3e\x3cpre\x3e" + _h_esc(_text)
+                   + "\x3c/pre\x3e\x3c/body\x3e\x3c/html\x3e")
 
 
 def _csv(rows):
@@ -558,8 +596,8 @@ if _bst.get("state") == "unknown":
 _bst1, _bst2 = st.columns([0.72, 0.28])
 with _bst1:
     if _bst.get("state") == "ready":
-        st.caption("\u2705 Browser ready - the address half is a real page, through your "
-                   "proxy pool. One page per worker, reused for the whole run.")
+        st.caption("\u2705 Browser ready - the address half is a real page, through "
+                   "your proxy pool. One page per worker, reused for the whole run.")
     elif _bst.get("state") == "installing":
         st.caption("\u23f3 Browser installing (%ss). Passwords work either way; "
                    "addresses come back UNREAD until it finishes."
@@ -583,13 +621,13 @@ with _bst2:
 # ---- the proxy pool the address half will use ----------------------------------
 _pstat = breach.pool_status()
 if _pstat["count"]:
-    st.caption("\U0001f310 **%d** proxy node(s) loaded from your own pool - probed nodes "
-               "first, DIRECT as the last attempt. Sample: `%s`"
+    st.caption("\U0001f310 **%d** proxy node(s) loaded from your own pool - probed "
+               "nodes first, DIRECT as the last attempt. Sample: `%s`"
                % (_pstat["count"], ", ".join(p.rsplit("@", 1)[-1]
                                              for p in _pstat["sample"])))
 else:
-    st.warning("\U0001f310 **Your proxy pool is empty.** The address half will try DIRECT "
-               "only. Fetch a pool on the checker page first, or import a list.")
+    st.warning("\U0001f310 **Your proxy pool is empty.** The address half will try "
+               "DIRECT only. Fetch a pool on the checker page first, or import a list.")
 
 # ---- workers, pacing, the draw -------------------------------------------------
 _c1, _c2, _c3 = st.columns(3)
@@ -613,9 +651,9 @@ with _c3:
                                "OFF: walk the probed order instead, same spread, "
                                "easier to read in the trace.")
 
-st.caption("**%d** worker(s), so at most **%d** page(s), each reused and reset between "
-           "items and recycled after a challenge. **%d** proxy node(s), drawn at random "
-           "per attempt with DIRECT as the last attempt."
+st.caption("**%d** worker(s), so at most **%d** page(s), each reused and reset "
+           "between items and recycled after a challenge. **%d** proxy node(s), drawn "
+           "at random per attempt with DIRECT as the last attempt."
            % (int(_workers), int(_workers), _pstat["count"]))
 
 # ---- cache and history, monitored and clearable --------------------------------
@@ -769,7 +807,8 @@ if isinstance(_job, dict):
             st.session_state[_RUN_KEY] = _stamp
             _state_save(_rows, _quality, _stamp)
             _b = _band_counts(_rows)
-            _unread = sum(1 for r in _rows if not r.get("read") and r.get("kind") != "password")
+            _unread = sum(1 for r in _rows
+                          if not r.get("read") and r.get("kind") != "password")
             _cancel_n = sum(1 for r in _rows if "cancel" in str(r.get("error") or ""))
             _msg = ("Checked %d. %d old, %d partially new, %d new, %d clean, "
                     "%d unresolved. %d unread. %d cancelled."
@@ -780,8 +819,8 @@ if isinstance(_job, dict):
             if _unread:
                 _tips.append("%d address half(s) are UNREAD, not zero." % _unread)
             if _b["UNKNOWN"]:
-                _tips.append("Re-run the unresolved ones - a fresh random proxy is drawn "
-                             "for each attempt, so a second pass usually lands.")
+                _tips.append("Re-run the unresolved ones - a fresh random proxy is "
+                             "drawn for each attempt, so a second pass usually lands.")
             _lvl = "warning" if (_unread or _b["UNKNOWN"]) else "success"
             st.session_state[_MSG_KEY] = (
                 _lvl, _msg + ((" " + " ".join(_tips)) if _tips else ""))
@@ -818,7 +857,8 @@ if _rows:
         % (_q.get("pct", {}).get("OLD", 0), _q.get("pct", {}).get("PARTIAL", 0),
            _q.get("pct", {}).get("NEW", 0), _q.get("pct", {}).get("UNKNOWN", 0)))
 
-    _unread_rows = [r for r in _rows if not r.get("read") and r.get("kind") != "password"]
+    _unread_rows = [r for r in _rows
+                    if not r.get("read") and r.get("kind") != "password"]
     if _unread_rows:
         st.caption("\u26a0 **%d of these address half(s) were never read.** Their "
                    "counts are UNREAD, not zero, and a verdict on one of them comes "
@@ -869,8 +909,8 @@ if _rows:
                 _av = str(r.get("addr_verdict") or "UNREAD")
                 _pb = str(r.get("pw_band") or "none")
                 st.markdown(
-                    'address %s   '
-                    'password %s   %s'
+                    "\x3cspan class='br-band %s'\x3eaddress %s\x3c/span\x3e\u00a0 "
+                    "\x3cspan class='br-band %s'\x3epassword %s\x3c/span\x3e\u00a0 %s"
                     % (_BAND_CSS.get(_av, "br-unknown"), _av,
                        _BAND_CSS.get(_pb, "br-unknown"), _pb,
                        _h_esc(r.get("reason") or "")), unsafe_allow_html=True)
@@ -931,10 +971,8 @@ if _rows:
                         key="_pvt_%s" % _key)
                 else:
                     import streamlit.components.v1 as components
-                    components.html(_pg_h or "
-(empty page)
-", height=520,
-                                    scrolling=True)
+                    components.html(_pg_h or "\x3cp\x3e(empty page)\x3c/p\x3e",
+                                    height=520, scrolling=True)
                     st.download_button(
                         "\u2b07 Download this page as HTML",
                         data=_pg_h.encode("utf-8"),
@@ -979,8 +1017,8 @@ st.caption("Everything that happened, newest last: each control moved, each item
            "started, the node drawn, the status, whether a challenge appeared, the "
            "band and every error. `%s` carries only the address - the password is "
            "never in it."
-           % (breach.last_url() or "https://haveibeenpwned.com/unifiedsearch/
-"))
+           % (breach.last_url()
+              or "https://haveibeenpwned.com/unifiedsearch/\x3caddress\x3e"))
 
 _tevents = _trace_read(limit=250, skip=("page",))
 if not _tevents:
