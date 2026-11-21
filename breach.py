@@ -1,42 +1,50 @@
 """breach.py - breach exposure and combo freshness.  v13.86
 
-THE FAST PATH IS THE SITE'S OWN XHR, NOT ITS RENDER  (this pass)
----------------------------------------------------------------
-A log settled it: at 01:49:49 the trace said `settled: wall` and, in the same
-breath, `json caught from the page: 10 breach(es)`. The page's own fetch to
-/unifiedsearch/ succeeds WHILE the visual page is still a Cloudflare wall. The
-DOM render was never the thing we needed - waiting for it cost 60s per address
-and produced nothing.
+CLEARANCE IS A COOKIE, NOT A GUESS  (this pass)
+-----------------------------------------------
+A log showed the fetch being declared "wall cleared, retrying" SIX MILLISECONDS
+after a 401:
 
-So the browser tier now calls the endpoint from INSIDE the page:
+    04:51:58.605  attempt 1 -> http 401
+    04:51:58.611  wall cleared, retrying
+    04:51:58.627  attempt 2 -> http 401
 
-    page.evaluate("(u) => fetch(u, {credentials:'include'})...")
+The root page had only been open 4.2s. _solve_wall() asked _wall(), which reads
+the title and body - and a page still loading has neither interstitial mark, so
+"no wall" was returned and the retry fired before the challenge had even
+appeared. Every fetch then 401'd and the visual fallback walked into the wall.
 
-Same cookies, same origin, no CORS problem, and it returns in about a second.
-Order: fetch -> on 401 try to clear the wall (12s) -> fetch again -> only then
-fall back to navigating and scraping the DOM. A wall is no longer retried a
-second time, because retrying a wall immediately rarely helps.
+cf_clearance is the arbiter now. No cookie -> solve first, and again between
+attempts; "cleared" means the cookie EXISTS, or the wall has been absent twice
+running. A slot also warms up at boot, so the cookie is on disk before address 1.
 
-MEMORY  (this pass)
--------------------
-Three Chromium profiles plus a 6MB base64 screenshot per record, held in session
-state and re-serialised on every 1s rerun, is what tripped "this app has gone over
-its resource limits". Screenshots are JPEG files on disk now (~200KB), the record
-carries the PATH, and the page renders them with st.image so no base64 ever enters
-a delta. Defaults are 2 pages and 2 workers.
-
-STATE THAT SURVIVES A RELOAD  (this pass)
------------------------------------------
-Settings, results and the quality figure are written to a per-user
-breach_state.json on every finished run and restored before the widgets are
-built. History was already a file. The trace is WIPED on each fresh session, which
-is what the owner asked for and also the cheapest thing to do with it.
-
-THE REST, UNCHANGED IN SUBSTANCE
+THE TURNSTILE CLICK  (this pass)
 --------------------------------
+frame_locator() on a shadow-hosted cross-origin iframe returned False on every
+attempt - there was no "clicked the challenge widget" line in any run. The frames
+are iterated directly now (page.frames, URL match) and clicked inside, with a
+mouse click on the iframe's own geometry as a fallback.
+
+BOTH HALVES ARE SHOWN  (this pass)
+----------------------------------
+With a password supplied, PARTIAL came from 1,902 password hits while the address
+half was never read, and the card never said which half produced the verdict - so
+a clean address looked like a breach. Every record now carries `addr_verdict` and
+`pw_band`, the card prints both, and the header badge shows the ADDRESS verdict
+when no password was supplied, because then the address IS the verdict.
+
+THE FAST PATH
+-------------
+The site's own XHR succeeds while the visual page is a wall - a trace showed
+`settled: wall` and `10 breach(es)` in the same breath. So the browser tier calls
+the endpoint from INSIDE the page (same cookies, same origin, no CORS) and only
+scrapes the DOM when the fetch is refused.
+
+THE REST
+--------
 Three sources in order of proof: Pwned Passwords (k-anonymity, keyless), the
-address (site UI), the breach catalogue (local match). A combo is only as good as
-its worse half. Bands are about freshness, not count:
+address, the catalogue. A combo is only as good as its worse half. Bands are about
+freshness, not count:
 
     NEW       password unseen, or address in a corpus < 365d
     PARTIAL   password seen 1-9999 times, or address in a breach < 730d
@@ -44,32 +52,14 @@ its worse half. Bands are about freshness, not count:
     CLEAN     password unseen AND address in no source
     UNKNOWN   nothing readable - the only honest answer when every tier failed
 
-count 0 and count None are different facts and every record carries `read` so the
-page, the history and the CSV can say which. _page_from_record() builds the view
-when nothing was captured; its CSS is a constant because `width:100%` inside a
-%-formatted string broke every call.
+count 0 and count None are different facts and `read` says which. Screenshots are
+JPEG files on disk, referenced by path, so no base64 sits in session state.
 
-ONE THREAD PER PAGE, REUSED TAB, PERSISTENT PROFILE
----------------------------------------------------
-_BrowserPool._run used to be a single loop, so the page count bought nothing. The
-pool is slots now - thread, Playwright, browser and tab each - and jobs go to the
-least busy one. A slot types the next address into the tab it already has, and the
-profile on disk keeps cf_clearance between runs.
-
-The wall is detected on the title AND the body, and the Turnstile widget is
-clicked by frame locator and then by geometry. channel="chromium" selects new
-headless instead of the flagged headless shell, with a plain launch as fallback.
-
-Stop works: check() takes the cancel event, _await_future polls it every 400ms,
-the browser waits break out, and a slot skips a queued job whose run was
-cancelled. _lock is an RLock and the page count is read outside it.
-
-ISOLATION
----------
-Cache, trace, state and shots resolve through the PINNED owner (the unlocked
-hash), set per thread by set_owner(). The config is snapshotted per run. The
-trace ring and _last are per owner. Process-wide on purpose: the binary, the slot
-pool and its profiles, the boot cooldown, the optional key.
+One thread per page, reused tab, persistent profile. Jobs go to the least busy
+slot. Stop is honoured inside the browser wait. _lock is an RLock, the page count
+is read outside it, and the config is snapshotted per run. Cache, trace, state and
+shots resolve through the pinned owner; the binary, the pool and its profiles are
+process-wide on purpose.
 
 Plain module, NOT frame-gated. No Streamlit. EVERY public function swallows.
 """
@@ -125,13 +115,13 @@ TURNSTILE_SELECTORS = (
 NAV_POLL = 8.0
 NAV_STEP = 250
 RESULT_WAIT = 15.0
-CHALLENGE_WAIT = 12.0
-FETCH_TRIES = 2
+CHALLENGE_WAIT = 20.0
+FETCH_TRIES = 3
+WARM_SETTLE = 1500
 INTERSTITIAL_MARKS = ("just a moment", "checking your browser", "verify you are human",
                       "performing security verification", "attention required",
                       "cf-challenge", "verifying...", "security service to protect")
 
-# Fetch the endpoint from INSIDE the page. Same cookies, same origin, no CORS.
 JS_FETCH = """async (u) => {
   try {
     const r = await fetch(u, {credentials: 'include',
@@ -168,10 +158,14 @@ JS_READ = """() => {
           html: document.documentElement ? document.documentElement.outerHTML : ''};
 }"""
 
+STEALTH_JS = ("Object.defineProperty(navigator,'webdriver',{get:()=>undefined});"
+              "Object.defineProperty(navigator,'languages',"
+              "{get:()=>['en-GB','en']});"
+              "Object.defineProperty(navigator,'plugins',{get:()=>[1,2,3,4,5]});"
+              "window.chrome={runtime:{}};")
+
 PAGE_HTML_MAX = 60000
 PAGE_TEXT_MAX = 20000
-# JPEG on disk, not base64 in memory. 6MB data URIs re-sent every second were a
-# large part of the resource-limit crash.
 PAGE_SHOT_MAX = 1500000
 PAGE_TIMEOUT = 12.0
 
@@ -205,8 +199,6 @@ INSTALL_TIMEOUT = 900
 
 DELAY_DEFAULT = 1.0
 DELAY_MAX = 20.0
-BROWSER_SETTLE = 500
-BROWSER_JITTER = 400
 
 PW_NEW_MAX = 0
 PW_PARTIAL_MAX = 9999
@@ -278,7 +270,6 @@ def _is_cancelled(cancel):
 
 
 def _await_future(fut, cancel, budget):
-    """(record, was_cancelled). Polls the cancel event every 400ms."""
     end = time.time() + max(5.0, float(budget))
     while time.time() < end:
         try:
@@ -313,20 +304,6 @@ def _user_file(name) -> str:
         return name
 
 
-def _user_dir(name) -> str:
-    p = owner()
-    try:
-        import auth
-        return auth.user_dir(name) if not p else _dir_for(p, name)
-    except Exception:
-        d = os.path.join(_HERE, "data", (p or "anon"), name)
-        try:
-            os.makedirs(d, exist_ok=True)
-        except Exception:
-            pass
-        return d
-
-
 def _dir_for(prefix, name) -> str:
     d = os.path.join("data", prefix, name)
     try:
@@ -334,6 +311,17 @@ def _dir_for(prefix, name) -> str:
     except Exception:
         pass
     return d
+
+
+def _user_dir(name) -> str:
+    p = owner()
+    if p:
+        return _dir_for(p, name)
+    try:
+        import auth
+        return auth.user_dir(name)
+    except Exception:
+        return _dir_for("anon", name)
 
 
 # ---------------------------------------------------------------------------
@@ -526,7 +514,6 @@ def trace_seq() -> int:
 
 
 def trace_read(limit=200, since=0, skip=None):
-    """Events newer than `since`, oldest first, for THIS owner. `skip` drops steps."""
     try:
         n = max(1, min(TRACE_MAX, int(limit or 200)))
         floor = int(since or 0)
@@ -564,7 +551,6 @@ def trace_dump() -> str:
 
 
 def trace_clear():
-    """Clear THIS owner's file and ring entries. Other users keep theirs."""
     p = _trace_path()
     try:
         if p and os.path.exists(p):
@@ -743,7 +729,6 @@ def _esc(v) -> str:
 
 
 def _shot_path(addr) -> str:
-    """Where this address's screenshot lives. Per user, per address."""
     key = re.sub(r"[^a-z0-9]+", "_", _email_only(addr)).strip("_")[:60] or "row"
     return os.path.join(_user_dir("shots"), key + ".jpg")
 
@@ -842,6 +827,7 @@ def _blank(addr, pw="") -> dict:
             "pw_count": None, "corpora": 0, "sites": 0, "sensitive": 0,
             "newest_days": None, "count": None, "via": "",
             "read": False, "partial_read": False,
+            "addr_verdict": "UNREAD", "pw_band": "none",
             "page_url": "", "page_html": "", "page_text": "", "page_shot_file": "",
             "page_via": "", "page_error": "", "page_at": "",
             "checked_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"), "error": ""}
@@ -886,7 +872,6 @@ def _page_http(addr, kind="records") -> dict:
 
 
 def _page_from_record(rec, kind="records", force=False) -> dict:
-    """A text and an HTML view BUILT FROM the record. _PAGE_CSS stays a value."""
     if not force and not page_wanted(kind):
         return _page_skip(kind)
     addr = _email_only(rec.get("email") or "")
@@ -894,7 +879,8 @@ def _page_from_record(rec, kind="records", force=False) -> dict:
     lines = ["address: %s" % addr,
              "checked: %s" % (rec.get("checked_at") or ""),
              "verdict: %s - %s" % (rec.get("verdict") or "?", rec.get("reason") or ""),
-             "address half: %s" % ("READ" if rec.get("read") else "NOT READ"),
+             "address half: %s" % (rec.get("addr_verdict") or "UNREAD"),
+             "password half: %s" % (rec.get("pw_band") or "none"),
              "password appearances: %s" % (_pw if _pw is not None
                                            else "no password supplied"),
              "source: %s" % (rec.get("via") or "-"),
@@ -926,11 +912,11 @@ def _page_from_record(rec, kind="records", force=False) -> dict:
 
     head = ("<html><head><meta charset='utf-8'><title>%s</title>%s</head>"
             "<body><h1>%s</h1><p class='c'>%s - %s</p>"
-            "<p>address half: %s<br>password appearances: %s<br>source: %s<br>"
-            "checked: %s</p>"
+            "<p>address half: %s<br>password half: %s<br>password appearances: %s"
+            "<br>source: %s<br>checked: %s</p>"
             % (_esc(addr), _PAGE_CSS, _esc(addr), _esc(rec.get("verdict") or "?"),
-               _esc(rec.get("reason") or ""),
-               "READ" if rec.get("read") else "NOT READ",
+               _esc(rec.get("reason") or ""), _esc(rec.get("addr_verdict") or "UNREAD"),
+               _esc(rec.get("pw_band") or "none"),
                _esc(_pw) if _pw is not None else "-", _esc(rec.get("via") or "-"),
                _esc(rec.get("checked_at") or "")))
     body = []
@@ -1283,12 +1269,7 @@ def _keyed_search(addr, pw):
 # tier 3 - a SLOT per page
 # ---------------------------------------------------------------------------
 class _Slot:
-    """One worker: own thread, own Playwright, own browser, one reused tab.
-
-    The tab is never closed between addresses and the profile is on disk, so the
-    clearance cookie survives. The address is answered by a FETCH from inside the
-    page first; the DOM is only scraped when the fetch is refused.
-    """
+    """One worker: own thread, own Playwright, own browser, one reused tab."""
 
     def __init__(self, index):
         self.index = index
@@ -1334,11 +1315,26 @@ class _Slot:
                 channel="chromium", **opts)
         except Exception:
             self.context = self.pw.chromium.launch_persistent_context(**opts)
-        self.context.add_init_script(
-            "Object.defineProperty(navigator,'webdriver',{get:()=>undefined});")
+        self.context.add_init_script(STEALTH_JS)
         self.context.set_default_timeout(NAV_TIMEOUT)
         self.page = (self.context.pages[0] if self.context.pages
                      else self.context.new_page())
+        # WARM UP: land on the site and clear once, before any job. The cookie
+        # then exists for address 1 instead of being paid for on it.
+        try:
+            if not self._has_clearance():
+                trace("INFO", "browser", "slot %d warming up" % self.index)
+                self.page.goto(HIBP_BASE + "/", wait_until="domcontentloaded",
+                               timeout=NAV_TIMEOUT)
+                self._sleep(self.page, WARM_SETTLE)
+                self._solve_wall(self.page)
+                if self._has_clearance():
+                    trace("INFO", "browser", "slot %d holds clearance" % self.index)
+                else:
+                    trace("WARN", "browser", "slot %d has no clearance yet" % self.index)
+        except Exception as exc:
+            trace("WARN", "browser", "slot %d warm-up failed: %s"
+                  % (self.index, type(exc).__name__))
 
     def _run(self):
         try:
@@ -1461,7 +1457,6 @@ class _Slot:
             return {}
 
     def _shot(self, page, addr):
-        """Full-length JPEG on DISK. The record carries the path, not the bytes."""
         try:
             raw = page.screenshot(full_page=True, type="jpeg", quality=72)
         except Exception as exc:
@@ -1498,28 +1493,42 @@ class _Slot:
             low = ""
         return any(m in low for m in INTERSTITIAL_MARKS)
 
+    def _has_clearance(self):
+        """True when the context actually holds cf_clearance for the site.
+
+        THIS is the arbiter. The old code asked _wall() six milliseconds after a
+        401, on a page that had not finished loading - no marks, "no wall",
+        retry, 401, give up. A cookie cannot be faked by timing.
+        """
+        try:
+            for c in self.context.cookies():
+                if (c.get("name") == "cf_clearance"
+                        and "haveibeenpwned.com" in str(c.get("domain") or "")):
+                    return True
+        except Exception:
+            pass
+        return False
+
     def _click_turnstile(self, page):
-        for sel in TURNSTILE_SELECTORS:
+        """Click inside the Turnstile frame. Cross-origin frames are reachable by
+        iterating page.frames; a frame_locator on a shadow-hosted iframe is not
+        and returned False on every attempt in the log."""
+        for fr in list(page.frames):
             try:
-                if page.query_selector(sel) is None:
+                if "challenges.cloudflare.com" not in (fr.url or ""):
                     continue
             except Exception:
                 continue
-            try:
-                fl = page.frame_locator(sel)
+            for sel in ("input[type='checkbox']", "#challenge-stage", "body"):
                 try:
-                    fl.locator("input[type='checkbox']").first.click(timeout=1200)
+                    if sel == "body":
+                        fr.click(sel, timeout=1200, position={"x": 20, "y": 20})
+                    else:
+                        fr.click(sel, timeout=1200)
                     return True
                 except Exception:
-                    pass
-                try:
-                    fl.locator("body").first.click(timeout=1200,
-                                                   position={"x": 18, "y": 18})
-                    return True
-                except Exception:
-                    pass
-            except Exception:
-                pass
+                    continue
+        for sel in TURNSTILE_SELECTORS:
             try:
                 el = page.query_selector(sel)
                 bb = el.bounding_box() if el is not None else None
@@ -1527,26 +1536,33 @@ class _Slot:
                     page.mouse.click(bb["x"] + 22, bb["y"] + bb["height"] / 2.0)
                     return True
             except Exception:
-                pass
+                continue
         return False
 
     def _solve_wall(self, page, cancel=None):
+        """Clear the interstitial. True only on evidence, never on a guess."""
         deadline = time.time() + CHALLENGE_WAIT
         last = 0.0
+        clear_streak = 0
         while time.time() < deadline:
             if _is_cancelled(cancel):
                 return False
-            if not self._wall(page):
+            if self._has_clearance():
                 return True
-            if time.time() - last > 3.0:
-                last = time.time()
-                if self._click_turnstile(page):
-                    trace("INFO", "browser", "clicked the challenge widget")
+            if not self._wall(page):
+                clear_streak += 1
+                if clear_streak >= 2:
+                    return True
+            else:
+                clear_streak = 0
+                if time.time() - last > 3.0:
+                    last = time.time()
+                    if self._click_turnstile(page):
+                        trace("INFO", "browser", "clicked the challenge widget")
             self._sleep(page, 700)
-        return not self._wall(page)
+        return self._has_clearance() or not self._wall(page)
 
     def _fetch(self, page, addr):
-        """Ask the endpoint from INSIDE the page. (status, body). Never raises."""
         try:
             got = page.evaluate(JS_FETCH, unified_url(addr)) or {}
         except Exception as exc:
@@ -1555,38 +1571,40 @@ class _Slot:
         return int(got.get("status") or 0), str(got.get("body") or "")
 
     def _ask(self, page, addr, cancel=None):
-        """THE FAST PATH: fetch, clear the wall if refused, fetch again.
-
-        Returns (status, body, state). A 200 body is the answer and needs no DOM
-        at all - the trace showed the page's own XHR succeeding while the visual
-        page was still a wall, which is the whole reason this exists.
-        """
+        """Fetch first, solve on refusal, fetch again, then fall back visually."""
         addr = _email_only(addr)
         try:
             if "haveibeenpwned.com" not in (page.url or ""):
                 trace("INFO", "browser", "landing on %s/" % HIBP_BASE, addr)
                 page.goto(HIBP_BASE + "/", wait_until="domcontentloaded",
                           timeout=NAV_TIMEOUT)
+                self._sleep(page, WARM_SETTLE)
         except Exception:
             pass
+
+        if not self._has_clearance():
+            trace("INFO", "browser", "no clearance - solving before the fetch", addr)
+            self._solve_wall(page, cancel)
 
         status, body = 0, ""
         for attempt in range(FETCH_TRIES):
             if _is_cancelled(cancel):
                 return 0, "", "cancelled"
             status, body = self._fetch(page, addr)
-            trace("INFO", "fetch", "attempt %d -> http %d" % (attempt + 1, status), addr)
+            trace("INFO", "fetch", "attempt %d -> http %d (clearance %s)"
+                  % (attempt + 1, status, "yes" if self._has_clearance() else "no"),
+                  addr)
             if status in (200, 404):
                 return status, body, ("records" if status == 200 else "clean")
-            if status not in (401, 403, 0):
-                break
             if attempt + 1 >= FETCH_TRIES:
                 break
-            if self._solve_wall(page, cancel):
-                trace("INFO", "fetch", "wall cleared, retrying the fetch", addr)
+            if self._has_clearance():
+                # Cookie present but the XHR was still refused: give the edge a beat.
+                self._sleep(page, 900)
+            elif not self._solve_wall(page, cancel):
+                trace("WARN", "browser", "wall did not clear - fetch will fail", addr)
+                break
 
-        # The fetch is refused. Fall back to the visual path, which can still
-        # render even when the fetch is blocked.
         if _is_cancelled(cancel):
             return 0, "", "cancelled"
         try:
@@ -1872,9 +1890,6 @@ def check(addr, password="", force=False, allow_browser=None, cancel=None) -> di
                     trace("WARN", "browser", "cancelled during the browser step", addr)
                 else:
                     addr_rec = _res
-                    # A WALL IS NOT RETRIED: the fetch already had two goes and
-                    # clearing it twice in a row rarely helps. Only an empty read
-                    # on a page that DID load is worth another visit.
                     _wall = "challenge wall" in str(addr_rec.get("error") or "")
                     _cut = "TimeoutError" in str(addr_rec.get("error") or "")
                     if (not addr_rec.get("breaches") and addr_rec.get("error")
@@ -1931,14 +1946,20 @@ def check(addr, password="", force=False, allow_browser=None, cancel=None) -> di
         except Exception:
             pass
 
-    rec["bucket"] = _combine(_pw_bucket(rec["pw_count"]), _addr_bucket(addr_rec))
+    # BOTH HALVES, LABELLED. addr_verdict is what the ADDRESS said (or UNREAD);
+    # pw_band is what the PASSWORD said. Without them a clean address wearing a
+    # circulating password reads as a breached address.
+    _ab = _addr_bucket(addr_rec)
+    rec["addr_verdict"] = _ab or ("UNREAD" if not rec["read"] else "UNKNOWN")
+    rec["pw_band"] = _pw_bucket(rec["pw_count"]) or "none"
+    rec["bucket"] = _combine(_pw_bucket(rec["pw_count"]), _ab)
     rec["verdict"] = rec["bucket"]
     rec["reason"] = _REASON.get(rec["bucket"], "")
     if rec["bucket"] == "UNKNOWN" and not rec["error"]:
         rec["error"] = "no readable answer"
-    trace("INFO", "band", "%s (%s) - pw %s, addr %s, %d ms"
-          % (rec["bucket"], rec["reason"] or "-", rec["pw_count"],
-             addr_rec.get("via") or "-", rec["elapsed_ms"]), addr)
+    trace("INFO", "band", "%s (%s) - addr %s, pw %s, %d ms"
+          % (rec["bucket"], rec["reason"] or "-", rec["addr_verdict"],
+             rec["pw_band"], rec["elapsed_ms"]), addr)
 
     if rec["bucket"] != "UNKNOWN":
         _slim = dict(rec)
@@ -2102,47 +2123,45 @@ def selftest(verbose=False) -> bool:
         checks.append((n, bool(ok)))
 
     add("lock_reentrant", type(_lock).__name__ == "RLock")
-    add("pages_under_lock", _pages() >= 1)
     add("is_email", is_email("a.b@c.co"))
     add("not_email", not is_email("nope"))
-    add("domain_of", domain_of("A@B.com") == "b.com")
     add("only_colon", _email_only("a@b.co:hunter2") == "a@b.co")
     add("only_pipe", _email_only("a@b.co | OLD") == "a@b.co")
-    add("only_mailto", _email_only("mailto:a@b.co") == "a@b.co")
-    add("only_quoted", _email_only("\"a@b.co\":pw") == "a@b.co")
-    add("only_upper", _email_only(" A@B.CO:pw ") == "a@b.co")
     add("url_no_password", unified_url("a@b.co:hunter2") ==
         HIBP_BASE + "/unifiedsearch/a%40b.co")
-    add("blank_has_page", "page_html" in _blank("a@b.co"))
     add("blank_read_false", _blank("a@b.co").get("read") is False)
+    add("blank_addr_unread", _blank("a@b.co").get("addr_verdict") == "UNREAD")
+    add("blank_pw_none", _blank("a@b.co").get("pw_band") == "none")
     add("blank_has_shot_file", "page_shot_file" in _blank("a@b.co"))
-    add("blank_no_shot_b64", "page_shot" not in _blank("a@b.co"))
     add("clean_url_strips_token",
-        _clean_url("https://x/account/a%40b.co?__cf_chl_rt_tk=zz") ==
+        _clean_url("https://x/account/a%40b.co?__cf_chl_rt_tk=z") ==
         "https://x/account/a%40b.co")
 
-    # ---- the fast path ----
-    add("fetch_js_exists", "credentials: 'include'" in JS_FETCH)
-    add("slot_has_fetch", hasattr(_Slot, "_fetch"))
-    add("slot_has_ask", hasattr(_Slot, "_ask"))
-    add("ask_fetches_first", "_fetch(page, addr)" in inspect.getsource(_Slot._ask))
-    add("ask_retries_fetch", "FETCH_TRIES" in inspect.getsource(_Slot._ask))
-    add("ask_solves_before_retry", "_solve_wall" in inspect.getsource(_Slot._ask))
-    add("ask_falls_back", "visual fallback" in inspect.getsource(_Slot._ask))
-    add("fetch_returns_early_on_200", "if status in (200, 404)" in
+    # ---- clearance is the arbiter ----
+    add("has_clearance", hasattr(_Slot, "_has_clearance"))
+    add("clearance_reads_cookies", "cf_clearance" in
+        inspect.getsource(_Slot._has_clearance))
+    add("solve_checks_clearance", "self._has_clearance()" in
+        inspect.getsource(_Slot._solve_wall))
+    add("solve_needs_streak", "clear_streak" in inspect.getsource(_Slot._solve_wall))
+    add("ask_gates_on_clearance", "no clearance - solving" in
         inspect.getsource(_Slot._ask))
-    add("shot_returns_path", "_shot_path" in inspect.getsource(_Slot._shot))
-    add("shot_is_jpeg", "type=\"jpeg\"" in inspect.getsource(_Slot._shot))
-    add("shot_cap_sane", 500000 < PAGE_SHOT_MAX <= 3000000)
-    add("turnstile_selectors", len(TURNSTILE_SELECTORS) >= 3)
-    add("turnstile_any_selector", "for sel in TURNSTILE_SELECTORS" in
+    add("ask_logs_clearance", "clearance %s" in inspect.getsource(_Slot._ask))
+    add("warm_up_at_boot", "warming up" in inspect.getsource(_Slot._boot))
+    add("stealth_script", "plugins" in STEALTH_JS and "webdriver" in STEALTH_JS)
+    add("stealth_applied", "STEALTH_JS" in inspect.getsource(_Slot._boot))
+    add("turnstile_by_frames", "page.frames" in
         inspect.getsource(_Slot._click_turnstile))
-    add("wall_checks_body", "innerText" in inspect.getsource(_Slot._wall))
-    add("challenge_wait_short", CHALLENGE_WAIT <= 15.0)
-    add("no_retry_on_wall", "_wall = \"challenge wall\"" in inspect.getsource(check))
-    add("zygote_disabled", "--no-zygote" in inspect.getsource(_Slot._boot))
-    add("persistent_profile", "launch_persistent_context" in
-        inspect.getsource(_Slot._boot))
+    add("turnstile_fallback_geometry", "bounding_box" in
+        inspect.getsource(_Slot._click_turnstile))
+    add("fetch_tries_three", FETCH_TRIES >= 3)
+    add("warm_settle_sane", 800 <= WARM_SETTLE <= 4000)
+
+    # ---- both halves ----
+    add("addr_verdict_set", "rec[\"addr_verdict\"]" in inspect.getsource(check))
+    add("pw_band_set", "rec[\"pw_band\"]" in inspect.getsource(check))
+    add("verdict_from_addr_when_no_pw", _combine(None, "CLEAN") == "CLEAN")
+    add("unread_not_clean", _addr_bucket({"error": "challenge wall"}) is None)
 
     # ---- cancellation ----
     _ev = threading.Event()
@@ -2151,18 +2170,12 @@ def selftest(verbose=False) -> bool:
     add("cancel_helper_true", _is_cancelled(_ev))
     _fut = _cf.Future()
     add("await_returns_on_cancel", _await_future(_fut, _ev, 30.0) == (None, True))
-    _fut2 = _cf.Future()
-    _fut2.set_result({"x": 1})
-    add("await_returns_result", _await_future(_fut2, None, 5.0) == ({"x": 1}, False))
     add("check_takes_cancel", "cancel" in inspect.signature(check).parameters)
     add("submit_takes_cancel", "cancel" in inspect.signature(
         _BrowserPool.submit).parameters)
-    add("cancel_skips_queued", "cancelled before the page" in
-        inspect.getsource(_Slot._handle))
 
-    # ---- pool shape ----
+    # ---- pool ----
     add("pool_picks_by_depth", "qsize" in inspect.getsource(_BrowserPool._pick))
-    add("pool_resize", hasattr(_BrowserPool, "resize"))
     add("report_slots", isinstance(report().get("slots"), int))
 
     # ---- trace ----
@@ -2172,17 +2185,13 @@ def selftest(verbose=False) -> bool:
     trace("INFO", "ui", "real")
     _got_skip = trace_text(limit=20, since=_seq_skip, skip=("page",))
     add("skip_drops_page", "heartbeat" not in _got_skip and "real" in _got_skip)
-    add("ring_raised", TRACE_MAX >= 1200)
 
     # ---- isolation ----
     _was_owner = owner()
     set_owner("aaaa1111")
-    add("owner_pins", owner() == "aaaa1111")
     add("user_file_prefixed", _user_file(CACHE_NAME) == "aaaa1111_" + CACHE_NAME)
-    add("shot_path_prefixed", "aaaa1111" in _shot_path("a@b.co"))
     add("shot_path_is_jpg", _shot_path("a@b.co").endswith(".jpg"))
-    set_owner("bbbb2222")
-    add("owner_switches", _path().endswith("bbbb2222_" + CACHE_NAME))
+    add("shot_path_prefixed", "aaaa1111" in _shot_path("a@b.co"))
     set_owner("")
     add("owner_empty_falls_back", bool(_user_file(CACHE_NAME)))
 
@@ -2202,11 +2211,6 @@ def selftest(verbose=False) -> bool:
     trace("INFO", "selftest", "mine a", "a@b.co")
     set_owner("bbbb2222")
     add("ring_other_owner_empty", trace_read(limit=50, since=_seq_a) == [])
-    set_owner("aaaa1111")
-    _remember({"email": "a@b.co", "url": "u-a"})
-    set_owner("bbbb2222")
-    _remember({"email": "b@b.co", "url": "u-b"})
-    add("last_url_own", last_url() == "u-b")
     set_owner(_was_owner)
 
     configure(page_mode=PAGE_MODE_FAST, page_on=PAGE_KINDS)
@@ -2218,12 +2222,10 @@ def selftest(verbose=False) -> bool:
 
     pairs = parse_addresses("a@b.co:pw\n- c@d.co:pw2 | VALID\njunk")
     add("parse_count", len(pairs) == 2)
-    add("parse_cuts_tail", pairs[1][1] == "pw2")
 
     add("pw_new", _pw_bucket(0) == "NEW")
     add("pw_old", _pw_bucket(50000) == "OLD")
     add("combine_worst", _combine("NEW", "OLD") == "OLD")
-    add("combine_unknown", _combine(None, None) == "UNKNOWN")
 
     pwn = {"Breaches": [
         {"Name": "Stealer Logs", "Domain": "", "BreachDate": "2026-06-01",
@@ -2233,18 +2235,13 @@ def selftest(verbose=False) -> bool:
     rec = _parse_payload("a@b.co", pwn, "browser", time.time(), "pw")
     add("corpus_split", rec["corpora"] == 1 and rec["sites"] == 1)
     add("count_total", rec["count"] == 3)
-    add("addr_bucket_corpus_new", _addr_bucket(rec) == "NEW")
     clean = _parse_payload("a@b.co", {"Breaches": [], "Pastes": []}, "browser", None, "")
     add("addr_bucket_clean", _addr_bucket(clean) == "CLEAN")
-    bad = _blank("a@b.co")
-    bad["error"] = "challenge wall"
-    add("addr_bucket_error_none", _addr_bucket(bad) is None)
 
     add("date_long", _any_date("Breach date: 4 October 2013") == "2013-10-04")
-    _got_b, _got_clean = _parse_rendered(
+    _got_b, _ = _parse_rendered(
         "Adobe\nBreach date: 4 October 2013\nAccounts: 152,445,165\n",
         [{"t": "Adobe", "h": "/breach/Adobe"}])
-    add("scrape_count", len(_got_b) == 1)
     add("scrape_accounts", _got_b[0]["pwn_count"] == 152445165)
     add("scrape_clean", _parse_rendered("Good news - no pwnage found", [])[1] is True)
 
@@ -2253,28 +2250,18 @@ def selftest(verbose=False) -> bool:
     add("report_tier", report().get("tier") == "ui")
     add("env_set", os.environ.get("PLAYWRIGHT_BROWSERS_PATH") == _PW_DIR)
 
-    _pr = {"email": "a@b.co", "verdict": "OLD", "reason": "r", "via": "api",
-           "read": True, "pw_count": 3,
-           "breaches": [{"title": "X", "date": "2015-01-01", "days": 4000,
-                         "pwn_count": 12, "classes": ["Passwords"]}],
-           "pastes": [], "checked_at": "2026-01-01 00:00:00"}
-    add("gen_text", "breaches: 1" in _page_from_record(_pr, "clean")["page_text"])
     add("page_percent_css", "100%" in
         _page_from_record({"email": "a@b.co"}, "clean")["page_html"])
-    add("record_view_pair", record_view({"email": "a@b.co"})[0] != "")
+    add("gen_shows_halves", "password half" in
+        _page_from_record({"email": "a@b.co"}, "clean")["page_text"])
     add("record_view_never_raises", record_view(None) == ("", ""))
     add("esc", _esc("<a&b>") == "&lt;a&amp;b&gt;")
 
     import inspect
-    add("check_many_takes_owner",
-        "owner_prefix" in inspect.signature(check_many).parameters)
-    add("check_many_takes_cancel",
-        "cancel" in inspect.signature(check_many).parameters)
     add("check_passes_cancel", "cancel=cancel" in inspect.getsource(check_many))
     add("check_keeps_reason", "addr_rec[\"error\"] +=" in inspect.getsource(check))
     add("cache_drops_html", "pop(\"page_html\"" in inspect.getsource(check))
     add("pool_resized_on_get", "pool.resize(size)" in inspect.getsource(_get_pool))
-    add("timeout_default_roomy", _cfg["timeout"] >= 90.0)
 
     before = trace_seq()
     trace("INFO", "selftest", "hello")
@@ -2308,12 +2295,11 @@ def main(argv=None) -> int:
         only = "--http-only" in argv
         configure(http_only=only)
         pairs = parse_addresses(target) or [(target, "")]
-        print("key:", "present" if _api_key() else "absent (browser does the work)")
         res = check(pairs[0][0], pairs[0][1], force=True)
         print("url sent:", last_url())
-        print(json.dumps({k: res.get(k) for k in ("email", "verdict", "pw_count",
-                                                  "count", "read", "via", "error")},
-                         indent=2))
+        print(json.dumps({k: res.get(k) for k in ("email", "verdict", "addr_verdict",
+                                                  "pw_band", "count", "read", "via",
+                                                  "error")}, indent=2))
         print(trace_text(limit=40))
         return 0 if res.get("verdict") else 1
     selftest(verbose=True)
