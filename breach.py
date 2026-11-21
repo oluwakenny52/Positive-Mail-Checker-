@@ -1,61 +1,66 @@
 """breach.py - breach exposure and combo freshness.  v13.86
 
-THE BROWSER IS THE ADDRESS PATH
--------------------------------
-The keyless endpoint answers with a Cloudflare 401 to a plain urllib request, so
-the address half is a real Chromium page from Playwright, driven through the
-app's OWN proxy pool. The JSON endpoint is navigated to directly and its body
-read from the response - no DOM scraping, no screenshot, no persistent profile
-to go stale. `page.goto` answers 200 with the payload, 404 for "not in any
-breach", and anything else means the challenge has to be earned.
+THE FLOW IS THE COLAB FLOW, EXACTLY
+-----------------------------------
+Per item: build the unifiedsearch URL, then up to PROXY_TRIES (3) attempts, each
+one a random live node from the app's own pool in a real headless Chromium with
+the proxy on the context.
 
-THE WARM PAGE IS WHAT EARNS IT
-------------------------------
-A challenge cannot be solved on the JSON endpoint, because Chromium renders a
-401 body as a bare block of JSON - there is no interstitial, no Turnstile
-widget and no cookie to win. That is what made the first edition report
-"challenge (http 401)" and then a re-fetch 115 ms later, on every proxy and on
-DIRECT alike.
+    200            parse the JSON, remember the node as via_proxy, stop
+    other status   log " via host:port", record the status
+    exception      log "err via host:port (Type)", record None
 
-So when the endpoint refuses, the slot navigates the HTML page at the origin,
-which DOES carry the widget, waits there for the wall to clear, and only then
-re-fetches the endpoint from inside the same page - same origin, same cookies,
-now including the clearance the solve produced. A slot records that it holds
-clearance and goes straight to the endpoint next time, so a warmed proxy pays
-the warm navigation once rather than once per item; clearance is dropped again
-the moment a re-fetch still fails.
+THEN THE 401/404 RULE. If no 200 happened but 401 or 404 was seen, STOP without
+touching DIRECT and report zero breaches. A 401 is Cloudflare refusing the
+endpoint, and 404 is the site's own "not in any breach" - both are readable
+answers about the ADDRESS, not failures of the path, so neither may be reported
+as UNREAD. That rule is the whole difference from the previous edition, which
+treated 401 as unread and left every field null.
+
+DIRECT runs only when no 200 happened AND no 401/404 appeared (403, 429, a
+timeout, a dead proxy). One attempt, proxy=None; a 200 there sets via_proxy to
+"DIRECT". If DIRECT also fails, the record is a connection/proxy error and is NOT
+cached, so a later run does not inherit it.
+
+There is no Turnstile solve. A 401 is expected and handled by the rule above, so
+waiting 15 s for a widget that the endpoint never renders was pure cost.
+
+THE CATALOGUE FILLS THE ZERO
+----------------------------
+A zero from a 401 says "we did not read this address", which is honest but thin.
+The public catalogue (`/api/v3/breaches`) is keyless, unchallenged and indexed by
+domain, so when a 401/404 zero happens the domain is looked up and, if it has
+breaches, they fill the record with real names, dates, data classes and record
+counts. That sets `partial_read`, because it is a DOMAIN match and not an
+individual confirmation, and it is never cached as exact. If the catalogue is
+unreadable the zero stands.
 
 PAGES ARE TIED TO WORKERS
 -------------------------
-There is no page-count control. A run of N workers keeps at most N pages, one
-per worker slot, and each slot is REUSED: the same context and page serve item
-after item, reset to about:blank with its cookies cleared between them. The
-Chromium process behind a slot is launched once per worker for the whole batch,
-so a 500-item run pays for N browsers, not 500.
+No page-count control. N workers keep at most N pages, one per worker slot, and
+each slot is REUSED: the same context and page serve item after item, reset to
+about:blank with its cookies cleared between them. The Chromium process behind a
+slot is launched once per worker for the whole batch, so a 500-item run pays for
+N browsers, not 500.
 
-A slot recycles itself on its own terms - after SLOT_USES_MAX uses, or after
-SLOT_FAILS_MAX consecutive failed attempts, or when the next attempt wants a
-different proxy (the proxy is bound to the context, so a swap is a new context
-on the same browser). Recycling is local: the item that was in flight is
-already recorded, so a stuck or challenged page can never lose a finished
-result and can never hold the queue.
+A slot recycles itself after SLOT_USES_MAX uses, after SLOT_FAILS_MAX failed
+attempts in a row, or when the next attempt wants a different proxy (the proxy is
+bound to the context, so a swap is a new context on the same browser). Recycling
+is local: the item in flight is already recorded, so a wedged page can never lose
+a finished result and can never hold the queue.
 
 THE DRAW IS RANDOM
 ------------------
-Drawing `pool_lines()[:3]` gave every key the same first three nodes, so one
-node carried the entire run. Each attempt now draws a RANDOM node from the whole
-tier-ordered pool, never one already tried for that item, and a node that fails
-twice hard is skipped for the rest of the run. The `rotate` switch turns the
-draw off and walks the tier order instead, which is what you want when the pool
-is tiny and a deterministic sweep is easier to read in the trace. DIRECT is the
-last attempt in both modes, never the first.
+`pool_lines()[:3]` gave every key the same first three nodes, so one node carried
+the whole run. Each attempt draws a RANDOM node from the whole tier-ordered pool,
+never one already tried for that item, and a node that fails twice in transport is
+skipped for the rest of the run. The `rotate` switch walks the tier order instead.
 
 THE PASSWORD HALF
 -----------------
-Pwned Passwords k-anonymity, unchanged and keyless: the SHA-1 is computed
-locally, 5 of its 40 characters leave the box, and the 35 kept characters are
-matched locally against the padded range response. It never touches the address
-path and it never sees a proxy.
+Pwned Passwords k-anonymity: the SHA-1 is computed locally, 5 of its 40 characters
+leave the box, and the 35 kept characters are matched locally against the padded
+range response. It never touches the address path and it never sees a proxy.
 
 WHAT AN INPUT LINE CAN BE
 -------------------------
@@ -71,7 +76,7 @@ THE BANDS ARE ABOUT FRESHNESS, NOT COUNT
     PARTIAL   password seen 1-9999 times, or exposure inside 730 days
     OLD       password seen 10000+ times, or only old breaches
     CLEAN     password unseen and the address in no readable source
-    UNKNOWN   nothing readable - the only honest answer when every attempt failed
+    UNKNOWN   nothing readable - proxy and direct both failed
 
 count 0 and count None are different facts and `read` says which.
 
@@ -132,32 +137,6 @@ HEADERS = {
     "sec-fetch-site": "same-origin",
 }
 
-# "challenge" alone is in here because the refused endpoint answers with a short
-# JSON body and that word is in it; the rest are the interstitial's own wording.
-CHALLENGE_MARKS = (
-    "just a moment", "performing security verification", "checking your browser",
-    "cf-challenge", "attention required", "verify you are human",
-    "security service to protect", "verifying...", "challenge",
-)
-CLEAN_MARKS = ("no pwnage", "good news", "not been pwned", "no breaches found")
-
-TURNSTILE_SELECTORS = (
-    "iframe[src*='challenges.cloudflare.com']",
-    "div#challenge-stage iframe",
-    "iframe[title*='challenge' i]",
-    "iframe[title*='turnstile' i]",
-)
-
-JS_FETCH = """async (u) => {
-  try {
-    const r = await fetch(u, {credentials: 'include',
-                              headers: {'Accept': 'application/json'}});
-    let t = '';
-    try { t = await r.text(); } catch (e) { t = ''; }
-    return {status: r.status, body: t};
-  } catch (e) { return {status: 0, body: String(e)}; }
-}"""
-
 STEALTH_JS = ("Object.defineProperty(navigator,'webdriver',{get:()=>undefined});"
               "Object.defineProperty(navigator,'languages',{get:()=>['en-US','en']});"
               "Object.defineProperty(navigator,'plugins',{get:()=>[1,2,3,4,5]});"
@@ -170,21 +149,22 @@ CHROME_ARGS = ["--no-sandbox", "--no-zygote", "--disable-dev-shm-usage",
                "--no-default-browser-check"]
 
 NAV_TIMEOUT = 25000
-CHALLENGE_WAIT = 15.0
 HTTP_TIMEOUT = 15.0
-TRIES = 4
+
+# The Colab limit. Three nodes, then the rule below decides.
+PROXY_TRIES = 3
 
 # A page slot's own terms. Uses bounds the memory a long run can build up on one
 # context; fails bounds how long a page that keeps timing out is kept.
 SLOT_USES_MAX = 25
 SLOT_FAILS_MAX = 2
 
-# A node skipped for the rest of the run after this many hard fails, so a 500
-# item batch does not keep drawing a node the provider has already dropped.
+# A node skipped for the rest of the run after this many transport fails.
 BAD_AFTER = 2
 
-# Markers only - read by the page's stale-module guard, not by the flow.
-RESULT_WAIT = 15.0
+# The catalogue is one request per window for the whole process, not per item.
+CATALOGUE_TTL = 6 * 3600.0
+CAT_ROWS_MAX = 60
 
 CACHE_NAME = "breach_cache.json"
 CACHE_TTL = 6 * 3600.0
@@ -225,6 +205,9 @@ _pool_ttl = 30.0
 _cursor = [0]
 _bad = {}
 _slots = {}
+
+_cat_lock = threading.Lock()
+_cat = {"ts": 0.0, "by_domain": {}, "busy": False, "error": ""}
 
 _tls = threading.local()
 _lasts = {}
@@ -270,14 +253,12 @@ def _is_cancelled(cancel):
         return False
 
 
-def _await(cancel, budget):
-    """Marker kept for the page guard: a bounded wait helper."""
-    end = time.time() + max(5.0, float(budget))
-    while time.time() < end:
-        if _is_cancelled(cancel):
-            return None, True
-        time.sleep(0.05)
-    return None, False
+def _zero_rule(seen) -> bool:
+    """The Colab rule: a 401 or a 404 is a readable 'nothing', not a failure."""
+    try:
+        return 401 in seen or 404 in seen
+    except Exception:
+        return False
 
 
 # ---------------------------------------------------------------------------
@@ -402,7 +383,7 @@ def key_present() -> bool:
 def key_hint() -> str:
     k = _api_key()
     if not k:
-        return "no key needed - keyless browser + Pwned Passwords"
+        return "no key needed - keyless browser + catalogue + Pwned Passwords"
     return "key present (optional, %d chars)" % len(k)
 
 
@@ -654,8 +635,9 @@ def account_url(addr) -> str:
 
 
 def _esc(v) -> str:
-    return (str(v or "").replace(chr(38), _AMP).replace(chr(60), _LT)
-            .replace(chr(62), _GT).replace(chr(34), _QUOT))
+    """Escape for HTML. 0 and False survive - `v or ""` used to drop them."""
+    return (str(v if v is not None else "").replace(chr(38), _AMP)
+            .replace(chr(60), _LT).replace(chr(62), _GT).replace(chr(34), _QUOT))
 
 
 def _plain(s) -> str:
@@ -748,7 +730,7 @@ def _blank(item, pw="") -> dict:
             "breaches": [], "pastes": [], "pw_count": None, "corpora": 0, "sites": 0,
             "sensitive": 0, "stealer": 0, "newest_days": None, "count": None,
             "via": "", "via_proxy": "", "read": False, "partial_read": False,
-            "addr_verdict": "UNREAD", "pw_band": "none",
+            "pwned": False, "addr_verdict": "UNREAD", "pw_band": "none",
             "page_text": "", "page_html": "", "page_via": "",
             "password_check": None, "earliest_breach": None, "latest_breach": None,
             "total_records_exposed": 0, "password_breaches": [], "summary_note": "",
@@ -803,6 +785,8 @@ def _fresh(entry, ttl) -> bool:
 
 def clear_cache() -> None:
     _save({})
+    with _cat_lock:
+        _cat["ts"] = 0.0
     trace("CLICK", "cache", "cleared by the page")
 
 
@@ -814,6 +798,90 @@ def cache_stats() -> dict:
         size = 0
     return {"entries": len(data.get("item") or {}) + len(data.get("pw") or {}),
             "bytes": size, "path": os.path.basename(_cache_path())}
+
+
+# ---------------------------------------------------------------------------
+# the public catalogue - keyless, and the one source that is not challenged
+# ---------------------------------------------------------------------------
+def _cat_fetch():
+    """The whole breach catalogue as a list, or None. One request per window."""
+    try:
+        import requests
+    except Exception:
+        return None
+    try:
+        trace("INFO", "catalogue", "GET %s" % CATALOGUE_URL)
+        r = requests.get(CATALOGUE_URL, timeout=max(20.0, HTTP_TIMEOUT),
+                         headers={"User-Agent": UA,
+                                  "Accept": "application/json"})
+        trace("INFO", "catalogue", "http %d, %d byte(s)"
+              % (r.status_code, len(r.content or b"")))
+        if r.status_code != 200:
+            return None
+        data = r.json()
+    except Exception as exc:
+        trace("ERR", "catalogue", "%s: %s" % (type(exc).__name__, str(exc)[:160]))
+        return None
+    return data if isinstance(data, list) else None
+
+
+def catalogue(force=False):
+    """domain -> [breach, ...]. {} before the first fetch, None when it failed."""
+    now = time.time()
+    with _cat_lock:
+        if not force and _cat["by_domain"] and (now - _cat["ts"]) < CATALOGUE_TTL:
+            return _cat["by_domain"]
+        if _cat["busy"]:
+            return _cat["by_domain"] or None
+        _cat["busy"] = True
+    rows = None
+    try:
+        rows = _cat_fetch()
+    finally:
+        with _cat_lock:
+            _cat["busy"] = False
+    if rows is None:
+        with _cat_lock:
+            _cat["error"] = "fetch failed"
+        return _cat["by_domain"] or None
+    index = {}
+    for b in rows:
+        if not isinstance(b, dict):
+            continue
+        d = str(b.get("Domain") or "").strip().lower().strip(".")
+        if not d:
+            continue
+        index.setdefault(d, []).append(b)
+    with _cat_lock:
+        _cat["by_domain"] = index
+        _cat["ts"] = time.time()
+        _cat["error"] = ""
+    trace("INFO", "catalogue", "%d breach(es) indexed over %d domain(s)"
+          % (len(rows), len(index)))
+    return index
+
+
+def _cat_rows(email):
+    """Breaches for the address's domain. None when the catalogue is unreadable."""
+    cat = catalogue()
+    if cat is None:
+        return None
+    dom = str(email or "").rsplit("@", 1)[-1].strip().lower().strip(".")
+    if not dom:
+        return []
+    for cand in (dom, ".".join(dom.split(".")[-2:])):
+        got = cat.get(cand)
+        if got:
+            got = sorted(got, key=lambda b: str(b.get("BreachDate") or ""),
+                         reverse=True)
+            return got[:CAT_ROWS_MAX]
+    return []
+
+
+def catalogue_state() -> dict:
+    with _cat_lock:
+        return {"domains": len(_cat["by_domain"]), "age": int(time.time() - _cat["ts"])
+                if _cat["ts"] else -1, "error": _cat["error"]}
 
 
 # ---------------------------------------------------------------------------
@@ -940,8 +1008,7 @@ def _pick_proxy(used):
     Random across the whole tier order so one node is never the only one the run
     ever touches, never a node this item has already tried, and never a node that
     has already failed BAD_AFTER times - until nothing else is left. `rotate`
-    off walks the tier order from a shared cursor instead, which is a readable
-    deterministic sweep for a small pool.
+    off walks the tier order from a shared cursor instead.
     """
     pool = pool_lines()
     if not pool:
@@ -1084,14 +1151,10 @@ class _Slot:
 
     The proxy is bound to the CONTEXT, so a different proxy means a new context -
     but always on the same browser, which is the expensive half. `get()` resets
-    the page between items and recycles on its own terms, so a page that is
-    challenged or wedged never costs more than the attempt it was in.
-
-    `cf` records that this context has already earned clearance, so a warmed
-    proxy goes straight to the endpoint instead of warming on every item.
+    the page between items and recycles on its own terms.
     """
 
-    __slots__ = ("ctx", "page", "proxy", "uses", "fails", "cf")
+    __slots__ = ("ctx", "page", "proxy", "uses", "fails")
 
     def __init__(self):
         self.ctx = None
@@ -1099,7 +1162,6 @@ class _Slot:
         self.proxy = ""
         self.uses = 0
         self.fails = 0
-        self.cf = False
 
     def close_ctx(self):
         try:
@@ -1112,7 +1174,6 @@ class _Slot:
         self.proxy = ""
         self.uses = 0
         self.fails = 0
-        self.cf = False
 
     def open_ctx(self, proxy_line):
         self.close_ctx()
@@ -1131,12 +1192,7 @@ class _Slot:
         self.proxy = proxy_line or ""
 
     def reset(self):
-        """Blank the page and drop its cookies - state never carries over.
-
-        The clearance cookie goes with them, so `cf` is cleared too; the next
-        challenge warms again. A blank page is what keeps one item's render out
-        of the next item's way.
-        """
+        """Blank the page and drop its cookies - state never carries over."""
         if self.page is not None and not self.page.is_closed():
             self.page.goto("about:blank", wait_until="commit", timeout=8000)
         try:
@@ -1144,7 +1200,6 @@ class _Slot:
                 self.ctx.clear_cookies()
         except Exception:
             pass
-        self.cf = False
 
     def get(self, proxy_line):
         """A page ready for this attempt. Reuses, resets, recycles as needed."""
@@ -1197,102 +1252,11 @@ def _close_all_slots():
         s.close_ctx()
 
 
-def _looks_challenge(status, body) -> bool:
-    if status in (401, 403, 429, 503):
-        return True
-    low = str(body or "")[:4000].lower()
-    return any(m in low for m in CHALLENGE_MARKS)
-
-
-def _is_wall(page) -> bool:
-    try:
-        if any(m in (page.title() or "").lower() for m in CHALLENGE_MARKS):
-            return True
-    except Exception:
-        pass
-    try:
-        low = (page.evaluate("() => document.body ? (document.body.innerText || '')"
-                             ".slice(0, 1500) : ''") or "").lower()
-    except Exception:
-        low = ""
-    return any(m in low for m in CHALLENGE_MARKS)
-
-
-def _click_turnstile(page) -> bool:
-    for fr in list(page.frames):
-        try:
-            if "challenges.cloudflare.com" not in (fr.url or ""):
-                continue
-        except Exception:
-            continue
-        for sel in ("input[type='checkbox']", "#challenge-stage", "body"):
-            try:
-                fr.click(sel, timeout=1200,
-                         position={"x": 20, "y": 20} if sel == "body" else None)
-                return True
-            except Exception:
-                continue
-    for sel in TURNSTILE_SELECTORS:
-        try:
-            el = page.query_selector(sel)
-            bb = el.bounding_box() if el is not None else None
-            if bb:
-                page.mouse.click(bb["x"] + 22, bb["y"] + bb["height"] / 2.0)
-                return True
-        except Exception:
-            continue
-    return False
-
-
-def _solve_wall(page, cancel=None):
-    """Bounded wait for a challenge to clear. True when the page looks clear."""
-    deadline = time.time() + CHALLENGE_WAIT
-    last = 0.0
-    streak = 0
-    while time.time() < deadline:
-        if _is_cancelled(cancel):
-            return False
-        if not _is_wall(page):
-            streak += 1
-            if streak >= 2:
-                return True
-        else:
-            streak = 0
-            if time.time() - last > 3.0:
-                last = time.time()
-                if _click_turnstile(page):
-                    trace("INFO", "browser", "clicked the challenge widget")
-        try:
-            page.wait_for_timeout(700)
-        except Exception:
-            time.sleep(0.7)
-    return not _is_wall(page)
-
-
-def _warm(page, label, addr):
-    """Navigate the origin HTML so a challenge has a widget to solve.
-
-    The endpoint renders a refused body as bare JSON - no interstitial, no
-    Turnstile, no cookie. This is the page that can actually earn one. Returns
-    the status it got, 0 when the navigation itself failed.
-    """
-    try:
-        warm = page.goto(HIBP_BASE + "/", wait_until="domcontentloaded",
-                         timeout=NAV_TIMEOUT)
-        wstatus = warm.status if warm is not None else 0
-        trace("INFO", "fetch", "warm page http %d via %s" % (wstatus, label), addr)
-        return wstatus
-    except Exception as exc:
-        trace("WARN", "fetch", "warm page failed via %s: %s"
-              % (label, type(exc).__name__), addr)
-        return 0
-
-
-def _attempt(addr, proxy_line, cancel=None):
+def _attempt(addr, proxy_line):
     """One navigation through one proxy (or DIRECT). -> (status, payload|None).
 
-    The page comes from this worker's slot and goes back to it. Nothing is closed
-    here; the slot decides when to recycle, so the browser survives the batch.
+    An HTTP status - any status - leaves the page healthy, so the slot keeps it.
+    Only a transport exception recycles the slot.
     """
     label = (proxy_line.rsplit("@", 1)[-1] if proxy_line else "DIRECT")
     url = unified_url(addr)
@@ -1300,10 +1264,9 @@ def _attempt(addr, proxy_line, cancel=None):
     try:
         page = slot.get(proxy_line)
     except Exception as exc:
-        trace("ERR", "slot", "no page via %s: %s" % (label, type(exc).__name__), addr)
+        trace("ERR", "fetch", "no page via %s: %s" % (label, type(exc).__name__), addr)
         return 0, None
     try:
-        trace("INFO", "fetch", "goto via %s" % label, addr)
         resp = page.goto(url, wait_until="domcontentloaded", timeout=NAV_TIMEOUT)
         status = resp.status if resp is not None else 0
         body = ""
@@ -1311,92 +1274,59 @@ def _attempt(addr, proxy_line, cancel=None):
             body = resp.text() if resp is not None else ""
         except Exception:
             body = ""
-        trace("INFO", "fetch", "http %d via %s (%d byte(s))"
-              % (status, label, len(body)), addr)
-
+        trace("INFO", "fetch", "%s via %s (%d byte(s))"
+              % (status or "?", label, len(body)), addr)
         if status == 200 and body.strip():
             try:
                 got = json.loads(body)
-                if isinstance(got, dict):
-                    slot.ok()
-                    return 200, got
             except Exception:
-                pass
-
-        if _looks_challenge(status, body):
-            trace("WARN", "fetch", "challenge (http %d) via %s" % (status, label), addr)
-            wstatus = 0
-            if not slot.cf:
-                wstatus = _warm(page, label, addr)
-            if _solve_wall(page, cancel):
-                if wstatus == 200:
-                    slot.cf = True
-                try:
-                    got = page.evaluate(JS_FETCH, url) or {}
-                except Exception:
-                    got = {}
-                s2 = int(got.get("status") or 0)
-                b2 = str(got.get("body") or "")
-                trace("INFO", "fetch", "re-fetch from the page -> http %d" % s2, addr)
-                if s2 == 200 and b2.strip():
-                    try:
-                        parsed = json.loads(b2)
-                        if isinstance(parsed, dict):
-                            slot.ok()
-                            return 200, parsed
-                    except Exception:
-                        pass
-                if s2 == 404:
-                    slot.ok()
-                    return 404, None
-                slot.cf = False
-                slot.bad()
-                return s2 or status, None
-            slot.cf = False
-            slot.bad()
-            return status, None
-
-        if status == 404:
+                got = None
+            if isinstance(got, dict):
+                slot.ok()
+                return 200, got
             slot.ok()
-            return 404, None
-        slot.bad()
+            return 200, None
+        slot.ok()
         return status, None
     except Exception as exc:
-        trace("ERR", "fetch", "%s via %s: %s" % (type(exc).__name__, label,
-                                                 str(exc)[:160]), addr)
+        trace("ERR", "fetch", "err via %s (%s)" % (label, type(exc).__name__), addr)
         slot.bad()
         return 0, None
 
 
 def _search_address(addr, cancel=None):
-    """Draw nodes, then DIRECT. -> (payload|None, via_label, error, tried)."""
-    tries = max(1, min(8, int(TRIES)))
-    order, used = [], set()
-    for _ in range(tries - 1):
+    """3 proxies, the 401/404 rule, then DIRECT. -> (payload|None, via, err, seen)."""
+    seen = []
+    errors = []
+    used = set()
+    for _ in range(PROXY_TRIES):
+        if _is_cancelled(cancel):
+            return None, "", "cancelled", seen
         line = _pick_proxy(used)
         if line is None:
             break
         used.add(line)
-        order.append(line)
-    order.append(None)
-    errors = []
-    last_status = 0
-    for line in order:
-        if _is_cancelled(cancel):
-            return None, "", "cancelled", errors
-        status, payload = _attempt(addr, line, cancel)
-        last_status = status
-        label = (line.rsplit("@", 1)[-1] if line else "DIRECT")
+        status, payload = _attempt(addr, line)
+        label = line.rsplit("@", 1)[-1]
+        seen.append(status)
         if payload is not None:
-            return payload, label, "", errors
-        if status == 404:
-            return {}, label, "", errors
-        if status in (0, 401, 403, 429, 503):
+            return payload, label, "", seen
+        errors.append("%s: %s" % (label, status or "err"))
+        if status == 0:
             _mark_bad(line)
-        errors.append("%s: http %s" % (label, status or "?"))
-        if status == 200 and not payload:
-            errors[-1] = "%s: http 200 but no JSON" % label
-    return None, "", "; ".join(errors[-3:]) or ("http %s" % (last_status or "?")), errors
+
+    if _is_cancelled(cancel):
+        return None, "", "cancelled", seen
+    # A 401 or a 404 is an answer about the address. Do not spend DIRECT on it.
+    if _zero_rule(seen):
+        return {}, "", "", seen
+
+    status, payload = _attempt(addr, None)
+    seen.append(status)
+    if payload is not None:
+        return payload, "DIRECT", "", seen
+    errors.append("DIRECT: %s" % (status or "err"))
+    return None, "", "; ".join(errors[-4:]), seen
 
 
 # ---------------------------------------------------------------------------
@@ -1423,7 +1353,7 @@ def _parse_payload(item, payload, via, started, pw) -> dict:
         days = _days(b.get("BreachDate") or b.get("AddedDate"))
         rec["breaches"].append({
             "Name": str(b.get("Name") or ""),
-            "Title": str(b.get("Title") or b.get("Name") or "Unnamed")[:160],
+            "Title": _plain(b.get("Title") or b.get("Name") or "Unnamed")[:160],
             "Domain": str(b.get("Domain") or ""),
             "BreachDate": str(b.get("BreachDate") or "")[:10],
             "AddedDate": str(b.get("AddedDate") or "")[:24],
@@ -1437,7 +1367,7 @@ def _parse_payload(item, payload, via, started, pw) -> dict:
             "IsSpamList": bool(b.get("IsSpamList")),
             "corpus": corpus, "days": days,
             "name": str(b.get("Name") or ""),
-            "title": str(b.get("Title") or b.get("Name") or "Unnamed")[:160],
+            "title": _plain(b.get("Title") or b.get("Name") or "Unnamed")[:160],
             "domain": str(b.get("Domain") or ""),
             "date": str(b.get("BreachDate") or "")[:10],
             "pwn_count": int(b.get("PwnCount") or 0),
@@ -1460,10 +1390,10 @@ def _parse_payload(item, payload, via, started, pw) -> dict:
     for p in raw_p:
         if not isinstance(p, dict):
             continue
-        rec["pastes"].append({"Title": str(p.get("Title") or "Untitled")[:200],
+        rec["pastes"].append({"Title": _plain(p.get("Title") or "Untitled")[:200],
                               "Source": str(p.get("Source") or "")[:120],
                               "Date": str(p.get("Date") or "")[:10],
-                              "title": str(p.get("Title") or "Untitled")[:200],
+                              "title": _plain(p.get("Title") or "Untitled")[:200],
                               "source": str(p.get("Source") or "")[:120],
                               "date": str(p.get("Date") or "")[:10]})
 
@@ -1496,6 +1426,14 @@ def _page_from_record(rec) -> dict:
     head_addr = rec.get("email") or "(password only)"
     _pw = rec.get("pw_count")
     pc = rec.get("password_check") or {}
+    if rec.get("partial_read"):
+        basis = "domain match - the exact search was refused"
+    elif not rec.get("read"):
+        basis = "nothing readable - proxy and direct both failed"
+    elif rec.get("count"):
+        basis = "exact search"
+    else:
+        basis = "exact search refused (401/404) - reported as no breach"
     lines = ["kind: %s" % kind,
              "address: %s" % (rec.get("email") or "-"),
              "checked: %s" % (rec.get("checked_at") or ""),
@@ -1505,6 +1443,7 @@ def _page_from_record(rec) -> dict:
              "password appearances: %s" % (_pw if _pw is not None
                                            else "no password supplied"),
              "source: %s" % (rec.get("via") or "-"),
+             "basis: %s" % basis,
              "breaches: %d, pastes: %d" % (len(rec.get("breaches") or []),
                                           len(rec.get("pastes") or []))]
     if rec.get("error"):
@@ -1544,9 +1483,9 @@ def _page_from_record(rec) -> dict:
          _esc(rec.get("reason") or ""), "\x3c/p\x3e\x3cp\x3eaddress half: ",
          _esc(rec.get("addr_verdict") or "UNREAD"), "\x3cbr\x3epassword half: ",
          _esc(rec.get("pw_band") or "none"), "\x3cbr\x3epassword appearances: ",
-         (_esc(_pw) if _pw is not None else "-"), "\x3cbr\x3esource: ",
-         _esc(rec.get("via") or "-"), "\x3cbr\x3echecked: ",
-         _esc(rec.get("checked_at") or ""), "\x3c/p\x3e"]
+         _esc(_pw if _pw is not None else "-"), "\x3cbr\x3esource: ",
+         _esc(rec.get("via") or "-"), "\x3cbr\x3ebasis: ", _esc(basis),
+         "\x3cbr\x3echecked: ", _esc(rec.get("checked_at") or ""), "\x3c/p\x3e"]
     if rec.get("error"):
         h.append("\x3cp class='c'\x3eerror: %s\x3c/p\x3e" % _esc(rec["error"]))
     if pc:
@@ -1573,7 +1512,8 @@ def _page_from_record(rec) -> dict:
     else:
         h.append("\x3cp\x3e%s\x3c/p\x3e"
                  % ("No breach record could be read - see the error above."
-                    if rec.get("error") else "No breach record for this address."))
+                    if not rec.get("read") else
+                    "No breach record - the source was read and lists none."))
     if rec.get("pastes"):
         h.append("\x3ch2\x3ePastes\x3c/h2\x3e\x3cul\x3e")
         for p in (rec.get("pastes") or [])[:30]:
@@ -1642,7 +1582,7 @@ _REASON = {
                % BREACH_PARTIAL_DAYS,
     "OLD": "password has been public for years, or only old breaches",
     "CLEAN": "password unseen and the address in no readable source",
-    "UNKNOWN": "no readable answer - every attempt failed",
+    "UNKNOWN": "no readable answer - proxy and direct both failed",
 }
 
 
@@ -1673,6 +1613,16 @@ def _cache_key(item) -> str:
     return "%s:%s" % (item["kind"], item["email"].lower())
 
 
+def _pw_halves(rec, item, force):
+    """Fill both password fields from the item, or clear them."""
+    if not item["password"]:
+        rec["pw_count"] = None
+        rec["password_check"] = None
+        return
+    rec["pw_count"] = pwned_count(item["password"], force=force)
+    rec["password_check"] = check_password(item["password"], force=force)
+
+
 def check_item(item, force=False, cancel=None) -> dict:
     item = _as_item(item)
     started = time.time()
@@ -1689,6 +1639,7 @@ def check_item(item, force=False, cancel=None) -> dict:
         rec["bucket"] = _combine(_pw_bucket(rec["pw_count"]), None)
         rec["verdict"] = rec["bucket"]
         rec["reason"] = _REASON.get(rec["bucket"], "")
+        rec["pwned"] = bool(rec["pw_count"])
         rec["summary_note"] = (rec["password_check"] or {}).get("message", "")
         if rec["pw_count"] is None:
             rec["error"] = "password check failed"
@@ -1723,20 +1674,42 @@ def check_item(item, force=False, cancel=None) -> dict:
         trace("INFO", "pw", "result: %s" % ("no password" if rec["pw_count"] is None
                                             else "%d hit(s)" % rec["pw_count"]), email)
 
-    payload, via, err, tried = _search_address(email, cancel)
-    if payload is not None:
+    payload, via, err, seen = _search_address(email, cancel)
+    if payload:
         rec = _parse_payload(item, payload, via or "browser", started, item["password"])
-        rec["pw_count"] = (pwned_count(item["password"], force=force)
-                           if item["password"] else None)
-        if item["password"]:
-            rec["password_check"] = check_password(item["password"], force=force)
+        _pw_halves(rec, item, force)
         rec["read"] = True
+        rec["via_proxy"] = via or "browser"
+    elif payload is not None:
+        # The 401/404 rule fired: a readable zero. The catalogue may still know
+        # the domain, which is real data rather than a bare zero.
+        rows = _cat_rows(email)
+        if rows:
+            rec = _parse_payload(item, {"Breaches": rows}, "catalogue", started,
+                                 item["password"])
+            _pw_halves(rec, item, force)
+            rec["read"] = True
+            rec["partial_read"] = True
+            rec["via_proxy"] = ""
+            rec["error"] = "; ".join("%s: %s" % ("proxies", s or "err") for s in seen)
+            trace("INFO", "catalogue", "%d domain match(es) - 401/404 zero filled"
+                  % len(rows), email)
+        else:
+            rec["via"] = "browser"
+            rec["via_proxy"] = ""
+            rec["read"] = True
+            rec["count"] = 0
+            rec["error"] = ""
+            trace("INFO", "address", "401/404 - reported as no breach (statuses %s)"
+                  % seen, email)
     else:
         rec["via"] = "browser"
-        rec["error"] = err or "no answer"
+        rec["via_proxy"] = ""
         rec["read"] = False
-        if _is_cancelled(cancel):
-            rec["error"] = "cancelled"
+        rec["error"] = ("cancelled" if _is_cancelled(cancel) else
+                        "connection/proxy error - unreachable on proxy and direct"
+                        + ((" (%s)" % err) if err else ""))
+
     rec["breach_count"] = len(rec.get("breaches") or [])
     rec["summary_note"] = _summary_note(rec)
 
@@ -1746,6 +1719,7 @@ def check_item(item, force=False, cancel=None) -> dict:
     rec["bucket"] = _combine(_pw_bucket(rec.get("pw_count")), ab)
     rec["verdict"] = rec["bucket"]
     rec["reason"] = _REASON.get(rec["bucket"], "")
+    rec["pwned"] = bool(rec["breach_count"] or (rec.get("pw_count") or 0))
     if rec["bucket"] == "UNKNOWN" and not rec["error"]:
         rec["error"] = "no readable answer"
     rec.update(_page_from_record(rec))
@@ -1753,7 +1727,9 @@ def check_item(item, force=False, cancel=None) -> dict:
           % (rec["bucket"], rec["reason"] or "-", rec["addr_verdict"],
              rec["pw_band"], rec.get("elapsed_ms") or 0), email)
 
-    if rec["bucket"] != "UNKNOWN":
+    # Exact answers and 401/404 zeros are cached. A domain match is not, and
+    # neither is a connection error - both retry next run.
+    if rec["bucket"] != "UNKNOWN" and not rec["partial_read"]:
         cache.setdefault("item", {})[key] = {"ts": time.time(), "report": rec}
         if len(cache.get("item") or {}) > CACHE_MAX:
             cut = list(cache["item"])[:len(cache["item"]) - CACHE_MAX]
@@ -1791,10 +1767,8 @@ def check_many(items, workers=3, progress=None, cancel=None, force=False,
                delay=None, rotate=None, owner_prefix=None) -> dict:
     """Run the list. One page slot per worker, reused and recycled, never more.
 
-    The pool is drawn at most (tries - 1) times per item, so N workers hold at
-    most N pages and the batch never opens one per check. Each worker's browser
-    is launched on its first item and closed by a teardown task at the end, so a
-    500-item run pays for N browsers and N pages, not 500.
+    The catalogue is warmed once up front on the main thread, so the workers only
+    ever read the index and never race for it.
     """
     pin = owner() if owner_prefix is None else str(owner_prefix or "")
     set_owner(pin)
@@ -1826,6 +1800,8 @@ def check_many(items, workers=3, progress=None, cancel=None, force=False,
                          "on" if snap.get("rotate") else "off"))
     if not total:
         return out
+    if any(i["kind"] != "password" for i in uniq):
+        catalogue()
 
     def _tell(n, label, verdict):
         if progress is not None:
@@ -1929,6 +1905,7 @@ def report() -> dict:
             "browser_state": browser_state().get("state", ""),
             "browser_error": browser_note(), "delay": _delay(),
             "pool": len(pool_lines()), "rotate": rotating(), "skipped": bad,
+            "catalogue": catalogue_state(), "tries": PROXY_TRIES,
             "key": bool(_api_key()), "owner": owner(), "cache": cache_stats(),
             "last": mine, "trace_seq": trace_seq()}
 
@@ -1951,6 +1928,7 @@ def selftest(verbose=False) -> bool:
     add("blank_read_false", _blank({"kind": "email", "email": "a@b.co"}).get("read") is False)
     add("blank_addr_unread", _blank({"kind": "email", "email": "a@b.co"}).get("addr_verdict")
         == "UNREAD")
+    add("blank_not_pwned", _blank({"kind": "email", "email": "a@b.co"}).get("pwned") is False)
 
     items = parse_lines("a@b.co:pw\nc@d.co\nhunter2\njunk line\n")
     add("parse_combo", items[0]["kind"] == "combo" and items[0]["password"] == "pw")
@@ -1959,6 +1937,14 @@ def selftest(verbose=False) -> bool:
     add("parse_pairs", len(parse_addresses("a@b.co:pw\nc@d.co\n")) == 2)
     add("parse_skips_junk", all(i["kind"] for i in items))
     add("parse_dedupes", len(parse_lines("a@b.co:pw\na@b.co:pw\n")) == 1)
+
+    # ---- the 401/404 rule ----
+    add("tries_is_three", PROXY_TRIES == 3)
+    add("zero_on_401", _zero_rule([401, 0, 0]))
+    add("zero_on_404", _zero_rule([404]))
+    add("zero_on_late_401", _zero_rule([0, 403, 401]))
+    add("no_zero_on_403", not _zero_rule([403, 0, 0]))
+    add("no_zero_on_empty", not _zero_rule([]))
 
     add("pw_hash", len(_pw_hash("abc")) == 40)
     add("pw_new", _pw_bucket(0) == "NEW")
@@ -1974,7 +1960,8 @@ def selftest(verbose=False) -> bool:
         {"Name": "June2026StealerLogs", "Title": "June 2026 Stealer Logs",
          "Domain": "", "BreachDate": "2026-06-15", "DataClasses": ["Passwords"],
          "IsStealerLog": True, "PwnCount": 1000},
-        {"Name": "Wattpad", "Domain": "wattpad.com", "BreachDate": "2020-06-29",
+        {"Name": "Wattpad", "Title": "\x3cb\x3eWattpad\x3c/b\x3e",
+         "Domain": "wattpad.com", "BreachDate": "2020-06-29",
          "DataClasses": ["Passwords"], "PwnCount": 2000,
          "Description": "\x3ca href='x'\x3elink\x3c/a\x3e text"}],
         "Pastes": [{"Title": "p", "Source": "P"}]}
@@ -1988,6 +1975,8 @@ def selftest(verbose=False) -> bool:
     add("exposed_sum", rec["total_records_exposed"] == 3000)
     add("html_stripped", "\x3ca" not in rec["breaches"][1]["Description"])
     add("html_kept", "\x3ca" in rec["breaches"][1]["DescriptionHtml"])
+    add("title_stripped", rec["breaches"][1]["Title"] == "Wattpad")
+    add("paste_title_stripped", rec["pastes"][0]["Title"] == "p")
     add("password_breaches", "Wattpad" in rec["password_breaches"])
     add("summary_note_counts", "2" in _summary_note({"breach_count": 2}))
 
@@ -1999,11 +1988,48 @@ def selftest(verbose=False) -> bool:
     add("view_password_only", "password only" in record_view(
         {"kind": "password", "pw_count": 3})[0])
 
+    # ---- zero must survive escaping and the page ----
+    add("esc_zero", _esc(0) == "0")
+    add("esc_false", _esc(False) == "False")
+    _z = {"kind": "combo", "email": "a@b.co", "pw_count": 0, "verdict": "NEW",
+          "addr_verdict": "CLEAN", "read": True}
+    _zt, _zh = record_view(_z)
+    add("html_keeps_zero", "password appearances: 0" in _zh)
+    add("html_keeps_seen_zero", "seen: 0 time(s)" in _zh)
+    add("text_keeps_zero", "password appearances: 0" in _zt)
+    add("basis_partial", "domain match" in record_view(
+        {"kind": "email", "email": "a@b.co", "read": True,
+         "partial_read": True})[0])
+    add("basis_refused", "401/404" in record_view(
+        {"kind": "email", "email": "a@b.co", "read": True, "count": 0})[0])
+    add("basis_unread", "nothing readable" in record_view(
+        {"kind": "email", "email": "a@b.co", "read": False})[0])
+
     add("proxy_parse_auth", (parse_proxy_line("u:p@1.2.3.4:8080") or {}).get("user") == "u")
     add("proxy_parse_plain", (parse_proxy_line("1.2.3.4:8080") or {}).get("port") == 8080)
     add("proxy_reject", parse_proxy_line("nope") is None)
     add("proxy_cfg_server", (_proxy_cfg("1.2.3.4:8080") or {}).get("server")
         == "http://1.2.3.4:8080")
+
+    # ---- the catalogue ----
+    add("cat_helpers", callable(catalogue) and callable(_cat_rows)
+        and callable(catalogue_state))
+    add("cat_ttl", CATALOGUE_TTL >= 3600.0)
+    _keep_cat = dict(_cat)
+    _cat["by_domain"] = {"b.co": [{"Name": "X", "Domain": "b.co",
+                                   "BreachDate": "2024-01-01", "PwnCount": 5,
+                                   "DataClasses": ["Passwords"]}],
+                         "a.b.co": []}
+    _cat["ts"] = time.time()
+    _cat["busy"] = False
+    add("cat_match", len(_cat_rows("me@b.co")) == 1)
+    add("cat_miss", _cat_rows("me@z.co") == [])
+    _cat["by_domain"] = {}
+    _cat["ts"] = 0.0
+    _cat["error"] = "fetch failed"
+    add("cat_none_is_unread", _cat_rows("me@b.co") is None)
+    add("cat_state_keys", set(catalogue_state()) == {"domains", "age", "error"})
+    _cat.update(_keep_cat)
 
     # ---- rotation and the slot ----
     add("rotate_default", _cfg.get("rotate") is True)
@@ -2011,15 +2037,10 @@ def selftest(verbose=False) -> bool:
     add("slot_reuse_reset", hasattr(_Slot, "reset") and hasattr(_Slot, "get")
         and hasattr(_Slot, "bad") and hasattr(_Slot, "ok"))
     add("slot_limits", SLOT_FAILS_MAX >= 1 and SLOT_USES_MAX >= 1)
-    add("slot_has_cf", "cf" in _Slot.__slots__)
-    add("warm_helper", callable(_warm))
-    add("warm_is_origin", _warm.__doc__ is not None and HIBP_BASE.endswith(".com"))
-    add("challenge_mark", "challenge" in CHALLENGE_MARKS)
-    add("wait_is_bounded", CHALLENGE_WAIT >= 10.0)
     _s = _Slot()
     for _ in range(SLOT_FAILS_MAX):
         _s.bad()
-    add("slot_bad_clears", _s.ctx is None and _s.page is None and _s.cf is False)
+    add("slot_bad_clears", _s.ctx is None and _s.page is None)
     _s2 = _Slot()
     _s2.bad()
     _s2.ok()
@@ -2046,11 +2067,13 @@ def selftest(verbose=False) -> bool:
     add("check_many_takes_workers", "workers" in inspect_sig(check_many))
     add("check_many_takes_rotate", "rotate" in inspect_sig(check_many))
     add("check_takes_cancel", "cancel" in inspect_sig(check))
+    add("search_takes_cancel", "cancel" in inspect_sig(_search_address))
     add("clear_cache_exists", callable(clear_cache))
     add("cache_stats_keys", set(cache_stats()) == {"entries", "bytes", "path"})
     add("page_wanted", page_wanted("records") is True)
-    add("js_fetch", "fetch(" in JS_FETCH)
     add("rotate_reported", "rotate" in report())
+    add("cat_reported", "catalogue" in report())
+    add("tries_reported", report().get("tries") == 3)
     add("tag_regex", bool(_TAG_RE.search("\x3cb\x3ex\x3c/b\x3e")))
 
     _ev = threading.Event()
@@ -2091,6 +2114,11 @@ def main(argv=None) -> int:
         st = browser_state()
         print("browser:", st["state"], st.get("error", ""))
         return 0 if st["state"] == "ready" else 1
+    if "--catalogue" in argv:
+        cat = catalogue(force=True)
+        print("catalogue:", "unreadable" if cat is None else
+              "%d domain(s)" % len(cat))
+        return 0 if cat is not None else 1
     if "--probe" in argv:
         try:
             target = argv[argv.index("--probe") + 1]
@@ -2101,7 +2129,8 @@ def main(argv=None) -> int:
         res = check_item(items[0], force=True)
         print("pool:", len(pool_lines()), "rotate:", rotating())
         print(json.dumps({k: res.get(k) for k in ("email", "verdict", "addr_verdict",
-                                                  "pw_band", "count", "read", "via",
+                                                  "pw_band", "count", "read",
+                                                  "partial_read", "pwned", "via",
                                                   "error")}, indent=2))
         print(trace_text(limit=40))
         return 0 if res.get("verdict") else 1
