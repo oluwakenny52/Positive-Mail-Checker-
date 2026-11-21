@@ -11,9 +11,8 @@ Three sources, in order of how much they prove:
                haveibeenpwned.com, finds the search box, types the bare address
                into it, presses Enter, waits for the account page, and reads the
                rendered DOM - the breach names, their dates, the data classes and
-               the accounts figure - plus the page text and HTML from that same
-               read. The JSON the page fires on its own is caught and preferred
-               when it arrives, because it is exact; nothing depends on it.
+               the accounts figure - plus a FULL-PAGE SCREENSHOT, the page text
+               and the page HTML from that same visit.
     catalogue  /api/v3/breaches - one fetch, matched LOCALLY by domain. Kept as
                a fallback for when the address tiers are blocked.
 
@@ -73,15 +72,14 @@ why the browser had failed - it said the site had challenged, which is the one
 thing already known. The failure is folded into addr_rec's error now, so it
 survives to the record.
 
-The per-address budget is 180s, not 45 and not 90. One navigation (20s) + a root
-interstitial (10s) + the box scan + a render ceiling (12s) + an interstitial
-ceiling (25s) does not fit in 90, and the budget also covers a spell in the queue
-behind the other workers. A cut call is indistinguishable from a broken site, and
-the old code answered it by re-queueing the same address and paying the whole
-thing twice.
+The per-address budget is 180s. One navigation (20s) + a root interstitial (10s) +
+the box scan + a render ceiling (12s) + an interstitial ceiling (25s) does not fit
+in 90, and the budget also covers a spell in the queue behind the other workers. A
+cut call is indistinguishable from a broken site, and the old code answered it by
+re-queueing the same address and paying the whole thing twice.
 
-THE PAGE VIEW THAT NEVER EXISTED  (v13.86, this pass)
------------------------------------------------------
+THE PAGE VIEW THAT NEVER EXISTED  (v13.86, earlier pass)
+--------------------------------------------------------
 _page_from_record() builds the Text and HTML view when a live page could not be
 read. It formatted its head with `%` while the head contained the CSS rule
 `width:100%`, and `%` followed by `;` is not a conversion - so EVERY call raised
@@ -91,16 +89,49 @@ Text/HTML toggle, which read as a capture-policy fault and was nothing of the
 kind. The CSS is a constant now, appended unformatted, and the selftest asserts a
 `100%` survives the round trip.
 
-READ, VERSUS ZERO  (v13.86, this pass)
---------------------------------------
+READ, VERSUS ZERO  (v13.86, earlier pass)
+-----------------------------------------
 count 0 and count None used to look identical: "0 breaches" whether the page had
 been read and listed none, or every tier had failed and nothing was read at all.
 Every record now carries `read` (the address half answered) and `partial_read`
 (only the password half answered). A record with read False is UNREAD, not clean,
 and the page, the history and the CSV all say so.
 
-PER-USER ISOLATION, AND THE FOUR PLACES IT BROKE  (v13.86, this pass)
----------------------------------------------------------------------
+THE TWO MINUTES PER ADDRESS, AND THE PAGE YOU COULD NOT SEE  (this pass)
+------------------------------------------------------------------------
+Measured from a real run: 20s of wait_for_url, 37s of flat render ceiling, then a
+retry that paid both again. Two minutes per address, ten minutes for five, and
+"page rendered but no breach block was readable" at the end of every one - even
+though the page HAD navigated (the `landed on .../account/...` line is 30ms after
+the timeout) and renders perfectly in a real browser.
+
+  wait_for_url was the wrong instrument. The site navigates through a Cloudflare
+  challenge, so the URL arrives late and the glob block always ran to the ceiling.
+  The navigation is POLLED now (250ms) and the fallback goto is the safety net,
+  not the first resort.
+
+  _await_render knew only two states - anchors, or clean copy. A page still
+  solving the challenge has neither, so it expired on the ceiling and reported a
+  failed render. _wait_result() polls for what actually settles it - anchors,
+  clean copy, or an interstitial title/body - and returns the state it found:
+  records, clean, wall or blank. A wall is now reported AS a wall.
+
+  And the page is CAPTURED AS AN IMAGE. page.screenshot(full_page=True) gives the
+  whole rendered document, the same thing the print view gives you, so the breach
+  cards, dates and data classes can be read and scrolled even when parsing finds
+  nothing. It is capped, dropped from the disk cache and dropped from history so
+  neither file balloons.
+
+CONCURRENCY IS THE PAGE COUNT  (this pass)
+------------------------------------------
+The page count was only a pool hint and a separate Workers slider bounded
+in-flight addresses, so "Browser pages: 2" opened two tabs and then checked two
+at a time whatever else was set. The slider is gone: workers = pages, the pool is
+resized to match and pre-warmed, so five addresses on five pages start together.
+The delay still paces only the STARTS.
+
+PER-USER ISOLATION, AND THE FOUR PLACES IT BROKE  (earlier pass)
+----------------------------------------------------------------
 The cache and the trace file were already per-user - auth.user_file() prefixes
 them with the unlocked hash - but the RESOLUTION of that identity was not
 isolated, and three pieces of shared state leaked or interfered:
@@ -241,6 +272,7 @@ USAGE
     python breach.py --selftest
 """
 
+import base64
 import concurrent.futures as _cf
 import json
 import os
@@ -289,12 +321,19 @@ UI_SEARCH_SELECTORS = (
     "input[type='email']",
     "input[type='text']",
 )
-# v13.86 FIX PARSE-1: the render wait is a CEILING now, not a fixed sleep, and
-# there is a second ceiling for the interstitial. A fresh __cf_chl_rt_tk is
-# minted per URL, so an account page can land challenged even though the root
-# page cleared - 8s of a flat loop cannot cover that, and the old code returned 0
-# either way.
-RENDER_WAIT = 12.0
+
+# The navigation is POLLED, not blocked on. wait_for_url("**/account/**") ran to
+# its full 20s ceiling on every address because the site navigates THROUGH a
+# Cloudflare challenge and the URL only lands after it - the trace showed "landed
+# on .../account/..." 30ms after the timeout. 250ms is the poll step; NAV_POLL is
+# the short ceiling before the direct goto takes over as the safety net.
+NAV_POLL = 12.0
+NAV_STEP = 250
+
+# How long the result is waited for once the page is real, and how much longer
+# while the title or body still reads as an interstitial. These are ceilings on
+# a POLL, not sleeps: a normal page settles in 2-4s and returns at once.
+RESULT_WAIT = 25.0
 CHALLENGE_EXTRA = 25.0
 INTERSTITIAL_MARKS = ("just a moment", "checking your browser", "verify you are human",
                       "performing security verification", "attention required",
@@ -335,6 +374,11 @@ JS_READ = """() => {
 
 PAGE_HTML_MAX = 90000
 PAGE_TEXT_MAX = 30000
+# The screenshot is the whole rendered document, base64. It is the view that
+# survives a parse failure - the breach cards, dates and classes are legible in
+# the image even when no anchor matches. Capped, and dropped from the disk cache
+# and from history so neither file balloons.
+PAGE_SHOT_MAX = 6000000
 PAGE_TIMEOUT = 12.0
 
 # WHEN a page is captured. Two modes, because a page costs a second request per
@@ -369,8 +413,8 @@ HTTP_TIMEOUT = 8.0
 NAV_TIMEOUT = 20000
 CHALLENGE_WAIT = 25.0
 # The root clear only has to re-establish a cookie the context already holds, so
-# it gets a short ceiling. The full CHALLENGE_WAIT is still spent where it
-# matters: on the account page itself, in _await_render.
+# it gets a short ceiling. The long window is spent where it counts: on the
+# account page itself, in _wait_result.
 ROOT_SETTLE = 10.0
 BOOT_WAIT = 90.0
 BOOT_RETRY_AFTER = 60.0
@@ -383,8 +427,7 @@ CATALOGUE_TTL = 6 * 3600.0
 INSTALL_TIMEOUT = 900
 
 # Pacing. One new address may START every DELAY_DEFAULT seconds; workers bound
-# concurrency, delay bounds the rate. 0 = flood as fast as the pool allows. The
-# address tier is a whole page load, so the defaults are deliberately small.
+# concurrency, delay bounds the rate. 0 = flood as fast as the pool allows.
 DELAY_DEFAULT = 3.0
 DELAY_MAX = 20.0
 BROWSER_SETTLE = 500      # ms to sit on a page before reading it
@@ -423,12 +466,10 @@ TRACE_NAME = "breach_trace.jsonl"
 TRACE_FILE_MAX = 4000
 TRACE_DUMP_MAX = 500
 
-# 180s, not 45 and not 90. A navigation (20s) plus a root interstitial (10s) plus
-# the box scan plus a render ceiling (12s) plus an interstitial ceiling (25s)
-# does not fit in 90 - and the budget also has to cover time spent in the queue
-# behind the other workers, because the timeout is armed at submit, not at page
-# take. A cut call is indistinguishable from a broken site, and it used to be
-# answered by re-queueing the same address and paying the whole thing twice.
+# 180s. The budget has to cover time spent in the QUEUE behind the other workers,
+# because the timeout is armed at submit, not at page take. A cut call is
+# indistinguishable from a broken site, and it used to be answered by re-queueing
+# the same address and paying the whole thing twice.
 _cfg = {"pages": PAGES_DEFAULT, "timeout": 180.0, "delay": DELAY_DEFAULT,
         "http_only": False, "page_mode": PAGE_MODE_FAST,
         "page_on": tuple(PAGE_ON_DEFAULT)}
@@ -475,6 +516,8 @@ _CLASSES_RE = re.compile(r"compromised data:?\s*([^\n]{0,200})", re.IGNORECASE)
 _COUNT_RE = re.compile(r"([\d][\d,]{3,})\s+accounts", re.IGNORECASE)
 _MONTHS = {"jan": 1, "feb": 2, "mar": 3, "apr": 4, "may": 5, "jun": 6,
            "jul": 7, "aug": 8, "sep": 9, "oct": 10, "nov": 11, "dec": 12}
+
+RESIZE_MARK = "__RESIZE__"
 
 
 # ---------------------------------------------------------------------------
@@ -992,6 +1035,12 @@ def account_url(addr) -> str:
     return ACCOUNT % urllib.parse.quote(_email_only(addr))
 
 
+def _clean_url(url) -> str:
+    """A URL without Cloudflare's per-navigation token, for display only."""
+    u = str(url or "")
+    return u.split("?", 1)[0] if "?" in u else u
+
+
 def _esc(v) -> str:
     """Minimal HTML escape for the generated view."""
     return (str(v or "").replace("&", "&amp;").replace("<", "&lt;")
@@ -1118,7 +1167,7 @@ def _blank(addr, pw="") -> dict:
             "pw_count": None, "corpora": 0, "sites": 0, "sensitive": 0,
             "newest_days": None, "count": None, "via": "",
             "read": False, "partial_read": False,
-            "page_url": "", "page_html": "", "page_text": "",
+            "page_url": "", "page_html": "", "page_text": "", "page_shot": "",
             "page_via": "", "page_error": "", "page_at": "",
             "checked_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"), "error": ""}
 
@@ -1627,6 +1676,9 @@ class _BrowserPool:
     Each job carries its OWNER, and the driver pins it before it touches a page,
     so a pool line lands in the right user's trace and the page a job takes can
     never be handed to another job while it is in use.
+
+    The page count IS the concurrency: resize() moves the target, and the driver
+    pre-opens pages to it so a run does not pay tab creation on its first jobs.
     """
 
     def __init__(self, size):
@@ -1637,6 +1689,20 @@ class _BrowserPool:
         self._started = threading.Event()
         self._boot_err = ""
         self._closed = False
+
+    def resize(self, size):
+        """Ask for a different page count. No-op when unchanged.
+
+        The pages themselves are created on the driver thread - Playwright's sync
+        API cannot be touched from here - so this only posts the target.
+        """
+        try:
+            size = max(1, min(PAGES_MAX, int(size)))
+        except Exception:
+            return
+        if size == self._size:
+            return
+        self._q.put((RESIZE_MARK, size, None, ""))
 
     def start(self):
         """Spawn the driver thread and wait for the boot. Raises on boot failure.
@@ -1702,6 +1768,17 @@ class _BrowserPool:
             if job is None:
                 break
             addr, pw_s, fut, job_owner = job
+            if addr == RESIZE_MARK:
+                self._size = max(1, min(PAGES_MAX, int(pw_s)))
+                # Pre-open to the new target so the first jobs of a run do not
+                # pay a tab creation each.
+                while self._free.qsize() < self._size:
+                    _p2 = self._new_page(context)
+                    if _p2 is None:
+                        break
+                    self._free.put(_p2)
+                trace("INFO", "browser", "pool target is now %d page(s)" % self._size)
+                continue
             # Pin the job's owner on THIS thread before any trace call, so a
             # pool line is written to the file of the user whose address it is.
             set_owner(job_owner)
@@ -1710,7 +1787,7 @@ class _BrowserPool:
                 page = self._take(context)
                 trace("INFO", "browser", "page taken", addr)
                 started = time.time()
-                cap_status, cap_body = self._ui_search(page, addr)
+                cap_status, cap_body, state = self._ui_search(page, addr)
                 got = None
                 if cap_status == 200 and cap_body:
                     try:
@@ -1723,30 +1800,31 @@ class _BrowserPool:
                         trace("WARN", "browser", "caught json unparsable (%s) - "
                               "scraping the DOM" % type(exc).__name__, addr)
                         rec, got = self._dom_record(page, addr, pw_s)
-                elif cap_status == 404:
+                elif state == "records":
+                    rec, got = self._dom_record(page, addr, pw_s)
+                elif state == "clean":
                     rec = _blank(addr, pw_s)
                     rec["via"] = "browser"
                     rec["count"] = 0
                     got = self._read(page)
-                elif cap_status in (401, 403, 429, 503):
-                    # THE JSON FAILING DOES NOT MEAN THE PAGE FAILED. The in-page
-                    # fetch hits the same wall the DOM already got past, so the
-                    # rendered page is read FIRST and the 401 is only the reason
-                    # when the DOM has nothing either. This is the branch that
-                    # discarded sportmedizin's rendered page.
+                elif state == "wall":
+                    # The DOM is still read: the interstitial's own markup is the
+                    # proof, and the screenshot shows exactly what was served.
                     rec, got = self._dom_record(page, addr, pw_s)
                     if rec.get("error"):
-                        rec["error"] = ("challenge survived (http %d) - %s"
-                                        % (cap_status, rec["error"]))
-                    trace("WARN", "browser",
-                          "json challenged (http %d), dom read: %s"
-                          % (cap_status, "empty" if rec.get("error") else "ok"), addr)
+                        rec["error"] = "challenge wall - %s" % rec["error"]
+                    trace("WARN", "browser", "challenge wall, dom read: %s"
+                          % ("empty" if rec.get("error") else "ok"), addr)
                 else:
                     rec, got = self._dom_record(page, addr, pw_s)
 
                 if rec.get("error") or rec.get("count") is not None:
                     kind = ("records" if rec.get("count") else
                             ("error" if rec.get("error") else "clean"))
+                    if page_wanted(kind):
+                        _shot = self._shot(page)
+                        if _shot:
+                            rec["page_shot"] = _shot
                     rec.update(_fill_page(page, got, addr, kind))
                 if not fut.done():
                     fut.set_result(rec)
@@ -1785,12 +1863,16 @@ class _BrowserPool:
             return None
 
     def _take(self, context):
-        try:
-            page = self._free.get_nowait()
-            if not page.is_closed():
-                return page
-        except queue.Empty:
-            pass
+        while True:
+            try:
+                page = self._free.get_nowait()
+            except queue.Empty:
+                break
+            try:
+                if not page.is_closed():
+                    return page
+            except Exception:
+                pass
         page = self._new_page(context)
         if page is None:
             raise RuntimeError("could not open a page")
@@ -1802,7 +1884,7 @@ class _BrowserPool:
         The budget is ROOT_SETTLE, not CHALLENGE_WAIT: the context already holds
         the clearance cookie, so the root normally loads first time and only a
         genuinely re-challenged session spends the full window. The long window
-        is spent where it counts, on the account page in _await_render.
+        is spent where it counts, on the account page in _wait_result.
         """
         trace("INFO", "browser", "landing on %s/ to clear" % HIBP_BASE)
         page.goto(HIBP_BASE + "/", wait_until="domcontentloaded", timeout=NAV_TIMEOUT)
@@ -1838,25 +1920,54 @@ class _BrowserPool:
             trace("WARN", "browser", "read failed: %s" % type(exc).__name__)
             return {}
 
-    def _await_render(self, page):
-        """Wait until the result is on the page. Returns the anchor count.
+    def _shot(self, page):
+        """The whole rendered document as base64 PNG. "" when it cannot be taken.
 
-        A CHALLENGE ON THE ACCOUNT URL IS WAITED OUT, not counted as a failed
-        render - the interstitial has no anchors and no "no pwnage" copy, so the
-        flat 8s loop used to expire on a page that was still solving and report
-        zero. The render ceiling only starts once the page is real.
+        full_page=True is the point: the breach cards, their dates and the data
+        classes are all below the fold, and a viewport-sized grab shows one card.
+        This is the view that survives a parse failure, so it is taken whether or
+        not the scrape found anything.
         """
-        hard = time.time() + RENDER_WAIT + CHALLENGE_EXTRA
-        while time.time() < hard:
+        try:
+            raw = page.screenshot(full_page=True, type="png")
+        except Exception as exc:
+            trace("WARN", "browser", "screenshot failed: %s" % type(exc).__name__)
+            return ""
+        if not raw:
+            return ""
+        try:
+            b64 = base64.b64encode(raw).decode("ascii")
+        except Exception:
+            return ""
+        if len(b64) > PAGE_SHOT_MAX:
+            trace("WARN", "browser", "screenshot too large (%d) - dropped"
+                  % len(b64))
+            return ""
+        return b64
+
+    def _wait_result(self, page, budget=RESULT_WAIT, extra=CHALLENGE_EXTRA):
+        """Poll until the page is a REAL answer. Returns (state, anchors).
+
+        state is records / clean / wall / blank. This is the replacement for a
+        flat render ceiling: the old loop knew only "anchors" and "clean copy", so
+        a page still solving the challenge matched neither and expired on the
+        ceiling, then reported "rendered but no breach block was readable" - the
+        same words for a wall and for a blank frame.
+
+        The render budget only starts once the title is not an interstitial; the
+        extra window is for the wall itself.
+        """
+        soft = time.time() + budget
+        hard = soft + extra
+        while True:
             try:
                 title = (page.title() or "").lower()
             except Exception:
                 title = ""
             if any(m in title for m in INTERSTITIAL_MARKS):
-                try:
-                    page.wait_for_timeout(900)
-                except Exception:
-                    time.sleep(0.9)
+                if time.time() >= hard:
+                    return "wall", 0
+                self._sleep(page, 700)
                 continue
             try:
                 n = page.evaluate(
@@ -1864,7 +1975,7 @@ class _BrowserPool:
             except Exception:
                 n = 0
             if n:
-                return int(n)
+                return "records", int(n)
             try:
                 low = (page.evaluate(
                     "() => document.body ? (document.body.innerText || '') : ''"
@@ -1872,24 +1983,49 @@ class _BrowserPool:
             except Exception:
                 low = ""
             if any(m in low for m in CLEAN_MARKS):
-                return 0
-            try:
-                page.wait_for_timeout(500)
-            except Exception:
-                time.sleep(0.5)
-        return 0
+                return "clean", 0
+            if any(m in low for m in INTERSTITIAL_MARKS):
+                if time.time() >= hard:
+                    return "wall", 0
+                self._sleep(page, 700)
+                continue
+            if time.time() >= soft:
+                # One last look, scrolled: a tile mounted on scroll is not in the
+                # DOM until it is scrolled into view.
+                try:
+                    page.evaluate("() => window.scrollTo(0, document.body.scrollHeight)")
+                except Exception:
+                    pass
+                self._sleep(page, 500)
+                try:
+                    n = page.evaluate(
+                        "() => document.querySelectorAll(\"a[href*='/breach/']\").length")
+                except Exception:
+                    n = 0
+                return ("records", int(n)) if n else ("blank", 0)
+            self._sleep(page, 400)
+
+    def _sleep(self, page, ms):
+        try:
+            page.wait_for_timeout(ms)
+        except Exception:
+            time.sleep(ms / 1000.0)
 
     def _ui_search(self, page, addr):
         """Type the address into the site's own box and land on its page.
 
-        Returns (status, body) for the JSON response the page fired on its own, if
-        any was caught. status 0 means nothing was caught and the caller must read
-        the DOM instead - which is the normal path when the endpoint is walled.
+        Returns (status, body, state). status/body are the JSON the page fired on
+        its own, if any was caught - 0 means none was and the DOM is the answer.
+        state is what _wait_result settled on.
+
+        The navigation is POLLED, not blocked on. wait_for_url("**/account/**")
+        ran to its full 20s ceiling on every single address because the site
+        navigates through a Cloudflare challenge and the URL only lands after it -
+        the trace showed the account URL arriving 30ms after the timeout. Polling
+        notices it in a second or two and starts reading.
 
         The address typed is _email_only(), so the box receives the bare address
-        and never a combo tail. If no box can be found, or the click is swallowed
-        by a banner, it navigates straight to the account page: same page, same
-        render, just no typing.
+        and never a combo tail.
         """
         addr = _email_only(addr)
         cap = {}
@@ -1907,6 +2043,7 @@ class _BrowserPool:
             page.on("response", _on_response)
         except Exception:
             pass
+        state = "blank"
         try:
             # ALWAYS, not only off-site. The pool hands back a page still sitting
             # on the previous account URL, so the old guard skipped the clear and
@@ -1948,17 +2085,25 @@ class _BrowserPool:
                     page.goto(account_url(addr), wait_until="domcontentloaded",
                               timeout=NAV_TIMEOUT)
                 else:
-                    try:
-                        page.wait_for_url("**/account/**", timeout=NAV_TIMEOUT)
-                    except Exception:
-                        trace("WARN", "ui", "no navigation to an account page", addr)
-                        if "/account/" not in (page.url or ""):
-                            page.goto(account_url(addr),
-                                      wait_until="domcontentloaded",
-                                      timeout=NAV_TIMEOUT)
-            trace("INFO", "ui", "landed on %s" % (page.url or "-")[:140], addr)
-            n = self._await_render(page)
-            trace("INFO", "ui", "rendered %s breach link(s)" % n, addr)
+                    # POLL for the account URL instead of a 20s glob block.
+                    deadline = time.time() + NAV_POLL
+                    landed = False
+                    while time.time() < deadline:
+                        try:
+                            if "/account/" in (page.url or ""):
+                                landed = True
+                                break
+                        except Exception:
+                            pass
+                        self._sleep(page, NAV_STEP)
+                    if not landed:
+                        trace("WARN", "ui", "no navigation to an account page - "
+                              "going directly", addr)
+                        page.goto(account_url(addr), wait_until="domcontentloaded",
+                                  timeout=NAV_TIMEOUT)
+            trace("INFO", "ui", "landed on %s" % _clean_url(page.url or "-")[:140], addr)
+            state, n = self._wait_result(page)
+            trace("INFO", "ui", "settled: %s (%s breach link(s))" % (state, n), addr)
         except Exception as exc:
             trace("ERR", "ui", "%s: %s" % (type(exc).__name__, exc), addr)
         finally:
@@ -1966,7 +2111,7 @@ class _BrowserPool:
                 page.remove_listener("response", _on_response)
             except Exception:
                 pass
-        return int(cap.get("status") or 0), str(cap.get("body") or "")
+        return int(cap.get("status") or 0), str(cap.get("body") or ""), state
 
     def _dom_record(self, page, addr, pw):
         """Build the record from what actually rendered. Returns (rec, got).
@@ -2026,7 +2171,7 @@ class _BrowserPool:
 
 
 def _get_pool():
-    """The process pool, started once.
+    """The process pool, started once, and kept at the requested page count.
 
     The page count is read BEFORE the lock: _pages() takes the same lock, so
     reading it inside the with-block on a non-reentrant lock would block for ever
@@ -2037,9 +2182,9 @@ def _get_pool():
     launch and the workers take _lock too.
 
     The pool is shared by every user on purpose - one Chromium, one clearance
-    cookie - and pages are created on demand, so a second user's addresses are
-    not capped by the first user's page count. They do share the QUEUE, so a
-    large run delays a small one.
+    cookie. The QUEUE is shared too, so a large run delays a small one, but pages
+    are created on demand and resize() moves the target, so the page count is the
+    concurrency for whoever is running.
     """
     global _pool, _pool_boot_failed
     size = _pages()
@@ -2056,6 +2201,7 @@ def _get_pool():
     except Exception:
         _pool_boot_failed = time.time()
         raise
+    pool.resize(size)
     _pool_boot_failed = 0.0
     return pool
 
@@ -2170,8 +2316,7 @@ def check(addr, password="", force=False, allow_browser=None) -> dict:
                 # ONE retry, and only for an EMPTY READ - a page that rendered and
                 # held nothing. A TimeoutError already means the pool was slower
                 # than the whole budget, so re-queueing it pays the same wait a
-                # second time behind the addresses still queued; the page the
-                # first job produced arrives later anyway.
+                # second time behind the addresses still queued.
                 _cut = "TimeoutError" in str(addr_rec.get("error") or "")
                 if (not addr_rec.get("breaches") and addr_rec.get("error")
                         and not _cut):
@@ -2218,8 +2363,8 @@ def check(addr, password="", force=False, allow_browser=None) -> dict:
     rec["read"] = bool(addr_rec.get("count") is not None
                        and not addr_rec.get("error"))
     rec["partial_read"] = bool(not rec["read"] and rec.get("pw_count") is not None)
-    for _k in ("page_url", "page_html", "page_text", "page_via", "page_error",
-               "page_at"):
+    for _k in ("page_url", "page_html", "page_text", "page_shot", "page_via",
+               "page_error", "page_at"):
         if _k in addr_rec:
             rec[_k] = addr_rec[_k]
 
@@ -2251,7 +2396,12 @@ def check(addr, password="", force=False, allow_browser=None) -> dict:
              addr_rec.get("via") or "-", rec["elapsed_ms"]), addr)
 
     if rec["bucket"] != "UNKNOWN":
-        cache.setdefault("address", {})[addr] = {"ts": time.time(), "report": rec}
+        # The screenshot is stripped from the cached report: a 1-4MB data URI per
+        # address would make breach_cache.json unusable within a few runs. A
+        # cache hit still carries the text and HTML view.
+        _slim = dict(rec)
+        _slim.pop("page_shot", None)
+        cache.setdefault("address", {})[addr] = {"ts": time.time(), "report": _slim}
         _save(cache)
     _remember(rec)
     return rec
@@ -2464,6 +2614,10 @@ def selftest(verbose=False) -> bool:
     # ---- READ, VERSUS ZERO ----
     add("blank_read_false", _blank("a@b.co").get("read") is False)
     add("blank_partial_false", _blank("a@b.co").get("partial_read") is False)
+    add("blank_has_shot", "page_shot" in _blank("a@b.co"))
+    add("clean_url_strips_token",
+        _clean_url("https://x/account/a%40b.co?__cf_chl_rt_tk=zz") ==
+        "https://x/account/a%40b.co")
 
     # ---- ISOLATION: the owner pins the paths, and does not survive a thread --
     _was_owner = owner()
@@ -2643,17 +2797,27 @@ def selftest(verbose=False) -> bool:
     add("js_read_innertext", "innerText" in JS_READ)
     add("js_read_dedupes", "seen" in JS_READ)
     add("js_read_fallback", "class*='pwned'" in JS_READ)
-    add("render_ceiling_raised", RENDER_WAIT >= 12.0)
+    add("render_ceiling_raised", RESULT_WAIT >= 20.0)
     add("challenge_ceiling", CHALLENGE_EXTRA > 0)
     add("root_settle_shorter", ROOT_SETTLE < CHALLENGE_WAIT)
+    add("nav_poll_shorter", NAV_POLL < NAV_TIMEOUT / 1000.0)
+    add("nav_is_polled", "NAV_POLL" in inspect.getsource(_BrowserPool._ui_search))
     add("interstitial_marks", "just a moment" in INTERSTITIAL_MARKS)
     add("settle_exists", hasattr(_BrowserPool, "_settle"))
+    add("wait_result_exists", hasattr(_BrowserPool, "_wait_result"))
+    add("shot_exists", hasattr(_BrowserPool, "_shot"))
+    add("resize_exists", hasattr(_BrowserPool, "resize"))
+    add("resize_handled", RESIZE_MARK in inspect.getsource(_BrowserPool._run))
+    add("shot_cap_sane", 1000000 < PAGE_SHOT_MAX <= 12000000)
+    add("shot_is_full_page", "full_page=True" in inspect.getsource(_BrowserPool._shot))
     add("clear_unconditional", "if \"haveibeenpwned.com\" not in"
         not in inspect.getsource(_BrowserPool._ui_search))
     add("ui_waits_for_box", "wait_for_selector" in
         inspect.getsource(_BrowserPool._ui_search))
     add("dom_record_scrolls", "scrollTo" in inspect.getsource(_BrowserPool._dom_record))
     add("dom_read_on_wall", "_dom_record(page, addr, pw_s)" in
+        inspect.getsource(_BrowserPool._run))
+    add("wall_reported_as_wall", "challenge wall" in
         inspect.getsource(_BrowserPool._run))
     add("check_retries_once", "one retry" in inspect.getsource(check))
     add("gen_force_param", "force" in inspect.signature(_page_from_record).parameters)
@@ -2728,12 +2892,13 @@ def selftest(verbose=False) -> bool:
     add("available_checks_boot", "_pool_boot_failed" in inspect.getsource(available))
     add("check_keeps_reason", "addr_rec[\"error\"] +=" in inspect.getsource(check))
     add("timeout_default_roomy", _cfg["timeout"] >= 90.0)
-    # ---- the budget covers a queue slot, not just one page ----
     add("budget_covers_queue", _cfg["timeout"] >= 180.0)
     add("budget_from_snapshot", "one retry" in inspect.getsource(check)
         and "_budget()" in inspect.getsource(check))
     add("retry_skips_cut_calls", "_cut" in inspect.getsource(check))
     add("check_many_guards_one", "rec = check(em, pw" in inspect.getsource(check_many))
+    add("pool_resized_on_get", "pool.resize(size)" in inspect.getsource(_get_pool))
+    add("cache_drops_shot", "pop(\"page_shot\"" in inspect.getsource(check))
 
     before = trace_seq()
     trace("INFO", "selftest", "hello")
