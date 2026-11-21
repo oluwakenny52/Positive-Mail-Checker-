@@ -229,16 +229,17 @@ st.markdown(_css(), unsafe_allow_html=True)
 import breach
 
 # ---- stale-module guard -------------------------------------------------------
-# parse_lines, pool_lines, check_item, clear_cache, cache_stats and record_view are
-# version markers: a module without them predates the proxy edition. _Slot and
-# RESULT_WAIT are the page-slot edition - a module without them still closed a
-# context per attempt, so it is replaced as well.
+# Every marker is a capability this page calls. A module missing one predates it
+# and is replaced before anything touches it. `_zero_rule` and `PROXY_TRIES` are
+# the Colab-rule markers: a module without them still treated a 401 as UNREAD and
+# still waited on a Turnstile widget, so it has to go.
 if not (hasattr(breach, "parse_lines") and hasattr(breach, "pool_lines")
         and hasattr(breach, "check_item") and hasattr(breach, "clear_cache")
         and hasattr(breach, "cache_stats") and hasattr(breach, "record_view")
-        and hasattr(breach, "set_owner") and hasattr(breach, "_await")
-        and hasattr(breach, "_Slot") and hasattr(breach, "JS_FETCH")
-        and hasattr(breach, "RESULT_WAIT") and hasattr(breach, "rotating")):
+        and hasattr(breach, "set_owner") and hasattr(breach, "_Slot")
+        and hasattr(breach, "rotating") and hasattr(breach, "_zero_rule")
+        and hasattr(breach, "PROXY_TRIES") and hasattr(breach, "catalogue")
+        and hasattr(breach, "_cat_rows") and hasattr(breach, "catalogue_state")):
     breach = importlib.reload(breach)
     try:
         breach.trace("INFO", "page", "stale breach module replaced by reload")
@@ -457,10 +458,10 @@ def _record_page(r):
 
 
 def _csv(rows):
-    head = ("verdict,kind,email,breaches,pastes,pw_count,pw_hits,corpora,sites,"
-            "stealer,sensitive,earliest_breach,latest_breach,total_exposed,"
+    head = ("verdict,kind,email,pwned,breaches,pastes,pw_count,pw_hits,corpora,"
+            "sites,stealer,sensitive,earliest_breach,latest_breach,total_exposed,"
             "breach_names,data_classes,paste_titles,via,via_proxy,reason,error,"
-            "checked_at,read")
+            "checked_at,read,partial")
     out = [head]
     for r in rows:
         bs = r.get("breaches") or []
@@ -469,6 +470,7 @@ def _csv(rows):
             str(r.get("verdict") or ""),
             str(r.get("kind") or ""),
             str(r.get("email") or ""),
+            "yes" if r.get("pwned") else "no",
             str(len(bs)),
             str(len(ps)),
             str(r.get("pw_count") if r.get("pw_count") is not None else ""),
@@ -493,6 +495,7 @@ def _csv(rows):
             '"%s"' % str(r.get("error") or "").replace('"', "'"),
             str(r.get("checked_at") or ""),
             "yes" if r.get("read") else "no",
+            "yes" if r.get("partial_read") else "no",
         ]))
     return "\n".join(out) + "\n"
 
@@ -835,6 +838,22 @@ _rows = st.session_state.get(_RES_KEY) or []
 # A 500-item run cannot draw 500 expanders on a phone in one go.
 _CARD_MAX = 150
 
+
+def _iframe(html, height=520):
+    """st.iframe when the runtime has it, else the legacy component.
+
+    st.iframe takes an HTML string directly and auto-detects it as markup. The
+    legacy call is only reached on a Streamlit old enough not to have it, and
+    `components.v1.html` prints a deprecation line on every single call.
+    """
+    fn = getattr(st, "iframe", None)
+    if callable(fn):
+        fn(html, height=height)
+        return
+    import streamlit.components.v1 as components
+    components.html(html, height=height, scrolling=True)
+
+
 if _rows:
     _b = _band_counts(_rows)
     _q = st.session_state.get(_QUAL_KEY) or {}
@@ -857,16 +876,20 @@ if _rows:
         % (_q.get("pct", {}).get("OLD", 0), _q.get("pct", {}).get("PARTIAL", 0),
            _q.get("pct", {}).get("NEW", 0), _q.get("pct", {}).get("UNKNOWN", 0)))
 
-    # FIX UNREAD-1: this caption carried two arguments and one placeholder, so it
-    # raised "not all arguments converted" the first time a run had an unread row.
-    # The count is now "x of y", which is also the more useful reading.
     _unread_rows = [r for r in _rows
                     if not r.get("read") and r.get("kind") != "password"]
     if _unread_rows:
-        st.caption("\u26a0 **%d of %d address half(s) were never read.** Their "
-                   "counts are UNREAD, not zero, and a verdict on one of them comes "
-                   "from the password half alone."
+        st.caption("\u26a0 **%d of %d address half(s) were never read.** Proxy and "
+                   "direct both failed on them, so the verdict rests on the password "
+                   "half alone."
                    % (len(_unread_rows), len(_rows)))
+    _dom_rows = [r for r in _rows if r.get("partial_read")]
+    if _dom_rows:
+        st.caption("\U0001f4da **%d of %d were matched by DOMAIN**, not by the exact "
+                   "address - the exact search was refused (401/404) and the "
+                   "catalogue answered instead. The breach list is real for the "
+                   "domain; this mailbox is not individually confirmed."
+                   % (len(_dom_rows), len(_rows)))
     st.bar_chart({"Band": list(_q.get("buckets", {}).keys()),
                   "Count": list(_q.get("buckets", {}).values())},
                  x="Band", y="Count", height=160)
@@ -903,6 +926,7 @@ if _rows:
             _bs = r.get("breaches") or []
             _ps = r.get("pastes") or []
             _read = bool(r.get("read"))
+            _dom = bool(r.get("partial_read"))
             _head_v = (_v if r.get("pw_band") != "none"
                        else str(r.get("addr_verdict") or _v))
             _key = _row_key(r)
@@ -928,9 +952,14 @@ if _rows:
                                "verdict.")
                 if r.get("error"):
                     st.caption("error: %s" % r["error"])
-                if not _read and r.get("kind") != "password":
-                    st.caption("\u26a0 **The address half was not read.** The counts "
-                               "below are unread, not zero.")
+                if _dom:
+                    st.caption("\U0001f4da **Matched by domain** (`%s`) from the "
+                               "catalogue - the exact search was refused (401/404), "
+                               "so this mailbox is not individually confirmed."
+                               % (str(r.get("email") or "").rsplit("@", 1)[-1] or "?"))
+                elif not _read and r.get("kind") != "password":
+                    st.caption("\u26a0 **The address half was not read.** Proxy and "
+                               "direct both failed; the counts are unread, not zero.")
                 if _bs:
                     st.markdown("**Breaches on this address** - %d" % len(_bs))
                     for b in _bs[:25]:
@@ -951,7 +980,7 @@ if _rows:
                             st.caption(str(b.get("Description")
                                            or b.get("description"))[:300])
                 elif _read:
-                    st.caption("No breach record - the answer was read and lists none.")
+                    st.caption("No breach record - the source was read and lists none.")
                 elif r.get("error"):
                     st.caption("No breach record could be read - see the error above.")
                 if _ps:
@@ -973,9 +1002,7 @@ if _rows:
                         mime="text/plain", width="stretch",
                         key="_pvt_%s" % _key)
                 else:
-                    import streamlit.components.v1 as components
-                    components.html(_pg_h or "\x3cp\x3e(empty page)\x3c/p\x3e",
-                                    height=520, scrolling=True)
+                    _iframe(_pg_h or "\x3cp\x3e(empty page)\x3c/p\x3e", height=520)
                     st.download_button(
                         "\u2b07 Download this page as HTML",
                         data=_pg_h.encode("utf-8"),
