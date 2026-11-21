@@ -1,7 +1,23 @@
 """breach.py - breach exposure and combo freshness.  v13.86
 
-CLEARANCE IS A COOKIE, NOT A GUESS  (this pass)
------------------------------------------------
+THE KEY IS THE PRIMARY PATH  (this pass)
+----------------------------------------
+The browser was the only way to the address half, so every run paid for a page:
+a navigation, a challenge, a fetch, a screenshot. The free HIBP API key answers
+the same question with two small JSON calls and no page at all.
+
+So the order is fixed now: Pwned Passwords, then the KEYED API, then the keyless
+site endpoint, and the browser ONLY as a fallback. `fallback` is a setting, on by
+default and persisted per user. With it off, a refused address stops at UNREAD
+instead of opening a page - which is the whole point of having a key.
+
+A key that answers ends the address half immediately; nothing is opened. A key
+that 401s, 403s, 429s or times out hands over to the next tier and says so in the
+trace. The browser is never reached with the switch off, and the record carries
+"browser fallback off" so an unread half is explained rather than mysterious.
+
+CLEARANCE IS A COOKIE, NOT A GUESS  (earlier pass)
+--------------------------------------------------
 A log showed the fetch being declared "wall cleared, retrying" SIX MILLISECONDS
 after a 401:
 
@@ -18,15 +34,15 @@ cf_clearance is the arbiter now. No cookie -> solve first, and again between
 attempts; "cleared" means the cookie EXISTS, or the wall has been absent twice
 running. A slot also warms up at boot, so the cookie is on disk before address 1.
 
-THE TURNSTILE CLICK  (this pass)
---------------------------------
+THE TURNSTILE CLICK  (earlier pass)
+-----------------------------------
 frame_locator() on a shadow-hosted cross-origin iframe returned False on every
 attempt - there was no "clicked the challenge widget" line in any run. The frames
 are iterated directly now (page.frames, URL match) and clicked inside, with a
 mouse click on the iframe's own geometry as a fallback.
 
-BOTH HALVES ARE SHOWN  (this pass)
-----------------------------------
+BOTH HALVES ARE SHOWN  (earlier pass)
+-------------------------------------
 With a password supplied, PARTIAL came from 1,902 password hits while the address
 half was never read, and the card never said which half produced the verdict - so
 a clean address looked like a breach. Every record now carries `addr_verdict` and
@@ -42,9 +58,7 @@ scrapes the DOM when the fetch is refused.
 
 THE REST
 --------
-Three sources in order of proof: Pwned Passwords (k-anonymity, keyless), the
-address, the catalogue. A combo is only as good as its worse half. Bands are about
-freshness, not count:
+Bands are about freshness, not count:
 
     NEW       password unseen, or address in a corpus < 365d
     PARTIAL   password seen 1-9999 times, or address in a breach < 730d
@@ -65,6 +79,7 @@ Plain module, NOT frame-gated. No Streamlit. EVERY public function swallows.
 """
 
 import concurrent.futures as _cf
+import inspect
 import json
 import os
 import queue
@@ -228,7 +243,7 @@ TRACE_FILE_MAX = 4000
 TRACE_DUMP_MAX = 500
 
 _cfg = {"pages": PAGES_DEFAULT, "timeout": 180.0, "delay": DELAY_DEFAULT,
-        "http_only": False, "page_mode": PAGE_MODE_FAST,
+        "http_only": False, "fallback": True, "page_mode": PAGE_MODE_FAST,
         "page_on": tuple(PAGE_ON_DEFAULT)}
 _lock = threading.RLock()
 _pool = None
@@ -328,7 +343,7 @@ def _user_dir(name) -> str:
 # config
 # ---------------------------------------------------------------------------
 def configure(pages=None, timeout=None, delay=None, http_only=None,
-              page_mode=None, page_on=None):
+              fallback=None, page_mode=None, page_on=None):
     with _lock:
         if pages is not None:
             try:
@@ -347,6 +362,8 @@ def configure(pages=None, timeout=None, delay=None, http_only=None,
                 pass
         if http_only is not None:
             _cfg["http_only"] = bool(http_only)
+        if fallback is not None:
+            _cfg["fallback"] = bool(fallback)
         if page_mode is not None:
             _mode = str(page_mode or "").strip().lower()
             if _mode in PAGE_MODES:
@@ -367,15 +384,18 @@ def _cfg_get(key, default=None):
         return _cfg.get(key, default)
 
 
-def _snapshot_cfg(http_only=None) -> dict:
+def _snapshot_cfg(http_only=None, fallback=None) -> dict:
     with _lock:
         snap = {"pages": int(_cfg["pages"]), "delay": float(_cfg["delay"]),
                 "timeout": float(_cfg["timeout"]),
                 "http_only": bool(_cfg.get("http_only")),
+                "fallback": bool(_cfg.get("fallback", True)),
                 "page_mode": str(_cfg.get("page_mode") or PAGE_MODE_FAST),
                 "page_on": tuple(_cfg.get("page_on") or ())}
     if http_only is not None:
         snap["http_only"] = bool(http_only)
+    if fallback is not None:
+        snap["fallback"] = bool(fallback)
     return snap
 
 
@@ -406,6 +426,11 @@ def _delay() -> float:
 
 def _http_only() -> bool:
     return bool(_cfg_get("http_only", False))
+
+
+def _fallback() -> bool:
+    """True when the browser may still be used after the API tiers fail."""
+    return bool(_cfg_get("fallback", True))
 
 
 def _page_mode() -> str:
@@ -450,6 +475,15 @@ def _api_key() -> str:
 
 def key_present() -> bool:
     return bool(_api_key())
+
+
+def key_hint() -> str:
+    """One line about the key, for the page. Never prints the key itself."""
+    k = _api_key()
+    if not k:
+        return "no key - keyed API off, keyless site search used"
+    return "key set (%d chars, ends %s)" % (len(k), k[-4:]) if len(k) > 8 \
+        else "key set"
 
 
 # ---------------------------------------------------------------------------
@@ -1082,7 +1116,7 @@ def pwned_count(password, force=False):
 
 
 # ---------------------------------------------------------------------------
-# tier 2 - address exposure
+# tier 2 - address exposure, keyless
 # ---------------------------------------------------------------------------
 def _looks_like_challenge(status, body) -> bool:
     if status in (401, 403, 429, 503):
@@ -1203,9 +1237,14 @@ def _http_search(addr, pw) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# tier 2b - the OPTIONAL keyed API
+# tier 2b - the KEYED API. This is the primary path now.
 # ---------------------------------------------------------------------------
 def _keyed_search(addr, pw):
+    """Two small API calls. None means "did not answer", never "clean".
+
+    Every failure mode returns None so the caller can move on to the keyless
+    endpoint and, only if the fallback is switched on, to a browser.
+    """
     key = _api_key()
     if not key:
         return None
@@ -1229,24 +1268,25 @@ def _keyed_search(addr, pw):
             status, body = exc.code, ""
             trace("WARN", "api", "http %d" % status, addr)
         except Exception as exc:
-            trace("ERR", "api", "%s: %s - falling back"
+            trace("ERR", "api", "%s: %s - keyed tier gave up"
                   % (type(exc).__name__, exc), addr)
             return None
         if status == 404:
             continue
         if status in (401, 403):
-            trace("WARN", "api", "key rejected (http %d) - keyless next" % status, addr)
+            trace("WARN", "api", "key rejected (http %d) - keyed tier gave up"
+                  % status, addr)
             return None
         if status == 429:
-            trace("WARN", "api", "rate limited (429) - keyless next", addr)
+            trace("WARN", "api", "rate limited (429) - keyed tier gave up", addr)
             return None
         if status != 200:
-            trace("WARN", "api", "http %d - keyless next" % status, addr)
+            trace("WARN", "api", "http %d - keyed tier gave up" % status, addr)
             return None
         try:
             got = json.loads(body or "[]")
         except Exception as exc:
-            trace("ERR", "api", "unparsable: %s" % exc, addr)
+            trace("ERR", "api", "unparsable: %s - keyed tier gave up" % exc, addr)
             return None
         if isinstance(got, list):
             payload[field] = got
@@ -1266,7 +1306,7 @@ def _keyed_search(addr, pw):
 
 
 # ---------------------------------------------------------------------------
-# tier 3 - a SLOT per page
+# tier 3 - a SLOT per page. Reached only when the fallback is on.
 # ---------------------------------------------------------------------------
 class _Slot:
     """One worker: own thread, own Playwright, own browser, one reused tab."""
@@ -1838,9 +1878,14 @@ _REASON = {
 # ---------------------------------------------------------------------------
 # the check
 # ---------------------------------------------------------------------------
-def check(addr, password="", force=False, allow_browser=None, cancel=None) -> dict:
+def check(addr, password="", force=False, allow_browser=None, cancel=None,
+          fallback=None) -> dict:
+    """One address. Key first, keyless next, browser only if fallback is on."""
     if allow_browser is None:
         allow_browser = not _http_only()
+    if fallback is None:
+        fallback = _fallback()
+    fallback = bool(fallback)
     raw = addr
     addr = _email_only(addr)
     if not is_email(addr):
@@ -1849,9 +1894,14 @@ def check(addr, password="", force=False, allow_browser=None, cancel=None) -> di
         rec["reason"] = rec["error"] = "not an email address"
         trace("WARN", "address", "rejected %r - not an email" % str(raw)[:80])
         return rec
+    _keyed = bool(_api_key())
+    _tier = "key" if _keyed else "keyless-http"
+    if allow_browser and fallback:
+        _tier += "+browser"
+    elif not fallback:
+        _tier += " (fallback off)"
     trace("INFO", "address", "using %r, password %s, tier %s, pages %s"
-          % (addr, "kept (hash only)" if password else "absent",
-             "http+browser" if allow_browser else "http-only",
+          % (addr, "kept (hash only)" if password else "absent", _tier,
              _page_mode() if _page_mode() != PAGE_MODE_FAST
              else "fast(%s)" % (",".join(_page_on()) or "none")), addr)
 
@@ -1870,19 +1920,25 @@ def check(addr, password="", force=False, allow_browser=None, cancel=None) -> di
                                         else "%d hit(s)" % rec["pw_count"]), addr)
 
     addr_rec = None
-    if _api_key():
+    # 1. THE KEY. A keyed answer ends the address half; nothing else is opened.
+    if _keyed:
         addr_rec = _keyed_search(addr, password)
         if addr_rec is not None:
             trace("INFO", "api", "answered by the keyed tier", addr)
         else:
             trace("WARN", "api", "keyed tier did not answer - keyless next", addr)
+    # 2. The keyless site endpoint. No page, no browser, cheap either way.
     if addr_rec is None:
         addr_rec = _http_search(addr, password)
+    # 3. THE BROWSER, only when the switch allows it.
     if addr_rec.get("error", "").startswith("challenge") and not _is_cancelled(cancel):
-        if allow_browser and available():
+        if not fallback:
+            addr_rec["error"] += " | browser fallback off"
+            trace("WARN", "browser", "fallback is switched off - left unread", addr)
+        elif allow_browser and available():
             try:
                 pool = _get_pool()
-                trace("INFO", "browser", "handing off to the browser tier (UI)", addr)
+                trace("INFO", "browser", "handing off to the browser fallback (UI)", addr)
                 _res, was_cancelled = _await_future(
                     pool.submit(addr, password, cancel=cancel), cancel, _budget())
                 if was_cancelled:
@@ -1987,12 +2043,14 @@ def last_url() -> str:
 
 
 def check_many(pairs, workers=2, progress=None, cancel=None, force=False,
-               delay=None, http_only=None, owner_prefix=None) -> dict:
+               delay=None, http_only=None, fallback=None,
+               owner_prefix=None) -> dict:
     pin = owner() if owner_prefix is None else str(owner_prefix or "")
     set_owner(pin)
-    snap = _snapshot_cfg(http_only)
+    snap = _snapshot_cfg(http_only, fallback)
     _pin_cfg(snap)
     ho = bool(snap.get("http_only"))
+    fb = bool(snap.get("fallback", True))
     uniq, seen = [], set()
     for item in pairs or []:
         if isinstance(item, (tuple, list)) and item:
@@ -2006,9 +2064,13 @@ def check_many(pairs, workers=2, progress=None, cancel=None, force=False,
     out, guard, done = {}, threading.Lock(), [0]
     total = len(uniq)
     pace = float(snap.get("delay") if delay is None else max(0.0, float(delay or 0.0)))
+    _tier = ("key" if _api_key() else "keyless-http")
+    if fb and not ho:
+        _tier += "+browser"
+    else:
+        _tier += " (no browser fallback)"
     trace("INFO", "run", "start: %d unique address(es), workers=%d, pace=%ss, tier=%s"
-          % (total, max(1, int(workers or 1)), pace,
-             "http-only" if ho else "http+browser"))
+          % (total, max(1, int(workers or 1)), pace, _tier))
     if not total:
         return out
 
@@ -2033,7 +2095,8 @@ def check_many(pairs, workers=2, progress=None, cancel=None, force=False,
             trace("INFO", "start", "checking", em)
             _tell(position, em, "starting")
             try:
-                rec = check(em, pw, force=force, allow_browser=not ho, cancel=cancel)
+                rec = check(em, pw, force=force, allow_browser=not ho,
+                            fallback=fb, cancel=cancel)
             except Exception as exc:
                 rec = _blank(em, pw)
                 rec["verdict"] = rec["bucket"] = "UNKNOWN"
@@ -2065,7 +2128,8 @@ def check_many(pairs, workers=2, progress=None, cancel=None, force=False,
               % type(exc).__name__)
         for position, item in enumerate(uniq, 1):
             out.setdefault(item[0], check(item[0], item[1], force=force,
-                                          allow_browser=not ho, cancel=cancel))
+                                          allow_browser=not ho, fallback=fb,
+                                          cancel=cancel))
             _tell(position, item[0], out[item[0]].get("verdict", ""))
     trace("INFO", "run", "finished: %d record(s)" % len(out))
     return out
@@ -2104,7 +2168,8 @@ def report() -> dict:
     return {"version": BREACH_VERSION, "browser": available(),
             "browser_state": browser_state().get("state", ""),
             "browser_error": browser_note(), "pages": _pages(), "delay": _delay(),
-            "http_only": _http_only(), "pool": _pool is not None,
+            "http_only": _http_only(), "fallback": _fallback(),
+            "pool": _pool is not None,
             "slots": len(getattr(_pool, "_slots", [])) if _pool else 0,
             "key": bool(_api_key()), "tier": "ui", "owner": owner(),
             "boot_failed_ago": (int(time.time() - _pool_boot_failed)
@@ -2136,6 +2201,31 @@ def selftest(verbose=False) -> bool:
     add("clean_url_strips_token",
         _clean_url("https://x/account/a%40b.co?__cf_chl_rt_tk=z") ==
         "https://x/account/a%40b.co")
+
+    # ---- the key is primary, the browser is a switchable fallback ----
+    add("cfg_has_fallback", "fallback" in _cfg)
+    add("fallback_default_on", _cfg["fallback"] is True)
+    add("configure_takes_fallback", "fallback" in
+        inspect.signature(configure).parameters)
+    add("check_takes_fallback", "fallback" in inspect.signature(check).parameters)
+    add("check_many_takes_fallback", "fallback" in
+        inspect.signature(check_many).parameters)
+    _src_check = inspect.getsource(check)
+    add("keyed_before_keyless",
+        _src_check.index("_keyed_search(") < _src_check.index("_http_search("))
+    add("fallback_gates_browser", "fallback is switched off" in _src_check)
+    add("fallback_traced", "fallback off" in _src_check)
+    add("report_has_fallback", isinstance(report().get("fallback"), bool))
+    add("key_hint_str", isinstance(key_hint(), str))
+    _saved_fb = dict(_cfg)
+    configure(fallback=False)
+    add("fallback_off_reads", _fallback() is False)
+    _snap_fb = _snapshot_cfg()
+    configure(fallback=True)
+    add("snapshot_pins_fallback", _snap_fb.get("fallback") is False)
+    with _lock:
+        _cfg.clear()
+        _cfg.update(_saved_fb)
 
     # ---- clearance is the arbiter ----
     add("has_clearance", hasattr(_Slot, "_has_clearance"))
@@ -2257,8 +2347,8 @@ def selftest(verbose=False) -> bool:
     add("record_view_never_raises", record_view(None) == ("", ""))
     add("esc", _esc("<a&b>") == "&lt;a&amp;b&gt;")
 
-    import inspect
     add("check_passes_cancel", "cancel=cancel" in inspect.getsource(check_many))
+    add("check_passes_fallback", "fallback=fb" in inspect.getsource(check_many))
     add("check_keeps_reason", "addr_rec[\"error\"] +=" in inspect.getsource(check))
     add("cache_drops_html", "pop(\"page_html\"" in inspect.getsource(check))
     add("pool_resized_on_get", "pool.resize(size)" in inspect.getsource(_get_pool))
@@ -2290,12 +2380,13 @@ def main(argv=None) -> int:
             target = argv[argv.index("--probe") + 1]
         except Exception:
             print("usage: breach.py --probe someone@example.com[:password] "
-                  "[--http-only]")
+                  "[--no-fallback]")
             return 2
-        only = "--http-only" in argv
-        configure(http_only=only)
+        no_fb = "--no-fallback" in argv
+        configure(fallback=not no_fb)
         pairs = parse_addresses(target) or [(target, "")]
         res = check(pairs[0][0], pairs[0][1], force=True)
+        print("key:", key_hint())
         print("url sent:", last_url())
         print(json.dumps({k: res.get(k) for k in ("email", "verdict", "addr_verdict",
                                                   "pw_band", "count", "read", "via",
