@@ -9,8 +9,8 @@ read from the response - no DOM scraping, no screenshot, no persistent profile
 to go stale. `page.goto` answers 200 with the payload, 404 for "not in any
 breach", and anything else means the next proxy gets a turn.
 
-PAGES ARE TIED TO WORKERS  (this pass)
---------------------------------------
+PAGES ARE TIED TO WORKERS
+-------------------------
 There is no page-count control. A run of N workers keeps at most N pages, one
 per worker slot, and each slot is REUSED: the same context and page serve item
 after item, reset to about:blank with its cookies cleared between them. The
@@ -24,8 +24,8 @@ on the same browser). Recycling is local: the item that was in flight is
 already recorded, so a stuck or challenged page can never lose a finished
 result and can never hold the queue.
 
-THE DRAW IS RANDOM  (this pass)
--------------------------------
+THE DRAW IS RANDOM
+------------------
 Drawing `pool_lines()[:3]` gave every key the same first three nodes, so one
 node carried the entire run. Each attempt now draws a RANDOM node from the whole
 tier-ordered pool, never one already tried for that item, and a node that fails
@@ -63,6 +63,14 @@ THE BANDS ARE ABOUT FRESHNESS, NOT COUNT
     UNKNOWN   nothing readable - the only honest answer when every attempt failed
 
 count 0 and count None are different facts and `read` says which.
+
+HTML IS WRITTEN AS \x3c ESCAPES
+-------------------------------
+Every angle bracket in a string literal is written \x3c / \x3e and every entity
+is built from chr(38). A paste that strips tags out of literals - which eats
+"" down to a bare newline and turns ".replace("&", "&amp;")"
+into a no-op - cannot break either form. A raw tag in a literal compiles here
+but not after such a paste.
 
 Isolation: cache, trace and state resolve through the pinned owner, which is the
 unlocked hash, so each is one file per user. The proxy pool is the owner's own
@@ -165,7 +173,6 @@ BAD_AFTER = 2
 
 # Markers only - read by the page's stale-module guard, not by the flow.
 RESULT_WAIT = 15.0
-_await_future = None
 
 CACHE_NAME = "breach_cache.json"
 CACHE_TTL = 6 * 3600.0
@@ -223,13 +230,25 @@ _trace_writes = [0]
 
 _EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[A-Za-z]{2,}$")
 _MAILTO_RE = re.compile(r"^mailto:\s*", re.IGNORECASE)
-_TAG_RE = re.compile(r"<[^>]+>")
+_TAG_RE = re.compile("\x3c[^\x3e]+\x3e")
 _ISO_RE = re.compile(r"\b(\d{4})-(\d{2})-(\d{2})\b")
 _MONTHS = {"jan": 1, "feb": 2, "mar": 3, "apr": 4, "may": 5, "jun": 6,
            "jul": 7, "aug": 8, "sep": 9, "oct": 10, "nov": 11, "dec": 12}
 _D_MONTH_Y = re.compile(r"\b(\d{1,2})\s+([A-Za-z]{3,9})\.?\s+(\d{4})\b")
 
-_PAGE_CSS = ("")
+# Entities, built so no "&" sequence exists in the source to be decoded.
+_AMP = chr(38) + "amp;"
+_LT = chr(38) + "lt;"
+_GT = chr(38) + "gt;"
+_QUOT = chr(38) + "quot;"
+
+_PAGE_CSS = ("\x3cstyle\x3e"
+             "body{font-family:system-ui,sans-serif;background:#0b1020;"
+             "color:#e6ebff;padding:16px}h1{font-size:1.05rem}"
+             "h2{font-size:.9rem}table{border-collapse:collapse;width:100%;"
+             "font-size:.8rem}td,th{border:1px solid #2a3350;padding:5px;"
+             "text-align:left;vertical-align:top}th{background:#141b30}"
+             ".c{color:#fcd34d}\x3c/style\x3e")
 
 
 def _is_cancelled(cancel):
@@ -623,8 +642,8 @@ def account_url(addr) -> str:
 
 
 def _esc(v) -> str:
-    return (str(v or "").replace("&", "&").replace("<", "<")
-            .replace(">", ">").replace('"', """))
+    return (str(v or "").replace(chr(38), _AMP).replace(chr(60), _LT)
+            .replace(chr(62), _GT).replace(chr(34), _QUOT))
 
 
 def _plain(s) -> str:
@@ -970,7 +989,8 @@ def pwned_count(password, force=False):
         return entry.get("n") if entry else None
     n = None
     try:
-        trace("INFO", "pw", "GET %s (prefix %s, 35 chars kept local)" % (PW_RANGE % prefix, prefix))
+        trace("INFO", "pw", "GET %s (prefix %s, 35 chars kept local)"
+              % (PW_RANGE % prefix, prefix))
         r = requests.get(PW_RANGE % prefix, timeout=HTTP_TIMEOUT,
                          headers={"User-Agent": UA, "Add-Padding": "true"})
         trace("INFO", "pw", "http %d, %d byte(s)" % (r.status_code, len(r.text or "")))
@@ -1095,11 +1115,8 @@ class _Slot:
 
     def reset(self):
         """Blank the page and drop its cookies - state never carries over."""
-        try:
-            if self.page is not None and not self.page.is_closed():
-                self.page.goto("about:blank", wait_until="commit", timeout=8000)
-        except Exception:
-            raise
+        if self.page is not None and not self.page.is_closed():
+            self.page.goto("about:blank", wait_until="commit", timeout=8000)
         try:
             if self.ctx is not None:
                 self.ctx.clear_cookies()
@@ -1265,7 +1282,8 @@ def _attempt(addr, proxy_line, cancel=None):
                 pass
 
         if _looks_challenge(status, body):
-            trace("WARN", "fetch", "challenge (http %d) via %s - solving" % (status, label), addr)
+            trace("WARN", "fetch", "challenge (http %d) via %s - solving"
+                  % (status, label), addr)
             if _solve_wall(page, cancel):
                 try:
                     got = page.evaluate(JS_FETCH, url) or {}
@@ -1470,70 +1488,54 @@ def _page_from_record(rec) -> dict:
                                               p.get("Date") or p.get("date") or ""))
     text = "\n".join(lines)[:PAGE_TEXT_MAX]
 
-    h = ["", _PAGE_CSS, "
-", _esc(head_addr),
-         "
-", _esc(rec.get("verdict") or "?"), " - ",
-         _esc(rec.get("reason") or ""), "
-address half: ",
-         _esc(rec.get("addr_verdict") or "UNREAD"), "
-password half: ",
-         _esc(rec.get("pw_band") or "none"), "
-password appearances: ",
-         (_esc(_pw) if _pw is not None else "-"), "
-source: ",
-         _esc(rec.get("via") or "-"), "
-checked: ",
-         _esc(rec.get("checked_at") or ""), "
-"]
+    h = ["\x3chtml\x3e\x3chead\x3e\x3cmeta charset='utf-8'\x3e\x3ctitle\x3e",
+         _esc(head_addr),
+         "\x3c/title\x3e", _PAGE_CSS, "\x3c/head\x3e\x3cbody\x3e\x3ch1\x3e",
+         _esc(head_addr),
+         "\x3c/h1\x3e\x3cp class='c'\x3e", _esc(rec.get("verdict") or "?"), " - ",
+         _esc(rec.get("reason") or ""), "\x3c/p\x3e\x3cp\x3eaddress half: ",
+         _esc(rec.get("addr_verdict") or "UNREAD"), "\x3cbr\x3epassword half: ",
+         _esc(rec.get("pw_band") or "none"), "\x3cbr\x3epassword appearances: ",
+         (_esc(_pw) if _pw is not None else "-"), "\x3cbr\x3esource: ",
+         _esc(rec.get("via") or "-"), "\x3cbr\x3echecked: ",
+         _esc(rec.get("checked_at") or ""), "\x3c/p\x3e"]
     if rec.get("error"):
-        h.append("
-error: %s
-" % _esc(rec["error"]))
+        h.append("\x3cp class='c'\x3eerror: %s\x3c/p\x3e" % _esc(rec["error"]))
     if pc:
-        h.append("
-SHA-1: %s
-seen: %s time(s)
-"
+        h.append("\x3cp\x3eSHA-1: %s\x3cbr\x3eseen: %s time(s)\x3c/p\x3e"
                  % (_esc(pc.get("sha1") or "-"), _esc(pc.get("times_pwned"))))
     rows = rec.get("breaches") or []
     if rows:
-        h.append(""
-                 "")
+        h.append("\x3ctable\x3e\x3ctr\x3e\x3cth\x3eBreach\x3c/th\x3e\x3cth\x3eDate"
+                 "\x3c/th\x3e\x3cth\x3eAge\x3c/th\x3e\x3cth\x3eAccounts\x3c/th\x3e"
+                 "\x3cth\x3eData classes\x3c/th\x3e\x3c/tr\x3e")
         for b in rows:
-            h.append(""
+            h.append("\x3ctr\x3e\x3ctd\x3e%s%s\x3c/td\x3e\x3ctd\x3e%s\x3c/td\x3e"
+                     "\x3ctd\x3e%s\x3c/td\x3e\x3ctd\x3e%s\x3c/td\x3e\x3ctd\x3e%s"
+                     "\x3c/td\x3e\x3c/tr\x3e"
                      % (_esc(b.get("Title") or b.get("title") or "?"),
-                        " (stealer log)" if (b.get("IsStealerLog") or b.get("corpus")) else "",
+                        " (stealer log)" if (b.get("IsStealerLog")
+                                             or b.get("corpus")) else "",
                         _esc(b.get("BreachDate") or b.get("date") or "-"),
                         ("%d d" % int(b["days"])) if b.get("days") is not None else "-",
                         "{:,}".format(int(b.get("PwnCount") or b.get("pwn_count") or 0)),
-                        _esc(", ".join(b.get("DataClasses") or b.get("classes") or []) or "-")))
-        h.append("
-Breach	Date	Age	Accounts	Data classes
-%s%s	%s	%s	%s	%s
-")
+                        _esc(", ".join(b.get("DataClasses") or b.get("classes") or [])
+                             or "-")))
+        h.append("\x3c/table\x3e")
     else:
-        h.append("
-%s
-" % ("No breach record could be read - see the error above."
-                                if rec.get("error") else "No breach record for this address."))
+        h.append("\x3cp\x3e%s\x3c/p\x3e"
+                 % ("No breach record could be read - see the error above."
+                    if rec.get("error") else "No breach record for this address."))
     if rec.get("pastes"):
-        h.append("
-Pastes
-")
+        h.append("\x3ch2\x3ePastes\x3c/h2\x3e\x3cul\x3e")
         for p in (rec.get("pastes") or [])[:30]:
-            h.append("
-%s (%s) %s
-"
+            h.append("\x3cli\x3e%s (%s) %s\x3c/li\x3e"
                      % (_esc(p.get("Title") or p.get("title") or "?"),
                         _esc(p.get("Source") or p.get("source") or "-"),
                         _esc(p.get("Date") or p.get("date") or "")))
-        h.append("
-")
-    h.append("
-Generated from the answer, not a captured page.
-"
-             "")
+        h.append("\x3c/ul\x3e")
+    h.append("\x3cp\x3e\x3csmall\x3eGenerated from the answer, not a captured page."
+             "\x3c/small\x3e\x3c/p\x3e\x3c/body\x3e\x3c/html\x3e")
     return {"page_text": text, "page_html": "".join(h)[:PAGE_HTML_MAX],
             "page_via": "record"}
 
@@ -1660,7 +1662,8 @@ def check_item(item, force=False, cancel=None) -> dict:
     entry = (cache.get("item") or {}).get(key)
     if not force and _fresh(entry, CACHE_TTL) and entry.get("report"):
         got = dict(entry["report"])
-        trace("INFO", "cache", "hit, verdict %s - no request sent" % got.get("verdict"), email)
+        trace("INFO", "cache", "hit, verdict %s - no request sent"
+              % got.get("verdict"), email)
         return got
 
     trace("INFO", "address", "checking %r, password %s, pool %d, rotate %s"
@@ -1675,7 +1678,8 @@ def check_item(item, force=False, cancel=None) -> dict:
     payload, via, err, tried = _search_address(email, cancel)
     if payload is not None:
         rec = _parse_payload(item, payload, via or "browser", started, item["password"])
-        rec["pw_count"] = pwned_count(item["password"], force=force) if item["password"] else None
+        rec["pw_count"] = (pwned_count(item["password"], force=force)
+                           if item["password"] else None)
         if item["password"]:
             rec["password_check"] = check_password(item["password"], force=force)
         rec["read"] = True
@@ -1739,7 +1743,7 @@ def check_many(items, workers=3, progress=None, cancel=None, force=False,
                delay=None, rotate=None, owner_prefix=None) -> dict:
     """Run the list. One page slot per worker, reused and recycled, never more.
 
-    The pool is walked at most (tries - 1) times per item, so N workers hold at
+    The pool is drawn at most (tries - 1) times per item, so N workers hold at
     most N pages and the batch never opens one per check. Each worker's browser
     is launched on its first item and closed by a teardown task at the end, so a
     500-item run pays for N browsers and N pages, not 500.
@@ -1758,8 +1762,7 @@ def check_many(items, workers=3, progress=None, cancel=None, force=False,
     for raw in items or []:
         item = _as_item(raw)
         if item["kind"] != "password" and not is_email(item["email"]):
-            if item["kind"] != "password":
-                continue
+            continue
         key = _cache_key(item)
         if key in seen:
             continue
@@ -1834,7 +1837,8 @@ def check_many(items, workers=3, progress=None, cancel=None, force=False,
             for _ in range(width):
                 ex.submit(_teardown)
     except Exception as exc:
-        trace("ERR", "run", "executor failed (%s), falling back to serial" % type(exc).__name__)
+        trace("ERR", "run", "executor failed (%s), falling back to serial"
+              % type(exc).__name__)
         for position, item in enumerate(uniq, 1):
             out.setdefault(_cache_key(item), check_item(item, force=force, cancel=cancel))
             _tell(position, item["email"], out[_cache_key(item)].get("verdict", ""))
@@ -1924,7 +1928,7 @@ def selftest(verbose=False) -> bool:
          "IsStealerLog": True, "PwnCount": 1000},
         {"Name": "Wattpad", "Domain": "wattpad.com", "BreachDate": "2020-06-29",
          "DataClasses": ["Passwords"], "PwnCount": 2000,
-         "Description": "link text"}],
+         "Description": "\x3ca href='x'\x3elink\x3c/a\x3e text"}],
         "Pastes": [{"Title": "p", "Source": "P"}]}
     rec = _parse_payload({"kind": "combo", "email": "a@b.co", "password": "pw"},
                          pwn, "1.2.3.4:8080", time.time(), "pw")
@@ -1934,7 +1938,15 @@ def selftest(verbose=False) -> bool:
     add("earliest", rec["earliest_breach"] == "2020-06-29")
     add("latest", rec["latest_breach"] == "2026-06-15")
     add("exposed_sum", rec["total_records_exposed"] == 3000)
-    add("html_stripped", "" in htm)
+    add("html_stripped", "\x3ca" not in rec["breaches"][1]["Description"])
+    add("html_kept", "\x3ca" in rec["breaches"][1]["DescriptionHtml"])
+    add("password_breaches", "Wattpad" in rec["password_breaches"])
+    add("summary_note_counts", "2" in _summary_note({"breach_count": 2}))
+
+    txt, htm = record_view(rec)
+    add("view_has_breach", "Wattpad" in txt and "Wattpad" in htm)
+    add("view_has_table", "\x3ctable\x3e" in htm)
+    add("view_has_css", "\x3cstyle\x3e" in htm and "\x3c/style\x3e" in htm)
     add("view_never_raises", record_view(None) == ("", ""))
     add("view_password_only", "password only" in record_view(
         {"kind": "password", "pw_count": 3})[0])
@@ -1950,8 +1962,7 @@ def selftest(verbose=False) -> bool:
     add("slot_class", callable(_Slot))
     add("slot_reuse_reset", hasattr(_Slot, "reset") and hasattr(_Slot, "get")
         and hasattr(_Slot, "bad") and hasattr(_Slot, "ok"))
-    add("slot_recycle_on_fails", _Slot.__init__ is not None
-        and SLOT_FAILS_MAX >= 1 and SLOT_USES_MAX >= 1)
+    add("slot_limits", SLOT_FAILS_MAX >= 1 and SLOT_USES_MAX >= 1)
     _s = _Slot()
     for _ in range(SLOT_FAILS_MAX):
         _s.bad()
@@ -1987,6 +1998,7 @@ def selftest(verbose=False) -> bool:
     add("page_wanted", page_wanted("records") is True)
     add("js_fetch", "fetch(" in JS_FETCH)
     add("rotate_reported", "rotate" in report())
+    add("tag_regex", bool(_TAG_RE.search("\x3cb\x3ex\x3c/b\x3e")))
 
     _ev = threading.Event()
     add("cancel_false", not _is_cancelled(_ev))
@@ -2000,7 +2012,8 @@ def selftest(verbose=False) -> bool:
     add("owner_empty_falls_back", bool(_user_file(CACHE_NAME)))
     set_owner(_was)
 
-    add("esc", _esc("") == "<a&b>")
+    add("esc", _esc("\x3ca&b\x3e") == _LT + "a" + _AMP + "b" + _GT)
+    add("esc_quote", _esc('"') == _QUOT)
     add("report_tier", isinstance(report().get("pool"), int))
 
     bad = [n for n, ok in checks if not ok]
