@@ -9167,6 +9167,13 @@ def _write_clean_valid(header, valids):
 #     session. Both are POPPED now - safe, because these are callbacks and run
 #     before the checkboxes are re-created.
 #
+# v13.86 - THE BREACH PAGE'S FILES
+# --------------------------------
+# 10. breach_history.jsonl and breach_state.json are HISTORY, not cache, so the
+#     cache sweep must leave them alone - a sweep used to take the whole breach
+#     ledger with it. Both are on the keep list, and a dedicated Breach panel
+#     below counts them, sizes them and clears them on their own buttons.
+#
 # WHAT IS AND IS NOT PER USER - stated here because the numbers are easy to
 # misread:
 #
@@ -9224,11 +9231,14 @@ _RES_SESSION_KEYS = (
 # v13.70: notifications.jsonl and notify_seen.json were the same story - the
 # sweep took the entire alert history and the seen marker with it, so the badge
 # reset to zero and every past RAM/disk warning vanished on the next load.
+# v13.86: breach_history.jsonl and breach_state.json are the breach ledger and
+# its saved results - history, not cache. A sweep used to take both.
 _RES_KEEP_SUFFIX = (
     "clean_valid_accounts.txt", "settings.json", "paste_accounts.txt",
     "inspect_cat.txt", "theme.json", "download_presets.json", "proxies.txt",
     "mem_history.jsonl", "reader_state.json", "disposable_domains.txt",
     "notifications.jsonl", "notify_seen.json",
+    "breach_history.jsonl", "breach_state.json",
 )
 
 _MEM_FILE = user_file("mem_history.jsonl")
@@ -9874,6 +9884,76 @@ def _on_clear_result_files():
         "success", f"Removed {_n} result file(s) and emptied my buckets.")
 
 
+# --------------------------------------------------------------------------
+# v13.86 - THE BREACH LEDGER, ON ITS OWN BUTTONS
+#
+# breach.py and pages/8_Breach.py keep a per-user answer cache, a result state
+# file and an append-only history. They are that page's own files and they carry
+# this user's prefix like everything else, so they are listed in the browser
+# above too - but a cache sweep should not take the HISTORY, which is why both
+# history files are on _RES_KEEP_SUFFIX. These buttons are the explicit way to
+# clear them without hunting the file list.
+# --------------------------------------------------------------------------
+_BREACH_FILES = ("breach_cache.json", "breach_history.jsonl",
+                 "breach_state.json", "breach_trace.jsonl")
+
+
+def _breach_paths(which="all"):
+    _pfx = os.path.basename(user_file("")) or ""
+    if not _pfx:
+        return []
+    _want = {
+        "cache": ("breach_cache.json",),
+        "history": ("breach_history.jsonl", "breach_state.json"),
+        "trace": ("breach_trace.jsonl",),
+        "all": _BREACH_FILES,
+    }.get(which, _BREACH_FILES)
+    _out = []
+    for _name in _want:
+        _p = os.path.join(os.getcwd(), _pfx + "_" + _name)
+        if os.path.exists(_p):
+            _out.append(_p)
+    return _out
+
+
+def _breach_counts():
+    """(cache entries, history rows, bytes) for THIS user's breach files."""
+    _c = _h = _b = 0
+    for _p in _breach_paths("all"):
+        try:
+            _b += os.path.getsize(_p)
+        except Exception:
+            pass
+    for _p in _breach_paths("cache"):
+        try:
+            with open(_p, encoding="utf-8", errors="ignore") as _fh:
+                _data = json.load(_fh)
+            if isinstance(_data, dict):
+                _c += len(_data.get("item") or {}) + len(_data.get("pw") or {})
+        except Exception:
+            pass
+    for _p in _breach_paths("history"):
+        if not _p.endswith("_breach_history.jsonl"):
+            continue
+        try:
+            with open(_p, encoding="utf-8", errors="ignore") as _fh:
+                _h += sum(1 for _l in _fh if _l.strip())
+        except Exception:
+            pass
+    return _c, _h, _b
+
+
+def _on_clear_breach(which):
+    _paths = _breach_paths(which)
+    _n = _res_delete(_paths)
+    _res_forget_ticks(_paths)
+    str_lit.session_state.pop("_res_snap", None)
+    _label = {"cache": "answer cache", "history": "history",
+              "trace": "trace", "all": "cache, history and trace"}.get(which, which)
+    str_lit.session_state["_res_flash"] = (
+        "success", f"Cleared my breach {_label} ({_n} file(s)).")
+
+
 section_title("🧮", "Resources (RAM / Disk)",
               "live readings, my files, my stored history, and the buttons that give it back")
 
@@ -9967,8 +10047,8 @@ if _res_open:
                        help="Domain cache, proxy metadata, key map, proxies_all "
                             "backup and my data/ scratch directory. Keeps results, "
                             "settings, theme, presets, proxies.txt, my history, my "
-                            "reader's remembered account, the disposable blocklist and "
-                            "my notifications.")
+                            "reader's remembered account, the disposable blocklist, "
+                            "my notifications and my breach ledger.")
     with _rb3:
         str_lit.button("🗑 Delete my RESULT files", width="stretch",
                        on_click=_on_clear_result_files, disabled=not _res_ok,
@@ -9991,6 +10071,39 @@ if _res_open:
                         + ", ".join(f"{_k}={_n}" for _n, _k in _brk[:6]))
     else:
         str_lit.caption("My session payload is empty.")
+
+    # ----------------------------------------------------------------------
+    # v13.86 MY BREACH LEDGER
+    # ----------------------------------------------------------------------
+    str_lit.markdown("---")
+    str_lit.markdown("#### 🛡 My breach cache & history")
+    _b_c, _b_h, _b_b = _breach_counts()
+    _bp1, _bp2, _bp3 = str_lit.columns(3)
+    _bp1.metric("Cached answers", _b_c,
+                help="Answered items held for 6 hours by the Breach page. A cached "
+                     "answer sends no request.")
+    _bp2.metric("History rows", _b_h,
+                help="One row per item on every Breach run, capped at 2000 there.")
+    _bp3.metric("Ledger size", _res_fmt(_b_b))
+    _bb1, _bb2, _bb3, _bb4 = str_lit.columns(4)
+    with _bb1:
+        str_lit.button("🧽 Clear breach cache", width="stretch", disabled=not _res_ok,
+                       on_click=_on_clear_breach, args=("cache",),
+                       help="Forgets cached breach answers for this user only.")
+    with _bb2:
+        str_lit.button("🧾 Clear breach history", width="stretch",
+                       disabled=not _res_ok, on_click=_on_clear_breach,
+                       args=("history",),
+                       help="Deletes my breach history and its saved results. The "
+                            "cache is untouched.")
+    with _bb3:
+        str_lit.button("🧭 Clear breach trace", width="stretch", disabled=not _res_ok,
+                       on_click=_on_clear_breach, args=("trace",),
+                       help="Deletes my breach trace log only.")
+    with _bb4:
+        str_lit.button("🗑 Clear all breach files", width="stretch",
+                       disabled=not _res_ok, on_click=_on_clear_breach, args=("all",),
+                       help="Cache, history and trace together.")
 
     # ----------------------------------------------------------------------
     # MY FILES - view, tick, download, delete
