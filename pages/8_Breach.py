@@ -35,8 +35,8 @@ THE BANDS
   CLEAN     password unseen and address in no readable source
   UNKNOWN   nothing readable - the only honest answer when every tier failed
 
-THE RUN DOES NOT RUN IN THE SCRIPT  (v13.86, this pass)
--------------------------------------------------------
+THE RUN DOES NOT RUN IN THE SCRIPT  (earlier pass)
+--------------------------------------------------
 It used to. Streamlit holds the whole delta stream while a script run blocks, so
 a three-minute run greyed the page out and left the bar on 0 / 4 until the first
 address happened to finish, and the widget states were dead for the duration.
@@ -44,8 +44,21 @@ The run is a THREAD now, its counters live in a session job dict, and this page
 polls them with st.rerun(). The bar and the live trace move per address, Stop
 works, and a refresh or a tab switch does not lose the run.
 
-READ, VERSUS ZERO  (v13.86, this pass)
---------------------------------------
+THE PAGE COUNT IS THE CONCURRENCY  (this pass)
+----------------------------------------------
+The Workers slider is gone. "Browser pages" now opens exactly that many tabs and
+checks exactly that many addresses at the same time - five addresses on five
+pages start together instead of two at a time. The delay only paces the starts.
+
+THE PAGE OPENS, AND YOU SCROLL IT  (this pass)
+----------------------------------------------
+Every captured address carries a FULL-LENGTH screenshot of what the browser
+rendered, shown first in a scrollable box, so the breach cards, their dates and
+their data classes can be read exactly as the site prints them - even when the
+scrape found no anchor to parse. Text and HTML views stay beside it.
+
+READ, VERSUS ZERO  (earlier pass)
+---------------------------------
 A card that said "0 breaches" could mean the page was read and lists none, or
 that every tier failed and nothing was read. Those are opposite facts. Every
 record carries `read`; an unread address half is flagged on the card, marked "-"
@@ -57,8 +70,7 @@ Section 4 is a trace of everything: each control you moved, each address started
 the literal URL sent, the status, whether a challenge appeared, which tier
 took over, the band, and every error verbatim. It is shown live during a run,
 kept in a per-user file, and downloadable - so a run that goes wrong can be read
-afterwards instead of guessed at. The Delay control paces address starts; workers
-only bound concurrency. Both exist because HIBP's failures are quiet ones.
+afterwards instead of guessed at.
 
 THE BROWSER
 -----------
@@ -70,13 +82,15 @@ address the site challenges.
 
 ISOLATION
 ---------
-The cache, the history and the trace resolve through auth.user_file(), so each is
-one file per user. Nothing on this page reads another user's data.
+The cache, the history and the trace resolve through the pinned owner, which is
+the unlocked hash, so each is one file per user. Nothing on this page reads
+another user's data.
 
 Read-only except Run / Stop / Prepare browser / Clear history / Clear trace /
 downloads.
 """
 
+import base64
 import importlib
 import json
 import os
@@ -146,6 +160,11 @@ _CSS_TMPL = """
     .br-old      { background:#ef444433; color:#fca5a5; border:1px solid #ef444466; }
     .br-clean    { background:#64748b33; color:#cbd5e1; border:1px solid #64748b66; }
     .br-unknown  { background:#a78bfa33; color:#ddd6fe; border:1px solid #a78bfa66; }
+    /* The captured page. Tall pages are scrolled inside the box instead of
+       stretching the whole card, and the image keeps its own proportions. */
+    .br-shot { max-height: 70vh; overflow: auto; border: 1px solid #2a3350;
+               border-radius: 8px; background: #0b1020; }
+    .br-shot img { width: 100%; display: block; }
     .block-container, [data-testid="stMainBlockContainer"] {
         padding-top: 1.2rem !important; padding-bottom: 2rem !important;
         max-width: 1100px !important;
@@ -156,6 +175,7 @@ _CSS_TMPL = """
             padding-right: .7rem !important;
         }
         .br-hero h1 { font-size: 1.15rem !important; }
+        .br-shot { max-height: 60vh; }
     }
 </style>
 """
@@ -219,13 +239,14 @@ import streamlit.components.v1 as components
 # and the page ran old code with no page_mode, no trace_read and no 401 handling.
 # page_wanted, trace_read and trace_clear exist only in the current module, so
 # testing those is a real version test and the reload actually happens.
-# record_view and set_owner are the newest markers: a module without set_owner
-# resolves identity from st.session_state on a worker thread and can cross
-# prefixes, and a module without record_view builds no page at all when the
-# address tier fails. Both belong in the same test.
+# record_view, set_owner and _wait_result are the newest markers: a module
+# without set_owner resolves identity from st.session_state on a worker thread
+# and can cross prefixes, a module without record_view builds no page at all when
+# the address tier fails, and a module without _wait_result still blocks 20s on a
+# URL glob and calls every wall a failed render.
 if not (hasattr(breach, "page_wanted") and hasattr(breach, "trace_read")
         and hasattr(breach, "trace_clear") and hasattr(breach, "record_view")
-        and hasattr(breach, "set_owner")):
+        and hasattr(breach, "set_owner") and hasattr(breach, "RESULT_WAIT")):
     breach = importlib.reload(breach)
     try:
         breach.trace("INFO", "page", "stale breach module replaced by reload")
@@ -277,14 +298,21 @@ def _hist_path():
 
 
 def _hist_add(rows):
-    """Append reports, then trim the file to _HIST_MAX. Never raises."""
+    """Append reports, then trim the file to _HIST_MAX. Never raises.
+
+    The full-page screenshot is dropped here. It is a base64 data URI of 1-4MB
+    and a hundred of them would make the ledger unreadable and the file useless;
+    the text and HTML views are kept, so the row still describes itself.
+    """
     p = _hist_path()
     if not p:
         return
     try:
         with open(p, "a", encoding="utf-8") as fh:
             for r in rows:
-                fh.write(json.dumps(r, ensure_ascii=False) + "\n")
+                d = dict(r)
+                d.pop("page_shot", None)
+                fh.write(json.dumps(d, ensure_ascii=False) + "\n")
         with open(p, encoding="utf-8", errors="ignore") as fh:
             lines = fh.readlines()
         if len(lines) > _HIST_MAX:
@@ -353,10 +381,8 @@ def _h_esc(v):
 def _record_page(r):
     """(text, html) of a record, built here when no page was captured.
 
-    The card must ALWAYS be able to offer a Text and an HTML view. When the
-    address tier failed there is no captured page, and printing "no page
-    captured" with no toggle hides the only artefact left to inspect. This is a
-    view of the RECORD and says so in its own footer.
+    The card must ALWAYS be able to offer a view. When the address tier failed
+    and no screenshot exists either, this is the only artefact left to inspect.
     """
     _read = bool(r.get("read"))
     _e = str(r.get("email") or "")
@@ -610,7 +636,7 @@ with _bst2:
 # ---- the address tier: the UI, keyless ----------------------------------------
 # No key is needed and none is faked. The page is the API: the address goes into
 # the site's own search box, the result is scraped from what renders, and the page
-# text and HTML are kept from that same read. A key only makes it faster.
+# is photographed full length so it can be read even when the scrape finds nothing.
 if breach.key_present():
     st.caption("\U0001f511 HIBP_API_KEY is set - the keyed API is tried first because "
                "it is faster and exact. The browser is still the fallback.")
@@ -619,40 +645,46 @@ else:
                "site's own search box and the rendered page is scraped for the breach "
                "names, dates and classes. Slower than an API call, and free.")
 
-_c1, _c2, _c3, _c4, _c5 = st.columns(5)
+# ---- pages IS the concurrency --------------------------------------------------
+# The Workers slider is gone. It and this number both bounded in-flight addresses,
+# so they contradicted each other: "2 pages" opened two tabs and then still checked
+# two at a time whatever Workers said. One knob now - N pages means N tabs and N
+# addresses at once.
+_c1, _c2, _c3, _c4 = st.columns(4)
 with _c1:
-    _workers = st.slider("Workers", 1, 8, 2, key="_breach_workers",
-                         on_change=_watch("_breach_workers", "workers"),
-                         help="How many addresses may be in flight at once. Each one "
-                              "is a whole page load, so 2 is the honest default on a "
-                              "small container - raise it only if runs feel slow.")
+    _pages = st.number_input("Browser pages (at once)", 1, 8, 2, 1,
+                             key="_breach_pages",
+                             on_change=_watch("_breach_pages", "pages"),
+                             help="How many tabs, and therefore how many addresses, "
+                                  "run at the same time. Five addresses on five pages "
+                                  "start together instead of two at a time.")
 with _c2:
     _delay = st.slider("Delay (s)", 0.0, 10.0, 3.0, 0.5, key="_breach_delay",
                        on_change=_watch("_breach_delay", "delay"),
-                       help="Seconds between STARTING addresses, regardless of "
-                            "worker count. This is the knob for being gentle - 3s "
+                       help="Seconds between STARTING addresses, regardless of the "
+                            "page count. This is the knob for being gentle - 3s "
                             "trickles, 0 floods.")
 with _c3:
-    _pages = st.number_input("Browser pages", 1, 8, 2, 1, key="_breach_pages",
-                             on_change=_watch("_breach_pages", "pages"),
-                             help="Chromium tabs for addresses. Each is reused, and "
-                                  "recreated if it dies.")
-with _c4:
     _force = st.checkbox("Ignore cache", value=False, key="_breach_force",
                          on_change=_watch("_breach_force", "ignore cache"),
                          help="A cached answer is served for 6 hours. Tick this to "
                               "re-check from the sources, which is what you want "
                               "straight after changing anything.")
-with _c5:
+with _c4:
     _http_only = st.checkbox("HTTP only", value=False, key="_breach_http_only",
                              on_change=_watch("_breach_http_only", "http only"),
                              help="No browser. Faster, but a walled address comes "
                                   "back UNKNOWN instead of resolved.")
 
+# Derived, not separate: the pool is resized to this and the workers are this.
+_workers = int(_pages)
+st.caption("**%d** address(es) are checked at the same time, one tab each. The delay "
+           "only paces when a new one starts." % _workers)
+
 # ---- page capture, and how much of it ------------------------------------
 # The page read and the search are the SAME visit now, so capture costs almost
-# nothing - the text and HTML are already in hand. The mode decides which
-# outcomes keep them.
+# nothing - the screenshot, the text and the HTML are already in hand. The mode
+# decides which outcomes keep them.
 st.markdown("##### Captured pages")
 _cm1, _cm2 = st.columns([0.58, 0.42])
 with _cm1:
@@ -660,8 +692,9 @@ with _cm1:
         "Capture", list(_MODE_LABELS.keys()), horizontal=False, key=_CAP_MODE_KEY,
         on_change=_watch(_CAP_MODE_KEY, "capture mode"),
         help="The page is what the site actually rendered for an address - titles, "
-             "dates, data classes, or the 'no pwnage' copy. It is kept per address "
-             "under your own prefix and can be wiped at the bottom of the page.")
+             "dates, data classes, or the 'no pwnage' copy. It is kept as a "
+             "full-length image, plus text and HTML, under your own prefix, and can "
+             "be wiped at the bottom of the page.")
 _page_mode = _MODE_LABELS.get(_mode_label, "fast")
 with _cm2:
     if _page_mode == "fast":
@@ -985,15 +1018,17 @@ if _rows:
                     for p in _ps[:10]:
                         st.caption("%s  %s" % (p.get("title") or "?", p.get("date") or ""))
 
-                # ---- the page: text or HTML, and ALWAYS one of them ----
-                # A missing captured page used to mean a missing toggle, so a
-                # failed run left the one thing worth inspecting unavailable. The
-                # view is built from the record when nothing was captured, and the
-                # caption says which of the three it is.
+                # ---- the page: image, text or HTML, and ALWAYS one of them ----
+                # The image is FIRST because it is the whole document exactly as
+                # served - the breach cards, dates and classes included - and it is
+                # scrollable, so a long page is read inside the box instead of
+                # stretching the card. It survives a parse failure, which the text
+                # and HTML views cannot.
+                _pg_s = str(r.get("page_shot") or "")
                 _pg_t = str(r.get("page_text") or "")
                 _pg_h = str(r.get("page_html") or "")
                 _pg_via = str(r.get("page_via") or "")
-                if not (_pg_t or _pg_h):
+                if not (_pg_s or _pg_t or _pg_h):
                     _fn = getattr(breach, "record_view", None)
                     if callable(_fn):
                         try:
@@ -1003,23 +1038,42 @@ if _rows:
                     if not (_pg_t or _pg_h):
                         _pg_t, _pg_h = _record_page(r)
                     _src = "view built from the record - no page was captured"
-                elif _pg_via == "browser":
-                    _src = "page as the browser rendered it"
+                elif _pg_s:
+                    _src = ("the page as the browser rendered it, full length - "
+                            "scroll the box")
                 elif _pg_via == "http":
                     _src = ("page as fetched over plain HTTP - not rendered, so it is "
                             "often the challenge body itself")
                 else:
                     _src = "view built from the record"
 
-                if _pg_t or _pg_h:
+                _opts = []
+                if _pg_s:
+                    _opts.append("Page")
+                if _pg_t:
+                    _opts.append("Text")
+                if _pg_h:
+                    _opts.append("HTML")
+                if _opts:
                     st.caption(_src)
-                    _opts = (["Text", "HTML"] if (_pg_t and _pg_h)
-                             else (["Text"] if _pg_t else ["HTML"]))
                     _pv = st.radio("Page view", _opts, horizontal=True, index=0,
                                    key="_pv_%s" % _key,
                                    help="What the source actually returned for this "
                                         "address, kept under your own prefix.")
-                    if _pv == "Text":
+                    if _pv == "Page":
+                        st.markdown('<div class="br-shot"><img src="data:image/png;'
+                                    'base64,' + _pg_s + '" alt="captured page"></div>',
+                                    unsafe_allow_html=True)
+                        try:
+                            _png = base64.b64decode(_pg_s)
+                        except Exception:
+                            _png = b""
+                        st.download_button(
+                            "\u2b07 Download this page as an image",
+                            data=_png, file_name="page_%s.png" % _key,
+                            mime="image/png", width="stretch",
+                            key="_pvs_%s" % _key, disabled=not _png)
+                    elif _pv == "Text":
                         st.code(_pg_t[:40000] or "(empty page)", language="text")
                         st.download_button(
                             "\u2b07 Download this page as text",
