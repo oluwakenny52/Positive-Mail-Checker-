@@ -632,7 +632,7 @@ with _t6:
 | **`pages/5_Blocks.py`** | Block Inspector. Frame audit, paste validation, `@@END` canonicaliser, fix self-check. | zero |
 | **`pages/6_User_Guide.py`** | This page. | zero |
 | **`pages/7_Logs.py`** | Full log & operator trace: the execution log, per-account dial traces, boot ledger, run record and every result file. Read-only, per user. | zero |
-| **`pages/8_Breach.py`** | Breach exposure for a list of addresses, from free sources. Verdict is about how **recent** the exposure is: ACT / REVIEW / HISTORIC / CLEAN / UNKNOWN. | free, rate-limited |
+| **`pages/8_Breach.py`** | Breach exposure for a list of combos, addresses or passwords, from free keyless sources. Verdict is about how **recent** the exposure is: NEW / PARTIAL / OLD / CLEAN / UNKNOWN. | free, through your own pool |
 | **`pages/9_AI.py`** | The UNKNOWN-tail classifier on its own page: enable, key, model, per-run and per-day caps, the queue, the drain and the trace. | zero, spends Gemini quota, never proxy credit |
 | **`pages/10_Debug.py`** | Operator debug console: live counters, the probe log, the quarantine and strike maps, the gate table, thread census and the diagnostic bundle. | zero |
 """
@@ -647,35 +647,57 @@ with _t6:
     st.markdown(
         """
 Breach Exposure never touches a mailbox, so it is safe to run on addresses you
-have already discarded.
+have already discarded. It needs **no API key and no subscription**.
 
-It uses three free sources and **no API key**:
+Paste three shapes in one box, one per line:
 
-* the public breach catalogue, fetched once and matched locally by domain, so a
-  list of 500 addresses makes one request, not 500;
-* the account page on haveibeenpwned, fetched only when the local match found
-  nothing, at one request every two seconds because it is throttled;
-* `psbdmp.ws`, for pastes quoting the address.
+* `email:password` - both halves;
+* `email` - the address half only;
+* a line with no `@` - a **password**, checked against Pwned Passwords only.
 
-The account page can be fetched two ways, and the page lets you pick:
+Only the **address** is transmitted. A pasted `email:password` is cut at the
+colon before the request is built. The password goes to exactly one place: the
+Pwned Passwords hash check, where the SHA-1 is computed locally and only 5 of
+its 40 characters leave the box.
 
-* **Browser** - a real Chromium. It gets past the bot check, and it costs a 44 MB
-  package plus a ~292 MB browser image that the deploy has to download once.
-* **HTTP** - plain `requests`. No download, no browser, but the bot check refuses
-  it more often, and a refusal is reported as UNKNOWN rather than as CLEAN.
+The address half is a real Chromium page driven through **your own proxy pool**,
+one node per attempt, with the payload read straight from the response. `404`
+means "in no breach" and is a clean answer, not a failure. A challenge gets a
+bounded solve window and one re-fetch from inside the page; only then does the
+next node get a turn. **DIRECT is the last attempt, never the first.**
+
+Two controls, and nothing else:
+
+| Control | What it does |
+|---|---|
+| **Workers** | Parallel items. It is also the page count: **N workers keep at most N pages**, each one reused for every item after the first, blanked and with its cookies dropped between them, and rebuilt after 25 uses or 2 failed attempts in a row. There is no page-count box and no fixed number. |
+| **🎲 Random proxy per attempt** | ON by default. Every attempt draws a different random node from the whole probed pool, so one node never carries a 500-item run. OFF walks the probed order instead - same spread, easier to read in the trace. |
+
+A page that is stuck or challenged recycles itself, so the queue keeps moving
+and a record that is already written is never lost. Each worker's browser is
+launched once for the whole batch, so 500 items cost a handful of browsers, not
+500.
 
 Read the verdict as urgency, not as a score:
 
 | Verdict | Meaning |
 |---|---|
-| **ACT** | a breach added inside 90 days, or a paste from the last year |
-| **REVIEW** | a breach added inside a year |
-| **HISTORIC** | only old exposure - rotate anyway, nothing is urgent |
-| **CLEAN** | not in those sources, which is not the same as never exposed |
-| **UNKNOWN** | no readable answer - usually a throttle or a refused bot check |
+| **NEW** | the password is not in Pwned Passwords at all, or the exposure is inside 90-365 days, or a stealer log names it |
+| **PARTIAL** | the password already circulates (seen 1-9999 times), or the exposure is inside two years |
+| **OLD** | the password has been public for years, or only old breaches touch it |
+| **CLEAN** | the password is unseen and the address is in no readable source |
+| **UNKNOWN** | nothing readable - usually every node refused. Re-run these: a fresh node is drawn for each attempt |
 
-Nothing on that page is written outside your own files, and the history is yours
-alone.
+Two facts are kept apart on every card: **UNREAD** (the address half never
+answered) versus **zero** (it answered and lists nothing). An unread half is
+flagged on the card, shown as `-` in History and `no` in the CSV, and is never
+reported as a clean result. Only the password half can still carry a verdict
+when the address half is unread.
+
+The cache (6 hours, so a re-run sends no request) and your history have their
+own counters and their own Clear buttons on that page and in the app's resource
+monitor. Nothing on that page is written outside your own files, and the history
+is yours alone.
 """
     )
 # @@END 013 TAB_PAGES
