@@ -857,10 +857,13 @@ if _rows:
         % (_q.get("pct", {}).get("OLD", 0), _q.get("pct", {}).get("PARTIAL", 0),
            _q.get("pct", {}).get("NEW", 0), _q.get("pct", {}).get("UNKNOWN", 0)))
 
+    # FIX UNREAD-1: this caption carried two arguments and one placeholder, so it
+    # raised "not all arguments converted" the first time a run had an unread row.
+    # The count is now "x of y", which is also the more useful reading.
     _unread_rows = [r for r in _rows
                     if not r.get("read") and r.get("kind") != "password"]
     if _unread_rows:
-        st.caption("\u26a0 **%d of these address half(s) were never read.** Their "
+        st.caption("\u26a0 **%d of %d address half(s) were never read.** Their "
                    "counts are UNREAD, not zero, and a verdict on one of them comes "
                    "from the password half alone."
                    % (len(_unread_rows), len(_rows)))
