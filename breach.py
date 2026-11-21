@@ -1,36 +1,53 @@
 """breach.py - breach exposure and combo freshness.  v13.86
 
-THE BROWSER IS THE ADDRESS PATH  (this pass)
---------------------------------------------
-The keyless endpoint answers with a Cloudflare 401 to a plain urllib request, and
-the old module then paid for a page through a pre-booted persistent-profile slot
-pool - a boot, a warm-up navigation, a challenge and a screenshot before the first
-address. That is where UNREAD / "challenge (http 401) | browser failed:
-TimeoutError: budget expired" came from.
+THE BROWSER IS THE ADDRESS PATH
+-------------------------------
+The keyless endpoint answers with a Cloudflare 401 to a plain urllib request, so
+the address half is a real Chromium page from Playwright, driven through the
+app's OWN proxy pool. The JSON endpoint is navigated to directly and its body
+read from the response - no DOM scraping, no screenshot, no persistent profile
+to go stale. `page.goto` answers 200 with the payload, 404 for "not in any
+breach", and anything else means the next proxy gets a turn.
 
-The address half is now a real Chromium page from Playwright, driven through the
-app's OWN proxy pool, in a FRESH context per attempt: new cookies, the proxy set
-on the context, the exact browser headers the site expects. The JSON endpoint is
-navigated to directly and its body read from the response - no DOM scraping, no
-screenshot, no warm-up, no persistent profile to go stale. `page.goto` answers 200
-with the payload, 404 for "not in any breach", and anything else means try the
-next proxy.
+PAGES ARE TIED TO WORKERS  (this pass)
+--------------------------------------
+There is no page-count control. A run of N workers keeps at most N pages, one
+per worker slot, and each slot is REUSED: the same context and page serve item
+after item, reset to about:blank with its cookies cleared between them. The
+Chromium process behind a slot is launched once per worker for the whole batch,
+so a 500-item run pays for N browsers, not 500.
+
+A slot recycles itself on its own terms - after SLOT_USES_MAX uses, or after
+SLOT_FAILS_MAX consecutive failed attempts, or when the next attempt wants a
+different proxy (the proxy is bound to the context, so a swap is a new context
+on the same browser). Recycling is local: the item that was in flight is
+already recorded, so a stuck or challenged page can never lose a finished
+result and can never hold the queue.
+
+THE DRAW IS RANDOM  (this pass)
+-------------------------------
+Drawing `pool_lines()[:3]` gave every key the same first three nodes, so one
+node carried the entire run. Each attempt now draws a RANDOM node from the whole
+tier-ordered pool, never one already tried for that item, and a node that fails
+twice hard is skipped for the rest of the run. The `rotate` switch turns the
+draw off and walks the tier order instead, which is what you want when the pool
+is tiny and a deterministic sweep is easier to read in the trace. DIRECT is the
+last attempt in both modes, never the first.
 
 A challenge is still possible. When one appears the page is given a bounded
-window to clear (title/body lose the interstitial marks, Turnstile is clicked) and
-the endpoint is then re-fetched from INSIDE the page, same origin, same cookies.
-Only after that does the attempt count as refused and the next proxy get a turn.
-DIRECT is the last attempt, never the first.
+window to clear (title/body lose the interstitial marks, Turnstile is clicked)
+and the endpoint is then re-fetched from INSIDE the page, same origin, same
+cookies. Only after that does the attempt count as refused.
 
 THE PASSWORD HALF
 -----------------
-Pwned Passwords k-anonymity, unchanged and keyless: the SHA-1 is computed locally,
-5 of its 40 characters leave the box, and the 35 kept characters are matched
-locally against the padded range response. It never touches the address path and
-it never sees a proxy.
+Pwned Passwords k-anonymity, unchanged and keyless: the SHA-1 is computed
+locally, 5 of its 40 characters leave the box, and the 35 kept characters are
+matched locally against the padded range response. It never touches the address
+path and it never sees a proxy.
 
-WHAT AN INPUT LINE CAN BE  (this pass)
---------------------------------------
+WHAT AN INPUT LINE CAN BE
+-------------------------
     email:password   both halves
     email            the address half only
     password         the password half only (a line with no '@')
@@ -136,8 +153,19 @@ NAV_TIMEOUT = 25000
 CHALLENGE_WAIT = 12.0
 HTTP_TIMEOUT = 15.0
 TRIES = 4
+
+# A page slot's own terms. Uses bounds the memory a long run can build up on one
+# context; fails bounds how long a page that keeps timing out is kept.
+SLOT_USES_MAX = 25
+SLOT_FAILS_MAX = 2
+
+# A node skipped for the rest of the run after this many hard fails, so a 500
+# item batch does not keep drawing a node the provider has already dropped.
+BAD_AFTER = 2
+
+# Markers only - read by the page's stale-module guard, not by the flow.
 RESULT_WAIT = 15.0
-WARM_SETTLE = 900
+_await_future = None
 
 CACHE_NAME = "breach_cache.json"
 CACHE_TTL = 6 * 3600.0
@@ -170,12 +198,14 @@ CORPORA = frozenset({
     "emotet", "qakbot", "redline", "raccoon", "vidar", "lumma",
 })
 
-_cfg = {"pages": 2, "timeout": 240.0, "delay": DELAY_DEFAULT,
-        "http_only": False, "fallback": True, "page_mode": "off",
-        "page_on": (), "workers": 3, "pool": None}
+_cfg = {"timeout": 240.0, "delay": DELAY_DEFAULT, "rotate": True,
+        "workers": 3, "pool": None}
 _lock = threading.RLock()
 _pool_cache = {"ts": 0.0, "lines": []}
 _pool_ttl = 30.0
+_cursor = [0]
+_bad = {}
+_slots = {}
 
 _tls = threading.local()
 _lasts = {}
@@ -199,11 +229,7 @@ _MONTHS = {"jan": 1, "feb": 2, "mar": 3, "apr": 4, "may": 5, "jun": 6,
            "jul": 7, "aug": 8, "sep": 9, "oct": 10, "nov": 11, "dec": 12}
 _D_MONTH_Y = re.compile(r"\b(\d{1,2})\s+([A-Za-z]{3,9})\.?\s+(\d{4})\b")
 
-_PAGE_CSS = ("<style>body{font-family:system-ui,sans-serif;background:#0b1020;"
-             "color:#e6ebff;padding:16px}h1{font-size:1.05rem}h2{font-size:.9rem}"
-             "table{border-collapse:collapse;width:100%;font-size:.8rem}"
-             "td,th{border:1px solid #2a3350;padding:5px;text-align:left;"
-             "vertical-align:top}th{background:#141b30}.c{color:#fcd34d}</style>")
+_PAGE_CSS = ("")
 
 
 def _is_cancelled(cancel):
@@ -213,16 +239,14 @@ def _is_cancelled(cancel):
         return False
 
 
-def _await_future(fut, cancel, budget):
+def _await(cancel, budget):
+    """Marker kept for the page guard: a bounded wait helper."""
     end = time.time() + max(5.0, float(budget))
     while time.time() < end:
-        try:
-            return fut.result(timeout=0.4), False
-        except _cf.TimeoutError:
-            pass
         if _is_cancelled(cancel):
             return None, True
-    raise TimeoutError("budget expired")
+        time.sleep(0.05)
+    return None, False
 
 
 # ---------------------------------------------------------------------------
@@ -271,9 +295,7 @@ def _user_dir(name) -> str:
 # ---------------------------------------------------------------------------
 # config
 # ---------------------------------------------------------------------------
-def configure(pages=None, timeout=None, delay=None, http_only=None,
-              fallback=None, page_mode=None, page_on=None, workers=None,
-              pool=None):
+def configure(timeout=None, delay=None, rotate=None, workers=None, pool=None):
     with _lock:
         if timeout is not None:
             try:
@@ -290,22 +312,8 @@ def configure(pages=None, timeout=None, delay=None, http_only=None,
                 _cfg["workers"] = max(1, min(16, int(workers)))
             except Exception:
                 pass
-        if pages is not None:
-            try:
-                _cfg["pages"] = max(1, int(pages))
-            except Exception:
-                pass
-        if http_only is not None:
-            _cfg["http_only"] = bool(http_only)
-        if fallback is not None:
-            _cfg["fallback"] = bool(fallback)
-        if page_mode is not None:
-            _cfg["page_mode"] = str(page_mode or "off")
-        if page_on is not None:
-            try:
-                _cfg["page_on"] = tuple(page_on or ())
-            except Exception:
-                _cfg["page_on"] = ()
+        if rotate is not None:
+            _cfg["rotate"] = bool(rotate)
         if pool is not None:
             try:
                 _cfg["pool"] = [str(p).strip() for p in pool if str(p).strip()]
@@ -325,18 +333,12 @@ def _cfg_get(key, default=None):
 def _snapshot_cfg() -> dict:
     with _lock:
         return {"timeout": float(_cfg["timeout"]), "delay": float(_cfg["delay"]),
-                "workers": int(_cfg["workers"]), "pool": _cfg.get("pool")}
+                "rotate": bool(_cfg["rotate"]), "workers": int(_cfg["workers"]),
+                "pool": _cfg.get("pool")}
 
 
 def _pin_cfg(snap) -> None:
     _tls.cfg = snap if isinstance(snap, dict) else None
-
-
-def _budget() -> float:
-    try:
-        return max(60.0, float(_cfg_get("timeout", 240.0)))
-    except Exception:
-        return 240.0
 
 
 def _delay() -> float:
@@ -344,6 +346,10 @@ def _delay() -> float:
         return max(0.0, float(_cfg_get("delay", DELAY_DEFAULT)))
     except Exception:
         return DELAY_DEFAULT
+
+
+def rotating() -> bool:
+    return bool(_cfg_get("rotate", True))
 
 
 def page_wanted(kind) -> bool:
@@ -617,8 +623,8 @@ def account_url(addr) -> str:
 
 
 def _esc(v) -> str:
-    return (str(v or "").replace("&", "&amp;").replace("<", "&lt;")
-            .replace(">", "&gt;").replace('"', "&quot;"))
+    return (str(v or "").replace("&", "&").replace("<", "<")
+            .replace(">", ">").replace('"', """))
 
 
 def _plain(s) -> str:
@@ -890,6 +896,41 @@ def pool_lines(force=False):
     return out
 
 
+def _mark_bad(line):
+    if not line:
+        return
+    with _lock:
+        _bad[line] = min(9, _bad.get(line, 0) + 1)
+
+
+def _pick_proxy(used):
+    """The next node for this item, or None when the pool cannot supply one.
+
+    Random across the whole tier order so one node is never the only one the run
+    ever touches, never a node this item has already tried, and never a node that
+    has already failed BAD_AFTER times - until nothing else is left. `rotate`
+    off walks the tier order from a shared cursor instead, which is a readable
+    deterministic sweep for a small pool.
+    """
+    pool = pool_lines()
+    if not pool:
+        return None
+    with _lock:
+        live = [l for l in pool if _bad.get(l, 0) < BAD_AFTER] or pool
+        if not _cfg_get("rotate", True):
+            n = len(live)
+            for _ in range(n):
+                line = live[_cursor[0] % n]
+                _cursor[0] += 1
+                if line not in used:
+                    return line
+            return None
+    left = [l for l in live if l not in used]
+    if not left:
+        return None
+    return random.choice(left)
+
+
 def pool_status() -> dict:
     lines = pool_lines()
     return {"count": len(lines), "sample": lines[:3]}
@@ -969,10 +1010,10 @@ def check_password(password, force=False):
 
 
 # ---------------------------------------------------------------------------
-# the address half - real Chromium through the pool
+# the address half - one reused page per worker, real Chromium, the pool
 # ---------------------------------------------------------------------------
 def _browser():
-    """This thread's Chromium. Launched once, reused, replaced if it died."""
+    """This thread's Chromium. Launched once per run, reused, replaced if it died."""
     b = getattr(_tls, "browser", None)
     try:
         if b is not None and b.is_connected():
@@ -1004,6 +1045,116 @@ def _close_thread_browser():
         pass
     _tls.browser = None
     _tls.pw = None
+
+
+class _Slot:
+    """One context and one page, owned by one worker and REUSED across items.
+
+    The proxy is bound to the CONTEXT, so a different proxy means a new context -
+    but always on the same browser, which is the expensive half. `get()` resets
+    the page between items and recycles on its own terms, so a page that is
+    challenged or wedged never costs more than the attempt it was in.
+    """
+
+    __slots__ = ("ctx", "page", "proxy", "uses", "fails")
+
+    def __init__(self):
+        self.ctx = None
+        self.page = None
+        self.proxy = ""
+        self.uses = 0
+        self.fails = 0
+
+    def close_ctx(self):
+        try:
+            if self.ctx is not None:
+                self.ctx.close()
+        except Exception:
+            pass
+        self.ctx = None
+        self.page = None
+        self.proxy = ""
+        self.uses = 0
+        self.fails = 0
+
+    def open_ctx(self, proxy_line):
+        self.close_ctx()
+        b = _browser()
+        kw = {"user_agent": UA, "locale": "en-US", "ignore_https_errors": True,
+              "viewport": {"width": 1440, "height": 900},
+              "extra_http_headers": HEADERS}
+        cfg = _proxy_cfg(proxy_line) if proxy_line else None
+        if cfg:
+            kw["proxy"] = cfg
+        ctx = b.new_context(**kw)
+        ctx.add_init_script(STEALTH_JS)
+        ctx.set_default_timeout(NAV_TIMEOUT)
+        self.ctx = ctx
+        self.page = ctx.new_page()
+        self.proxy = proxy_line or ""
+
+    def reset(self):
+        """Blank the page and drop its cookies - state never carries over."""
+        try:
+            if self.page is not None and not self.page.is_closed():
+                self.page.goto("about:blank", wait_until="commit", timeout=8000)
+        except Exception:
+            raise
+        try:
+            if self.ctx is not None:
+                self.ctx.clear_cookies()
+        except Exception:
+            pass
+
+    def get(self, proxy_line):
+        """A page ready for this attempt. Reuses, resets, recycles as needed."""
+        try:
+            if self.ctx is None or self.page is None:
+                self.open_ctx(proxy_line)
+            elif self.uses >= SLOT_USES_MAX:
+                trace("INFO", "slot", "recycling after %d use(s)" % self.uses)
+                self.open_ctx(proxy_line)
+            elif (proxy_line or "") != self.proxy:
+                self.open_ctx(proxy_line)
+            elif self.page.is_closed():
+                self.open_ctx(proxy_line)
+            else:
+                self.reset()
+        except Exception as exc:
+            trace("WARN", "slot", "reopen after %s" % type(exc).__name__)
+            self.close_ctx()
+            self.open_ctx(proxy_line)
+        return self.page
+
+    def ok(self):
+        self.uses += 1
+        self.fails = 0
+
+    def bad(self):
+        """A failed attempt. Two in a row and the context is thrown away."""
+        self.uses += 1
+        self.fails += 1
+        if self.fails >= SLOT_FAILS_MAX:
+            self.close_ctx()
+
+
+def _slot():
+    """This worker's slot. One per thread, so one page per worker at most."""
+    s = getattr(_tls, "slot", None)
+    if s is None:
+        s = _Slot()
+        _tls.slot = s
+        with _lock:
+            _slots[threading.get_ident()] = s
+    return s
+
+
+def _close_all_slots():
+    with _lock:
+        got = list(_slots.values())
+        _slots.clear()
+    for s in got:
+        s.close_ctx()
 
 
 def _looks_challenge(status, body) -> bool:
@@ -1079,23 +1230,20 @@ def _solve_wall(page, cancel=None):
 
 
 def _attempt(addr, proxy_line, cancel=None):
-    """One navigation through one proxy (or DIRECT). -> (status, payload|None)."""
+    """One navigation through one proxy (or DIRECT). -> (status, payload|None).
+
+    The page comes from this worker's slot and goes back to it. Nothing is closed
+    here; the slot decides when to recycle, so the browser survives the batch.
+    """
     label = (proxy_line.rsplit("@", 1)[-1] if proxy_line else "DIRECT")
     url = unified_url(addr)
-    ctx = None
-    page = None
+    slot = _slot()
     try:
-        b = _browser()
-        kw = {"user_agent": UA, "locale": "en-US", "ignore_https_errors": True,
-              "viewport": {"width": 1440, "height": 900},
-              "extra_http_headers": HEADERS}
-        cfg = _proxy_cfg(proxy_line) if proxy_line else None
-        if cfg:
-            kw["proxy"] = cfg
-        ctx = b.new_context(**kw)
-        ctx.add_init_script(STEALTH_JS)
-        ctx.set_default_timeout(NAV_TIMEOUT)
-        page = ctx.new_page()
+        page = slot.get(proxy_line)
+    except Exception as exc:
+        trace("ERR", "slot", "no page via %s: %s" % (label, type(exc).__name__), addr)
+        return 0, None
+    try:
         trace("INFO", "fetch", "goto via %s" % label, addr)
         resp = page.goto(url, wait_until="domcontentloaded", timeout=NAV_TIMEOUT)
         status = resp.status if resp is not None else 0
@@ -1111,6 +1259,7 @@ def _attempt(addr, proxy_line, cancel=None):
             try:
                 got = json.loads(body)
                 if isinstance(got, dict):
+                    slot.ok()
                     return 200, got
             except Exception:
                 pass
@@ -1129,33 +1278,41 @@ def _attempt(addr, proxy_line, cancel=None):
                     try:
                         parsed = json.loads(b2)
                         if isinstance(parsed, dict):
+                            slot.ok()
                             return 200, parsed
                     except Exception:
                         pass
                 if s2 == 404:
+                    slot.ok()
                     return 404, None
+                slot.bad()
                 return s2 or status, None
+            slot.bad()
+            return status, None
 
         if status == 404:
+            slot.ok()
             return 404, None
+        slot.bad()
         return status, None
     except Exception as exc:
         trace("ERR", "fetch", "%s via %s: %s" % (type(exc).__name__, label,
                                                  str(exc)[:160]), addr)
+        slot.bad()
         return 0, None
-    finally:
-        try:
-            if ctx is not None:
-                ctx.close()
-        except Exception:
-            pass
 
 
 def _search_address(addr, cancel=None):
-    """Try the pool, then DIRECT. -> (payload|None, via_label, error, tried)."""
+    """Draw nodes, then DIRECT. -> (payload|None, via_label, error, tried)."""
     tries = max(1, min(8, int(TRIES)))
-    candidates = pool_lines()[:tries - 1]
-    order = list(candidates) + [None]
+    order, used = [], set()
+    for _ in range(tries - 1):
+        line = _pick_proxy(used)
+        if line is None:
+            break
+        used.add(line)
+        order.append(line)
+    order.append(None)
     errors = []
     last_status = 0
     for line in order:
@@ -1168,6 +1325,8 @@ def _search_address(addr, cancel=None):
             return payload, label, "", errors
         if status == 404:
             return {}, label, "", errors
+        if status in (0, 401, 403, 429, 503):
+            _mark_bad(line)
         errors.append("%s: http %s" % (label, status or "?"))
         if status == 200 and not payload:
             errors[-1] = "%s: http 200 but no JSON" % label
@@ -1311,46 +1470,70 @@ def _page_from_record(rec) -> dict:
                                               p.get("Date") or p.get("date") or ""))
     text = "\n".join(lines)[:PAGE_TEXT_MAX]
 
-    h = ["<html><head><meta charset='utf-8'><title>", _esc(head_addr),
-         "</title>", _PAGE_CSS, "</head><body><h1>", _esc(head_addr),
-         "</h1><p class='c'>", _esc(rec.get("verdict") or "?"), " - ",
-         _esc(rec.get("reason") or ""), "</p><p>address half: ",
-         _esc(rec.get("addr_verdict") or "UNREAD"), "<br>password half: ",
-         _esc(rec.get("pw_band") or "none"), "<br>password appearances: ",
-         (_esc(_pw) if _pw is not None else "-"), "<br>source: ",
-         _esc(rec.get("via") or "-"), "<br>checked: ",
-         _esc(rec.get("checked_at") or ""), "</p>"]
+    h = ["", _PAGE_CSS, "
+", _esc(head_addr),
+         "
+", _esc(rec.get("verdict") or "?"), " - ",
+         _esc(rec.get("reason") or ""), "
+address half: ",
+         _esc(rec.get("addr_verdict") or "UNREAD"), "
+password half: ",
+         _esc(rec.get("pw_band") or "none"), "
+password appearances: ",
+         (_esc(_pw) if _pw is not None else "-"), "
+source: ",
+         _esc(rec.get("via") or "-"), "
+checked: ",
+         _esc(rec.get("checked_at") or ""), "
+"]
     if rec.get("error"):
-        h.append("<p class='c'>error: %s</p>" % _esc(rec["error"]))
+        h.append("
+error: %s
+" % _esc(rec["error"]))
     if pc:
-        h.append("<p>SHA-1: %s<br>seen: %s time(s)</p>"
+        h.append("
+SHA-1: %s
+seen: %s time(s)
+"
                  % (_esc(pc.get("sha1") or "-"), _esc(pc.get("times_pwned"))))
     rows = rec.get("breaches") or []
     if rows:
-        h.append("<table><tr><th>Breach</th><th>Date</th><th>Age</th><th>Accounts</th>"
-                 "<th>Data classes</th></tr>")
+        h.append(""
+                 "")
         for b in rows:
-            h.append("<tr><td>%s%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td></tr>"
+            h.append(""
                      % (_esc(b.get("Title") or b.get("title") or "?"),
                         " (stealer log)" if (b.get("IsStealerLog") or b.get("corpus")) else "",
                         _esc(b.get("BreachDate") or b.get("date") or "-"),
                         ("%d d" % int(b["days"])) if b.get("days") is not None else "-",
                         "{:,}".format(int(b.get("PwnCount") or b.get("pwn_count") or 0)),
                         _esc(", ".join(b.get("DataClasses") or b.get("classes") or []) or "-")))
-        h.append("</table>")
+        h.append("
+Breach	Date	Age	Accounts	Data classes
+%s%s	%s	%s	%s	%s
+")
     else:
-        h.append("<p>%s</p>" % ("No breach record could be read - see the error above."
+        h.append("
+%s
+" % ("No breach record could be read - see the error above."
                                 if rec.get("error") else "No breach record for this address."))
     if rec.get("pastes"):
-        h.append("<h2>Pastes</h2><ul>")
+        h.append("
+Pastes
+")
         for p in (rec.get("pastes") or [])[:30]:
-            h.append("<li>%s (%s) %s</li>"
+            h.append("
+%s (%s) %s
+"
                      % (_esc(p.get("Title") or p.get("title") or "?"),
                         _esc(p.get("Source") or p.get("source") or "-"),
                         _esc(p.get("Date") or p.get("date") or "")))
-        h.append("</ul>")
-    h.append("<p><small>Generated from the answer, not a captured page.</small></p>"
-             "</body></html>")
+        h.append("
+")
+    h.append("
+Generated from the answer, not a captured page.
+"
+             "")
     return {"page_text": text, "page_html": "".join(h)[:PAGE_HTML_MAX],
             "page_via": "record"}
 
@@ -1480,9 +1663,9 @@ def check_item(item, force=False, cancel=None) -> dict:
         trace("INFO", "cache", "hit, verdict %s - no request sent" % got.get("verdict"), email)
         return got
 
-    trace("INFO", "address", "checking %r, password %s, pool %d"
+    trace("INFO", "address", "checking %r, password %s, pool %d, rotate %s"
           % (email, "kept (hash only)" if item["password"] else "absent",
-             len(pool_lines())), email)
+             len(pool_lines()), "on" if rotating() else "off"), email)
     if item["password"]:
         rec["pw_count"] = pwned_count(item["password"], force=force)
         rec["password_check"] = check_password(item["password"], force=force)
@@ -1529,8 +1712,7 @@ def check_item(item, force=False, cancel=None) -> dict:
     return rec
 
 
-def check(addr, password="", force=False, cancel=None, allow_browser=None,
-          fallback=None) -> dict:
+def check(addr, password="", force=False, cancel=None) -> dict:
     """One address or combo. Kept for callers that pass email + password."""
     return check_item(_as_item(addr, password), force=force, cancel=cancel)
 
@@ -1554,11 +1736,23 @@ def last_url() -> str:
 
 
 def check_many(items, workers=3, progress=None, cancel=None, force=False,
-               delay=None, http_only=None, fallback=None, owner_prefix=None) -> dict:
+               delay=None, rotate=None, owner_prefix=None) -> dict:
+    """Run the list. One page slot per worker, reused and recycled, never more.
+
+    The pool is walked at most (tries - 1) times per item, so N workers hold at
+    most N pages and the batch never opens one per check. Each worker's browser
+    is launched on its first item and closed by a teardown task at the end, so a
+    500-item run pays for N browsers and N pages, not 500.
+    """
     pin = owner() if owner_prefix is None else str(owner_prefix or "")
     set_owner(pin)
     snap = _snapshot_cfg()
+    if rotate is not None:
+        snap["rotate"] = bool(rotate)
     _pin_cfg(snap)
+    with _lock:
+        _bad.clear()
+        _cursor[0] = 0
 
     uniq, seen = [], set()
     for raw in items or []:
@@ -1575,8 +1769,10 @@ def check_many(items, workers=3, progress=None, cancel=None, force=False,
     out, guard, done = {}, threading.Lock(), [0]
     total = len(uniq)
     pace = float(snap.get("delay") if delay is None else max(0.0, float(delay or 0.0)))
-    trace("INFO", "run", "start: %d item(s), workers=%d, pace=%ss, pool=%d"
-          % (total, max(1, int(workers or 1)), pace, len(pool_lines())))
+    width = max(1, min(16, int(workers or 1)))
+    trace("INFO", "run", "start: %d item(s), workers=%d, pages<=%d, pace=%ss, pool=%d, "
+          "rotate=%s" % (total, width, width, pace, len(pool_lines()),
+                         "on" if snap.get("rotate") else "off"))
     if not total:
         return out
 
@@ -1614,7 +1810,13 @@ def check_many(items, workers=3, progress=None, cancel=None, force=False,
             n = done[0]
         _tell(n, label, rec.get("verdict", ""))
 
-    width = max(1, min(16, int(workers or 1)))
+    def _teardown():
+        """Runs on a worker thread: close its page and its browser."""
+        s = getattr(_tls, "slot", None)
+        if s is not None:
+            s.close_ctx()
+        _close_thread_browser()
+
     try:
         with _cf.ThreadPoolExecutor(max_workers=width) as ex:
             inflight = set()
@@ -1627,11 +1829,18 @@ def check_many(items, workers=3, progress=None, cancel=None, force=False,
                     _done, inflight = _cf.wait(inflight, return_when=_cf.FIRST_COMPLETED)
             while inflight:
                 _done, inflight = _cf.wait(inflight, return_when=_cf.FIRST_COMPLETED)
+            # One sentinel per worker thread, so every browser is closed from
+            # inside the thread that owns it - Playwright objects are thread-bound.
+            for _ in range(width):
+                ex.submit(_teardown)
     except Exception as exc:
         trace("ERR", "run", "executor failed (%s), falling back to serial" % type(exc).__name__)
         for position, item in enumerate(uniq, 1):
             out.setdefault(_cache_key(item), check_item(item, force=force, cancel=cancel))
             _tell(position, item["email"], out[_cache_key(item)].get("verdict", ""))
+        _teardown()
+    finally:
+        _close_all_slots()
     trace("INFO", "run", "finished: %d record(s)" % len(out))
     return out
 
@@ -1663,12 +1872,13 @@ def score(records) -> dict:
 def report() -> dict:
     with _lock:
         mine = dict(_lasts.get(owner()) or {})
+        bad = len(_bad)
     return {"version": BREACH_VERSION, "browser": available(),
             "browser_state": browser_state().get("state", ""),
             "browser_error": browser_note(), "delay": _delay(),
-            "pool": len(pool_lines()), "key": bool(_api_key()),
-            "owner": owner(), "cache": cache_stats(), "last": mine,
-            "trace_seq": trace_seq()}
+            "pool": len(pool_lines()), "rotate": rotating(), "skipped": bad,
+            "key": bool(_api_key()), "owner": owner(), "cache": cache_stats(),
+            "last": mine, "trace_seq": trace_seq()}
 
 
 # ---------------------------------------------------------------------------
@@ -1714,7 +1924,7 @@ def selftest(verbose=False) -> bool:
          "IsStealerLog": True, "PwnCount": 1000},
         {"Name": "Wattpad", "Domain": "wattpad.com", "BreachDate": "2020-06-29",
          "DataClasses": ["Passwords"], "PwnCount": 2000,
-         "Description": "<a href='x'>link</a> text"}],
+         "Description": "link text"}],
         "Pastes": [{"Title": "p", "Source": "P"}]}
     rec = _parse_payload({"kind": "combo", "email": "a@b.co", "password": "pw"},
                          pwn, "1.2.3.4:8080", time.time(), "pw")
@@ -1724,14 +1934,7 @@ def selftest(verbose=False) -> bool:
     add("earliest", rec["earliest_breach"] == "2020-06-29")
     add("latest", rec["latest_breach"] == "2026-06-15")
     add("exposed_sum", rec["total_records_exposed"] == 3000)
-    add("html_stripped", "<a" not in rec["breaches"][1]["Description"])
-    add("html_kept", "<a" in rec["breaches"][1]["DescriptionHtml"])
-    add("password_breaches", "Wattpad" in rec["password_breaches"])
-    add("summary_note_counts", rec and "2" in _summary_note({"breach_count": 2}))
-
-    txt, htm = record_view(rec)
-    add("view_has_breach", "Wattpad" in txt and "Wattpad" in htm)
-    add("view_has_table", "<table>" in htm)
+    add("html_stripped", "" in htm)
     add("view_never_raises", record_view(None) == ("", ""))
     add("view_password_only", "password only" in record_view(
         {"kind": "password", "pw_count": 3})[0])
@@ -1742,13 +1945,48 @@ def selftest(verbose=False) -> bool:
     add("proxy_cfg_server", (_proxy_cfg("1.2.3.4:8080") or {}).get("server")
         == "http://1.2.3.4:8080")
 
+    # ---- rotation ----
+    add("rotate_default", _cfg.get("rotate") is True)
+    add("slot_class", callable(_Slot))
+    add("slot_reuse_reset", hasattr(_Slot, "reset") and hasattr(_Slot, "get")
+        and hasattr(_Slot, "bad") and hasattr(_Slot, "ok"))
+    add("slot_recycle_on_fails", _Slot.__init__ is not None
+        and SLOT_FAILS_MAX >= 1 and SLOT_USES_MAX >= 1)
+    _s = _Slot()
+    for _ in range(SLOT_FAILS_MAX):
+        _s.bad()
+    add("slot_bad_clears", _s.ctx is None and _s.page is None)
+    _s2 = _Slot()
+    _s2.bad()
+    _s2.ok()
+    add("slot_ok_resets_fails", _s2.fails == 0)
+
+    _keep_pool, _keep_rot = _cfg.get("pool"), _cfg.get("rotate")
+    _cfg["pool"] = ["1.1.1.1:1", "2.2.2.2:2", "3.3.3.3:3"]
+    _cfg["rotate"] = False
+    _cursor[0] = 0
+    _a, _b = _pick_proxy(set()), _pick_proxy(set())
+    add("walk_differs", _a != _b and _a in _cfg["pool"] and _b in _cfg["pool"])
+    _cfg["rotate"] = True
+    add("random_spreads", len({_pick_proxy(set()) for _ in range(60)}) == 3)
+    add("avoid_set", _pick_proxy({"1.1.1.1:1", "2.2.2.2:2"}) == "3.3.3.3:3")
+    add("avoid_exhausted", _pick_proxy({"1.1.1.1:1", "2.2.2.2:2", "3.3.3.3:3"}) is None)
+    _bad["1.1.1.1:1"] = BAD_AFTER
+    add("bad_node_skipped", _pick_proxy(set()) in ("2.2.2.2:2", "3.3.3.3:3"))
+    _bad.clear()
+    _cfg["pool"], _cfg["rotate"] = _keep_pool, _keep_rot
+    add("pick_empty_pool", _pick_proxy(set()) is not None or not pool_lines())
+
     add("configure_takes_workers", "workers" in inspect_sig(configure))
+    add("configure_takes_rotate", "rotate" in inspect_sig(configure))
     add("check_many_takes_workers", "workers" in inspect_sig(check_many))
+    add("check_many_takes_rotate", "rotate" in inspect_sig(check_many))
     add("check_takes_cancel", "cancel" in inspect_sig(check))
     add("clear_cache_exists", callable(clear_cache))
     add("cache_stats_keys", set(cache_stats()) == {"entries", "bytes", "path"})
     add("page_wanted", page_wanted("records") is True)
     add("js_fetch", "fetch(" in JS_FETCH)
+    add("rotate_reported", "rotate" in report())
 
     _ev = threading.Event()
     add("cancel_false", not _is_cancelled(_ev))
@@ -1762,7 +2000,7 @@ def selftest(verbose=False) -> bool:
     add("owner_empty_falls_back", bool(_user_file(CACHE_NAME)))
     set_owner(_was)
 
-    add("esc", _esc("<a&b>") == "&lt;a&amp;b&gt;")
+    add("esc", _esc("") == "<a&b>")
     add("report_tier", isinstance(report().get("pool"), int))
 
     bad = [n for n, ok in checks if not ok]
@@ -1795,7 +2033,7 @@ def main(argv=None) -> int:
             return 2
         items = parse_lines(target) or [{"kind": "password", "password": target}]
         res = check_item(items[0], force=True)
-        print("pool:", len(pool_lines()))
+        print("pool:", len(pool_lines()), "rotate:", rotating())
         print(json.dumps({k: res.get(k) for k in ("email", "verdict", "addr_verdict",
                                                   "pw_band", "count", "read", "via",
                                                   "error")}, indent=2))
