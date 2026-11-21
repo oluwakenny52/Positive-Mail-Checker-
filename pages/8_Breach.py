@@ -6,34 +6,31 @@ pages/8_Breach.py - breach exposure and combo freshness  (v13.86)
 What a list of combos has actually been in, with the verdict about FRESHNESS
 rather than count.
 
-WHY A PAGE AND NOT A RUN STEP
------------------------------
-A breach lookup is slow and rate-limited, and its answer never changes a mail
-verdict. Putting it in the checker would spend ladder time on it. Here it is a
-separate queue you point at a list when you want it.
+WHAT CHANGED IN THIS PASS
+-------------------------
+The address half is a real Chromium page again, but through the app's OWN proxy
+pool and with a fresh context per attempt - no key, no HTTP 401 wall, no
+persistent profile to go stale. Password-only and address-only lines are first
+class now. The controls that only existed for the old capture pipeline are gone
+(Browser pages, Ignore cache, Browser fallback, capture mode), and the cache and
+the history have their own monitor and clear buttons on this page and in the
+app's Resources panel.
 
-THE KEY IS THE PRIMARY PATH  (this pass)
-----------------------------------------
-A free HIBP API key answers the address half with two small JSON calls - exact,
-milliseconds, no page to render and nothing to challenge. It is tried FIRST,
-before anything is opened.
-
-The browser is demoted to a fallback and it has a switch. "Browser fallback" off
-means API-only: fast, and an address the API refuses stops at UNREAD instead of
-paying for a page. It is on by default because without a key there is no other
-way to read the address at all, and the trace says which tier answered.
+WHAT EACH INPUT LINE IS
+-----------------------
+  email:password   both halves
+  email            the address half only
+  password         the password half only (a line with no '@')
 
 WHAT EACH SOURCE IS
 -------------------
   passwords  Pwned Passwords k-anonymity. Keyless, un-challenged, and the real
              signal - it says how public this exact password already is.
-  address    the HIBP API when a key is set. Without a key, or when the key is
-             refused, the site's own search endpoint - and only then, and only
-             with the fallback switched on, a browser page.
-  catalogue  the free breach list, matched locally by domain, as a fallback.
+  address    the site's own unified search endpoint, fetched by a real Chromium
+             page through the proxy pool, DIRECT as the last attempt.
 
-WHAT LEAVES THE BOX  (v13.85)
------------------------------
+WHAT LEAVES THE BOX
+-------------------
 Only the ADDRESS. A pasted `email:password` is cut at the colon before the URL
 is built, so the password never reaches haveibeenpwned.com - which would not use
 it anyway. The password goes to exactly one place: the SHA-1 hash for Pwned
@@ -41,67 +38,36 @@ Passwords, where 5 of the 40 characters leave and 35 are matched locally.
 
 THE BANDS
 ---------
-  NEW       password unseen, or exposure inside 365 days
+  NEW       password unseen, or exposure inside 365 days, or a stealer log
   PARTIAL   password already circulating, or exposure inside 730 days
   OLD       password public for years, or only old breaches
-  CLEAN     password unseen and address in no readable source
-  UNKNOWN   nothing readable - the only honest answer when every tier failed
+  CLEAN     password unseen and the address in no readable source
+  UNKNOWN   nothing readable - the only honest answer when every attempt failed
 
-THE RUN DOES NOT RUN IN THE SCRIPT  (earlier pass)
---------------------------------------------------
-It used to. Streamlit holds the whole delta stream while a script run blocks, so
-a three-minute run greyed the page out and left the bar on 0 / 4 until the first
-address happened to finish, and the widget states were dead for the duration.
-The run is a THREAD now, its counters live in a session job dict, and this page
-polls them with st.rerun(). The bar and the live trace move per address, Stop
-works, and a refresh or a tab switch does not lose the run.
+THE RUN DOES NOT RUN IN THE SCRIPT
+----------------------------------
+Streamlit holds the delta stream while a script run blocks, so the run is a
+THREAD, its counters live in a session job dict, and this page polls them with
+st.rerun(). The bar and the live trace move per item, Stop works, and a refresh
+does not lose the run.
 
-THE PAGE COUNT IS THE CONCURRENCY  (earlier pass)
--------------------------------------------------
-The Workers slider was gone once; it is back. WORKERS is how many addresses are
-in flight. PAGES is how many tabs exist, one per worker slot. The delay only
-paces the starts.
-
-THE PAGE OPENS, AND YOU SCROLL IT  (earlier pass)
--------------------------------------------------
-Every captured address carries a FULL-LENGTH screenshot of what the browser
-rendered, shown first in a scrollable box, so the breach cards, their dates and
-their data classes can be read exactly as the site prints them - even when the
-scrape found no anchor to parse. Text and HTML views stay beside it.
-
-READ, VERSUS ZERO  (earlier pass)
----------------------------------
+READ, VERSUS ZERO
+-----------------
 A card that said "0 breaches" could mean the page was read and lists none, or
-that every tier failed and nothing was read. Those are opposite facts. Every
-record carries `read`; an unread address half is flagged on the card, marked "-"
-in History, marked `no` in the CSV, and counted in the run summary.
-
-TRACING AND PACING  (v13.85)
-----------------------------
-Section 4 is a trace of everything: each control you moved, each address started,
-the literal URL sent, the status, whether a challenge appeared, which tier
-took over, the band, and every error verbatim. It is shown live during a run,
-kept in a per-user file, and downloadable - so a run that goes wrong can be read
-afterwards instead of guessed at.
-
-THE BROWSER
------------
-The package comes from requirements.txt; the ~150 MB Chromium binary does not.
-The browser row in section 1 installs it once, on a background thread, and shows
-the state. It is only needed when the fallback is on and a key is missing or
-refused. Passwords work with no browser at all.
+that every attempt failed and nothing was read. Every record carries `read`; an
+unread address half is flagged on the card, marked "-" in History, marked `no`
+in the CSV and counted in the run summary.
 
 ISOLATION
 ---------
 The cache, the history and the trace resolve through the pinned owner, which is
-the unlocked hash, so each is one file per user. Nothing on this page reads
-another user's data.
+the unlocked hash, so each is one file per user. The proxy pool is the owner's
+own proxies.txt.
 
-Read-only except Run / Stop / Prepare browser / Clear history / Clear trace /
-downloads.
+Read-only except Run / Stop / Prepare browser / Clear cache / Clear history /
+Clear trace / downloads.
 """
 
-import base64
 import importlib
 import json
 import os
@@ -171,11 +137,8 @@ _CSS_TMPL = """
     .br-old      { background:#ef444433; color:#fca5a5; border:1px solid #ef444466; }
     .br-clean    { background:#64748b33; color:#cbd5e1; border:1px solid #64748b66; }
     .br-unknown  { background:#a78bfa33; color:#ddd6fe; border:1px solid #a78bfa66; }
-    /* The captured page. Tall pages are scrolled inside the box instead of
-       stretching the whole card, and the image keeps its own proportions. */
-    .br-shot { max-height: 70vh; overflow: auto; border: 1px solid #2a3350;
-               border-radius: 8px; background: #0b1020; }
-    .br-shot img { width: 100%; display: block; }
+    .br-mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+               font-size: .8rem; word-break: break-all; }
     .block-container, [data-testid="stMainBlockContainer"] {
         padding-top: 1.2rem !important; padding-bottom: 2rem !important;
         max-width: 1100px !important;
@@ -186,7 +149,6 @@ _CSS_TMPL = """
             padding-right: .7rem !important;
         }
         .br-hero h1 { font-size: 1.15rem !important; }
-        .br-shot { max-height: 60vh; }
     }
 </style>
 """
@@ -203,9 +165,10 @@ st.markdown(_css(), unsafe_allow_html=True)
 # @@BLOCK 005 HERO_GATE deps=004
 st.markdown(
     '<div class="br-hero"><h1>\U0001f6e1 Breach Exposure</h1>'
-    '<p>Point this at a list of combos. The HIBP API key answers first; a browser '
-    'page is only a fallback, and it has its own switch. The verdict is about how '
-    'RECENT the exposure is.</p></div>',
+    '<p>Point this at a list of combos, addresses or passwords. The address half is '
+    'read by a real browser through your own proxy pool; the password half is a local '
+    'SHA-1 and a k-anonymity lookup. The verdict is about how RECENT the exposure is.'
+    '</p></div>',
     unsafe_allow_html=True)
 
 import auth
@@ -225,36 +188,29 @@ audit_log = _audit
 if hasattr(audit_log, "page"):
     audit_log.page("pages/8_Breach.py")
 
-# INSTALL BEFORE require(), exactly as app.py block 007 and every other page do.
-# require() calls st.stop() while locked, so an install() after it never runs on
-# a locked page and the Unlock box is never wrapped.
+# INSTALL BEFORE require(), exactly as app.py block 007 does.
 if hasattr(audit_log, "install"):
     audit_log.install(st, "pages/8_Breach.py")
 
 auth.require(st, "Unlock Breach Exposure")
-auth.fit(st)                        # CSS only, before the first widget
+auth.fit(st)
 
-# The first theme read ran before the gate, on the anonymous prefix. Now that
-# the passphrase is unlocked the owner's real file exists - re-read and repaint.
 _TH = _theme()
 st.markdown(_css(), unsafe_allow_html=True)
 # @@END 005 HERO_GATE
 
 # @@BLOCK 006 SOURCES deps=005
 import breach
-import streamlit.components.v1 as components
 
 # ---- stale-module guard -------------------------------------------------------
-# page_wanted, trace_read, trace_clear, record_view, set_owner, RESULT_WAIT,
-# _await_future and _Slot are version markers. A module without _Slot runs every
-# scrape in one loop; a module without JS_FETCH still waits for a render that a
-# wall never produces.
-if not (hasattr(breach, "page_wanted") and hasattr(breach, "trace_read")
-        and hasattr(breach, "trace_clear") and hasattr(breach, "record_view")
-        and hasattr(breach, "set_owner") and hasattr(breach, "RESULT_WAIT")
-        and hasattr(breach, "_await_future") and hasattr(breach, "_Slot")
-        and hasattr(breach, "key_present") and hasattr(breach, "key_hint")
-        and hasattr(breach, "JS_FETCH")):
+# parse_lines, pool_lines, check_item, clear_cache, cache_stats and record_view are
+# version markers: a module without them predates the proxy edition.
+if not (hasattr(breach, "parse_lines") and hasattr(breach, "pool_lines")
+        and hasattr(breach, "check_item") and hasattr(breach, "clear_cache")
+        and hasattr(breach, "cache_stats") and hasattr(breach, "record_view")
+        and hasattr(breach, "set_owner") and hasattr(breach, "_await_future")
+        and hasattr(breach, "_Slot") and hasattr(breach, "JS_FETCH")
+        and hasattr(breach, "RESULT_WAIT")):
     breach = importlib.reload(breach)
     try:
         breach.trace("INFO", "page", "stale breach module replaced by reload")
@@ -274,14 +230,6 @@ _RES_KEY = "_breach_results"
 _QUAL_KEY = "_breach_quality"
 _MSG_KEY = "_breach_msg"
 _TRACE_SHOWN = "_breach_trace_shown"
-_CAP_MODE_KEY = "_breach_page_mode"
-_CAP_ON_KEY = "_breach_page_on"
-_FALLBACK_KEY = "_breach_fallback"
-_MODE_LABELS = {
-    "Fast - only what I filter for": "fast",
-    "Full - every address checked": "full",
-    "Off - capture no pages": "off",
-}
 
 _BAND_CSS = {"NEW": "br-new", "PARTIAL": "br-partial", "OLD": "br-old",
              "CLEAN": "br-clean", "UNKNOWN": "br-unknown"}
@@ -317,8 +265,7 @@ def _state_load():
 def _state_save(rows, quality, stamp):
     """Persist settings + results + quality so a reload keeps them.
 
-    The screenshot PATH is kept (it is a filename); the HTML is dropped and the
-    text trimmed, so the file stays a few hundred KB rather than megabytes.
+    The HTML is dropped and the text trimmed, so the file stays small.
     """
     p = _state_path()
     if not p:
@@ -331,13 +278,8 @@ def _state_save(rows, quality, stamp):
             d["page_text"] = str(d.get("page_text") or "")[:4000]
             slim.append(d)
         data = {"settings": {
-                    "workers": int(st.session_state.get("_breach_workers", 2)),
-                    "pages": int(st.session_state.get("_breach_pages", 2)),
-                    "delay": float(st.session_state.get("_breach_delay", 1.0)),
-                    "force": bool(st.session_state.get("_breach_force", False)),
-                    "fallback": bool(st.session_state.get(_FALLBACK_KEY, True)),
-                    "mode": st.session_state.get(_CAP_MODE_KEY, "Fast - only what I filter for"),
-                    "on": list(st.session_state.get(_CAP_ON_KEY) or []),
+                    "workers": int(st.session_state.get("_breach_workers", 3)),
+                    "delay": float(st.session_state.get("_breach_delay", 0.0)),
                     "view": st.session_state.get("_breach_view", "All")},
                 "results": slim, "quality": quality or {}, "run_at": stamp}
         tmp = p + ".tmp"
@@ -353,21 +295,13 @@ def _state_apply():
     st_ = _state_load()
     setts = st_.get("settings") or {}
     pairs = (("_breach_workers", setts.get("workers")),
-             ("_breach_pages", setts.get("pages")),
              ("_breach_delay", setts.get("delay")),
-             ("_breach_force", setts.get("force")),
-             (_FALLBACK_KEY, setts.get("fallback")),
-             (_CAP_MODE_KEY, setts.get("mode")),
-             (_CAP_ON_KEY, setts.get("on")),
              ("_breach_view", setts.get("view")))
     for key, val in pairs:
         if val is None:
             continue
         if key not in st.session_state:
             st.session_state[key] = val
-    # Files written before this pass stored the inverse (`http_only`). Honour it.
-    if _FALLBACK_KEY not in st.session_state and setts.get("http_only") is not None:
-        st.session_state[_FALLBACK_KEY] = not bool(setts.get("http_only"))
     if not st.session_state.get(_RES_KEY) and st_.get("results"):
         st.session_state[_RES_KEY] = st_["results"]
         st.session_state[_QUAL_KEY] = st_.get("quality") or {}
@@ -384,11 +318,7 @@ def _hist_path():
 
 
 def _hist_add(rows):
-    """Append reports, then trim the file to _HIST_MAX. Never raises.
-
-    page_html and page_shot_file are dropped: the ledger is a list, and the
-    screenshot is already a file of its own.
-    """
+    """Append reports, then trim the file to _HIST_MAX. Never raises."""
     p = _hist_path()
     if not p:
         return
@@ -397,7 +327,6 @@ def _hist_add(rows):
             for r in rows:
                 d = dict(r)
                 d.pop("page_html", None)
-                d.pop("page_shot_file", None)
                 d["page_text"] = str(d.get("page_text") or "")[:2000]
                 fh.write(json.dumps(d, ensure_ascii=False) + "\n")
         with open(p, encoding="utf-8", errors="ignore") as fh:
@@ -431,6 +360,18 @@ def _hist_read(limit=300):
     return out[-limit:]
 
 
+def _hist_count():
+    p = _hist_path()
+    if not p or not os.path.exists(p):
+        return 0, 0
+    try:
+        with open(p, encoding="utf-8", errors="ignore") as fh:
+            n = sum(1 for l in fh if l.strip())
+        return n, os.path.getsize(p)
+    except Exception:
+        return 0, 0
+
+
 def _hist_clear():
     p = _hist_path()
     try:
@@ -449,8 +390,8 @@ def _band_counts(rows):
 
 
 def _row_key(r):
-    return (re.sub(r"[^a-z0-9]+", "_", str(r.get("email") or "").lower()).strip("_")
-            [:48] or "row")
+    seed = r.get("email") or r.get("password_check", {}).get("sha1") or "row"
+    return (re.sub(r"[^a-z0-9]+", "_", str(seed).lower()).strip("_")[:48] or "row")
 
 
 def _h_esc(v):
@@ -458,110 +399,60 @@ def _h_esc(v):
             .replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;"))
 
 
-def _record_page(r):
-    """(text, html) of a record, built here when nothing was captured."""
-    _read = bool(r.get("read"))
-    _e = str(r.get("email") or "")
-    _pw = r.get("pw_count")
-    _lines = ["address: " + _e,
-              "checked: " + str(r.get("checked_at") or ""),
-              "verdict: %s - %s" % (r.get("verdict") or "?", r.get("reason") or ""),
-              "address half: " + ("READ" if _read else "NOT READ"),
-              "password appearances: " + ("no password supplied" if _pw is None
-                                          else str(_pw)),
-              "source: " + str(r.get("via") or "-"),
-              "breaches: %d, pastes: %d" % (len(r.get("breaches") or []),
-                                           len(r.get("pastes") or []))]
-    if r.get("error"):
-        _lines.append("error: " + str(r["error"]))
-    _rows = []
-    for b in (r.get("breaches") or [])[:60]:
-        _rows.append(b)
-        _lines.append("")
-        _lines.append("- " + str(b.get("title") or "?"))
-        if b.get("date"):
-            _lines.append("  breach date: " + str(b["date"]))
-        if b.get("days") is not None:
-            _lines.append("  age: %d day(s)" % int(b["days"]))
-        _lines.append("  accounts: " + "{:,}".format(int(b.get("pwn_count") or 0)))
-        if b.get("classes"):
-            _lines.append("  data: " + ", ".join(b["classes"]))
-    for p in (r.get("pastes") or [])[:30]:
-        _lines.append("")
-        _lines.append("- paste: %s (%s) %s" % (p.get("title") or "?",
-                                               p.get("source") or "-",
-                                               p.get("date") or ""))
-    _text = "\n".join(_lines)[:30000]
+def _label(r):
+    if r.get("kind") == "password":
+        return "password only"
+    return str(r.get("email") or "?")
 
-    _h = ["<!doctype html><html><head><meta charset='utf-8'><title>", _h_esc(_e),
-          "</title><style>body{font-family:system-ui,sans-serif;background:#0b1020;"
-          "color:#e6ebff;padding:16px}h1{font-size:1.05rem}"
-          "table{border-collapse:collapse;width:100%;font-size:.8rem}"
-          "td,th{border:1px solid #2a3350;padding:5px;text-align:left;"
-          "vertical-align:top}th{background:#141b30}.c{color:#fcd34d}"
-          "</style></head><body><h1>", _h_esc(_e), "</h1><p class='c'>",
-          _h_esc(r.get("verdict") or "?"), " - ", _h_esc(r.get("reason") or ""),
-          "</p><p>address half: " + ("READ" if _read else "NOT READ")
-          + "<br>password appearances: " + ("-" if _pw is None else _h_esc(_pw))
-          + "<br>source: " + _h_esc(r.get("via") or "-")
-          + "<br>checked: " + _h_esc(r.get("checked_at") or "") + "</p>"]
-    if r.get("error"):
-        _h.append("<p class='c'>error: " + _h_esc(r["error"]) + "</p>")
-    if _rows:
-        _h.append("<table><tr><th>Breach</th><th>Date</th><th>Age</th><th>Accounts</th>"
-                  "<th>Data classes</th></tr>")
-        for b in _rows:
-            _h.append("<tr><td>" + _h_esc(b.get("title") or "?") + "</td><td>"
-                      + _h_esc(b.get("date") or "-") + "</td><td>"
-                      + ("%d d" % int(b["days"]) if b.get("days") is not None else "-")
-                      + "</td><td>" + "{:,}".format(int(b.get("pwn_count") or 0))
-                      + "</td><td>" + _h_esc(", ".join(b.get("classes") or []) or "-")
-                      + "</td></tr>")
-        _h.append("</table>")
-    else:
-        _h.append("<p>" + ("No breach record could be read - see the error above."
-                           if r.get("error") else "No breach record for this address.")
-                  + "</p>")
-    if r.get("pastes"):
-        _h.append("<h2>Pastes</h2><ul>")
-        for p in (r.get("pastes") or [])[:30]:
-            _h.append("<li>" + _h_esc(p.get("title") or "?") + " ("
-                      + _h_esc(p.get("source") or "-") + ") "
-                      + _h_esc(p.get("date") or "") + "</li>")
-        _h.append("</ul>")
-    _h.append("<p><small>View built from the record, not a captured page.</small></p>"
-              "</body></html>")
-    return _text, "".join(_h)[:90000]
+
+def _record_page(r):
+    """(text, html) of a record, built here when nothing was generated."""
+    _fn = getattr(breach, "record_view", None)
+    if callable(_fn):
+        try:
+            _t, _h = _fn(r)
+            if _t or _h:
+                return _t, _h
+        except Exception:
+            pass
+    _text = ("kind: %s\naddress: %s\nverdict: %s\n"
+             % (r.get("kind") or "?", _label(r), r.get("verdict") or "?"))
+    return _text, ("<html><body><pre>" + _h_esc(_text) + "</pre></body></html>")
 
 
 def _csv(rows):
-    head = ("verdict,email,breaches,pastes,pw_count,bucket,pw_hits,corpora,"
-            "sites,sensitive,newest_breach_days,breach_names,data_classes,"
-            "paste_titles,via,reason,error,checked_at,read")
+    head = ("verdict,kind,email,breaches,pastes,pw_count,pw_hits,corpora,sites,"
+            "stealer,sensitive,earliest_breach,latest_breach,total_exposed,"
+            "breach_names,data_classes,paste_titles,via,via_proxy,reason,error,"
+            "checked_at,read")
     out = [head]
     for r in rows:
         bs = r.get("breaches") or []
         ps = r.get("pastes") or []
-        _newest = r.get("newest_days")
-        if _newest is None:
-            _newest = r.get("newest_breach_days")
         out.append(",".join([
             str(r.get("verdict") or ""),
+            str(r.get("kind") or ""),
             str(r.get("email") or ""),
             str(len(bs)),
             str(len(ps)),
             str(r.get("pw_count") if r.get("pw_count") is not None else ""),
-            str(r.get("bucket") or ""),
             str(r.get("pw_count") if r.get("pw_count") is not None else ""),
             str(r.get("corpora", 0)),
             str(r.get("sites", 0)),
+            str(r.get("stealer", 0)),
             str(r.get("sensitive", 0)),
-            str(_newest) if _newest is not None else "",
-            '"%s"' % "; ".join(b.get("title") or "" for b in bs[:12]).replace('"', "'"),
+            str(r.get("earliest_breach") or ""),
+            str(r.get("latest_breach") or ""),
+            str(r.get("total_records_exposed") or 0),
+            '"%s"' % "; ".join(b.get("Name") or b.get("title") or ""
+                               for b in bs[:12]).replace('"', "'"),
             '"%s"' % "; ".join(sorted({c for b in bs
-                                       for c in (b.get("classes") or [])})).replace('"', "'"),
-            '"%s"' % "; ".join(p.get("title") or "" for p in ps[:12]).replace('"', "'"),
+                                       for c in (b.get("DataClasses")
+                                                 or b.get("classes") or [])})).replace('"', "'"),
+            '"%s"' % "; ".join(p.get("Title") or p.get("title") or ""
+                               for p in ps[:12]).replace('"', "'"),
             str(r.get("via") or ""),
+            str(r.get("via_proxy") or ""),
             '"%s"' % str(r.get("reason") or "").replace('"', "'"),
             '"%s"' % str(r.get("error") or "").replace('"', "'"),
             str(r.get("checked_at") or ""),
@@ -586,30 +477,17 @@ def _trace_code(limit=200, since=0, skip=None):
 
 def _trace_read(limit=250, skip=None):
     fn = getattr(breach, "trace_read", None)
-    if callable(fn):
+    if not callable(fn):
+        return []
+    try:
+        return list(fn(limit=limit, skip=skip))
+    except TypeError:
         try:
-            return list(fn(limit=limit, skip=skip))
-        except TypeError:
-            try:
-                return list(fn(limit=limit))
-            except Exception:
-                return []
+            return list(fn(limit=limit))
         except Exception:
             return []
-    try:
-        return [1] if breach.trace_text(limit=limit) else []
     except Exception:
         return []
-
-
-def _hibp_key():
-    k = os.environ.get("HIBP_API_KEY") or ""
-    if not k:
-        try:
-            k = str(st.secrets.get("HIBP_API_KEY") or "")
-        except Exception:
-            k = ""
-    return bool(k.strip())
 
 
 # ---- owner gate ----
@@ -620,7 +498,7 @@ if st.session_state.get(_OWNER_KEY) != _OWNER:
     st.session_state[_OWNER_KEY] = _OWNER
     st.session_state.pop(_BOOT_KEY, None)
 
-# ---- a FRESH SESSION wipes the trace; it is the cheapest thing to do with it ----
+# ---- a FRESH SESSION wipes the trace ----
 if not st.session_state.get(_BOOT_KEY):
     st.session_state[_BOOT_KEY] = True
     try:
@@ -635,18 +513,18 @@ breach.trace("INFO", "page", "loaded")
 # @@END 006 SOURCES
 
 # @@BLOCK 007 INPUT deps=006
-st.markdown("### 1. Addresses")
+st.markdown("### 1. Input")
 
 _t1, _t2 = st.tabs(["\U0001f4dd Paste", "\U0001f4c1 Upload"])
 
 _text = ""
 with _t1:
     _text = st.text_area(
-        "One address per line. A pasted `email:pass` or `email | VERDICT` line is "
-        "cut down to the address; the password is kept for the Pwned Passwords "
-        "check, because how public the PASSWORD already is, is the real signal.",
+        "One entry per line. `email:pass` checks both halves, an address on its own "
+        "checks only its breaches, and a line with no `@` is treated as a PASSWORD and "
+        "checked against Pwned Passwords only.",
         height=200, key="_breach_text", on_change=_watch("_breach_text", "text"),
-        placeholder="someone@example.com:hunter2")
+        placeholder="someone@example.com:hunter2\nsomeone@example.com\nhunter2")
 with _t2:
     up = st.file_uploader("Upload a .txt list", type=["txt"], key="_breach_up")
     if up is not None:
@@ -658,21 +536,20 @@ with _t2:
             st.error("Could not read that file: %s" % e)
             breach.trace("ERR", "upload", str(e))
 
-_pairs = breach.parse_addresses(_text)
-_with_pw = sum(1 for _e, _p in _pairs if _p)
-if _pairs:
-    st.caption("**%d** address(es) ready, **%d** of them with a password."
-               % (len(_pairs), _with_pw))
-    if not _with_pw:
-        st.caption("No passwords in the list - the verdict then rests on the address "
-                   "alone, which is the weaker half.")
+_items = breach.parse_lines(_text)
+_n_combo = sum(1 for i in _items if i["kind"] == "combo")
+_n_mail = sum(1 for i in _items if i["kind"] == "email")
+_n_pw = sum(1 for i in _items if i["kind"] == "password")
+if _items:
+    st.caption("**%d** item(s) ready - **%d** combo(s), **%d** address only, "
+               "**%d** password only." % (len(_items), _n_combo, _n_mail, _n_pw))
 else:
     st.caption("Nothing queued.")
 
-st.caption("Only the address is sent to haveibeenpwned.com. A pasted "
-           "`email:password` is cut at the colon before the request is built - HIBP "
-           "does not use the password. The password only ever goes to the Pwned "
-           "Passwords hash check, and 5 of its 40 hash characters leave the box.")
+st.caption("Only the address is sent to haveibeenpwned.com - a pasted `email:password` "
+           "is cut at the colon before the request is built. The password only ever "
+           "goes to the Pwned Passwords hash check, and 5 of its 40 hash characters "
+           "leave the box.")
 
 # ---- the browser, and its state ------------------------------------------------
 _bst = breach.browser_state()
@@ -683,126 +560,109 @@ if _bst.get("state") == "unknown":
 _bst1, _bst2 = st.columns([0.72, 0.28])
 with _bst1:
     if _bst.get("state") == "ready":
-        st.caption("\u2705 Browser ready - addresses are typed into the site's search "
-                   "box and the rendered page is read. Tabs are reused and the "
-                   "clearance cookie is kept, so re-checks are much faster.")
+        st.caption("\u2705 Browser ready - the address half is a real page, one fresh "
+                   "context per attempt, through your proxy pool.")
     elif _bst.get("state") == "installing":
-        st.caption("\u23f3 Browser installing (%ss). Passwords are checked either way; "
-                   "addresses come back UNKNOWN until it finishes."
+        st.caption("\u23f3 Browser installing (%ss). Passwords work either way; "
+                   "addresses come back UNREAD until it finishes."
                    % _bst.get("seconds", 0))
     elif _bst.get("state") == "failed":
         st.caption("\u26a0 Browser install FAILED. Passwords still work; addresses "
-                   "come back UNKNOWN. Error: `%s`"
+                   "come back UNREAD. Error: `%s`"
                    % (_bst.get("error") or "unknown")[:300])
     else:
-        st.caption("Browser not installed. Passwords are checked either way; "
-                   "addresses come back UNKNOWN without one.")
+        st.caption("Browser not installed. Passwords are checked either way; addresses "
+                   "come back UNREAD without one.")
 with _bst2:
-    if _bst.get("state") != "ready" and _bst.get("state") != "installing":
+    if _bst.get("state") not in ("ready", "installing"):
         if st.button("\u2b07 Prepare browser", width="stretch",
                      help="Downloads Chromium once, into this repo, and keeps it. "
-                          "About 150 MB - do it on wifi. This is what reads the "
-                          "address pages."):
+                          "About 150 MB - do it on wifi."):
             breach.trace("CLICK", "browser", "Prepare browser pressed")
             breach.ensure_browser(force=True)
             st.rerun()
 
-# ---- the address tier: THE KEY, with the browser behind a switch --------------
-# Order is fixed in breach.check(): passwords, key, keyless endpoint, browser.
-# The key is what makes a 500-address run cheap; the browser is the rescue.
-if breach.key_present():
-    st.caption("\U0001f511 **Key set (%s) - the keyed API is the primary path.** "
-               "Each address is answered by two small API calls before any page is "
-               "opened, so a run costs seconds, not minutes."
-               % breach.key_hint())
+# ---- the proxy pool the address half will use ----------------------------------
+_pstat = breach.pool_status()
+if _pstat["count"]:
+    st.caption("\U0001f310 **%d** proxy node(s) loaded from your own pool - probed nodes "
+               "first, DIRECT as the last attempt. Sample: `%s`"
+               % (_pstat["count"], ", ".join(p.rsplit("@", 1)[-1]
+                                             for p in _pstat["sample"])))
 else:
-    st.warning("\U0001f5dd **No HIBP_API_KEY set - the fast path is switched off.** "
-               "Add `HIBP_API_KEY` in the app's secrets (Streamlit Cloud \u2192 "
-               "Settings \u2192 Secrets) or as an environment variable, then reload "
-               "this page. Until then the keyless site search runs, and any address "
-               "it refuses needs the browser fallback below.")
+    st.warning("\U0001f310 **Your proxy pool is empty.** The address half will try DIRECT "
+               "only. Fetch a pool on the checker page first, or import a list.")
 
-# ---- workers, pages, pacing, fallback ------------------------------------------
-# WORKERS is how many addresses are in flight. PAGES is how many tabs exist to run
-# them on; each worker takes a tab and keeps it, so a worker count above the page
-# count just queues. With a key and no wall, tabs are barely used at all.
-_c1, _c2, _c3, _c4, _c5 = st.columns(5)
+# ---- workers, pacing -----------------------------------------------------------
+_c1, _c2 = st.columns(2)
 with _c1:
-    _workers = st.slider("Workers", 1, 8, 3, key="_breach_workers",
+    _workers = st.slider("Workers", 1, 12, 3, key="_breach_workers",
                          on_change=_watch("_breach_workers", "workers"),
-                         help="How many addresses are worked on at the same time. "
-                              "This is the speed control.")
+                         help="How many items are worked on at the same time. This is "
+                              "the speed control - each worker gets its own browser "
+                              "thread and its own proxy from the pool.")
 with _c2:
-    _pages = st.number_input("Browser pages", 1, 8, 3, 1, key="_breach_pages",
-                             on_change=_watch("_breach_pages", "pages"),
-                             help="How many tabs exist, one per worker slot. Each tab "
-                                  "is reused for every address it handles - a new tab "
-                                  "per check would re-trigger the security check.")
-with _c3:
-    _delay = st.slider("Delay (s)", 0.0, 10.0, 1.0, 0.5, key="_breach_delay",
+    _delay = st.slider("Delay (s)", 0.0, 5.0, 0.0, 0.5, key="_breach_delay",
                        on_change=_watch("_breach_delay", "delay"),
-                       help="Seconds between STARTING addresses. Drop it to 0 with a "
-                            "key - only the browser fallback needs pacing.")
-with _c4:
-    _force = st.checkbox("Ignore cache", value=False, key="_breach_force",
-                         on_change=_watch("_breach_force", "ignore cache"),
-                         help="A cached answer is served for 6 hours. Tick this to "
-                              "re-check from the sources.")
-with _c5:
-    _fallback = st.checkbox("Browser fallback", value=True, key=_FALLBACK_KEY,
-                            on_change=_watch(_FALLBACK_KEY, "browser fallback"),
-                            help="When the key cannot answer (or no key is set), open "
-                                 "a page and read the site instead. Off = API-only: "
-                                 "faster, and a refused address comes back UNREAD "
-                                 "instead of resolved.")
-_http_only = not _fallback
+                       help="Seconds between STARTING items. 0 is fine for a probed "
+                            "pool.")
 
-if _fallback:
-    st.caption("**%d** worker(s) on **%d** reused tab(s). Tabs are not closed between "
-               "addresses and the clearance cookie is kept, so only the first check "
-               "pays the security verification." % (int(_workers), int(_pages)))
-else:
-    st.caption("**%d** worker(s), no browser. The key and the keyless endpoint only - "
-               "a refused address is reported UNREAD and nothing is opened."
-               % int(_workers))
+st.caption("**%d** worker(s), **%d** proxy node(s)**. A node that refuses or "
+           "challenges is skipped and the next is tried; DIRECT is the last attempt."
+           % (int(_workers), _pstat["count"]))
 
-# ---- page capture ---------------------------------------------------------------
-st.markdown("##### Captured pages")
-_cm1, _cm2 = st.columns([0.58, 0.42])
-with _cm1:
-    _mode_label = st.radio(
-        "Capture", list(_MODE_LABELS.keys()), horizontal=False, key=_CAP_MODE_KEY,
-        on_change=_watch(_CAP_MODE_KEY, "capture mode"),
-        help="The page is what the site actually rendered - titles, dates, data "
-             "classes, or the 'no pwnage' copy. It is kept as a full-length image, "
-             "plus text and HTML, under your own prefix.")
-_page_mode = _MODE_LABELS.get(_mode_label, "fast")
-with _cm2:
-    if _page_mode == "fast":
-        _on_labels = st.multiselect(
-            "Capture which outcomes", ["CLEAN", "Errored"],
-            default=["CLEAN", "Errored"], key=_CAP_ON_KEY,
-            on_change=_watch(_CAP_ON_KEY, "capture outcomes"),
-            help="Only these are fetched. A breached address keeps its records and "
-                 "gets no page - the scrape already has the titles and dates.")
-        _page_on = [x.lower() for x in _on_labels]
-    elif _page_mode == "full":
-        st.caption("Every checked address keeps its page, records or not.")
-        _page_on = ["clean", "error"]
-    else:
-        st.caption("No pages are kept. Records, verdicts and exports are "
-                   "unaffected.")
-        _page_on = []
-
-if _page_mode == "fast" and not _page_on:
-    st.caption("Fast mode with nothing ticked keeps nothing - the same as Off.")
+# ---- cache and history, monitored and clearable --------------------------------
+st.markdown("##### Cache and history")
+_cstat = breach.cache_stats()
+_h_n, _h_b = _hist_count()
+_m1, _m2, _m3 = st.columns(3)
+_m1.metric("Cache entries", _cstat.get("entries", 0),
+           help="Answered items kept for 6 hours in `%s`. "
+                "A cached answer sends no request." % _cstat.get("path", "-"))
+_m2.metric("History rows", _h_n, help="Appended by every run, capped at %d." % _HIST_MAX)
+_m3.metric("History size", "%d KB" % max(0, _h_b // 1024))
+_b1, _b2, _b3 = st.columns(3)
+with _b1:
+    if st.button("Clear cache", width="stretch",
+                 help="Forgets every cached answer for this user."):
+        breach.clear_cache()
+        breach.trace("CLICK", "cache", "cleared")
+        st.rerun()
+with _b2:
+    if st.button("Clear history", width="stretch",
+                 help="Deletes your breach_history.jsonl and the saved result state."):
+        breach.trace("CLICK", "history", "cleared")
+        _hist_clear()
+        st.session_state.pop(_RES_KEY, None)
+        st.session_state.pop(_QUAL_KEY, None)
+        st.session_state.pop(_RUN_KEY, None)
+        try:
+            if os.path.exists(_state_path()):
+                os.remove(_state_path())
+        except Exception:
+            pass
+        st.rerun()
+with _b3:
+    if st.button("Clear cache + history", width="stretch"):
+        breach.clear_cache()
+        breach.trace("CLICK", "cache", "cleared with history")
+        _hist_clear()
+        st.session_state.pop(_RES_KEY, None)
+        st.session_state.pop(_QUAL_KEY, None)
+        st.session_state.pop(_RUN_KEY, None)
+        try:
+            if os.path.exists(_state_path()):
+                os.remove(_state_path())
+        except Exception:
+            pass
+        st.rerun()
 # @@END 007 INPUT
 
 # @@BLOCK 008 RUN deps=007
 _job = st.session_state.get(_JOB_KEY)
 if isinstance(_job, dict) and not _job.get("done"):
     try:
-        if time.time() - float(_job.get("started") or 0) > 1800.0:
+        if time.time() - float(_job.get("started") or 0) > 3600.0:
             _job["error"] = _job.get("error") or "watchdog: the run stopped reporting"
             _job["done"] = True
     except Exception:
@@ -812,49 +672,33 @@ _running = bool(isinstance(_job, dict) and not _job.get("done"))
 _bc1, _bc2 = st.columns([0.72, 0.28])
 with _bc1:
     _run = st.button("\U0001f6e1 Check exposure", type="primary",
-                     disabled=(not _pairs or _running), width="stretch")
+                     disabled=(not _items or _running), width="stretch")
 with _bc2:
     _stop = st.button("\u23f9 Stop", width="stretch", disabled=not _running,
-                      help="Cancels the run. Workers stop mid-address and queued "
-                           "addresses are dropped; finished records are kept.")
+                      help="Cancels the run. Workers stop mid-item and queued items "
+                           "are dropped; finished records are kept.")
 
 
-def _job_start(tier):
+def _job_start():
     """Start the run on a THREAD. The cancel event travels into check_many."""
-    job = {"rows": {}, "done": False, "n": 0, "total": len(_pairs), "last": "",
+    job = {"rows": {}, "done": False, "n": 0, "total": len(_items), "last": "",
            "error": "", "cancel": threading.Event(), "started": time.time(),
-           "since0": breach.trace_seq(), "tier": tier, "mode": _page_mode,
-           "page_on": list(_page_on), "owner": _OWNER}
+           "since0": breach.trace_seq(), "owner": _OWNER}
     st.session_state[_JOB_KEY] = job
 
-    def _tick(n, total, email, verdict):
+    def _tick(n, total, label, verdict):
         try:
             job["n"] = int(n or 0)
-            job["last"] = ("%s %s" % (email or "", (verdict or "").lower())).strip()
+            job["last"] = ("%s %s" % (label or "", (verdict or "").lower())).strip()
         except Exception:
             pass
 
     def _body():
         try:
-            try:
-                job["rows"] = breach.check_many(
-                    _pairs, workers=int(_workers), progress=_tick,
-                    cancel=job["cancel"], force=bool(_force), delay=float(_delay),
-                    http_only=bool(_http_only), fallback=bool(_fallback),
-                    owner_prefix=_OWNER)
-            except TypeError:
-                try:
-                    job["rows"] = breach.check_many(
-                        _pairs, workers=int(_workers), progress=_tick,
-                        cancel=job["cancel"], force=bool(_force),
-                        delay=float(_delay), http_only=bool(_http_only),
-                        owner_prefix=_OWNER)
-                except TypeError:
-                    breach.trace("WARN", "run", "check_many has no tier argument")
-                    job["rows"] = breach.check_many(
-                        _pairs, workers=int(_workers), progress=_tick,
-                        cancel=job["cancel"], force=bool(_force),
-                        delay=float(_delay), owner_prefix=_OWNER)
+            job["rows"] = breach.check_many(
+                _items, workers=int(_workers), progress=_tick,
+                cancel=job["cancel"], delay=float(_delay),
+                owner_prefix=_OWNER)
         except Exception as e:
             job["error"] = "%s: %s" % (type(e).__name__, e)
             breach.trace("ERR", "run", "raised %s: %s" % (type(e).__name__, e))
@@ -865,29 +709,14 @@ def _job_start(tier):
     return job
 
 
-if _run and _pairs and not _running:
-    _tier = ("key" if breach.key_present() else "keyless") + (
-        "+browser" if _fallback else " (no fallback)")
-    breach.trace("CLICK", "run", "pressed: %d address(es), workers=%d, pages=%d, "
-                 "delay=%s, tier=%s, key=%s"
-                 % (len(_pairs), int(_workers), int(_pages), _delay, _tier,
-                    breach.key_hint()))
+if _run and _items and not _running:
+    breach.trace("CLICK", "run", "pressed: %d item(s), workers=%d, delay=%s, pool=%d"
+                 % (len(_items), int(_workers), _delay, _pstat["count"]))
     try:
-        breach.configure(pages=int(_pages), delay=float(_delay),
-                         http_only=bool(_http_only), fallback=bool(_fallback),
-                         page_mode=_page_mode, page_on=_page_on)
-        breach.trace("INFO", "run", "configure: tier + capture switch accepted")
+        breach.configure(workers=int(_workers), delay=float(_delay))
     except TypeError:
-        try:
-            breach.configure(pages=int(_pages), delay=float(_delay),
-                             http_only=bool(_http_only), fallback=bool(_fallback))
-        except TypeError:
-            breach.configure(pages=int(_pages), delay=float(_delay))
-            breach.trace("WARN", "run", "breach.configure has no tier arguments")
-        breach.trace("WARN", "run", "breach.configure has no page_mode argument")
-    breach.trace("INFO", "run", "pages: %s%s" % (
-        _page_mode, (" (%s)" % ",".join(_page_on)) if _page_on else ""))
-    _job = _job_start(_tier)
+        breach.configure(delay=float(_delay))
+    _job = _job_start()
     _running = True
 
 if isinstance(_job, dict):
@@ -917,9 +746,6 @@ if isinstance(_job, dict):
     else:
         st.session_state.pop(_JOB_KEY, None)
         _rows = list((_job.get("rows") or {}).values())
-        _mode_used = str(_job.get("mode") or _page_mode)
-        _on_used = list(_job.get("page_on") or [])
-        _tier_used = str(_job.get("tier") or "-")
         if _job.get("error"):
             st.session_state[_MSG_KEY] = ("error", "Run failed: %s" % _job["error"])
         elif not _rows:
@@ -928,38 +754,28 @@ if isinstance(_job, dict):
             _rows.sort(key=lambda r: ({"OLD": 0, "PARTIAL": 1, "NEW": 2,
                                        "UNKNOWN": 3, "CLEAN": 4}.get(
                                            r.get("verdict") or "UNKNOWN", 5),
-                                      r.get("email") or ""))
+                                      r.get("email") or r.get("kind") or ""))
             _hist_add(_rows)
             _quality = breach.score(_rows)
             _stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             st.session_state[_RES_KEY] = _rows
             st.session_state[_QUAL_KEY] = _quality
             st.session_state[_RUN_KEY] = _stamp
-            # Survive a reload: settings, results and quality go to the user's
-            # state file. This is why the quality figure no longer vanishes.
             _state_save(_rows, _quality, _stamp)
             _b = _band_counts(_rows)
-            _unread = sum(1 for r in _rows if not r.get("read"))
+            _unread = sum(1 for r in _rows if not r.get("read") and r.get("kind") != "password")
             _cancel_n = sum(1 for r in _rows if "cancel" in str(r.get("error") or ""))
-            _msg = ("Checked %d via %s. %d old, %d partially new, %d new, %d clean, "
-                    "%d unresolved. %d unread. %d cancelled. Pages kept: %s."
-                    % (len(_rows), _tier_used, _b["OLD"], _b["PARTIAL"], _b["NEW"],
-                       _b["CLEAN"], _b["UNKNOWN"], _unread, _cancel_n,
-                       ("off" if _mode_used == "off" else
-                        ("all" if _mode_used == "full"
-                         else (",".join(_on_used) or "none")))))
+            _msg = ("Checked %d. %d old, %d partially new, %d new, %d clean, "
+                    "%d unresolved. %d unread. %d cancelled."
+                    % (len(_rows), _b["OLD"], _b["PARTIAL"], _b["NEW"],
+                       _b["CLEAN"], _b["UNKNOWN"], _unread, _cancel_n))
             breach.trace("INFO", "run", "summary: " + _msg)
             _tips = []
             if _unread:
                 _tips.append("%d address half(s) are UNREAD, not zero." % _unread)
             if _b["UNKNOWN"]:
-                if _fallback:
-                    _tips.append("Re-run the unresolved ones - the tab and its "
-                                 "clearance cookie are reused, so the second pass "
-                                 "usually passes.")
-                else:
-                    _tips.append("Re-run the unresolved ones with the browser "
-                                 "fallback on, or check the key.")
+                _tips.append("Re-run the unresolved ones - a fresh proxy is drawn for "
+                             "each attempt, so a second pass usually lands.")
             _lvl = "warning" if (_unread or _b["UNKNOWN"]) else "success"
             st.session_state[_MSG_KEY] = (
                 _lvl, _msg + ((" " + " ".join(_tips)) if _tips else ""))
@@ -971,8 +787,7 @@ if st.session_state.get(_MSG_KEY):
 
 # @@BLOCK 009 DASHBOARD deps=008
 _rows = st.session_state.get(_RES_KEY) or []
-# A 500-address run cannot draw 500 expanders on a phone in one go. The band
-# filter narrows it; this caps what an unfiltered view paints.
+# A 500-item run cannot draw 500 expanders on a phone in one go.
 _CARD_MAX = 150
 
 if _rows:
@@ -981,7 +796,7 @@ if _rows:
     _stamp = st.session_state.get(_RUN_KEY) or ""
 
     st.markdown("### 2. Combo quality")
-    st.caption("Checked %s. **%d** address(es)." % (_stamp, len(_rows)))
+    st.caption("Checked %s. **%d** item(s)." % (_stamp, len(_rows)))
 
     _qc1, _qc2, _qc3, _qc4 = st.columns(4)
     _qc1.metric("Quality", "%s%%" % _q.get("quality", 0), _q.get("grade", "-"),
@@ -997,9 +812,9 @@ if _rows:
         % (_q.get("pct", {}).get("OLD", 0), _q.get("pct", {}).get("PARTIAL", 0),
            _q.get("pct", {}).get("NEW", 0), _q.get("pct", {}).get("UNKNOWN", 0)))
 
-    _unread_rows = [r for r in _rows if not r.get("read")]
+    _unread_rows = [r for r in _rows if not r.get("read") and r.get("kind") != "password"]
     if _unread_rows:
-        st.caption("\u26a0 **%d of these %d address half(s) were never read.** Their "
+        st.caption("\u26a0 **%d of these address half(s) were never read.** Their "
                    "counts are UNREAD, not zero, and a verdict on one of them comes "
                    "from the password half alone."
                    % (len(_unread_rows), len(_rows)))
@@ -1039,15 +854,12 @@ if _rows:
             _bs = r.get("breaches") or []
             _ps = r.get("pastes") or []
             _read = bool(r.get("read"))
-            # No password supplied -> the ADDRESS is the verdict, so that is what
-            # the header shows. With a password the badge is the combo verdict and
-            # both halves are printed inside.
-            _head_v = _v if r.get("pw_band") != "none" else str(r.get("addr_verdict") or _v)
+            _head_v = (_v if r.get("pw_band") != "none"
+                       else str(r.get("addr_verdict") or _v))
             _key = _row_key(r)
             with st.expander("%s %s%s" % ("\u26a0" if not _read else "\u2022",
-                                          r.get("email") or "?", "  " + _head_v),
+                                          _label(r), "  " + _head_v),
                              expanded=False):
-                # ---- BOTH HALVES, so nothing is misread ----
                 _av = str(r.get("addr_verdict") or "UNREAD")
                 _pb = str(r.get("pw_band") or "none")
                 st.markdown(
@@ -1055,7 +867,7 @@ if _rows:
                     '<span class="br-band %s">password %s</span> &nbsp; %s'
                     % (_BAND_CSS.get(_av, "br-unknown"), _av,
                        _BAND_CSS.get(_pb, "br-unknown"), _pb,
-                       r.get("reason") or ""), unsafe_allow_html=True)
+                       _h_esc(r.get("reason") or "")), unsafe_allow_html=True)
                 st.caption("Combo verdict **%s** - the worse of the two halves. "
                            "Address half: **%s**. Password half: **%s**."
                            % (_v, _av, _pb))
@@ -1067,101 +879,67 @@ if _rows:
                                "verdict.")
                 if r.get("error"):
                     st.caption("error: %s" % r["error"])
-                if not _read:
+                if not _read and r.get("kind") != "password":
                     st.caption("\u26a0 **The address half was not read.** The counts "
                                "below are unread, not zero.")
                 if _bs:
                     st.markdown("**Breaches on this address** - %d" % len(_bs))
                     for b in _bs[:25]:
                         _d = b.get("days")
-                        _when = (b.get("date") or b.get("breach_date")
+                        _when = (b.get("BreachDate") or b.get("date")
                                  or ("%d day(s) ago" % _d if _d is not None
                                      else "date unknown"))
                         st.markdown("- **%s**%s - %s, %s record(s), classes: %s"
-                                    % (b.get("title") or "?",
-                                       " _(stealer corpus)_" if b.get("corpus") else "",
-                                       _when, "{:,}".format(int(b.get("pwn_count") or 0)),
-                                       ", ".join(b.get("classes") or []) or "-"))
-                        if b.get("description"):
-                            st.caption(b["description"][:300])
+                                    % (b.get("Title") or b.get("title") or "?",
+                                       " _(stealer log)_" if (b.get("IsStealerLog")
+                                                              or b.get("corpus")) else "",
+                                       _when,
+                                       "{:,}".format(int(b.get("PwnCount")
+                                                         or b.get("pwn_count") or 0)),
+                                       ", ".join(b.get("DataClasses")
+                                                 or b.get("classes") or []) or "-"))
+                        if b.get("Description") or b.get("description"):
+                            st.caption(str(b.get("Description")
+                                           or b.get("description"))[:300])
                 elif _read:
-                    st.caption("No breach record - the page was read and lists none.")
+                    st.caption("No breach record - the answer was read and lists none.")
                 elif r.get("error"):
                     st.caption("No breach record could be read - see the error above.")
-                else:
-                    st.caption("No breach record for this address.")
                 if _ps:
                     st.markdown("**Pastes quoting the address:** %d" % len(_ps))
                     for p in _ps[:10]:
-                        st.caption("%s  %s" % (p.get("title") or "?", p.get("date") or ""))
+                        st.caption("%s  %s" % (p.get("Title") or p.get("title") or "?",
+                                               p.get("Date") or p.get("date") or ""))
 
-                _pg_f = str(r.get("page_shot_file") or "")
-                _pg_t = str(r.get("page_text") or "")
-                _pg_h = str(r.get("page_html") or "")
-                _pg_via = str(r.get("page_via") or "")
-                _has_img = bool(_pg_f and os.path.exists(_pg_f))
-                if not (_has_img or _pg_t or _pg_h):
-                    _fn = getattr(breach, "record_view", None)
-                    if callable(_fn):
-                        try:
-                            _pg_t, _pg_h = _fn(r)
-                        except Exception:
-                            _pg_t, _pg_h = "", ""
-                    if not (_pg_t or _pg_h):
-                        _pg_t, _pg_h = _record_page(r)
-                    _src = "view built from the record - no page was captured"
-                elif _has_img:
-                    _src = "the page as the browser rendered it, full length"
-                elif _pg_via == "http":
-                    _src = "page as fetched over plain HTTP (not rendered)"
+                _pg_t, _pg_h = _record_page(r)
+                st.caption("Page view - built from the answer, not a captured page.")
+                _pv = st.radio("Page view", ["Text", "HTML"], horizontal=True, index=0,
+                               key="_pv_%s" % _key)
+                if _pv == "Text":
+                    st.code(_pg_t[:30000] or "(empty page)", language="text")
+                    st.download_button(
+                        "\u2b07 Download this page as text",
+                        data=_pg_t.encode("utf-8"),
+                        file_name="page_%s.txt" % _key,
+                        mime="text/plain", width="stretch",
+                        key="_pvt_%s" % _key)
                 else:
-                    _src = "view built from the record"
-
-                _opts = []
-                if _has_img:
-                    _opts.append("Page")
-                if _pg_t:
-                    _opts.append("Text")
-                if _pg_h:
-                    _opts.append("HTML")
-                if _opts:
-                    st.caption(_src)
-                    _pv = st.radio("Page view", _opts, horizontal=True, index=0,
-                                   key="_pv_%s" % _key)
-                    if _pv == "Page":
-                        st.image(_pg_f, width="stretch")
-                        try:
-                            with open(_pg_f, "rb") as _fh:
-                                _img = _fh.read()
-                        except Exception:
-                            _img = b""
-                        st.download_button(
-                            "\u2b07 Download this page as an image",
-                            data=_img, file_name="page_%s.jpg" % _key,
-                            mime="image/jpeg", width="stretch",
-                            key="_pvs_%s" % _key, disabled=not _img)
-                    elif _pv == "Text":
-                        st.code(_pg_t[:30000] or "(empty page)", language="text")
-                        st.download_button(
-                            "\u2b07 Download this page as text",
-                            data=_pg_t.encode("utf-8"),
-                            file_name="page_%s.txt" % _key,
-                            mime="text/plain", width="stretch",
-                            key="_pvt_%s" % _key)
-                    else:
-                        components.html(_pg_h, height=520, scrolling=True)
-                        st.download_button(
-                            "\u2b07 Download this page as HTML",
-                            data=_pg_h.encode("utf-8"),
-                            file_name="page_%s.html" % _key,
-                            mime="text/html", width="stretch",
-                            key="_pvh_%s" % _key)
+                    import streamlit.components.v1 as components
+                    components.html(_pg_h or "<p>(empty page)</p>", height=520,
+                                    scrolling=True)
+                    st.download_button(
+                        "\u2b07 Download this page as HTML",
+                        data=_pg_h.encode("utf-8"),
+                        file_name="page_%s.html" % _key,
+                        mime="text/html", width="stretch",
+                        key="_pvh_%s" % _key)
 
                 st.caption("via %s \u00b7 checked %s"
-                           % (r.get("via") or "-", r.get("checked_at") or ""))
+                           % (r.get("via_proxy") or r.get("via") or "-",
+                              r.get("checked_at") or ""))
 
     st.markdown("### 3. Export")
-    _d1, _d2 = st.columns(2)
+    _d1, _d2, _d3 = st.columns(3)
     with _d1:
         st.download_button("\u2b07 Download CSV (all bands)",
                            data=_csv(_rows).encode("utf-8"),
@@ -1169,9 +947,19 @@ if _rows:
                                      % datetime.now().strftime("%Y%m%d_%H%M%S"),
                            mime="text/csv", width="stretch")
     with _d2:
+        st.download_button("\u2b07 Download JSON (full records)",
+                           data=json.dumps(_rows, indent=2,
+                                           ensure_ascii=False).encode("utf-8"),
+                           file_name="breach_%s.json"
+                                     % datetime.now().strftime("%Y%m%d_%H%M%S"),
+                           mime="application/json", width="stretch")
+    with _d3:
         _bad = [r for r in _rows if r.get("verdict") in ("OLD", "PARTIAL")]
-        st.download_button("\u2b07 Download OLD + PARTIAL addresses",
-                           data="\n".join(r.get("email") or "" for r in _bad).encode(),
+        st.download_button("\u2b07 Download OLD + PARTIAL combos",
+                           data="\n".join(
+                               (("%s:%s" % (r.get("email"), ""))
+                                if r.get("kind") == "password"
+                                else (r.get("email") or "")) for r in _bad).encode(),
                            file_name="breach_rotate_%d.txt" % len(_bad),
                            mime="text/plain", width="stretch", disabled=not _bad)
 # @@END 009 DASHBOARD
@@ -1179,11 +967,10 @@ if _rows:
 # @@BLOCK 010 HISTORY deps=009
 st.markdown("---")
 st.markdown("### 4. Trace")
-st.caption("Everything that happened, newest last: each control moved, each address "
-           "started, the exact URL sent, the status, whether a wall appeared, which "
-           "tier took over, the band and every error. `%s` carries only the address - "
-           "the password is never in it. The page's own `page loaded` heartbeat is "
-           "hidden here."
+st.caption("Everything that happened, newest last: each control moved, each item "
+           "started, the proxy tried, the status, whether a challenge appeared, the "
+           "band and every error. `%s` carries only the address - the password is "
+           "never in it."
            % (breach.last_url() or "https://haveibeenpwned.com/unifiedsearch/<address>"))
 
 _tevents = _trace_read(limit=250, skip=("page",))
@@ -1222,10 +1009,13 @@ else:
     for h in reversed(_hist[-100:]):
         _hr = h.get("read")
         _hrows.append({"checked": h.get("checked_at"), "verdict": h.get("verdict"),
-                       "email": h.get("email"),
+                       "kind": h.get("kind"),
+                       "email": h.get("email") or "-",
                        "read": "yes" if _hr else ("no" if _hr is False else "?"),
                        "breaches": (len(h.get("breaches") or []) if _hr else "-"),
-                       "pastes": (len(h.get("pastes") or []) if _hr else "-")})
+                       "pastes": (len(h.get("pastes") or []) if _hr else "-"),
+                       "pw_hits": (h.get("pw_count")
+                                   if h.get("pw_count") is not None else "-")})
     st.dataframe(_hrows, width="stretch", height=260)
     st.caption("`read` is whether the address half answered. A dash means it did not, "
                "so the count beside it is unread - not zero. Rows written before this "
@@ -1269,11 +1059,10 @@ st.markdown("---")
 auth.fit_panel(st)
 
 st.caption("Sources: Pwned Passwords (k-anonymity - only 5 hash characters leave the "
-           "box), the HIBP API when a key is set, then the keyless site search, then "
-           "a browser page only if the fallback is on. Only the address is "
-           "transmitted; a pasted password is never. A CLEAN verdict means not in "
-           "those sources, not that the address was never exposed - and an address "
-           "half that could not be read is flagged UNREAD rather than reported as "
-           "zero.")
+           "box) and the site's unified search read by a real browser through your "
+           "proxy pool, DIRECT as the last attempt. Only the address is transmitted; "
+           "a pasted password is never. A CLEAN verdict means not in those sources, "
+           "not that the address was never exposed - and an address half that could "
+           "not be read is flagged UNREAD rather than reported as zero.")
 # @@END 011 FOOTER
 # @@EOF
