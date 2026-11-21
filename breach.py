@@ -7,7 +7,23 @@ the address half is a real Chromium page from Playwright, driven through the
 app's OWN proxy pool. The JSON endpoint is navigated to directly and its body
 read from the response - no DOM scraping, no screenshot, no persistent profile
 to go stale. `page.goto` answers 200 with the payload, 404 for "not in any
-breach", and anything else means the next proxy gets a turn.
+breach", and anything else means the challenge has to be earned.
+
+THE WARM PAGE IS WHAT EARNS IT
+------------------------------
+A challenge cannot be solved on the JSON endpoint, because Chromium renders a
+401 body as a bare block of JSON - there is no interstitial, no Turnstile
+widget and no cookie to win. That is what made the first edition report
+"challenge (http 401)" and then a re-fetch 115 ms later, on every proxy and on
+DIRECT alike.
+
+So when the endpoint refuses, the slot navigates the HTML page at the origin,
+which DOES carry the widget, waits there for the wall to clear, and only then
+re-fetches the endpoint from inside the same page - same origin, same cookies,
+now including the clearance the solve produced. A slot records that it holds
+clearance and goes straight to the endpoint next time, so a warmed proxy pays
+the warm navigation once rather than once per item; clearance is dropped again
+the moment a re-fetch still fails.
 
 PAGES ARE TIED TO WORKERS
 -------------------------
@@ -33,11 +49,6 @@ twice hard is skipped for the rest of the run. The `rotate` switch turns the
 draw off and walks the tier order instead, which is what you want when the pool
 is tiny and a deterministic sweep is easier to read in the trace. DIRECT is the
 last attempt in both modes, never the first.
-
-A challenge is still possible. When one appears the page is given a bounded
-window to clear (title/body lose the interstitial marks, Turnstile is clicked)
-and the endpoint is then re-fetched from INSIDE the page, same origin, same
-cookies. Only after that does the attempt count as refused.
 
 THE PASSWORD HALF
 -----------------
@@ -67,10 +78,9 @@ count 0 and count None are different facts and `read` says which.
 HTML IS WRITTEN AS \x3c ESCAPES
 -------------------------------
 Every angle bracket in a string literal is written \x3c / \x3e and every entity
-is built from chr(38). A paste that strips tags out of literals - which eats
-"" down to a bare newline and turns ".replace("&", "&amp;")"
-into a no-op - cannot break either form. A raw tag in a literal compiles here
-but not after such a paste.
+is built from chr(38). A paste that strips tags out of literals - which eats a
+raw tag down to a bare newline and turns a raw entity into a no-op - cannot
+break either form.
 
 Isolation: cache, trace and state resolve through the pinned owner, which is the
 unlocked hash, so each is one file per user. The proxy pool is the owner's own
@@ -122,10 +132,12 @@ HEADERS = {
     "sec-fetch-site": "same-origin",
 }
 
+# "challenge" alone is in here because the refused endpoint answers with a short
+# JSON body and that word is in it; the rest are the interstitial's own wording.
 CHALLENGE_MARKS = (
     "just a moment", "performing security verification", "checking your browser",
     "cf-challenge", "attention required", "verify you are human",
-    "security service to protect", "verifying...",
+    "security service to protect", "verifying...", "challenge",
 )
 CLEAN_MARKS = ("no pwnage", "good news", "not been pwned", "no breaches found")
 
@@ -158,7 +170,7 @@ CHROME_ARGS = ["--no-sandbox", "--no-zygote", "--disable-dev-shm-usage",
                "--no-default-browser-check"]
 
 NAV_TIMEOUT = 25000
-CHALLENGE_WAIT = 12.0
+CHALLENGE_WAIT = 15.0
 HTTP_TIMEOUT = 15.0
 TRIES = 4
 
@@ -1074,9 +1086,12 @@ class _Slot:
     but always on the same browser, which is the expensive half. `get()` resets
     the page between items and recycles on its own terms, so a page that is
     challenged or wedged never costs more than the attempt it was in.
+
+    `cf` records that this context has already earned clearance, so a warmed
+    proxy goes straight to the endpoint instead of warming on every item.
     """
 
-    __slots__ = ("ctx", "page", "proxy", "uses", "fails")
+    __slots__ = ("ctx", "page", "proxy", "uses", "fails", "cf")
 
     def __init__(self):
         self.ctx = None
@@ -1084,6 +1099,7 @@ class _Slot:
         self.proxy = ""
         self.uses = 0
         self.fails = 0
+        self.cf = False
 
     def close_ctx(self):
         try:
@@ -1096,6 +1112,7 @@ class _Slot:
         self.proxy = ""
         self.uses = 0
         self.fails = 0
+        self.cf = False
 
     def open_ctx(self, proxy_line):
         self.close_ctx()
@@ -1114,7 +1131,12 @@ class _Slot:
         self.proxy = proxy_line or ""
 
     def reset(self):
-        """Blank the page and drop its cookies - state never carries over."""
+        """Blank the page and drop its cookies - state never carries over.
+
+        The clearance cookie goes with them, so `cf` is cleared too; the next
+        challenge warms again. A blank page is what keeps one item's render out
+        of the next item's way.
+        """
         if self.page is not None and not self.page.is_closed():
             self.page.goto("about:blank", wait_until="commit", timeout=8000)
         try:
@@ -1122,6 +1144,7 @@ class _Slot:
                 self.ctx.clear_cookies()
         except Exception:
             pass
+        self.cf = False
 
     def get(self, proxy_line):
         """A page ready for this attempt. Reuses, resets, recycles as needed."""
@@ -1246,6 +1269,25 @@ def _solve_wall(page, cancel=None):
     return not _is_wall(page)
 
 
+def _warm(page, label, addr):
+    """Navigate the origin HTML so a challenge has a widget to solve.
+
+    The endpoint renders a refused body as bare JSON - no interstitial, no
+    Turnstile, no cookie. This is the page that can actually earn one. Returns
+    the status it got, 0 when the navigation itself failed.
+    """
+    try:
+        warm = page.goto(HIBP_BASE + "/", wait_until="domcontentloaded",
+                         timeout=NAV_TIMEOUT)
+        wstatus = warm.status if warm is not None else 0
+        trace("INFO", "fetch", "warm page http %d via %s" % (wstatus, label), addr)
+        return wstatus
+    except Exception as exc:
+        trace("WARN", "fetch", "warm page failed via %s: %s"
+              % (label, type(exc).__name__), addr)
+        return 0
+
+
 def _attempt(addr, proxy_line, cancel=None):
     """One navigation through one proxy (or DIRECT). -> (status, payload|None).
 
@@ -1282,9 +1324,13 @@ def _attempt(addr, proxy_line, cancel=None):
                 pass
 
         if _looks_challenge(status, body):
-            trace("WARN", "fetch", "challenge (http %d) via %s - solving"
-                  % (status, label), addr)
+            trace("WARN", "fetch", "challenge (http %d) via %s" % (status, label), addr)
+            wstatus = 0
+            if not slot.cf:
+                wstatus = _warm(page, label, addr)
             if _solve_wall(page, cancel):
+                if wstatus == 200:
+                    slot.cf = True
                 try:
                     got = page.evaluate(JS_FETCH, url) or {}
                 except Exception:
@@ -1303,8 +1349,10 @@ def _attempt(addr, proxy_line, cancel=None):
                 if s2 == 404:
                     slot.ok()
                     return 404, None
+                slot.cf = False
                 slot.bad()
                 return s2 or status, None
+            slot.cf = False
             slot.bad()
             return status, None
 
@@ -1957,16 +2005,21 @@ def selftest(verbose=False) -> bool:
     add("proxy_cfg_server", (_proxy_cfg("1.2.3.4:8080") or {}).get("server")
         == "http://1.2.3.4:8080")
 
-    # ---- rotation ----
+    # ---- rotation and the slot ----
     add("rotate_default", _cfg.get("rotate") is True)
     add("slot_class", callable(_Slot))
     add("slot_reuse_reset", hasattr(_Slot, "reset") and hasattr(_Slot, "get")
         and hasattr(_Slot, "bad") and hasattr(_Slot, "ok"))
     add("slot_limits", SLOT_FAILS_MAX >= 1 and SLOT_USES_MAX >= 1)
+    add("slot_has_cf", "cf" in _Slot.__slots__)
+    add("warm_helper", callable(_warm))
+    add("warm_is_origin", _warm.__doc__ is not None and HIBP_BASE.endswith(".com"))
+    add("challenge_mark", "challenge" in CHALLENGE_MARKS)
+    add("wait_is_bounded", CHALLENGE_WAIT >= 10.0)
     _s = _Slot()
     for _ in range(SLOT_FAILS_MAX):
         _s.bad()
-    add("slot_bad_clears", _s.ctx is None and _s.page is None)
+    add("slot_bad_clears", _s.ctx is None and _s.page is None and _s.cf is False)
     _s2 = _Slot()
     _s2.bad()
     _s2.ok()
