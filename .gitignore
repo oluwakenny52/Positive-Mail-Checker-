@@ -17,6 +17,7 @@ mail_results/
 # under here, so a local run no longer litters the repo root with one directory per
 # unlock. The old bare mail_results/ line stays above for repos that already have one.
 data/
+data/*/shots/
 *.zip
 __pycache__/
 *.py[cod]
@@ -42,4 +43,5 @@ notify_seen.json
 theme.json
 *_theme.json
 .pw-browsers/
+.pw-profile/
 __pycache__/
