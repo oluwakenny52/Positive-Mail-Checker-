@@ -13,10 +13,9 @@ with the proxy on the context.
 
 A 200 that is NOT JSON is the only case that gets a same-origin fetch() from
 inside the page: there is a document to fetch from and the shell may carry what
-the plain navigation lacked. A 401 does NOT get one - the 401 body is plain text
-and the in-page ask simply repeats the 401. RETRY_STATUS is still the retry set:
-the test flight gives a 401 exactly one second chance, after a warm-up, on the
-same node.
+the plain navigation lacked. A 401 does NOT get one on the reader path - the
+reader is spending nodes. The test flight does use it, once, because the flight's
+job is to find out whether the node can read at all.
 
 ONLY A 404 IS A READABLE ZERO
 -----------------------------
@@ -81,15 +80,37 @@ requested, while ipify through `requests` had just returned 200 on the same
 nodes. `_body_of()` accepts both shapes, the target is always requested, and
 `no_egress` survives only as the label for "no egress IP AND no status either".
 
-THE HOMEPAGE STEP IS A RETRY ONLY
----------------------------------
-Colab's test_flight_single() goes straight to the unified URL. Attempt 1 does
-exactly that, byte for byte. Only a retryable status (RETRY_STATUS) earns a
-warm-up of the homepage and a single second chance on the same node.
+THE REQUEST HAS TO LOOK LIKE THE PAGE'S OWN CALL
+------------------------------------------------
+A bare navigation sends no Referer, no Origin and no sec-* headers, and
+/unifiedsearch/ answers exactly that with
+    401 {"message": "You're probably a bot, try the official API instead"}
+which is Cloudflare, not the application - the request never reaches HIBP. The
+site's own call to that path is a same-origin XHR from a page, carrying the Cell 3
+header set. Every context therefore carries CTX_HEADERS (Accept: application/json,
+Accept-Language, Referer and Origin on haveibeenpwned.com, sec-ch-ua*,
+sec-fetch-*), on the flight AND on the reader's slot contexts, because the reader
+walks into the same wall.
+
+THE TARGET TAB STARTS AT THE TARGET
+-----------------------------------
+The egress read happens in its OWN tab of the same context, and that tab is
+closed before the target is touched, so the target page's first navigation is the
+unified URL with an empty history and no cross-site Referer - exactly Cell 4.
+Attempt 1 is one direct navigation. Only a retryable status earns a same-origin
+in-page fetch (the XHR the site itself makes), then one homepage warm-up and one
+second chance on the same node.
 
 Vanilla launch: no STEALTH_JS, no automation flag. Only --no-sandbox and
 --disable-dev-shm-usage stay, because Streamlit Cloud is a container and those
 two are container necessities rather than fingerprint.
+
+A GATEWAY THAT FAILS AUTH IS DEAD, NOT LATE
+--------------------------------------------
+`Tunnel connection failed: 407 Unauthorized` means the gateway rejected the
+credentials before a tunnel existed. A browser will not fare better, so an
+oxylabs.io gateway that fails ipify on a 407 is skipped at step 1 instead of
+burning two 35 s timeouts. Any other ipify failure still pushes it through.
 
 proxies_breach.txt is the ONLY file the flight writes, so the mail checker's own
 proxies.txt is never touched; the reader prefers the flight pool while it is
@@ -212,6 +233,24 @@ UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
 # Colab that produced the 200s launched vanilla, and an over-decorated headless
 # browser is its own fingerprint.
 CONTAINER_ARGS = ["--no-sandbox", "--disable-dev-shm-usage"]
+
+# The Colab Cell 3 header set, on every context. A bare navigation sends none of
+# these and /unifiedsearch/ answers that with the Cloudflare "probably a bot" 401;
+# these are the headers the page's own same-origin call carries, so the request
+# reads as the site asking for its own JSON instead of a stranger arriving.
+CTX_HEADERS = {
+    "Accept": "application/json, text/plain, */*",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Referer": HIBP_BASE + "/",
+    "Origin": HIBP_BASE,
+    "sec-ch-ua": '"Chromium";v="131", "Not_A Brand";v="24", '
+                 '"Google Chrome";v="131"',
+    "sec-ch-ua-mobile": "?0",
+    "sec-ch-ua-platform": '"Windows"',
+    "sec-fetch-dest": "empty",
+    "sec-fetch-mode": "cors",
+    "sec-fetch-site": "same-origin",
+}
 
 # Same-origin fetch helper for NON-JSON 200 responses only.
 FETCH_JS = ("async (u) => {try {const r = await fetch(u, {headers: "
@@ -1190,6 +1229,17 @@ def _bucket(status, reason="") -> str:
     return "other"
 
 
+def _gateway_dead(note) -> bool:
+    """A gateway that failed AUTH fails auth in a browser too - skip it at step 1.
+
+    `Tunnel connection failed: 407 Unauthorized` means the credential was refused
+    before a tunnel existed, so pushing it into Chromium only buys two 35 s
+    timeouts. Any other ipify failure still earns the browser.
+    """
+    n = str(note or "")
+    return ("407" in n) or ("Unauthorized" in n) or ("unauthorized" in n)
+
+
 def _webshare_fetch(keys, log=None):
     try:
         import requests
@@ -1311,13 +1361,29 @@ def _ip_of(resp):
         return "-"
 
 
+def _ctx_kw(proxy_line=None) -> dict:
+    """Context kwargs: the Cell 3 header set, and the proxy when there is one.
+
+    Shared by the flight and the reader's slots so both walk through the WAF the
+    same way. A navigation without Referer/Origin is exactly what the 401 body
+    calls "probably a bot".
+    """
+    kw = {"user_agent": UA, "locale": "en-US",
+          "viewport": {"width": 1440, "height": 900},
+          "extra_http_headers": dict(CTX_HEADERS)}
+    cfg = _proxy_cfg(proxy_line) if proxy_line else None
+    if cfg:
+        kw["proxy"] = cfg
+    return kw
+
+
 def _proxy_ok(line, diag=False, log=None):
     """Does this node carry a request at all? -> (ok, note).
 
     `note` is the real reason on failure - the HTTP status or the exception text,
-    never a generic "dead". It is kept to 220 characters so a ProxyError keeps its
-    reason (407, tunnel failed, port or credential) instead of being cut at the
-    word that mattered.
+    never a generic "dead". It is kept to 220 characters, whitespace collapsed, so
+    a ProxyError keeps its reason (407, tunnel failed, port or credential) on one
+    line instead of being cut at the word that mattered.
     """
     url = _proxy_url(line)
     if not url:
@@ -1332,7 +1398,7 @@ def _proxy_ok(line, diag=False, log=None):
             return True, "ok"
         return False, "ipify http %d" % r.status_code
     except Exception as exc:
-        note = "%s: %s" % (type(exc).__name__, str(exc)[:220])
+        note = _snippet("%s: %s" % (type(exc).__name__, exc), 220)
         if diag:
             _say(log, "      <- ipify fail | %s" % note)
         return False, note
@@ -1378,13 +1444,15 @@ def _flight_one(line, diag=False, log=None):
     """One node through a vanilla headless context.
 
     -> dict(ok, reason, bucket, ip, status, ctype, size, headers, snippet,
-            home). Attempt 1 is the Colab call: straight at the unified URL, no
-    homepage first. Only a retryable status earns a warm-up and a second chance.
+            home). The target tab's FIRST navigation is the target: the egress
+    read happens in its own tab and that tab is closed first, so the history is
+    empty and the Referer is not a cross-site one - Cell 4 exactly.
 
-    The egress IP is read INSIDE the context first, because a context that does
-    not carry `proxy` answers from Streamlit's own address and looks exactly like
-    a walled endpoint. It is INFORMATIONAL: a failed read no longer drops the node
-    - the target itself is the verdict. Credentials are never printed, only
+    Attempt 1 is one direct navigation. Only a retryable status earns a
+    same-origin in-page fetch, then one homepage warm-up and one second chance.
+
+    The egress IP is INFORMATIONAL: a failed read never drops the node, because
+    the target itself is the verdict. Credentials are never printed, only
     host:port and auth=yes/no.
     """
     ctx = None
@@ -1393,26 +1461,28 @@ def _flight_one(line, diag=False, log=None):
     short = line.rsplit("@", 1)[-1]
     try:
         b = _browser()
-        kw = {"user_agent": UA, "locale": "en-US",
-              "viewport": {"width": 1440, "height": 900}}
-        cfg = _proxy_cfg(line)
-        if cfg:
-            kw["proxy"] = cfg
-        ctx = b.new_context(**kw)
+        ctx = b.new_context(**_ctx_kw(line))
         page = ctx.new_page()
         page.set_default_timeout(FLIGHT_TIMEOUT)
         if diag:
             _say(log, "    send -> %s | auth=%s | target %s | home=retry-only"
-                 % (short, "yes" if cfg else "no", unified_url(FLIGHT_PROBE)))
+                 % (short, "yes" if "@" in line else "no",
+                    unified_url(FLIGHT_PROBE)))
+        # Egress read in its OWN tab, so the target tab stays a clean first
+        # navigation. Same context, so it still proves the proxy is carried.
         try:
-            probe = page.goto(IPIFY_URL, wait_until="domcontentloaded",
-                              timeout=FLIGHT_TIMEOUT)
-            if probe is not None and probe.status == 200:
-                out["ip"] = _ip_of(probe)
+            probe_tab = ctx.new_page()
+            try:
+                probe = probe_tab.goto(IPIFY_URL, wait_until="domcontentloaded",
+                                       timeout=FLIGHT_TIMEOUT)
+                if probe is not None and probe.status == 200:
+                    out["ip"] = _ip_of(probe)
+            finally:
+                probe_tab.close()
         except Exception as exc:
             if diag:
                 _say(log, "      <- egress probe raised %s: %s"
-                     % (type(exc).__name__, str(exc)[:160]))
+                     % (type(exc).__name__, _snippet(str(exc), 160)))
         if out["ip"] in ("", "-") and diag:
             _say(log, "      <- egress unread, target is tried anyway")
         for attempt in (1, 2):
@@ -1422,7 +1492,8 @@ def _flight_one(line, diag=False, log=None):
                                  timeout=FLIGHT_TIMEOUT)
             except Exception as exc:
                 out["status"] = 0
-                out["reason"] = "%s: %s" % (type(exc).__name__, str(exc)[:160])
+                out["reason"] = "%s: %s" % (type(exc).__name__,
+                                            _snippet(str(exc), 160))
                 if out["ip"] in ("", "-"):
                     out["reason"] = "no egress ip and no status - " + out["reason"]
                 out["bucket"] = _bucket(0, out["reason"])
@@ -1470,8 +1541,25 @@ def _flight_one(line, diag=False, log=None):
             out["bucket"] = _bucket(out["status"], out["reason"])
             if out["status"] not in RETRY_STATUS:
                 return out
+            # The same-origin XHR the site's own page makes. It carries Origin,
+            # a same-origin Referer and sec-fetch-mode: cors, which is what the
+            # WAF is actually judging - the document navigation is not.
+            page.wait_for_timeout(400)
+            got, payload = _inpage_fetch(page, FLIGHT_PROBE)
+            if isinstance(payload, dict):
+                out["ok"] = True
+                out["reason"] = "200"
+                out["bucket"] = "200"
+                if diag:
+                    _say(log, "      <- in-page 200, JSON body accepted")
+                return out
+            if got:
+                out["bucket"] = _bucket(got, "in-page %s" % got)
+                out["reason"] = "in-page %s" % got
+                if diag:
+                    _say(log, "      <- in-page %s after the %s"
+                         % (got, out["status"] or "?"))
             if attempt == 1:
-                # The only warm-up. Attempt 1 above matched Colab exactly.
                 try:
                     home = page.goto(HIBP_BASE + "/", wait_until="domcontentloaded",
                                      timeout=FLIGHT_TIMEOUT)
@@ -1482,11 +1570,12 @@ def _flight_one(line, diag=False, log=None):
                 except Exception as exc:
                     if diag:
                         _say(log, "      <- home raised %s: %s | egress %s"
-                             % (type(exc).__name__, str(exc)[:160], out["ip"]))
+                             % (type(exc).__name__, _snippet(str(exc), 160),
+                                out["ip"]))
             page.wait_for_timeout(900)
         return out
     except Exception as exc:
-        out["reason"] = "%s: %s" % (type(exc).__name__, str(exc)[:160])
+        out["reason"] = "%s: %s" % (type(exc).__name__, _snippet(str(exc), 160))
         out["bucket"] = _bucket(0, out["reason"])
         if diag:
             _say(log, "      <- raised %s" % out["reason"])
@@ -1520,9 +1609,10 @@ def _flight_ipify(cand, cancel=None, log=None, pin="", diag=False, codes=None,
         if codes is not None:
             _bump(codes, "ipify_fail", lock)
         # An Oxylabs rotating gateway can answer ipify badly and still be fine in
-        # a real browser, which is exactly how Colab Cell 2 used it. It is pushed
-        # into step 2 regardless; only the plain nodes are dropped here.
-        gateway = "oxylabs.io" in line
+        # a real browser, which is how Colab Cell 2 used it - unless the failure
+        # is auth, which a browser cannot fix. That one is skipped like any dead
+        # node instead of burning two 35 s timeouts.
+        gateway = "oxylabs.io" in line and not _gateway_dead(note)
         _say(log, "    %s -> %s | ipify_fail (%s)%s"
              % ("keep" if gateway else "skip", short, note,
                 " - pushed to step 2 anyway" if gateway else ""))
@@ -2051,12 +2141,7 @@ class _Slot:
     def open_ctx(self, proxy_line):
         self.close_ctx()
         b = _browser()
-        kw = {"user_agent": UA, "locale": "en-US",
-              "viewport": {"width": 1440, "height": 900}}
-        cfg = _proxy_cfg(proxy_line) if proxy_line else None
-        if cfg:
-            kw["proxy"] = cfg
-        ctx = b.new_context(**kw)
+        ctx = b.new_context(**_ctx_kw(proxy_line))
         ctx.set_default_timeout(NAV_TIMEOUT)
         self.ctx = ctx
         self.page = ctx.new_page()
@@ -2158,6 +2243,19 @@ def _attempt(addr, proxy_line):
         if status == 404:
             slot.ok()
             return 404, None
+        if status in RETRY_STATUS:
+            # Same-origin re-ask: the XHR the page itself makes, with a Referer
+            # and Origin the navigation does not carry.
+            page.wait_for_timeout(400)
+            got, payload = _inpage_fetch(page, addr)
+            if isinstance(payload, dict):
+                slot.ok()
+                return 200, payload
+            if got == 404:
+                slot.ok()
+                return 404, None
+            slot.ok()
+            return got or status, None
         slot.ok()
         return status, None
     except Exception as exc:
@@ -2861,6 +2959,22 @@ def selftest(verbose=False) -> bool:
     add("ip_of_raises", _ip_of(_Boom()) == "-")
     add("ip_of_none", _ip_of(None) == "-")
     add("ip_of_non_json", _ip_of(type("R", (), {"text": "hello"})()) == "-")
+
+    # ---- the context headers, and the gateway skip rule ----
+    add("ctx_headers_referer", CTX_HEADERS.get("Referer") == HIBP_BASE + "/")
+    add("ctx_headers_origin", CTX_HEADERS.get("Origin") == HIBP_BASE)
+    add("ctx_headers_sec_fetch", "sec-fetch-site" in CTX_HEADERS)
+    add("ctx_headers_on_context", "extra_http_headers" in _ctx_kw(None))
+    add("ctx_headers_copied", _ctx_kw(None)["extra_http_headers"] is not CTX_HEADERS)
+    add("ctx_kw_proxy", (_ctx_kw("u:p@1.2.3.4:8080").get("proxy") or {}).get("server")
+        == "http://1.2.3.4:8080")
+    add("ctx_kw_direct_no_proxy", "proxy" not in _ctx_kw(None))
+    add("ctx_kw_ua", _ctx_kw(None).get("user_agent") == UA)
+    add("gateway_dead_407", _gateway_dead("ProxyError: Tunnel connection failed: "
+                                          "407 Unauthorized"))
+    add("gateway_dead_word", _gateway_dead("Tunnel connection failed: Unauthorized"))
+    add("gateway_alive_503", not _gateway_dead("ipify http 503"))
+    add("gateway_alive_timeout", not _gateway_dead("ReadTimeout: x"))
 
     add("blank_read_false", _blank({"kind": "email", "email": "a@b.co"}).get("read") is False)
     add("blank_addr_unread", _blank({"kind": "email", "email": "a@b.co"}).get("addr_verdict")
