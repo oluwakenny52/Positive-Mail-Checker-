@@ -256,9 +256,10 @@ import breach
 # ---- stale-module guard -------------------------------------------------------
 # Every marker is a capability this page calls. A module missing one predates it
 # and is replaced before anything touches it. `_zero_rule`, PROXY_TRIES, the
-# flight markers and flight_log_text belong to the 401 fix and the test flight: a
-# module without them still reported a 401 as CLEAN, still ran an unproven pool,
-# and still lost the flight's own log to an unpinned worker thread.
+# flight markers, flight_log_text and OUTCOMES belong to the 401 fix, the test
+# flight and the diagnostic switch: a module without them still reported a 401 as
+# CLEAN, still ran an unproven pool, still lost the flight's log to an unpinned
+# worker thread, and still had no `diagnose` argument.
 if not (hasattr(breach, "parse_lines") and hasattr(breach, "pool_lines")
         and hasattr(breach, "check_item") and hasattr(breach, "clear_cache")
         and hasattr(breach, "cache_stats") and hasattr(breach, "record_view")
@@ -268,7 +269,8 @@ if not (hasattr(breach, "parse_lines") and hasattr(breach, "pool_lines")
         and hasattr(breach, "_cat_rows") and hasattr(breach, "catalogue_state")
         and hasattr(breach, "flight") and hasattr(breach, "flight_state")
         and hasattr(breach, "flight_log_text") and hasattr(breach, "available")
-        and hasattr(breach, "RETRY_STATUS") and hasattr(breach, "POOL_TTL")):
+        and hasattr(breach, "OUTCOMES") and hasattr(breach, "RETRY_STATUS")
+        and hasattr(breach, "POOL_TTL")):
     breach = importlib.reload(breach)
     try:
         breach.trace("INFO", "page", "stale breach module replaced by reload")
@@ -288,6 +290,7 @@ _FLY_KEY = "_breach_flight_job"
 _RES_KEY = "_breach_results"
 _QUAL_KEY = "_breach_quality"
 _MSG_KEY = "_breach_msg"
+_DIAG_KEY = "_breach_diag"
 _TRACE_SHOWN = "_breach_trace_shown"
 
 _BAND_CSS = {"NEW": "br-new", "PARTIAL": "br-partial", "OLD": "br-old",
@@ -691,11 +694,20 @@ else:
     st.warning("\U0001f310 **Your proxy pool is empty.** The address half will try "
                "DIRECT only. Run the test flight, or import a list on the checker page.")
 
+_diag = st.checkbox("\U0001f52c Diagnostic flight", value=False, key=_DIAG_KEY,
+                    on_change=_watch(_DIAG_KEY, "diagnostic flight"),
+                    help="Logs the node, auth mode, target, whether the homepage ran, "
+                         "the ipify answer, the status, content-type, byte count, the "
+                         "headers that matter and 200 characters of the body, then a "
+                         "count per code with a legend. Credentials are never printed. "
+                         "Nothing changes about what gets kept - still 200 + JSON only.")
+
 _f1, _f2 = st.columns([0.72, 0.28])
 with _f1:
     if _flying:
-        st.caption("\u2708 **Test flight running** - fetching candidates and proving "
-                   "each one in Chromium, five at a time. The log follows live.")
+        st.caption("\u2708 **Test flight running**%s - fetching candidates and proving "
+                   "each one in Chromium, five at a time. The log follows live."
+                   % (" in diagnostic mode" if _diag else ""))
     elif _fst.get("ts"):
         st.caption("\u2708 Last test flight %s ago: **%d** candidate(s), **%d** kept. "
                    "Only kept nodes are drawn."
@@ -715,14 +727,15 @@ with _f2:
                       "this exact endpoint. Only survivors are written, to this page's "
                       "own pool - your proxies.txt is not touched."):
         _job = {"done": False, "started": time.time(), "result": {}, "owner": _OWNER,
-                "since0": breach.trace_seq()}
+                "since0": breach.trace_seq(), "diag": bool(_diag)}
         st.session_state[_FLY_KEY] = _job
-        breach.trace("CLICK", "flight", "pressed by the page")
+        breach.trace("CLICK", "flight", "pressed by the page%s"
+                     % (" [diagnostic]" if _diag else ""))
 
-        def _fly_body(job=_job, pin=_OWNER):
+        def _fly_body(job=_job, pin=_OWNER, diag=bool(_diag)):
             try:
                 breach.set_owner(pin)
-                job["result"] = breach.flight(force=True)
+                job["result"] = breach.flight(force=True, diagnose=diag)
             except Exception as e:
                 job["result"] = {"error": "%s: %s" % (type(e).__name__, e)}
                 breach.trace("ERR", "flight", "%s: %s" % (type(e).__name__, e))
@@ -733,19 +746,26 @@ with _f2:
         st.rerun()
 
 if _flying:
-    st.caption("Flight output, live - `%d` candidate(s) so far." % len(
-        breach.trace_read(limit=400, since=int(_fly.get("since0") or 0),
+    st.caption("Flight output, live - `%d` line(s) so far." % len(
+        breach.trace_read(limit=900, since=int(_fly.get("since0") or 0),
                           skip=("page", "control"))))
     _flive = st.empty()
     try:
-        _flive.code(breach.trace_text(limit=16, since=int(_fly.get("since0") or 0),
+        _flive.code(breach.trace_text(limit=18, since=int(_fly.get("since0") or 0),
                                       skip=("page", "control")), language="text")
     except Exception:
         pass
 elif _fst.get("log"):
-    with st.expander("Test flight output (%d kept)" % int(_fst.get("kept") or 0),
+    _codes = _fst.get("codes") or {}
+    with st.expander("Test flight output (%d kept%s)"
+                     % (int(_fst.get("kept") or 0),
+                        ", diagnostic" if _fst.get("diagnose") else ""),
                      expanded=False):
-        st.code(breach.flight_log_text(limit=400), language="text")
+        if _codes:
+            st.caption("Outcome counts: %s"
+                       % ", ".join("%s %d" % (k, int(v))
+                                   for k, v in _codes.items() if v))
+        st.code(breach.flight_log_text(limit=600), language="text")
 
 # ---- workers, pacing, the draw -------------------------------------------------
 _c1, _c2, _c3 = st.columns(3)
