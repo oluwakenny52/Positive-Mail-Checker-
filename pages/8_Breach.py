@@ -701,10 +701,10 @@ _diag = st.checkbox("\U0001f52c Diagnostic flight", value=False, key=_DIAG_KEY,
                     help="Logs the node, auth mode, target, the ipify answer, the "
                          "status, content-type, byte count, the headers that matter and "
                          "200 characters of the body, then a count per code with a "
-                         "legend. Attempt 1 goes straight at the endpoint; the homepage "
-                         "is only warmed before the retry. Credentials are never "
-                         "printed. Nothing changes about what gets kept - still 200 + "
-                         "JSON only.")
+                         "legend. The target tab's first navigation is the target; only "
+                         "a refusal earns a same-origin re-ask, then one warm-up and one "
+                         "retry. Credentials are never printed. Nothing changes about "
+                         "what gets kept - still 200 + JSON only.")
 
 _f1, _f2 = st.columns([0.72, 0.28])
 with _f1:
