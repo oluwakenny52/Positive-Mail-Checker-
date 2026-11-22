@@ -1,5 +1,4 @@
 # @@FILE pages/8_Breach.py blocks=12 version=v13.86
-# @@FILE pages/8_Breach.py blocks=12 version=v13.86
 # @@BLOCK 000 FILE_HEADER deps=-
 """
 pages/8_Breach.py - breach exposure and combo freshness  (v13.86)
@@ -9,28 +8,25 @@ rather than count.
 
 WHAT CHANGED IN THIS PASS
 -------------------------
-Four defects, all reported from real runs:
+The wall. HIBP answers `401 {"message": "You're probably a bot..."}` with a
+`cf-ray` header on every node for a while, and the app was reading that as a dead
+proxy and as an unread address, so a walled afternoon produced an empty flight
+pool and a card full of UNREAD. Four fixes:
 
-  1. A 401 was being reported as a CLEAN address. The endpoint answers a real
-     Chromium navigation with 200 on the same nodes the app was getting 401
-     from, so the header set that was being forced onto the NAVIGATION is gone,
-     and a refused attempt is now re-asked once from INSIDE the page with a
-     same-origin fetch() - the call the site itself makes. Only a 404 is a
-     readable zero any more.
-  2. A combo was graded on its password alone. When the address half could not
-     be read the combo read as PARTIAL off the password and said "no breach
-     record - the source was read and lists none", which was not true. A combo
-     whose address half is UNREAD is now UNKNOWN; the password band is still
-     shown beside it but no longer decides the grade. Password-only lines are
-     unaffected - there, the password IS the question.
-  3. Nothing ever proved the pool against this endpoint. The Colab's second cell
-     did, and that is now here: a test flight fetches Webshare and Oxylabs, drops
-     the dead nodes on ipify, proves the rest in Chromium against the unified
-     endpoint, and keeps only the survivors. It runs by itself when the flight
-     pool is missing or stale, and can be run by hand.
-  4. The record never carried its password, so the card could only show an
-     address. It does now, so the card, the CSV and the rotate export show the
-     combo that was actually checked.
+  1. A node the target ANSWERED is alive. The flight keeps 200, 401, 403, 404 and
+     429 and drops only transport failures, so the pool is never empty on a walled
+     day. The 200s are still counted separately and the early stop waits for
+     twelve of them, not for the first twelve nodes.
+  2. The pool is kept for an hour instead of half an hour, because a flight is
+     itself a burn - the same shared exits flown every thirty minutes arrive
+     already scored.
+  3. A walled address now has a second, keyless, per-address source outside the
+     wall (XposedOrNot), and the HIBP catalogue names the breaches it returns so
+     the dates, record counts and data classes are HIBP's own. The catalogue by
+     DOMAIN is the third step now, because a domain answer for a gmail mailbox is
+     noise.
+  4. The legend, the help text and the summary say carried / read / kept instead
+     of calling a 401 "nothing readable".
 
 THE ADDRESS HALF IS A REAL PAGE
 -------------------------------
@@ -73,14 +69,20 @@ WHAT EACH SOURCE IS
              signal - it says how public this exact password already is.
   address    the site's own unified search endpoint, fetched by a real Chromium
              page through the proxy pool, DIRECT as the last attempt.
+  index      XposedOrNot, keyless and per-address, used only when the address half
+             was refused. Its breach names are resolved against the HIBP
+             catalogue, so the row still carries a real date and record count.
+  domain     the HIBP catalogue by DOMAIN, last. Fills a walled address with
+             breaches that name the domain and flags the record `partial_read`.
 
 WHAT LEAVES THE BOX
 -------------------
 Only the ADDRESS. A pasted `email:password` is cut at the colon before the URL
 is built, so the password never reaches haveibeenpwned.com - which would not use
-it anyway. The password goes to exactly one place: the SHA-1 hash for Pwned
-Passwords, where 5 of the 40 characters leave and 35 are matched locally. The
-plaintext is kept LOCALLY on the record so the card can show the combo.
+it anyway. The address does reach XposedOrNot when the exact search was walled.
+The password goes to exactly one place: the SHA-1 hash for Pwned Passwords, where
+5 of the 40 characters leave and 35 are matched locally. The plaintext is kept
+LOCALLY on the record so the card can show the combo.
 
 THE BANDS
 ---------
@@ -262,7 +264,9 @@ import breach
 # worker thread, and still had no `diagnose` argument. `_body_of` belongs to the
 # no_egress fix. `STEALTH_JS` belongs to the fingerprint pass: a module without it
 # navigates as a bare headless browser, which the WAF scores before it looks at
-# the IP.
+# the IP. `CARRY_STATUS`, `WALL_STATUS` and `_xposed_lookup` belong to the wall
+# pass: a module without them keeps only 200 + JSON, so a walled flight leaves an
+# empty pool, and a walled address has no second source to fall back to.
 if not (hasattr(breach, "parse_lines") and hasattr(breach, "pool_lines")
         and hasattr(breach, "check_item") and hasattr(breach, "clear_cache")
         and hasattr(breach, "cache_stats") and hasattr(breach, "record_view")
@@ -274,7 +278,9 @@ if not (hasattr(breach, "parse_lines") and hasattr(breach, "pool_lines")
         and hasattr(breach, "flight_log_text") and hasattr(breach, "available")
         and hasattr(breach, "OUTCOMES") and hasattr(breach, "RETRY_STATUS")
         and hasattr(breach, "POOL_TTL") and hasattr(breach, "_body_of")
-        and hasattr(breach, "STEALTH_JS")):
+        and hasattr(breach, "STEALTH_JS") and hasattr(breach, "CARRY_STATUS")
+        and hasattr(breach, "WALL_STATUS") and hasattr(breach, "_xposed_lookup")
+        and hasattr(breach, "FLIGHT_READ_WANT")):
     breach = importlib.reload(breach)
     try:
         breach.trace("INFO", "page", "stale breach module replaced by reload")
@@ -637,10 +643,11 @@ else:
     st.caption("Nothing queued.")
 
 st.caption("Only the address is sent to haveibeenpwned.com - a pasted `email:password` "
-           "is cut at the colon before the request is built. The password only ever "
-           "goes to the Pwned Passwords hash check, and 5 of its 40 hash characters "
-           "leave the box. The plaintext stays on the record so the card can show the "
-           "combo it came from.")
+           "is cut at the colon before the request is built, and the address goes to "
+           "XposedOrNot too when HIBP refuses. The password only ever goes to the "
+           "Pwned Passwords hash check, and 5 of its 40 hash characters leave the box. "
+           "The plaintext stays on the record so the card can show the combo it came "
+           "from.")
 
 # ---- the browser, and its state ------------------------------------------------
 _bst = breach.browser_state()
@@ -705,8 +712,8 @@ _diag = st.checkbox("\U0001f52c Diagnostic flight", value=False, key=_DIAG_KEY,
                          "200 characters of the body, then a count per code with a "
                          "legend. One navigation per node, two nodes at a time, "
                          "staggered - nothing is re-asked on a 401. Credentials are "
-                         "never printed. Nothing changes about what gets kept - still "
-                         "200 + JSON only.")
+                         "never printed. Nothing changes about what gets kept: any node "
+                         "the target answers is kept.")
 
 _f1, _f2 = st.columns([0.72, 0.28])
 with _f1:
@@ -715,10 +722,10 @@ with _f1:
                    "two at a time. The log follows live."
                    % (" in diagnostic mode" if _diag else ""))
     elif _fst.get("ts"):
-        st.caption("\u2708 Last test flight %s ago: **%d** candidate(s), **%d** kept. "
-                   "Only kept nodes are drawn."
+        st.caption("\u2708 Last test flight %s ago: **%d** candidate(s), **%d** kept, "
+                   "**%d** of them readable. Only kept nodes are drawn."
                    % (_ago(_fst.get("age")), int(_fst.get("candidates") or 0),
-                      int(_fst.get("kept") or 0))
+                      int(_fst.get("kept") or 0), int(_fst.get("reads") or 0))
                    + ((" Error: `%s`" % _fst["error"]) if _fst.get("error") else ""))
     else:
         st.caption("\u2708 No test flight yet. One runs by itself before a run whenever "
@@ -731,9 +738,11 @@ with _f2:
                  help="Needs the browser ready. Flies every credential line in your "
                       "proxies.txt, minus the ones proxy_meta.json already marks dead - "
                       "the Webshare and Oxylabs APIs are only fetched if that file is "
-                      "empty. One navigation per node, two at a time, staggered; a node "
-                      "must answer 200 with JSON to be kept. Survivors go to this page's "
-                      "own pool - your proxies.txt is not touched."):
+                      "empty. One navigation per node, two at a time, staggered. Any "
+                      "node the target ANSWERS is kept - a 200 with JSON is counted as a "
+                      "read, and a 401 is the WAF refusing the caller, not a dead node. "
+                      "Survivors go to this page's own pool - your proxies.txt is not "
+                      "touched."):
         _job = {"done": False, "started": time.time(), "result": {}, "owner": _OWNER,
                 "since0": breach.trace_seq(), "diag": bool(_diag)}
         st.session_state[_FLY_KEY] = _job
@@ -765,8 +774,8 @@ if _flying:
         pass
 elif _fst.get("log"):
     _codes = _fst.get("codes") or {}
-    with st.expander("Test flight output (%d kept%s)"
-                     % (int(_fst.get("kept") or 0),
+    with st.expander("Test flight output (%d kept, %d readable%s)"
+                     % (int(_fst.get("kept") or 0), int(_fst.get("reads") or 0),
                         ", diagnostic" if _fst.get("diagnose") else ""),
                      expanded=False):
         if _codes:
@@ -1031,12 +1040,19 @@ if _rows:
                    "on them was refused, so they are UNKNOWN - a password alone does "
                    "not grade a combo. Re-run them; a fresh node is drawn each time."
                    % (len(_unread_rows), len(_rows)))
+    _xp_rows = [r for r in _rows if r.get("via") == "xposedornot"]
+    if _xp_rows:
+        st.caption("\U0001f310 **%d of %d were read from XposedOrNot**, not from HIBP - "
+                   "the HIBP search was refused for those and the second index answered "
+                   "the exact address instead. The breaches are real and individually "
+                   "confirmed; the dates come from the HIBP catalogue by name."
+                   % (len(_xp_rows), len(_rows)))
     _dom_rows = [r for r in _rows if r.get("partial_read")]
     if _dom_rows:
         st.caption("\U0001f4da **%d of %d were matched by DOMAIN**, not by the exact "
-                   "address - the exact search was refused and the catalogue answered "
-                   "instead. The breach list is real for the domain; this mailbox is "
-                   "not individually confirmed."
+                   "address - the exact search was refused, the second index failed, "
+                   "and the catalogue answered instead. The breach list is real for the "
+                   "domain; this mailbox is not individually confirmed."
                    % (len(_dom_rows), len(_rows)))
     st.bar_chart({"Band": list(_q.get("buckets", {}).keys()),
                   "Count": list(_q.get("buckets", {}).values())},
@@ -1075,6 +1091,7 @@ if _rows:
             _ps = r.get("pastes") or []
             _read = bool(r.get("read"))
             _dom = bool(r.get("partial_read"))
+            _xp = r.get("via") == "xposedornot"
             _head_v = (_v if r.get("pw_band") != "none"
                        else str(r.get("addr_verdict") or _v))
             _key = _row_key(r)
@@ -1106,10 +1123,16 @@ if _rows:
                                "verdict.")
                 if r.get("error"):
                     st.caption("error: %s" % r["error"])
-                if _dom:
+                if _xp:
+                    st.caption("\U0001f310 **Read from XposedOrNot** - the HIBP search "
+                               "was refused, so the second index answered the exact "
+                               "address. The breaches are individually confirmed; the "
+                               "dates are the catalogue's, matched by breach name.")
+                elif _dom:
                     st.caption("\U0001f4da **Matched by domain** (`%s`) from the "
-                               "catalogue - the exact search was refused, so this "
-                               "mailbox is not individually confirmed."
+                               "catalogue - the exact search was refused and the second "
+                               "index failed, so this mailbox is not individually "
+                               "confirmed."
                                % (str(r.get("email") or "").rsplit("@", 1)[-1] or "?"))
                 elif not _read and r.get("kind") != "password":
                     st.caption("\u26a0 **The address half was not read.** Every attempt "
@@ -1287,10 +1310,12 @@ st.markdown("---")
 auth.fit_panel(st)
 
 st.caption("Sources: Pwned Passwords (k-anonymity - only 5 hash characters leave the "
-           "box) and the site's unified search read by a real browser through your "
-           "proxy pool, DIRECT as the last attempt. Only the address is transmitted; "
-           "a pasted password is never. A CLEAN verdict means not in those sources, "
-           "not that the address was never exposed - and an address half that could "
-           "not be read is flagged UNREAD rather than reported as zero.")
+           "box), the site's unified search read by a real browser through your proxy "
+           "pool with DIRECT as the last attempt, and - when HIBP refuses the caller - "
+           "XposedOrNot for the exact address, then the HIBP catalogue by domain as the "
+           "last resort. Only the address is transmitted; a pasted password is never. A "
+           "CLEAN verdict means not in those sources, not that the address was never "
+           "exposed - and an address half that could not be read is flagged UNREAD "
+           "rather than reported as zero.")
 # @@END 011 FOOTER
 # @@EOF
