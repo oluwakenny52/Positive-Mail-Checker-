@@ -255,9 +255,10 @@ import breach
 
 # ---- stale-module guard -------------------------------------------------------
 # Every marker is a capability this page calls. A module missing one predates it
-# and is replaced before anything touches it. `_zero_rule`, PROXY_TRIES and the
-# flight markers belong to the 401 fix and the test flight: a module without them
-# still reported a 401 as CLEAN and still ran an unproven pool, so it has to go.
+# and is replaced before anything touches it. `_zero_rule`, PROXY_TRIES, the
+# flight markers and flight_log_text belong to the 401 fix and the test flight: a
+# module without them still reported a 401 as CLEAN, still ran an unproven pool,
+# and still lost the flight's own log to an unpinned worker thread.
 if not (hasattr(breach, "parse_lines") and hasattr(breach, "pool_lines")
         and hasattr(breach, "check_item") and hasattr(breach, "clear_cache")
         and hasattr(breach, "cache_stats") and hasattr(breach, "record_view")
@@ -266,6 +267,7 @@ if not (hasattr(breach, "parse_lines") and hasattr(breach, "pool_lines")
         and hasattr(breach, "PROXY_TRIES") and hasattr(breach, "catalogue")
         and hasattr(breach, "_cat_rows") and hasattr(breach, "catalogue_state")
         and hasattr(breach, "flight") and hasattr(breach, "flight_state")
+        and hasattr(breach, "flight_log_text") and hasattr(breach, "available")
         and hasattr(breach, "RETRY_STATUS") and hasattr(breach, "POOL_TTL")):
     breach = importlib.reload(breach)
     try:
@@ -282,6 +284,7 @@ _OWNER_KEY = "_breach_owner"
 _BOOT_KEY = "_breach_booted"
 _RUN_KEY = "_breach_run"
 _JOB_KEY = "_breach_job"
+_FLY_KEY = "_breach_flight_job"
 _RES_KEY = "_breach_results"
 _QUAL_KEY = "_breach_quality"
 _MSG_KEY = "_breach_msg"
@@ -592,8 +595,8 @@ def _trace_read(limit=250, skip=None):
 
 # ---- owner gate ----
 if st.session_state.get(_OWNER_KEY) != _OWNER:
-    for k in (_RES_KEY, _RUN_KEY, _JOB_KEY, _QUAL_KEY, _MSG_KEY, "_breach_text",
-              _TRACE_SHOWN):
+    for k in (_RES_KEY, _RUN_KEY, _JOB_KEY, _FLY_KEY, _QUAL_KEY, _MSG_KEY,
+              "_breach_text", _TRACE_SHOWN):
         st.session_state.pop(k, None)
     st.session_state[_OWNER_KEY] = _OWNER
     st.session_state.pop(_BOOT_KEY, None)
@@ -657,15 +660,17 @@ _bst = breach.browser_state()
 if _bst.get("state") == "unknown":
     breach.ensure_browser()
     _bst = breach.browser_state()
+_browser_ready = _bst.get("state") == "ready"
 
 _bst1, _bst2 = st.columns([0.72, 0.28])
 with _bst1:
-    if _bst.get("state") == "ready":
+    if _browser_ready:
         st.caption("\u2705 Browser ready - the address half is a real page, through "
                    "your proxy pool. One page per worker, reused for the whole run.")
     elif _bst.get("state") == "installing":
         st.caption("\u23f3 Browser installing (%ss). Passwords work either way; "
-                   "addresses come back UNREAD until it finishes."
+                   "addresses come back UNREAD until it finishes, and the test flight "
+                   "waits for it."
                    % _bst.get("seconds", 0))
     elif _bst.get("state") == "failed":
         st.caption("\u26a0 Browser install FAILED. Passwords still work; addresses "
@@ -673,7 +678,7 @@ with _bst1:
                    % (_bst.get("error") or "unknown")[:300])
     else:
         st.caption("Browser not installed. Passwords are checked either way; addresses "
-                   "come back UNREAD without one.")
+                   "come back UNREAD without one, and the flight needs it.")
 with _bst2:
     if _bst.get("state") not in ("ready", "installing"):
         if st.button("\u2b07 Prepare browser", width="stretch",
@@ -686,6 +691,16 @@ with _bst2:
 # ---- the pool, and the test flight that proves it ------------------------------
 _fst = breach.flight_state()
 _pstat = breach.pool_status()
+_fly = st.session_state.get(_FLY_KEY)
+if isinstance(_fly, dict) and not _fly.get("done"):
+    try:
+        if time.time() - float(_fly.get("started") or 0) > 900.0:
+            _fly["error"] = _fly.get("error") or "watchdog: the flight stopped reporting"
+            _fly["done"] = True
+    except Exception:
+        pass
+_flying = bool(isinstance(_fly, dict) and not _fly.get("done"))
+
 if _pstat["count"]:
     st.caption("\U0001f310 **%d** proxy node(s) loaded%s - probed nodes first, DIRECT "
                "as the last attempt. Sample: `%s`"
@@ -698,9 +713,9 @@ else:
 
 _f1, _f2 = st.columns([0.72, 0.28])
 with _f1:
-    if _fst.get("busy"):
+    if _flying:
         st.caption("\u2708 **Test flight running** - fetching candidates and proving "
-                   "each one in Chromium, five at a time. The run waits for it.")
+                   "each one in Chromium, five at a time. The log follows live.")
     elif _fst.get("ts"):
         st.caption("\u2708 Last test flight %s ago: **%d** candidate(s), **%d** kept. "
                    "Only kept nodes are drawn."
@@ -714,18 +729,43 @@ with _f1:
                    % max(1, int(breach.POOL_TTL // 60)))
 with _f2:
     if st.button("\u2708 Run test flight", width="stretch",
-                 disabled=bool(_fst.get("busy")),
-                 help="Fetches Webshare + Oxylabs, drops the dead nodes on ipify, then "
-                      "proves the rest in Chromium against this exact endpoint. Only "
-                      "survivors are written and used."):
+                 disabled=(_flying or not _browser_ready),
+                 help="Needs the browser ready. Fetches Webshare + Oxylabs, drops the "
+                      "dead nodes on ipify, then proves the rest in Chromium against "
+                      "this exact endpoint. Only survivors are written, to this page's "
+                      "own pool - your proxies.txt is not touched."):
+        _job = {"done": False, "started": time.time(), "result": {}, "owner": _OWNER,
+                "since0": breach.trace_seq()}
+        st.session_state[_FLY_KEY] = _job
         breach.trace("CLICK", "flight", "pressed by the page")
-        breach.flight(force=True)
+
+        def _fly_body(job=_job, pin=_OWNER):
+            try:
+                breach.set_owner(pin)
+                job["result"] = breach.flight(force=True)
+            except Exception as e:
+                job["result"] = {"error": "%s: %s" % (type(e).__name__, e)}
+                breach.trace("ERR", "flight", "%s: %s" % (type(e).__name__, e))
+            finally:
+                job["done"] = True
+
+        threading.Thread(target=_fly_body, name="breach-flight", daemon=True).start()
         st.rerun()
 
-if _fst.get("log"):
+if _flying:
+    st.caption("Flight output, live - `%d` candidate(s) so far." % len(
+        breach.trace_read(limit=400, since=int(_fly.get("since0") or 0),
+                          skip=("page", "control"))))
+    _flive = st.empty()
+    try:
+        _flive.code(breach.trace_text(limit=16, since=int(_fly.get("since0") or 0),
+                                      skip=("page", "control")), language="text")
+    except Exception:
+        pass
+elif _fst.get("log"):
     with st.expander("Test flight output (%d kept)" % int(_fst.get("kept") or 0),
                      expanded=False):
-        st.code("\n".join(_fst["log"][-400:]), language="text")
+        st.code(breach.flight_log_text(limit=400), language="text")
 
 # ---- workers, pacing, the draw -------------------------------------------------
 _c1, _c2, _c3 = st.columns(3)
@@ -799,6 +839,11 @@ with _b3:
         except Exception:
             pass
         st.rerun()
+
+# ---- while the flight runs, poll it and keep the page breathing ----------------
+if _flying:
+    time.sleep(0.8)
+    st.rerun()
 # @@END 007 INPUT
 
 # @@BLOCK 008 RUN deps=007
