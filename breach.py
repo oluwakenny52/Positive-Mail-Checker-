@@ -41,26 +41,53 @@ THE TEST FLIGHT IS CELL 2, AND IT IS BREACH-ONLY
     dedupe       BY FULL LINE. `u:p@1.2.3.4:8080` and `v:q@1.2.3.4:8080` are two
                  candidates: the gateway judges the CREDENTIAL, so a dead sub-user
                  must not hide a live one behind the same IP. FLIGHT_MAX (200) is
-                 above the 130 lines a full Webshare import produces, so none is
-                 cut.
+                 above the 140 lines a full Webshare import produces.
     step 1       ipify, 8 s, dead nodes dropped with the REAL reason
     step 2       headless Chromium, FIVE at a time, one isolated context per
                  node, egress IP read inside the context FIRST
-    pass         HTTP 200 AND a JSON object body ({ or [ that json.loads)
+    pass         HTTP 200 AND a JSON body
     log          "    ✅ 200 -> host:port | country | city | egress IP"
                  "    skip  -> host:port | test flight failed (reason) | egress IP"
     save         the survivors, one per line, to proxies_breach.txt
     summary      "[*] Passed test flight (✅ 200) : N" and the file name
 
+TWO CONTEXT PROFILES, AND VANILLA GOES FIRST
+--------------------------------------------
+The Colab that passes 32 of 140 builds a context with a UA, a locale, a viewport
+and a proxy. NOTHING else. Everything added on top of that since - the header
+set, the timezone override, the screen size, the fingerprint patches, the full
+Chromium channel - is a difference from a setup that provably works, and a build
+carrying all of it scored 0 of 140. At least one of those additions is what the
+WAF objects to.
+
+So there are two profiles and they are ordered by evidence, not by taste:
+
+    PROFILE_VANILLA   Colab Cell 3/4 byte for byte - UA, locale, viewport, proxy,
+                      one navigation, no init script, no extra header. A node it
+                      reads is KEPT and the dressed profile never runs.
+    PROFILE_DRESSED   adds CTX_HEADERS, STEALTH_JS, timezone_id, screen, the
+                      desktop device flags and the homepage warm-up. It only gets
+                      a turn on a node vanilla could not read.
+
+The reader alternates them across its three attempts for the same reason. When
+the log shows which profile wins, one of them can go.
+
+CLOUDFLARE DECIDES PER REQUEST, NOT PER IP
+------------------------------------------
+In a 140-node Colab run, 64.137.96.74 passed four times and failed twice and
+104.164.49.38 passed, failed, then passed - about 23% per attempt. So a refusal
+on one attempt says nothing about the node, which is why a refused node gets a
+same-origin in-page fetch and one retry on the same node before it is dropped.
+
 THE DIAGNOSTIC FLIGHT
 ---------------------
 `diagnose=True` (the "Diagnostic flight" switch on the page) turns the flight
 into a transcript instead of a verdict: the node, whether it carries auth, the
-exact target, whether the homepage step ran, the ipify answer with the real
-exception when it fails, then the status, content-type, byte count, the response
-headers that matter (server, cf-ray, www-authenticate, via, x-cache) and the
-first 200 characters of the body. Credentials are never printed - only host:port
-and auth=yes/no.
+profile, the exact target, whether the homepage step ran, the ipify answer with
+the real exception when it fails, then the status, content-type, byte count, the
+response headers that matter (server, cf-ray, www-authenticate, via, x-cache) and
+the first 200 characters of the body. Credentials are never printed - only
+host:port and auth=yes/no.
 
 It closes with a count per outcome and a legend for every code it can emit, so a
 wall of 401s says WHAT a 401 is here instead of just being one. It does not stop
@@ -84,42 +111,12 @@ requested, while ipify through `requests` had just returned 200 on the same
 nodes. `_body_of()` accepts both shapes, the target is always requested, and
 `no_egress` survives only as the label for "no egress IP AND no status either".
 
-THE REQUEST HAS TO LOOK LIKE THE PAGE'S OWN CALL
-------------------------------------------------
-A bare navigation sends no Referer, no Origin and no sec-* headers, and
-/unifiedsearch/ answers exactly that with
-    401 {"message": "You're probably a bot, try the official API instead"}
-which is Cloudflare, not the application - the request never reaches HIBP. The
-site's own call to that path is a same-origin XHR from a page, carrying the Cell 3
-header set. Every context therefore carries CTX_HEADERS (Accept: application/json,
-Accept-Language, Referer and Origin on haveibeenpwned.com, sec-ch-ua*,
-sec-fetch-*), on the flight AND on the reader's slot contexts, because the reader
-walks into the same wall.
-
 THE TARGET TAB STARTS AT THE TARGET
 -----------------------------------
 The egress read happens in its OWN tab of the same context, and that tab is
-closed before the target is touched, so the target page's first navigation is the
-unified URL with an empty history and no cross-site Referer - exactly Cell 4.
-Attempt 1 is one direct navigation. Only a retryable status earns a same-origin
-in-page fetch (the XHR the site itself makes), then one homepage warm-up and one
-second chance on the same node.
-
-THE BROWSER IS MADE TO LOOK LIKE A DESKTOP CHROME
--------------------------------------------------
-Headless Chromium is a fingerprint on its own: navigator.webdriver is true,
-navigator.platform says Linux while the UA says Windows, navigator.plugins is
-empty, WebGL reports a Google software renderer and Notification.permission is
-"denied" instead of "default". Launch carries
---disable-blink-features=AutomationControlled and --lang=en-US, the context is a
-desktop Windows identity (Win32 platform, a 1920x1080 screen behind a 1440x900
-window, 8 cores, 8 GB, no touch, en-US, America/New_York) and STEALTH_JS
-re-declares every property a real Chrome reports. `channel="chromium"` is tried
-first, because the new headless build has a real renderer path; it falls back to
-plain headless once if that build is not installed.
-
-Container necessities stay regardless: --no-sandbox and --disable-dev-shm-usage,
-because Streamlit Cloud is a container.
+closed before the target is touched, so the target page is the FIRST page in the
+context and its first navigation is the unified URL, with an empty history and no
+cross-site Referer. Attempt 1 is one direct navigation.
 
 A GATEWAY THAT FAILS AUTH IS DEAD, NOT LATE
 --------------------------------------------
@@ -157,9 +154,10 @@ slot is launched once per worker for the whole batch, so a 500-item run pays for
 N browsers, not 500.
 
 A slot recycles itself after SLOT_USES_MAX uses, after SLOT_FAILS_MAX failed
-attempts in a row, or when the next attempt wants a different proxy. Recycling is
-local: the item in flight is already recorded, so a wedged page can never lose a
-finished result and can never hold the queue.
+attempts in a row, when the next attempt wants a different proxy, or when the
+next attempt wants the other profile. Recycling is local: the item in flight is
+already recorded, so a wedged page can never lose a finished result and can never
+hold the queue.
 
 THE DRAW IS RANDOM
 ------------------
@@ -238,16 +236,17 @@ KEY_ENV = "HIBP_API_KEY"
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
 
-# Container necessities, plus the two that kill the loudest headless tells. No
-# extension, no persistent profile, no headed window.
-CONTAINER_ARGS = ["--no-sandbox", "--disable-dev-shm-usage",
-                  "--disable-blink-features=AutomationControlled",
-                  "--lang=en-US"]
+# Container necessities only. Colab passes NO launch args at all; these two are
+# the ones Streamlit Cloud cannot do without, because it is a container.
+CONTAINER_ARGS = ["--no-sandbox", "--disable-dev-shm-usage"]
 
-# The Colab Cell 3 header set, on every context. A bare navigation sends none of
-# these and /unifiedsearch/ answers that with the Cloudflare "probably a bot" 401;
-# these are the headers the page's own same-origin call carries, so the request
-# reads as the site asking for its own JSON instead of a stranger arriving.
+# The two context shapes. VANILLA is Colab Cell 3/4 exactly and is tried first.
+PROFILE_VANILLA = "vanilla"
+PROFILE_DRESSED = "dressed"
+PROFILES = (PROFILE_VANILLA, PROFILE_DRESSED)
+
+# Dressed only. A bare navigation sends none of these; whether that helps or
+# hurts is what the profile A/B is for.
 CTX_HEADERS = {
     "Accept": "application/json, text/plain, */*",
     "Accept-Language": "en-US,en;q=0.9",
@@ -262,10 +261,8 @@ CTX_HEADERS = {
     "sec-fetch-site": "same-origin",
 }
 
-# The properties a real desktop Chrome reports and headless does not. Read-only
-# getters on the prototypes, so page JS reads them like any other native value and
-# nothing is left as an own-property tell. The values are consistent with the UA:
-# Windows, a 1080p screen, an Intel GPU, no touch, en-US.
+# Dressed only. Read-only getters on the prototypes, values consistent with the
+# UA: Windows, a 1080p screen, an Intel GPU, no touch, en-US.
 STEALTH_JS = r"""
 (() => {
   const put = (obj, prop, value) => {
@@ -400,7 +397,7 @@ FLIGHT_PROBE = "eddiemurphy@gmail.com"
 FLIGHT_MAX = 200
 FLIGHT_WANT = 12
 FLIGHT_WORKERS = 5
-FLIGHT_BUDGET = 300.0
+FLIGHT_BUDGET = 420.0
 FLIGHT_TIMEOUT = 35000
 FLIGHT_GEO_URL = "http://ip-api.com/json/"
 FLIGHT_GEO_TIMEOUT = 8.0
@@ -420,6 +417,8 @@ DIAG_HEADERS = ("server", "cf-ray", "www-authenticate", "proxy-authenticate",
 # Every outcome the diagnostic summary can print, in report order.
 OUTCOMES = (
     ("200", "read - JSON body accepted, node KEPT"),
+    ("vanilla_ok", "read with the exact Colab context - node KEPT"),
+    ("dressed_ok", "read only with the dressed context - node KEPT"),
     ("404", "endpoint answered not-found - a readable zero for that address"),
     ("401", "rejected / challenged by the target WAF - nothing readable"),
     ("403", "forbidden or blocked by the WAF"),
@@ -483,10 +482,6 @@ _pw_lock = threading.Lock()
 _pw_thread = None
 _pw_state = {"state": "unknown", "error": "", "started": 0.0, "finished": 0.0}
 _pw_missing = ""
-
-# Set once if the new headless build is not installed, so a 130-node flight does
-# not pay a failed launch on every single node.
-_no_channel = [False]
 
 _trace_lock = threading.Lock()
 _trace_file_lock = threading.Lock()
@@ -966,11 +961,21 @@ def _plain(s) -> str:
 
 
 def _json_of(body):
+    """A JSON OBJECT body, or None. The reader needs a dict."""
     try:
         got = json.loads(str(body or "").strip())
     except Exception:
         return None
     return got if isinstance(got, dict) else None
+
+
+def _json_any(body):
+    """A JSON object OR array body, or None. The flight only needs "it parsed"."""
+    try:
+        got = json.loads(str(body or "").strip())
+    except Exception:
+        return None
+    return got if isinstance(got, (dict, list)) else None
 
 
 def _snippet(body, n=None):
@@ -1420,7 +1425,7 @@ def _candidates(log=None):
     Dedupe is by FULL LINE: `u:p@1.2.3.4:8080` and `v:q@1.2.3.4:8080` are two
     candidates, because the gateway judges the CREDENTIAL, so a dead sub-user must
     not hide a live one behind the same IP. Only an exact duplicate line is
-    skipped, and FLIGHT_MAX sits above the 130 lines a full import produces.
+    skipped, and FLIGHT_MAX sits above the 140 lines a full import produces.
     """
     tiers = _meta_tiers()
     own, buried = [], 0
@@ -1500,37 +1505,42 @@ def _ip_of(resp):
         return "-"
 
 
-def _ctx_kw(proxy_line=None) -> dict:
-    """Context kwargs: one desktop Windows identity, and the proxy if there is one.
+def _ctx_kw(proxy_line=None, profile=PROFILE_VANILLA) -> dict:
+    """Context kwargs for one profile, plus the proxy when there is one.
 
-    Shared by the flight and the reader's slots so both walk through the WAF the
-    same way. A navigation without Referer/Origin is exactly what the 401 body
-    calls "probably a bot"; a Linux platform under a Windows UA is the next tell.
+    VANILLA is the Colab context and nothing more: UA, locale, viewport. DRESSED
+    adds the header set and the desktop emulation. The reader alternates the two
+    and the flight tries vanilla first, so a build can never be slower-but-worse
+    than the Colab it replaces.
     """
     kw = {"user_agent": UA, "locale": "en-US",
-          "timezone_id": "America/New_York",
-          "viewport": {"width": 1440, "height": 900},
-          "screen": {"width": 1920, "height": 1080},
-          "device_scale_factor": 1, "is_mobile": False, "has_touch": False,
-          "color_scheme": "light",
-          "extra_http_headers": dict(CTX_HEADERS)}
+          "viewport": {"width": 1440, "height": 900}}
+    if profile == PROFILE_DRESSED:
+        kw["timezone_id"] = "America/New_York"
+        kw["screen"] = {"width": 1920, "height": 1080}
+        kw["device_scale_factor"] = 1
+        kw["is_mobile"] = False
+        kw["has_touch"] = False
+        kw["color_scheme"] = "light"
+        kw["extra_http_headers"] = dict(CTX_HEADERS)
     cfg = _proxy_cfg(proxy_line) if proxy_line else None
     if cfg:
         kw["proxy"] = cfg
     return kw
 
 
-def _new_context(b, proxy_line=None):
-    """A context with the desktop identity and STEALTH_JS already installed.
+def _new_context(b, proxy_line=None, profile=PROFILE_VANILLA):
+    """A context in the requested profile. STEALTH_JS is dressed-only.
 
     The init script runs before any document, so the first page never sees an
-    unpatched Navigator even for a frame.
+    unpatched Navigator even for a frame - in the profile that carries it.
     """
-    ctx = b.new_context(**_ctx_kw(proxy_line))
-    try:
-        ctx.add_init_script(STEALTH_JS)
-    except Exception:
-        pass
+    ctx = b.new_context(**_ctx_kw(proxy_line, profile))
+    if profile == PROFILE_DRESSED:
+        try:
+            ctx.add_init_script(STEALTH_JS)
+        except Exception:
+            pass
     return ctx
 
 
@@ -1597,16 +1607,17 @@ def _inpage_fetch(page, addr):
     return status, payload
 
 
-def _flight_one(line, diag=False, log=None):
-    """One node through a headless context dressed as a desktop Chrome.
+def _flight_one(line, diag=False, log=None, profile=PROFILE_VANILLA):
+    """One node, one context, one profile.
 
     -> dict(ok, reason, bucket, ip, status, ctype, size, headers, snippet,
-            home). The target tab's FIRST navigation is the target: the egress
-    read happens in its own tab and that tab is closed first, so the history is
-    empty and the Referer is not a cross-site one - Cell 4 exactly.
+            home). The target page is the FIRST page in the context and its first
+    navigation is the target: the egress read lives in a second tab that is
+    closed first, so the history is empty and the Referer is not a cross-site one.
 
-    Attempt 1 is one direct navigation. Only a retryable status earns a
-    same-origin in-page fetch, then one homepage warm-up and one second chance.
+    PROFILE_VANILLA is the Colab call exactly. Only a retryable status earns a
+    same-origin in-page fetch, and the homepage warm-up is dressed-only, so a
+    vanilla attempt 1 stays byte for byte the Colab request.
 
     The egress IP is INFORMATIONAL: a failed read never drops the node, because
     the target itself is the verdict. Credentials are never printed, only
@@ -1614,17 +1625,19 @@ def _flight_one(line, diag=False, log=None):
     """
     ctx = None
     out = {"ok": False, "reason": "", "bucket": "other", "ip": "-", "status": 0,
-           "ctype": "-", "size": 0, "headers": "-", "snippet": "", "home": False}
+           "ctype": "-", "size": 0, "headers": "-", "snippet": "", "home": False,
+           "profile": profile}
     short = line.rsplit("@", 1)[-1]
     try:
         b = _browser()
-        ctx = _new_context(b, line)
+        ctx = _new_context(b, line, profile)
         page = ctx.new_page()
         page.set_default_timeout(FLIGHT_TIMEOUT)
         if diag:
-            _say(log, "    send -> %s | auth=%s | target %s | home=retry-only"
+            _say(log, "    send -> %s | auth=%s | target %s | profile=%s | home=%s"
                  % (short, "yes" if "@" in line else "no",
-                    unified_url(FLIGHT_PROBE)))
+                    unified_url(FLIGHT_PROBE), profile,
+                    "retry-only" if profile == PROFILE_DRESSED else "none"))
         # Egress read in its OWN tab, so the target tab stays a clean first
         # navigation. Same context, so it still proves the proxy is carried.
         try:
@@ -1674,7 +1687,8 @@ def _flight_one(line, diag=False, log=None):
                 if out["snippet"]:
                     _say(log, "        body: %s" % out["snippet"])
             if out["status"] == 200:
-                if isinstance(_json_of(body), dict):
+                # Colab's own test: the body starts with { or [ and json.loads.
+                if _json_any(body) is not None:
                     out["ok"] = True
                     out["reason"] = "200"
                     out["bucket"] = "200"
@@ -1700,7 +1714,7 @@ def _flight_one(line, diag=False, log=None):
                 return out
             # The same-origin XHR the site's own page makes. It carries Origin,
             # a same-origin Referer and sec-fetch-mode: cors, which is what the
-            # WAF is actually judging - the document navigation is not.
+            # WAF is judging - the document navigation is not.
             page.wait_for_timeout(400)
             got, payload = _inpage_fetch(page, FLIGHT_PROBE)
             if isinstance(payload, dict):
@@ -1716,7 +1730,7 @@ def _flight_one(line, diag=False, log=None):
                 if diag:
                     _say(log, "      <- in-page %s after the %s"
                          % (got, out["status"] or "?"))
-            if attempt == 1:
+            if attempt == 1 and profile == PROFILE_DRESSED:
                 try:
                     home = page.goto(HIBP_BASE + "/", wait_until="domcontentloaded",
                                      timeout=FLIGHT_TIMEOUT)
@@ -1798,16 +1812,34 @@ def _flight_browser(alive, cancel=None, log=None, pin="", diag=False, codes=None
         with own:
             if not diag and len(kept) >= FLIGHT_WANT:
                 return
-        res = _flight_one(line, diag, log)
+        # Vanilla first - the Colab shape. A node it reads is kept and the dressed
+        # profile is never spent on it.
+        res = _flight_one(line, diag, log, PROFILE_VANILLA)
+        prof = PROFILE_VANILLA
+        if not res.get("ok"):
+            alt = _flight_one(line, diag, log, PROFILE_DRESSED)
+            if alt.get("ok"):
+                res, prof = alt, PROFILE_DRESSED
+                _say(log, "    ~ dressed -> %s | vanilla was refused, dressed read it"
+                     % short)
+            else:
+                _say(log, "    ~ dressed -> %s | also %s"
+                     % (short, alt.get("reason") or "?"))
+                if not res.get("ip") and alt.get("ip"):
+                    res["ip"] = alt["ip"]
         if codes is not None:
-            _bump(codes, res.get("bucket") or "other", lock)
+            if res.get("ok"):
+                _bump(codes, ("vanilla_ok" if prof == PROFILE_VANILLA
+                              else "dressed_ok"), lock)
+            else:
+                _bump(codes, res.get("bucket") or "other", lock)
         if res.get("ok"):
             country, city = _flight_geo(line)
             tag = " [OXYLABS CURRENT]" if "oxylabs.io" in line else ""
             with own:
                 kept.append(line)
-            _say(log, "    ✅ 200 -> %-22s | %-16s | %s%s | egress %s"
-                 % (short, country, city, tag, res.get("ip")))
+            _say(log, "    ✅ 200 -> %-22s | %-16s | %s%s | egress %s | %s"
+                 % (short, country, city, tag, res.get("ip"), prof))
         else:
             _say(log, "    skip  -> %-22s | test flight failed (%s) | egress %s"
                  % (short, res.get("reason") or "?", res.get("ip")))
@@ -1915,6 +1947,7 @@ def flight(force=False, cancel=None, diagnose=False) -> dict:
         _say(log, "   AUTO LIVE PROXIES + PLAYWRIGHT TEST FLIGHT%s"
              % ("  [DIAGNOSTIC]" if diag else ""))
         _say(log, "   Test email: %s" % FLIGHT_PROBE)
+        _say(log, "   Profile order: vanilla (Colab exact), then dressed")
         _say(log, "=" * 62)
         if not available():
             st["error"] = "browser not ready - %s" % browser_note()
@@ -2247,19 +2280,8 @@ def _browser():
     if pw is None:
         pw = sync_playwright().start()
         _tls.pw = pw
-    # The new headless build carries a real renderer path; the old headless shell
-    # reports SwiftShader and is easier to score. Try the former once, then stop
-    # trying so a 130-node flight does not pay a failed launch per node.
-    if not _no_channel[0]:
-        try:
-            b = pw.chromium.launch(headless=True, channel="chromium",
-                                   args=CONTAINER_ARGS)
-            _tls.browser = b
-            return b
-        except Exception as exc:
-            _no_channel[0] = True
-            trace("WARN", "browser", "chromium channel unavailable (%s) - plain "
-                  "headless from here" % type(exc).__name__)
+    # Plain launch, no channel: Colab calls chromium.launch(headless=True) with no
+    # channel, so the headless shell is the build that produced the 200s.
     b = pw.chromium.launch(headless=True, args=CONTAINER_ARGS)
     _tls.browser = b
     return b
@@ -2283,12 +2305,13 @@ def _close_thread_browser():
 
 
 class _Slot:
-    __slots__ = ("ctx", "page", "proxy", "uses", "fails")
+    __slots__ = ("ctx", "page", "proxy", "prof", "uses", "fails")
 
     def __init__(self):
         self.ctx = None
         self.page = None
         self.proxy = ""
+        self.prof = PROFILE_VANILLA
         self.uses = 0
         self.fails = 0
 
@@ -2301,17 +2324,19 @@ class _Slot:
         self.ctx = None
         self.page = None
         self.proxy = ""
+        self.prof = PROFILE_VANILLA
         self.uses = 0
         self.fails = 0
 
-    def open_ctx(self, proxy_line):
+    def open_ctx(self, proxy_line, profile=PROFILE_VANILLA):
         self.close_ctx()
         b = _browser()
-        ctx = _new_context(b, proxy_line)
+        ctx = _new_context(b, proxy_line, profile)
         ctx.set_default_timeout(NAV_TIMEOUT)
         self.ctx = ctx
         self.page = ctx.new_page()
         self.proxy = proxy_line or ""
+        self.prof = profile
 
     def reset(self):
         if self.page is not None and not self.page.is_closed():
@@ -2322,23 +2347,23 @@ class _Slot:
         except Exception:
             pass
 
-    def get(self, proxy_line):
+    def get(self, proxy_line, profile=PROFILE_VANILLA):
         try:
             if self.ctx is None or self.page is None:
-                self.open_ctx(proxy_line)
+                self.open_ctx(proxy_line, profile)
             elif self.uses >= SLOT_USES_MAX:
                 trace("INFO", "slot", "recycling after %d use(s)" % self.uses)
-                self.open_ctx(proxy_line)
-            elif (proxy_line or "") != self.proxy:
-                self.open_ctx(proxy_line)
+                self.open_ctx(proxy_line, profile)
+            elif (proxy_line or "") != self.proxy or profile != self.prof:
+                self.open_ctx(proxy_line, profile)
             elif self.page.is_closed():
-                self.open_ctx(proxy_line)
+                self.open_ctx(proxy_line, profile)
             else:
                 self.reset()
         except Exception as exc:
             trace("WARN", "slot", "reopen after %s" % type(exc).__name__)
             self.close_ctx()
-            self.open_ctx(proxy_line)
+            self.open_ctx(proxy_line, profile)
         return self.page
 
     def ok(self):
@@ -2372,12 +2397,12 @@ def _close_all_slots():
         s.close_ctx()
 
 
-def _attempt(addr, proxy_line):
+def _attempt(addr, proxy_line, profile=PROFILE_VANILLA):
     label = (proxy_line.rsplit("@", 1)[-1] if proxy_line else "DIRECT")
     url = unified_url(addr)
     slot = _slot()
     try:
-        page = slot.get(proxy_line)
+        page = slot.get(proxy_line, profile)
     except Exception as exc:
         trace("ERR", "fetch", "no page via %s: %s" % (label, type(exc).__name__), addr)
         return 0, None
@@ -2434,14 +2459,17 @@ def _search_address(addr, cancel=None):
     seen = []
     errors = []
     used = set()
-    for _ in range(PROXY_TRIES):
+    # Alternate the profiles: vanilla is the shape that reads, dressed is the
+    # fallback for a node vanilla refuses.
+    shapes = (PROFILE_VANILLA, PROFILE_DRESSED, PROFILE_VANILLA)
+    for n in range(PROXY_TRIES):
         if _is_cancelled(cancel):
             return None, "", "cancelled", seen
         line = _pick_proxy(used)
         if line is None:
             break
         used.add(line)
-        status, payload = _attempt(addr, line)
+        status, payload = _attempt(addr, line, shapes[n % len(shapes)])
         label = line.rsplit("@", 1)[-1]
         seen.append(status)
         if payload is not None:
@@ -2464,7 +2492,7 @@ def _search_address(addr, cancel=None):
             return got, "KEY", "", seen
         errors.append("KEY: failed")
 
-    status, payload = _attempt(addr, None)
+    status, payload = _attempt(addr, None, PROFILE_VANILLA)
     seen.append(status)
     if payload is not None:
         return payload, "DIRECT", "", seen
@@ -3084,14 +3112,15 @@ def selftest(verbose=False) -> bool:
         HIBP_BASE + "/api/v3/breachedaccount/a%40b.co?truncateResponse=false")
     add("api_lookup_callable", callable(_api_lookup))
     add("container_args", "--no-sandbox" in CONTAINER_ARGS)
-    add("container_args_automation",
-        "--disable-blink-features=AutomationControlled" in CONTAINER_ARGS)
+    add("container_args_slim", len(CONTAINER_ARGS) == 2)
     add("hostport", _hostport("u:p@1.2.3.4:8080") == "1.2.3.4:8080")
     add("hostport_bad", _hostport("nope") == "")
 
     # ---- the diagnostic plumbing ----
     add("outcomes_have_200", "200" in [k for k, _m in OUTCOMES])
     add("outcomes_have_ipify_fail", "ipify_fail" in [k for k, _m in OUTCOMES])
+    add("outcomes_have_profiles", "vanilla_ok" in dict(OUTCOMES)
+        and "dressed_ok" in dict(OUTCOMES))
     add("no_egress_is_informational", "no status" in dict(OUTCOMES)["no_egress"])
     add("bucket_200", _bucket(200) == "200")
     add("bucket_401", _bucket(401, "status 401") == "401")
@@ -3127,27 +3156,47 @@ def selftest(verbose=False) -> bool:
     add("ip_of_raises", _ip_of(_Boom()) == "-")
     add("ip_of_none", _ip_of(None) == "-")
     add("ip_of_non_json", _ip_of(type("R", (), {"text": "hello"})()) == "-")
+    add("json_any_dict", _json_any('{"a": 1}') == {"a": 1})
+    add("json_any_list", _json_any("[1, 2]") == [1, 2])
+    add("json_any_junk", _json_any("hello") is None)
+    add("json_of_list_is_none", _json_of("[1]") is None)
 
-    # ---- the context identity, the patches, and the gateway skip rule ----
+    # ---- the profiles: vanilla is Colab-exact, dressed carries the extras ----
+    add("profile_consts", PROFILE_VANILLA == "vanilla"
+        and PROFILE_DRESSED == "dressed")
+    add("ctx_vanilla_no_headers", "extra_http_headers" not in _ctx_kw(None))
+    add("ctx_vanilla_no_tz", "timezone_id" not in _ctx_kw(None))
+    add("ctx_vanilla_no_screen", "screen" not in _ctx_kw(None))
+    add("ctx_vanilla_no_device", "is_mobile" not in _ctx_kw(None))
+    add("ctx_vanilla_ua", _ctx_kw(None).get("user_agent") == UA)
+    add("ctx_vanilla_locale", _ctx_kw(None).get("locale") == "en-US")
+    add("ctx_vanilla_viewport", (_ctx_kw(None).get("viewport") or {}).get("width")
+        == 1440)
+    add("ctx_dressed_headers", "extra_http_headers" in _ctx_kw(None, PROFILE_DRESSED))
+    add("ctx_dressed_tz", _ctx_kw(None, PROFILE_DRESSED).get("timezone_id")
+        == "America/New_York")
+    add("ctx_dressed_screen", (_ctx_kw(None, PROFILE_DRESSED).get("screen") or {})
+        .get("width") == 1920)
+    add("ctx_dressed_not_mobile", _ctx_kw(None, PROFILE_DRESSED).get("is_mobile")
+        is False)
+    add("ctx_dressed_no_touch", _ctx_kw(None, PROFILE_DRESSED).get("has_touch")
+        is False)
+    add("ctx_headers_copied", _ctx_kw(None, PROFILE_DRESSED)["extra_http_headers"]
+        is not CTX_HEADERS)
     add("ctx_headers_referer", CTX_HEADERS.get("Referer") == HIBP_BASE + "/")
     add("ctx_headers_origin", CTX_HEADERS.get("Origin") == HIBP_BASE)
     add("ctx_headers_sec_fetch", "sec-fetch-site" in CTX_HEADERS)
-    add("ctx_headers_on_context", "extra_http_headers" in _ctx_kw(None))
-    add("ctx_headers_copied", _ctx_kw(None)["extra_http_headers"] is not CTX_HEADERS)
     add("ctx_kw_proxy", (_ctx_kw("u:p@1.2.3.4:8080").get("proxy") or {}).get("server")
         == "http://1.2.3.4:8080")
     add("ctx_kw_direct_no_proxy", "proxy" not in _ctx_kw(None))
-    add("ctx_kw_ua", _ctx_kw(None).get("user_agent") == UA)
-    add("ctx_kw_timezone", _ctx_kw(None).get("timezone_id") == "America/New_York")
-    add("ctx_kw_not_mobile", _ctx_kw(None).get("is_mobile") is False)
-    add("ctx_kw_no_touch", _ctx_kw(None).get("has_touch") is False)
-    add("ctx_kw_screen", (_ctx_kw(None).get("screen") or {}).get("width") == 1920)
     add("stealth_webdriver", "webdriver" in STEALTH_JS)
     add("stealth_platform", "'Win32'" in STEALTH_JS)
     add("stealth_plugins", "PDF Viewer" in STEALTH_JS)
     add("stealth_webgl", "37446" in STEALTH_JS)
     add("stealth_no_angle", "\x3c" not in STEALTH_JS)
     add("new_context_callable", callable(_new_context))
+    add("flight_one_takes_profile", "profile" in inspect_sig(_flight_one))
+    add("slot_has_prof", "prof" in _Slot.__slots__)
     add("gateway_dead_407", _gateway_dead("ProxyError: Tunnel connection failed: "
                                           "407 Unauthorized"))
     add("gateway_dead_word", _gateway_dead("Tunnel connection failed: Unauthorized"))
@@ -3261,7 +3310,7 @@ def selftest(verbose=False) -> bool:
     add("flight_timeout_35s", FLIGHT_TIMEOUT == 35000)
     add("flight_probe_is_email", is_email(FLIGHT_PROBE))
     add("flight_pool_only", FLIGHT_POOL == "proxies_breach.txt")
-    add("flight_cap_above_130", FLIGHT_MAX >= 130)
+    add("flight_cap_above_130", FLIGHT_MAX >= 140)
     add("fetch_js", "fetch(" in FETCH_JS and "credentials" in FETCH_JS)
     add("flight_geo_helper", callable(_flight_geo))
     add("flight_log_helper", "no test flight" in flight_log_text())
