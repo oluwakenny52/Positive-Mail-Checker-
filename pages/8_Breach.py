@@ -1,4 +1,5 @@
 # @@FILE pages/8_Breach.py blocks=12 version=v13.86
+# @@FILE pages/8_Breach.py blocks=12 version=v13.86
 # @@BLOCK 000 FILE_HEADER deps=-
 """
 pages/8_Breach.py - breach exposure and combo freshness  (v13.86)
@@ -8,12 +9,33 @@ rather than count.
 
 WHAT CHANGED IN THIS PASS
 -------------------------
-The address half is a real Chromium page again, but through the app's OWN proxy
-pool - no key, no HTTP 401 wall, no persistent profile to go stale. Password-only
-and address-only lines are first class. The controls that only existed for the old
-capture pipeline are gone (Browser pages, Ignore cache, Browser fallback, capture
-mode), and the cache and the history have their own monitor and clear buttons on
-this page and in the app's Resources panel.
+Four defects, all reported from real runs:
+
+  1. A 401 was being reported as a CLEAN address. The endpoint answers a real
+     Chromium navigation with 200 on the same nodes the app was getting 401
+     from, so the header set that was being forced onto the NAVIGATION is gone,
+     and a refused attempt is now re-asked once from INSIDE the page with a
+     same-origin fetch() - the call the site itself makes. Only a 404 is a
+     readable zero any more.
+  2. A combo was graded on its password alone. When the address half could not
+     be read the combo read as PARTIAL off the password and said "no breach
+     record - the source was read and lists none", which was not true. A combo
+     whose address half is UNREAD is now UNKNOWN; the password band is still
+     shown beside it but no longer decides the grade. Password-only lines are
+     unaffected - there, the password IS the question.
+  3. Nothing ever proved the pool against this endpoint. The Colab's second cell
+     did, and that is now here: a test flight fetches Webshare and Oxylabs, drops
+     the dead nodes on ipify, proves the rest in Chromium against the unified
+     endpoint, and keeps only the survivors. It runs by itself when the flight
+     pool is missing or stale, and can be run by hand.
+  4. The record never carried its password, so the card could only show an
+     address. It does now, so the card, the CSV and the rotate export show the
+     combo that was actually checked.
+
+THE ADDRESS HALF IS A REAL PAGE
+-------------------------------
+Through the app's OWN proxy pool - no key, no persistent profile to go stale.
+Password-only and address-only lines are first class.
 
 PAGES FOLLOW WORKERS
 --------------------
@@ -57,7 +79,8 @@ WHAT LEAVES THE BOX
 Only the ADDRESS. A pasted `email:password` is cut at the colon before the URL
 is built, so the password never reaches haveibeenpwned.com - which would not use
 it anyway. The password goes to exactly one place: the SHA-1 hash for Pwned
-Passwords, where 5 of the 40 characters leave and 35 are matched locally.
+Passwords, where 5 of the 40 characters leave and 35 are matched locally. The
+plaintext is kept LOCALLY on the record so the card can show the combo.
 
 THE BANDS
 ---------
@@ -65,7 +88,7 @@ THE BANDS
   PARTIAL   password already circulating, or exposure inside 730 days
   OLD       password public for years, or only old breaches
   CLEAN     password unseen and the address in no readable source
-  UNKNOWN   nothing readable - the only honest answer when every attempt failed
+  UNKNOWN   nothing readable, or a combo whose address half was never read
 
 THE RUN DOES NOT RUN IN THE SCRIPT
 ----------------------------------
@@ -83,14 +106,16 @@ in the CSV and counted in the run summary.
 
 ISOLATION
 ---------
-The cache, the history and the trace resolve through the pinned owner, which is
-the unlocked hash, so each is one file per user. The proxy pool is the owner's
-own proxies.txt.
+The cache, the history, the trace and the flight all resolve through the pinned
+owner, which is the unlocked hash, so each is one file per user. The proxy pool
+is the owner's own proxies.txt, and the flight writes its survivors to the
+owner's own proxies_breach.txt.
 
-Read-only except Run / Stop / Prepare browser / Clear cache / Clear history /
-Clear trace / downloads.
+Read-only except Run / Stop / Prepare browser / Test flight / Clear cache /
+Clear history / Clear trace / downloads.
 """
 
+import hashlib
 import importlib
 import json
 import os
@@ -230,16 +255,18 @@ import breach
 
 # ---- stale-module guard -------------------------------------------------------
 # Every marker is a capability this page calls. A module missing one predates it
-# and is replaced before anything touches it. `_zero_rule` and `PROXY_TRIES` are
-# the Colab-rule markers: a module without them still treated a 401 as UNREAD and
-# still waited on a Turnstile widget, so it has to go.
+# and is replaced before anything touches it. `_zero_rule`, PROXY_TRIES and the
+# flight markers belong to the 401 fix and the test flight: a module without them
+# still reported a 401 as CLEAN and still ran an unproven pool, so it has to go.
 if not (hasattr(breach, "parse_lines") and hasattr(breach, "pool_lines")
         and hasattr(breach, "check_item") and hasattr(breach, "clear_cache")
         and hasattr(breach, "cache_stats") and hasattr(breach, "record_view")
         and hasattr(breach, "set_owner") and hasattr(breach, "_Slot")
         and hasattr(breach, "rotating") and hasattr(breach, "_zero_rule")
         and hasattr(breach, "PROXY_TRIES") and hasattr(breach, "catalogue")
-        and hasattr(breach, "_cat_rows") and hasattr(breach, "catalogue_state")):
+        and hasattr(breach, "_cat_rows") and hasattr(breach, "catalogue_state")
+        and hasattr(breach, "flight") and hasattr(breach, "flight_state")
+        and hasattr(breach, "RETRY_STATUS") and hasattr(breach, "POOL_TTL")):
     breach = importlib.reload(breach)
     try:
         breach.trace("INFO", "page", "stale breach module replaced by reload")
@@ -426,8 +453,14 @@ def _band_counts(rows):
 
 
 def _row_key(r):
+    """A stable, unique widget key. The password is part of it, or two combos on
+    one address would share every widget key on the page."""
     seed = r.get("email") or r.get("password_check", {}).get("sha1") or "row"
-    return (re.sub(r"[^a-z0-9]+", "_", str(seed).lower()).strip("_")[:48] or "row")
+    if r.get("password"):
+        seed = "%s|%s" % (seed, r.get("password"))
+    base = re.sub(r"[^a-z0-9]+", "_", str(seed).lower()).strip("_")[:40] or "row"
+    tail = hashlib.sha1(str(seed).encode("utf-8")).hexdigest()[:8]
+    return "%s_%s" % (base, tail)
 
 
 def _h_esc(v):
@@ -436,9 +469,36 @@ def _h_esc(v):
 
 
 def _label(r):
+    """What the card is about: the combo exactly as it was checked."""
     if r.get("kind") == "password":
         return "password only"
-    return str(r.get("email") or "?")
+    em = str(r.get("email") or "?")
+    pw = str(r.get("password") or "")
+    return "%s:%s" % (em, pw) if pw else em
+
+
+def _combo_line(r):
+    """One pasteable line for the rotate export."""
+    if r.get("kind") == "password":
+        return "pw:%s" % (r.get("password") or "")
+    em = str(r.get("email") or "")
+    pw = str(r.get("password") or "")
+    return "%s:%s" % (em, pw) if pw else em
+
+
+def _ago(sec):
+    """Seconds -> a short age. Never raises, never negative."""
+    try:
+        s = int(sec if sec is not None else -1)
+    except Exception:
+        s = -1
+    if s < 0:
+        return "never"
+    if s < 90:
+        return "%d s" % s
+    if s < 5400:
+        return "%d min" % (s // 60)
+    return "%d h" % (s // 3600)
 
 
 def _record_page(r):
@@ -458,10 +518,10 @@ def _record_page(r):
 
 
 def _csv(rows):
-    head = ("verdict,kind,email,pwned,breaches,pastes,pw_count,pw_hits,corpora,"
-            "sites,stealer,sensitive,earliest_breach,latest_breach,total_exposed,"
-            "breach_names,data_classes,paste_titles,via,via_proxy,reason,error,"
-            "checked_at,read,partial")
+    head = ("verdict,kind,email,password,pwned,breaches,pastes,pw_count,pw_hits,"
+            "corpora,sites,stealer,sensitive,earliest_breach,latest_breach,"
+            "total_exposed,breach_names,data_classes,paste_titles,via,via_proxy,"
+            "reason,error,checked_at,read,partial")
     out = [head]
     for r in rows:
         bs = r.get("breaches") or []
@@ -470,6 +530,7 @@ def _csv(rows):
             str(r.get("verdict") or ""),
             str(r.get("kind") or ""),
             str(r.get("email") or ""),
+            '"%s"' % str(r.get("password") or "").replace('"', "'"),
             "yes" if r.get("pwned") else "no",
             str(len(bs)),
             str(len(ps)),
@@ -588,7 +649,8 @@ else:
 st.caption("Only the address is sent to haveibeenpwned.com - a pasted `email:password` "
            "is cut at the colon before the request is built. The password only ever "
            "goes to the Pwned Passwords hash check, and 5 of its 40 hash characters "
-           "leave the box.")
+           "leave the box. The plaintext stays on the record so the card can show the "
+           "combo it came from.")
 
 # ---- the browser, and its state ------------------------------------------------
 _bst = breach.browser_state()
@@ -621,16 +683,44 @@ with _bst2:
             breach.ensure_browser(force=True)
             st.rerun()
 
-# ---- the proxy pool the address half will use ----------------------------------
+# ---- the pool, and the test flight that proves it ------------------------------
+_fst = breach.flight_state()
 _pstat = breach.pool_status()
 if _pstat["count"]:
-    st.caption("\U0001f310 **%d** proxy node(s) loaded from your own pool - probed "
-               "nodes first, DIRECT as the last attempt. Sample: `%s`"
-               % (_pstat["count"], ", ".join(p.rsplit("@", 1)[-1]
-                                             for p in _pstat["sample"])))
+    st.caption("\U0001f310 **%d** proxy node(s) loaded%s - probed nodes first, DIRECT "
+               "as the last attempt. Sample: `%s`"
+               % (_pstat["count"],
+                  " from your test flight" if _pstat.get("flight") else " from your pool",
+                  ", ".join(p.rsplit("@", 1)[-1] for p in _pstat["sample"])))
 else:
     st.warning("\U0001f310 **Your proxy pool is empty.** The address half will try "
-               "DIRECT only. Fetch a pool on the checker page first, or import a list.")
+               "DIRECT only. Run the test flight, or import a list on the checker page.")
+
+_f1, _f2 = st.columns([0.72, 0.28])
+with _f1:
+    if _fst.get("busy"):
+        st.caption("\u2708 **Test flight running** - fetching candidates and proving "
+                   "each one in Chromium. The run waits for it.")
+    elif _fst.get("ts"):
+        st.caption("\u2708 Last test flight %s ago: **%d** candidate(s), **%d** kept. "
+                   "Only kept nodes are drawn."
+                   % (_ago(_fst.get("age")), int(_fst.get("candidates") or 0),
+                      int(_fst.get("kept") or 0))
+                   + ((" Error: `%s`" % _fst["error"]) if _fst.get("error") else ""))
+    else:
+        st.caption("\u2708 No test flight yet. One runs by itself before a run whenever "
+                   "the flight pool is missing or older than **%d minutes** - so the "
+                   "run never draws from a pool nobody has proved."
+                   % max(1, int(breach.POOL_TTL // 60)))
+with _f2:
+    if st.button("\u2708 Run test flight", width="stretch",
+                 disabled=bool(_fst.get("busy")),
+                 help="Fetches Webshare + Oxylabs, drops the dead nodes on ipify, then "
+                      "proves the rest in Chromium against this exact endpoint. Only "
+                      "the survivors are written and used."):
+        breach.trace("CLICK", "flight", "pressed by the page")
+        breach.flight(force=True)
+        st.rerun()
 
 # ---- workers, pacing, the draw -------------------------------------------------
 _c1, _c2, _c3 = st.columns(3)
@@ -879,16 +969,16 @@ if _rows:
     _unread_rows = [r for r in _rows
                     if not r.get("read") and r.get("kind") != "password"]
     if _unread_rows:
-        st.caption("\u26a0 **%d of %d address half(s) were never read.** Proxy and "
-                   "direct both failed on them, so the verdict rests on the password "
-                   "half alone."
+        st.caption("\u26a0 **%d of %d address half(s) were never read.** Every attempt "
+                   "on them was refused, so they are UNKNOWN - a password alone does "
+                   "not grade a combo. Re-run them; a fresh node is drawn each time."
                    % (len(_unread_rows), len(_rows)))
     _dom_rows = [r for r in _rows if r.get("partial_read")]
     if _dom_rows:
         st.caption("\U0001f4da **%d of %d were matched by DOMAIN**, not by the exact "
-                   "address - the exact search was refused (401/404) and the "
-                   "catalogue answered instead. The breach list is real for the "
-                   "domain; this mailbox is not individually confirmed."
+                   "address - the exact search was refused and the catalogue answered "
+                   "instead. The breach list is real for the domain; this mailbox is "
+                   "not individually confirmed."
                    % (len(_dom_rows), len(_rows)))
     st.bar_chart({"Band": list(_q.get("buckets", {}).keys()),
                   "Count": list(_q.get("buckets", {}).values())},
@@ -941,9 +1031,15 @@ if _rows:
                     % (_BAND_CSS.get(_av, "br-unknown"), _av,
                        _BAND_CSS.get(_pb, "br-unknown"), _pb,
                        _h_esc(r.get("reason") or "")), unsafe_allow_html=True)
-                st.caption("Combo verdict **%s** - the worse of the two halves. "
-                           "Address half: **%s**. Password half: **%s**."
-                           % (_v, _av, _pb))
+                if _v == "UNKNOWN" and _av == "UNREAD" and _pb != "none":
+                    st.caption("Combo verdict **UNKNOWN** - the address half was not "
+                               "read, so the password half does not grade the combo. "
+                               "Address half: **%s**. Password half: **%s**."
+                               % (_av, _pb))
+                else:
+                    st.caption("Combo verdict **%s** - the worse of the two halves. "
+                               "Address half: **%s**. Password half: **%s**."
+                               % (_v, _av, _pb))
                 if r.get("pw_count") is not None:
                     st.caption("Password appears **%s** time(s) in Pwned Passwords."
                                % "{:,}".format(int(r["pw_count"])))
@@ -954,12 +1050,12 @@ if _rows:
                     st.caption("error: %s" % r["error"])
                 if _dom:
                     st.caption("\U0001f4da **Matched by domain** (`%s`) from the "
-                               "catalogue - the exact search was refused (401/404), "
-                               "so this mailbox is not individually confirmed."
+                               "catalogue - the exact search was refused, so this "
+                               "mailbox is not individually confirmed."
                                % (str(r.get("email") or "").rsplit("@", 1)[-1] or "?"))
                 elif not _read and r.get("kind") != "password":
-                    st.caption("\u26a0 **The address half was not read.** Proxy and "
-                               "direct both failed; the counts are unread, not zero.")
+                    st.caption("\u26a0 **The address half was not read.** Every attempt "
+                               "was refused; the counts are unread, not zero.")
                 if _bs:
                     st.markdown("**Breaches on this address** - %d" % len(_bs))
                     for b in _bs[:25]:
@@ -1032,10 +1128,7 @@ if _rows:
     with _d3:
         _bad = [r for r in _rows if r.get("verdict") in ("OLD", "PARTIAL")]
         st.download_button("\u2b07 Download OLD + PARTIAL combos",
-                           data="\n".join(
-                               (("%s:%s" % (r.get("email"), ""))
-                                if r.get("kind") == "password"
-                                else (r.get("email") or "")) for r in _bad).encode(),
+                           data="\n".join(_combo_line(r) for r in _bad).encode(),
                            file_name="breach_rotate_%d.txt" % len(_bad),
                            mime="text/plain", width="stretch", disabled=not _bad)
 # @@END 009 DASHBOARD
