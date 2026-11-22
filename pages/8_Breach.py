@@ -259,7 +259,9 @@ import breach
 # flight markers, flight_log_text and OUTCOMES belong to the 401 fix, the test
 # flight and the diagnostic switch: a module without them still reported a 401 as
 # CLEAN, still ran an unproven pool, still lost the flight's log to an unpinned
-# worker thread, and still had no `diagnose` argument.
+# worker thread, and still had no `diagnose` argument. `_body_of` belongs to the
+# no_egress fix: a module without it reads a Playwright Response with the requests
+# property and drops every node before the target is ever requested.
 if not (hasattr(breach, "parse_lines") and hasattr(breach, "pool_lines")
         and hasattr(breach, "check_item") and hasattr(breach, "clear_cache")
         and hasattr(breach, "cache_stats") and hasattr(breach, "record_view")
@@ -270,7 +272,7 @@ if not (hasattr(breach, "parse_lines") and hasattr(breach, "pool_lines")
         and hasattr(breach, "flight") and hasattr(breach, "flight_state")
         and hasattr(breach, "flight_log_text") and hasattr(breach, "available")
         and hasattr(breach, "OUTCOMES") and hasattr(breach, "RETRY_STATUS")
-        and hasattr(breach, "POOL_TTL")):
+        and hasattr(breach, "POOL_TTL") and hasattr(breach, "_body_of")):
     breach = importlib.reload(breach)
     try:
         breach.trace("INFO", "page", "stale breach module replaced by reload")
@@ -696,11 +698,13 @@ else:
 
 _diag = st.checkbox("\U0001f52c Diagnostic flight", value=False, key=_DIAG_KEY,
                     on_change=_watch(_DIAG_KEY, "diagnostic flight"),
-                    help="Logs the node, auth mode, target, whether the homepage ran, "
-                         "the ipify answer, the status, content-type, byte count, the "
-                         "headers that matter and 200 characters of the body, then a "
-                         "count per code with a legend. Credentials are never printed. "
-                         "Nothing changes about what gets kept - still 200 + JSON only.")
+                    help="Logs the node, auth mode, target, the ipify answer, the "
+                         "status, content-type, byte count, the headers that matter and "
+                         "200 characters of the body, then a count per code with a "
+                         "legend. Attempt 1 goes straight at the endpoint; the homepage "
+                         "is only warmed before the retry. Credentials are never "
+                         "printed. Nothing changes about what gets kept - still 200 + "
+                         "JSON only.")
 
 _f1, _f2 = st.columns([0.72, 0.28])
 with _f1:
