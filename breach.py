@@ -4,7 +4,7 @@ THE FLOW IS THE COLAB FLOW, WITH A SECOND SOURCE BEHIND IT
 ----------------------------------------------------------
 Per item: build the unifiedsearch URL, then up to PROXY_TRIES (3) attempts, each
 one a random live node from the owner's own pool in a real headless Chromium
-with the proxy on the context.
+launched STRAIGHT AT that node, in a browser that is thrown away afterwards.
 
     200 + JSON     parse it, remember the node as via_proxy, stop
     404            the site's own "not in any breach", stop
@@ -27,17 +27,27 @@ dead node. So the flight keeps any node the target ANSWERED (200, 401, 403, 404,
 429) and counts the 200s separately, and the reader does not need a 200 either,
 because a walled address has a second source.
 
+THE PROXY GOES ON THE LAUNCH, NOT THE CONTEXT
+---------------------------------------------
+Colab Cell 4 is `p.chromium.launch(headless=True, proxy=proxy_cfg)` with a fresh
+browser per attempt, closed in `finally`, and that is the shape that produced the
+200s. Playwright cannot put a proxy on a Chromium context natively, so a
+context-level proxy means Playwright runs its own local proxy and points the
+browser at it - an extra local hop and a different connection shape from a
+browser launched straight at the proxy. Both the flight and the reader launch per
+node now. It costs a browser per node and it is the only structural difference
+that was left between this file and the Colab.
+
 THE SAME NODE IS RE-ASKED AS A PLAIN CLIENT
 -------------------------------------------
 The wall is a fingerprint verdict, not an IP verdict: the exit IP is the same
-whether the request came from Chromium or from `requests`, and the two carry a
-different TLS and header shape. A plain HTTP GET from a server therefore answers
-200 with the full JSON on the same nodes that refuse every headless navigation. So
-a node that answers the browser with 401 is re-asked through `requests`, on the
-same proxy, before it is dropped - one request, no navigation, no page. A 200 +
-JSON there is a real read and the node keeps its place. DIRECT is the same call
-without a proxy, and it replaced the browser DIRECT attempt, which was the most
-expensive shape and the one already proven to be refused.
+whether the request came from Chromium or from `requests`. So a node that answers
+the browser with 401 is re-asked through `requests`, on the same proxy, before it
+is dropped - one request, no navigation, no page. A 200 + JSON there is a real
+read and the node keeps its place. It is the THIRD shot, not the first: the
+navigation is the path that produced the 200s. DIRECT is the same call without a
+proxy, and it replaced the browser DIRECT attempt, which was the most expensive
+shape and the one already proven to be refused.
 
 THE SECOND SOURCE IS PER-ADDRESS AND OUTSIDE THE WALL
 -----------------------------------------------------
@@ -77,12 +87,14 @@ band is still shown beside it, but it no longer decides the grade.
 
 THE TEST FLIGHT IS ONE NAVIGATION PER NODE
 ------------------------------------------
-The Colab fired ONE page.goto per candidate and 32 of 141 came back 200. Our
-build was firing about five requests per node - the navigation, an in-page
-re-fetch, a homepage warm-up, a retry, then the whole dressed context again - at
-eleven shared exit IPs. The homepage still answers 200 while /unifiedsearch/
-answers 401 on every node, so the browser and the proxy are both fine: the wall
-had simply been fed too much. The flight is now the Colab call and nothing more.
+The Colab fired ONE page.goto per candidate, in a browser launched against the
+proxy, and 32 of 141 came back 200. Our build was firing about five requests per
+node - the navigation, an in-page re-fetch, a homepage warm-up, a retry, then the
+whole dressed context again - at eleven shared exit IPs, and attaching the proxy
+to the context instead of the launch. The homepage still answers 200 while
+/unifiedsearch/ answers 401 on every node, so the browser and the proxy are both
+fine: the wall had simply been fed too much. The flight is now the Colab call and
+nothing more, including where the proxy is attached.
 
     candidates   the owner's own proxies.txt FIRST, minus everything
                  proxy_meta.json marks dead / auth / timeout; proxies_secret.txt
@@ -93,9 +105,10 @@ had simply been fed too much. The flight is now the Colab call and nothing more.
                  must not hide a live one behind the same IP. FLIGHT_MAX (200) is
                  above the 140 lines a full Webshare import produces.
     step 1       ipify, 8 s, dead nodes dropped with the REAL reason
-    step 2       headless Chromium, TWO at a time, one context per node, ONE
-                 navigation, with a short random jitter before it so two lanes
-                 never land on the same exit IP in the same instant
+    step 2       headless Chromium, TWO at a time, a fresh browser per node with
+                 the proxy on the LAUNCH, ONE navigation, with a short random
+                 jitter before it so two lanes never land on the same exit IP in
+                 the same instant
     carry        the target ANSWERED the node: 200, 404, 401, 403 or 429
     read         200 AND a JSON body - counted separately, and the early stop
                  waits for FLIGHT_READ_WANT of them, never for the first few
@@ -130,12 +143,12 @@ at FLIGHT_WANT, so every node is reported.
 WHY THE EGRESS IP IS LOGGED
 ---------------------------
 ipify in step 1 goes through `requests`, which does use the proxy. The browser
-does not necessarily - and if `proxy` is not carried on the context, every node
+does not necessarily - and if the launch does not carry the proxy, every node
 answers from Streamlit's own address instead of the proxy's, which looks exactly
-like "all 401". So each node reads api.ipify.org FROM INSIDE ITS OWN CONTEXT
-first and the answer is printed beside the verdict. ipify is a different host, so
-it costs the target nothing. If every line shows the same IP, the proxy is not
-being applied and that is the bug, not the endpoint.
+like "all 401". So each node reads api.ipify.org FROM INSIDE ITS OWN BROWSER and
+the answer is printed beside the verdict. ipify is a different host, so it costs
+the target nothing. If every line shows the same IP, the proxy is not being
+applied and that is the bug, not the endpoint.
 
 THE READ IS INFORMATIONAL AND NEVER DROPS A NODE
 ------------------------------------------------
@@ -146,12 +159,13 @@ requested, while ipify through `requests` had just returned 200 on the same
 nodes. `_body_of()` accepts both shapes, the target is always requested, and
 `no_egress` survives only as the label for "no egress IP AND no status either".
 
-THE TARGET TAB STARTS AT THE TARGET
------------------------------------
-The egress read happens in its OWN tab of the same context, and that tab is
-closed before the target is touched, so the target page is the FIRST page in the
-context and its only navigation is the unified URL, with an empty history and no
-cross-site Referer.
+THE TARGET IS THE FIRST NAVIGATION
+----------------------------------
+The Colab navigated the target as the first page in a brand-new context and
+nothing else, so that is reproduced exactly: one browser, one context, the target
+as its only navigation, with an empty history and no cross-site Referer. The
+egress read happens in a SECOND tab AFTER the target, so it can never sit between
+the context and the verdict.
 
 A GATEWAY THAT FAILS AUTH IS DEAD, NOT LATE
 --------------------------------------------
@@ -182,18 +196,15 @@ individual confirmation, and it is never cached as exact. The catalogue is also
 indexed by NAME here, so the XposedOrNot path above can name its breaches with
 the real date, record count and data classes instead of a bare string.
 
-PAGES ARE TIED TO WORKERS
--------------------------
-No page-count control. N workers keep at most N pages, one per worker slot, and
-each slot is REUSED: the same context and page serve item after item, reset to
-about:blank with its cookies cleared between them. The Chromium process behind a
-slot is launched once per worker for the whole batch, so a 500-item run pays for
-N browsers, not 500.
-
-A slot recycles itself after SLOT_USES_MAX uses, after SLOT_FAILS_MAX failed
-attempts in a row, or when the next attempt wants a different proxy. Recycling is
-local: the item in flight is already recorded, so a wedged page can never lose a
-finished result and can never hold the queue.
+A FRESH BROWSER PER NODE
+------------------------
+No page-count control and no reused page. Each attempt launches its own Chromium
+with the proxy attached at the launch, navigates once, and closes the browser in
+a `finally`. That is Cell 4 line for line. The Playwright instance itself is
+started once per worker thread and reused across its nodes, so a 500-item run
+pays for 500 short-lived browsers but only N engine startups. `_Slot` is still
+here and still exercised by the selftest, but the address path no longer depends
+on a page surviving between items.
 
 THE DRAW IS RANDOM, BUT NEVER THE SAME EXIT TWICE
 -------------------------------------------------
@@ -285,9 +296,9 @@ UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
 CONTAINER_ARGS = ["--no-sandbox", "--disable-dev-shm-usage"]
 
 # The context shape that flies. PROFILE_VANILLA is Colab Cell 3/4 exactly - UA,
-# locale, viewport, proxy - and it is what the 32 passes came from. The dressed
-# shape is kept intact behind this one constant because every extra option is a
-# difference from a setup that works; set it to PROFILE_DRESSED to try again.
+# locale, viewport - and it is what the 32 passes came from. The dressed shape is
+# kept intact behind this one constant because every extra option is a difference
+# from a setup that works; set it to PROFILE_DRESSED to try again.
 PROFILE_VANILLA = "vanilla"
 PROFILE_DRESSED = "dressed"
 _ACTIVE_PROFILE = PROFILE_VANILLA
@@ -434,7 +445,8 @@ WALL_STATUS = frozenset({401, 403, 429})
 # The Colab limit. Three nodes, then DIRECT if no 404 arrived.
 PROXY_TRIES = 3
 
-# A page slot's own terms.
+# A page slot's own terms. The address path no longer uses slots, but they stay
+# for the selftest and for anything that wants a reused page.
 SLOT_USES_MAX = 25
 SLOT_FAILS_MAX = 2
 
@@ -1659,11 +1671,14 @@ def _ip_of(resp):
 
 
 def _ctx_kw(proxy_line=None, profile=None) -> dict:
-    """Context kwargs for a profile, plus the proxy when there is one.
+    """Context kwargs for a profile, plus the proxy when one is asked for.
 
     VANILLA is the Colab context and nothing more: UA, locale, viewport. DRESSED
     adds the header set and the desktop emulation. `_ACTIVE_PROFILE` decides which
     one flies; the other stays reachable through the argument.
+
+    The proxy here is only used by `_new_context`/`_Slot`; `_colab_attempt` puts
+    the proxy on the LAUNCH instead, which is what Cell 4 does.
     """
     profile = profile or _ACTIVE_PROFILE
     kw = {"user_agent": UA, "locale": "en-US",
@@ -1756,121 +1771,173 @@ def _inpage_fetch(page, addr):
     return status, payload
 
 
+def _launch(proxy_cfg=None):
+    """A fresh Chromium with the proxy at LAUNCH - Colab Cell 4 exactly.
+
+    Cell 4 does `p.chromium.launch(headless=True, proxy=proxy_cfg)` and closes
+    the browser in `finally`; the proxy is never on the context. Playwright has to
+    implement a per-CONTEXT proxy by running its own local proxy and pointing the
+    browser at it, so a context-level proxy puts an extra local hop and a
+    different connection shape between the browser and the node. The launch-level
+    proxy is the shape that produced the 200s, so the flight and the reader both
+    launch per node now.
+
+    The Playwright instance is per thread and reused; only the browser is fresh.
+    """
+    pw = getattr(_tls, "pw", None)
+    if pw is None:
+        from playwright.sync_api import sync_playwright
+        pw = sync_playwright().start()
+        _tls.pw = pw
+    kw = {"headless": True, "args": CONTAINER_ARGS}
+    if proxy_cfg:
+        kw["proxy"] = proxy_cfg
+    b = pw.chromium.launch(**kw)
+    if not getattr(_tls, "said_version", False):
+        _tls.said_version = True
+        try:
+            trace("INFO", "flight", "engine build %s | UA claims Chrome 131"
+                  % b.version)
+        except Exception:
+            pass
+    return b
+
+
+def _colab_attempt(addr, proxy_line=None, want_ip=False):
+    """One node, one fresh browser, one navigation - Colab Cell 4, synchronously.
+
+    -> (status, payload, ip, ctype, headers, body).
+    `payload` is a dict ONLY for a 200 that parsed as JSON, so it is the read
+    signal. The egress read is optional and always happens in a SECOND tab AFTER
+    the target, because the Colab navigated the target as the first page in a
+    brand-new context and that is the shape being reproduced.
+
+    The browser is closed in a `finally`: nothing survives an item, so a wedged
+    page can never hold the next one.
+    """
+    cfg = None
+    if proxy_line:
+        cfg = _proxy_cfg(proxy_line)
+        if not cfg:
+            return 0, None, "-", "-", "-", ""
+    b = ctx = None
+    try:
+        b = _launch(cfg)
+        ctx = b.new_context(user_agent=UA, locale="en-US",
+                            viewport={"width": 1440, "height": 900})
+        page = ctx.new_page()
+        page.set_default_timeout(FLIGHT_TIMEOUT)
+        resp = page.goto(unified_url(addr), wait_until="domcontentloaded",
+                         timeout=FLIGHT_TIMEOUT)
+        status = resp.status if resp is not None else 0
+        body = _body_of(resp)
+        ctype = str((resp.headers or {}).get("content-type")
+                    if resp is not None else "-")[:60] or "-"
+        headers = _safe_headers(resp)
+        ip = "-"
+        if want_ip:
+            try:
+                tab = ctx.new_page()
+                try:
+                    probe = tab.goto(IPIFY_URL, wait_until="domcontentloaded",
+                                     timeout=FLIGHT_TIMEOUT)
+                    if probe is not None and probe.status == 200:
+                        ip = _ip_of(probe)
+                finally:
+                    tab.close()
+            except Exception:
+                pass
+        payload = None
+        if status == 200:
+            payload = _json_of(body)
+            if payload is None:
+                page.wait_for_timeout(500)
+                got, payload = _inpage_fetch(page, addr)
+                if payload is None:
+                    status = got or 200
+        return status, payload, ip, ctype, headers, body
+    finally:
+        for thing in (ctx, b):
+            try:
+                if thing is not None:
+                    thing.close()
+            except Exception:
+                pass
+
+
 def _flight_one(line, diag=False, log=None):
-    """One node, one context, ONE navigation - the Colab Cell 2 call.
+    """One node, one fresh browser, ONE navigation - Colab Cell 4 in the app.
 
     -> dict(ok, carried, reason, bucket, ip, status, ctype, size, headers, snippet).
     `ok` is a 200 that parsed as JSON. `carried` is "the target ANSWERED this node
-    at all", which includes the 401/403 the WAF hands the caller and the 404 that
-    is the site's own zero - those are alive nodes and they are kept.
+    at all" - the 401/403 the WAF hands the caller and the 404 that is the site's
+    own zero are alive nodes and they are kept.
 
-    The target page is the FIRST page in the context and its only navigation is
-    the unified URL: the egress read lives in a second tab that is closed first,
-    and that tab talks to ipify, not to the target.
+    The proxy goes on the LAUNCH and the browser is thrown away afterwards, which
+    is Cell 4 exactly. A 401/403/429 is then re-asked on the same node as a plain
+    HTTP client as a cheap third shot, but the working path is the navigation.
 
-    Nothing re-asks on a 401. The wall is a verdict, not a hiccup: five requests
-    per node is what cooked eleven shared exit IPs, so a refused node is simply
-    recorded and kept. The only in-page fetch left is the one for a 200 that is
-    not JSON, because there a document exists and the answer may still be behind
-    it.
-
-    The egress IP is INFORMATIONAL: a failed read never drops the node.
-    Credentials are never printed, only host:port and auth=yes/no.
+    The egress IP is INFORMATIONAL and read AFTER the target: a failed read never
+    drops the node. Credentials are never printed, only host:port and auth.
     """
-    ctx = None
     out = {"ok": False, "carried": False, "reason": "", "bucket": "other", "ip": "-",
            "status": 0, "ctype": "-", "size": 0, "headers": "-", "snippet": ""}
     short = line.rsplit("@", 1)[-1]
+    if diag:
+        _say(log, "    send -> %s | auth=%s | target %s"
+             % (short, "yes" if "@" in line else "no", unified_url(FLIGHT_PROBE)))
     try:
-        b = _browser()
-        ctx = _new_context(b, line)
-        page = ctx.new_page()
-        page.set_default_timeout(FLIGHT_TIMEOUT)
-        if diag:
-            _say(log, "    send -> %s | auth=%s | target %s"
-                 % (short, "yes" if "@" in line else "no",
-                    unified_url(FLIGHT_PROBE)))
-        # Egress read in its OWN tab, so the target page stays a clean first
-        # navigation. ipify is a different host and costs the target nothing.
-        try:
-            probe_tab = ctx.new_page()
-            try:
-                probe = probe_tab.goto(IPIFY_URL, wait_until="domcontentloaded",
-                                       timeout=FLIGHT_TIMEOUT)
-                if probe is not None and probe.status == 200:
-                    out["ip"] = _ip_of(probe)
-            finally:
-                probe_tab.close()
-        except Exception as exc:
-            if diag:
-                _say(log, "      <- egress probe raised %s: %s"
-                     % (type(exc).__name__, _snippet(str(exc), 160)))
-        if out["ip"] in ("", "-") and diag:
-            _say(log, "      <- egress unread, target is tried anyway")
-        try:
-            resp = page.goto(unified_url(FLIGHT_PROBE),
-                             wait_until="domcontentloaded",
-                             timeout=FLIGHT_TIMEOUT)
-        except Exception as exc:
-            out["reason"] = "%s: %s" % (type(exc).__name__, _snippet(str(exc), 160))
-            if out["ip"] in ("", "-"):
-                out["reason"] = "no egress ip and no status - " + out["reason"]
-            out["bucket"] = _bucket(0, out["reason"])
-            if diag:
-                _say(log, "      <- transport raised %s | egress %s"
-                     % (out["reason"], out["ip"]))
-            return out
-        out["status"] = resp.status if resp is not None else 0
-        out["carried"] = out["status"] in CARRY_STATUS
-        body = _body_of(resp)
-        out["size"] = len(body or "")
-        out["ctype"] = str((resp.headers or {}).get("content-type")
-                           if resp is not None else "-")[:60] or "-"
-        out["headers"] = _safe_headers(resp)
-        out["snippet"] = _snippet(body)
-        if diag:
-            _say(log, "      <- %s | content-type: %s | %d byte(s) | %s | egress %s"
-                 % (out["status"] or "?", out["ctype"], out["size"],
-                    out["headers"], out["ip"]))
-            if out["snippet"]:
-                _say(log, "        body: %s" % out["snippet"])
-        if out["status"] == 200:
-            # Colab's own test: the body starts with { or [ and json.loads.
-            if _json_any(body) is not None:
-                out["ok"] = True
-                out["reason"] = "200"
-                out["bucket"] = "200"
-                return out
-            page.wait_for_timeout(500)
-            got, payload = _inpage_fetch(page, FLIGHT_PROBE)
-            if isinstance(payload, dict):
-                out["ok"] = True
-                out["reason"] = "200"
-                out["bucket"] = "200"
-                return out
-            out["reason"] = "in-page %s" % (got or "200 non-JSON body")
-            out["bucket"] = _bucket(got, out["reason"])
-            if diag:
-                _say(log, "      <- in-page %s after a non-JSON 200" % (got or "?"))
-            return out
-        if not out["status"] and out["ip"] in ("", "-"):
-            out["reason"] = "no egress ip and no status - proxy not carried"
-        else:
-            out["reason"] = "status %s" % (out["status"] or "?")
-        out["bucket"] = _bucket(out["status"], out["reason"])
-        return out
+        status, payload, ip, ctype, headers, body = _colab_attempt(
+            FLIGHT_PROBE, line, want_ip=True)
     except Exception as exc:
         out["reason"] = "%s: %s" % (type(exc).__name__, _snippet(str(exc), 160))
         out["bucket"] = _bucket(0, out["reason"])
         if diag:
             _say(log, "      <- raised %s" % out["reason"])
         return out
-    finally:
-        try:
-            if ctx is not None:
-                ctx.close()
-        except Exception:
-            pass
+    out["ip"] = ip
+    out["status"] = status
+    out["ctype"] = ctype
+    out["headers"] = headers
+    out["size"] = len(body or "")
+    out["snippet"] = _snippet(body)
+    out["carried"] = status in CARRY_STATUS
+    if diag:
+        _say(log, "      <- %s | content-type: %s | %d byte(s) | %s | egress %s"
+             % (status or "?", ctype, out["size"], headers, ip))
+        if out["snippet"]:
+            _say(log, "        body: %s" % out["snippet"])
+    if isinstance(payload, dict):
+        out["ok"] = True
+        out["reason"] = "200"
+        out["bucket"] = "200"
+        return out
+    if status == 404:
+        out["reason"] = "404"
+        out["bucket"] = "404"
+        return out
+    if status in WALL_STATUS:
+        got, pl = _http_attempt(FLIGHT_PROBE, line)
+        if diag:
+            _say(log, "      <- http %s | same node, plain client"
+                 % (got or "transport"))
+        if isinstance(pl, dict):
+            out["ok"] = True
+            out["status"] = 200
+            out["reason"] = "http 200"
+            out["bucket"] = "200"
+            return out
+        if got == 404:
+            out["status"] = 404
+            out["reason"] = "http 404"
+            out["bucket"] = "404"
+            return out
+    if not status and ip in ("", "-"):
+        out["reason"] = "no egress ip and no status - proxy not carried"
+    else:
+        out["reason"] = "status %s" % (status or "?")
+    out["bucket"] = _bucket(status, out["reason"])
+    return out
 
 
 def _flight_ipify(cand, cancel=None, log=None, pin="", diag=False, codes=None,
@@ -1962,11 +2029,11 @@ def _flight_browser(alive, cancel=None, log=None, pin="", diag=False, codes=None
                     res.get("ip")))
 
     def lane(chunk):
-        """One lane owns one browser for its whole chunk, and closes it itself.
+        """One lane owns its thread's Playwright instance and stops it itself.
 
         A teardown task submitted after the map finishes lands on whichever
-        thread is free, not the thread that owns the browser, so a browser per
-        worker was left running until the process died.
+        thread is free, not the thread that owns the engine, so a per-thread
+        engine was left running until the process died.
         """
         set_owner(pin)
         try:
@@ -2409,7 +2476,7 @@ def check_password(password, force=False):
 
 
 # ---------------------------------------------------------------------------
-# the address half - one reused page per worker, headless Chromium, the pool
+# the address half - a fresh browser per node, headless Chromium, the pool
 # ---------------------------------------------------------------------------
 def _browser():
     b = getattr(_tls, "browser", None)
@@ -2574,65 +2641,33 @@ def _http_attempt(addr, proxy_line=None):
 
 
 def _attempt(addr, proxy_line):
+    """One attempt, Colab shape: fresh browser, proxy on the launch, one nav."""
     label = (proxy_line.rsplit("@", 1)[-1] if proxy_line else "DIRECT")
-    url = unified_url(addr)
-    slot = _slot()
     try:
-        page = slot.get(proxy_line)
-    except Exception as exc:
-        trace("ERR", "fetch", "no page via %s: %s" % (label, type(exc).__name__), addr)
-        return 0, None
+        time.sleep(random.uniform(0.0, READ_JITTER))
+    except Exception:
+        pass
     try:
-        # A small stagger so the workers do not land together on one exit IP.
-        try:
-            time.sleep(random.uniform(0.0, READ_JITTER))
-        except Exception:
-            pass
-        resp = page.goto(url, wait_until="domcontentloaded", timeout=NAV_TIMEOUT)
-        status = resp.status if resp is not None else 0
-        body = ""
-        try:
-            body = resp.text() if resp is not None else ""
-        except Exception:
-            body = ""
-        trace("INFO", "fetch", "%s via %s (%d byte(s))"
-              % (status or "?", label, len(body)), addr)
-        if status == 200:
-            payload = _json_of(body)
-            if isinstance(payload, dict):
-                slot.ok()
-                return 200, payload
-            page.wait_for_timeout(700)
-            got, payload = _inpage_fetch(page, addr)
-            if isinstance(payload, dict):
-                slot.ok()
-                return 200, payload
-            if got == 404:
-                slot.ok()
-                return 404, None
-            slot.ok()
-            return got or 200, None
-        if status == 404:
-            slot.ok()
-            return 404, None
-        if status in WALL_STATUS:
-            # The node is alive and its tunnel works - only the fingerprint was
-            # refused. Re-ask the SAME node as a plain client before dropping it.
-            got, payload = _http_attempt(addr, proxy_line)
-            if payload is not None:
-                slot.ok()
-                return 200, payload
-            if got == 404:
-                slot.ok()
-                return 404, None
-            slot.ok()
-            return status, None
-        slot.ok()
-        return status, None
+        status, payload, _ip, _ct, _hd, body = _colab_attempt(addr, proxy_line)
     except Exception as exc:
         trace("ERR", "fetch", "err via %s (%s)" % (label, type(exc).__name__), addr)
-        slot.bad()
         return 0, None
+    trace("INFO", "fetch", "%s via %s (%d byte(s))"
+          % (status or "?", label, len(body or "")), addr)
+    if isinstance(payload, dict):
+        return 200, payload
+    if status == 404:
+        return 404, None
+    if status in WALL_STATUS:
+        # The node is alive and its tunnel works - only the fingerprint was
+        # refused. Re-ask the SAME node as a plain client before dropping it.
+        got, pl = _http_attempt(addr, proxy_line)
+        if isinstance(pl, dict):
+            return 200, pl
+        if got == 404:
+            return 404, None
+        return status, None
+    return status, None
 
 
 def _search_address(addr, cancel=None):
@@ -3407,6 +3442,9 @@ def selftest(verbose=False) -> bool:
     add("stealth_platform", "'Win32'" in STEALTH_JS)
     add("stealth_no_angle", "\x3c" not in STEALTH_JS)
     add("new_context_callable", callable(_new_context))
+    add("launch_callable", callable(_launch))
+    add("colab_attempt_callable", callable(_colab_attempt))
+    add("colab_takes_ip", "want_ip" in inspect_sig(_colab_attempt))
     add("flight_one_callable", callable(_flight_one))
     add("gateway_dead_407", _gateway_dead("ProxyError: Tunnel connection failed: "
                                           "407 Unauthorized"))
