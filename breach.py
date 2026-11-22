@@ -8,7 +8,8 @@ with the proxy on the context.
 
     200 + JSON     parse it, remember the node as via_proxy, stop
     404            the site's own "not in any breach", stop
-    401 / 403      the endpoint refusing the CALLER - next node, then DIRECT
+    401 / 403      the endpoint refusing the CALLER - re-ask as a plain client,
+                   then next node, then DIRECT
     anything else  next node
 
 A 200 that is NOT JSON is the only case that gets a same-origin fetch() from
@@ -25,6 +26,18 @@ and the egress IP in the line is the node's own. Only a transport failure is a
 dead node. So the flight keeps any node the target ANSWERED (200, 401, 403, 404,
 429) and counts the 200s separately, and the reader does not need a 200 either,
 because a walled address has a second source.
+
+THE SAME NODE IS RE-ASKED AS A PLAIN CLIENT
+-------------------------------------------
+The wall is a fingerprint verdict, not an IP verdict: the exit IP is the same
+whether the request came from Chromium or from `requests`, and the two carry a
+different TLS and header shape. A plain HTTP GET from a server therefore answers
+200 with the full JSON on the same nodes that refuse every headless navigation. So
+a node that answers the browser with 401 is re-asked through `requests`, on the
+same proxy, before it is dropped - one request, no navigation, no page. A 200 +
+JSON there is a real read and the node keeps its place. DIRECT is the same call
+without a proxy, and it replaced the browser DIRECT attempt, which was the most
+expensive shape and the one already proven to be refused.
 
 THE SECOND SOURCE IS PER-ADDRESS AND OUTSIDE THE WALL
 -----------------------------------------------------
@@ -182,11 +195,15 @@ attempts in a row, or when the next attempt wants a different proxy. Recycling i
 local: the item in flight is already recorded, so a wedged page can never lose a
 finished result and can never hold the queue.
 
-THE DRAW IS RANDOM
-------------------
+THE DRAW IS RANDOM, BUT NEVER THE SAME EXIT TWICE
+-------------------------------------------------
 Each attempt draws a RANDOM node from the whole tier-ordered pool, never one
 already tried for that item, and a node that fails twice in transport is skipped
-for the rest of the run. The `rotate` switch walks the tier order instead.
+for the rest of the run. The `rotate` switch walks the tier order instead. The
+wall is judged per EXIT IP and a full Webshare import puts a dozen credential
+lines behind each of about eleven addresses, so a line whose host:port this item
+has already used is passed over while any other IP is left - three blind draws
+otherwise land on the same address three times and the second two prove nothing.
 
 THE PASSWORD HALF
 -----------------
@@ -2276,24 +2293,37 @@ def _mark_bad(line):
         user_bad[line] = min(9, user_bad.get(line, 0) + 1)
 
 
-def _pick_proxy(used):
+def _pick_proxy(used, tried_ips=None):
+    """A node for one attempt, preferring an exit IP this item has not used.
+
+    The wall is judged per EXIT IP, and a full Webshare import puts a dozen
+    credential lines behind each of about eleven addresses - so three blind draws
+    often land on the same IP three times and the second two prove nothing. A line
+    whose host:port is already in `tried_ips` is passed over while any other IP is
+    left; when none is, it falls back to the old behaviour.
+    """
     pool = pool_lines()
     if not pool:
         return None
     who = _owner_key()
+    ips = tried_ips if tried_ips is not None else set()
     with _lock:
         user_bad = _bads.get(who) or {}
         live = [l for l in pool if user_bad.get(l, 0) < BAD_AFTER] or pool
-        if not _cfg_get("rotate", True):
-            n = len(live)
+    fresh = [l for l in live if _hostport(l) not in ips]
+    pick_from = fresh or live
+    if not _cfg_get("rotate", True):
+        with _lock:
+            n = len(pick_from)
             cur = _cursors.setdefault(who, [0])
             for _ in range(n):
-                line = live[cur[0] % n]
+                line = pick_from[cur[0] % n]
                 cur[0] += 1
                 if line not in used:
                     return line
-            return None
-    left = [l for l in live if l not in used]
+        left = [l for l in pick_from if l not in used]
+        return left[0] if left else None
+    left = [l for l in pick_from if l not in used]
     if not left:
         return None
     return random.choice(left)
@@ -2507,6 +2537,42 @@ def _close_all_slots():
         s.close_ctx()
 
 
+def _http_attempt(addr, proxy_line=None):
+    """The same address as a plain HTTP GET, through `proxy_line` or DIRECT.
+
+    The wall is a fingerprint verdict, not an IP verdict - the exit IP is the same
+    either way and only the TLS and header shape differ. So a node that just
+    refused the browser is re-asked as a plain client before it is dropped: one
+    request, no navigation, no page. 200 + JSON is a read; anything else is the
+    same wall (or a transport fail) and has cost nothing.
+    """
+    url = unified_url(addr)
+    label = "DIRECT"
+    proxies = None
+    if proxy_line:
+        purl = _proxy_url(proxy_line)
+        if not purl:
+            return 0, None
+        proxies = {"http": purl, "https": purl}
+        label = proxy_line.rsplit("@", 1)[-1]
+    try:
+        import requests
+        r = requests.get(url, timeout=HTTP_TIMEOUT, proxies=proxies,
+                         headers={"User-Agent": UA,
+                                  "Accept": "application/json, text/plain, */*",
+                                  "Accept-Language": "en-US,en;q=0.9",
+                                  "Referer": HIBP_BASE + "/"})
+    except Exception as exc:
+        trace("ERR", "http", "err via %s (%s)" % (label, type(exc).__name__), addr)
+        return 0, None
+    payload = _json_of(r.text) if r.status_code == 200 else None
+    trace("INFO", "http", "%s via %s (%d byte(s))"
+          % (r.status_code or "?", label, len(r.text or "")), addr)
+    if isinstance(payload, dict):
+        return 200, payload
+    return r.status_code, None
+
+
 def _attempt(addr, proxy_line):
     label = (proxy_line.rsplit("@", 1)[-1] if proxy_line else "DIRECT")
     url = unified_url(addr)
@@ -2549,8 +2615,18 @@ def _attempt(addr, proxy_line):
         if status == 404:
             slot.ok()
             return 404, None
-        # A 401 is a dead end for the browser: no in-page re-ask, just the next
-        # node, and the caller has the second source for when they all refuse.
+        if status in WALL_STATUS:
+            # The node is alive and its tunnel works - only the fingerprint was
+            # refused. Re-ask the SAME node as a plain client before dropping it.
+            got, payload = _http_attempt(addr, proxy_line)
+            if payload is not None:
+                slot.ok()
+                return 200, payload
+            if got == 404:
+                slot.ok()
+                return 404, None
+            slot.ok()
+            return status, None
         slot.ok()
         return status, None
     except Exception as exc:
@@ -2563,13 +2639,15 @@ def _search_address(addr, cancel=None):
     seen = []
     errors = []
     used = set()
+    ips = set()
     for _ in range(PROXY_TRIES):
         if _is_cancelled(cancel):
             return None, "", "cancelled", seen
-        line = _pick_proxy(used)
+        line = _pick_proxy(used, ips)
         if line is None:
             break
         used.add(line)
+        ips.add(_hostport(line))
         status, payload = _attempt(addr, line)
         label = line.rsplit("@", 1)[-1]
         seen.append(status)
@@ -2586,7 +2664,9 @@ def _search_address(addr, cancel=None):
     if _zero_rule(seen):
         return {}, "", "", seen
 
-    status, payload = _attempt(addr, None)
+    # DIRECT, as a plain HTTP client: cheaper than a browser, and a different
+    # fingerprint, which is the only thing the wall is judging.
+    status, payload = _http_attempt(addr, None)
     seen.append(status)
     if payload is not None:
         return payload, "DIRECT", "", seen
@@ -3573,6 +3653,12 @@ def selftest(verbose=False) -> bool:
     add("random_spreads", len({_pick_proxy(set()) for _ in range(60)}) == 3)
     add("avoid_set", _pick_proxy({"1.1.1.1:1", "2.2.2.2:2"}) == "3.3.3.3:3")
     add("avoid_exhausted", _pick_proxy({"1.1.1.1:1", "2.2.2.2:2", "3.3.3.3:3"}) is None)
+    _tmp_pool = _cfg["pool"]
+    _cfg["pool"] = ["u:p@9.9.9.9:1", "v:q@9.9.9.9:1", "w:r@9.9.9.9:2"]
+    add("pick_avoids_tried_ip", _pick_proxy(set(), {"9.9.9.9:1"}) == "w:r@9.9.9.9:2")
+    add("pick_ip_falls_back", _pick_proxy(set(), {"9.9.9.9:1", "9.9.9.9:2"})
+        in ("u:p@9.9.9.9:1", "v:q@9.9.9.9:1", "w:r@9.9.9.9:2"))
+    _cfg["pool"] = _tmp_pool
     _bads[_who] = {"1.1.1.1:1": BAD_AFTER}
     add("bad_node_skipped", _pick_proxy(set()) in ("2.2.2.2:2", "3.3.3.3:3"))
     _bads.pop(_who, None)
@@ -3587,6 +3673,8 @@ def selftest(verbose=False) -> bool:
     add("check_many_takes_flight_first", "flight_first" in inspect_sig(check_many))
     add("check_takes_cancel", "cancel" in inspect_sig(check))
     add("search_takes_cancel", "cancel" in inspect_sig(_search_address))
+    add("http_attempt_callable", callable(_http_attempt))
+    add("http_takes_proxy", "proxy_line" in inspect_sig(_http_attempt))
     add("clear_cache_exists", callable(clear_cache))
     add("cache_stats_keys", set(cache_stats()) == {"entries", "bytes", "path"})
     add("page_wanted", page_wanted("records") is True)
@@ -3636,6 +3724,17 @@ def main(argv=None) -> int:
         st = browser_state()
         print("browser:", st["state"], st.get("error", ""))
         return 0 if st["state"] == "ready" else 1
+    if "--http" in argv:
+        try:
+            target = argv[argv.index("--http") + 1]
+        except Exception:
+            print("usage: breach.py --http someone@example.com")
+            return 2
+        status, payload = _http_attempt(target, None)
+        print("direct http:", status or "transport", "|",
+              "READ" if payload is not None else "no payload")
+        print(trace_text(limit=10))
+        return 0 if payload is not None else 1
     if "--catalogue" in argv:
         cat = catalogue(force=True)
         print("catalogue:", "unreadable" if cat is None else
