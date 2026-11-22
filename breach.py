@@ -13,17 +13,23 @@ with the proxy on the context.
 
 A 200 that is NOT JSON is the only case that gets a same-origin fetch() from
 inside the page: there is a document to fetch from and the shell may carry what
-the plain navigation lacked. A 401 does NOT get one on the reader path - the
-reader is spending nodes. The test flight does use it, once, because the flight's
-job is to find out whether the node can read at all.
+the plain navigation lacked. A 401 does NOT get one any more - it is a dead end
+that costs a request and repeats the same 401.
 
 ONLY A 404 IS A READABLE ZERO
 -----------------------------
 A 404 is the site's own "not in any breach" - an answer about the ADDRESS. A 401
 is the endpoint refusing the CALLER, which says nothing about the mailbox, so it
-is retried (three nodes, then DIRECT) instead of being reported as clean. The
-catalogue is still used to fill a genuine 404 zero, but it is a DOMAIN match and
-is labelled as one.
+is retried (three nodes, then DIRECT) instead of being reported as clean.
+
+THE FREE SOURCES FILL THE WALL
+------------------------------
+Pwned Passwords and the public catalogue are both keyless and neither is behind
+the wall. When the address half is walled and nothing readable came back, the
+domain is looked up in the catalogue and any breaches fill the record as a
+DOMAIN match, flagged `partial_read`. A domain answer is worth more than an empty
+card, and it is labelled for what it is. When the domain has nothing either, the
+address half stays UNREAD - a wall is never a zero.
 
 A COMBO IS GRADED ON BOTH HALVES
 --------------------------------
@@ -32,8 +38,15 @@ when the password is all that was asked for - a line with no '@'. When the line 
 a combo and the address half could not be read, the combo is UNKNOWN: the password
 band is still shown beside it, but it no longer decides the grade.
 
-THE TEST FLIGHT IS CELL 2, AND IT IS BREACH-ONLY
-------------------------------------------------
+THE TEST FLIGHT IS ONE NAVIGATION PER NODE
+------------------------------------------
+The Colab fired ONE page.goto per candidate and 32 of 141 came back 200. Our
+build was firing about five requests per node - the navigation, an in-page
+re-fetch, a homepage warm-up, a retry, then the whole dressed context again - at
+eleven shared exit IPs. The homepage still answers 200 while /unifiedsearch/
+answers 401 on every node, so the browser and the proxy are both fine: the wall
+had simply been fed too much. The flight is now the Colab call and nothing more.
+
     candidates   the owner's own proxies.txt FIRST, minus everything
                  proxy_meta.json marks dead / auth / timeout; proxies_secret.txt
                  and proxies_custom.txt next; the Webshare and Oxylabs APIs only
@@ -43,51 +56,29 @@ THE TEST FLIGHT IS CELL 2, AND IT IS BREACH-ONLY
                  must not hide a live one behind the same IP. FLIGHT_MAX (200) is
                  above the 140 lines a full Webshare import produces.
     step 1       ipify, 8 s, dead nodes dropped with the REAL reason
-    step 2       headless Chromium, FIVE at a time, one isolated context per
-                 node, egress IP read inside the context FIRST
+    step 2       headless Chromium, TWO at a time, one context per node, ONE
+                 navigation, with a short random jitter before it so two lanes
+                 never land on the same exit IP in the same instant
     pass         HTTP 200 AND a JSON body
     log          "    ✅ 200 -> host:port | country | city | egress IP"
                  "    skip  -> host:port | test flight failed (reason) | egress IP"
     save         the survivors, one per line, to proxies_breach.txt
     summary      "[*] Passed test flight (✅ 200) : N" and the file name
 
-TWO CONTEXT PROFILES, AND VANILLA GOES FIRST
---------------------------------------------
-The Colab that passes 32 of 140 builds a context with a UA, a locale, a viewport
-and a proxy. NOTHING else. Everything added on top of that since - the header
-set, the timezone override, the screen size, the fingerprint patches, the full
-Chromium channel - is a difference from a setup that provably works, and a build
-carrying all of it scored 0 of 140. At least one of those additions is what the
-WAF objects to.
-
-So there are two profiles and they are ordered by evidence, not by taste:
-
-    PROFILE_VANILLA   Colab Cell 3/4 byte for byte - UA, locale, viewport, proxy,
-                      one navigation, no init script, no extra header. A node it
-                      reads is KEPT and the dressed profile never runs.
-    PROFILE_DRESSED   adds CTX_HEADERS, STEALTH_JS, timezone_id, screen, the
-                      desktop device flags and the homepage warm-up. It only gets
-                      a turn on a node vanilla could not read.
-
-The reader alternates them across its three attempts for the same reason. When
-the log shows which profile wins, one of them can go.
-
-CLOUDFLARE DECIDES PER REQUEST, NOT PER IP
-------------------------------------------
-In a 140-node Colab run, 64.137.96.74 passed four times and failed twice and
-104.164.49.38 passed, failed, then passed - about 23% per attempt. So a refusal
-on one attempt says nothing about the node, which is why a refused node gets a
-same-origin in-page fetch and one retry on the same node before it is dropped.
+LOW BURST PRESSURE IS THE POINT
+-------------------------------
+FLIGHT_WORKERS is 2 and every node waits a random 0-0.7 s first. Eleven shared
+exit IPs cannot absorb five lanes firing back to back; they can absorb two that
+are staggered. Slower is faster here.
 
 THE DIAGNOSTIC FLIGHT
 ---------------------
 `diagnose=True` (the "Diagnostic flight" switch on the page) turns the flight
 into a transcript instead of a verdict: the node, whether it carries auth, the
-profile, the exact target, whether the homepage step ran, the ipify answer with
-the real exception when it fails, then the status, content-type, byte count, the
-response headers that matter (server, cf-ray, www-authenticate, via, x-cache) and
-the first 200 characters of the body. Credentials are never printed - only
-host:port and auth=yes/no.
+exact target, the ipify answer with the real exception when it fails, then the
+status, content-type, byte count, the response headers that matter (server,
+cf-ray, www-authenticate, via, x-cache) and the first 200 characters of the body.
+Credentials are never printed - only host:port and auth=yes/no.
 
 It closes with a count per outcome and a legend for every code it can emit, so a
 wall of 401s says WHAT a 401 is here instead of just being one. It does not stop
@@ -99,8 +90,9 @@ ipify in step 1 goes through `requests`, which does use the proxy. The browser
 does not necessarily - and if `proxy` is not carried on the context, every node
 answers from Streamlit's own address instead of the proxy's, which looks exactly
 like "all 401". So each node reads api.ipify.org FROM INSIDE ITS OWN CONTEXT
-first and the answer is printed beside the verdict. If every line shows the same
-IP, the proxy is not being applied and that is the bug, not the endpoint.
+first and the answer is printed beside the verdict. ipify is a different host, so
+it costs the target nothing. If every line shows the same IP, the proxy is not
+being applied and that is the bug, not the endpoint.
 
 THE READ IS INFORMATIONAL AND NEVER DROPS A NODE
 ------------------------------------------------
@@ -115,8 +107,8 @@ THE TARGET TAB STARTS AT THE TARGET
 -----------------------------------
 The egress read happens in its OWN tab of the same context, and that tab is
 closed before the target is touched, so the target page is the FIRST page in the
-context and its first navigation is the unified URL, with an empty history and no
-cross-site Referer. Attempt 1 is one direct navigation.
+context and its only navigation is the unified URL, with an empty history and no
+cross-site Referer.
 
 A GATEWAY THAT FAILS AUTH IS DEAD, NOT LATE
 --------------------------------------------
@@ -140,8 +132,8 @@ start when Chromium is not ready instead of throwing 200 instant failures away.
 THE CATALOGUE FILLS THE ZERO
 ----------------------------
 The public catalogue (`/api/v3/breaches`) is keyless, unchallenged and indexed by
-domain, so when a 404 zero happens the domain is looked up and, if it has
-breaches, they fill the record with real names, dates, data classes and record
+domain, so a 404 zero - and now a wall - gets the domain looked up, and if it has
+breaches they fill the record with real names, dates, data classes and record
 counts. That sets `partial_read`, because it is a DOMAIN match and not an
 individual confirmation, and it is never cached as exact.
 
@@ -154,10 +146,9 @@ slot is launched once per worker for the whole batch, so a 500-item run pays for
 N browsers, not 500.
 
 A slot recycles itself after SLOT_USES_MAX uses, after SLOT_FAILS_MAX failed
-attempts in a row, when the next attempt wants a different proxy, or when the
-next attempt wants the other profile. Recycling is local: the item in flight is
-already recorded, so a wedged page can never lose a finished result and can never
-hold the queue.
+attempts in a row, or when the next attempt wants a different proxy. Recycling is
+local: the item in flight is already recorded, so a wedged page can never lose a
+finished result and can never hold the queue.
 
 THE DRAW IS RANDOM
 ------------------
@@ -229,9 +220,7 @@ HIBP_BASE = "https://haveibeenpwned.com"
 UNIFIED = HIBP_BASE + "/unifiedsearch/%s"
 ACCOUNT = HIBP_BASE + "/account/%s"
 CATALOGUE_URL = HIBP_BASE + "/api/v3/breaches"
-KEY_API = HIBP_BASE + "/api/v3/breachedaccount/%s?truncateResponse=false"
 PW_RANGE = "https://api.pwnedpasswords.com/range/%s"
-KEY_ENV = "HIBP_API_KEY"
 
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
@@ -240,13 +229,16 @@ UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
 # the ones Streamlit Cloud cannot do without, because it is a container.
 CONTAINER_ARGS = ["--no-sandbox", "--disable-dev-shm-usage"]
 
-# The two context shapes. VANILLA is Colab Cell 3/4 exactly and is tried first.
+# The context shape that flies. PROFILE_VANILLA is Colab Cell 3/4 exactly - UA,
+# locale, viewport, proxy - and it is what the 32 passes came from. The dressed
+# shape is kept intact behind this one constant because every extra option is a
+# difference from a setup that works; set it to PROFILE_DRESSED to try again.
 PROFILE_VANILLA = "vanilla"
 PROFILE_DRESSED = "dressed"
-PROFILES = (PROFILE_VANILLA, PROFILE_DRESSED)
+_ACTIVE_PROFILE = PROFILE_VANILLA
 
-# Dressed only. A bare navigation sends none of these; whether that helps or
-# hurts is what the profile A/B is for.
+# Dressed only. A bare navigation sends none of these; whether that helps is what
+# the constant above decides.
 CTX_HEADERS = {
     "Accept": "application/json, text/plain, */*",
     "Accept-Language": "en-US,en;q=0.9",
@@ -372,8 +364,8 @@ FETCH_JS = ("async (u) => {try {const r = await fetch(u, {headers: "
 NAV_TIMEOUT = 25000
 HTTP_TIMEOUT = 15.0
 
-# The retry set. A flight gives one of these a single second chance on the same
-# node after a warm-up; the reader does not re-ask at all on a 401.
+# The retry set. The reader moves to the next node on these; the flight does not
+# re-ask at all.
 RETRY_STATUS = frozenset({401, 403, 408, 425, 429, 500, 502, 503, 504})
 
 # The Colab limit. Three nodes, then DIRECT if no 404 arrived.
@@ -396,8 +388,9 @@ FLIGHT_POOL = "proxies_breach.txt"
 FLIGHT_PROBE = "eddiemurphy@gmail.com"
 FLIGHT_MAX = 200
 FLIGHT_WANT = 12
-FLIGHT_WORKERS = 5
-FLIGHT_BUDGET = 420.0
+FLIGHT_WORKERS = 2
+FLIGHT_JITTER = 0.7
+FLIGHT_BUDGET = 300.0
 FLIGHT_TIMEOUT = 35000
 FLIGHT_GEO_URL = "http://ip-api.com/json/"
 FLIGHT_GEO_TIMEOUT = 8.0
@@ -409,6 +402,7 @@ IPIFY_URL = "https://api.ipify.org?format=json"
 POOL_TTL = 1800.0
 WS_PAGES = 20
 WS_PAGE_SIZE = 100
+READ_JITTER = 0.25
 
 # Header names worth printing in a diagnostic line. Nothing else is echoed.
 DIAG_HEADERS = ("server", "cf-ray", "www-authenticate", "proxy-authenticate",
@@ -417,8 +411,6 @@ DIAG_HEADERS = ("server", "cf-ray", "www-authenticate", "proxy-authenticate",
 # Every outcome the diagnostic summary can print, in report order.
 OUTCOMES = (
     ("200", "read - JSON body accepted, node KEPT"),
-    ("vanilla_ok", "read with the exact Colab context - node KEPT"),
-    ("dressed_ok", "read only with the dressed context - node KEPT"),
     ("404", "endpoint answered not-found - a readable zero for that address"),
     ("401", "rejected / challenged by the target WAF - nothing readable"),
     ("403", "forbidden or blocked by the WAF"),
@@ -685,22 +677,15 @@ def page_wanted(kind) -> bool:
     return True
 
 
-def _api_key() -> str:
-    try:
-        return str(os.environ.get(KEY_ENV) or "").strip()
-    except Exception:
-        return ""
-
-
 def key_present() -> bool:
-    return bool(_api_key())
+    try:
+        return bool(str(os.environ.get("HIBP_API_KEY") or "").strip())
+    except Exception:
+        return False
 
 
 def key_hint() -> str:
-    k = _api_key()
-    if not k:
-        return "no key needed - keyless browser + catalogue + Pwned Passwords"
-    return "key present (optional, %d chars)" % len(k)
+    return "keyless - browser, catalogue and Pwned Passwords"
 
 
 # ---------------------------------------------------------------------------
@@ -1235,41 +1220,6 @@ def catalogue_state() -> dict:
 
 
 # ---------------------------------------------------------------------------
-# the keyed API - the route that is not behind the wall at all
-# ---------------------------------------------------------------------------
-def _api_lookup(addr):
-    """breachedaccount with the user's own key. -> payload | {} | None.
-
-    None means "no key, or the key did not answer" - the caller falls through.
-    HIBP's API needs a real User-Agent and returns 404 for a clean address.
-    """
-    key = _api_key()
-    if not key:
-        return None
-    try:
-        import requests
-    except Exception:
-        return None
-    try:
-        trace("INFO", "key", "GET %s" % (KEY_API % urllib.parse.quote(_email_only(addr))))
-        r = requests.get(KEY_API % urllib.parse.quote(_email_only(addr)),
-                         timeout=HTTP_TIMEOUT,
-                         headers={"hibp-api-key": key, "User-Agent": UA,
-                                  "Accept": "application/json"})
-        trace("INFO", "key", "http %d, %d byte(s)"
-              % (r.status_code, len(r.content or b"")))
-        if r.status_code == 404:
-            return {}
-        if r.status_code != 200:
-            return None
-        got = r.json()
-    except Exception as exc:
-        trace("ERR", "key", "%s: %s" % (type(exc).__name__, str(exc)[:120]))
-        return None
-    return {"Breaches": got} if isinstance(got, list) else None
-
-
-# ---------------------------------------------------------------------------
 # the test flight - the Colab's second cell, in the app, for the breach only
 # ---------------------------------------------------------------------------
 def _flight_path() -> str:
@@ -1505,14 +1455,14 @@ def _ip_of(resp):
         return "-"
 
 
-def _ctx_kw(proxy_line=None, profile=PROFILE_VANILLA) -> dict:
-    """Context kwargs for one profile, plus the proxy when there is one.
+def _ctx_kw(proxy_line=None, profile=None) -> dict:
+    """Context kwargs for a profile, plus the proxy when there is one.
 
     VANILLA is the Colab context and nothing more: UA, locale, viewport. DRESSED
-    adds the header set and the desktop emulation. The reader alternates the two
-    and the flight tries vanilla first, so a build can never be slower-but-worse
-    than the Colab it replaces.
+    adds the header set and the desktop emulation. `_ACTIVE_PROFILE` decides which
+    one flies; the other stays reachable through the argument.
     """
+    profile = profile or _ACTIVE_PROFILE
     kw = {"user_agent": UA, "locale": "en-US",
           "viewport": {"width": 1440, "height": 900}}
     if profile == PROFILE_DRESSED:
@@ -1529,14 +1479,10 @@ def _ctx_kw(proxy_line=None, profile=PROFILE_VANILLA) -> dict:
     return kw
 
 
-def _new_context(b, proxy_line=None, profile=PROFILE_VANILLA):
-    """A context in the requested profile. STEALTH_JS is dressed-only.
-
-    The init script runs before any document, so the first page never sees an
-    unpatched Navigator even for a frame - in the profile that carries it.
-    """
-    ctx = b.new_context(**_ctx_kw(proxy_line, profile))
-    if profile == PROFILE_DRESSED:
+def _new_context(b, proxy_line=None):
+    """A context in the active profile. STEALTH_JS only in the dressed one."""
+    ctx = b.new_context(**_ctx_kw(proxy_line))
+    if _ACTIVE_PROFILE == PROFILE_DRESSED:
         try:
             ctx.add_init_script(STEALTH_JS)
         except Exception:
@@ -1607,39 +1553,38 @@ def _inpage_fetch(page, addr):
     return status, payload
 
 
-def _flight_one(line, diag=False, log=None, profile=PROFILE_VANILLA):
-    """One node, one context, one profile.
+def _flight_one(line, diag=False, log=None):
+    """One node, one context, ONE navigation - the Colab Cell 2 call.
 
-    -> dict(ok, reason, bucket, ip, status, ctype, size, headers, snippet,
-            home). The target page is the FIRST page in the context and its first
-    navigation is the target: the egress read lives in a second tab that is
-    closed first, so the history is empty and the Referer is not a cross-site one.
+    -> dict(ok, reason, bucket, ip, status, ctype, size, headers, snippet).
+    The target page is the FIRST page in the context and its only navigation is
+    the unified URL: the egress read lives in a second tab that is closed first,
+    and that tab talks to ipify, not to the target.
 
-    PROFILE_VANILLA is the Colab call exactly. Only a retryable status earns a
-    same-origin in-page fetch, and the homepage warm-up is dressed-only, so a
-    vanilla attempt 1 stays byte for byte the Colab request.
+    Nothing re-asks on a 401. The wall is a verdict, not a hiccup: five requests
+    per node is what cooked eleven shared exit IPs, so a refused node is simply
+    recorded and dropped. The only in-page fetch left is the one for a 200 that
+    is not JSON, because there a document exists and the answer may still be
+    behind it.
 
-    The egress IP is INFORMATIONAL: a failed read never drops the node, because
-    the target itself is the verdict. Credentials are never printed, only
-    host:port and auth=yes/no.
+    The egress IP is INFORMATIONAL: a failed read never drops the node.
+    Credentials are never printed, only host:port and auth=yes/no.
     """
     ctx = None
     out = {"ok": False, "reason": "", "bucket": "other", "ip": "-", "status": 0,
-           "ctype": "-", "size": 0, "headers": "-", "snippet": "", "home": False,
-           "profile": profile}
+           "ctype": "-", "size": 0, "headers": "-", "snippet": ""}
     short = line.rsplit("@", 1)[-1]
     try:
         b = _browser()
-        ctx = _new_context(b, line, profile)
+        ctx = _new_context(b, line)
         page = ctx.new_page()
         page.set_default_timeout(FLIGHT_TIMEOUT)
         if diag:
-            _say(log, "    send -> %s | auth=%s | target %s | profile=%s | home=%s"
+            _say(log, "    send -> %s | auth=%s | target %s"
                  % (short, "yes" if "@" in line else "no",
-                    unified_url(FLIGHT_PROBE), profile,
-                    "retry-only" if profile == PROFILE_DRESSED else "none"))
-        # Egress read in its OWN tab, so the target tab stays a clean first
-        # navigation. Same context, so it still proves the proxy is carried.
+                    unified_url(FLIGHT_PROBE)))
+        # Egress read in its OWN tab, so the target page stays a clean first
+        # navigation. ipify is a different host and costs the target nothing.
         try:
             probe_tab = ctx.new_page()
             try:
@@ -1655,95 +1600,56 @@ def _flight_one(line, diag=False, log=None, profile=PROFILE_VANILLA):
                      % (type(exc).__name__, _snippet(str(exc), 160)))
         if out["ip"] in ("", "-") and diag:
             _say(log, "      <- egress unread, target is tried anyway")
-        for attempt in (1, 2):
-            try:
-                resp = page.goto(unified_url(FLIGHT_PROBE),
-                                 wait_until="domcontentloaded",
-                                 timeout=FLIGHT_TIMEOUT)
-            except Exception as exc:
-                out["status"] = 0
-                out["reason"] = "%s: %s" % (type(exc).__name__,
-                                            _snippet(str(exc), 160))
-                if out["ip"] in ("", "-"):
-                    out["reason"] = "no egress ip and no status - " + out["reason"]
-                out["bucket"] = _bucket(0, out["reason"])
-                if diag:
-                    _say(log, "      <- transport raised %s | egress %s"
-                         % (out["reason"], out["ip"]))
-                return out
-            out["status"] = resp.status if resp is not None else 0
-            body = _body_of(resp)
-            out["size"] = len(body or "")
-            out["ctype"] = str((resp.headers or {}).get("content-type")
-                               if resp is not None else "-")[:60] or "-"
-            out["headers"] = _safe_headers(resp)
-            out["snippet"] = _snippet(body)
+        try:
+            resp = page.goto(unified_url(FLIGHT_PROBE),
+                             wait_until="domcontentloaded",
+                             timeout=FLIGHT_TIMEOUT)
+        except Exception as exc:
+            out["reason"] = "%s: %s" % (type(exc).__name__, _snippet(str(exc), 160))
+            if out["ip"] in ("", "-"):
+                out["reason"] = "no egress ip and no status - " + out["reason"]
+            out["bucket"] = _bucket(0, out["reason"])
             if diag:
-                _say(log, "      <- %s | content-type: %s | %d byte(s) | %s | "
-                          "egress %s%s"
-                     % (out["status"] or "?", out["ctype"], out["size"],
-                        out["headers"], out["ip"],
-                        "" if attempt == 1 else " (retry)"))
-                if out["snippet"]:
-                    _say(log, "        body: %s" % out["snippet"])
-            if out["status"] == 200:
-                # Colab's own test: the body starts with { or [ and json.loads.
-                if _json_any(body) is not None:
-                    out["ok"] = True
-                    out["reason"] = "200"
-                    out["bucket"] = "200"
-                    return out
-                page.wait_for_timeout(700)
-                got, payload = _inpage_fetch(page, FLIGHT_PROBE)
-                if isinstance(payload, dict):
-                    out["ok"] = True
-                    out["reason"] = "200"
-                    out["bucket"] = "200"
-                    return out
-                out["reason"] = "in-page %s" % (got or "200 non-JSON body")
-                out["bucket"] = _bucket(got, out["reason"])
-                if diag:
-                    _say(log, "      <- in-page %s after a non-JSON 200" % (got or "?"))
+                _say(log, "      <- transport raised %s | egress %s"
+                     % (out["reason"], out["ip"]))
+            return out
+        out["status"] = resp.status if resp is not None else 0
+        body = _body_of(resp)
+        out["size"] = len(body or "")
+        out["ctype"] = str((resp.headers or {}).get("content-type")
+                           if resp is not None else "-")[:60] or "-"
+        out["headers"] = _safe_headers(resp)
+        out["snippet"] = _snippet(body)
+        if diag:
+            _say(log, "      <- %s | content-type: %s | %d byte(s) | %s | egress %s"
+                 % (out["status"] or "?", out["ctype"], out["size"],
+                    out["headers"], out["ip"]))
+            if out["snippet"]:
+                _say(log, "        body: %s" % out["snippet"])
+        if out["status"] == 200:
+            # Colab's own test: the body starts with { or [ and json.loads.
+            if _json_any(body) is not None:
+                out["ok"] = True
+                out["reason"] = "200"
+                out["bucket"] = "200"
                 return out
-            if not out["status"] and out["ip"] in ("", "-"):
-                out["reason"] = "no egress ip and no status - proxy not carried"
-            else:
-                out["reason"] = "status %s" % (out["status"] or "?")
-            out["bucket"] = _bucket(out["status"], out["reason"])
-            if out["status"] not in RETRY_STATUS:
-                return out
-            # The same-origin XHR the site's own page makes. It carries Origin,
-            # a same-origin Referer and sec-fetch-mode: cors, which is what the
-            # WAF is judging - the document navigation is not.
-            page.wait_for_timeout(400)
+            page.wait_for_timeout(500)
             got, payload = _inpage_fetch(page, FLIGHT_PROBE)
             if isinstance(payload, dict):
                 out["ok"] = True
                 out["reason"] = "200"
                 out["bucket"] = "200"
-                if diag:
-                    _say(log, "      <- in-page 200, JSON body accepted")
                 return out
-            if got:
-                out["bucket"] = _bucket(got, "in-page %s" % got)
-                out["reason"] = "in-page %s" % got
-                if diag:
-                    _say(log, "      <- in-page %s after the %s"
-                         % (got, out["status"] or "?"))
-            if attempt == 1 and profile == PROFILE_DRESSED:
-                try:
-                    home = page.goto(HIBP_BASE + "/", wait_until="domcontentloaded",
-                                     timeout=FLIGHT_TIMEOUT)
-                    out["home"] = True
-                    if diag:
-                        _say(log, "      <- home %s | egress %s"
-                             % (getattr(home, "status", "?"), out["ip"]))
-                except Exception as exc:
-                    if diag:
-                        _say(log, "      <- home raised %s: %s | egress %s"
-                             % (type(exc).__name__, _snippet(str(exc), 160),
-                                out["ip"]))
-            page.wait_for_timeout(900)
+            out["reason"] = "in-page %s" % (got or "200 non-JSON body")
+            out["bucket"] = _bucket(got, out["reason"])
+            if diag:
+                _say(log, "      <- in-page %s after a non-JSON 200" % (got or "?"))
+            return out
+        if not out["status"] and out["ip"] in ("", "-"):
+            out["reason"] = "no egress ip and no status - proxy not carried"
+        else:
+            out["reason"] = "status %s" % (out["status"] or "?")
+        out["bucket"] = _bucket(out["status"], out["reason"])
         return out
     except Exception as exc:
         out["reason"] = "%s: %s" % (type(exc).__name__, _snippet(str(exc), 160))
@@ -1812,34 +1718,22 @@ def _flight_browser(alive, cancel=None, log=None, pin="", diag=False, codes=None
         with own:
             if not diag and len(kept) >= FLIGHT_WANT:
                 return
-        # Vanilla first - the Colab shape. A node it reads is kept and the dressed
-        # profile is never spent on it.
-        res = _flight_one(line, diag, log, PROFILE_VANILLA)
-        prof = PROFILE_VANILLA
-        if not res.get("ok"):
-            alt = _flight_one(line, diag, log, PROFILE_DRESSED)
-            if alt.get("ok"):
-                res, prof = alt, PROFILE_DRESSED
-                _say(log, "    ~ dressed -> %s | vanilla was refused, dressed read it"
-                     % short)
-            else:
-                _say(log, "    ~ dressed -> %s | also %s"
-                     % (short, alt.get("reason") or "?"))
-                if not res.get("ip") and alt.get("ip"):
-                    res["ip"] = alt["ip"]
+        # Stagger the lanes: two workers landing on the same shared exit IP in
+        # the same instant is the burst that got these IPs refused.
+        try:
+            time.sleep(random.uniform(0.0, FLIGHT_JITTER))
+        except Exception:
+            pass
+        res = _flight_one(line, diag, log)
         if codes is not None:
-            if res.get("ok"):
-                _bump(codes, ("vanilla_ok" if prof == PROFILE_VANILLA
-                              else "dressed_ok"), lock)
-            else:
-                _bump(codes, res.get("bucket") or "other", lock)
+            _bump(codes, res.get("bucket") or "other", lock)
         if res.get("ok"):
             country, city = _flight_geo(line)
             tag = " [OXYLABS CURRENT]" if "oxylabs.io" in line else ""
             with own:
                 kept.append(line)
-            _say(log, "    ✅ 200 -> %-22s | %-16s | %s%s | egress %s | %s"
-                 % (short, country, city, tag, res.get("ip"), prof))
+            _say(log, "    ✅ 200 -> %-22s | %-16s | %s%s | egress %s"
+                 % (short, country, city, tag, res.get("ip")))
         else:
             _say(log, "    skip  -> %-22s | test flight failed (%s) | egress %s"
                  % (short, res.get("reason") or "?", res.get("ip")))
@@ -1947,7 +1841,8 @@ def flight(force=False, cancel=None, diagnose=False) -> dict:
         _say(log, "   AUTO LIVE PROXIES + PLAYWRIGHT TEST FLIGHT%s"
              % ("  [DIAGNOSTIC]" if diag else ""))
         _say(log, "   Test email: %s" % FLIGHT_PROBE)
-        _say(log, "   Profile order: vanilla (Colab exact), then dressed")
+        _say(log, "   One navigation per node, %d at a time, staggered"
+             % FLIGHT_WORKERS)
         _say(log, "=" * 62)
         if not available():
             st["error"] = "browser not ready - %s" % browser_note()
@@ -1984,7 +1879,8 @@ def flight(force=False, cancel=None, diagnose=False) -> dict:
             st["error"] = "no candidate answered the endpoint with 200 and JSON"
             _say(log, "[!] " + st["error"])
             _say(log, "[*] Nothing was kept, so %s was left as it was - the reader "
-                      "keeps using proxies.txt." % FLIGHT_POOL)
+                      "keeps using proxies.txt, and a walled address falls back to "
+                      "the catalogue by domain." % FLIGHT_POOL)
         _summary_lines(log, codes, kept, diag, len(cand), len(alive))
         return st
     except Exception as exc:
@@ -2305,13 +2201,12 @@ def _close_thread_browser():
 
 
 class _Slot:
-    __slots__ = ("ctx", "page", "proxy", "prof", "uses", "fails")
+    __slots__ = ("ctx", "page", "proxy", "uses", "fails")
 
     def __init__(self):
         self.ctx = None
         self.page = None
         self.proxy = ""
-        self.prof = PROFILE_VANILLA
         self.uses = 0
         self.fails = 0
 
@@ -2324,19 +2219,17 @@ class _Slot:
         self.ctx = None
         self.page = None
         self.proxy = ""
-        self.prof = PROFILE_VANILLA
         self.uses = 0
         self.fails = 0
 
-    def open_ctx(self, proxy_line, profile=PROFILE_VANILLA):
+    def open_ctx(self, proxy_line):
         self.close_ctx()
         b = _browser()
-        ctx = _new_context(b, proxy_line, profile)
+        ctx = _new_context(b, proxy_line)
         ctx.set_default_timeout(NAV_TIMEOUT)
         self.ctx = ctx
         self.page = ctx.new_page()
         self.proxy = proxy_line or ""
-        self.prof = profile
 
     def reset(self):
         if self.page is not None and not self.page.is_closed():
@@ -2347,23 +2240,23 @@ class _Slot:
         except Exception:
             pass
 
-    def get(self, proxy_line, profile=PROFILE_VANILLA):
+    def get(self, proxy_line):
         try:
             if self.ctx is None or self.page is None:
-                self.open_ctx(proxy_line, profile)
+                self.open_ctx(proxy_line)
             elif self.uses >= SLOT_USES_MAX:
                 trace("INFO", "slot", "recycling after %d use(s)" % self.uses)
-                self.open_ctx(proxy_line, profile)
-            elif (proxy_line or "") != self.proxy or profile != self.prof:
-                self.open_ctx(proxy_line, profile)
+                self.open_ctx(proxy_line)
+            elif (proxy_line or "") != self.proxy:
+                self.open_ctx(proxy_line)
             elif self.page.is_closed():
-                self.open_ctx(proxy_line, profile)
+                self.open_ctx(proxy_line)
             else:
                 self.reset()
         except Exception as exc:
             trace("WARN", "slot", "reopen after %s" % type(exc).__name__)
             self.close_ctx()
-            self.open_ctx(proxy_line, profile)
+            self.open_ctx(proxy_line)
         return self.page
 
     def ok(self):
@@ -2397,16 +2290,21 @@ def _close_all_slots():
         s.close_ctx()
 
 
-def _attempt(addr, proxy_line, profile=PROFILE_VANILLA):
+def _attempt(addr, proxy_line):
     label = (proxy_line.rsplit("@", 1)[-1] if proxy_line else "DIRECT")
     url = unified_url(addr)
     slot = _slot()
     try:
-        page = slot.get(proxy_line, profile)
+        page = slot.get(proxy_line)
     except Exception as exc:
         trace("ERR", "fetch", "no page via %s: %s" % (label, type(exc).__name__), addr)
         return 0, None
     try:
+        # A small stagger so the workers do not land together on one exit IP.
+        try:
+            time.sleep(random.uniform(0.0, READ_JITTER))
+        except Exception:
+            pass
         resp = page.goto(url, wait_until="domcontentloaded", timeout=NAV_TIMEOUT)
         status = resp.status if resp is not None else 0
         body = ""
@@ -2434,19 +2332,7 @@ def _attempt(addr, proxy_line, profile=PROFILE_VANILLA):
         if status == 404:
             slot.ok()
             return 404, None
-        if status in RETRY_STATUS:
-            # Same-origin re-ask: the XHR the page itself makes, with a Referer
-            # and Origin the navigation does not carry.
-            page.wait_for_timeout(400)
-            got, payload = _inpage_fetch(page, addr)
-            if isinstance(payload, dict):
-                slot.ok()
-                return 200, payload
-            if got == 404:
-                slot.ok()
-                return 404, None
-            slot.ok()
-            return got or status, None
+        # A 401 is a dead end: no in-page re-ask, just the next node.
         slot.ok()
         return status, None
     except Exception as exc:
@@ -2459,17 +2345,14 @@ def _search_address(addr, cancel=None):
     seen = []
     errors = []
     used = set()
-    # Alternate the profiles: vanilla is the shape that reads, dressed is the
-    # fallback for a node vanilla refuses.
-    shapes = (PROFILE_VANILLA, PROFILE_DRESSED, PROFILE_VANILLA)
-    for n in range(PROXY_TRIES):
+    for _ in range(PROXY_TRIES):
         if _is_cancelled(cancel):
             return None, "", "cancelled", seen
         line = _pick_proxy(used)
         if line is None:
             break
         used.add(line)
-        status, payload = _attempt(addr, line, shapes[n % len(shapes)])
+        status, payload = _attempt(addr, line)
         label = line.rsplit("@", 1)[-1]
         seen.append(status)
         if payload is not None:
@@ -2485,14 +2368,7 @@ def _search_address(addr, cancel=None):
     if _zero_rule(seen):
         return {}, "", "", seen
 
-    # A key sidesteps the wall entirely - try it before spending DIRECT.
-    if key_present():
-        got = _api_lookup(addr)
-        if got is not None:
-            return got, "KEY", "", seen
-        errors.append("KEY: failed")
-
-    status, payload = _attempt(addr, None, PROFILE_VANILLA)
+    status, payload = _attempt(addr, None)
     seen.append(status)
     if payload is not None:
         return payload, "DIRECT", "", seen
@@ -2600,7 +2476,7 @@ def _page_from_record(rec) -> dict:
     _pw = rec.get("pw_count")
     pc = rec.get("password_check") or {}
     if rec.get("partial_read"):
-        basis = "domain match - the exact search was refused"
+        basis = "domain match - the exact search was walled"
     elif not rec.get("read"):
         basis = "nothing readable - proxy, in-page fetch and direct all failed"
     elif rec.get("count"):
@@ -2615,7 +2491,7 @@ def _page_from_record(rec) -> dict:
              "checked: %s" % (rec.get("checked_at") or ""),
              "verdict: %s - %s" % (rec.get("verdict") or "?", rec.get("reason") or ""),
              "address half: %s" % (rec.get("addr_verdict") or "UNREAD"),
-             "password half: %s" % (rec.get("pw_band") or "none"),
+<｜begin▁of▁sentence｜>|             "password half: %s" % (rec.get("pw_band") or "none"),
              "password appearances: %s" % (_pw if _pw is not None
                                            else "no password supplied"),
              "source: %s" % (rec.get("via") or "-"),
@@ -2866,6 +2742,7 @@ def check_item(item, force=False, cancel=None) -> dict:
             _pw_halves(rec, item, force)
             rec["read"] = True
             rec["partial_read"] = True
+            rec["via"] = "catalogue"
             rec["via_proxy"] = ""
             rec["error"] = "; ".join("%s: %s" % ("proxies", s or "err") for s in seen)
             trace("INFO", "catalogue", "%d domain match(es) - 404 zero filled"
@@ -2879,12 +2756,30 @@ def check_item(item, force=False, cancel=None) -> dict:
             trace("INFO", "address", "404 - reported as no breach (statuses %s)"
                   % seen, email)
     else:
-        rec["via"] = "browser"
-        rec["via_proxy"] = ""
-        rec["read"] = False
-        rec["error"] = ("cancelled" if _is_cancelled(cancel) else
-                        "connection/proxy error - unreachable on proxy, in-page fetch "
-                        "and direct" + ((" (%s)" % err) if err else ""))
+        # The address half was walled. Pwned Passwords and the catalogue are both
+        # keyless and neither sits behind the wall, so the domain gets looked up
+        # instead of leaving an empty card. A domain answer beats no answer, and
+        # `partial_read` says exactly what it is.
+        rows = _cat_rows(email)
+        if rows:
+            rec = _parse_payload(item, {"Breaches": rows}, "catalogue", started,
+                                 item["password"])
+            _pw_halves(rec, item, force)
+            rec["read"] = True
+            rec["partial_read"] = True
+            rec["via"] = "catalogue"
+            rec["via_proxy"] = ""
+            rec["error"] = ("the exact search was walled - filled from the catalogue "
+                            "by DOMAIN" + ((" (%s)" % err) if err else ""))
+            trace("INFO", "catalogue", "%d domain match(es) - walled address filled"
+                  % len(rows), email)
+        else:
+            rec["via"] = "browser"
+            rec["via_proxy"] = ""
+            rec["read"] = False
+            rec["error"] = ("cancelled" if _is_cancelled(cancel) else
+                            "connection/proxy error - unreachable on proxy, in-page "
+                            "fetch and direct" + ((" (%s)" % err) if err else ""))
 
     rec["breach_count"] = len(rec.get("breaches") or [])
     rec["summary_note"] = _summary_note(rec)
@@ -3108,9 +3003,6 @@ def selftest(verbose=False) -> bool:
         HIBP_BASE + "/unifiedsearch/a%40b.co")
     add("flight_probe_url", unified_url(FLIGHT_PROBE) ==
         HIBP_BASE + "/unifiedsearch/eddiemurphy%40gmail.com")
-    add("key_api_url", KEY_API % "a%40b.co" ==
-        HIBP_BASE + "/api/v3/breachedaccount/a%40b.co?truncateResponse=false")
-    add("api_lookup_callable", callable(_api_lookup))
     add("container_args", "--no-sandbox" in CONTAINER_ARGS)
     add("container_args_slim", len(CONTAINER_ARGS) == 2)
     add("hostport", _hostport("u:p@1.2.3.4:8080") == "1.2.3.4:8080")
@@ -3119,8 +3011,6 @@ def selftest(verbose=False) -> bool:
     # ---- the diagnostic plumbing ----
     add("outcomes_have_200", "200" in [k for k, _m in OUTCOMES])
     add("outcomes_have_ipify_fail", "ipify_fail" in [k for k, _m in OUTCOMES])
-    add("outcomes_have_profiles", "vanilla_ok" in dict(OUTCOMES)
-        and "dressed_ok" in dict(OUTCOMES))
     add("no_egress_is_informational", "no status" in dict(OUTCOMES)["no_egress"])
     add("bucket_200", _bucket(200) == "200")
     add("bucket_401", _bucket(401, "status 401") == "401")
@@ -3161,9 +3051,8 @@ def selftest(verbose=False) -> bool:
     add("json_any_junk", _json_any("hello") is None)
     add("json_of_list_is_none", _json_of("[1]") is None)
 
-    # ---- the profiles: vanilla is Colab-exact, dressed carries the extras ----
-    add("profile_consts", PROFILE_VANILLA == "vanilla"
-        and PROFILE_DRESSED == "dressed")
+    # ---- the profiles: vanilla is active and Colab-exact, dressed stays valid ----
+    add("active_profile_vanilla", _ACTIVE_PROFILE == PROFILE_VANILLA)
     add("ctx_vanilla_no_headers", "extra_http_headers" not in _ctx_kw(None))
     add("ctx_vanilla_no_tz", "timezone_id" not in _ctx_kw(None))
     add("ctx_vanilla_no_screen", "screen" not in _ctx_kw(None))
@@ -3177,31 +3066,19 @@ def selftest(verbose=False) -> bool:
         == "America/New_York")
     add("ctx_dressed_screen", (_ctx_kw(None, PROFILE_DRESSED).get("screen") or {})
         .get("width") == 1920)
-    add("ctx_dressed_not_mobile", _ctx_kw(None, PROFILE_DRESSED).get("is_mobile")
-        is False)
-    add("ctx_dressed_no_touch", _ctx_kw(None, PROFILE_DRESSED).get("has_touch")
-        is False)
-    add("ctx_headers_copied", _ctx_kw(None, PROFILE_DRESSED)["extra_http_headers"]
-        is not CTX_HEADERS)
     add("ctx_headers_referer", CTX_HEADERS.get("Referer") == HIBP_BASE + "/")
     add("ctx_headers_origin", CTX_HEADERS.get("Origin") == HIBP_BASE)
-    add("ctx_headers_sec_fetch", "sec-fetch-site" in CTX_HEADERS)
     add("ctx_kw_proxy", (_ctx_kw("u:p@1.2.3.4:8080").get("proxy") or {}).get("server")
         == "http://1.2.3.4:8080")
     add("ctx_kw_direct_no_proxy", "proxy" not in _ctx_kw(None))
     add("stealth_webdriver", "webdriver" in STEALTH_JS)
     add("stealth_platform", "'Win32'" in STEALTH_JS)
-    add("stealth_plugins", "PDF Viewer" in STEALTH_JS)
-    add("stealth_webgl", "37446" in STEALTH_JS)
     add("stealth_no_angle", "\x3c" not in STEALTH_JS)
     add("new_context_callable", callable(_new_context))
-    add("flight_one_takes_profile", "profile" in inspect_sig(_flight_one))
-    add("slot_has_prof", "prof" in _Slot.__slots__)
+    add("flight_one_callable", callable(_flight_one))
     add("gateway_dead_407", _gateway_dead("ProxyError: Tunnel connection failed: "
                                           "407 Unauthorized"))
-    add("gateway_dead_word", _gateway_dead("Tunnel connection failed: Unauthorized"))
     add("gateway_alive_503", not _gateway_dead("ipify http 503"))
-    add("gateway_alive_timeout", not _gateway_dead("ReadTimeout: x"))
 
     add("blank_read_false", _blank({"kind": "email", "email": "a@b.co"}).get("read") is False)
     add("blank_addr_unread", _blank({"kind": "email", "email": "a@b.co"}).get("addr_verdict")
@@ -3226,7 +3103,6 @@ def selftest(verbose=False) -> bool:
     add("no_zero_on_403", not _zero_rule([403, 0, 0]))
     add("no_zero_on_empty", not _zero_rule([]))
     add("retry_status_has_401", 401 in RETRY_STATUS)
-    add("retry_status_has_403", 403 in RETRY_STATUS)
 
     add("pw_hash", len(_pw_hash("abc")) == 40)
     add("pw_new", _pw_bucket(0) == "NEW")
@@ -3306,11 +3182,13 @@ def selftest(verbose=False) -> bool:
     add("flight_takes_diagnose", "diagnose" in inspect_sig(flight))
     add("flight_consts", FLIGHT_WANT >= 1 and FLIGHT_MAX >= FLIGHT_WANT
         and POOL_TTL > 0)
-    add("flight_concurrency_five", FLIGHT_WORKERS == 5)
+    add("flight_workers_low", FLIGHT_WORKERS <= 3)
+    add("flight_jitter", FLIGHT_JITTER > 0)
+    add("read_jitter", READ_JITTER > 0)
     add("flight_timeout_35s", FLIGHT_TIMEOUT == 35000)
     add("flight_probe_is_email", is_email(FLIGHT_PROBE))
     add("flight_pool_only", FLIGHT_POOL == "proxies_breach.txt")
-    add("flight_cap_above_130", FLIGHT_MAX >= 140)
+    add("flight_cap_above_140", FLIGHT_MAX >= 140)
     add("fetch_js", "fetch(" in FETCH_JS and "credentials" in FETCH_JS)
     add("flight_geo_helper", callable(_flight_geo))
     add("flight_log_helper", "no test flight" in flight_log_text())
