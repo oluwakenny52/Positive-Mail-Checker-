@@ -1,35 +1,59 @@
 """breach.py - breach exposure and combo freshness.  v13.86
 
-THE FLOW IS THE COLAB FLOW
-------------------------
+THE FLOW IS THE COLAB FLOW, WITH A SECOND SOURCE BEHIND IT
+----------------------------------------------------------
 Per item: build the unifiedsearch URL, then up to PROXY_TRIES (3) attempts, each
 one a random live node from the owner's own pool in a real headless Chromium
 with the proxy on the context.
 
     200 + JSON     parse it, remember the node as via_proxy, stop
     404            the site's own "not in any breach", stop
-    401 / 403      the endpoint refusing the caller - next node, then DIRECT
+    401 / 403      the endpoint refusing the CALLER - next node, then DIRECT
     anything else  next node
 
 A 200 that is NOT JSON is the only case that gets a same-origin fetch() from
 inside the page: there is a document to fetch from and the shell may carry what
-the plain navigation lacked. A 401 does NOT get one any more - it is a dead end
-that costs a request and repeats the same 401.
+the plain navigation lacked. A 401 does NOT get one - it is the same 401 from the
+same address and it only costs a request.
 
-ONLY A 404 IS A READABLE ZERO
------------------------------
+THE WALL IS ABOUT THE CALLER, NOT THE NODE
+------------------------------------------
+`{"message": "You're probably a bot, try the official API instead"}` with a
+`cf-ray` header is HIBP's own answer, produced by Cloudflare's bot score. A node
+that produces it is ALIVE: the tunnel opened, TLS completed, the edge answered,
+and the egress IP in the line is the node's own. Only a transport failure is a
+dead node. So the flight keeps any node the target ANSWERED (200, 401, 403, 404,
+429) and counts the 200s separately, and the reader does not need a 200 either,
+because a walled address has a second source.
+
+THE SECOND SOURCE IS PER-ADDRESS AND OUTSIDE THE WALL
+-----------------------------------------------------
+XposedOrNot (`/v1/breach-analytics`) is keyless, is not behind the HIBP wall, and
+answers the EXACT address with breach names, domains, years, record counts, data
+classes and descriptions. The HIBP catalogue then names the same breaches, so the
+row is filled with the real date and record count instead of a bare name. It is
+tried only when the HIBP half was walled, and the record says so: `via` is
+`xposedornot`, `read` is True and `partial_read` is False, because the address
+half WAS read - just not by HIBP. A miss there is a readable zero and is labelled
+as an index miss; an unreachable XposedOrNot falls through to the catalogue.
+
+WHAT A ZERO IS
+--------------
 A 404 is the site's own "not in any breach" - an answer about the ADDRESS. A 401
 is the endpoint refusing the CALLER, which says nothing about the mailbox, so it
-is retried (three nodes, then DIRECT) instead of being reported as clean.
+is retried (three nodes, then DIRECT) and then handed to the second source
+instead of being reported as clean. A zero is only ever reported from a source
+that actually answered.
 
 THE FREE SOURCES FILL THE WALL
 ------------------------------
 Pwned Passwords and the public catalogue are both keyless and neither is behind
 the wall. When the address half is walled and nothing readable came back, the
-domain is looked up in the catalogue and any breaches fill the record as a
-DOMAIN match, flagged `partial_read`. A domain answer is worth more than an empty
-card, and it is labelled for what it is. When the domain has nothing either, the
-address half stays UNREAD - a wall is never a zero.
+exact address goes to XposedOrNot first; only if that fails too is the domain
+looked up in the catalogue and filled as a DOMAIN match, flagged `partial_read`.
+A domain answer is worth more than an empty card, and it is labelled for what it
+is. When the domain has nothing either, the address half stays UNREAD - a wall is
+never a zero.
 
 A COMBO IS GRADED ON BOTH HALVES
 --------------------------------
@@ -59,17 +83,23 @@ had simply been fed too much. The flight is now the Colab call and nothing more.
     step 2       headless Chromium, TWO at a time, one context per node, ONE
                  navigation, with a short random jitter before it so two lanes
                  never land on the same exit IP in the same instant
-    pass         HTTP 200 AND a JSON body
+    carry        the target ANSWERED the node: 200, 404, 401, 403 or 429
+    read         200 AND a JSON body - counted separately, and the early stop
+                 waits for FLIGHT_READ_WANT of them, never for the first few
     log          "    ✅ 200 -> host:port | country | city | egress IP"
+                 "    keep  -> host:port | carried (401) | country | city | egress"
                  "    skip  -> host:port | test flight failed (reason) | egress IP"
-    save         the survivors, one per line, to proxies_breach.txt
-    summary      "[*] Passed test flight (✅ 200) : N" and the file name
+    save         every carried node, one per line, to proxies_breach.txt
+    summary      "[*] Passed test flight (✅ 200) : N", the carried count and the
+                 file name
 
 LOW BURST PRESSURE IS THE POINT
 -------------------------------
 FLIGHT_WORKERS is 2 and every node waits a random 0-0.7 s first. Eleven shared
 exit IPs cannot absorb five lanes firing back to back; they can absorb two that
-are staggered. Slower is faster here.
+are staggered. Slower is faster here. The pool is then kept for an hour
+(POOL_TTL), because a flight is itself a burn: the same exits flown every half
+hour arrive already scored.
 
 THE DIAGNOSTIC FLIGHT
 ---------------------
@@ -82,7 +112,7 @@ Credentials are never printed - only host:port and auth=yes/no.
 
 It closes with a count per outcome and a legend for every code it can emit, so a
 wall of 401s says WHAT a 401 is here instead of just being one. It does not stop
-at FLIGHT_WANT, so every node is reported. Keeping still requires 200 + JSON.
+at FLIGHT_WANT, so every node is reported.
 
 WHY THE EGRESS IP IS LOGGED
 ---------------------------
@@ -135,7 +165,9 @@ The public catalogue (`/api/v3/breaches`) is keyless, unchallenged and indexed b
 domain, so a 404 zero - and now a wall - gets the domain looked up, and if it has
 breaches they fill the record with real names, dates, data classes and record
 counts. That sets `partial_read`, because it is a DOMAIN match and not an
-individual confirmation, and it is never cached as exact.
+individual confirmation, and it is never cached as exact. The catalogue is also
+indexed by NAME here, so the XposedOrNot path above can name its breaches with
+the real date, record count and data classes instead of a bare string.
 
 PAGES ARE TIED TO WORKERS
 -------------------------
@@ -221,6 +253,12 @@ UNIFIED = HIBP_BASE + "/unifiedsearch/%s"
 ACCOUNT = HIBP_BASE + "/account/%s"
 CATALOGUE_URL = HIBP_BASE + "/api/v3/breaches"
 PW_RANGE = "https://api.pwnedpasswords.com/range/%s"
+
+# The second source. Keyless, per-address, and NOT behind the HIBP wall.
+XPOSED_BASE = "https://api.xposedornot.com/v1"
+XPOSED_ANALYTICS = XPOSED_BASE + "/breach-analytics?email=%s"
+XPOSED_TIMEOUT = 20.0
+XPOSED_ROWS_MAX = 200
 
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
@@ -368,6 +406,14 @@ HTTP_TIMEOUT = 15.0
 # re-ask at all.
 RETRY_STATUS = frozenset({401, 403, 408, 425, 429, 500, 502, 503, 504})
 
+# A node CARRIED the request when the target ANSWERED it at all. 401/403 are the
+# WAF judging the caller, 404 is the site's own zero, 429 is "slow down" - all of
+# them mean the tunnel, the TLS and the edge worked, so none of them drops a node.
+CARRY_STATUS = frozenset({200, 401, 403, 404, 429})
+
+# The wall. A refusal about the CALLER says nothing about the mailbox.
+WALL_STATUS = frozenset({401, 403, 429})
+
 # The Colab limit. Three nodes, then DIRECT if no 404 arrived.
 PROXY_TRIES = 3
 
@@ -388,6 +434,7 @@ FLIGHT_POOL = "proxies_breach.txt"
 FLIGHT_PROBE = "eddiemurphy@gmail.com"
 FLIGHT_MAX = 200
 FLIGHT_WANT = 12
+FLIGHT_READ_WANT = 12
 FLIGHT_WORKERS = 2
 FLIGHT_JITTER = 0.7
 FLIGHT_BUDGET = 300.0
@@ -399,7 +446,7 @@ FLIGHT_SNIPPET = 200
 IPIFY_WORKERS = 12
 IPIFY_TIMEOUT = 8.0
 IPIFY_URL = "https://api.ipify.org?format=json"
-POOL_TTL = 1800.0
+POOL_TTL = 3600.0
 WS_PAGES = 20
 WS_PAGE_SIZE = 100
 READ_JITTER = 0.25
@@ -411,11 +458,12 @@ DIAG_HEADERS = ("server", "cf-ray", "www-authenticate", "proxy-authenticate",
 # Every outcome the diagnostic summary can print, in report order.
 OUTCOMES = (
     ("200", "read - JSON body accepted, node KEPT"),
-    ("404", "endpoint answered not-found - a readable zero for that address"),
-    ("401", "rejected / challenged by the target WAF - nothing readable"),
-    ("403", "forbidden or blocked by the WAF"),
-    ("429", "rate limited - the node is alive but must slow down"),
-    ("5xx", "target-side error - node alive, endpoint unwell"),
+    ("404", "endpoint answered not-found - a readable zero for that address, KEPT"),
+    ("401", "the WAF refused the CALLER - nothing readable, but the node is alive "
+            "and is KEPT"),
+    ("403", "forbidden by the WAF - node alive, KEPT"),
+    ("429", "rate limited - the node is alive, KEPT, and must slow down"),
+    ("5xx", "target-side error - node alive, retried on the next one"),
     ("0", "transport failure - timeout, TLS, reset or proxy dropped"),
     ("no_egress", "no egress IP and no status - the proxy was probably not carried"),
     ("other", "any other status"),
@@ -453,6 +501,21 @@ CORPORA = frozenset({
     "emotet", "qakbot", "redline", "raccoon", "vidar", "lumma",
 })
 
+
+def _corpus_key(name) -> str:
+    """A breach name reduced to letters and digits, for matching a corpus.
+
+    The catalogue says `Collection #1`, XposedOrNot says `Collection-1`; both
+    reduce to `collection1`, so one table matches either spelling.
+    """
+    try:
+        return re.sub(r"[^a-z0-9]+", "", str(name or "").lower())
+    except Exception:
+        return ""
+
+
+_CORPUS_KEYS = frozenset(_corpus_key(n) for n in CORPORA)
+
 _cfg = {"timeout": 240.0, "delay": DELAY_DEFAULT, "rotate": True,
         "workers": 3, "pool": None, "flight": True}
 _lock = threading.RLock()
@@ -463,7 +526,7 @@ _bads = {}
 _slots = {}
 
 _cat_lock = threading.Lock()
-_cat = {"ts": 0.0, "by_domain": {}, "busy": False, "error": ""}
+_cat = {"ts": 0.0, "by_domain": {}, "by_name": {}, "busy": False, "error": ""}
 
 _flights = {}
 
@@ -685,7 +748,7 @@ def key_present() -> bool:
 
 
 def key_hint() -> str:
-    return "keyless - browser, catalogue and Pwned Passwords"
+    return "keyless - browser, XposedOrNot, catalogue and Pwned Passwords"
 
 
 # ---------------------------------------------------------------------------
@@ -1054,6 +1117,8 @@ def _is_corpus(breach) -> bool:
     name = str(breach.get("Name") or breach.get("Title") or "").strip().lower()
     if name in CORPORA:
         return True
+    if _corpus_key(name) in _CORPUS_KEYS:
+        return True
     if any(k in name for k in ("stealer", "combolist", "credential stuff",
                                "txtbase", "naz.api")):
         return True
@@ -1180,20 +1245,23 @@ def catalogue(force=False):
         with _cat_lock:
             _cat["error"] = "fetch failed"
         return _cat["by_domain"] or None
-    index = {}
+    index, names = {}, {}
     for b in rows:
         if not isinstance(b, dict):
             continue
         d = str(b.get("Domain") or "").strip().lower().strip(".")
-        if not d:
-            continue
-        index.setdefault(d, []).append(b)
+        if d:
+            index.setdefault(d, []).append(b)
+        n = _corpus_key(b.get("Name"))
+        if n and n not in names:
+            names[n] = b
     with _cat_lock:
         _cat["by_domain"] = index
+        _cat["by_name"] = names
         _cat["ts"] = time.time()
         _cat["error"] = ""
-    trace("INFO", "catalogue", "%d breach(es) indexed over %d domain(s)"
-          % (len(rows), len(index)))
+    trace("INFO", "catalogue", "%d breach(es) indexed over %d domain(s) and %d name(s)"
+          % (len(rows), len(index), len(names)))
     return index
 
 
@@ -1213,10 +1281,128 @@ def _cat_rows(email):
     return []
 
 
+def _cat_row_by_name(name):
+    """The catalogue row for a breach NAME, or None. Read-only, cached."""
+    cat = catalogue()
+    if not cat:
+        return None
+    key = _corpus_key(name)
+    if not key:
+        return None
+    with _cat_lock:
+        return (_cat.get("by_name") or {}).get(key)
+
+
 def catalogue_state() -> dict:
     with _cat_lock:
         return {"domains": len(_cat["by_domain"]), "age": int(time.time() - _cat["ts"])
                 if _cat["ts"] else -1, "error": _cat["error"]}
+
+
+# ---------------------------------------------------------------------------
+# the second source - keyless, per-address, and outside the wall
+# ---------------------------------------------------------------------------
+def _xposed_fetch(email):
+    """(status, data) from XposedOrNot. Never raises; 0 on transport."""
+    try:
+        import requests
+    except Exception:
+        return 0, None
+    url = XPOSED_ANALYTICS % urllib.parse.quote(_email_only(email))
+    try:
+        trace("INFO", "xposed", "GET %s" % url, email)
+        r = requests.get(url, timeout=XPOSED_TIMEOUT,
+                         headers={"User-Agent": UA, "Accept": "application/json"})
+    except Exception as exc:
+        trace("ERR", "xposed", "%s: %s" % (type(exc).__name__, str(exc)[:160]), email)
+        return 0, None
+    trace("INFO", "xposed", "http %d, %d byte(s)"
+          % (r.status_code, len(r.content or b"")), email)
+    if r.status_code != 200:
+        return r.status_code, None
+    try:
+        return 200, r.json()
+    except Exception:
+        return 200, None
+
+
+def _xposed_rows(data):
+    """The breach list of an XposedOrNot answer, HIBP-shaped and catalogue-filled.
+
+    -> a list (possibly empty) when the answer was readable, else None. A row is
+    filled from the catalogue by NAME wherever the catalogue knows the breach, so
+    the date, record count and data classes are HIBP's own and not a bare year.
+    """
+    if not isinstance(data, dict):
+        return None
+    blk = data.get("ExposedBreaches")
+    det = blk.get("breaches_details") if isinstance(blk, dict) else None
+    if not isinstance(det, list):
+        summ = data.get("BreachesSummary")
+        site = summ.get("site") if isinstance(summ, dict) else ""
+        names = [s.strip() for s in str(site or "").split(";") if s.strip()]
+        if not names:
+            return None
+        det = [{"breach": n} for n in names]
+    rows = []
+    for d in det[:XPOSED_ROWS_MAX]:
+        if not isinstance(d, dict):
+            continue
+        name = str(d.get("breach") or "").strip()
+        if not name:
+            continue
+        cat = _cat_row_by_name(name) or {}
+        date = str(cat.get("BreachDate") or "")[:10]
+        if not date:
+            year = str(d.get("xposed_date") or "").strip()[:4]
+            if year.isdigit():
+                date = "%s-01-01" % year
+        classes = [c.strip() for c in str(d.get("xposed_data") or "").split(";")
+                   if c.strip()]
+        if not classes:
+            classes = [str(c) for c in (cat.get("DataClasses") or [])]
+        rows.append({
+            "Name": name,
+            "Title": str(cat.get("Title") or name)[:160],
+            "Domain": str(cat.get("Domain") or d.get("domain") or ""),
+            "BreachDate": date,
+            "AddedDate": str(cat.get("AddedDate") or d.get("added") or "")[:24],
+            "PwnCount": int(cat.get("PwnCount") or d.get("xposed_records") or 0),
+            "Description": str(cat.get("Description") or d.get("details") or ""),
+            "DataClasses": classes[:12],
+            "IsVerified": str(d.get("verified") or "").strip().lower() == "yes",
+            "IsSensitive": False,
+            "IsStealerLog": "stealer" in name.lower(),
+            "IsSpamList": _corpus_key(name) in _CORPUS_KEYS,
+        })
+    return rows
+
+
+def _xposed_lookup(email):
+    """('hit'|'miss'|'fail', payload, note) for one address. Never raises.
+
+    'hit'  a readable answer that lists breaches - payload is HIBP-shaped
+    'miss' a readable answer that lists none - a zero from a source that answered
+    'fail' nothing readable - the caller falls through to the catalogue
+    """
+    try:
+        status, data = _xposed_fetch(email)
+    except Exception as exc:
+        return "fail", None, "%s: %s" % (type(exc).__name__, str(exc)[:120])
+    if status == 404:
+        return "miss", None, "xposedornot: not indexed"
+    if status != 200:
+        return "fail", None, "xposedornot: %s" % (status or "transport")
+    if not isinstance(data, dict):
+        return "fail", None, "xposedornot: body was not JSON"
+    if str(data.get("Error") or "").strip():
+        return "miss", None, "xposedornot: %s" % str(data["Error"])[:60]
+    rows = _xposed_rows(data)
+    if rows is None:
+        return "fail", None, "xposedornot: no breach list in the answer"
+    if not rows:
+        return "miss", None, "xposedornot: lists no breach"
+    return "hit", {"Breaches": rows}, "xposedornot: %d breach(es)" % len(rows)
 
 
 # ---------------------------------------------------------------------------
@@ -1556,23 +1742,27 @@ def _inpage_fetch(page, addr):
 def _flight_one(line, diag=False, log=None):
     """One node, one context, ONE navigation - the Colab Cell 2 call.
 
-    -> dict(ok, reason, bucket, ip, status, ctype, size, headers, snippet).
+    -> dict(ok, carried, reason, bucket, ip, status, ctype, size, headers, snippet).
+    `ok` is a 200 that parsed as JSON. `carried` is "the target ANSWERED this node
+    at all", which includes the 401/403 the WAF hands the caller and the 404 that
+    is the site's own zero - those are alive nodes and they are kept.
+
     The target page is the FIRST page in the context and its only navigation is
     the unified URL: the egress read lives in a second tab that is closed first,
     and that tab talks to ipify, not to the target.
 
     Nothing re-asks on a 401. The wall is a verdict, not a hiccup: five requests
     per node is what cooked eleven shared exit IPs, so a refused node is simply
-    recorded and dropped. The only in-page fetch left is the one for a 200 that
-    is not JSON, because there a document exists and the answer may still be
-    behind it.
+    recorded and kept. The only in-page fetch left is the one for a 200 that is
+    not JSON, because there a document exists and the answer may still be behind
+    it.
 
     The egress IP is INFORMATIONAL: a failed read never drops the node.
     Credentials are never printed, only host:port and auth=yes/no.
     """
     ctx = None
-    out = {"ok": False, "reason": "", "bucket": "other", "ip": "-", "status": 0,
-           "ctype": "-", "size": 0, "headers": "-", "snippet": ""}
+    out = {"ok": False, "carried": False, "reason": "", "bucket": "other", "ip": "-",
+           "status": 0, "ctype": "-", "size": 0, "headers": "-", "snippet": ""}
     short = line.rsplit("@", 1)[-1]
     try:
         b = _browser()
@@ -1614,6 +1804,7 @@ def _flight_one(line, diag=False, log=None):
                      % (out["reason"], out["ip"]))
             return out
         out["status"] = resp.status if resp is not None else 0
+        out["carried"] = out["status"] in CARRY_STATUS
         body = _body_of(resp)
         out["size"] = len(body or "")
         out["ctype"] = str((resp.headers or {}).get("content-type")
@@ -1705,7 +1896,15 @@ def _flight_ipify(cand, cancel=None, log=None, pin="", diag=False, codes=None,
 
 def _flight_browser(alive, cancel=None, log=None, pin="", diag=False, codes=None,
                     lock=None):
-    kept, own = [], threading.Lock()
+    """-> (carried lines, number of them that READ with 200 + JSON).
+
+    A node is kept when the target ANSWERED it (CARRY_STATUS). The early stop is
+    on the READ count, not the kept count: on a walled day every node is 401, so
+    stopping at FLIGHT_WANT kept nodes would stop after twelve and leave a pool of
+    twelve - which is exactly what a walled day needs most of.
+    """
+    kept, reads = [], [0]
+    own = threading.Lock()
     lock = lock or own
     deadline = time.time() + FLIGHT_BUDGET
     width = max(1, min(FLIGHT_WORKERS, len(alive) or 1))
@@ -1716,7 +1915,7 @@ def _flight_browser(alive, cancel=None, log=None, pin="", diag=False, codes=None
         if _is_cancelled(cancel) or time.time() > deadline:
             return
         with own:
-            if not diag and len(kept) >= FLIGHT_WANT:
+            if not diag and reads[0] >= FLIGHT_READ_WANT:
                 return
         # Stagger the lanes: two workers landing on the same shared exit IP in
         # the same instant is the burst that got these IPs refused.
@@ -1727,16 +1926,23 @@ def _flight_browser(alive, cancel=None, log=None, pin="", diag=False, codes=None
         res = _flight_one(line, diag, log)
         if codes is not None:
             _bump(codes, res.get("bucket") or "other", lock)
+        if not res.get("carried"):
+            _say(log, "    skip  -> %-22s | test flight failed (%s) | egress %s"
+                 % (short, res.get("reason") or "?", res.get("ip")))
+            return
+        country, city = _flight_geo(line)
+        tag = " [OXYLABS CURRENT]" if "oxylabs.io" in line else ""
+        with own:
+            kept.append(line)
+            if res.get("ok"):
+                reads[0] += 1
         if res.get("ok"):
-            country, city = _flight_geo(line)
-            tag = " [OXYLABS CURRENT]" if "oxylabs.io" in line else ""
-            with own:
-                kept.append(line)
             _say(log, "    ✅ 200 -> %-22s | %-16s | %s%s | egress %s"
                  % (short, country, city, tag, res.get("ip")))
         else:
-            _say(log, "    skip  -> %-22s | test flight failed (%s) | egress %s"
-                 % (short, res.get("reason") or "?", res.get("ip")))
+            _say(log, "    keep  -> %-22s | carried (%s) | %-16s | %s%s | egress %s"
+                 % (short, res.get("status") or "?", country, city, tag,
+                    res.get("ip")))
 
     def lane(chunk):
         """One lane owns one browser for its whole chunk, and closes it itself.
@@ -1754,7 +1960,7 @@ def _flight_browser(alive, cancel=None, log=None, pin="", diag=False, codes=None
 
     with _cf.ThreadPoolExecutor(max_workers=width) as ex:
         list(ex.map(lane, lanes))
-    return kept
+    return kept, reads[0]
 
 
 def _flight_load() -> dict:
@@ -1794,11 +2000,12 @@ def _flight_fresh() -> bool:
     return bool(_read_lines(p))
 
 
-def _summary_lines(log, codes, kept, diag, candidates, alive):
+def _summary_lines(log, codes, kept, diag, candidates, alive, reads=0):
     """The closing block: counts per outcome, then the legend for each code."""
     _say(log, "")
     _say(log, "=" * 62)
-    _say(log, "[*] Passed test flight (✅ 200) : %d" % len(kept))
+    _say(log, "[*] Passed test flight (✅ 200) : %d" % reads)
+    _say(log, "[*] Carried - alive, KEPT      : %d" % len(kept))
     _say(log, "[*] File                         : %s" % FLIGHT_POOL)
     _say(log, "=" * 62)
     if diag:
@@ -1833,7 +2040,8 @@ def flight(force=False, cancel=None, diagnose=False) -> dict:
         cur_f["busy"] = True
         _flights[who] = cur_f
     st = {"ran": True, "ts": time.time(), "candidates": 0, "alive": 0, "kept": 0,
-          "error": "", "seconds": 0.0, "diagnose": diag, "codes": {}, "log": []}
+          "reads": 0, "error": "", "seconds": 0.0, "diagnose": diag, "codes": {},
+          "log": []}
     log = st["log"]
     codes, clock = {}, threading.Lock()
     try:
@@ -1841,8 +2049,8 @@ def flight(force=False, cancel=None, diagnose=False) -> dict:
         _say(log, "   AUTO LIVE PROXIES + PLAYWRIGHT TEST FLIGHT%s"
              % ("  [DIAGNOSTIC]" if diag else ""))
         _say(log, "   Test email: %s" % FLIGHT_PROBE)
-        _say(log, "   One navigation per node, %d at a time, staggered"
-             % FLIGHT_WORKERS)
+        _say(log, "   One navigation per node, %d at a time, staggered. A node the "
+                  "target ANSWERS is kept." % FLIGHT_WORKERS)
         _say(log, "=" * 62)
         if not available():
             st["error"] = "browser not ready - %s" % browser_note()
@@ -1868,20 +2076,25 @@ def flight(force=False, cancel=None, diagnose=False) -> dict:
         if not alive:
             st["error"] = "no candidate carried a request (all dead on ipify)"
             _say(log, "[!] " + st["error"])
-            _summary_lines(log, codes, [], diag, len(cand), 0)
+            _summary_lines(log, codes, [], diag, len(cand), 0, 0)
             return st
-        kept = _flight_browser(alive, cancel, log, pin, diag, codes, clock)
+        kept, reads = _flight_browser(alive, cancel, log, pin, diag, codes, clock)
         st["kept"] = len(kept)
+        st["reads"] = reads
         if kept:
             _write_lines(_flight_pool_path(), kept)
             _invalidate_pool_cache(who)
+            if not reads:
+                _say(log, "[*] No node could READ the endpoint - every carried node "
+                          "is behind the wall. They are kept anyway: the tunnel, the "
+                          "TLS and the edge all worked, and a walled address is read "
+                          "from the second source instead.")
         else:
-            st["error"] = "no candidate answered the endpoint with 200 and JSON"
+            st["error"] = "no candidate carried the request (all dead in transport)"
             _say(log, "[!] " + st["error"])
             _say(log, "[*] Nothing was kept, so %s was left as it was - the reader "
-                      "keeps using proxies.txt, and a walled address falls back to "
-                      "the catalogue by domain." % FLIGHT_POOL)
-        _summary_lines(log, codes, kept, diag, len(cand), len(alive))
+                      "keeps using proxies.txt." % FLIGHT_POOL)
+        _summary_lines(log, codes, kept, diag, len(cand), len(alive), reads)
         return st
     except Exception as exc:
         st["error"] = "%s: %s" % (type(exc).__name__, exc)
@@ -1911,6 +2124,10 @@ def flight_state() -> dict:
         st["log"] = []
     if not isinstance(st.get("codes"), dict):
         st["codes"] = {}
+    try:
+        st["reads"] = int(st.get("reads") or 0)
+    except Exception:
+        st["reads"] = 0
     try:
         st["age"] = int(time.time() - float(st.get("ts") or 0)) if st.get("ts") else -1
     except Exception:
@@ -2332,7 +2549,8 @@ def _attempt(addr, proxy_line):
         if status == 404:
             slot.ok()
             return 404, None
-        # A 401 is a dead end: no in-page re-ask, just the next node.
+        # A 401 is a dead end for the browser: no in-page re-ask, just the next
+        # node, and the caller has the second source for when they all refuse.
         slot.ok()
         return status, None
     except Exception as exc:
@@ -2475,7 +2693,9 @@ def _page_from_record(rec) -> dict:
     head_addr = rec.get("email") or "(password only)"
     _pw = rec.get("pw_count")
     pc = rec.get("password_check") or {}
-    if rec.get("partial_read"):
+    if rec.get("via") == "xposedornot":
+        basis = "XposedOrNot index - the exact HIBP search was walled"
+    elif rec.get("partial_read"):
         basis = "domain match - the exact search was walled"
     elif not rec.get("read"):
         basis = "nothing readable - proxy, in-page fetch and direct all failed"
@@ -2756,30 +2976,59 @@ def check_item(item, force=False, cancel=None) -> dict:
             trace("INFO", "address", "404 - reported as no breach (statuses %s)"
                   % seen, email)
     else:
-        # The address half was walled. Pwned Passwords and the catalogue are both
-        # keyless and neither sits behind the wall, so the domain gets looked up
-        # instead of leaving an empty card. A domain answer beats no answer, and
-        # `partial_read` says exactly what it is.
-        rows = _cat_rows(email)
-        if rows:
-            rec = _parse_payload(item, {"Breaches": rows}, "catalogue", started,
+        # The address half was walled. Two keyless sources sit OUTSIDE the wall and
+        # neither is a browser: XposedOrNot answers the EXACT address, the HIBP
+        # catalogue answers the DOMAIN. Exact first - a domain answer for a gmail
+        # mailbox is noise - and the catalogue only when the exact one failed too.
+        xp_state, xp_payload, xp_note = "fail", None, ""
+        if not _is_cancelled(cancel):
+            xp_state, xp_payload, xp_note = _xposed_lookup(email)
+            trace("INFO", "xposed", "%s%s" % (xp_state,
+                                              (" - " + xp_note) if xp_note else ""),
+                  email)
+        if xp_state == "hit":
+            rec = _parse_payload(item, xp_payload, "xposedornot", started,
                                  item["password"])
             _pw_halves(rec, item, force)
             rec["read"] = True
-            rec["partial_read"] = True
-            rec["via"] = "catalogue"
+            rec["partial_read"] = False
+            rec["via"] = "xposedornot"
             rec["via_proxy"] = ""
-            rec["error"] = ("the exact search was walled - filled from the catalogue "
-                            "by DOMAIN" + ((" (%s)" % err) if err else ""))
-            trace("INFO", "catalogue", "%d domain match(es) - walled address filled"
-                  % len(rows), email)
+            rec["error"] = ("the exact HIBP search was walled - read from "
+                            "XposedOrNot instead" + ((" (%s)" % err) if err else ""))
+        elif xp_state == "miss":
+            rec = _parse_payload(item, {"Breaches": [], "Pastes": []},
+                                 "xposedornot", started, item["password"])
+            _pw_halves(rec, item, force)
+            rec["read"] = True
+            rec["partial_read"] = False
+            rec["via"] = "xposedornot"
+            rec["via_proxy"] = ""
+            rec["error"] = ("the exact HIBP search was walled - XposedOrNot lists no "
+                            "breach for the address" + ((" (%s)" % err) if err else ""))
         else:
-            rec["via"] = "browser"
-            rec["via_proxy"] = ""
-            rec["read"] = False
-            rec["error"] = ("cancelled" if _is_cancelled(cancel) else
-                            "connection/proxy error - unreachable on proxy, in-page "
-                            "fetch and direct" + ((" (%s)" % err) if err else ""))
+            rows = _cat_rows(email)
+            if rows:
+                rec = _parse_payload(item, {"Breaches": rows}, "catalogue", started,
+                                     item["password"])
+                _pw_halves(rec, item, force)
+                rec["read"] = True
+                rec["partial_read"] = True
+                rec["via"] = "catalogue"
+                rec["via_proxy"] = ""
+                rec["error"] = ("the exact search was walled and the second source "
+                                "failed - filled from the catalogue by DOMAIN"
+                                + ((" (%s)" % err) if err else ""))
+                trace("INFO", "catalogue", "%d domain match(es) - walled address filled"
+                      % len(rows), email)
+            else:
+                rec["via"] = "browser"
+                rec["via_proxy"] = ""
+                rec["read"] = False
+                rec["error"] = ("cancelled" if _is_cancelled(cancel) else
+                                "connection/proxy error - unreachable on proxy, in-page "
+                                "fetch and direct, and the second source failed"
+                                + ((" (%s)" % err) if err else ""))
 
     rec["breach_count"] = len(rec.get("breaches") or [])
     rec["summary_note"] = _summary_note(rec)
@@ -3012,6 +3261,9 @@ def selftest(verbose=False) -> bool:
     add("outcomes_have_200", "200" in [k for k, _m in OUTCOMES])
     add("outcomes_have_ipify_fail", "ipify_fail" in [k for k, _m in OUTCOMES])
     add("no_egress_is_informational", "no status" in dict(OUTCOMES)["no_egress"])
+    add("legend_401_kept", "KEPT" in dict(OUTCOMES)["401"])
+    add("legend_403_kept", "KEPT" in dict(OUTCOMES)["403"])
+    add("legend_404_kept", "KEPT" in dict(OUTCOMES)["404"])
     add("bucket_200", _bucket(200) == "200")
     add("bucket_401", _bucket(401, "status 401") == "401")
     add("bucket_5xx", _bucket(503) == "5xx")
@@ -3170,6 +3422,9 @@ def selftest(verbose=False) -> bool:
         {"kind": "email", "email": "a@b.co", "read": True, "count": 0})[0])
     add("basis_unread", "nothing readable" in record_view(
         {"kind": "email", "email": "a@b.co", "read": False})[0])
+    add("basis_xposed", "XposedOrNot" in record_view(
+        {"kind": "email", "email": "a@b.co", "read": True, "count": 0,
+         "via": "xposedornot"})[0])
 
     add("proxy_parse_auth", (parse_proxy_line("u:p@1.2.3.4:8080") or {}).get("user") == "u")
     add("proxy_parse_plain", (parse_proxy_line("1.2.3.4:8080") or {}).get("port") == 8080)
@@ -3182,6 +3437,15 @@ def selftest(verbose=False) -> bool:
     add("flight_takes_diagnose", "diagnose" in inspect_sig(flight))
     add("flight_consts", FLIGHT_WANT >= 1 and FLIGHT_MAX >= FLIGHT_WANT
         and POOL_TTL > 0)
+    add("flight_read_want", FLIGHT_READ_WANT >= 1)
+    add("flight_carry_200", 200 in CARRY_STATUS)
+    add("flight_carry_401", 401 in CARRY_STATUS)
+    add("flight_carry_404", 404 in CARRY_STATUS)
+    add("flight_carry_403", 403 in CARRY_STATUS)
+    add("flight_wall_401", 401 in WALL_STATUS)
+    add("flight_wall_403", 403 in WALL_STATUS)
+    add("flight_not_carry_0", 0 not in CARRY_STATUS)
+    add("pool_ttl_hour", POOL_TTL >= 3600.0)
     add("flight_workers_low", FLIGHT_WORKERS <= 3)
     add("flight_jitter", FLIGHT_JITTER > 0)
     add("read_jitter", READ_JITTER > 0)
@@ -3193,7 +3457,9 @@ def selftest(verbose=False) -> bool:
     add("flight_geo_helper", callable(_flight_geo))
     add("flight_log_helper", "no test flight" in flight_log_text())
     add("flight_state_keys", "kept" in flight_state() and "pool" in flight_state()
-        and "log" in flight_state() and "codes" in flight_state())
+        and "log" in flight_state() and "codes" in flight_state()
+        and "reads" in flight_state())
+    add("flight_browser_returns_pair", callable(_flight_browser))
     add("pool_status_keys", set(pool_status()) == {"count", "sample", "flight"})
     _lgl = []
     _say(_lgl, "x")
@@ -3236,7 +3502,7 @@ def selftest(verbose=False) -> bool:
         set_owner(_was_c)
 
     add("cat_helpers", callable(catalogue) and callable(_cat_rows)
-        and callable(catalogue_state))
+        and callable(catalogue_state) and callable(_cat_row_by_name))
     add("cat_ttl", CATALOGUE_TTL >= 3600.0)
     _keep_cat = dict(_cat)
     _cat["by_domain"] = {"b.co": [{"Name": "X", "Domain": "b.co",
@@ -3247,6 +3513,34 @@ def selftest(verbose=False) -> bool:
     _cat["busy"] = False
     add("cat_match", len(_cat_rows("me@b.co")) == 1)
     add("cat_miss", _cat_rows("me@z.co") == [])
+
+    # ---- the second source: shape, spelling, and every miss/fail branch ----
+    add("corpus_key", _corpus_key("Collection #1") == "collection1")
+    add("corpus_key_same", _corpus_key("Collection-1") == _corpus_key("Collection #1"))
+    add("corpus_by_key", _is_corpus({"Name": "ExploitIN"}))
+    add("corpus_plain", not _is_corpus({"Name": "Wattpad", "Domain": "wattpad.com"}))
+    add("xposed_consts", XPOSED_ANALYTICS.startswith("https://api.xposedornot.com/"))
+    add("xposed_callable", callable(_xposed_lookup) and callable(_xposed_rows)
+        and callable(_xposed_fetch))
+    _xr = _xposed_rows({"ExposedBreaches": {"breaches_details": [
+        {"breach": "Wattpad", "domain": "wattpad.com", "xposed_date": "2020",
+         "xposed_records": 5, "xposed_data": "Email addresses;Passwords",
+         "verified": "Yes", "details": "d"}]}})
+    add("xposed_rows_shape", isinstance(_xr, list) and len(_xr) == 1)
+    add("xposed_rows_year", _xr[0]["BreachDate"] == "2020-01-01")
+    add("xposed_rows_classes", _xr[0]["DataClasses"] == ["Email addresses",
+                                                         "Passwords"])
+    add("xposed_rows_verified", _xr[0]["IsVerified"] is True)
+    add("xposed_rows_records", _xr[0]["PwnCount"] == 5)
+    add("xposed_rows_none", _xposed_rows({"Error": "Not found"}) is None)
+    add("xposed_rows_empty", _xposed_rows(
+        {"ExposedBreaches": {"breaches_details": []}}) == [])
+    add("xposed_summary_fallback", len(_xposed_rows(
+        {"BreachesSummary": {"site": "Tumblr;Wattpad"}}) or []) == 2)
+    add("xposed_summary_corpus", (_xposed_rows(
+        {"BreachesSummary": {"site": "Collection-1"}}) or [{}])[0]["IsSpamList"]
+        is True)
+
     _cat["by_domain"] = {}
     _cat["ts"] = 0.0
     _cat["error"] = "fetch failed"
@@ -3347,6 +3641,20 @@ def main(argv=None) -> int:
         print("catalogue:", "unreadable" if cat is None else
               "%d domain(s)" % len(cat))
         return 0 if cat is not None else 1
+    if "--xposed" in argv:
+        try:
+            target = argv[argv.index("--xposed") + 1]
+        except Exception:
+            print("usage: breach.py --xposed someone@example.com")
+            return 2
+        state, payload, note = _xposed_lookup(target)
+        print("state:", state, "|", note)
+        if payload:
+            for b in payload.get("Breaches") or []:
+                print("  %-32s %-10s %s" % (b.get("Title") or b.get("Name") or "?",
+                                            b.get("BreachDate") or "-",
+                                            ", ".join(b.get("DataClasses") or [])))
+        return 0 if state != "fail" else 1
     if "--flight" in argv:
         got = flight(force=True, diagnose=("--diagnose" in argv))
         print("\n".join(got.get("log") or []))
