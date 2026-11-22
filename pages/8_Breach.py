@@ -703,16 +703,16 @@ _diag = st.checkbox("\U0001f52c Diagnostic flight", value=False, key=_DIAG_KEY,
                     help="Logs the node, auth mode, target, the ipify answer, the "
                          "status, content-type, byte count, the headers that matter and "
                          "200 characters of the body, then a count per code with a "
-                         "legend. The target tab's first navigation is the target; only "
-                         "a refusal earns a same-origin re-ask, then one warm-up and one "
-                         "retry. Credentials are never printed. Nothing changes about "
-                         "what gets kept - still 200 + JSON only.")
+                         "legend. One navigation per node, two nodes at a time, "
+                         "staggered - nothing is re-asked on a 401. Credentials are "
+                         "never printed. Nothing changes about what gets kept - still "
+                         "200 + JSON only.")
 
 _f1, _f2 = st.columns([0.72, 0.28])
 with _f1:
     if _flying:
-        st.caption("\u2708 **Test flight running**%s - proving every credential line "
-                   "in Chromium, five at a time. The log follows live."
+        st.caption("\u2708 **Test flight running**%s - one request per credential line, "
+                   "two at a time. The log follows live."
                    % (" in diagnostic mode" if _diag else ""))
     elif _fst.get("ts"):
         st.caption("\u2708 Last test flight %s ago: **%d** candidate(s), **%d** kept. "
@@ -731,8 +731,9 @@ with _f2:
                  help="Needs the browser ready. Flies every credential line in your "
                       "proxies.txt, minus the ones proxy_meta.json already marks dead - "
                       "the Webshare and Oxylabs APIs are only fetched if that file is "
-                      "empty. A node must answer 200 with JSON to be kept. Survivors go "
-                      "to this page's own pool - your proxies.txt is not touched."):
+                      "empty. One navigation per node, two at a time, staggered; a node "
+                      "must answer 200 with JSON to be kept. Survivors go to this page's "
+                      "own pool - your proxies.txt is not touched."):
         _job = {"done": False, "started": time.time(), "result": {}, "owner": _OWNER,
                 "since0": breach.trace_seq(), "diag": bool(_diag)}
         st.session_state[_FLY_KEY] = _job
