@@ -260,8 +260,9 @@ import breach
 # flight and the diagnostic switch: a module without them still reported a 401 as
 # CLEAN, still ran an unproven pool, still lost the flight's log to an unpinned
 # worker thread, and still had no `diagnose` argument. `_body_of` belongs to the
-# no_egress fix: a module without it reads a Playwright Response with the requests
-# property and drops every node before the target is ever requested.
+# no_egress fix. `STEALTH_JS` belongs to the fingerprint pass: a module without it
+# navigates as a bare headless browser, which the WAF scores before it looks at
+# the IP.
 if not (hasattr(breach, "parse_lines") and hasattr(breach, "pool_lines")
         and hasattr(breach, "check_item") and hasattr(breach, "clear_cache")
         and hasattr(breach, "cache_stats") and hasattr(breach, "record_view")
@@ -272,7 +273,8 @@ if not (hasattr(breach, "parse_lines") and hasattr(breach, "pool_lines")
         and hasattr(breach, "flight") and hasattr(breach, "flight_state")
         and hasattr(breach, "flight_log_text") and hasattr(breach, "available")
         and hasattr(breach, "OUTCOMES") and hasattr(breach, "RETRY_STATUS")
-        and hasattr(breach, "POOL_TTL") and hasattr(breach, "_body_of")):
+        and hasattr(breach, "POOL_TTL") and hasattr(breach, "_body_of")
+        and hasattr(breach, "STEALTH_JS")):
     breach = importlib.reload(breach)
     try:
         breach.trace("INFO", "page", "stale breach module replaced by reload")
@@ -709,8 +711,8 @@ _diag = st.checkbox("\U0001f52c Diagnostic flight", value=False, key=_DIAG_KEY,
 _f1, _f2 = st.columns([0.72, 0.28])
 with _f1:
     if _flying:
-        st.caption("\u2708 **Test flight running**%s - fetching candidates and proving "
-                   "each one in Chromium, five at a time. The log follows live."
+        st.caption("\u2708 **Test flight running**%s - proving every credential line "
+                   "in Chromium, five at a time. The log follows live."
                    % (" in diagnostic mode" if _diag else ""))
     elif _fst.get("ts"):
         st.caption("\u2708 Last test flight %s ago: **%d** candidate(s), **%d** kept. "
@@ -726,10 +728,11 @@ with _f1:
 with _f2:
     if st.button("\u2708 Run test flight", width="stretch",
                  disabled=(_flying or not _browser_ready),
-                 help="Needs the browser ready. Fetches Webshare + Oxylabs, drops the "
-                      "dead nodes on ipify, then proves the rest in Chromium against "
-                      "this exact endpoint. Only survivors are written, to this page's "
-                      "own pool - your proxies.txt is not touched."):
+                 help="Needs the browser ready. Flies every credential line in your "
+                      "proxies.txt, minus the ones proxy_meta.json already marks dead - "
+                      "the Webshare and Oxylabs APIs are only fetched if that file is "
+                      "empty. A node must answer 200 with JSON to be kept. Survivors go "
+                      "to this page's own pool - your proxies.txt is not touched."):
         _job = {"done": False, "started": time.time(), "result": {}, "owner": _OWNER,
                 "since0": breach.trace_seq(), "diag": bool(_diag)}
         st.session_state[_FLY_KEY] = _job
