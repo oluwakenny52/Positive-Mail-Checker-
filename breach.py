@@ -35,16 +35,28 @@ a combo and the address half could not be read, the combo is UNKNOWN: the passwo
 band is still shown beside it, but it no longer decides the grade. Otherwise every
 walled address graded itself off its password and read as PARTIAL.
 
-THE TEST FLIGHT PROVES THE POOL FIRST
--------------------------------------
+THE TEST FLIGHT PROVES THE POOL FIRST - AND IT IS THE COLAB CELL
+----------------------------------------------------------------
 Cell 2 of the Colab was the only thing that ever established a node works against
-this exact endpoint. That is now here: candidates come from the Webshare keys and
-Oxylabs gateway (secrets or env) plus any proxies_secret.txt / proxies_custom.txt
-/ proxies.txt, are pre-checked against ipify, then flown through Chromium against
-the unified endpoint, and ONLY the survivors are written. The survivors go to
-proxies_breach.txt so an HTTP-only flight cannot shrink the mail checker's IMAP
-pool; pool_lines() prefers it while it is under POOL_TTL old. It runs by itself
-when the flight pool is missing or stale, and can be run by hand.
+this exact endpoint, so it is reproduced here line for line in behaviour:
+
+    candidates   Webshare (every key, paginated) + Oxylabs + any
+                 proxies_secret.txt / proxies_custom.txt / proxies.txt
+    step 1       ipify, 8 s, dead nodes dropped and logged as "dead ipify check"
+    step 2       headless Chromium, FIVE at a time, one isolated context per
+                 node, against /unifiedsearch/eddiemurphy%40gmail.com
+    pass         HTTP 200 AND a JSON object body ({ or [ that json.loads)
+    log          "    ✅ 200 -> host:port | country | city" for a pass and
+                 "    skip  -> host:port | test flight failed (reason)" for a fail
+    save         the survivors, one per line, to proxies.txt
+    summary      "[*] Passed test flight (✅ 200) : N" and the file name
+
+A 401 that answers 200 to the in-page re-ask counts as a pass - the answer WAS a
+200 with a JSON body, which is the only criterion that matters. Survivors are also
+written to proxies_breach.txt and the reader prefers that copy, so an HTTP-only
+flight never decides which nodes the mail checker may use. The flight runs by
+itself when the flight pool is missing or older than POOL_TTL, and can be run by
+hand; the last log is kept and shown on the page.
 
 THE CATALOGUE FILLS THE ZERO
 ----------------------------
@@ -195,11 +207,14 @@ FLIGHT_POOL = "proxies_breach.txt"
 FLIGHT_PROBE = "eddiemurphy@gmail.com"
 FLIGHT_MAX = 120
 FLIGHT_WANT = 12
-FLIGHT_WORKERS = 4
-FLIGHT_BUDGET = 120.0
-FLIGHT_TIMEOUT = 15000
+FLIGHT_WORKERS = 5
+FLIGHT_BUDGET = 150.0
+FLIGHT_TIMEOUT = 20000
+FLIGHT_GEO_URL = "http://ip-api.com/json/"
+FLIGHT_GEO_TIMEOUT = 8.0
+FLIGHT_LOG_MAX = 500
 IPIFY_WORKERS = 12
-IPIFY_TIMEOUT = 6.0
+IPIFY_TIMEOUT = 8.0
 IPIFY_URL = "https://api.ipify.org?format=json"
 # How long a flight pool stays good enough to use without flying again.
 POOL_TTL = 1800.0
@@ -971,7 +986,7 @@ def catalogue_state() -> dict:
 
 
 # ---------------------------------------------------------------------------
-# the test flight - fetch candidates, prove them, keep only the survivors
+# the test flight - the Colab's second cell, in the app
 # ---------------------------------------------------------------------------
 def _flight_path() -> str:
     p = _user_file(FLIGHT_NAME)
@@ -1014,7 +1029,7 @@ def _oxylabs_lines():
     return [l.strip() for l in str(raw or "").splitlines() if l.strip()]
 
 
-def _webshare_fetch(keys):
+def _webshare_fetch(keys, log=None):
     """Every direct proxy on every key, paginated, deduped. [] on any failure."""
     try:
         import requests
@@ -1024,22 +1039,21 @@ def _webshare_fetch(keys):
     for idx, key in enumerate(keys, 1):
         page = 1
         while page <= WS_PAGES:
-            if _is_cancelled(None):
-                break
             try:
                 r = requests.get(
                     "https://proxy.webshare.io/api/v2/proxy/list/?mode=direct"
                     "&page=%d&page_size=%d" % (page, WS_PAGE_SIZE),
                     headers={"Authorization": "Token %s" % key}, timeout=20)
             except Exception as exc:
-                trace("ERR", "flight", "webshare key #%d %s" % (idx,
-                                                               type(exc).__name__))
+                _say(log, "[!] Webshare key #%d failed: %s"
+                     % (idx, type(exc).__name__))
                 break
             if r.status_code == 401:
-                trace("WARN", "flight", "webshare key #%d rejected" % idx)
+                _say(log, "[!] Webshare API key #%d invalid" % idx)
                 break
             if r.status_code != 200:
-                trace("WARN", "flight", "webshare key #%d http %d" % (idx, r.status_code))
+                _say(log, "[!] Webshare API error %d on key #%d"
+                     % (r.status_code, idx))
                 break
             try:
                 data = r.json()
@@ -1057,19 +1071,22 @@ def _webshare_fetch(keys):
             if not data.get("next"):
                 break
             page += 1
-        trace("INFO", "flight", "webshare key #%d -> %d line(s)" % (idx, len(out)))
+        _say(log, "[*] Webshare [Key #%d] fetched : %d" % (idx, len(out)))
     return out
 
 
-def _candidates():
+def _candidates(log=None):
     """Every candidate node from every source, deduped and capped."""
     raw = []
     keys = _webshare_keys()
     if keys:
-        raw.extend(_webshare_fetch(keys))
+        raw.extend(_webshare_fetch(keys, log))
     else:
-        trace("WARN", "flight", "no WEBSHARE_KEYS in secrets or env")
-    raw.extend(_oxylabs_lines())
+        _say(log, "[!] No WEBSHARE_KEYS in secrets or env")
+    oxy = _oxylabs_lines()
+    raw.extend(oxy)
+    if oxy:
+        _say(log, "[*] Oxylabs line(s)       : %d" % len(oxy))
     for name in ("proxies_secret.txt", "proxies_custom.txt", "proxies.txt",
                  FLIGHT_POOL):
         raw.extend(_read_lines(_user_file(name)))
@@ -1081,6 +1098,19 @@ def _candidates():
         seen.add(line)
         out.append(line)
     return out[:FLIGHT_MAX]
+
+
+def _say(log, msg):
+    """Append one flight log line, and trace it. Never raises."""
+    try:
+        if log is not None:
+            log.append(str(msg))
+    except Exception:
+        pass
+    try:
+        trace("INFO", "flight", str(msg))
+    except Exception:
+        pass
 
 
 def _proxy_url(line):
@@ -1109,6 +1139,21 @@ def _proxy_ok(line) -> bool:
         return False
 
 
+def _flight_geo(line):
+    """(country, city) through the node itself, or ("-", "-")."""
+    url = _proxy_url(line)
+    if not url:
+        return "-", "-"
+    try:
+        import requests
+        r = requests.get(FLIGHT_GEO_URL, proxies={"http": url, "https": url},
+                         timeout=FLIGHT_GEO_TIMEOUT)
+        data = r.json()
+        return (str(data.get("country") or "-"), str(data.get("city") or "-"))
+    except Exception:
+        return "-", "-"
+
+
 def _inpage_fetch(page, addr):
     """Ask the endpoint from INSIDE the page, same-origin, with the cookie jar.
 
@@ -1135,8 +1180,12 @@ def _inpage_fetch(page, addr):
     return status, payload
 
 
-def _flight_one(line) -> bool:
-    """One node through a real Chromium. True when it answers this endpoint."""
+def _flight_one(line):
+    """One node through a real Chromium, in its own context.
+
+    -> (passed, reason). ONLY a 200 carrying a JSON object passes; the in-page
+    re-ask is accepted because its answer is exactly that - a 200 with JSON.
+    """
     ctx = None
     try:
         b = _browser()
@@ -1156,17 +1205,21 @@ def _flight_one(line) -> bool:
             body = resp.text() if resp is not None else ""
         except Exception:
             body = ""
-        if status == 200 and isinstance(_json_of(body), dict):
-            return True
-        if status == 404:
-            return True
+        if status == 200:
+            if isinstance(_json_of(body), dict):
+                return True, "200"
+            reason = "200 non-JSON body"
+        else:
+            reason = "status %s" % (status or "?")
         if status == 200 or status in RETRY_STATUS:
             page.wait_for_timeout(700)
             got, payload = _inpage_fetch(page, FLIGHT_PROBE)
-            return isinstance(payload, dict) or got == 404
-        return False
-    except Exception:
-        return False
+            if isinstance(payload, dict):
+                return True, "200"
+            reason = "in-page %s" % (got or "err")
+        return False, reason
+    except Exception as exc:
+        return False, type(exc).__name__
     finally:
         try:
             if ctx is not None:
@@ -1175,7 +1228,7 @@ def _flight_one(line) -> bool:
             pass
 
 
-def _flight_ipify(cand, cancel=None):
+def _flight_ipify(cand, cancel=None, log=None):
     """Phase 1: drop the nodes that cannot carry a request at all."""
     out, lock = [], threading.Lock()
 
@@ -1185,6 +1238,8 @@ def _flight_ipify(cand, cancel=None):
         if _proxy_ok(line):
             with lock:
                 out.append(line)
+        else:
+            _say(log, "    skip  -> %s | dead ipify check" % line.rsplit("@", 1)[-1])
 
     width = max(1, min(IPIFY_WORKERS, len(cand) or 1))
     with _cf.ThreadPoolExecutor(max_workers=width) as ex:
@@ -1192,23 +1247,30 @@ def _flight_ipify(cand, cancel=None):
     return out
 
 
-def _flight_browser(alive, cancel=None):
-    """Phase 2: the real flight. Only nodes that answer this endpoint survive."""
+def _flight_browser(alive, cancel=None, log=None):
+    """Phase 2: the real flight, FLIGHT_WORKERS at a time, isolated contexts.
+
+    Only nodes that answer the endpoint with 200 + JSON are kept, and each one is
+    logged with its own country and city exactly like the Colab cell did.
+    """
     kept, lock = [], threading.Lock()
     deadline = time.time() + FLIGHT_BUDGET
 
     def one(line):
+        short = line.rsplit("@", 1)[-1]
         if _is_cancelled(cancel) or time.time() > deadline:
             return
         with lock:
             if len(kept) >= FLIGHT_WANT:
                 return
-        if _flight_one(line):
+        ok, reason = _flight_one(line)
+        if ok:
+            country, city = _flight_geo(line)
             with lock:
                 kept.append(line)
-            trace("INFO", "flight", "pass -> %s" % line.rsplit("@", 1)[-1])
+            _say(log, "    ✅ 200 -> %-22s | %-16s | %s" % (short, country, city))
         else:
-            trace("INFO", "flight", "fail -> %s" % line.rsplit("@", 1)[-1])
+            _say(log, "    skip  -> %-22s | test flight failed (%s)" % (short, reason))
 
     width = max(1, min(FLIGHT_WORKERS, len(alive) or 1))
     with _cf.ThreadPoolExecutor(max_workers=width) as ex:
@@ -1257,48 +1319,69 @@ def _flight_fresh() -> bool:
 
 
 def flight(force=False, cancel=None) -> dict:
-    """Fetch, pre-check, fly, keep the survivors. Never raises."""
+    """Fetch, pre-check, fly, keep the survivors, print the Colab's own report.
+
+    Never raises. The survivors are written to proxies.txt (the Colab's file) and
+    to proxies_breach.txt (the copy the reader prefers, so an HTTP-only flight
+    cannot decide the mail checker's pool).
+    """
     started = time.time()
     with _lock:
         if _flight["busy"] and not force:
             return dict(_flight["last"])
         _flight["busy"] = True
     st = {"ran": True, "ts": time.time(), "candidates": 0, "alive": 0, "kept": 0,
-          "error": "", "seconds": 0.0}
+          "error": "", "seconds": 0.0, "log": []}
+    log = st["log"]
     try:
-        cand = _candidates()
+        _say(log, "=" * 62)
+        _say(log, "   AUTO LIVE PROXIES + PLAYWRIGHT TEST FLIGHT")
+        _say(log, "   Test email: %s" % FLIGHT_PROBE)
+        _say(log, "=" * 62)
+        cand = _candidates(log)
         st["candidates"] = len(cand)
-        trace("INFO", "flight", "start: %d candidate(s)" % len(cand))
+        _say(log, "[*] Total from servers     : %d" % len(cand))
         if not cand:
             st["error"] = ("no candidate proxies - add WEBSHARE_KEYS to secrets or "
                            "import a proxies.txt")
+            _say(log, "[!] " + st["error"])
             return st
-        alive = _flight_ipify(cand, cancel)
+        _say(log, "[*] Step 1: checking ipify connectivity...")
+        alive = _flight_ipify(cand, cancel, log)
         st["alive"] = len(alive)
-        trace("INFO", "flight", "%d/%d survived ipify" % (len(alive), len(cand)))
+        _say(log, "[*] Step 2: running Chromium test flight on %d proxies..."
+             % len(alive))
         if not alive:
             st["error"] = "no candidate carried a request (all dead on ipify)"
+            _say(log, "[!] " + st["error"])
             return st
-        kept = _flight_browser(alive, cancel)
+        kept = _flight_browser(alive, cancel, log)
         st["kept"] = len(kept)
         if kept:
+            _write_lines(_user_file("proxies.txt"), kept)
             _write_lines(_flight_pool_path(), kept)
             _pool_cache["ts"] = 0.0
         else:
-            st["error"] = "no candidate answered the endpoint in Chromium"
+            st["error"] = "no candidate answered the endpoint with 200 and JSON"
+            _say(log, "[!] " + st["error"])
+        _say(log, "")
+        _say(log, "=" * 62)
+        _say(log, "[*] Passed test flight (✅ 200) : %d" % len(kept))
+        _say(log, "[*] File                        : proxies.txt")
+        _say(log, "=" * 62)
         return st
     except Exception as exc:
         st["error"] = "%s: %s" % (type(exc).__name__, exc)
-        trace("ERR", "flight", st["error"])
+        _say(log, "[!] %s" % st["error"])
         return st
     finally:
         st["seconds"] = round(time.time() - started, 1)
+        if len(st["log"]) > FLIGHT_LOG_MAX:
+            del st["log"][:len(st["log"]) - FLIGHT_LOG_MAX]
         with _lock:
             _flight["busy"] = False
             _flight["last"] = dict(st)
         _flight_save(st)
-        trace("INFO", "flight", "done: %d candidate(s), %d alive, %d kept, %.1fs"
-              % (st["candidates"], st["alive"], st["kept"], st["seconds"]))
 
 
 def flight_state() -> dict:
@@ -1309,11 +1392,28 @@ def flight_state() -> dict:
         st = _flight_load()
     st["busy"] = busy
     st["pool"] = len(_read_lines(_flight_pool_path()))
+    if not isinstance(st.get("log"), list):
+        st["log"] = []
     try:
         st["age"] = int(time.time() - float(st.get("ts") or 0)) if st.get("ts") else -1
     except Exception:
         st["age"] = -1
     return st
+
+
+def flight_log_text(limit=400) -> str:
+    """The last flight's own output, newest lines last."""
+    try:
+        rows = list(flight_state().get("log") or [])
+    except Exception:
+        rows = []
+    if not rows:
+        return "(no test flight yet)"
+    try:
+        n = max(1, int(limit or 400))
+    except Exception:
+        n = 400
+    return "\n".join(rows[-n:])
 
 
 def flight_clear() -> None:
@@ -1410,9 +1510,8 @@ def _meta_tiers():
 def pool_lines(force=False):
     """The owner's own pool, best tier first, shuffled inside each tier.
 
-    The flight pool wins while it is fresh - those nodes were proven against this
-    endpoint minutes ago. Otherwise the app's own proxies.txt is used, so an
-    HTTP-only flight can never shrink the mail checker's IMAP pool.
+    The flight pool wins while it is fresh - those nodes answered this endpoint
+    minutes ago. Otherwise the app's own proxies.txt is used.
     """
     with _lock:
         given = _cfg.get("pool")
@@ -2409,6 +2508,8 @@ def selftest(verbose=False) -> bool:
     add("only_colon", _email_only("a@b.co:hunter2") == "a@b.co")
     add("url_no_password", unified_url("a@b.co:hunter2") ==
         HIBP_BASE + "/unifiedsearch/a%40b.co")
+    add("flight_probe_url", unified_url(FLIGHT_PROBE) ==
+        HIBP_BASE + "/unifiedsearch/eddiemurphy%40gmail.com")
     add("blank_read_false", _blank({"kind": "email", "email": "a@b.co"}).get("read") is False)
     add("blank_addr_unread", _blank({"kind": "email", "email": "a@b.co"}).get("addr_verdict")
         == "UNREAD")
@@ -2516,9 +2617,17 @@ def selftest(verbose=False) -> bool:
     add("flight_callable", callable(flight) and callable(flight_state))
     add("flight_consts", FLIGHT_WANT >= 1 and FLIGHT_MAX >= FLIGHT_WANT
         and POOL_TTL > 0)
+    add("flight_concurrency_five", FLIGHT_WORKERS == 5)
+    add("flight_probe_is_email", is_email(FLIGHT_PROBE))
     add("fetch_js", "fetch(" in FETCH_JS and "credentials" in FETCH_JS)
-    add("flight_state_keys", "kept" in flight_state() and "pool" in flight_state())
+    add("flight_geo_helper", callable(_flight_geo))
+    add("flight_log_helper", "no test flight" in flight_log_text())
+    add("flight_state_keys", "kept" in flight_state() and "pool" in flight_state()
+        and "log" in flight_state())
     add("pool_status_keys", set(pool_status()) == {"count", "sample", "flight"})
+    _lgl = []
+    _say(_lgl, "x")
+    add("say_appends", _lgl == ["x"])
 
     # ---- the catalogue ----
     add("cat_helpers", callable(catalogue) and callable(_cat_rows)
@@ -2634,7 +2743,7 @@ def main(argv=None) -> int:
         return 0 if cat is not None else 1
     if "--flight" in argv:
         got = flight(force=True)
-        print(json.dumps(got, indent=2))
+        print("\n".join(got.get("log") or []))
         return 0 if got.get("kept") else 1
     if "--probe" in argv:
         try:
