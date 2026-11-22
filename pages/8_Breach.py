@@ -253,6 +253,12 @@ st.markdown(_css(), unsafe_allow_html=True)
 # @@BLOCK 006 SOURCES deps=005
 import breach
 
+# ---- stale-module guard -------------------------------------------------------
+# Every marker is a capability this page calls. A module missing one predates it
+# and is replaced before anything touches it. `_zero_rule`, PROXY_TRIES, the
+# flight markers and flight_log_text belong to the 401 fix and the test flight: a
+# module without them still reported a 401 as CLEAN, still ran an unproven pool,
+# and still lost the flight's own log to an unpinned worker thread.
 if not (hasattr(breach, "parse_lines") and hasattr(breach, "pool_lines")
         and hasattr(breach, "check_item") and hasattr(breach, "clear_cache")
         and hasattr(breach, "cache_stats") and hasattr(breach, "record_view")
