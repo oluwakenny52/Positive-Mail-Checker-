@@ -700,7 +700,7 @@ _f1, _f2 = st.columns([0.72, 0.28])
 with _f1:
     if _fst.get("busy"):
         st.caption("\u2708 **Test flight running** - fetching candidates and proving "
-                   "each one in Chromium. The run waits for it.")
+                   "each one in Chromium, five at a time. The run waits for it.")
     elif _fst.get("ts"):
         st.caption("\u2708 Last test flight %s ago: **%d** candidate(s), **%d** kept. "
                    "Only kept nodes are drawn."
@@ -717,10 +717,15 @@ with _f2:
                  disabled=bool(_fst.get("busy")),
                  help="Fetches Webshare + Oxylabs, drops the dead nodes on ipify, then "
                       "proves the rest in Chromium against this exact endpoint. Only "
-                      "the survivors are written and used."):
+                      "survivors are written and used."):
         breach.trace("CLICK", "flight", "pressed by the page")
         breach.flight(force=True)
         st.rerun()
+
+if _fst.get("log"):
+    with st.expander("Test flight output (%d kept)" % int(_fst.get("kept") or 0),
+                     expanded=False):
+        st.code("\n".join(_fst["log"][-400:]), language="text")
 
 # ---- workers, pacing, the draw -------------------------------------------------
 _c1, _c2, _c3 = st.columns(3)
