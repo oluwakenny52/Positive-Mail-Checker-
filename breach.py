@@ -34,11 +34,15 @@ band is still shown beside it, but it no longer decides the grade.
 
 THE TEST FLIGHT IS CELL 2, AND IT IS BREACH-ONLY
 ------------------------------------------------
-    candidates   Oxylabs first, then Webshare (every key, paginated), then any
-                 proxies_secret.txt / proxies_custom.txt / proxies.txt
-    dedupe       BY host:port, not by line. Webshare hands the same IP:port out
-                 under every sub-user, so a line-level dedupe flew one endpoint
-                 ten times and buried the run in its own 401s.
+    candidates   the owner's own proxies.txt FIRST, minus everything
+                 proxy_meta.json marks dead / auth / timeout; proxies_secret.txt
+                 and proxies_custom.txt next; the Webshare and Oxylabs APIs only
+                 when all of that is empty
+    dedupe       BY FULL LINE. `u:p@1.2.3.4:8080` and `v:q@1.2.3.4:8080` are two
+                 candidates: the gateway judges the CREDENTIAL, so a dead sub-user
+                 must not hide a live one behind the same IP. FLIGHT_MAX (200) is
+                 above the 130 lines a full Webshare import produces, so none is
+                 cut.
     step 1       ipify, 8 s, dead nodes dropped with the REAL reason
     step 2       headless Chromium, FIVE at a time, one isolated context per
                  node, egress IP read inside the context FIRST
@@ -101,9 +105,21 @@ Attempt 1 is one direct navigation. Only a retryable status earns a same-origin
 in-page fetch (the XHR the site itself makes), then one homepage warm-up and one
 second chance on the same node.
 
-Vanilla launch: no STEALTH_JS, no automation flag. Only --no-sandbox and
---disable-dev-shm-usage stay, because Streamlit Cloud is a container and those
-two are container necessities rather than fingerprint.
+THE BROWSER IS MADE TO LOOK LIKE A DESKTOP CHROME
+-------------------------------------------------
+Headless Chromium is a fingerprint on its own: navigator.webdriver is true,
+navigator.platform says Linux while the UA says Windows, navigator.plugins is
+empty, WebGL reports a Google software renderer and Notification.permission is
+"denied" instead of "default". Launch carries
+--disable-blink-features=AutomationControlled and --lang=en-US, the context is a
+desktop Windows identity (Win32 platform, a 1920x1080 screen behind a 1440x900
+window, 8 cores, 8 GB, no touch, en-US, America/New_York) and STEALTH_JS
+re-declares every property a real Chrome reports. `channel="chromium"` is tried
+first, because the new headless build has a real renderer path; it falls back to
+plain headless once if that build is not installed.
+
+Container necessities stay regardless: --no-sandbox and --disable-dev-shm-usage,
+because Streamlit Cloud is a container.
 
 A GATEWAY THAT FAILS AUTH IS DEAD, NOT LATE
 --------------------------------------------
@@ -115,13 +131,6 @@ burning two 35 s timeouts. Any other ipify failure still pushes it through.
 proxies_breach.txt is the ONLY file the flight writes, so the mail checker's own
 proxies.txt is never touched; the reader prefers the flight pool while it is
 under POOL_TTL old and falls back to proxies.txt otherwise.
-
-A KEY ENDS THE ARGUMENT
------------------------
-`HIBP_API_KEY` is optional and was already plumbed but unused. When it is set and
-the browser path produced no answer, /api/v3/breachedaccount is asked directly -
-it is not Cloudflare-challenged, so a keyed deployment never depends on a proxy
-surviving the wall at all.
 
 THE FLIGHT'S LOG HAS TO BE VISIBLE
 ----------------------------------
@@ -229,10 +238,11 @@ KEY_ENV = "HIBP_API_KEY"
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
 
-# Container necessities only. The stealth flags and STEALTH_JS are gone: the
-# Colab that produced the 200s launched vanilla, and an over-decorated headless
-# browser is its own fingerprint.
-CONTAINER_ARGS = ["--no-sandbox", "--disable-dev-shm-usage"]
+# Container necessities, plus the two that kill the loudest headless tells. No
+# extension, no persistent profile, no headed window.
+CONTAINER_ARGS = ["--no-sandbox", "--disable-dev-shm-usage",
+                  "--disable-blink-features=AutomationControlled",
+                  "--lang=en-US"]
 
 # The Colab Cell 3 header set, on every context. A bare navigation sends none of
 # these and /unifiedsearch/ answers that with the Cloudflare "probably a bot" 401;
@@ -251,6 +261,109 @@ CTX_HEADERS = {
     "sec-fetch-mode": "cors",
     "sec-fetch-site": "same-origin",
 }
+
+# The properties a real desktop Chrome reports and headless does not. Read-only
+# getters on the prototypes, so page JS reads them like any other native value and
+# nothing is left as an own-property tell. The values are consistent with the UA:
+# Windows, a 1080p screen, an Intel GPU, no touch, en-US.
+STEALTH_JS = r"""
+(() => {
+  const put = (obj, prop, value) => {
+    try { Object.defineProperty(obj, prop, {get: () => value, configurable: true}); }
+    catch (e) {}
+  };
+  const nav = Navigator.prototype;
+  put(nav, 'webdriver', false);
+  put(nav, 'platform', 'Win32');
+  put(nav, 'vendor', 'Google Inc.');
+  put(nav, 'vendorSub', '');
+  put(nav, 'productSub', '20030107');
+  put(nav, 'languages', ['en-US', 'en']);
+  put(nav, 'hardwareConcurrency', 8);
+  put(nav, 'deviceMemory', 8);
+  put(nav, 'maxTouchPoints', 0);
+
+  const rows = [
+    ['PDF Viewer', 'Portable Document Format', 'internal-pdf-viewer'],
+    ['Chrome PDF Viewer', 'Portable Document Format', 'internal-pdf-viewer'],
+    ['Chromium PDF Viewer', 'Portable Document Format', 'internal-pdf-viewer'],
+    ['Microsoft Edge PDF Viewer', 'Portable Document Format', 'internal-pdf-viewer'],
+    ['WebKit built-in PDF', 'Portable Document Format', 'internal-pdf-viewer']
+  ];
+  const plugins = [];
+  for (const row of rows) {
+    const p = Object.create(Plugin.prototype);
+    put(p, 'name', row[0]);
+    put(p, 'description', row[1]);
+    put(p, 'filename', row[2]);
+    put(p, 'length', 1);
+    plugins.push(p);
+  }
+  plugins.item = (i) => plugins[i] || null;
+  plugins.namedItem = (n) => Array.prototype.find.call(plugins, (p) => p.name === n) || null;
+  put(plugins, 'length', rows.length);
+
+  const mimes = [
+    ['application/pdf', 'pdf', 'Portable Document Format', plugins[0]],
+    ['text/pdf', 'pdf', 'Portable Document Format', plugins[0]]
+  ].map((row) => {
+    const m = Object.create(MimeType.prototype);
+    put(m, 'type', row[0]);
+    put(m, 'suffixes', row[1]);
+    put(m, 'description', row[2]);
+    put(m, 'enabledPlugin', row[3]);
+    return m;
+  });
+  mimes.item = (i) => mimes[i] || null;
+  mimes.namedItem = (n) => Array.prototype.find.call(mimes, (m) => m.type === n) || null;
+  put(mimes, 'length', 2);
+
+  const scr = Screen.prototype;
+  put(scr, 'width', 1920);
+  put(scr, 'height', 1080);
+  put(scr, 'availWidth', 1920);
+  put(scr, 'availHeight', 1040);
+  put(scr, 'colorDepth', 24);
+  put(scr, 'pixelDepth', 24);
+
+  const gl = (proto) => {
+    if (!proto) return;
+    const real = proto.getParameter;
+    proto.getParameter = function (p) {
+      if (p === 37445) return 'Intel Inc.';
+      if (p === 37446) {
+        return 'ANGLE (Intel, Intel(R) UHD Graphics 630 Direct3D11 vs_5_0 ps_5_0, D3D11)';
+      }
+      return real.call(this, p);
+    };
+  };
+  gl(window.WebGLRenderingContext && WebGLRenderingContext.prototype);
+  gl(window.WebGL2RenderingContext && WebGL2RenderingContext.prototype);
+
+  if (!window.chrome) put(window, 'chrome', {});
+  put(window.chrome, 'runtime', {});
+  put(window.chrome, 'app', {
+    isInstalled: false,
+    InstallState: {INSTALLED: 'installed', MISSING: 'missing', DISABLED: 'disabled'},
+    RunningState: {RUNNING: 'running', CANNOT_RUN: 'cannot_run',
+                   READY_TO_RUN: 'ready_to_run'}
+  });
+  put(window.chrome, 'csi', () => ({onloadT: Date.now(), startE: Date.now(),
+                                    pageT: 0, tran: 15}));
+  put(window.chrome, 'loadTimes', () => ({requestTime: 0, startLoadTime: 0,
+                                          commitLoadTime: 0,
+                                          finishDocumentLoadTime: 0,
+                                          finishLoadTime: 0, firstPaintTime: 0,
+                                          navigationType: 'Other'}));
+
+  if (window.Notification) put(Notification, 'permission', 'default');
+
+  try { Object.setPrototypeOf(plugins, PluginArray.prototype); } catch (e) {}
+  try { Object.setPrototypeOf(mimes, MimeTypeArray.prototype); } catch (e) {}
+  put(nav, 'plugins', plugins);
+  put(nav, 'mimeTypes', mimes);
+})();
+"""
 
 # Same-origin fetch helper for NON-JSON 200 responses only.
 FETCH_JS = ("async (u) => {try {const r = await fetch(u, {headers: "
@@ -370,6 +483,10 @@ _pw_lock = threading.Lock()
 _pw_thread = None
 _pw_state = {"state": "unknown", "error": "", "started": 0.0, "finished": 0.0}
 _pw_missing = ""
+
+# Set once if the new headless build is not installed, so a 130-node flight does
+# not pay a failed launch on every single node.
+_no_channel = [False]
 
 _trace_lock = threading.Lock()
 _trace_file_lock = threading.Lock()
@@ -1293,37 +1410,59 @@ def _hostport(line) -> str:
 
 
 def _candidates(log=None):
-    """Every candidate node, Oxylabs first, deduped BY host:port, capped.
+    """The owner's own probed pool first, the APIs only when it is empty.
 
-    Line-level dedupe is not enough: Webshare hands the same IP:port out under
-    every sub-user, so 130 lines were 11 endpoints and each one was flown many
-    times. Only the first credential for an endpoint is kept.
+    proxies.txt is what the main page already probed, and proxy_meta.json says
+    why each node failed - tier 3 is dead / auth / auth_dest / timeout /
+    transport / tcp, and those are skipped rather than re-litigated. The flight
+    is not the place to rediscover a node the probe already buried.
+
+    Dedupe is by FULL LINE: `u:p@1.2.3.4:8080` and `v:q@1.2.3.4:8080` are two
+    candidates, because the gateway judges the CREDENTIAL, so a dead sub-user must
+    not hide a live one behind the same IP. Only an exact duplicate line is
+    skipped, and FLIGHT_MAX sits above the 130 lines a full import produces.
     """
-    raw = []
-    oxy = _oxylabs_lines()
-    raw.extend(oxy)
-    if oxy:
-        _say(log, "[*] Oxylabs line(s)       : %d" % len(oxy))
+    tiers = _meta_tiers()
+    own, buried = [], 0
+    for line in _read_lines(_user_file("proxies.txt")):
+        line = str(line or "").strip()
+        if not line or not parse_proxy_line(line):
+            continue
+        if tiers.get(line) == 3:
+            buried += 1
+            continue
+        own.append(line)
+    if own:
+        _say(log, "[*] From proxies.txt        : %d" % len(own))
+        if buried:
+            _say(log, "[*] Skipped as dead/auth    : %d (per proxy_meta.json)" % buried)
+        raw = own
     else:
-        _say(log, "[!] No OXYLABS_BASE in secrets or env")
-    keys = _webshare_keys()
-    if keys:
-        raw.extend(_webshare_fetch(keys, log))
-    else:
-        _say(log, "[!] No WEBSHARE_KEYS in secrets or env")
-    for name in ("proxies_secret.txt", "proxies_custom.txt", "proxies.txt",
-                 FLIGHT_POOL):
-        raw.extend(_read_lines(_user_file(name)))
-    seen, seen_hp, out = set(), set(), []
+        _say(log, "[!] proxies.txt holds nothing usable - trying your imports")
+        raw = []
+        for name in ("proxies_secret.txt", "proxies_custom.txt"):
+            extra = _read_lines(_user_file(name))
+            if extra:
+                _say(log, "[*] From %s : %d" % (name, len(extra)))
+                raw.extend(extra)
+        if not raw:
+            oxy = _oxylabs_lines()
+            if oxy:
+                _say(log, "[*] Oxylabs line(s)       : %d" % len(oxy))
+                raw.extend(oxy)
+            keys = _webshare_keys()
+            if keys:
+                raw.extend(_webshare_fetch(keys, log))
+            else:
+                _say(log, "[!] No WEBSHARE_KEYS in secrets or env")
+    seen, out = set(), []
     for line in raw:
         line = str(line or "").strip()
-        hp = _hostport(line)
-        if not line or not hp or line in seen or hp in seen_hp:
+        if not line or line in seen or not parse_proxy_line(line):
             continue
         seen.add(line)
-        seen_hp.add(hp)
         out.append(line)
-    _say(log, "[*] Unique endpoints      : %d" % len(out))
+    _say(log, "[*] Unique credential lines: %d" % len(out))
     return out[:FLIGHT_MAX]
 
 
@@ -1362,19 +1501,37 @@ def _ip_of(resp):
 
 
 def _ctx_kw(proxy_line=None) -> dict:
-    """Context kwargs: the Cell 3 header set, and the proxy when there is one.
+    """Context kwargs: one desktop Windows identity, and the proxy if there is one.
 
     Shared by the flight and the reader's slots so both walk through the WAF the
     same way. A navigation without Referer/Origin is exactly what the 401 body
-    calls "probably a bot".
+    calls "probably a bot"; a Linux platform under a Windows UA is the next tell.
     """
     kw = {"user_agent": UA, "locale": "en-US",
+          "timezone_id": "America/New_York",
           "viewport": {"width": 1440, "height": 900},
+          "screen": {"width": 1920, "height": 1080},
+          "device_scale_factor": 1, "is_mobile": False, "has_touch": False,
+          "color_scheme": "light",
           "extra_http_headers": dict(CTX_HEADERS)}
     cfg = _proxy_cfg(proxy_line) if proxy_line else None
     if cfg:
         kw["proxy"] = cfg
     return kw
+
+
+def _new_context(b, proxy_line=None):
+    """A context with the desktop identity and STEALTH_JS already installed.
+
+    The init script runs before any document, so the first page never sees an
+    unpatched Navigator even for a frame.
+    """
+    ctx = b.new_context(**_ctx_kw(proxy_line))
+    try:
+        ctx.add_init_script(STEALTH_JS)
+    except Exception:
+        pass
+    return ctx
 
 
 def _proxy_ok(line, diag=False, log=None):
@@ -1441,7 +1598,7 @@ def _inpage_fetch(page, addr):
 
 
 def _flight_one(line, diag=False, log=None):
-    """One node through a vanilla headless context.
+    """One node through a headless context dressed as a desktop Chrome.
 
     -> dict(ok, reason, bucket, ip, status, ctype, size, headers, snippet,
             home). The target tab's FIRST navigation is the target: the egress
@@ -1461,7 +1618,7 @@ def _flight_one(line, diag=False, log=None):
     short = line.rsplit("@", 1)[-1]
     try:
         b = _browser()
-        ctx = b.new_context(**_ctx_kw(line))
+        ctx = _new_context(b, line)
         page = ctx.new_page()
         page.set_default_timeout(FLIGHT_TIMEOUT)
         if diag:
@@ -1766,10 +1923,10 @@ def flight(force=False, cancel=None, diagnose=False) -> dict:
             return st
         cand = _candidates(log)
         st["candidates"] = len(cand)
-        _say(log, "[*] Total from servers     : %d" % len(cand))
+        _say(log, "[*] Total candidates       : %d" % len(cand))
         if not cand:
-            st["error"] = ("no candidate proxies - add WEBSHARE_KEYS to secrets or "
-                           "import a proxies.txt")
+            st["error"] = ("no candidate proxies - import a proxies.txt on the "
+                           "checker page, or add WEBSHARE_KEYS to secrets")
             _say(log, "[!] " + st["error"])
             return st
         _say(log, "[*] Step 1: Checking basic ipify connectivity...")
@@ -1793,12 +1950,8 @@ def flight(force=False, cancel=None, diagnose=False) -> dict:
         else:
             st["error"] = "no candidate answered the endpoint with 200 and JSON"
             _say(log, "[!] " + st["error"])
-            if key_present():
-                _say(log, "[*] A HIBP_API_KEY is set - the reader will fall back to "
-                          "the keyed API, which is not challenged.")
-            else:
-                _say(log, "[*] No HIBP_API_KEY set. A keyed call is not challenged; "
-                          "with every node walled it is the reliable route.")
+            _say(log, "[*] Nothing was kept, so %s was left as it was - the reader "
+                      "keeps using proxies.txt." % FLIGHT_POOL)
         _summary_lines(log, codes, kept, diag, len(cand), len(alive))
         return st
     except Exception as exc:
@@ -2080,7 +2233,7 @@ def check_password(password, force=False):
 
 
 # ---------------------------------------------------------------------------
-# the address half - one reused page per worker, vanilla Chromium, the pool
+# the address half - one reused page per worker, headless Chromium, the pool
 # ---------------------------------------------------------------------------
 def _browser():
     b = getattr(_tls, "browser", None)
@@ -2094,6 +2247,19 @@ def _browser():
     if pw is None:
         pw = sync_playwright().start()
         _tls.pw = pw
+    # The new headless build carries a real renderer path; the old headless shell
+    # reports SwiftShader and is easier to score. Try the former once, then stop
+    # trying so a 130-node flight does not pay a failed launch per node.
+    if not _no_channel[0]:
+        try:
+            b = pw.chromium.launch(headless=True, channel="chromium",
+                                   args=CONTAINER_ARGS)
+            _tls.browser = b
+            return b
+        except Exception as exc:
+            _no_channel[0] = True
+            trace("WARN", "browser", "chromium channel unavailable (%s) - plain "
+                  "headless from here" % type(exc).__name__)
     b = pw.chromium.launch(headless=True, args=CONTAINER_ARGS)
     _tls.browser = b
     return b
@@ -2141,7 +2307,7 @@ class _Slot:
     def open_ctx(self, proxy_line):
         self.close_ctx()
         b = _browser()
-        ctx = b.new_context(**_ctx_kw(proxy_line))
+        ctx = _new_context(b, proxy_line)
         ctx.set_default_timeout(NAV_TIMEOUT)
         self.ctx = ctx
         self.page = ctx.new_page()
@@ -2918,6 +3084,8 @@ def selftest(verbose=False) -> bool:
         HIBP_BASE + "/api/v3/breachedaccount/a%40b.co?truncateResponse=false")
     add("api_lookup_callable", callable(_api_lookup))
     add("container_args", "--no-sandbox" in CONTAINER_ARGS)
+    add("container_args_automation",
+        "--disable-blink-features=AutomationControlled" in CONTAINER_ARGS)
     add("hostport", _hostport("u:p@1.2.3.4:8080") == "1.2.3.4:8080")
     add("hostport_bad", _hostport("nope") == "")
 
@@ -2960,7 +3128,7 @@ def selftest(verbose=False) -> bool:
     add("ip_of_none", _ip_of(None) == "-")
     add("ip_of_non_json", _ip_of(type("R", (), {"text": "hello"})()) == "-")
 
-    # ---- the context headers, and the gateway skip rule ----
+    # ---- the context identity, the patches, and the gateway skip rule ----
     add("ctx_headers_referer", CTX_HEADERS.get("Referer") == HIBP_BASE + "/")
     add("ctx_headers_origin", CTX_HEADERS.get("Origin") == HIBP_BASE)
     add("ctx_headers_sec_fetch", "sec-fetch-site" in CTX_HEADERS)
@@ -2970,6 +3138,16 @@ def selftest(verbose=False) -> bool:
         == "http://1.2.3.4:8080")
     add("ctx_kw_direct_no_proxy", "proxy" not in _ctx_kw(None))
     add("ctx_kw_ua", _ctx_kw(None).get("user_agent") == UA)
+    add("ctx_kw_timezone", _ctx_kw(None).get("timezone_id") == "America/New_York")
+    add("ctx_kw_not_mobile", _ctx_kw(None).get("is_mobile") is False)
+    add("ctx_kw_no_touch", _ctx_kw(None).get("has_touch") is False)
+    add("ctx_kw_screen", (_ctx_kw(None).get("screen") or {}).get("width") == 1920)
+    add("stealth_webdriver", "webdriver" in STEALTH_JS)
+    add("stealth_platform", "'Win32'" in STEALTH_JS)
+    add("stealth_plugins", "PDF Viewer" in STEALTH_JS)
+    add("stealth_webgl", "37446" in STEALTH_JS)
+    add("stealth_no_angle", "\x3c" not in STEALTH_JS)
+    add("new_context_callable", callable(_new_context))
     add("gateway_dead_407", _gateway_dead("ProxyError: Tunnel connection failed: "
                                           "407 Unauthorized"))
     add("gateway_dead_word", _gateway_dead("Tunnel connection failed: Unauthorized"))
@@ -3083,6 +3261,7 @@ def selftest(verbose=False) -> bool:
     add("flight_timeout_35s", FLIGHT_TIMEOUT == 35000)
     add("flight_probe_is_email", is_email(FLIGHT_PROBE))
     add("flight_pool_only", FLIGHT_POOL == "proxies_breach.txt")
+    add("flight_cap_above_130", FLIGHT_MAX >= 130)
     add("fetch_js", "fetch(" in FETCH_JS and "credentials" in FETCH_JS)
     add("flight_geo_helper", callable(_flight_geo))
     add("flight_log_helper", "no test flight" in flight_log_text())
@@ -3092,6 +3271,42 @@ def selftest(verbose=False) -> bool:
     _lgl = []
     _say(_lgl, "x")
     add("say_appends", _lgl == ["x"])
+
+    # ---- candidates: proxies.txt first, full-line dedupe, dead nodes skipped ----
+    _was_c = owner()
+    set_owner("zzcand")
+    _pf, _mf = _user_file("proxies.txt"), _user_file("proxy_meta.json")
+    _old_pf = _old_mf = None
+    try:
+        for _p in (_pf, _mf):
+            if os.path.exists(_p):
+                with open(_p, encoding="utf-8") as _fh:
+                    if _p == _pf:
+                        _old_pf = _fh.read()
+                    else:
+                        _old_mf = _fh.read()
+        with open(_mf, "w", encoding="utf-8") as _fh:
+            json.dump({"probe": {"1.2.3.4:2": {"reason": "dead"}}}, _fh)
+        with open(_pf, "w", encoding="utf-8") as _fh:
+            _fh.write("u:p@1.1.1.1:1\nv:q@1.1.1.1:1\nu:p@1.1.1.1:1\n"
+                      "1.2.3.4:2\n5.6.7.8:3\n")
+        _got = _candidates()
+        add("cand_full_line_dedupe", len(_got) == 3)
+        add("cand_keeps_two_creds", _got.count("u:p@1.1.1.1:1") == 1
+            and "v:q@1.1.1.1:1" in _got)
+        add("cand_skips_dead", "1.2.3.4:2" not in _got)
+        add("cand_keeps_unknown", "5.6.7.8:3" in _got)
+    finally:
+        for _p, _old in ((_pf, _old_pf), (_mf, _old_mf)):
+            try:
+                if _old is not None:
+                    with open(_p, "w", encoding="utf-8") as _fh:
+                        _fh.write(_old)
+                elif os.path.exists(_p):
+                    os.remove(_p)
+            except Exception:
+                pass
+        set_owner(_was_c)
 
     add("cat_helpers", callable(catalogue) and callable(_cat_rows)
         and callable(catalogue_state))
