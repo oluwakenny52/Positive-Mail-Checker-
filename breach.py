@@ -2491,7 +2491,7 @@ def _page_from_record(rec) -> dict:
              "checked: %s" % (rec.get("checked_at") or ""),
              "verdict: %s - %s" % (rec.get("verdict") or "?", rec.get("reason") or ""),
              "address half: %s" % (rec.get("addr_verdict") or "UNREAD"),
-<｜begin▁of▁sentence｜>|             "password half: %s" % (rec.get("pw_band") or "none"),
+             "password half: %s" % (rec.get("pw_band") or "none"),
              "password appearances: %s" % (_pw if _pw is not None
                                            else "no password supplied"),
              "source: %s" % (rec.get("via") or "-"),
