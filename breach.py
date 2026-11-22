@@ -8,49 +8,80 @@ with the proxy on the context.
 
     200 + JSON     parse it, remember the node as via_proxy, stop
     404            the site's own "not in any breach", stop
-    anything else  continue to next attempt, then DIRECT
+    401 / 403      the endpoint refusing the caller - next node, then DIRECT
+    anything else  next node
+
+A 200 that is NOT JSON is the only case that gets a same-origin fetch() from
+inside the page: there is a document to fetch from and the shell may carry what
+the plain navigation lacked. A 401 does NOT get one - the 401 body is plain text
+and the in-page ask simply repeats the 401 (proved by a 130-node run where every
+single node logged "in-page 401"). RETRY_STATUS is still the retry set: the test
+flight gives a 401 exactly one second chance, after a warm-up, on the same node.
 
 ONLY A 404 IS A READABLE ZERO
 -----------------------------
 A 404 is the site's own "not in any breach" - an answer about the ADDRESS. A 401
 is the endpoint refusing the CALLER, which says nothing about the mailbox, so it
 is retried (three nodes, then DIRECT) instead of being reported as clean. The
-catalogue is still used to fill a genuine 404 zero, but it is a DOMAIN match
-and is labelled as one.
+catalogue is still used to fill a genuine 404 zero, but it is a DOMAIN match and
+is labelled as one.
 
 A COMBO IS GRADED ON BOTH HALVES
 --------------------------------
 `_combine()` takes the worse half. A password-only band is only a valid VERDICT
 when the password is all that was asked for - a line with no '@'. When the line is
 a combo and the address half could not be read, the combo is UNKNOWN: the password
-band is still shown beside it, but it no longer decides the grade. Otherwise every
-walled address graded itself off its password and read as PARTIAL.
+band is still shown beside it, but it no longer decides the grade.
 
 THE TEST FLIGHT IS CELL 2, AND IT IS BREACH-ONLY
 ------------------------------------------------
     candidates   Oxylabs first, then Webshare (every key, paginated), then any
                  proxies_secret.txt / proxies_custom.txt / proxies.txt
+    dedupe       BY host:port, not by line. Webshare hands the same IP:port out
+                 under every sub-user, so a line-level dedupe flew one endpoint
+                 ten times and buried the run in its own 401s. Colab never had
+                 that: 31 lines, 30 unique.
     step 1       ipify, 8 s, dead nodes dropped and logged "dead ipify check"
     step 2       headless Chromium, FIVE at a time, one isolated context per
-                 node, against /unifiedsearch/eddiemurphy%40gmail.com
+                 node, egress IP read inside the context FIRST
     pass         HTTP 200 AND a JSON object body ({ or [ that json.loads)
-    log          "    ✅ 200 -> host:port | country | city" for a pass and
-                 "    skip  -> host:port | test flight failed (reason)" for a fail
+    log          "    ✅ 200 -> host:port | country | city | egress IP"
+                 "    skip  -> host:port | test flight failed (reason) | egress IP"
     save         the survivors, one per line, to proxies_breach.txt
     summary      "[*] Passed test flight (✅ 200) : N" and the file name
 
+WHY THE EGRESS IP IS LOGGED
+---------------------------
+ipify in step 1 goes through `requests`, which does use the proxy. The browser
+does not necessarily - and if `proxy` is not carried on the context, every node
+answers from Streamlit's own address instead of the proxy's, which looks exactly
+like "all 401". So each node reads api.ipify.org FROM INSIDE ITS OWN CONTEXT
+first and the answer is printed beside the verdict. If every line shows the same
+IP, the proxy is not being applied and that is the bug, not the endpoint.
+
+Vanilla launch: no STEALTH_JS, no automation flag. Only --no-sandbox and
+--disable-dev-shm-usage stay, because Streamlit Cloud is a container and those
+two are container necessities rather than fingerprint.
+
 proxies_breach.txt is the ONLY file the flight writes, so the mail checker's own
-proxies.txt is never touched; the reader prefers the flight pool while it is under
-POOL_TTL old and falls back to proxies.txt otherwise.
+proxies.txt is never touched; the reader prefers the flight pool while it is
+under POOL_TTL old and falls back to proxies.txt otherwise.
+
+A KEY ENDS THE ARGUMENT
+-----------------------
+`HIBP_API_KEY` is optional and was already plumbed but unused. When it is set and
+the browser path produced no answer, /api/v3/breachedaccount is asked directly -
+it is not Cloudflare-challenged, so a keyed deployment never depends on a proxy
+surviving the wall at all.
 
 THE FLIGHT'S LOG HAS TO BE VISIBLE
 ----------------------------------
 `owner()` is thread-local, so a worker thread that does not pin it traces with an
 empty owner and trace_read() filters its lines away - the whole per-node log of a
 flight vanished that way and a 0-of-120 read as if nothing had run. Every flight
-worker now pins the owner first, and a failure keeps the exception TEXT, not just
-its class name. The flight also refuses to start when Chromium is not ready
-instead of throwing 120 instant failures into the void.
+worker pins the owner first, and a failure keeps the exception TEXT, not just its
+class name. The flight also refuses to start when Chromium is not ready instead
+of throwing 200 instant failures into the void.
 
 THE CATALOGUE FILLS THE ZERO
 ----------------------------
@@ -69,10 +100,9 @@ slot is launched once per worker for the whole batch, so a 500-item run pays for
 N browsers, not 500.
 
 A slot recycles itself after SLOT_USES_MAX uses, after SLOT_FAILS_MAX failed
-attempts in a row, or when the next attempt wants a different proxy (the proxy is
-bound to the context, so a swap is a new context on the same browser). Recycling
-is local: the item in flight is already recorded, so a wedged page can never lose
-a finished result and can never hold the queue.
+attempts in a row, or when the next attempt wants a different proxy. Recycling is
+local: the item in flight is already recorded, so a wedged page can never lose a
+finished result and can never hold the queue.
 
 THE DRAW IS RANDOM
 ------------------
@@ -112,10 +142,10 @@ is built from chr(38). A paste that strips tags out of literals - which eats a
 raw tag down to a bare newline and turns a raw entity into a no-op - cannot
 break either form.
 
-Isolation: cache, trace, flight, pool cache, bad-node list, slots and state
-resolve through the pinned owner, which is the unlocked hash, so each is one
-file/bucket per user. Plain module, NOT frame-gated, no Streamlit. EVERY public
-function swallows.
+Isolation: cache, trace, flight, pool cache, bad-node list, cursor, slots and
+state resolve through the pinned owner, which is the unlocked hash, so each is
+one file/bucket per user. Plain module, NOT frame-gated, no Streamlit. EVERY
+public function swallows.
 """
 
 import concurrent.futures as _cf
@@ -144,13 +174,19 @@ HIBP_BASE = "https://haveibeenpwned.com"
 UNIFIED = HIBP_BASE + "/unifiedsearch/%s"
 ACCOUNT = HIBP_BASE + "/account/%s"
 CATALOGUE_URL = HIBP_BASE + "/api/v3/breaches"
+KEY_API = HIBP_BASE + "/api/v3/breachedaccount/%s?truncateResponse=false"
 PW_RANGE = "https://api.pwnedpasswords.com/range/%s"
 KEY_ENV = "HIBP_API_KEY"
 
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
 
-# Same-origin fetch helper for non-JSON 200 responses only.
+# Container necessities only. The stealth flags and STEALTH_JS are gone: the
+# Colab that produced the 200s launched vanilla, and an over-decorated headless
+# browser is its own fingerprint.
+CONTAINER_ARGS = ["--no-sandbox", "--disable-dev-shm-usage"]
+
+# Same-origin fetch helper for NON-JSON 200 responses only.
 FETCH_JS = ("async (u) => {try {const r = await fetch(u, {headers: "
             "{'accept': 'application/json'}, credentials: 'include', "
             "cache: 'no-store'}); const t = await r.text(); "
@@ -160,7 +196,8 @@ FETCH_JS = ("async (u) => {try {const r = await fetch(u, {headers: "
 NAV_TIMEOUT = 25000
 HTTP_TIMEOUT = 15.0
 
-# Statuses worth a second ask from inside the page only when 200 non-JSON arrived.
+# The retry set. A flight gives one of these a single second chance on the same
+# node after a warm-up; the reader does not re-ask at all on a 401.
 RETRY_STATUS = frozenset({401, 403, 408, 425, 429, 500, 502, 503, 504})
 
 # The Colab limit. Three nodes, then DIRECT if no 404 arrived.
@@ -305,6 +342,12 @@ def owner() -> str:
 
 
 def _owner_key() -> str:
+    """The bucket name for every per-user table in this module.
+
+    `owner()` first, because it is the only one that survives a worker thread.
+    auth.user_key_hash() reads st.session_state, which a bare thread cannot do,
+    so it is a fallback and "anonlocal" is the last resort - never a mix.
+    """
     p = owner()
     if p:
         return p
@@ -964,6 +1007,41 @@ def catalogue_state() -> dict:
 
 
 # ---------------------------------------------------------------------------
+# the keyed API - the route that is not behind the wall at all
+# ---------------------------------------------------------------------------
+def _api_lookup(addr):
+    """breachedaccount with the user's own key. -> payload | {} | None.
+
+    None means "no key, or the key did not answer" - the caller falls through.
+    HIBP's API needs a real User-Agent and returns 404 for a clean address.
+    """
+    key = _api_key()
+    if not key:
+        return None
+    try:
+        import requests
+    except Exception:
+        return None
+    try:
+        trace("INFO", "key", "GET %s" % (KEY_API % urllib.parse.quote(_email_only(addr))))
+        r = requests.get(KEY_API % urllib.parse.quote(_email_only(addr)),
+                         timeout=HTTP_TIMEOUT,
+                         headers={"hibp-api-key": key, "User-Agent": UA,
+                                  "Accept": "application/json"})
+        trace("INFO", "key", "http %d, %d byte(s)"
+              % (r.status_code, len(r.content or b"")))
+        if r.status_code == 404:
+            return {}
+        if r.status_code != 200:
+            return None
+        got = r.json()
+    except Exception as exc:
+        trace("ERR", "key", "%s: %s" % (type(exc).__name__, str(exc)[:120]))
+        return None
+    return {"Breaches": got} if isinstance(got, list) else None
+
+
+# ---------------------------------------------------------------------------
 # the test flight - the Colab's second cell, in the app, for the breach only
 # ---------------------------------------------------------------------------
 def _flight_path() -> str:
@@ -1065,7 +1143,18 @@ def _webshare_fetch(keys, log=None):
     return out
 
 
+def _hostport(line) -> str:
+    info = parse_proxy_line(line)
+    return "%s:%d" % (info["host"], info["port"]) if info else ""
+
+
 def _candidates(log=None):
+    """Every candidate node, Oxylabs first, deduped BY host:port, capped.
+
+    Line-level dedupe is not enough: Webshare hands the same IP:port out under
+    every sub-user, so 130 lines were 13 endpoints and each one was flown ten
+    times. Only the first credential for an endpoint is kept.
+    """
     raw = []
     oxy = _oxylabs_lines()
     raw.extend(oxy)
@@ -1081,13 +1170,16 @@ def _candidates(log=None):
     for name in ("proxies_secret.txt", "proxies_custom.txt", "proxies.txt",
                  FLIGHT_POOL):
         raw.extend(_read_lines(_user_file(name)))
-    seen, out = set(), []
+    seen, seen_hp, out = set(), set(), []
     for line in raw:
         line = str(line or "").strip()
-        if not line or line in seen or not parse_proxy_line(line):
+        hp = _hostport(line)
+        if not line or not hp or line in seen or hp in seen_hp:
             continue
         seen.add(line)
+        seen_hp.add(hp)
         out.append(line)
+    _say(log, "[*] Unique endpoints      : %d" % len(out))
     return out[:FLIGHT_MAX]
 
 
@@ -1152,11 +1244,18 @@ def _inpage_fetch(page, addr):
 
 
 def _flight_one(line):
-    """One node through a vanilla headless Chromium context, matching Colab."""
+    """One node through a vanilla headless context. -> (passed, reason, egress).
+
+    The egress IP is read INSIDE the context first: if `proxy` is not carried,
+    the browser answers from Streamlit's own address and every node 401s, which
+    is indistinguishable from a walled endpoint unless it is measured. Then a
+    warm-up, then the ask, with exactly one retry on a retryable status.
+    """
     ctx = None
+    ip = "-"
     try:
         b = _browser()
-        kw = {"user_agent": UA, "locale": "en-US", "ignore_https_errors": True,
+        kw = {"user_agent": UA, "locale": "en-US",
               "viewport": {"width": 1440, "height": 900}}
         cfg = _proxy_cfg(line)
         if cfg:
@@ -1164,25 +1263,48 @@ def _flight_one(line):
         ctx = b.new_context(**kw)
         page = ctx.new_page()
         page.set_default_timeout(FLIGHT_TIMEOUT)
-        resp = page.goto(unified_url(FLIGHT_PROBE), wait_until="domcontentloaded",
-                         timeout=FLIGHT_TIMEOUT)
-        status = resp.status if resp is not None else 0
-        body = ""
         try:
-            body = resp.text() if resp is not None else ""
+            probe = page.goto(IPIFY_URL, wait_until="domcontentloaded",
+                              timeout=FLIGHT_TIMEOUT)
+            if probe is not None and probe.status == 200:
+                ip = str((_json_of(probe.text()) or {}).get("ip") or "-")
         except Exception:
+            pass
+        if ip in ("", "-"):
+            return False, "no egress ip - proxy not carried", ip
+        try:
+            page.goto(HIBP_BASE + "/", wait_until="domcontentloaded",
+                      timeout=FLIGHT_TIMEOUT)
+        except Exception:
+            pass
+        status = 0
+        for attempt in (1, 2):
+            try:
+                resp = page.goto(unified_url(FLIGHT_PROBE),
+                                 wait_until="domcontentloaded",
+                                 timeout=FLIGHT_TIMEOUT)
+            except Exception as exc:
+                return False, "%s: %s" % (type(exc).__name__, str(exc)[:100]), ip
+            status = resp.status if resp is not None else 0
             body = ""
-        if status == 200:
-            if isinstance(_json_of(body), dict):
-                return True, "200"
-            page.wait_for_timeout(700)
-            got, payload = _inpage_fetch(page, FLIGHT_PROBE)
-            if isinstance(payload, dict):
-                return True, "200"
-            return False, "in-page %s" % (got or "200 non-JSON body")
-        return False, "status %s" % (status or "?")
+            try:
+                body = resp.text() if resp is not None else ""
+            except Exception:
+                body = ""
+            if status == 200:
+                if isinstance(_json_of(body), dict):
+                    return True, "200", ip
+                page.wait_for_timeout(700)
+                got, payload = _inpage_fetch(page, FLIGHT_PROBE)
+                if isinstance(payload, dict):
+                    return True, "200", ip
+                return False, "in-page %s" % (got or "200 non-JSON body"), ip
+            if status not in RETRY_STATUS:
+                break
+            page.wait_for_timeout(900)
+        return False, "status %s" % (status or "?"), ip
     except Exception as exc:
-        return False, "%s: %s" % (type(exc).__name__, str(exc)[:110])
+        return False, "%s: %s" % (type(exc).__name__, str(exc)[:110]), ip
     finally:
         try:
             if ctx is not None:
@@ -1222,16 +1344,17 @@ def _flight_browser(alive, cancel=None, log=None, pin=""):
         with lock:
             if len(kept) >= FLIGHT_WANT:
                 return
-        ok, reason = _flight_one(line)
+        ok, reason, ip = _flight_one(line)
         if ok:
             country, city = _flight_geo(line)
             tag = " [OXYLABS CURRENT]" if "oxylabs.io" in line else ""
             with lock:
                 kept.append(line)
-            _say(log, "    ✅ 200 -> %-22s | %-16s | %s%s"
-                 % (short, country, city, tag))
+            _say(log, "    ✅ 200 -> %-22s | %-16s | %s%s | egress %s"
+                 % (short, country, city, tag, ip))
         else:
-            _say(log, "    skip  -> %-22s | test flight failed (%s)" % (short, reason))
+            _say(log, "    skip  -> %-22s | test flight failed (%s) | egress %s"
+                 % (short, reason, ip))
 
     width = max(1, min(FLIGHT_WORKERS, len(alive) or 1))
     with _cf.ThreadPoolExecutor(max_workers=width) as ex:
@@ -1480,7 +1603,8 @@ def pool_lines(force=False):
     now = time.time()
     with _lock:
         cached = _pool_caches.get(who)
-        if not force and cached and cached.get("lines") and (now - float(cached.get("ts") or 0)) < _pool_ttl:
+        if (not force and cached and cached.get("lines")
+                and (now - float(cached.get("ts") or 0)) < _pool_ttl):
             return list(cached["lines"])
     path = _flight_pool_path() if _flight_fresh() else _user_file("proxies.txt")
     raw = [l for l in dict.fromkeys(_read_lines(path)) if parse_proxy_line(l)]
@@ -1624,7 +1748,7 @@ def _browser():
     if pw is None:
         pw = sync_playwright().start()
         _tls.pw = pw
-    b = pw.chromium.launch(headless=True)
+    b = pw.chromium.launch(headless=True, args=CONTAINER_ARGS)
     _tls.browser = b
     return b
 
@@ -1671,7 +1795,7 @@ class _Slot:
     def open_ctx(self, proxy_line):
         self.close_ctx()
         b = _browser()
-        kw = {"user_agent": UA, "locale": "en-US", "ignore_https_errors": True,
+        kw = {"user_agent": UA, "locale": "en-US",
               "viewport": {"width": 1440, "height": 900}}
         cfg = _proxy_cfg(proxy_line) if proxy_line else None
         if cfg:
@@ -1813,6 +1937,13 @@ def _search_address(addr, cancel=None):
     if _zero_rule(seen):
         return {}, "", "", seen
 
+    # A key sidesteps the wall entirely - try it before spending DIRECT.
+    if key_present():
+        got = _api_lookup(addr)
+        if got is not None:
+            return got, "KEY", "", seen
+        errors.append("KEY: failed")
+
     status, payload = _attempt(addr, None)
     seen.append(status)
     if payload is not None:
@@ -1923,7 +2054,7 @@ def _page_from_record(rec) -> dict:
     if rec.get("partial_read"):
         basis = "domain match - the exact search was refused"
     elif not rec.get("read"):
-        basis = "nothing readable - proxy and direct all failed"
+        basis = "nothing readable - proxy, in-page fetch and direct all failed"
     elif rec.get("count"):
         basis = "exact search"
     else:
@@ -2079,7 +2210,7 @@ _REASON = {
                % BREACH_PARTIAL_DAYS,
     "OLD": "password has been public for years, or only old breaches",
     "CLEAN": "password unseen and the address in no readable source",
-    "UNKNOWN": "no readable answer - proxy and direct all failed",
+    "UNKNOWN": "no readable answer - proxy, in-page fetch and direct all failed",
     "UNREAD": "address half was not read - a combo is not graded on its password",
 }
 
@@ -2204,8 +2335,8 @@ def check_item(item, force=False, cancel=None) -> dict:
         rec["via_proxy"] = ""
         rec["read"] = False
         rec["error"] = ("cancelled" if _is_cancelled(cancel) else
-                        "connection/proxy error - unreachable on proxy and direct"
-                        + ((" (%s)" % err) if err else ""))
+                        "connection/proxy error - unreachable on proxy, in-page fetch "
+                        "and direct" + ((" (%s)" % err) if err else ""))
 
     rec["breach_count"] = len(rec.get("breaches") or [])
     rec["summary_note"] = _summary_note(rec)
@@ -2407,7 +2538,7 @@ def report() -> dict:
             "browser_error": browser_note(), "delay": _delay(),
             "pool": len(pool_lines()), "rotate": rotating(), "skipped": bad,
             "catalogue": catalogue_state(), "tries": PROXY_TRIES,
-            "flight": flight_state(), "key": bool(_api_key()), "owner": owner(),
+            "flight": flight_state(), "key": key_present(), "owner": owner(),
             "cache": cache_stats(), "last": mine, "trace_seq": trace_seq()}
 
 
@@ -2421,6 +2552,7 @@ def selftest(verbose=False) -> bool:
         checks.append((n, bool(ok)))
 
     add("lock_reentrant", type(_lock).__name__ == "RLock")
+    add("owner_key_nonempty", bool(_owner_key()))
     add("is_email", is_email("a.b@c.co"))
     add("not_email", not is_email("nope"))
     add("only_colon", _email_only("a@b.co:hunter2") == "a@b.co")
@@ -2428,6 +2560,12 @@ def selftest(verbose=False) -> bool:
         HIBP_BASE + "/unifiedsearch/a%40b.co")
     add("flight_probe_url", unified_url(FLIGHT_PROBE) ==
         HIBP_BASE + "/unifiedsearch/eddiemurphy%40gmail.com")
+    add("key_api_url", KEY_API % "a%40b.co" ==
+        HIBP_BASE + "/api/v3/breachedaccount/a%40b.co?truncateResponse=false")
+    add("api_lookup_callable", callable(_api_lookup))
+    add("container_args", "--no-sandbox" in CONTAINER_ARGS)
+    add("hostport", _hostport("u:p@1.2.3.4:8080") == "1.2.3.4:8080")
+    add("hostport_bad", _hostport("nope") == "")
     add("blank_read_false", _blank({"kind": "email", "email": "a@b.co"}).get("read") is False)
     add("blank_addr_unread", _blank({"kind": "email", "email": "a@b.co"}).get("addr_verdict")
         == "UNREAD")
@@ -2580,16 +2718,17 @@ def selftest(verbose=False) -> bool:
     _keep_pool, _keep_rot = _cfg.get("pool"), _cfg.get("rotate")
     _cfg["pool"] = ["1.1.1.1:1", "2.2.2.2:2", "3.3.3.3:3"]
     _cfg["rotate"] = False
-    _cursors["anonlocal"] = [0]
+    _who = _owner_key()
+    _cursors[_who] = [0]
     _a, _b = _pick_proxy(set()), _pick_proxy(set())
     add("walk_differs", _a != _b and _a in _cfg["pool"] and _b in _cfg["pool"])
     _cfg["rotate"] = True
     add("random_spreads", len({_pick_proxy(set()) for _ in range(60)}) == 3)
     add("avoid_set", _pick_proxy({"1.1.1.1:1", "2.2.2.2:2"}) == "3.3.3.3:3")
     add("avoid_exhausted", _pick_proxy({"1.1.1.1:1", "2.2.2.2:2", "3.3.3.3:3"}) is None)
-    _bads["anonlocal"] = {"1.1.1.1:1": BAD_AFTER}
+    _bads[_who] = {"1.1.1.1:1": BAD_AFTER}
     add("bad_node_skipped", _pick_proxy(set()) in ("2.2.2.2:2", "3.3.3.3:3"))
-    _bads.clear()
+    _bads.pop(_who, None)
     _cfg["pool"], _cfg["rotate"] = _keep_pool, _keep_rot
     add("pick_empty_pool", _pick_proxy(set()) is not None or not pool_lines())
 
@@ -2619,6 +2758,7 @@ def selftest(verbose=False) -> bool:
     set_owner("aaaa1111")
     add("user_file_prefixed", _user_file(CACHE_NAME) == "aaaa1111_" + CACHE_NAME)
     add("flight_pool_prefixed", _flight_pool_path() == "aaaa1111_" + FLIGHT_POOL)
+    add("owner_key_is_pin", _owner_key() == "aaaa1111")
     set_owner("")
     add("owner_empty_falls_back", bool(_user_file(CACHE_NAME)))
     set_owner(_was)
