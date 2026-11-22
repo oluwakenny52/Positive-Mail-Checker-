@@ -253,12 +253,6 @@ st.markdown(_css(), unsafe_allow_html=True)
 # @@BLOCK 006 SOURCES deps=005
 import breach
 
-# ---- stale-module guard -------------------------------------------------------
-# Every marker is a capability this page calls. A module missing one predates it
-# and is replaced before anything touches it. `_zero_rule`, PROXY_TRIES, the
-# flight markers and flight_log_text belong to the 401 fix and the test flight: a
-# module without them still reported a 401 as CLEAN, still ran an unproven pool,
-# and still lost the flight's own log to an unpinned worker thread.
 if not (hasattr(breach, "parse_lines") and hasattr(breach, "pool_lines")
         and hasattr(breach, "check_item") and hasattr(breach, "clear_cache")
         and hasattr(breach, "cache_stats") and hasattr(breach, "record_view")
@@ -298,23 +292,20 @@ _LT = chr(38) + "lt;"
 _GT = chr(38) + "gt;"
 _QUOT = chr(38) + "quot;"
 
-_OWNER = os.path.basename(user_file("")) or ""
+_OWNER = str(st.session_state.get("user_key_hash") or os.path.basename(user_file("")) or "")
 _pin_owner = getattr(breach, "set_owner", None)
 if callable(_pin_owner):
     _pin_owner(_OWNER)
 
 
 def _state_path():
-    if _OWNER:
-        return "%s_%s" % (_OWNER, _STATE_NAME)
     try:
         return user_file(_STATE_NAME)
     except Exception:
-        return _STATE_NAME
+        return "%s_%s" % (_OWNER, _STATE_NAME) if _OWNER else _STATE_NAME
 
 
 def _state_load():
-    """This user's last settings and results. {} when there are none."""
     p = _state_path()
     if not p or not os.path.exists(p):
         return {}
@@ -327,10 +318,6 @@ def _state_load():
 
 
 def _state_save(rows, quality, stamp):
-    """Persist settings + results + quality so a reload keeps them.
-
-    The HTML is dropped and the text trimmed, so the file stays small.
-    """
     p = _state_path()
     if not p:
         return
@@ -356,7 +343,6 @@ def _state_save(rows, quality, stamp):
 
 
 def _state_apply():
-    """Seed the widget keys BEFORE the widgets exist. Never overwrites a live one."""
     st_ = _state_load()
     setts = st_.get("settings") or {}
     pairs = (("_breach_workers", setts.get("workers")),
@@ -375,16 +361,13 @@ def _state_apply():
 
 
 def _hist_path():
-    if _OWNER:
-        return "%s_%s" % (_OWNER, _HIST_NAME)
     try:
         return user_file(_HIST_NAME)
     except Exception:
-        return _HIST_NAME
+        return "%s_%s" % (_OWNER, _HIST_NAME) if _OWNER else _HIST_NAME
 
 
 def _hist_add(rows):
-    """Append reports, then trim the file to _HIST_MAX. Never raises."""
     p = _hist_path()
     if not p:
         return
@@ -456,8 +439,6 @@ def _band_counts(rows):
 
 
 def _row_key(r):
-    """A stable, unique widget key. The password is part of it, or two combos on
-    one address would share every widget key on the page."""
     seed = r.get("email") or r.get("password_check", {}).get("sha1") or "row"
     if r.get("password"):
         seed = "%s|%s" % (seed, r.get("password"))
@@ -472,7 +453,6 @@ def _h_esc(v):
 
 
 def _label(r):
-    """What the card is about: the combo exactly as it was checked."""
     if r.get("kind") == "password":
         return "password only"
     em = str(r.get("email") or "?")
@@ -481,7 +461,6 @@ def _label(r):
 
 
 def _combo_line(r):
-    """One pasteable line for the rotate export."""
     if r.get("kind") == "password":
         return "pw:%s" % (r.get("password") or "")
     em = str(r.get("email") or "")
@@ -490,7 +469,6 @@ def _combo_line(r):
 
 
 def _ago(sec):
-    """Seconds -> a short age. Never raises, never negative."""
     try:
         s = int(sec if sec is not None else -1)
     except Exception:
@@ -505,7 +483,6 @@ def _ago(sec):
 
 
 def _record_page(r):
-    """(text, html) of a record, built here when nothing was generated."""
     _fn = getattr(breach, "record_view", None)
     if callable(_fn):
         try:
@@ -593,7 +570,6 @@ def _trace_read(limit=250, skip=None):
         return []
 
 
-# ---- owner gate ----
 if st.session_state.get(_OWNER_KEY) != _OWNER:
     for k in (_RES_KEY, _RUN_KEY, _JOB_KEY, _FLY_KEY, _QUAL_KEY, _MSG_KEY,
               "_breach_text", _TRACE_SHOWN):
@@ -601,7 +577,6 @@ if st.session_state.get(_OWNER_KEY) != _OWNER:
     st.session_state[_OWNER_KEY] = _OWNER
     st.session_state.pop(_BOOT_KEY, None)
 
-# ---- a FRESH SESSION wipes the trace ----
 if not st.session_state.get(_BOOT_KEY):
     st.session_state[_BOOT_KEY] = True
     try:
@@ -609,7 +584,6 @@ if not st.session_state.get(_BOOT_KEY):
     except Exception:
         pass
 
-# ---- settings and results survive a reload ----
 _state_apply()
 
 breach.trace("INFO", "page", "loaded")
