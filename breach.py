@@ -14,9 +14,9 @@ with the proxy on the context.
 A 200 that is NOT JSON is the only case that gets a same-origin fetch() from
 inside the page: there is a document to fetch from and the shell may carry what
 the plain navigation lacked. A 401 does NOT get one - the 401 body is plain text
-and the in-page ask simply repeats the 401 (proved by a 130-node run where every
-single node logged "in-page 401"). RETRY_STATUS is still the retry set: the test
-flight gives a 401 exactly one second chance, after a warm-up, on the same node.
+and the in-page ask simply repeats the 401. RETRY_STATUS is still the retry set:
+the test flight gives a 401 exactly one second chance, after a warm-up, on the
+same node.
 
 ONLY A 404 IS A READABLE ZERO
 -----------------------------
@@ -39,9 +39,8 @@ THE TEST FLIGHT IS CELL 2, AND IT IS BREACH-ONLY
                  proxies_secret.txt / proxies_custom.txt / proxies.txt
     dedupe       BY host:port, not by line. Webshare hands the same IP:port out
                  under every sub-user, so a line-level dedupe flew one endpoint
-                 ten times and buried the run in its own 401s. Colab never had
-                 that: 31 lines, 30 unique.
-    step 1       ipify, 8 s, dead nodes dropped and logged "dead ipify check"
+                 ten times and buried the run in its own 401s.
+    step 1       ipify, 8 s, dead nodes dropped with the REAL reason
     step 2       headless Chromium, FIVE at a time, one isolated context per
                  node, egress IP read inside the context FIRST
     pass         HTTP 200 AND a JSON object body ({ or [ that json.loads)
@@ -49,6 +48,20 @@ THE TEST FLIGHT IS CELL 2, AND IT IS BREACH-ONLY
                  "    skip  -> host:port | test flight failed (reason) | egress IP"
     save         the survivors, one per line, to proxies_breach.txt
     summary      "[*] Passed test flight (✅ 200) : N" and the file name
+
+THE DIAGNOSTIC FLIGHT
+---------------------
+`diagnose=True` (the "Diagnostic flight" switch on the page) turns the flight
+into a transcript instead of a verdict: the node, whether it carries auth, the
+exact target, whether the homepage step ran, the ipify answer with the real
+exception when it fails, then the status, content-type, byte count, the response
+headers that matter (server, cf-ray, www-authenticate, via, x-cache) and the
+first 200 characters of the body. Credentials are never printed - only host:port
+and auth=yes/no.
+
+It closes with a count per outcome and a legend for every code it can emit, so a
+wall of 401s says WHAT a 401 is here instead of just being one. It does not stop
+at FLIGHT_WANT, so every node is reported. Keeping still requires 200 + JSON.
 
 WHY THE EGRESS IP IS LOGGED
 ---------------------------
@@ -78,10 +91,9 @@ THE FLIGHT'S LOG HAS TO BE VISIBLE
 ----------------------------------
 `owner()` is thread-local, so a worker thread that does not pin it traces with an
 empty owner and trace_read() filters its lines away - the whole per-node log of a
-flight vanished that way and a 0-of-120 read as if nothing had run. Every flight
-worker pins the owner first, and a failure keeps the exception TEXT, not just its
-class name. The flight also refuses to start when Chromium is not ready instead
-of throwing 200 instant failures into the void.
+flight vanished that way. Every flight worker pins the owner first, and a failure
+keeps the exception TEXT, not just its class name. The flight also refuses to
+start when Chromium is not ready instead of throwing 200 instant failures away.
 
 THE CATALOGUE FILLS THE ZERO
 ----------------------------
@@ -225,13 +237,32 @@ FLIGHT_BUDGET = 300.0
 FLIGHT_TIMEOUT = 35000
 FLIGHT_GEO_URL = "http://ip-api.com/json/"
 FLIGHT_GEO_TIMEOUT = 8.0
-FLIGHT_LOG_MAX = 600
+FLIGHT_LOG_MAX = 900
+FLIGHT_SNIPPET = 200
 IPIFY_WORKERS = 12
 IPIFY_TIMEOUT = 8.0
 IPIFY_URL = "https://api.ipify.org?format=json"
 POOL_TTL = 1800.0
 WS_PAGES = 20
 WS_PAGE_SIZE = 100
+
+# Header names worth printing in a diagnostic line. Nothing else is echoed.
+DIAG_HEADERS = ("server", "cf-ray", "www-authenticate", "proxy-authenticate",
+                "via", "x-cache", "retry-after")
+
+# Every outcome the diagnostic summary can print, in report order.
+OUTCOMES = (
+    ("200", "read - JSON body accepted, node KEPT"),
+    ("404", "endpoint answered not-found - a readable zero for that address"),
+    ("401", "rejected / challenged by the target WAF - nothing readable"),
+    ("403", "forbidden or blocked by the WAF"),
+    ("429", "rate limited - the node is alive but must slow down"),
+    ("5xx", "target-side error - node alive, endpoint unwell"),
+    ("0", "transport failure - timeout, TLS, reset or proxy dropped"),
+    ("no_egress", "browser never showed an egress IP - proxy not carried"),
+    ("other", "any other status"),
+    ("ipify_fail", "the node could not reach ipify at all"),
+)
 
 CACHE_NAME = "breach_cache.json"
 CACHE_TTL = 6 * 3600.0
@@ -771,6 +802,27 @@ def _json_of(body):
     return got if isinstance(got, dict) else None
 
 
+def _snippet(body, n=None):
+    """First `n` characters, whitespace collapsed, for a diagnostic line."""
+    try:
+        txt = " ".join(str(body or "").split())
+    except Exception:
+        return ""
+    return txt[:int(n or FLIGHT_SNIPPET)]
+
+
+def _safe_headers(resp):
+    """Only the interesting response headers, as `k=v`, or '-'."""
+    try:
+        items = []
+        for k, v in (resp.headers or {}).items():
+            if str(k).lower() in DIAG_HEADERS:
+                items.append("%s=%s" % (str(k).lower(), str(v)[:60]))
+        return " ".join(items) if items else "-"
+    except Exception:
+        return "-"
+
+
 # ---------------------------------------------------------------------------
 # input parsing - three shapes, decided per line
 # ---------------------------------------------------------------------------
@@ -1096,6 +1148,33 @@ def _say(log, msg):
         pass
 
 
+def _bump(codes, key, lock):
+    try:
+        with lock:
+            codes[key] = codes.get(key, 0) + 1
+    except Exception:
+        pass
+
+
+def _bucket(status, reason="") -> str:
+    """One outcome label for the diagnostic summary. Never raises."""
+    try:
+        r = str(reason or "")
+        if r.startswith("no egress"):
+            return "no_egress"
+        if status == 200:
+            return "200"
+        if status in (401, 403, 404, 429):
+            return str(status)
+        if 500 <= int(status or 0) < 600:
+            return "5xx"
+        if not status:
+            return "0"
+    except Exception:
+        return "other"
+    return "other"
+
+
 def _webshare_fetch(keys, log=None):
     try:
         import requests
@@ -1152,7 +1231,7 @@ def _candidates(log=None):
     """Every candidate node, Oxylabs first, deduped BY host:port, capped.
 
     Line-level dedupe is not enough: Webshare hands the same IP:port out under
-    every sub-user, so 130 lines were 13 endpoints and each one was flown ten
+    every sub-user, so 130 lines were 11 endpoints and each one was flown many
     times. Only the first credential for an endpoint is kept.
     """
     raw = []
@@ -1194,17 +1273,36 @@ def _proxy_url(line):
     return "http://%s%s:%d" % (auth, info["host"], info["port"])
 
 
-def _proxy_ok(line) -> bool:
+def _ip_of(resp):
+    try:
+        return str((_json_of(resp.text) or {}).get("ip") or "-")
+    except Exception:
+        return "-"
+
+
+def _proxy_ok(line, diag=False, log=None):
+    """Does this node carry a request at all? -> (ok, note).
+
+    `note` is the real reason on failure - the HTTP status or the exception text,
+    never a generic "dead".
+    """
     url = _proxy_url(line)
     if not url:
-        return False
+        return False, "no usable proxy url"
     try:
         import requests
         r = requests.get(IPIFY_URL, proxies={"http": url, "https": url},
                          timeout=IPIFY_TIMEOUT)
-        return r.status_code == 200
-    except Exception:
-        return False
+        if diag:
+            _say(log, "      <- ipify %d | egress %s" % (r.status_code, _ip_of(r)))
+        if r.status_code == 200:
+            return True, "ok"
+        return False, "ipify http %d" % r.status_code
+    except Exception as exc:
+        note = "%s: %s" % (type(exc).__name__, str(exc)[:80])
+        if diag:
+            _say(log, "      <- ipify fail | %s" % note)
+        return False, note
 
 
 def _flight_geo(line):
@@ -1243,16 +1341,19 @@ def _inpage_fetch(page, addr):
     return status, payload
 
 
-def _flight_one(line):
-    """One node through a vanilla headless context. -> (passed, reason, egress).
+def _flight_one(line, diag=False, log=None):
+    """One node through a vanilla headless context.
 
-    The egress IP is read INSIDE the context first: if `proxy` is not carried,
-    the browser answers from Streamlit's own address and every node 401s, which
-    is indistinguishable from a walled endpoint unless it is measured. Then a
-    warm-up, then the ask, with exactly one retry on a retryable status.
+    -> dict(ok, reason, bucket, ip, status, ctype, size, headers, snippet,
+            home). The egress IP is read INSIDE the context first: if `proxy` is
+    not carried, the browser answers from Streamlit's own address and every node
+    401s, which is indistinguishable from a walled endpoint unless it is
+    measured. Credentials are never printed - host:port and auth=yes/no only.
     """
     ctx = None
-    ip = "-"
+    out = {"ok": False, "reason": "", "bucket": "other", "ip": "-", "status": 0,
+           "ctype": "-", "size": 0, "headers": "-", "snippet": "", "home": False}
+    short = line.rsplit("@", 1)[-1]
     try:
         b = _browser()
         kw = {"user_agent": UA, "locale": "en-US",
@@ -1263,48 +1364,97 @@ def _flight_one(line):
         ctx = b.new_context(**kw)
         page = ctx.new_page()
         page.set_default_timeout(FLIGHT_TIMEOUT)
+        if diag:
+            _say(log, "    send -> %s | auth=%s | target %s | home=pending"
+                 % (short, "yes" if cfg else "no", unified_url(FLIGHT_PROBE)))
         try:
             probe = page.goto(IPIFY_URL, wait_until="domcontentloaded",
                               timeout=FLIGHT_TIMEOUT)
             if probe is not None and probe.status == 200:
-                ip = str((_json_of(probe.text()) or {}).get("ip") or "-")
-        except Exception:
-            pass
-        if ip in ("", "-"):
-            return False, "no egress ip - proxy not carried", ip
+                out["ip"] = _ip_of(probe)
+        except Exception as exc:
+            if diag:
+                _say(log, "      <- egress probe raised %s: %s"
+                     % (type(exc).__name__, str(exc)[:90]))
+        if out["ip"] in ("", "-"):
+            out["reason"] = "no egress ip - proxy not carried"
+            out["bucket"] = "no_egress"
+            if diag:
+                _say(log, "      <- no egress ip, node dropped before the target")
+            return out
         try:
-            page.goto(HIBP_BASE + "/", wait_until="domcontentloaded",
-                      timeout=FLIGHT_TIMEOUT)
-        except Exception:
-            pass
-        status = 0
+            home = page.goto(HIBP_BASE + "/", wait_until="domcontentloaded",
+                             timeout=FLIGHT_TIMEOUT)
+            out["home"] = True
+            if diag:
+                _say(log, "      <- home %s | egress %s"
+                     % (getattr(home, "status", "?"), out["ip"]))
+        except Exception as exc:
+            if diag:
+                _say(log, "      <- home raised %s: %s | egress %s"
+                     % (type(exc).__name__, str(exc)[:90], out["ip"]))
         for attempt in (1, 2):
             try:
                 resp = page.goto(unified_url(FLIGHT_PROBE),
                                  wait_until="domcontentloaded",
                                  timeout=FLIGHT_TIMEOUT)
             except Exception as exc:
-                return False, "%s: %s" % (type(exc).__name__, str(exc)[:100]), ip
-            status = resp.status if resp is not None else 0
+                out["reason"] = "%s: %s" % (type(exc).__name__, str(exc)[:100])
+                out["bucket"] = "0"
+                out["status"] = 0
+                if diag:
+                    _say(log, "      <- transport raised %s | egress %s"
+                         % (out["reason"], out["ip"]))
+                return out
+            out["status"] = resp.status if resp is not None else 0
             body = ""
             try:
                 body = resp.text() if resp is not None else ""
             except Exception:
                 body = ""
-            if status == 200:
+            out["size"] = len(body or "")
+            out["ctype"] = str((resp.headers or {}).get("content-type")
+                               if resp is not None else "-")[:60] or "-"
+            out["headers"] = _safe_headers(resp)
+            out["snippet"] = _snippet(body)
+            if diag:
+                _say(log, "      <- %s | content-type: %s | %d byte(s) | %s | "
+                          "egress %s%s"
+                     % (out["status"] or "?", out["ctype"], out["size"],
+                        out["headers"], out["ip"],
+                        "" if attempt == 1 else " (retry)"))
+                if out["snippet"]:
+                    _say(log, "        body: %s" % out["snippet"])
+            if out["status"] == 200:
                 if isinstance(_json_of(body), dict):
-                    return True, "200", ip
+                    out["ok"] = True
+                    out["reason"] = "200"
+                    out["bucket"] = "200"
+                    return out
                 page.wait_for_timeout(700)
                 got, payload = _inpage_fetch(page, FLIGHT_PROBE)
                 if isinstance(payload, dict):
-                    return True, "200", ip
-                return False, "in-page %s" % (got or "200 non-JSON body"), ip
-            if status not in RETRY_STATUS:
-                break
+                    out["ok"] = True
+                    out["reason"] = "200"
+                    out["bucket"] = "200"
+                    return out
+                out["reason"] = "in-page %s" % (got or "200 non-JSON body")
+                out["bucket"] = _bucket(got, out["reason"])
+                if diag:
+                    _say(log, "      <- in-page %s after a non-JSON 200" % (got or "?"))
+                return out
+            out["reason"] = "status %s" % (out["status"] or "?")
+            out["bucket"] = _bucket(out["status"], out["reason"])
+            if out["status"] not in RETRY_STATUS:
+                return out
             page.wait_for_timeout(900)
-        return False, "status %s" % (status or "?"), ip
+        return out
     except Exception as exc:
-        return False, "%s: %s" % (type(exc).__name__, str(exc)[:110]), ip
+        out["reason"] = "%s: %s" % (type(exc).__name__, str(exc)[:110])
+        out["bucket"] = _bucket(0, out["reason"])
+        if diag:
+            _say(log, "      <- raised %s" % out["reason"])
+        return out
     finally:
         try:
             if ctx is not None:
@@ -1313,18 +1463,27 @@ def _flight_one(line):
             pass
 
 
-def _flight_ipify(cand, cancel=None, log=None, pin=""):
-    out, lock = [], threading.Lock()
+def _flight_ipify(cand, cancel=None, log=None, pin="", diag=False, codes=None,
+                  lock=None):
+    out, own = [], threading.Lock()
+    lock = lock or own
 
     def one(line):
         set_owner(pin)
         if _is_cancelled(cancel):
             return
-        if _proxy_ok(line):
-            with lock:
+        short = line.rsplit("@", 1)[-1]
+        if diag:
+            _say(log, "    probe -> %s | auth=%s"
+                 % (short, "yes" if "@" in line else "no"))
+        ok, note = _proxy_ok(line, diag, log)
+        if ok:
+            with own:
                 out.append(line)
         else:
-            _say(log, "    skip  -> %s | dead ipify check" % line.rsplit("@", 1)[-1])
+            if codes is not None:
+                _bump(codes, "ipify_fail", lock)
+            _say(log, "    skip  -> %s | ipify_fail (%s)" % (short, note))
 
     width = max(1, min(IPIFY_WORKERS, len(cand) or 1))
     with _cf.ThreadPoolExecutor(max_workers=width) as ex:
@@ -1332,8 +1491,10 @@ def _flight_ipify(cand, cancel=None, log=None, pin=""):
     return out
 
 
-def _flight_browser(alive, cancel=None, log=None, pin=""):
-    kept, lock = [], threading.Lock()
+def _flight_browser(alive, cancel=None, log=None, pin="", diag=False, codes=None,
+                    lock=None):
+    kept, own = [], threading.Lock()
+    lock = lock or own
     deadline = time.time() + FLIGHT_BUDGET
 
     def one(line):
@@ -1341,20 +1502,22 @@ def _flight_browser(alive, cancel=None, log=None, pin=""):
         short = line.rsplit("@", 1)[-1]
         if _is_cancelled(cancel) or time.time() > deadline:
             return
-        with lock:
-            if len(kept) >= FLIGHT_WANT:
+        with own:
+            if not diag and len(kept) >= FLIGHT_WANT:
                 return
-        ok, reason, ip = _flight_one(line)
-        if ok:
+        res = _flight_one(line, diag, log)
+        if codes is not None:
+            _bump(codes, res.get("bucket") or "other", lock)
+        if res.get("ok"):
             country, city = _flight_geo(line)
             tag = " [OXYLABS CURRENT]" if "oxylabs.io" in line else ""
-            with lock:
+            with own:
                 kept.append(line)
             _say(log, "    ✅ 200 -> %-22s | %-16s | %s%s | egress %s"
-                 % (short, country, city, tag, ip))
+                 % (short, country, city, tag, res.get("ip")))
         else:
             _say(log, "    skip  -> %-22s | test flight failed (%s) | egress %s"
-                 % (short, reason, ip))
+                 % (short, res.get("reason") or "?", res.get("ip")))
 
     width = max(1, min(FLIGHT_WORKERS, len(alive) or 1))
     with _cf.ThreadPoolExecutor(max_workers=width) as ex:
@@ -1401,10 +1564,38 @@ def _flight_fresh() -> bool:
     return bool(_read_lines(p))
 
 
-def flight(force=False, cancel=None) -> dict:
+def _summary_lines(log, codes, kept, diag, candidates, alive):
+    """The closing block: counts per outcome, then the legend for each code."""
+    _say(log, "")
+    _say(log, "=" * 62)
+    _say(log, "[*] Passed test flight (✅ 200) : %d" % len(kept))
+    _say(log, "[*] File                         : %s" % FLIGHT_POOL)
+    _say(log, "=" * 62)
+    if diag:
+        _say(log, "")
+        _say(log, "[*] Summary by outcome (candidates %d, alive %d)"
+             % (candidates, alive))
+        total = 0
+        for key, _meaning in OUTCOMES:
+            n = int((codes or {}).get(key) or 0)
+            if not n:
+                continue
+            total += n
+            _say(log, "      %-11s : %d" % (key, n))
+        if not total:
+            _say(log, "      (nothing recorded)")
+        _say(log, "[*] What each code means here")
+        for key, meaning in OUTCOMES:
+            _say(log, "      %-11s %s" % (key, meaning))
+        if kept:
+            _say(log, "[*] Kept: %s" % ", ".join(k.rsplit("@", 1)[-1] for k in kept))
+
+
+def flight(force=False, cancel=None, diagnose=False) -> dict:
     started = time.time()
     pin = owner()
     who = _owner_key()
+    diag = bool(diagnose)
     with _lock:
         cur_f = _flights.get(who) or {"busy": False, "last": {}}
         if cur_f["busy"] and not force:
@@ -1412,11 +1603,13 @@ def flight(force=False, cancel=None) -> dict:
         cur_f["busy"] = True
         _flights[who] = cur_f
     st = {"ran": True, "ts": time.time(), "candidates": 0, "alive": 0, "kept": 0,
-          "error": "", "seconds": 0.0, "log": []}
+          "error": "", "seconds": 0.0, "diagnose": diag, "codes": {}, "log": []}
     log = st["log"]
+    codes, clock = {}, threading.Lock()
     try:
         _say(log, "=" * 62)
-        _say(log, "   AUTO LIVE PROXIES + PLAYWRIGHT TEST FLIGHT")
+        _say(log, "   AUTO LIVE PROXIES + PLAYWRIGHT TEST FLIGHT%s"
+             % ("  [DIAGNOSTIC]" if diag else ""))
         _say(log, "   Test email: %s" % FLIGHT_PROBE)
         _say(log, "=" * 62)
         if not available():
@@ -1434,7 +1627,7 @@ def flight(force=False, cancel=None) -> dict:
             return st
         _say(log, "[*] Step 1: Checking basic ipify connectivity...")
         _say(log, "")
-        alive = _flight_ipify(cand, cancel, log, pin)
+        alive = _flight_ipify(cand, cancel, log, pin, diag, codes, clock)
         st["alive"] = len(alive)
         _say(log, "")
         _say(log, "[*] Step 2: Running Chromium test flight on %d proxies..."
@@ -1443,8 +1636,9 @@ def flight(force=False, cancel=None) -> dict:
         if not alive:
             st["error"] = "no candidate carried a request (all dead on ipify)"
             _say(log, "[!] " + st["error"])
+            _summary_lines(log, codes, [], diag, len(cand), 0)
             return st
-        kept = _flight_browser(alive, cancel, log, pin)
+        kept = _flight_browser(alive, cancel, log, pin, diag, codes, clock)
         st["kept"] = len(kept)
         if kept:
             _write_lines(_flight_pool_path(), kept)
@@ -1452,11 +1646,13 @@ def flight(force=False, cancel=None) -> dict:
         else:
             st["error"] = "no candidate answered the endpoint with 200 and JSON"
             _say(log, "[!] " + st["error"])
-        _say(log, "")
-        _say(log, "=" * 62)
-        _say(log, "[*] Passed test flight (✅ 200) : %d" % len(kept))
-        _say(log, "[*] File                         : %s" % FLIGHT_POOL)
-        _say(log, "=" * 62)
+            if key_present():
+                _say(log, "[*] A HIBP_API_KEY is set - the reader will fall back to "
+                          "the keyed API, which is not challenged.")
+            else:
+                _say(log, "[*] No HIBP_API_KEY set. A keyed call is not challenged; "
+                          "with every node walled it is the reliable route.")
+        _summary_lines(log, codes, kept, diag, len(cand), len(alive))
         return st
     except Exception as exc:
         st["error"] = "%s: %s" % (type(exc).__name__, exc)
@@ -1464,6 +1660,7 @@ def flight(force=False, cancel=None) -> dict:
         return st
     finally:
         st["seconds"] = round(time.time() - started, 1)
+        st["codes"] = dict(codes)
         if len(st["log"]) > FLIGHT_LOG_MAX:
             del st["log"][:len(st["log"]) - FLIGHT_LOG_MAX]
         with _lock:
@@ -1483,6 +1680,8 @@ def flight_state() -> dict:
     st["pool"] = len(_read_lines(_flight_pool_path()))
     if not isinstance(st.get("log"), list):
         st["log"] = []
+    if not isinstance(st.get("codes"), dict):
+        st["codes"] = {}
     try:
         st["age"] = int(time.time() - float(st.get("ts") or 0)) if st.get("ts") else -1
     except Exception:
@@ -2566,6 +2765,22 @@ def selftest(verbose=False) -> bool:
     add("container_args", "--no-sandbox" in CONTAINER_ARGS)
     add("hostport", _hostport("u:p@1.2.3.4:8080") == "1.2.3.4:8080")
     add("hostport_bad", _hostport("nope") == "")
+
+    # ---- the diagnostic plumbing ----
+    add("outcomes_have_200", "200" in [k for k, _m in OUTCOMES])
+    add("outcomes_have_ipify_fail", "ipify_fail" in [k for k, _m in OUTCOMES])
+    add("bucket_200", _bucket(200) == "200")
+    add("bucket_401", _bucket(401, "status 401") == "401")
+    add("bucket_5xx", _bucket(503) == "5xx")
+    add("bucket_zero", _bucket(0, "Timeout: x") == "0")
+    add("bucket_no_egress", _bucket(0, "no egress ip - proxy not carried") == "no_egress")
+    add("bucket_other", _bucket(302) == "other")
+    add("snippet_cuts", len(_snippet("a b   c", 4)) == 4)
+    add("snippet_collapses", _snippet("a\n\n b") == "a b")
+    add("snippet_none", _snippet(None) == "")
+    add("diag_headers_tuple", "cf-ray" in DIAG_HEADERS)
+    add("bump_counts", (_c := {}, _bump(_c, "x", threading.Lock()), _c["x"] == 1)[2])
+
     add("blank_read_false", _blank({"kind": "email", "email": "a@b.co"}).get("read") is False)
     add("blank_addr_unread", _blank({"kind": "email", "email": "a@b.co"}).get("addr_verdict")
         == "UNREAD")
@@ -2666,6 +2881,7 @@ def selftest(verbose=False) -> bool:
     add("proxy_url_quotes", "%2B" in _proxy_url("u:pa+ss@1.2.3.4:8080"))
 
     add("flight_callable", callable(flight) and callable(flight_state))
+    add("flight_takes_diagnose", "diagnose" in inspect_sig(flight))
     add("flight_consts", FLIGHT_WANT >= 1 and FLIGHT_MAX >= FLIGHT_WANT
         and POOL_TTL > 0)
     add("flight_concurrency_five", FLIGHT_WORKERS == 5)
@@ -2676,7 +2892,7 @@ def selftest(verbose=False) -> bool:
     add("flight_geo_helper", callable(_flight_geo))
     add("flight_log_helper", "no test flight" in flight_log_text())
     add("flight_state_keys", "kept" in flight_state() and "pool" in flight_state()
-        and "log" in flight_state())
+        and "log" in flight_state() and "codes" in flight_state())
     add("pool_status_keys", set(pool_status()) == {"count", "sample", "flight"})
     _lgl = []
     _say(_lgl, "x")
@@ -2795,7 +3011,7 @@ def main(argv=None) -> int:
               "%d domain(s)" % len(cat))
         return 0 if cat is not None else 1
     if "--flight" in argv:
-        got = flight(force=True)
+        got = flight(force=True, diagnose=("--diagnose" in argv))
         print("\n".join(got.get("log") or []))
         return 0 if got.get("kept") else 1
     if "--probe" in argv:
