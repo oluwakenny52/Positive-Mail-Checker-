@@ -14,4 +14,6 @@ libasound2
 libglib2.0-0
 libpango-1.0-0
 libcairo2
+libatspi2.0-0
+libwayland-client0
 fonts-liberation
