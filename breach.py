@@ -72,6 +72,21 @@ like "all 401". So each node reads api.ipify.org FROM INSIDE ITS OWN CONTEXT
 first and the answer is printed beside the verdict. If every line shows the same
 IP, the proxy is not being applied and that is the bug, not the endpoint.
 
+THE READ IS INFORMATIONAL AND NEVER DROPS A NODE
+------------------------------------------------
+A Playwright Response exposes text() as a METHOD, not the `.text` property of a
+requests Response, so an `_ip_of()` written for requests read nothing - and the
+early return then threw every node away as no_egress before the target was ever
+requested, while ipify through `requests` had just returned 200 on the same
+nodes. `_body_of()` accepts both shapes, the target is always requested, and
+`no_egress` survives only as the label for "no egress IP AND no status either".
+
+THE HOMEPAGE STEP IS A RETRY ONLY
+---------------------------------
+Colab's test_flight_single() goes straight to the unified URL. Attempt 1 does
+exactly that, byte for byte. Only a retryable status (RETRY_STATUS) earns a
+warm-up of the homepage and a single second chance on the same node.
+
 Vanilla launch: no STEALTH_JS, no automation flag. Only --no-sandbox and
 --disable-dev-shm-usage stay, because Streamlit Cloud is a container and those
 two are container necessities rather than fingerprint.
@@ -259,7 +274,7 @@ OUTCOMES = (
     ("429", "rate limited - the node is alive but must slow down"),
     ("5xx", "target-side error - node alive, endpoint unwell"),
     ("0", "transport failure - timeout, TLS, reset or proxy dropped"),
-    ("no_egress", "browser never showed an egress IP - proxy not carried"),
+    ("no_egress", "no egress IP and no status - the proxy was probably not carried"),
     ("other", "any other status"),
     ("ipify_fail", "the node could not reach ipify at all"),
 )
@@ -1273,9 +1288,25 @@ def _proxy_url(line):
     return "http://%s%s:%d" % (auth, info["host"], info["port"])
 
 
+def _body_of(resp) -> str:
+    """Response body text from EITHER response shape, or "".
+
+    `requests` exposes .text as a PROPERTY. A Playwright Response exposes text()
+    as a METHOD. Reading the Playwright one as a property yields the bound method,
+    not the body, so every egress read came back "-" - and the caller then dropped
+    the node before the target was ever requested. Callable first, value second.
+    """
+    try:
+        got = getattr(resp, "text", "")
+        txt = got() if callable(got) else got
+        return str(txt or "")
+    except Exception:
+        return ""
+
+
 def _ip_of(resp):
     try:
-        return str((_json_of(resp.text) or {}).get("ip") or "-")
+        return str((_json_of(_body_of(resp)) or {}).get("ip") or "-")
     except Exception:
         return "-"
 
@@ -1284,7 +1315,9 @@ def _proxy_ok(line, diag=False, log=None):
     """Does this node carry a request at all? -> (ok, note).
 
     `note` is the real reason on failure - the HTTP status or the exception text,
-    never a generic "dead".
+    never a generic "dead". It is kept to 220 characters so a ProxyError keeps its
+    reason (407, tunnel failed, port or credential) instead of being cut at the
+    word that mattered.
     """
     url = _proxy_url(line)
     if not url:
@@ -1299,7 +1332,7 @@ def _proxy_ok(line, diag=False, log=None):
             return True, "ok"
         return False, "ipify http %d" % r.status_code
     except Exception as exc:
-        note = "%s: %s" % (type(exc).__name__, str(exc)[:80])
+        note = "%s: %s" % (type(exc).__name__, str(exc)[:220])
         if diag:
             _say(log, "      <- ipify fail | %s" % note)
         return False, note
@@ -1345,10 +1378,14 @@ def _flight_one(line, diag=False, log=None):
     """One node through a vanilla headless context.
 
     -> dict(ok, reason, bucket, ip, status, ctype, size, headers, snippet,
-            home). The egress IP is read INSIDE the context first: if `proxy` is
-    not carried, the browser answers from Streamlit's own address and every node
-    401s, which is indistinguishable from a walled endpoint unless it is
-    measured. Credentials are never printed - host:port and auth=yes/no only.
+            home). Attempt 1 is the Colab call: straight at the unified URL, no
+    homepage first. Only a retryable status earns a warm-up and a second chance.
+
+    The egress IP is read INSIDE the context first, because a context that does
+    not carry `proxy` answers from Streamlit's own address and looks exactly like
+    a walled endpoint. It is INFORMATIONAL: a failed read no longer drops the node
+    - the target itself is the verdict. Credentials are never printed, only
+    host:port and auth=yes/no.
     """
     ctx = None
     out = {"ok": False, "reason": "", "bucket": "other", "ip": "-", "status": 0,
@@ -1365,7 +1402,7 @@ def _flight_one(line, diag=False, log=None):
         page = ctx.new_page()
         page.set_default_timeout(FLIGHT_TIMEOUT)
         if diag:
-            _say(log, "    send -> %s | auth=%s | target %s | home=pending"
+            _say(log, "    send -> %s | auth=%s | target %s | home=retry-only"
                  % (short, "yes" if cfg else "no", unified_url(FLIGHT_PROBE)))
         try:
             probe = page.goto(IPIFY_URL, wait_until="domcontentloaded",
@@ -1375,43 +1412,26 @@ def _flight_one(line, diag=False, log=None):
         except Exception as exc:
             if diag:
                 _say(log, "      <- egress probe raised %s: %s"
-                     % (type(exc).__name__, str(exc)[:90]))
-        if out["ip"] in ("", "-"):
-            out["reason"] = "no egress ip - proxy not carried"
-            out["bucket"] = "no_egress"
-            if diag:
-                _say(log, "      <- no egress ip, node dropped before the target")
-            return out
-        try:
-            home = page.goto(HIBP_BASE + "/", wait_until="domcontentloaded",
-                             timeout=FLIGHT_TIMEOUT)
-            out["home"] = True
-            if diag:
-                _say(log, "      <- home %s | egress %s"
-                     % (getattr(home, "status", "?"), out["ip"]))
-        except Exception as exc:
-            if diag:
-                _say(log, "      <- home raised %s: %s | egress %s"
-                     % (type(exc).__name__, str(exc)[:90], out["ip"]))
+                     % (type(exc).__name__, str(exc)[:160]))
+        if out["ip"] in ("", "-") and diag:
+            _say(log, "      <- egress unread, target is tried anyway")
         for attempt in (1, 2):
             try:
                 resp = page.goto(unified_url(FLIGHT_PROBE),
                                  wait_until="domcontentloaded",
                                  timeout=FLIGHT_TIMEOUT)
             except Exception as exc:
-                out["reason"] = "%s: %s" % (type(exc).__name__, str(exc)[:100])
-                out["bucket"] = "0"
                 out["status"] = 0
+                out["reason"] = "%s: %s" % (type(exc).__name__, str(exc)[:160])
+                if out["ip"] in ("", "-"):
+                    out["reason"] = "no egress ip and no status - " + out["reason"]
+                out["bucket"] = _bucket(0, out["reason"])
                 if diag:
                     _say(log, "      <- transport raised %s | egress %s"
                          % (out["reason"], out["ip"]))
                 return out
             out["status"] = resp.status if resp is not None else 0
-            body = ""
-            try:
-                body = resp.text() if resp is not None else ""
-            except Exception:
-                body = ""
+            body = _body_of(resp)
             out["size"] = len(body or "")
             out["ctype"] = str((resp.headers or {}).get("content-type")
                                if resp is not None else "-")[:60] or "-"
@@ -1443,14 +1463,30 @@ def _flight_one(line, diag=False, log=None):
                 if diag:
                     _say(log, "      <- in-page %s after a non-JSON 200" % (got or "?"))
                 return out
-            out["reason"] = "status %s" % (out["status"] or "?")
+            if not out["status"] and out["ip"] in ("", "-"):
+                out["reason"] = "no egress ip and no status - proxy not carried"
+            else:
+                out["reason"] = "status %s" % (out["status"] or "?")
             out["bucket"] = _bucket(out["status"], out["reason"])
             if out["status"] not in RETRY_STATUS:
                 return out
+            if attempt == 1:
+                # The only warm-up. Attempt 1 above matched Colab exactly.
+                try:
+                    home = page.goto(HIBP_BASE + "/", wait_until="domcontentloaded",
+                                     timeout=FLIGHT_TIMEOUT)
+                    out["home"] = True
+                    if diag:
+                        _say(log, "      <- home %s | egress %s"
+                             % (getattr(home, "status", "?"), out["ip"]))
+                except Exception as exc:
+                    if diag:
+                        _say(log, "      <- home raised %s: %s | egress %s"
+                             % (type(exc).__name__, str(exc)[:160], out["ip"]))
             page.wait_for_timeout(900)
         return out
     except Exception as exc:
-        out["reason"] = "%s: %s" % (type(exc).__name__, str(exc)[:110])
+        out["reason"] = "%s: %s" % (type(exc).__name__, str(exc)[:160])
         out["bucket"] = _bucket(0, out["reason"])
         if diag:
             _say(log, "      <- raised %s" % out["reason"])
@@ -1480,10 +1516,19 @@ def _flight_ipify(cand, cancel=None, log=None, pin="", diag=False, codes=None,
         if ok:
             with own:
                 out.append(line)
-        else:
-            if codes is not None:
-                _bump(codes, "ipify_fail", lock)
-            _say(log, "    skip  -> %s | ipify_fail (%s)" % (short, note))
+            return
+        if codes is not None:
+            _bump(codes, "ipify_fail", lock)
+        # An Oxylabs rotating gateway can answer ipify badly and still be fine in
+        # a real browser, which is exactly how Colab Cell 2 used it. It is pushed
+        # into step 2 regardless; only the plain nodes are dropped here.
+        gateway = "oxylabs.io" in line
+        _say(log, "    %s -> %s | ipify_fail (%s)%s"
+             % ("keep" if gateway else "skip", short, note,
+                " - pushed to step 2 anyway" if gateway else ""))
+        if gateway:
+            with own:
+                out.append(line)
 
     width = max(1, min(IPIFY_WORKERS, len(cand) or 1))
     with _cf.ThreadPoolExecutor(max_workers=width) as ex:
@@ -1496,9 +1541,10 @@ def _flight_browser(alive, cancel=None, log=None, pin="", diag=False, codes=None
     kept, own = [], threading.Lock()
     lock = lock or own
     deadline = time.time() + FLIGHT_BUDGET
+    width = max(1, min(FLIGHT_WORKERS, len(alive) or 1))
+    lanes = [alive[i::width] for i in range(width)]
 
     def one(line):
-        set_owner(pin)
         short = line.rsplit("@", 1)[-1]
         if _is_cancelled(cancel) or time.time() > deadline:
             return
@@ -1519,11 +1565,22 @@ def _flight_browser(alive, cancel=None, log=None, pin="", diag=False, codes=None
             _say(log, "    skip  -> %-22s | test flight failed (%s) | egress %s"
                  % (short, res.get("reason") or "?", res.get("ip")))
 
-    width = max(1, min(FLIGHT_WORKERS, len(alive) or 1))
+    def lane(chunk):
+        """One lane owns one browser for its whole chunk, and closes it itself.
+
+        A teardown task submitted after the map finishes lands on whichever
+        thread is free, not the thread that owns the browser, so a browser per
+        worker was left running until the process died.
+        """
+        set_owner(pin)
+        try:
+            for line in chunk:
+                one(line)
+        finally:
+            _close_thread_browser()
+
     with _cf.ThreadPoolExecutor(max_workers=width) as ex:
-        list(ex.map(one, alive))
-        for _ in range(width):
-            ex.submit(_close_thread_browser)
+        list(ex.map(lane, lanes))
     return kept
 
 
@@ -2769,6 +2826,7 @@ def selftest(verbose=False) -> bool:
     # ---- the diagnostic plumbing ----
     add("outcomes_have_200", "200" in [k for k, _m in OUTCOMES])
     add("outcomes_have_ipify_fail", "ipify_fail" in [k for k, _m in OUTCOMES])
+    add("no_egress_is_informational", "no status" in dict(OUTCOMES)["no_egress"])
     add("bucket_200", _bucket(200) == "200")
     add("bucket_401", _bucket(401, "status 401") == "401")
     add("bucket_5xx", _bucket(503) == "5xx")
@@ -2780,6 +2838,29 @@ def selftest(verbose=False) -> bool:
     add("snippet_none", _snippet(None) == "")
     add("diag_headers_tuple", "cf-ray" in DIAG_HEADERS)
     add("bump_counts", (_c := {}, _bump(_c, "x", threading.Lock()), _c["x"] == 1)[2])
+
+    # ---- the body/ip read: BOTH response shapes, and a raising one ----
+    class _PwResp:          # requests shape - .text is a PROPERTY
+        text = '{"ip": "9.9.9.9"}'
+
+    class _PgResp:          # Playwright shape - .text() is a METHOD
+        def text(self):
+            return '{"ip": "8.8.8.8"}'
+
+    class _Boom:            # reading .text raises
+        @property
+        def text(self):
+            raise RuntimeError("boom")
+
+    add("body_of_property", _body_of(_PwResp()) == '{"ip": "9.9.9.9"}')
+    add("body_of_method", _body_of(_PgResp()) == '{"ip": "8.8.8.8"}')
+    add("body_of_raises", _body_of(_Boom()) == "")
+    add("body_of_none", _body_of(None) == "")
+    add("ip_of_property", _ip_of(_PwResp()) == "9.9.9.9")
+    add("ip_of_method", _ip_of(_PgResp()) == "8.8.8.8")
+    add("ip_of_raises", _ip_of(_Boom()) == "-")
+    add("ip_of_none", _ip_of(None) == "-")
+    add("ip_of_non_json", _ip_of(type("R", (), {"text": "hello"})()) == "-")
 
     add("blank_read_false", _blank({"kind": "email", "email": "a@b.co"}).get("read") is False)
     add("blank_addr_unread", _blank({"kind": "email", "email": "a@b.co"}).get("addr_verdict")
