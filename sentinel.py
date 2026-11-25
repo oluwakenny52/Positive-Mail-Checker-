@@ -31,6 +31,23 @@ stale "fetch produced nothing" from yesterday would greet you today. It is a
 process dict keyed by the caller's own scope, so two users cannot satisfy each
 other's, and satisfied entries are reaped after REAP_SECONDS.
 
+CHANGES IN THIS REVISION
+------------------------
+S-1  sweep() NO LONGER ASKS dir() WHETHER `due` EXISTS.  The emit loop was
+     `for k, v in due if 'due' in dir() else []`.  That is true only because
+     dir() with no argument happens to return the function's locals and `due`
+     happens to be one of them - correct by accident, and a no-op the moment the
+     variable is renamed, moved into a helper or shadowed. `due` is initialised
+     before the try now and the loop is unconditional.
+
+S-2  A FIRED WATCH OWNS ITS OWN DEDUPE WINDOW.  notify.add() was called with
+     key="watch:<name>" and no dedupe argument, so it used notify's
+     SYS_REPEAT_SECONDS (600 s) - while sweep() was separately suppressing on the
+     entry's own `repeat`. Two timers on one event, and whichever was shorter won
+     silently: a 60 s repeat reported every ten minutes, and a two-hour repeat
+     reported every ten. The entry's repeat is handed to notify as the dedupe
+     window, so there is one timer and it is the caller's.
+
 Every function swallows: a watchdog must never be the reason a page dies.
 """
 
@@ -159,8 +176,13 @@ def sweep(now=None):
 
     Idempotent: an entry fires once per `repeat` window, so a rerun loop cannot
     turn one dead fetch into fifty notifications.
+
+    S-1: `due` is bound before the try, so the emit loop below is unconditional.
+    S-2: the entry's own repeat is passed to notify as the dedupe window, so
+    there is one timer on the event and it is the caller's.
     """
     fired = []
+    due = []
     try:
         import notify
     except Exception:
@@ -169,7 +191,6 @@ def sweep(now=None):
         now = float(now if now is not None else time.time())
         with _lock:
             _reap(now)
-            due = []
             for k, v in _reg.items():
                 if k[0] != _scope() or v.get("ok"):
                     continue
@@ -179,15 +200,16 @@ def sweep(now=None):
                 if last and (now - last) < float(v.get("repeat") or DEFAULT_REPEAT):
                     continue
                 due.append((k, v))
-            for k, v in due:
+            for _k, v in due:
                 v["fired_ts"] = now
                 fired.append(v.get("name"))
     except Exception:
         return fired
-    for k, v in due if 'due' in dir() else []:
+    for _k, v in due:
         try:
             notify.add(v.get("severity") or "warn", KIND, v.get("label"),
-                       v.get("suggestion") or "", key="watch:" + str(v.get("name")))
+                       v.get("suggestion") or "", key="watch:" + str(v.get("name")),
+                       dedupe=float(v.get("repeat") or DEFAULT_REPEAT))
         except Exception:
             continue
     return fired
