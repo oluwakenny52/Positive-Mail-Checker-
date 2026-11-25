@@ -75,6 +75,17 @@ v13.47 fixes on this page
 * THREE EXPANDERS BECAME CHECKBOXES: an expander collapses on every rerun.
 * CROSS-USER CACHE FIXES: _UI_WRITE, _VALID_CACHE, _FP_MEMO, _ZIP_CACHE and every
   mailview cache are keyed per user, so one user cannot suppress or serve another.
+
+v13.86 fixes on this page
+-------------------------
+* LEGACY DELETE: deletion and Clear-All rewrote only <hash>_ files, while the list
+  showed bare ones too - the rows survived every "delete". Both now use _own().
+* CACHE VS PAGE SIZE: the 40-row session cache was below every page slider's 200,
+  so a restored page had phantom pages. The cap now follows the live page size.
+* UNIQUE TMP NAMES: every atomic write takes its own temp name, so two tabs of one
+  user cannot replace each other's half-written file.
+* TRAILING SAVE FORCED: the last run of a page always persists, instead of being
+  dropped by the 1 s throttle with nothing left to retry it.
 """
 
 import streamlit as st
@@ -98,7 +109,6 @@ import json
 import csv
 from datetime import datetime
 from typing import List, Tuple
-from urllib.parse import quote
 from email.header import decode_header
 from email import message_from_bytes
 # @@END 000 FILE_HEADER
@@ -871,6 +881,35 @@ DEFAULT_APP_CONFIG = {
     "allow_self_signed": True,
 }
 
+# A fixed `path + ".tmp"` is one name for the whole process. Two tabs of the same
+# user (same passkey, same files) then write the same temp and whichever finishes
+# second replaces the file with ITS copy - including a copy the other tab had
+# already half-written. Every atomic write below takes a unique name instead, so
+# the last os.replace wins cleanly and nothing is spliced.
+_TMP_SEQ = {"n": 0}
+
+
+def _tmp_path(path: str) -> str:
+    """A per-call temp name beside `path`, unique within this process."""
+    _TMP_SEQ["n"] += 1
+    return f"{path}.{os.getpid()}.{_TMP_SEQ['n']}.tmp"
+
+
+def _replace_write(path: str, text: str) -> None:
+    """Whole-file replace through a unique temp. Raises on failure."""
+    tmp = _tmp_path(path)
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write(text)
+        os.replace(tmp, path)
+    finally:
+        if os.path.exists(tmp):
+            try:
+                os.remove(tmp)
+            except Exception:
+                pass
+
+
 def load_app_config():
     if os.path.exists(APP_CONFIG_FILE):
         try:
@@ -885,15 +924,13 @@ def load_app_config():
 
 def save_app_config(config_dict):
     try:
-        with open(APP_CONFIG_FILE, "w", encoding="utf-8") as f:
-            json.dump(config_dict, f, indent=2)
+        _replace_write(APP_CONFIG_FILE, json.dumps(config_dict, indent=2))
     except Exception:
         pass
 
 def save_last_account(account_combo):
     try:
-        with open(LAST_ACCOUNT_FILE, "w", encoding="utf-8") as f:
-            f.write(account_combo)
+        _replace_write(LAST_ACCOUNT_FILE, account_combo)
     except Exception:
         pass
 
@@ -905,6 +942,31 @@ def load_last_account():
         except Exception:
             pass
     return ""
+
+# A restored page must be able to hold as many rows as the pager is able to show.
+# 40 was below every page slider's maximum of 200, so a reload restored 40 rows
+# under a counter of 200 and pages 2..N were phantom - Next Page refetched the
+# same 40. The cap follows the live page size for the bucket, floored at 40 so a
+# small page size does not make the cache useless, and never above the sliders.
+_CACHE_FLOOR = 40
+_CACHE_CEIL = 200
+_CACHE_PAGE_KEYS = {
+    "current_messages": ("stream_page_size", "page_size_sel"),
+    "otp_messages": ("otp_page_size_slider",),
+    "search_messages": ("search_page_size_slider",),
+}
+
+
+def _cache_limit(bucket: str) -> int:
+    for k in _CACHE_PAGE_KEYS.get(bucket, ()):
+        try:
+            n = int(st.session_state.get(k) or 0)
+        except (TypeError, ValueError):
+            n = 0
+        if n > 0:
+            return max(_CACHE_FLOOR, min(_CACHE_CEIL, n))
+    return _CACHE_FLOOR
+
 
 def save_session_cache():
     try:
@@ -932,9 +994,8 @@ def save_session_cache():
         # raw/body/body_raw are persisted so a restored page does not have to
         # re-fetch a mailbox to show a message. `raw` is bytes, so it is
         # base64-encoded here - json.dump cannot take bytes.
-        # 60 -> 40 rows: each carries a base64 blob and the file was rewritten
-        # every 2s during a fetch.
-        MAX_CACHED = 40
+        # The row cap is per bucket and follows that bucket's page size, so the
+        # restored list can always fill the page the counter describes.
         KEEP_KEYS = {
             "id", "folder", "from", "to", "subject", "date",
             "is_read", "is_bot", "categories", "flags", "size_bytes",
@@ -947,17 +1008,24 @@ def save_session_cache():
             ("search_messages", "search_messages"),
         ]:
             serialized_list = []
-            for m in st.session_state.get(key_in_state, [])[:MAX_CACHED]:
+            for m in st.session_state.get(key_in_state, [])[:_cache_limit(key_in_state)]:
                 m_copy = {k: v for k, v in m.items() if k in KEEP_KEYS}
                 if isinstance(m_copy.get("raw"), (bytes, bytearray)):
                     m_copy["raw"] = base64.b64encode(bytes(m_copy["raw"])).decode("ascii")
                 serialized_list.append(m_copy)
             cache_data[k_name] = serialized_list
 
-        tmp = SESSION_CACHE_FILE + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(cache_data, f, separators=(",", ":"))
-        os.replace(tmp, SESSION_CACHE_FILE)
+        tmp = _tmp_path(SESSION_CACHE_FILE)
+        try:
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(cache_data, f, separators=(",", ":"))
+            os.replace(tmp, SESSION_CACHE_FILE)
+        finally:
+            if os.path.exists(tmp):
+                try:
+                    os.remove(tmp)
+                except Exception:
+                    pass
     except Exception:
         pass
 
@@ -1245,7 +1313,13 @@ def _reader_ui_snapshot() -> dict:
 
 
 def _reader_ui_save(force: bool = False) -> None:
-    """Write the panel + the current mail's body edits. Throttled and deduped."""
+    """Write the panel + the current mail's body edits. Deduped, throttled.
+
+    The signature compare already removes the no-op writes. The 1 s gate is for
+    a dragged slider, but it returns without scheduling a retry - so a change
+    made inside that second was dropped and nothing ever wrote it. The trailing
+    call in block 043 passes force=True, so the last run of a page always lands.
+    """
     if _UI_WRITE["paused"] > 0 and not force:
         return
     try:
@@ -1269,10 +1343,7 @@ def _reader_ui_save(force: bool = False) -> None:
             return
         if not force and now - _UI_WRITE["t"] < 1.0:
             return
-        tmp = READER_UI_FILE + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            f.write(blob)
-        os.replace(tmp, READER_UI_FILE)
+        _replace_write(READER_UI_FILE, blob)
         _UI_WRITE["sig"] = blob
         _UI_WRITE["t"] = now
         _UI_WRITE["err"] = ""
@@ -1892,11 +1963,17 @@ def _looks_like_network_error(err_text: str) -> bool:
 # ============================================================================
 # VALID ACCOUNT STORAGE  (per-user isolation)
 # ============================================================================
-# READING AND DELETING ARE NOT THE SAME QUESTION.
-#   _own()        - "may I show this?"  A bare, unprefixed file is legacy and
-#                   genuinely shared, so it stays readable here, in the valid list
-#                   and in the ZIP. That is deliberate.
-#   _own_strict() - "may I REWRITE this?"  Only this user's own prefix.
+# ONE QUESTION, ONE PREDICATE.
+#   _own() - "may I show this, and may I rewrite it?"  False only for ANOTHER
+#            user's <hash>_ file. A bare, unprefixed file is legacy and genuinely
+#            shared, so it is both readable and rewritable here.
+#
+# v13.86: this used to be two predicates - _own() for reads, _own_strict() for
+# writes - and that split was wrong. load_valid() lists bare files, so every
+# account living only in a bare valid*.txt was offered in the deletion dropdown,
+# reported deleted, and still there after the rerun. Nothing but the list ever
+# needed the strict form, so writes use _own() now and the shared bare file is
+# rewritten exactly as it was read.
 _HASH_RX = re.compile(r"^(?:anon)?[0-9a-f]{16}_")
 _RES_DIR = user_file("mail_results")
 CLEAN_VALID_FILE = user_file("clean_valid_accounts.txt")
@@ -1926,7 +2003,11 @@ _VALID_CACHE = {"owner": None, "fp": None, "options": None}
 
 
 def _own(path) -> bool:
-    """True when `path` may be SHOWN to the unlocked user (bare files count)."""
+    """True when `path` may be shown to, and rewritten for, the unlocked user.
+
+    Bare files count: they are legacy and shared. Only a foreign <hash>_ file is
+    refused.
+    """
     base = os.path.basename(path)
     if not _HASH_RX.match(base):
         return True
@@ -1934,7 +2015,8 @@ def _own(path) -> bool:
 
 
 def _own_strict(path) -> bool:
-    """True only when `path` carries THIS user's own prefix - safe to rewrite."""
+    """Own prefix only - no bare files. Kept for callers that must not touch a
+    shared file; the storage writers below no longer use it (see above)."""
     base = os.path.basename(path)
     if not _HASH_RX.match(base):
         return False
@@ -2077,13 +2159,10 @@ def merge_into_clean_valid(new_combo_lines: List[str]) -> int:
         em = _combo_of(line).split(":")[0].strip().lower()
         if "@" in em:
             merged[em] = line
-    tmp = target + ".tmp"
+    body = "# email:password  (merged by the reader, newest wins)\n"
+    body += "".join(merged[em] + "\n" for em in sorted(merged))
     try:
-        with open(tmp, "w", encoding="utf-8") as f:
-            f.write("# email:password  (merged by the reader, newest wins)\n")
-            for em in sorted(merged):
-                f.write(merged[em] + "\n")
-        os.replace(tmp, target)
+        _replace_write(target, body)
     except Exception:
         pass
     _VALID_CACHE["fp"] = None
@@ -2091,12 +2170,19 @@ def merge_into_clean_valid(new_combo_lines: List[str]) -> int:
     return len(merged)
 
 
-def delete_specific_account_from_storage(target_combo: str):
-    """_own_strict - a bare file belongs to every user, so this only rewrites
-    files that carry THIS user's own prefix."""
+def delete_specific_account_from_storage(target_combo: str) -> int:
+    """Remove one combo from every file the list is built from.
+
+    v13.86: _own(), not _own_strict(). A bare file is shown in the dropdown, so
+    it has to be deletable from, or the row reappears on the next rerun and the
+    "deleted" toast is a lie. Returns the number of files actually rewritten so
+    the caller can tell the truth about a no-op.
+    """
     search_files = glob.glob(os.path.join(_RES_DIR, "*.txt")) + glob.glob("*.txt")
+    target_low = (target_combo or "").strip().lower()
+    touched = 0
     for path in search_files:
-        if not _own_strict(path):
+        if not _own(path):
             continue
         filename_lower = os.path.basename(path).lower()
         if filename_lower == os.path.basename(LAST_ACCOUNT_FILE) or any(kw in filename_lower for kw in ["resume", "unfinished", "remaining", "input", "proxies", "proxy", "config", "blocklist"]):
@@ -2104,7 +2190,6 @@ def delete_specific_account_from_storage(target_combo: str):
         try:
             with open(path, "r", encoding="utf-8", errors="ignore") as f:
                 lines = f.readlines()
-            target_low = (target_combo or "").strip().lower()
             new_lines, removed_here = [], 0
             for line in lines:
                 raw_line = line.strip()
@@ -2115,10 +2200,18 @@ def delete_specific_account_from_storage(target_combo: str):
                 new_lines.append(line)
             if removed_here == 0:
                 continue
-            tmp = path + ".tmp"
-            with open(tmp, "w", encoding="utf-8") as f:
-                f.writelines(new_lines)
-            os.replace(tmp, path)
+            tmp = _tmp_path(path)
+            try:
+                with open(tmp, "w", encoding="utf-8") as f:
+                    f.writelines(new_lines)
+                os.replace(tmp, path)
+                touched += 1
+            except Exception:
+                if os.path.exists(tmp):
+                    try:
+                        os.remove(tmp)
+                    except Exception:
+                        pass
         except Exception:
             pass
     if load_last_account() == target_combo:
@@ -2129,25 +2222,37 @@ def delete_specific_account_from_storage(target_combo: str):
                 pass
     _VALID_CACHE["fp"] = None
     _fp_invalidate()
+    return touched
 
 
-def clear_all_valid_accounts_storage():
-    """_own_strict - see delete_specific_account_from_storage()."""
+def clear_all_valid_accounts_storage() -> int:
+    """Empty every file the list is built from. See delete_specific_account_from_storage().
+
+    Returns the number of files emptied. `clean_proxies.txt` matched 'clean' and
+    was truncated to 0 bytes by the first version, hence the exclusion list.
+    """
     search_files = glob.glob(os.path.join(_RES_DIR, "*.txt")) + glob.glob("*.txt")
+    touched = 0
     for path in search_files:
-        if not _own_strict(path):
+        if not _own(path):
             continue
         filename_lower = os.path.basename(path).lower()
         if "valid" not in filename_lower and "clean" not in filename_lower:
             continue
-        # clean_proxies.txt matched 'clean' and got truncated to 0 bytes.
         if any(kw in filename_lower for kw in ("prox", "config", "blocklist", "resume", "unfinished", "remaining", "input")):
             continue
+        tmp = _tmp_path(path)
         try:
-            with open(path, "w", encoding="utf-8") as f:
+            with open(tmp, "w", encoding="utf-8") as f:
                 f.write("")
+            os.replace(tmp, path)
+            touched += 1
         except Exception:
-            pass
+            if os.path.exists(tmp):
+                try:
+                    os.remove(tmp)
+                except Exception:
+                    pass
     if os.path.exists(LAST_ACCOUNT_FILE):
         try:
             os.remove(LAST_ACCOUNT_FILE)
@@ -2155,6 +2260,7 @@ def clear_all_valid_accounts_storage():
             pass
     _VALID_CACHE["fp"] = None
     _fp_invalidate()
+    return touched
 # @@END 019 VALID_STORAGE
 
 
@@ -3165,9 +3271,21 @@ with st.expander("🗑️ Account Deletion Manager", expanded=False):
 
             if selected_accounts_to_delete:
                 if st.button("🗑️ Permanently Delete Selected Account(s)", type="primary", width="stretch"):
+                    # v13.86: the toast used to claim every selected row was
+                    # deleted whether or not any file was rewritable. Count the
+                    # files and say so, including when the count is zero.
+                    _files_hit = 0
                     for acc in selected_accounts_to_delete:
-                        delete_specific_account_from_storage(acc)
-                    flash(f"Permanently deleted {len(selected_accounts_to_delete)} account(s).")
+                        try:
+                            _files_hit += delete_specific_account_from_storage(acc) or 0
+                        except Exception:
+                            pass
+                    if _files_hit:
+                        flash(f"Permanently deleted {len(selected_accounts_to_delete)} account(s) "
+                              f"from {_files_hit} file(s).")
+                    else:
+                        flash(f"{len(selected_accounts_to_delete)} account(s) were selected but no "
+                              f"file could be rewritten.", "warning")
                     save_session_cache()
                     st.rerun()
 
@@ -3176,8 +3294,14 @@ with st.expander("🗑️ Account Deletion Manager", expanded=False):
             confirm_all = st.checkbox("I confirm I want to delete ALL valid accounts permanently", key="confirm_del_all_checkbox")
             if confirm_all:
                 if st.button("🚨 Permanently Delete ALL Accounts", type="primary", width="stretch"):
-                    clear_all_valid_accounts_storage()
-                    flash("Permanently deleted all valid accounts.")
+                    try:
+                        _files_hit = clear_all_valid_accounts_storage() or 0
+                    except Exception:
+                        _files_hit = 0
+                    if _files_hit:
+                        flash(f"Permanently deleted all valid accounts from {_files_hit} file(s).")
+                    else:
+                        flash("Nothing to clear - no valid-account file could be rewritten.", "warning")
                     save_session_cache()
                     st.rerun()
     else:
@@ -4863,9 +4987,9 @@ except Exception:
 
 
 # @@BLOCK 043 TRAILING deps=042
-# The last thing a run does is persist the panel and this mail's edits. Deduped
-# and throttled inside _reader_ui_save, so a run that changed nothing costs one
-# string compare and no write.
-_reader_ui_save()
+# The last thing a run does is persist the panel and this mail's edits. Forced:
+# this is the only call that is guaranteed to be reached after the widgets, so it
+# must not be swallowed by the 1 s throttle - there is no later run to retry it.
+_reader_ui_save(force=True)
 # @@END 043 TRAILING
 # @@EOF
