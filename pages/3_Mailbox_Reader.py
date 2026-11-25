@@ -4383,6 +4383,20 @@ def _render_body(key: str, msg: dict) -> None:
         st.caption("(body shown above)")
 
 
+def _move_sel(key: str) -> str:
+    """A per-message Move-to selectbox whose stored value is always legal.
+
+    v13.86: the key was unique per message but never validated, so a folder list
+    that shrank (a deleted folder, or a different account's folders) left a key
+    pointing at an option st.selectbox no longer offers and the widget raised.
+    Seeding before the widget exists this run is legal.
+    """
+    _opts = st.session_state.get("mb_folders") or ["INBOX"]
+    if st.session_state.get(key) not in _opts:
+        st.session_state[key] = _opts[0]
+    return st.selectbox("Move to", _opts, key=key)
+
+
 # Main Message Stream
 # THE STREAM DOES NOT FILTER. It is the main stream - everything loaded is shown
 # unless the filter below says otherwise. Three states, not two: a bare "only
@@ -4458,7 +4472,11 @@ if len(active_msgs) > 0 or total_msgs > 0:
                         st.markdown(f"- [{link}]({link})", unsafe_allow_html=True)
 
                 st.markdown("---")
-                _body_key = f"body_{msg['folder']}_{msg['id']}_{idx}"
+                # v13.86: the key carried `idx`, the row's POSITION. Changing the
+                # stream filter renumbers the page, so every body box got a new
+                # key and the edit in it was silently replaced by the original
+                # body. folder+id is stable for the life of the message.
+                _body_key = f"body_{msg['folder']}_{msg['id']}"
                 if _body_key not in st.session_state:
                     st.session_state[_body_key] = msg["body"]
                 _render_body(_body_key, msg)
@@ -4483,7 +4501,7 @@ if len(active_msgs) > 0 or total_msgs > 0:
                                 st.error(str(ex))
 
                 with op_col2:
-                    target_move = st.selectbox("Move to", st.session_state.mb_folders, key=f"mv_sel_{msg['folder']}_{msg['id']}_{idx}")
+                    target_move = _move_sel(f"mv_sel_{msg['folder']}_{msg['id']}")
                     if st.button("Move Message", key=f"mv_btn_{msg['folder']}_{msg['id']}_{idx}"):
                         try:
                             m_client = get_active_mail(active_email, active_password, host)
@@ -4660,7 +4678,13 @@ if hub_otp_open:
                 st.error(str(e))
 
     st.markdown("#### 🔒 Standalone Security & Card Message Stream")
-    otp_msgs = [m for m in st.session_state.otp_messages if not should_blacklist_message(m, otp_blacklist_input)]
+    # v13.86: the blacklist removed rows from the rendered list while the pager
+    # kept counting server matches, so a page where everything was filtered
+    # rendered blank with no explanation. The removed count is now stated and an
+    # all-filtered page says so instead of looking like a failed fetch.
+    _otp_all_rows = st.session_state.otp_messages or []
+    otp_msgs = [m for m in _otp_all_rows if not should_blacklist_message(m, otp_blacklist_input)]
+    _otp_dropped = len(_otp_all_rows) - len(otp_msgs)
     otp_total = st.session_state.get("otp_total_matched_count", len(otp_msgs))
 
     if len(otp_msgs) > 0:
@@ -4669,6 +4693,9 @@ if hub_otp_open:
         st.session_state.otp_current_page = otp_curr_p
 
         st.markdown(f"**Showing Page {otp_curr_p} of {otp_total_pages} (Total Security Matches: {otp_total})**")
+        if _otp_dropped:
+            st.caption(f"{_otp_dropped} row(s) on this page were removed by the blacklist. The pager counts "
+                       "server matches, so use Next / Previous to move past them.")
 
         for idx, msg in enumerate(otp_msgs):
             with st.expander(msg_label(msg, idx), expanded=False):
@@ -4694,7 +4721,9 @@ if hub_otp_open:
 
                 st.markdown("---")
                 display_body = msg["body"] if otp_auto_clean_toggle else msg.get("body_raw", msg["body"])
-                _ob_key = f"otp_b_{msg['folder']}_{msg['id']}_{idx}"
+                # v13.86: position-free key, so a filter change no longer mints a
+                # new box and drops the edit (see block 038).
+                _ob_key = f"otp_b_{msg['folder']}_{msg['id']}"
                 if _ob_key not in st.session_state:
                     st.session_state[_ob_key] = display_body
                 _render_body(_ob_key, msg)
@@ -4719,7 +4748,7 @@ if hub_otp_open:
                                 st.error(str(ex))
 
                 with o_col2:
-                    otp_mv_target = st.selectbox("Move to", st.session_state.mb_folders, key=f"otp_mv_sel_{msg['folder']}_{msg['id']}_{idx}")
+                    otp_mv_target = _move_sel(f"otp_mv_sel_{msg['folder']}_{msg['id']}")
                     if st.button("Move Message", key=f"otp_mv_btn_{msg['folder']}_{msg['id']}_{idx}"):
                         try:
                             m_client = get_active_mail(active_email, active_password, host)
@@ -4775,7 +4804,11 @@ if hub_otp_open:
                                     query=st.session_state.get("otp_exec_kw") or _otp_keywords(),
                                     field=st.session_state.get("otp_exec_field") or otp_search_field)
     else:
-        st.caption("No security messages scanned yet. Select categories or keywords and click 'Execute Dedicated Security Scan'.")
+        if _otp_dropped:
+            st.warning(f"Every row on this page was removed by the blacklist ({_otp_dropped} row(s)). "
+                       "Use Next / Previous, or clear the Blacklist Keywords box.")
+        else:
+            st.caption("No security messages scanned yet. Select categories or keywords and click 'Execute Dedicated Security Scan'.")
 
     st.markdown("#### 🛠️ OTP Engine Debugging & Diagnose Log Screen")
     with st.expander("🔐 OTP Scanner IMAP Diagnostic Traces & Logs", expanded=False):
@@ -4861,7 +4894,12 @@ if hub_search_open:
                 st.error(str(e))
 
     st.markdown("#### ✉️ Search Results Message Stream")
-    search_msgs = [m for m in st.session_state.search_messages if not should_blacklist_message(m, search_blacklist_input)]
+    # v13.86: see block 039 - filtered rows were dropped from the render while
+    # the pager kept counting server matches, so a fully filtered page looked
+    # like a broken fetch. The removal is stated and an empty page says why.
+    _search_all_rows = st.session_state.search_messages or []
+    search_msgs = [m for m in _search_all_rows if not should_blacklist_message(m, search_blacklist_input)]
+    _search_dropped = len(_search_all_rows) - len(search_msgs)
     search_total_msgs = st.session_state.get("search_total_matched_count", len(search_msgs))
 
     if len(search_msgs) > 0:
@@ -4870,6 +4908,14 @@ if hub_search_open:
         st.session_state.search_current_page = search_curr_p
 
         st.markdown(f"**Showing Page {search_curr_p} of {search_total_pages} (Total Matches Found: {search_total_msgs})**")
+        if _search_dropped:
+            st.caption(f"{_search_dropped} row(s) on this page were removed by the blacklist. The pager counts "
+                       "server matches, so use Next / Previous to move past them.")
+        # search_page_rows was written by the fetch and never read; this is the
+        # one place the post-fetch reality belongs.
+        _srows = st.session_state.get("search_page_rows")
+        if _srows and _srows != search_total_msgs:
+            st.caption(f"{_srows} of {search_total_msgs} server matches survived the fetch on this page.")
 
         for idx, msg in enumerate(search_msgs):
             with st.expander(msg_label(msg, idx), expanded=False):
@@ -4890,7 +4936,8 @@ if hub_search_open:
                         st.markdown(f"- [{link}]({link})", unsafe_allow_html=True)
 
                 st.markdown("---")
-                _sb_key = f"s_body_{msg['folder']}_{msg['id']}_{idx}"
+                # position-free key (see block 038)
+                _sb_key = f"s_body_{msg['folder']}_{msg['id']}"
                 if _sb_key not in st.session_state:
                     st.session_state[_sb_key] = msg["body"]
                 _render_body(_sb_key, msg)
@@ -4915,7 +4962,7 @@ if hub_search_open:
                                 st.error(str(ex))
 
                 with s_op2:
-                    s_target_move = st.selectbox("Move to", st.session_state.mb_folders, key=f"s_mv_sel_{msg['folder']}_{msg['id']}_{idx}")
+                    s_target_move = _move_sel(f"s_mv_sel_{msg['folder']}_{msg['id']}")
                     if st.button("Move Message", key=f"s_mv_btn_{msg['folder']}_{msg['id']}_{idx}"):
                         try:
                             m_client = get_active_mail(active_email, active_password, host)
@@ -4972,7 +5019,11 @@ if hub_search_open:
                                     query=st.session_state.get("search_exec_query") or search_query_input,
                                     field=st.session_state.get("search_exec_field") or search_field_choice)
     else:
-        st.caption("No search results loaded yet. Enter a query and click 'Execute Keyword Search'.")
+        if _search_dropped:
+            st.warning(f"Every row on this page was removed by the blacklist ({_search_dropped} row(s)). "
+                       "Use Next / Previous, or clear the Blacklist Keywords box.")
+        else:
+            st.caption("No search results loaded yet. Enter a query and click 'Execute Keyword Search'.")
 
     st.markdown("#### 🛠️ Deep Search Debugging & Diagnostic Log Screen")
     with st.expander("🔍 Search Engine IMAP Diagnostic Traces & Logs", expanded=False):
@@ -5089,9 +5140,18 @@ if hub_bot_open:
                             bot_log(f"  └─ ⚠️ STORE refused in '{r_folder}': {st_typ} {st_data}")
                             skipped_folders.append(r_folder)
                             continue
+                        # v13.86: the count was added after the STORE but before
+                        # the EXPUNGE, and the EXPUNGE result was never read - so
+                        # a folder that refused to expunge still reduced
+                        # total_matched_count and the tail pages went phantom.
+                        exp_typ, exp_data = mail.expunge()
+                        if exp_typ != "OK":
+                            bot_log(f"  └─ ⚠️ EXPUNGE refused in '{r_folder}': {exp_typ} {exp_data} "
+                                    f"- flagged \\Deleted but not purged, not counted")
+                            skipped_folders.append(r_folder)
+                            continue
                         deleted_count += len(ids)
                         bot_log(f"  └─ marked {len(ids)} bot message(s) deleted in '{r_folder}'.")
-                        mail.expunge()
 
                     if skipped_folders:
                         bot_log(f"🏁 Skipped folders: {skipped_folders}")
