@@ -2936,7 +2936,7 @@ def should_blacklist_message(msg, blacklist_input) -> bool:
 # @@BLOCK 026 SEARCH_AND_FETCH deps=025
 def execute_imap_search_safely(mail, field_cmd: str, query_term: str, log_func):
     # only quotes were escaped; ( ) { } \ broke the command outright.
-    clean_q = re.sub(r'([\\(){}"\[\]])', r'\\\1', query_term).strip()
+    clean_q = re.sub(r'([\\(){}\"\[\]])', r'\\\1', query_term).strip()
     f_cmd = field_cmd.upper()
 
     for strat_name, search_params in [
@@ -3028,6 +3028,13 @@ def _part_text(part) -> str:
         return ""
 
 
+# A dead socket used to cost one row per remaining message: every fetch raised,
+# was caught by the per-message handler and logged, and the loop carried on with
+# a connection that could never answer again. These are the exceptions that mean
+# "the connection is gone", not "this message is odd".
+_SOCKET_DEAD = (socket.timeout, TimeoutError, OSError, imaplib.IMAP4.abort, imaplib.IMAP4.error)
+
+
 def fetch_messages_paginated(mail, email_addr, password_val, host_val, target_folders: List[str],
                             search_query: str = "", search_field: str = "TEXT", mode: str = "SEARCH",
                             page_size: int = 15, page_number: int = 1, sort_order: str = "Newest First",
@@ -3044,6 +3051,24 @@ def fetch_messages_paginated(mail, email_addr, password_val, host_val, target_fo
 
     messages = []
     start_time = time.time()
+
+    # v13.86: email_addr / password_val / host_val were accepted and never read.
+    # They are what a reconnect needs, so one is now built from them. The combo
+    # key is written in exactly the format get_active_mail() compares against, so
+    # a later call reuses the fresh socket instead of logging it out again.
+    def _reconnect():
+        try:
+            mail.logout()
+        except Exception:
+            pass
+        fresh = open_mail(email_addr, password_val, host_val)
+        try:
+            _p = int(st.session_state.app_config.get("imap_port", 993) or 993)
+            st.session_state.active_mail = fresh
+            st.session_state.connected_account_combo = f"{email_addr}:{password_val}@{host_val}:{_p}"
+        except Exception:
+            pass
+        return fresh
 
     clean_query = search_query.strip()
     log_func(f"⚙️ [ENGINE INIT] Mode: '{mode}' | Target Folders ({len(target_folders)}): {target_folders}")
@@ -3069,58 +3094,72 @@ def fetch_messages_paginated(mail, email_addr, password_val, host_val, target_fo
             real_imap_encoded = encode_imap_utf7(real_imap_folder)
             log_func(f"\n📂 [PROCESSING FOLDER] Label='{f_label}' -> IMAP Path='{real_imap_folder}' (Encoded: '{real_imap_encoded}')")
 
-            try:
-                sel_typ, sel_data = mail.select(f'"{real_imap_encoded}"', readonly=True)
-                log_func(f"  ├─ [IMAP SELECT] Status: '{sel_typ}' | Response: {sel_data}")
+            _attempts = 0
+            while True:
+                _attempts += 1
+                try:
+                    sel_typ, sel_data = mail.select(f'"{real_imap_encoded}"', readonly=True)
+                    log_func(f"  ├─ [IMAP SELECT] Status: '{sel_typ}' | Response: {sel_data}")
 
-                if sel_typ != "OK":
-                    log_func(f"  └─ ⚠️ Skipped folder '{f_label}': Failed to select IMAP path.")
-                    continue
+                    if sel_typ != "OK":
+                        log_func(f"  └─ ⚠️ Skipped folder '{f_label}': Failed to select IMAP path.")
+                        break
 
-                if mode == "FOLDER_ONLY" or not clean_query:
-                    log_func("  ├─ [EXECUTING COMMAND] mail.search(None, 'ALL')")
-                    typ, data = mail.search(None, "ALL")
-                else:
-                    field_cmd = search_field if search_field in ("TEXT", "SUBJECT", "FROM", "BODY") else "TEXT"
-                    terms = clean_query.split()
-
-                    if len(terms) > 1:
-                        # 25 -> 60. The preset keyword lists are ~15 terms and a
-                        # custom override can be longer; the tail was dropped
-                        # without a word.
-                        max_terms = 60
-                        log_func(f"  ├─ [MULTI-TERM SEARCH] Query has {len(terms)} keywords, using the first {min(len(terms), max_terms)}. Executing individual IMAP fetches...")
-                        matched_ids_set = set()
-                        for t_idx, term in enumerate(terms[:max_terms], 1):
-                            log_func(f"  │   ├─ [Term #{t_idx}/{min(len(terms), max_terms)}]: '{term}'")
-                            sub_typ, sub_data = execute_imap_search_safely(mail, field_cmd, term, log_func)
-                            if sub_typ in ("OK", "OK_FALLBACK") and sub_data and sub_data[0]:
-                                found_ids = (sub_data[0] or b"").split()
-                                matched_ids_set.update(found_ids)
-                                log_func(f"  │   └─ Matches for '{term}': {len(found_ids)} IDs")
-                        typ = "OK"
-                        data = [b" ".join(sorted(matched_ids_set, key=lambda x: int(x)))]
+                    if mode == "FOLDER_ONLY" or not clean_query:
+                        log_func("  ├─ [EXECUTING COMMAND] mail.search(None, 'ALL')")
+                        typ, data = mail.search(None, "ALL")
                     else:
-                        log_func(f"  ├─ [SINGLE-TERM SEARCH] Querying term: '{clean_query}' via field '{field_cmd}'")
-                        typ, data = execute_imap_search_safely(mail, field_cmd, clean_query, log_func)
+                        field_cmd = search_field if search_field in ("TEXT", "SUBJECT", "FROM", "BODY") else "TEXT"
+                        terms = clean_query.split()
 
-                log_func(f"  ├─ [IMAP SEARCH RESPONSE] Status: '{typ}' | Raw Bytes: {data}")
-                ids = (data[0] or b"").split() if typ in ("OK", "OK_FALLBACK") and data else []
+                        if len(terms) > 1:
+                            # 25 -> 60. The preset keyword lists are ~15 terms and
+                            # a custom override can be longer; the tail was
+                            # dropped without a word.
+                            max_terms = 60
+                            log_func(f"  ├─ [MULTI-TERM SEARCH] Query has {len(terms)} keywords, using the first {min(len(terms), max_terms)}. Executing individual IMAP fetches...")
+                            matched_ids_set = set()
+                            for t_idx, term in enumerate(terms[:max_terms], 1):
+                                log_func(f"  │   ├─ [Term #{t_idx}/{min(len(terms), max_terms)}]: '{term}'")
+                                sub_typ, sub_data = execute_imap_search_safely(mail, field_cmd, term, log_func)
+                                if sub_typ in ("OK", "OK_FALLBACK") and sub_data and sub_data[0]:
+                                    found_ids = (sub_data[0] or b"").split()
+                                    matched_ids_set.update(found_ids)
+                                    log_func(f"  │   └─ Matches for '{term}': {len(found_ids)} IDs")
+                            typ = "OK"
+                            data = [b" ".join(sorted(matched_ids_set, key=lambda x: int(x)))]
+                        else:
+                            log_func(f"  ├─ [SINGLE-TERM SEARCH] Querying term: '{clean_query}' via field '{field_cmd}'")
+                            typ, data = execute_imap_search_safely(mail, field_cmd, clean_query, log_func)
 
-                if sort_order == "Newest First":
-                    ids = list(reversed(ids))
+                    log_func(f"  ├─ [IMAP SEARCH RESPONSE] Status: '{typ}' | Raw Bytes: {data}")
+                    ids = (data[0] or b"").split() if typ in ("OK", "OK_FALLBACK") and data else []
 
-                log_func(f"  ├─ [FOLDER MATCHES] '{f_label}' returned {len(ids)} IDs.")
-                for mid in ids:
-                    collected.append((f_label, mid))
+                    if sort_order == "Newest First":
+                        ids = list(reversed(ids))
 
-            except (socket.timeout, TimeoutError):
-                log_func(f"  └─ ❌ [TIMEOUT ERROR] Folder '{f_label}' timed out during IMAP search.")
-            except MsVerdict as mv:
-                log_func(f"  └─ ❌ [MICROSOFT VERDICT] {mv.verdict}: {mv.detail}")
-                raise
-            except Exception as ex:
-                log_func(f"  └─ ❌ [EXCEPTION ERROR] Querying folder '{f_label}' failed: {ex}")
+                    log_func(f"  ├─ [FOLDER MATCHES] '{f_label}' returned {len(ids)} IDs.")
+                    for mid in ids:
+                        collected.append((f_label, mid))
+                    break
+
+                except MsVerdict as mv:
+                    log_func(f"  └─ ❌ [MICROSOFT VERDICT] {mv.verdict}: {mv.detail}")
+                    raise
+                except _SOCKET_DEAD as ex:
+                    if _attempts > 1:
+                        log_func(f"  └─ ❌ [CONNECTION LOST] Folder '{f_label}' gave up after a reconnect: {ex}")
+                        break
+                    log_func(f"  ├─ ⚠️ [CONNECTION LOST] '{f_label}': {ex} - reconnecting once...")
+                    try:
+                        mail = _reconnect()
+                        log_func("  ├─ 🔌 [RECONNECTED] Retrying the folder.")
+                    except Exception as rex:
+                        log_func(f"  └─ ❌ [RECONNECT FAILED] {rex}")
+                        break
+                except Exception as ex:
+                    log_func(f"  └─ ❌ [EXCEPTION ERROR] Querying folder '{f_label}' failed: {ex}")
+                    break
 
         total_matched_all_folders = len(collected)
 
@@ -3138,116 +3177,132 @@ def fetch_messages_paginated(mail, email_addr, password_val, host_val, target_fo
 
         last_sel = None
         for idx, (f_label, mid) in enumerate(target_slice, 1):
-            try:
-                real_imap_folder = get_imap_path(f_label)
-                real_imap_encoded = encode_imap_utf7(real_imap_folder)
+            _attempts = 0
+            while True:
+                _attempts += 1
+                try:
+                    real_imap_folder = get_imap_path(f_label)
+                    real_imap_encoded = encode_imap_utf7(real_imap_folder)
 
-                # the return was ignored, so a folder that failed to open had its
-                # messages fetched from whatever was selected before it.
-                if last_sel != real_imap_encoded:
-                    sel_typ, sel_data = mail.select(f'"{real_imap_encoded}"', readonly=True)
-                    if sel_typ != "OK":
-                        log_func(f"  │   ├─ [Msg ID #{mid.decode()}] ⚠️ SELECT '{f_label}' failed "
-                                 f"({sel_typ} {sel_data}) - skipped.")
-                        last_sel = None
-                        continue
-                    last_sel = real_imap_encoded
+                    # the return was ignored, so a folder that failed to open had
+                    # its messages fetched from whatever was selected before it.
+                    if last_sel != real_imap_encoded:
+                        sel_typ, sel_data = mail.select(f'"{real_imap_encoded}"', readonly=True)
+                        if sel_typ != "OK":
+                            log_func(f"  │   ├─ [Msg ID #{mid.decode()}] ⚠️ SELECT '{f_label}' failed "
+                                     f"({sel_typ} {sel_data}) - skipped.")
+                            last_sel = None
+                            break
+                        last_sel = real_imap_encoded
 
-                msg_start = time.time()
+                    msg_start = time.time()
 
-                # NO PARTIAL FETCH. BODY.PEEK[]<0.262144> cut every message at
-                # 256 KB, so the body view was short, the regexes missed whatever
-                # followed, and mailview had to dial the server again to complete
-                # it. One full fetch here costs less than that second round trip
-                # and removes the truncation outright.
-                typ, msgdata = mail.fetch(mid, "(FLAGS BODY.PEEK[])")
+                    # NO PARTIAL FETCH. BODY.PEEK[]<0.262144> cut every message at
+                    # 256 KB, so the body view was short, the regexes missed
+                    # whatever followed, and mailview had to dial the server again
+                    # to complete it. One full fetch here costs less than that
+                    # second round trip and removes the truncation outright.
+                    typ, msgdata = mail.fetch(mid, "(FLAGS BODY.PEEK[])")
 
-                if not msgdata or not isinstance(msgdata[0], tuple):
-                    log_func(f"  │   ├─ [Msg ID #{mid.decode()}] ⚠️ FETCH returned empty structure.")
-                    continue
+                    if not msgdata or not isinstance(msgdata[0], tuple):
+                        log_func(f"  │   ├─ [Msg ID #{mid.decode()}] ⚠️ FETCH returned empty structure.")
+                        break
 
-                raw_msg_bytes = msgdata[0][1]
-                msg = message_from_bytes(raw_msg_bytes)
-                subject = decode_hdr(msg.get("Subject", ""))
-                frm = decode_hdr(msg.get("From", ""))
-                to_hdr = decode_hdr(msg.get("To", ""))
-                date_val = decode_hdr(msg.get("Date", ""))
-                flags_str = str(msgdata[0][0])
-                is_read = "\\Seen" in flags_str
+                    raw_msg_bytes = msgdata[0][1]
+                    msg = message_from_bytes(raw_msg_bytes)
+                    subject = decode_hdr(msg.get("Subject", ""))
+                    frm = decode_hdr(msg.get("From", ""))
+                    to_hdr = decode_hdr(msg.get("To", ""))
+                    date_val = decode_hdr(msg.get("Date", ""))
+                    flags_str = str(msgdata[0][0])
+                    is_read = "\\Seen" in flags_str
 
-                body_text, html_text = "", ""
-                if msg.is_multipart():
-                    for part in msg.walk():
-                        ctype = part.get_content_type()
-                        if ctype == "text/plain" and not body_text:
-                            body_text = _part_text(part)
-                        elif ctype == "text/html" and not html_text:
-                            html_text = _part_text(part)
-                else:
-                    _single = _part_text(msg)
-                    if msg.get_content_type() == "text/html":
-                        html_text = _single
+                    body_text, html_text = "", ""
+                    if msg.is_multipart():
+                        for part in msg.walk():
+                            ctype = part.get_content_type()
+                            if ctype == "text/plain" and not body_text:
+                                body_text = _part_text(part)
+                            elif ctype == "text/html" and not html_text:
+                                html_text = _part_text(part)
                     else:
-                        body_text = _single
-                if not body_text.strip() and html_text:
-                    body_text = html_to_text(html_text)
+                        _single = _part_text(msg)
+                        if msg.get_content_type() == "text/html":
+                            html_text = _single
+                        else:
+                            body_text = _single
+                    if not body_text.strip() and html_text:
+                        body_text = html_to_text(html_text)
 
-                # extortion mail is TAGGED now, not dropped. It used to be
-                # `continue`d, so a ransom mail appeared in no stream at all.
-                _extortion = is_extortion_spam(subject, body_text, frm)
+                    # extortion mail is TAGGED now, not dropped. It used to be
+                    # `continue`d, so a ransom mail appeared in no stream at all.
+                    _extortion = is_extortion_spam(subject, body_text, frm)
 
-                cleaned_body = clean_boilerplate(body_text)
-                pins, links = extract_pins_and_links(body_text)
-                if st.session_state.get("otp_regex_chk", True):
-                    cards, creds = extract_credentials_and_cards(body_text)
-                else:
-                    cards, creds = [], []
-                detected_categories = detect_specific_categories(subject, body_text, frm, pins, cards, creds)
-                if _extortion and "🕵️ EXTORTION / RANSOM" not in detected_categories:
-                    detected_categories.append("🕵️ EXTORTION / RANSOM")
-                is_bot = len(detected_categories) > 0
+                    cleaned_body = clean_boilerplate(body_text)
+                    pins, links = extract_pins_and_links(body_text)
+                    if st.session_state.get("otp_regex_chk", True):
+                        cards, creds = extract_credentials_and_cards(body_text)
+                    else:
+                        cards, creds = [], []
+                    detected_categories = detect_specific_categories(subject, body_text, frm, pins, cards, creds)
+                    if _extortion and "🕵️ EXTORTION / RANSOM" not in detected_categories:
+                        detected_categories.append("🕵️ EXTORTION / RANSOM")
+                    is_bot = len(detected_categories) > 0
 
-                messages.append({
-                    "id": mid.decode(),
-                    "folder": f_label,
-                    "from": frm,
-                    "to": to_hdr,
-                    "subject": subject,
-                    "date": date_val,
-                    "is_read": is_read,
-                    "is_bot": is_bot,
-                    "categories": detected_categories,
-                    "body": cleaned_body,
-                    "body_raw": body_text,
-                    "pins": pins,
-                    "links": links,
-                    "cards": cards,
-                    "creds": creds,
-                    "raw": raw_msg_bytes,
-                    "flags": flags_str,
-                    "size_bytes": len(raw_msg_bytes)
-                })
+                    messages.append({
+                        "id": mid.decode(),
+                        "folder": f_label,
+                        "from": frm,
+                        "to": to_hdr,
+                        "subject": subject,
+                        "date": date_val,
+                        "is_read": is_read,
+                        "is_bot": is_bot,
+                        "categories": detected_categories,
+                        "body": cleaned_body,
+                        "body_raw": body_text,
+                        "pins": pins,
+                        "links": links,
+                        "cards": cards,
+                        "creds": creds,
+                        "raw": raw_msg_bytes,
+                        "flags": flags_str,
+                        "size_bytes": len(raw_msg_bytes)
+                    })
 
-                fetch_elapsed = round((time.time() - msg_start) * 1000, 2)
-                log_func(
-                    f"  │   ├─ [Msg #{idx} | ID: {mid.decode()}] Parsed in {fetch_elapsed}ms | Size: {len(raw_msg_bytes)}B | "
-                    f"From: '{frm}' | To: '{to_hdr}' | Subject: '{subject}' | "
-                    f"Flags: {flags_str} | Categories={detected_categories} | Pins={pins} | Cards={cards}"
-                )
+                    fetch_elapsed = round((time.time() - msg_start) * 1000, 2)
+                    log_func(
+                        f"  │   ├─ [Msg #{idx} | ID: {mid.decode()}] Parsed in {fetch_elapsed}ms | Size: {len(raw_msg_bytes)}B | "
+                        f"From: '{frm}' | To: '{to_hdr}' | Subject: '{subject}' | "
+                        f"Flags: {flags_str} | Categories={detected_categories} | Pins={pins} | Cards={cards}"
+                    )
+                    break
 
-            except (socket.timeout, TimeoutError):
-                log_func(f"  │   └─ ❌ [TIMEOUT ERROR] Message {mid!r} in '{f_label}' timed out.")
-            except MsVerdict as mv:
-                log_func(f"  │   └─ ❌ [MICROSOFT VERDICT] {mv.verdict}: {mv.detail}")
-                raise
-            except Exception as ex:
-                log_func(f"  │   └─ ❌ [EXCEPTION ERROR] Message {mid!r} in '{f_label}' failed: {ex}")
+                except MsVerdict as mv:
+                    log_func(f"  │   └─ ❌ [MICROSOFT VERDICT] {mv.verdict}: {mv.detail}")
+                    raise
+                except _SOCKET_DEAD as ex:
+                    if _attempts > 1:
+                        log_func(f"  │   └─ ❌ [CONNECTION LOST] Message {mid!r} in '{f_label}' gave up after a reconnect: {ex}")
+                        break
+                    log_func(f"  │   ├─ ⚠️ [CONNECTION LOST] {mid!r} in '{f_label}': {ex} - reconnecting once...")
+                    try:
+                        mail = _reconnect()
+                        # the socket is new, so the folder selection is gone
+                        last_sel = None
+                        log_func("  │   ├─ 🔌 [RECONNECTED] Retrying the message.")
+                    except Exception as rex:
+                        log_func(f"  │   └─ ❌ [RECONNECT FAILED] {rex}")
+                        break
+                except Exception as ex:
+                    log_func(f"  │   └─ ❌ [EXCEPTION ERROR] Message {mid!r} in '{f_label}' failed: {ex}")
+                    break
 
         total_elapsed = round(time.time() - start_time, 2)
 
         # The pager must count MATCHES, not the rows on this page. The true match
         # total drives the pager; the page row count is stored separately so the
-        # header can show the post-filter reality.
+        # header can show the post-filter reality (block 040 renders it).
         page_rows = len(messages)
         if log_target == "SEARCH":
             st.session_state.search_total_matched_count = total_matched_all_folders
@@ -3467,16 +3522,25 @@ if clean_download_lines:
         data=valid_text_data,
         file_name=f"valid_accounts_{len(clean_download_lines)}.txt",
         mime="text/plain",
-        width="stretch"
+        width="stretch",
+        key="dl_valid_list"
     )
 
-    zip_bytes = generate_all_mail_zip()
+    # v13.86: the bundle was rebuilt on EVERY rerun - walking and re-zipping
+    # every result file whenever an mtime moved, including mid-fetch from a
+    # sidebar that may not even be open. The writer is paused while a fetch loop
+    # owns the disk, so the last blob is served instead of competing with it.
+    if _CACHE_PAUSE["n"] == 0 or _ZIP_CACHE.get("blob") is None:
+        zip_bytes = generate_all_mail_zip()
+    else:
+        zip_bytes = _ZIP_CACHE.get("blob") or b""
     st.sidebar.download_button(
         label="📦 Download All Mail Lists (ZIP)",
         data=zip_bytes,
         file_name="all_mail_results_bundle.zip",
         mime="application/zip",
-        width="stretch"
+        width="stretch",
+        key="dl_all_zip"
     )
 # @@END 030 SIDEBAR_HUB
 
@@ -3566,10 +3630,18 @@ def append_result(kind: str, line: str) -> None:
                         continue
                     rows.append(old)
         rows.append(line)
-        tmp = path + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            f.write("\n".join(rows) + "\n")
-        os.replace(tmp, path)
+        # v13.86: unique temp name - two tabs of one user wrote the same .tmp.
+        tmp = _tmp_path(path)
+        try:
+            with open(tmp, "w", encoding="utf-8") as f:
+                f.write("\n".join(rows) + "\n")
+            os.replace(tmp, path)
+        finally:
+            if os.path.exists(tmp):
+                try:
+                    os.remove(tmp)
+                except Exception:
+                    pass
     except Exception:
         pass
 
@@ -3700,6 +3772,11 @@ if st.sidebar.button("🚀 Validate & Import Batch Accounts", type="primary", wi
             ms_verdict = None                              # v13.37
             trace_steps = []
 
+            # v13.86: _last_socket_path is a process value. A row that never
+            # opened a socket used to inherit the PREVIOUS row's path, so its
+            # trace described a route this account never took.
+            st.session_state["_last_socket_path"] = "not attempted"
+
             users_to_try = username_candidates(email_val) if cfg_alt_user else [email_val]
 
             # v13.40: cap the ladder. 20 hosts x 2 users x 15 s looked hung.
@@ -3709,7 +3786,6 @@ if st.sidebar.button("🚀 Validate & Import Batch Accounts", type="primary", wi
                 try:
                     trace_steps.append(f"Attempting IMAP TLS -> Host: {h}:{cfg_port} (STARTTLS/plain fallback enabled)")
                     _retries = max(0, int(st.session_state.app_config.get("max_batch_retries", 1)))
-                    test_m = None
                     for _attempt in range(_retries + 1):
                         try:
                             test_m = connect_and_login(h, cfg_port, cfg_timeout,
@@ -3862,8 +3938,15 @@ st.markdown("---")
 tab_stream, tab_analytics = st.tabs(["⚡ Live Execution Stream", "📊 Live Report Log & Analytics"])
 
 with tab_stream:
-    if st.session_state.get("batch_validation_logs"):
-        st.code("\n".join(st.session_state.batch_validation_logs), language="text")
+    _batch_logs = st.session_state.get("batch_validation_logs") or []
+    if _batch_logs:
+        # v13.86: the whole run was dumped into one st.code. A 500-row import
+        # rendered 500 lines on every rerun; the tail is what anyone reads.
+        _LOG_CAP = 300
+        if len(_batch_logs) > _LOG_CAP:
+            st.caption(f"Showing the last {_LOG_CAP} of {len(_batch_logs)} log line(s).")
+            _batch_logs = _batch_logs[-_LOG_CAP:]
+        st.code("\n".join(_batch_logs), language="text")
     else:
         st.caption("No batch validation execution logs recorded yet. Run a batch validation from the sidebar.")
 
@@ -3914,6 +3997,7 @@ with tab_analytics:
             file_name=f"batch_run_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
             mime="text/csv",
             width="stretch",
+            key="dl_batch_csv",
         )
     else:
         st.caption("No table results available yet.")
@@ -3992,9 +4076,20 @@ if st.sidebar.button("🔑 Login & Save Account", type="primary", width="stretch
                             continue
                         _keep.append(_ln if _ln.endswith("\n") else _ln + "\n")
 
-            with open(MANUAL_VALID_FILE, "w", encoding="utf-8") as f:
-                f.write(new_entry_line)
-                f.writelines(_keep)
+            # v13.86: plain open(...,"w") truncated the list if the write died
+            # halfway. Unique temp + replace, as everywhere else.
+            _mtmp = _tmp_path(MANUAL_VALID_FILE)
+            try:
+                with open(_mtmp, "w", encoding="utf-8") as f:
+                    f.write(new_entry_line)
+                    f.writelines(_keep)
+                os.replace(_mtmp, MANUAL_VALID_FILE)
+            finally:
+                if os.path.exists(_mtmp):
+                    try:
+                        os.remove(_mtmp)
+                    except Exception:
+                        pass
 
             save_last_account(combo)
             st.session_state.forced_account = combo
@@ -4093,7 +4188,14 @@ if st.button("Connect & Discover Folders", type="primary", width="stretch"):
         st.error("Please select a valid account from the dropdown list first.")
     else:
         acc_email, acc_pass = actual_pick.split(":", 1)
-        hosts = candidate_hosts(acc_email)
+        _all_hosts = candidate_hosts(acc_email)
+        # v13.86: the whole ladder was walked at connection_timeout, so a dead
+        # domain was ~20 hosts x 15 s of dead air with no output at all. Six is
+        # the cap the batch path already uses, and the leftover count is reported
+        # rather than swallowed.
+        _MAX_HOSTS = 6
+        hosts = _all_hosts[:_MAX_HOSTS]
+        _untried = max(0, len(_all_hosts) - _MAX_HOSTS)
         last, connected_host, folders, success = "no host", "", ["INBOX"], False
         test_mail = None
 
@@ -4139,10 +4241,11 @@ if st.button("Connect & Discover Folders", type="primary", width="stretch"):
             flash(f"Connected: {connected_host} ({len(folders)} folders) — path: {_conn_path()}")
             st.rerun()
         else:
+            _tail = f" — {_untried} more host(s) untried" if _untried else ""
             if acc_email.split("@")[-1].lower() in ZERO_ACCESS_PROVIDERS:
-                st.error(f"{last} — this provider has no standard IMAP endpoint (needs an app password / bridge).")
+                st.error(f"{last}{_tail} — this provider has no standard IMAP endpoint (needs an app password / bridge).")
             else:
-                st.error(last)
+                st.error(last + _tail)
 # @@END 036 CONNECT_DISCOVER
 
 
