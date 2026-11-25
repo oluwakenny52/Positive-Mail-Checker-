@@ -214,20 +214,29 @@ try:
 except Exception:
     mailview = None
 
+import inspect
+
 # A redeploy re-executes THIS page and leaves mailview in sys.modules, so the
 # import above can hand back the module as it was before the last push. hasattr()
 # cannot tell the two apart - both expose render_auto - and the stale one raises
 # TypeError on view=/ns=. Reload until the signature is the current one, exactly
 # as block 001 does for auth, then re-check it. If the reload also fails the stale
 # module is kept and the text_area fallback in block 038 still holds.
+#
+# v13.86: the parameter list was the ONLY test, so a render_auto written as
+# `def render_auto(st, msg, key, mail, **kw)` never listed view/ns and reloaded
+# the module on every single run. A **kwargs tail accepts both names without a
+# TypeError, which is the only thing the reload guards against - so it counts.
 if mailview is not None:
     try:
         _mv_fn = getattr(mailview, "render_auto", None)
         _mv_code = getattr(_mv_fn, "__code__", None)
         _mv_args = ()
+        _mv_kwargs = False
         if _mv_code is not None:
             _mv_args = _mv_code.co_varnames[:_mv_code.co_argcount + _mv_code.co_kwonlyargcount]
-        if "view" not in _mv_args or "ns" not in _mv_args:
+            _mv_kwargs = bool(_mv_code.co_flags & inspect.CO_VARKEYWORDS)
+        if not _mv_kwargs and ("view" not in _mv_args or "ns" not in _mv_args):
             mailview = importlib.reload(mailview)
     except Exception:
         pass
@@ -1538,13 +1547,19 @@ def flash(msg: str, kind: str = "success") -> None:
 
 
 def msg_label(msg, idx: int) -> str:
-    """Raw subjects with newlines / huge length wreck the expander row."""
+    """Raw subjects with newlines / huge length wreck the expander row.
+
+    v13.86: `idx` was accepted and never used, so two rows with the same folder,
+    date, sender and subject were indistinguishable in the list. It is the row
+    number now - the bot preview already numbers its own rows, and this puts the
+    other three streams on the same footing.
+    """
     icon = "📖" if msg.get("is_read") else "📩"
     subj = re.sub(r"\s+", " ", str(msg.get("subject", ""))).strip()[:90] or "(no subject)"
     frm = re.sub(r"\s+", " ", str(msg.get("from", ""))).strip()[:45] or "(unknown)"
     date = re.sub(r"\s+", " ", str(msg.get("date", ""))).strip()[:31]
     cats = "".join(f" [{c}]" for c in msg.get("categories", []))
-    return f"{icon} [{msg.get('folder', '?')}] [{date}] {frm} — {subj}{cats}"
+    return f"{icon} #{idx + 1} [{msg.get('folder', '?')}] [{date}] {frm} — {subj}{cats}"
 
 
 def render_flash() -> None:
@@ -1623,6 +1638,39 @@ def _mail_tls_context(verify=False):
         pass
     return ctx
 
+def _split_hostport(p: str):
+    """(host, port, user, pw) from `host:port[:user[:pass]]`, or None.
+
+    v13.86: a plain split(":") cut a bracketed IPv6 literal into six pieces and
+    every one of them failed the int() cast, so `[2001:db8::1]:1080` could not be
+    used at all. The brackets are consumed first and the rest is split from the
+    port onwards.
+    """
+    if not p:
+        return None
+    if p.startswith("["):
+        end = p.find("]")
+        if end == -1:
+            return None
+        host = p[1:end]
+        tail = p[end + 1:]
+        if not tail.startswith(":"):
+            return None
+        tail = tail[1:]
+    else:
+        if ":" not in p:
+            return None
+        host, tail = p.split(":", 1)
+    parts = tail.split(":")
+    if not parts or not parts[0].isdigit():
+        return None
+    port = int(parts[0])
+    if not 1 <= port <= 65535:
+        return None
+    user = parts[1] or None if len(parts) > 1 else None
+    pw = ":".join(parts[2:]) if len(parts) > 2 else None
+    return host, port, user, pw
+
 def _parse_proxy_str(proxy_str):
     """Accepts host:port | host:port:user:pass | user:pass@host:port | scheme://...
 
@@ -1630,6 +1678,11 @@ def _parse_proxy_str(proxy_str):
     `auth` MODULE this page imports.  Inside this function `auth.require` was an
     AttributeError, and verify_v1337.py reported `auth.split` as a call to a
     function the module does not have.  It is `userinfo` now.
+
+    v13.86: the 3-part form discarded its third field whenever a userinfo half
+    had already supplied a user, so `u@host:1080:otheruser` lost `otheruser`
+    silently. The parse is centralised in _split_hostport() and userinfo wins
+    only for the field it actually sets.
     """
     if not proxy_str or proxy_str == "direct":
         return None
@@ -1648,22 +1701,12 @@ def _parse_proxy_str(proxy_str):
             else:
                 user = userinfo
 
-        parts = p.split(":")
-        host = None
-        port = None
-        try:
-            if len(parts) >= 4:
-                host, port, user, pw = parts[0], int(parts[1]), parts[2], ":".join(parts[3:])
-            elif len(parts) == 3:
-                host, port, extra = parts[0], int(parts[1]), parts[2]
-                if user is None:
-                    user, pw = extra, None
-            elif len(parts) == 2:
-                host, port = parts[0], int(parts[1])
-            else:
-                return None
-        except (ValueError, IndexError):
+        parsed = _split_hostport(p)
+        if not parsed:
             return None
+        host, port, hp_user, hp_pw = parsed
+        if not user and hp_user:
+            user, pw = hp_user, hp_pw
 
         if not host or not port:
             return None
@@ -1678,7 +1721,11 @@ def _parse_proxy_str(proxy_str):
 # v13.37: probe + rotate instead of blindly taking pool[0], and report the path
 # ---------------------------------------------------------------------------
 def _reader_proxy_reachable(proxy_str, host, port=993, timeout=5.0) -> bool:
-    """True if a SOCKS5/HTTP CONNECT to host:port through this node succeeds."""
+    """True if a SOCKS5/HTTP CONNECT to host:port through this node succeeds.
+
+    v13.86: the protocol order was fixed, so a socks5:// node was tried over HTTP
+    first and vice versa. It follows the scheme when the string carries one.
+    """
     info = _parse_proxy_str(proxy_str)
     if not info:
         return False
@@ -1686,7 +1733,14 @@ def _reader_proxy_reachable(proxy_str, host, port=993, timeout=5.0) -> bool:
         import socks
     except ImportError:
         return False
-    for _ptype in (socks.SOCKS5, socks.HTTP):
+    scheme = (info.get("scheme") or "").lower()
+    if scheme.startswith("socks"):
+        order = (socks.SOCKS5, socks.HTTP)
+    elif scheme.startswith("http"):
+        order = (socks.HTTP, socks.SOCKS5)
+    else:
+        order = (socks.SOCKS5, socks.HTTP)
+    for _ptype in order:
         s = None
         try:
             s = socks.socksocket()
@@ -1727,11 +1781,17 @@ def _reader_proxy_str(host: str = "", port=None):
         # v13.40: the probe hardcoded 993, so a port-143 account probed the wrong
         # port, failed every node and silently went direct. Use the real port.
         probe_port = int(port or st.session_state.app_config.get("imap_port", 993) or 993)
-        for item in pool[:5]:
+        # v13.86: 5 nodes x 2 protocols x 3 s was up to 30 s of dead air before a
+        # single real connection was even attempted. Three nodes at 2 s inside a
+        # 6 s budget, checked between nodes, so a slow pool cannot hold the page.
+        budget_end = time.time() + 6.0
+        for item in pool[:3]:
             px = item.get("proxy")
             if not px:
                 continue
-            if _reader_proxy_reachable(px, target, probe_port, timeout=3.0):
+            if time.time() > budget_end:
+                break
+            if _reader_proxy_reachable(px, target, probe_port, timeout=2.0):
                 st.session_state["_reader_proxy_path"] = f"via {px} ({item.get('country')})"
                 return px
         st.session_state["_reader_proxy_path"] = "direct (every probed node failed)"
@@ -2382,6 +2442,8 @@ def get_webmail_portal(email_addr):
 
 # @@BLOCK 022 IMAP_UTF7 deps=021
 _B64_MEMO = {}                                  # v13.37: decode memoisation
+# "Base (2)" -> the SECOND raw folder that cleans to "Base".
+_DUP_LABEL_RX = re.compile(r"^(.*) \((\d+)\)$")
 
 
 def decode_imap_utf7(s: str) -> str:
@@ -2483,15 +2545,36 @@ def parse_imap_list_line(s: str) -> Tuple[str, str, str]:
     return flags, delim, raw_name
 
 def get_imap_path(selected_ui_folder: str) -> str:
+    """UI label -> real IMAP path.
+
+    v13.86: an unknown label used to be returned unchanged, so the renamed
+    duplicate label minted by list_folders() ("Sent (2)") was sent to the server
+    as a mailbox name and every select() failed. The duplicate suffix is resolved
+    back to the raw folder it was minted from, in the same order the labels were
+    handed out.
+    """
     folder_map = st.session_state.get("folder_map", {})
-    return folder_map.get(selected_ui_folder, selected_ui_folder)
+    if selected_ui_folder in folder_map:
+        return folder_map[selected_ui_folder]
+    m = _DUP_LABEL_RX.match(selected_ui_folder or "")
+    if m:
+        base, want = m.group(1), int(m.group(2))
+        hits = [raw for raw in folder_map.values() if clean_display_label(raw) == base]
+        if 0 < want <= len(hits):
+            return hits[want - 1]
+    return selected_ui_folder
 # @@END 022 IMAP_UTF7
 
 
 # @@BLOCK 023 FOLDERS deps=022
 def list_folders(mail, email_addr: str = "", host_val: str = ""):
     found = set()
-    st.session_state.folder_debug_logs = []
+    # v13.86: this used to assign [] and threw away everything the connection
+    # layer had already logged this run - the proxy-load warning from block 009,
+    # the probe outcome, the path note. The panel opened blank on exactly the
+    # runs where those lines mattered. Carry the tail instead.
+    _carry = st.session_state.get("folder_debug_logs") or []
+    st.session_state.folder_debug_logs = list(_carry)[-40:]
     debug_log(f"📧 [TARGET ACCOUNT] Email: '{email_addr}' | Host: '{host_val}'")
     debug_log("🔍 [ENGINE START] Issuing IMAP command: LIST '' '*'")
 
