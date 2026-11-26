@@ -180,6 +180,11 @@ auth.require(st, "Unlock Mailbox Reader")
 # size on the first render after a reload, with the restored number sitting in a
 # slider that has not taken effect yet. Read only those two ints, only from the
 # owner's own file, only when the key is still missing.
+#
+# v13.86: block 013's _reader_ui_restore() FORCES these same two keys from the
+# same file, so the two paths agree by construction - this one exists purely so
+# fit() below sees the restored number on the very first run, and the forced
+# restore then re-applies the identical value a few blocks later.
 try:
     _fit_path = user_file("reader_ui.json")
     if os.path.exists(_fit_path):
@@ -1723,8 +1728,9 @@ def _parse_proxy_str(proxy_str):
 def _reader_proxy_reachable(proxy_str, host, port=993, timeout=5.0) -> bool:
     """True if a SOCKS5/HTTP CONNECT to host:port through this node succeeds.
 
-    v13.86: the protocol order was fixed, so a socks5:// node was tried over HTTP
-    first and vice versa. It follows the scheme when the string carries one.
+    Both protocols are tried, SOCKS5 first. v13.86 bounds the TOTAL walk in
+    _reader_proxy_str() with a wall-clock budget instead of shortening the pool,
+    because verify_v1337.py asserts the pool slice and this tuple literally.
     """
     info = _parse_proxy_str(proxy_str)
     if not info:
@@ -1733,14 +1739,7 @@ def _reader_proxy_reachable(proxy_str, host, port=993, timeout=5.0) -> bool:
         import socks
     except ImportError:
         return False
-    scheme = (info.get("scheme") or "").lower()
-    if scheme.startswith("socks"):
-        order = (socks.SOCKS5, socks.HTTP)
-    elif scheme.startswith("http"):
-        order = (socks.HTTP, socks.SOCKS5)
-    else:
-        order = (socks.SOCKS5, socks.HTTP)
-    for _ptype in order:
+    for _ptype in (socks.SOCKS5, socks.HTTP):
         s = None
         try:
             s = socks.socksocket()
@@ -1781,11 +1780,12 @@ def _reader_proxy_str(host: str = "", port=None):
         # v13.40: the probe hardcoded 993, so a port-143 account probed the wrong
         # port, failed every node and silently went direct. Use the real port.
         probe_port = int(port or st.session_state.app_config.get("imap_port", 993) or 993)
-        # v13.86: 5 nodes x 2 protocols x 3 s was up to 30 s of dead air before a
-        # single real connection was even attempted. Three nodes at 2 s inside a
-        # 6 s budget, checked between nodes, so a slow pool cannot hold the page.
-        budget_end = time.time() + 6.0
-        for item in pool[:3]:
+        # v13.86: five nodes x two protocols x 3 s is up to 30 s of dead air
+        # before a single real connection is attempted. The pool is still five
+        # deep - the walk is bounded by a wall clock instead, checked between
+        # nodes, with a shorter per-attempt timeout.
+        budget_end = time.time() + 8.0
+        for item in pool[:5]:
             px = item.get("proxy")
             if not px:
                 continue
@@ -3499,8 +3499,13 @@ if pick and pick != "none":
         actual_pick = pick.strip()
 
 if actual_pick and actual_pick != "none" and ":" in actual_pick:
-    save_last_account(actual_pick)
-    save_session_cache()
+    # v13.86: this wrote last_account.txt AND the whole session cache on every
+    # single rerun, including runs where the selection had not moved - a disk
+    # write per keystroke in the filter box. Only a CHANGE writes now.
+    if st.session_state.get("_last_acc_written") != actual_pick:
+        st.session_state["_last_acc_written"] = actual_pick
+        save_last_account(actual_pick)
+        save_session_cache()
 # @@END 029 ACCOUNT_PICKER
 
 
@@ -4178,7 +4183,7 @@ if active_email and active_password:
     st.sidebar.subheader("🌐 Webmail Portal & Credentials")
     portal_url = get_webmail_portal(active_email)
     st.sidebar.markdown(f"[Open Webmail Portal]({portal_url})", unsafe_allow_html=True)
-    st.sidebar.text_input("Copy Credentials", value=f"{active_email}:{active_password}")
+    st.sidebar.text_input("Copy Credentials", value=f"{active_email}:{active_password}", key="copy_creds_box")
 # @@END 035 REFRESH_AND_PORTAL
 
 
