@@ -13311,6 +13311,754 @@ def kw_drain(wait=0.0):
     return moved
 
 
+# ==========================================================================
+# v13.86 - THE CREDENTIALS SORTER
+#
+# WHAT IT IS FOR: the queue you paste is one flat list. Some runs want a whole
+# domain, some want a whole country, some want a region - and the engine can
+# only run what the Engine Action Mode dropdown names. This section turns the
+# queue into named groups, lets you tick several of them, and SEND them as ONE
+# section that then appears, as one entry, in BOTH the Engine Action Mode
+# dropdown and the Filter & Result Categories Inspector.
+#
+# THREE MODES, one control: group by DOMAIN, by COUNTRY or by REGION. A country
+# is resolved from a taught map first, then the built-in provider hints, then
+# the TLD table, and falls back to Global - never guessed beyond that.
+#
+# THE MAP IS TEACHABLE. "Teach a domain its country" writes to THIS user's own
+# domain_countries.json, "Auto-assign countries from the rows" fills every
+# domain the hints and TLDs can answer for, and the map panel draws one marker
+# per country that actually has credentials and lets you re-assign or forget any
+# domain. Nothing about it is shared with another user.
+#
+# EVERY COUNTRY CARRIES ITS FLAG. The flag is DERIVED from the two-letter code
+# with the regional-indicator arithmetic, so a country can never be listed
+# without one and no 200-entry emoji table can drift.
+#
+# ISOLATION, stated plainly, because this is credential data:
+#   * domain_countries.json and sorter_selection.json are per-user files,
+#     named through user_file() like every other per-user path.
+#   * Every widget key is cs_*, every value is cs_*, and the owner gate below
+#     drops all of it on an owner change in this tab.
+#   * The sent section is rebuilt from the keys every run, so a bucket that a
+#     new run emptied can never leave a stale label in either dropdown.
+# ==========================================================================
+_CS_GLOBAL = "Global"
+_CS_MODES = ("Domain", "Country", "Region")
+_CS_FILE_NAME = "domain_countries.json"
+_CS_SEL_NAME = "sorter_selection.json"
+_CS_GLOBAL_FLAG = "\U0001F310"
+_CS_MARK = "\U0001F5C2"
+_CS_OWNER_KEY = "_cs_owner"
+
+# code, name, region, latitude, longitude. The code is the flag AND the short
+# label; the coordinates are the country centroid the map marker sits on.
+_CS_COUNTRIES = (
+    ("AF", "Afghanistan", "Asia", 33.9, 67.7),
+    ("AL", "Albania", "Europe", 41.2, 20.2),
+    ("DZ", "Algeria", "Africa", 28.0, 1.7),
+    ("AD", "Andorra", "Europe", 42.5, 1.6),
+    ("AO", "Angola", "Africa", -11.2, 17.9),
+    ("AR", "Argentina", "South America", -38.4, -63.6),
+    ("AM", "Armenia", "Asia", 40.1, 45.0),
+    ("AU", "Australia", "Oceania", -25.3, 133.8),
+    ("AT", "Austria", "Europe", 47.5, 14.6),
+    ("AZ", "Azerbaijan", "Asia", 40.1, 47.6),
+    ("BS", "Bahamas", "Caribbean", 25.0, -77.4),
+    ("BH", "Bahrain", "Middle East", 26.0, 50.6),
+    ("BD", "Bangladesh", "Asia", 23.7, 90.4),
+    ("BB", "Barbados", "Caribbean", 13.2, -59.5),
+    ("BY", "Belarus", "Europe", 53.7, 27.9),
+    ("BE", "Belgium", "Europe", 50.5, 4.5),
+    ("BZ", "Belize", "Central America", 17.2, -88.5),
+    ("BJ", "Benin", "Africa", 9.3, 2.3),
+    ("BT", "Bhutan", "Asia", 27.5, 90.4),
+    ("BO", "Bolivia", "South America", -16.3, -63.6),
+    ("BA", "Bosnia and Herzegovina", "Europe", 43.9, 17.7),
+    ("BW", "Botswana", "Africa", -22.3, 24.7),
+    ("BR", "Brazil", "South America", -14.2, -51.9),
+    ("BN", "Brunei", "Asia", 4.5, 114.7),
+    ("BG", "Bulgaria", "Europe", 42.7, 25.5),
+    ("BF", "Burkina Faso", "Africa", 12.2, -1.6),
+    ("BI", "Burundi", "Africa", -3.4, 29.9),
+    ("KH", "Cambodia", "Asia", 12.6, 104.9),
+    ("CM", "Cameroon", "Africa", 7.4, 12.4),
+    ("CA", "Canada", "North America", 56.1, -106.3),
+    ("CV", "Cape Verde", "Africa", 16.0, -24.0),
+    ("CF", "Central African Republic", "Africa", 6.6, 20.9),
+    ("TD", "Chad", "Africa", 15.5, 18.7),
+    ("CL", "Chile", "South America", -35.7, -71.5),
+    ("CN", "China", "Asia", 35.9, 104.2),
+    ("CO", "Colombia", "South America", 4.6, -74.3),
+    ("KM", "Comoros", "Africa", -11.6, 43.3),
+    ("CG", "Congo (Brazzaville)", "Africa", -0.2, 15.8),
+    ("CD", "Congo (Kinshasa)", "Africa", -4.0, 21.8),
+    ("CR", "Costa Rica", "Central America", 9.7, -83.8),
+    ("HR", "Croatia", "Europe", 45.1, 15.2),
+    ("CU", "Cuba", "Caribbean", 21.5, -77.8),
+    ("CY", "Cyprus", "Europe", 35.1, 33.4),
+    ("CZ", "Czechia", "Europe", 49.8, 15.5),
+    ("DK", "Denmark", "Europe", 56.3, 9.5),
+    ("DJ", "Djibouti", "Africa", 11.8, 42.6),
+    ("DM", "Dominica", "Caribbean", 15.4, -61.4),
+    ("DO", "Dominican Republic", "Caribbean", 18.7, -70.2),
+    ("EC", "Ecuador", "South America", -1.8, -78.2),
+    ("EG", "Egypt", "Africa", 26.8, 30.8),
+    ("SV", "El Salvador", "Central America", 13.8, -88.9),
+    ("GQ", "Equatorial Guinea", "Africa", 1.7, 10.3),
+    ("ER", "Eritrea", "Africa", 15.2, 39.8),
+    ("EE", "Estonia", "Europe", 58.6, 25.0),
+    ("SZ", "Eswatini", "Africa", -26.5, 31.5),
+    ("ET", "Ethiopia", "Africa", 9.1, 40.5),
+    ("FJ", "Fiji", "Oceania", -17.7, 178.1),
+    ("FI", "Finland", "Europe", 61.9, 25.7),
+    ("FR", "France", "Europe", 46.2, 2.2),
+    ("GA", "Gabon", "Africa", -0.8, 11.6),
+    ("GM", "Gambia", "Africa", 13.4, -15.4),
+    ("GE", "Georgia", "Asia", 42.3, 43.4),
+    ("DE", "Germany", "Europe", 51.2, 10.5),
+    ("GH", "Ghana", "Africa", 7.9, -1.0),
+    ("GR", "Greece", "Europe", 39.1, 21.8),
+    ("GD", "Grenada", "Caribbean", 12.1, -61.7),
+    ("GT", "Guatemala", "Central America", 15.8, -90.2),
+    ("GN", "Guinea", "Africa", 9.9, -9.6),
+    ("GW", "Guinea-Bissau", "Africa", 11.8, -15.2),
+    ("GY", "Guyana", "South America", 4.9, -58.9),
+    ("HT", "Haiti", "Caribbean", 18.9, -72.3),
+    ("HN", "Honduras", "Central America", 15.2, -86.2),
+    ("HK", "Hong Kong", "Asia", 22.3, 114.2),
+    ("HU", "Hungary", "Europe", 47.2, 19.5),
+    ("IS", "Iceland", "Europe", 65.0, -18.6),
+    ("IN", "India", "Asia", 20.6, 79.0),
+    ("ID", "Indonesia", "Asia", -0.8, 113.9),
+    ("IR", "Iran", "Middle East", 32.4, 53.7),
+    ("IQ", "Iraq", "Middle East", 33.2, 43.7),
+    ("IE", "Ireland", "Europe", 53.4, -8.2),
+    ("IL", "Israel", "Middle East", 31.0, 34.9),
+    ("IT", "Italy", "Europe", 41.9, 12.6),
+    ("CI", "Ivory Coast", "Africa", 7.5, -5.5),
+    ("JM", "Jamaica", "Caribbean", 18.1, -77.3),
+    ("JP", "Japan", "Asia", 36.2, 138.3),
+    ("JO", "Jordan", "Middle East", 30.6, 36.2),
+    ("KZ", "Kazakhstan", "Asia", 48.0, 66.9),
+    ("KE", "Kenya", "Africa", -0.0, 37.9),
+    ("KI", "Kiribati", "Oceania", 1.9, -157.4),
+    ("XK", "Kosovo", "Europe", 42.6, 20.9),
+    ("KW", "Kuwait", "Middle East", 29.3, 47.5),
+    ("KG", "Kyrgyzstan", "Asia", 41.2, 74.8),
+    ("LA", "Laos", "Asia", 19.9, 102.5),
+    ("LV", "Latvia", "Europe", 56.9, 24.6),
+    ("LB", "Lebanon", "Middle East", 33.9, 35.9),
+    ("LS", "Lesotho", "Africa", -29.6, 28.2),
+    ("LR", "Liberia", "Africa", 6.4, -9.4),
+    ("LY", "Libya", "Africa", 26.3, 17.2),
+    ("LI", "Liechtenstein", "Europe", 47.2, 9.6),
+    ("LT", "Lithuania", "Europe", 55.2, 23.9),
+    ("LU", "Luxembourg", "Europe", 49.8, 6.1),
+    ("MO", "Macau", "Asia", 22.2, 113.5),
+    ("MG", "Madagascar", "Africa", -18.8, 46.9),
+    ("MW", "Malawi", "Africa", -13.3, 34.3),
+    ("MY", "Malaysia", "Asia", 4.2, 101.9),
+    ("MV", "Maldives", "Asia", 3.2, 73.2),
+    ("ML", "Mali", "Africa", 17.6, -4.0),
+    ("MT", "Malta", "Europe", 35.9, 14.4),
+    ("MR", "Mauritania", "Africa", 21.0, -10.9),
+    ("MU", "Mauritius", "Africa", -20.3, 57.6),
+    ("MX", "Mexico", "North America", 23.6, -102.6),
+    ("MD", "Moldova", "Europe", 47.4, 28.4),
+    ("MC", "Monaco", "Europe", 43.7, 7.4),
+    ("MN", "Mongolia", "Asia", 46.9, 103.8),
+    ("ME", "Montenegro", "Europe", 42.7, 19.4),
+    ("MA", "Morocco", "Africa", 31.8, -7.1),
+    ("MZ", "Mozambique", "Africa", -18.7, 35.5),
+    ("MM", "Myanmar", "Asia", 21.9, 95.9),
+    ("NA", "Namibia", "Africa", -22.9, 18.5),
+    ("NP", "Nepal", "Asia", 28.4, 84.1),
+    ("NL", "Netherlands", "Europe", 52.1, 5.3),
+    ("NZ", "New Zealand", "Oceania", -40.9, 174.9),
+    ("NI", "Nicaragua", "Central America", 12.9, -85.2),
+    ("NE", "Niger", "Africa", 17.6, 8.1),
+    ("NG", "Nigeria", "Africa", 9.1, 8.7),
+    ("KP", "North Korea", "Asia", 40.3, 127.5),
+    ("MK", "North Macedonia", "Europe", 41.6, 21.7),
+    ("NO", "Norway", "Europe", 60.5, 8.5),
+    ("OM", "Oman", "Middle East", 21.5, 55.9),
+    ("PK", "Pakistan", "Asia", 30.4, 69.3),
+    ("PS", "Palestine", "Middle East", 31.9, 35.2),
+    ("PA", "Panama", "Central America", 8.5, -80.8),
+    ("PG", "Papua New Guinea", "Oceania", -6.3, 143.9),
+    ("PY", "Paraguay", "South America", -23.4, -58.4),
+    ("PE", "Peru", "South America", -9.2, -75.0),
+    ("PH", "Philippines", "Asia", 12.9, 121.8),
+    ("PL", "Poland", "Europe", 51.9, 19.1),
+    ("PT", "Portugal", "Europe", 39.4, -8.2),
+    ("PR", "Puerto Rico", "Caribbean", 18.2, -66.6),
+    ("QA", "Qatar", "Middle East", 25.4, 51.2),
+    ("RO", "Romania", "Europe", 45.9, 24.9),
+    ("RU", "Russia", "Europe", 61.5, 105.3),
+    ("RW", "Rwanda", "Africa", -1.9, 29.9),
+    ("SA", "Saudi Arabia", "Middle East", 23.9, 45.1),
+    ("SN", "Senegal", "Africa", 14.5, -14.5),
+    ("RS", "Serbia", "Europe", 44.0, 21.0),
+    ("SC", "Seychelles", "Africa", -4.7, 55.5),
+    ("SL", "Sierra Leone", "Africa", 8.5, -11.8),
+    ("SG", "Singapore", "Asia", 1.4, 103.8),
+    ("SK", "Slovakia", "Europe", 48.7, 19.7),
+    ("SI", "Slovenia", "Europe", 46.2, 15.0),
+    ("SB", "Solomon Islands", "Oceania", -9.6, 160.2),
+    ("SO", "Somalia", "Africa", 5.2, 46.2),
+    ("ZA", "South Africa", "Africa", -30.6, 22.9),
+    ("KR", "South Korea", "Asia", 35.9, 127.8),
+    ("SS", "South Sudan", "Africa", 7.0, 30.9),
+    ("ES", "Spain", "Europe", 40.5, -3.7),
+    ("LK", "Sri Lanka", "Asia", 7.9, 80.8),
+    ("SD", "Sudan", "Africa", 15.5, 30.2),
+    ("SR", "Suriname", "South America", 3.9, -56.0),
+    ("SE", "Sweden", "Europe", 60.1, 18.6),
+    ("CH", "Switzerland", "Europe", 46.8, 8.2),
+    ("SY", "Syria", "Middle East", 34.8, 39.0),
+    ("TW", "Taiwan", "Asia", 23.7, 121.0),
+    ("TJ", "Tajikistan", "Asia", 38.9, 71.3),
+    ("TZ", "Tanzania", "Africa", -6.4, 34.9),
+    ("TH", "Thailand", "Asia", 15.9, 101.0),
+    ("TG", "Togo", "Africa", 8.6, 0.8),
+    ("TO", "Tonga", "Oceania", -21.2, -175.2),
+    ("TT", "Trinidad and Tobago", "Caribbean", 10.7, -61.2),
+    ("TN", "Tunisia", "Africa", 33.9, 9.5),
+    ("TR", "Turkey", "Middle East", 39.0, 35.2),
+    ("TM", "Turkmenistan", "Asia", 38.9, 59.6),
+    ("UG", "Uganda", "Africa", 1.4, 32.3),
+    ("UA", "Ukraine", "Europe", 48.4, 31.2),
+    ("AE", "United Arab Emirates", "Middle East", 23.4, 53.8),
+    ("GB", "United Kingdom", "Europe", 55.4, -3.4),
+    ("US", "United States", "North America", 39.8, -98.6),
+    ("UY", "Uruguay", "South America", -32.5, -55.8),
+    ("UZ", "Uzbekistan", "Asia", 41.4, 64.6),
+    ("VU", "Vanuatu", "Oceania", -15.4, 166.9),
+    ("VA", "Vatican City", "Europe", 41.9, 12.5),
+    ("VE", "Venezuela", "South America", 6.4, -66.6),
+    ("VN", "Vietnam", "Asia", 14.1, 108.3),
+    ("YE", "Yemen", "Middle East", 15.6, 48.5),
+    ("ZM", "Zambia", "Africa", -13.1, 27.9),
+    ("ZW", "Zimbabwe", "Africa", -19.0, 29.2),
+)
+
+_CS_BY_NAME = {_c[1]: _c for _c in _CS_COUNTRIES}
+_CS_COUNTRY_NAMES = tuple(sorted(_CS_BY_NAME)) + (_CS_GLOBAL,)
+_CS_REGIONS = tuple(sorted({_c[2] for _c in _CS_COUNTRIES})) + (_CS_GLOBAL,)
+_CS_PRE_SOURCES = ("Ready to Check", "Disposables", "Typos", "Skip previously valid",
+                   "App-Skipped", "Custom Filtered", "DNS Failed", "SMTP Failed")
+_CS_SOURCES = tuple(_CS_PRE_SOURCES) + tuple(_lbl for _lbl, _k in BUCKETS)
+_CS_BUCKET_MAP = {_lbl: _k for _lbl, _k in BUCKETS}
+_CS_PRE_MAP = {
+    "Ready to Check": lambda: clean_lines,
+    "Disposables": lambda: disp,
+    "Typos": lambda: typo,
+    "Skip previously valid": lambda: resume,
+    "App-Skipped": lambda: app_skip,
+    "Custom Filtered": lambda: custom_skipped,
+    "DNS Failed": lambda: dns_skipped,
+    "SMTP Failed": lambda: smtp_skipped,
+}
+
+
+def _cs_flag(country):
+    """The flag for a country, DERIVED from its code so none can be missing."""
+    _row = _CS_BY_NAME.get(country)
+    if not _row:
+        return _CS_GLOBAL_FLAG
+    return "".join(chr(0x1F1E6 + ord(_ch) - 65) for _ch in _row[0])
+
+
+def _cs_code(country):
+    _row = _CS_BY_NAME.get(country)
+    return _row[0] if _row else "GL"
+
+
+def _cs_region(country):
+    _row = _CS_BY_NAME.get(country)
+    return _row[2] if _row else _CS_GLOBAL
+
+
+def _cs_point(country):
+    _row = _CS_BY_NAME.get(country)
+    return (_row[3], _row[4]) if _row else None
+
+
+def _cs_path():
+    try:
+        return user_file(_CS_FILE_NAME)
+    except Exception:
+        return _CS_FILE_NAME
+
+
+def _cs_sel_path():
+    try:
+        return user_file(_CS_SEL_NAME)
+    except Exception:
+        return _CS_SEL_NAME
+
+
+def _cs_load_map():
+    """This user's taught map, cleaned. Anything unusable is dropped, not kept."""
+    _p = _cs_path()
+    if not os.path.exists(_p):
+        return {}
+    try:
+        with open(_p, encoding="utf-8") as _f:
+            _data = json.load(_f)
+    except Exception:
+        return {}
+    if not isinstance(_data, dict):
+        return {}
+    _out = {}
+    for _k, _v in _data.items():
+        _k = str(_k or "").lower().strip()
+        if not _k or not isinstance(_v, str):
+            continue
+        if _v in _CS_BY_NAME or _v == _CS_GLOBAL:
+            _out[_k] = _v
+    return _out
+
+
+def _cs_save_map(mapping):
+    try:
+        with file_write_lock:
+            _atomic_write_text(_cs_path(), json.dumps(mapping or {}, indent=1,
+                                                      sort_keys=True))
+    except Exception as _e:
+        warnings.warn(f"could not save {_CS_FILE_NAME}: {_e}")
+
+
+def _cs_save_sel():
+    try:
+        _payload = {"mode": str(str_lit.session_state.get("cs_mode") or "Domain"),
+                    "source": str(str_lit.session_state.get("cs_source")
+                                  or "Ready to Check"),
+                    "keys": list(str_lit.session_state.get("cs_keys") or []),
+                    "sent": bool(str_lit.session_state.get("cs_sent")),
+                    "saved_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
+        with file_write_lock:
+            _atomic_write_text(_cs_sel_path(), json.dumps(_payload, indent=1))
+    except Exception as _e:
+        warnings.warn(f"could not save {_CS_SEL_NAME}: {_e}")
+
+
+def _cs_country_of(domain, mapping):
+    """taught map, then the provider hints, then the TLD, then Global."""
+    _d = str(domain or "").lower().strip()
+    if not _d:
+        return _CS_GLOBAL
+    _hit = (mapping or {}).get(_d)
+    if _hit:
+        return _hit
+    if _d in DOMAIN_COUNTRY_HINTS:
+        return DOMAIN_COUNTRY_HINTS[_d]
+    for _part in reversed(_d.split(".")):
+        if _part in TLD_COUNTRY:
+            return TLD_COUNTRY[_part]
+    return _CS_GLOBAL
+
+
+def _cs_source_lines(source):
+    _fn = _CS_PRE_MAP.get(source)
+    if _fn is not None:
+        try:
+            return list(_fn() or [])
+        except Exception:
+            return []
+    _key = _CS_BUCKET_MAP.get(source)
+    if _key:
+        try:
+            return list(str_lit.session_state.get(_key) or [])
+        except Exception:
+            return []
+    return []
+
+
+def _cs_rows(source, mapping, ver):
+    """(line, domain, country, region) for every combo in `source`.
+
+    Cached on (source, line count, map version, owner): a 100,000-line Ready
+    list would otherwise be re-parsed on every rerun, and every slider tick is a
+    rerun.
+    """
+    _lines = _cs_source_lines(source)
+    _key = (source, len(_lines), int(ver), _input_owner)
+    _cache = str_lit.session_state.get("_cs_rows_cache") or {}
+    if _cache.get("key") == _key:
+        return list(_cache.get("rows") or [])
+    _out = []
+    for _line in _lines:
+        _combo = _combo_only(_line)
+        if ":" not in _combo:
+            continue
+        _em = _combo.split(":", 1)[0].strip().lower()
+        if "@" not in _em:
+            continue
+        _dom = _em.split("@")[-1].strip()
+        if not _dom:
+            continue
+        _ctry = _cs_country_of(_dom, mapping)
+        _out.append((_line, _dom, _ctry, _cs_region(_ctry)))
+    str_lit.session_state["_cs_rows_cache"] = {"key": _key, "rows": _out}
+    return list(_out)
+
+
+def _cs_groups(rows, mode):
+    _g = {}
+    for _line, _dom, _ctry, _reg in rows:
+        _k = _dom if mode == "Domain" else (_ctry if mode == "Country" else _reg)
+        _g.setdefault(_k, []).append(_line)
+    return _g
+
+
+def _cs_key_label(key, mode):
+    _k = str(key or "")
+    if mode == "Country":
+        return _cs_flag(_k) + " " + _cs_code(_k)
+    if mode == "Region":
+        return (_CS_GLOBAL_FLAG + " Global") if _k == _CS_GLOBAL else _k
+    return _k
+
+
+def _cs_build_label(keys, mode):
+    _parts = [_cs_key_label(_k, mode) for _k in keys if _k]
+    if not _parts:
+        return ""
+    if len(_parts) == 1:
+        return _CS_MARK + " " + _parts[0]
+    return _CS_MARK + " " + ", ".join(_parts[:-1]) + " and " + _parts[-1]
+
+
+def _cs_label():
+    """The ONE section label, or "" when nothing has been sent.
+
+    Rebuilt from the keys every run, so a bucket a new run emptied cannot leave
+    a dead label sitting in either dropdown.
+    """
+    try:
+        if not str_lit.session_state.get("cs_sent"):
+            return ""
+        _mode = str(str_lit.session_state.get("cs_mode") or "Domain")
+        _keys = [str(_k) for _k in (str_lit.session_state.get("cs_keys") or []) if _k]
+    except Exception:
+        return ""
+    if _mode not in _CS_MODES or not _keys:
+        return ""
+    return _cs_build_label(_keys, _mode)
+
+
+def _cs_selection_lines():
+    """The sent section as display lines: a header per group, then its combos."""
+    _lbl = _cs_label()
+    if not _lbl:
+        return []
+    _mode = str(str_lit.session_state.get("cs_mode") or "Domain")
+    _source = str(str_lit.session_state.get("cs_source") or "Ready to Check")
+    _mapping = str_lit.session_state.get("cs_map") or {}
+    _ver = int(str_lit.session_state.get("cs_map_ver") or 0)
+    _groups = _cs_groups(_cs_rows(_source, _mapping, _ver), _mode)
+    _keys = [str(_k) for _k in (str_lit.session_state.get("cs_keys") or []) if _k]
+    _order = sorted((_k for _k in _keys if _k in _groups),
+                    key=lambda _k: (_k == _CS_GLOBAL, str(_k).lower()))
+    _out = []
+    for _k in _order:
+        _out.append(("—" * 12) + str(_k) + ("—" * 12))
+        _out.extend(_groups[_k])
+    return _out
+
+
+def _cs_selection_combos():
+    """The same section, combos only - what the engine actually runs."""
+    return [_combo_only(_l) for _l in _cs_selection_lines() if ":" in _l]
+
+
+def _cs_on_mode_change():
+    str_lit.session_state["cs_keys"] = []
+    str_lit.session_state["cs_sent"] = False
+    _cs_save_sel()
+
+
+def _cs_on_pick_change():
+    str_lit.session_state["cs_sent"] = False
+
+
+# ---- owner gate, one-time load, and the map in the session -------------------
+_cs_owner = _cache_owner()
+if str_lit.session_state.get(_CS_OWNER_KEY) != _cs_owner:
+    for _k in ("cs_mode", "cs_source", "cs_keys", "cs_sent", "cs_map", "cs_map_ver",
+               "cs_teach_dom", "cs_teach_ctry", "cs_map_open", "_cs_sel_loaded",
+               "_cs_rows_cache", "_cs_flash", "cs_hide_empty"):
+        str_lit.session_state.pop(_k, None)
+    str_lit.session_state[_CS_OWNER_KEY] = _cs_owner
+if "cs_map" not in str_lit.session_state:
+    str_lit.session_state["cs_map"] = _cs_load_map()
+if "cs_map_ver" not in str_lit.session_state:
+    str_lit.session_state["cs_map_ver"] = 0
+if not str_lit.session_state.get("_cs_sel_loaded"):
+    str_lit.session_state["_cs_sel_loaded"] = True
+    _saved = {}
+    try:
+        if os.path.exists(_cs_sel_path()):
+            with open(_cs_sel_path(), encoding="utf-8") as _sf:
+                _saved = json.load(_sf) or {}
+    except Exception:
+        _saved = {}
+    if isinstance(_saved, dict):
+        _m = str(_saved.get("mode") or "")
+        _s = str(_saved.get("source") or "")
+        _k = _saved.get("keys")
+        str_lit.session_state["cs_mode"] = _m if _m in _CS_MODES else "Domain"
+        str_lit.session_state["cs_source"] = _s if _s in _CS_SOURCES else "Ready to Check"
+        str_lit.session_state["cs_keys"] = [_str for _str in (k for k in (_k or [])
+                                                             if isinstance(k, str))]
+        str_lit.session_state["cs_sent"] = bool(_saved.get("sent"))
+if str_lit.session_state.get("cs_mode") not in _CS_MODES:
+    str_lit.session_state["cs_mode"] = "Domain"
+if str_lit.session_state.get("cs_source") not in _CS_SOURCES:
+    str_lit.session_state["cs_source"] = "Ready to Check"
+if not isinstance(str_lit.session_state.get("cs_keys"), list):
+    str_lit.session_state["cs_keys"] = []
+if "cs_teach_ctry" not in str_lit.session_state \
+        or str_lit.session_state.get("cs_teach_ctry") not in _CS_COUNTRY_NAMES:
+    str_lit.session_state["cs_teach_ctry"] = _CS_COUNTRY_NAMES[0]
+
+section_title("🗂", "Credentials Sorter",
+              "group the queue by domain, country or region - then send one "
+              "section to the Inspector and the Engine Action Mode")
+
+_cs_flash = str_lit.session_state.pop("_cs_flash", None)
+if _cs_flash:
+    getattr(str_lit, _cs_flash[0], str_lit.info)(_cs_flash[1])
+
+_cs_mode = str_lit.session_state["cs_mode"]
+_cs_source = str_lit.session_state["cs_source"]
+_cs_map = dict(str_lit.session_state.get("cs_map") or {})
+_cs_ver = int(str_lit.session_state.get("cs_map_ver") or 0)
+_cs_all_rows = _cs_rows(_cs_source, _cs_map, _cs_ver)
+_cs_groups_now = _cs_groups(_cs_all_rows, _cs_mode)
+_cs_options = sorted(_cs_groups_now,
+                     key=lambda _k: (_k == _CS_GLOBAL, str(_k).lower()))
+
+_cs_kept = [_k for _k in (str_lit.session_state.get("cs_keys") or [])
+            if _k in _cs_groups_now]
+if _cs_kept != list(str_lit.session_state.get("cs_keys") or []):
+    str_lit.session_state["cs_keys"] = _cs_kept
+
+_cs_m1, _cs_m2 = str_lit.columns(2)
+with _cs_m1:
+    str_lit.selectbox("Group by", list(_CS_MODES), key="cs_mode",
+                      on_change=_cs_on_mode_change,
+                      help="Domain groups by the part after the @. Country groups "
+                           "by the country the domain is taught, hinted or TLD-"
+                           "resolved to, with everything unresolved under Global. "
+                           "Region groups those countries by continent.")
+with _cs_m2:
+    str_lit.selectbox("Sort credentials from", list(_CS_SOURCES), key="cs_source",
+                      on_change=_cs_on_mode_change,
+                      help="Ready to Check is the queue a run would use. The other "
+                           "entries let you sort a pre-filter bucket or a finished "
+                           "result bucket.")
+
+_cs_total = len(_cs_all_rows)
+_cs_unresolved = sum(1 for _r in _cs_all_rows if _r[2] == _CS_GLOBAL)
+str_lit.caption(
+    f"**{_cs_total}** credential line(s) in *{_cs_source}* across "
+    f"**{len(_cs_groups_now)}** group(s). **{_cs_unresolved}** line(s) have no "
+    f"country yet and sit under **{_CS_GLOBAL_FLAG} Global** - teach them below or "
+    f"press auto-assign. Nothing here re-checks or re-filters an account.")
+
+if not _cs_total:
+    str_lit.info("That source is empty. Paste combos above, or pick another source.")
+else:
+    _cs_picked = str_lit.multiselect(
+        "Pick groups to send", _cs_options, key="cs_keys",
+        on_change=_cs_on_pick_change,
+        format_func=lambda _k, _m=_cs_mode: _cs_key_label(_k, _m),
+        help="Several are allowed. The sent section names them as one line, e.g. "
+             "US, CA, DE and Global, and runs exactly those accounts.")
+    _cs_b1, _cs_b2, _cs_b3 = str_lit.columns(3)
+    with _cs_b1:
+        if str_lit.button("➡️ Send selection", width="stretch", type="primary"):
+            if not _cs_picked:
+                str_lit.session_state["_cs_flash"] = (
+                    "warning", "Nothing picked - tick at least one group first.")
+            else:
+                _cs_lbl = _cs_build_label(_cs_picked, _cs_mode)
+                _n = sum(len(_cs_groups_now[_k]) for _k in _cs_picked)
+                str_lit.session_state["cs_sent"] = True
+                _cs_save_sel()
+                str_lit.session_state["_cs_flash"] = (
+                    "success", f"Sent **{_n}** account(s) as **{_cs_lbl}** - it is "
+                               f"now one entry in the Inspector and in the Engine "
+                               f"Action Mode.")
+            str_lit.rerun()
+    with _cs_b2:
+        if str_lit.button("🧽 Clear selection", width="stretch"):
+            str_lit.session_state["cs_keys"] = []
+            str_lit.session_state["cs_sent"] = False
+            _cs_save_sel()
+            str_lit.session_state["_cs_flash"] = ("success", "Selection cleared.")
+            str_lit.rerun()
+    with _cs_b3:
+        if str_lit.button("🌍 Auto-assign from the rows", width="stretch",
+                          help="Fills a country for every domain the built-in "
+                               "provider hints or the TLD table can answer for. "
+                               "Domains already taught are left alone; the rest "
+                               "stay under Global."):
+            _m = dict(_cs_map)
+            _added = 0
+            for _dom in sorted({_r[1] for _r in _cs_all_rows}):
+                if _dom in _m:
+                    continue
+                _c = _cs_country_of(_dom, {})
+                if _c != _CS_GLOBAL:
+                    _m[_dom] = _c
+                    _added += 1
+            if _added:
+                str_lit.session_state["cs_map"] = _m
+                str_lit.session_state["cs_map_ver"] = _cs_ver + 1
+                _cs_save_map(_m)
+                str_lit.session_state["_cs_flash"] = (
+                    "success", f"Assigned **{_added}** domain(s) from the hints and "
+                               f"TLDs. **{len(_cs_map)}** teaching(s) stored before, "
+                               f"**{len(_m)}** now.")
+            else:
+                str_lit.session_state["_cs_flash"] = (
+                    "warning", "Nothing new to assign - every answerable domain is "
+                               "already taught.")
+            str_lit.rerun()
+
+    if _cs_label():
+        str_lit.caption(f"Sent section: **{_cs_label()}** - "
+                        f"**{len(_cs_selection_combos())}** account(s). It is listed "
+                        f"in the Inspector below and in the Engine Action Mode.")
+
+# ---- teach one domain -------------------------------------------------------
+with str_lit.expander("🏷 Teach a domain its country", expanded=False):
+    str_lit.caption("The domain is matched exactly, lower-cased, and only for THIS "
+                    "user. A taught domain always wins over the hints and the TLD, "
+                    "and Global is a real answer, not a blank.")
+    _cs_t1, _cs_t2 = str_lit.columns([0.55, 0.45])
+    with _cs_t1:
+        _cs_teach_dom = str_lit.text_input("Domain (e.g. example.com)",
+                                           key="cs_teach_dom",
+                                           placeholder="example.com")
+    with _cs_t2:
+        _cs_teach_ctry = str_lit.selectbox("Country", list(_CS_COUNTRY_NAMES),
+                                           key="cs_teach_ctry")
+    _cs_tb1, _cs_tb2 = str_lit.columns(2)
+    with _cs_tb1:
+        if str_lit.button("💾 Save this domain's country", width="stretch"):
+            _dom = str(_cs_teach_dom or "").lower().strip().lstrip("@")
+            if not _dom or "." not in _dom or " " in _dom:
+                str_lit.session_state["_cs_flash"] = (
+                    "warning", "That is not a domain - it needs a dot and no spaces.")
+            else:
+                _m = dict(_cs_map)
+                _m[_dom] = _cs_teach_ctry
+                str_lit.session_state["cs_map"] = _m
+                str_lit.session_state["cs_map_ver"] = _cs_ver + 1
+                _cs_save_map(_m)
+                str_lit.session_state["_cs_flash"] = (
+                    "success", f"**{_dom}** is now **{_cs_flag(_cs_teach_ctry)} "
+                               f"{_cs_teach_ctry}**.")
+            str_lit.rerun()
+    with _cs_tb2:
+        if str_lit.button("🧽 Forget this domain", width="stretch",
+                          help="Drops the teaching, so the domain falls back to the "
+                               "hints, the TLD and then Global."):
+            _dom = str(_cs_teach_dom or "").lower().strip().lstrip("@")
+            _m = dict(_cs_map)
+            if _dom in _m:
+                _m.pop(_dom, None)
+                str_lit.session_state["cs_map"] = _m
+                str_lit.session_state["cs_map_ver"] = _cs_ver + 1
+                _cs_save_map(_m)
+                str_lit.session_state["_cs_flash"] = (
+                    "success", f"Forgot the teaching for **{_dom}**.")
+            else:
+                str_lit.session_state["_cs_flash"] = (
+                    "warning", f"**{_dom or '(no domain)'}** had no teaching.")
+            str_lit.rerun()
+
+# ---- the map ---------------------------------------------------------------
+if str_lit.checkbox("🗺 Show and edit the country map", key="cs_map_open"):
+    _cs_counts = defaultdict(int)
+    for _r in _cs_all_rows:
+        _cs_counts[_r[2]] += 1
+    _cs_markers = []
+    for _ctry, _n in _cs_counts.items():
+        _pt = _cs_point(_ctry)
+        if not _pt:
+            continue
+        _cs_markers.append({"lat": _pt[0], "lon": _pt[1], "size": _n,
+                            "color": "#8b5cf6", "country": _ctry,
+                            "lines": _n})
+    if _cs_markers:
+        str_lit.map(pd.DataFrame(_cs_markers), latitude="lat", longitude="lon",
+                    color="color", size="size",
+                    help="One marker per country that has credentials in this "
+                         "source. Marker size is the line count.")
+    else:
+        str_lit.caption("No country has credentials in this source yet, so there is "
+                        "nothing to place. Teach a domain below or press "
+                        "auto-assign.")
+    if _cs_counts.get(_CS_GLOBAL):
+        str_lit.caption(f"{_CS_GLOBAL_FLAG} **Global** holds **"
+                        f"{_cs_counts[_CS_GLOBAL]}** line(s) and has no point on a "
+                        f"map - it is the bucket for every domain with no country.")
+
+    _cs_geo_rows = [{"Flag": _cs_flag(_c), "Country": _c, "Region": _cs_region(_c),
+                     "Lines": _n}
+                    for _c, _n in sorted(_cs_counts.items(),
+                                         key=lambda _kv: (-_kv[1], _kv[0]))]
+    if _cs_geo_rows:
+        str_lit.dataframe(pd.DataFrame(_cs_geo_rows), width="stretch",
+                          hide_index=True)
+
+    str_lit.markdown("##### ✏️ Edit the map")
+    _cs_domains = sorted({_r[1] for _r in _cs_all_rows})
+    if _cs_domains:
+        _cs_edit_dom = str_lit.selectbox(
+            "Domain to re-assign", _cs_domains, key="cs_edit_dom",
+            help="Every domain in the current source, with the country it "
+                 "currently resolves to.")
+        str_lit.caption(f"That domain currently resolves to "
+                        f"**{_cs_flag(_cs_country_of(_cs_edit_dom, _cs_map))} "
+                        f"{_cs_country_of(_cs_edit_dom, _cs_map)}**.")
+        _cs_e1, _cs_e2 = str_lit.columns(2)
+        with _cs_e1:
+            _cs_edit_ctry = str_lit.selectbox(
+                "Move it to", list(_CS_COUNTRY_NAMES), key="cs_edit_ctry",
+                index=list(_CS_COUNTRY_NAMES).index(
+                    _cs_country_of(_cs_edit_dom, _cs_map)))
+        with _cs_e2:
+            str_lit.caption("")
+            if str_lit.button("💾 Move it", width="stretch"):
+                _m = dict(_cs_map)
+                _m[str(_cs_edit_dom).lower()] = _cs_edit_ctry
+                str_lit.session_state["cs_map"] = _m
+                str_lit.session_state["cs_map_ver"] = _cs_ver + 1
+                _cs_save_map(_m)
+                str_lit.session_state["_cs_flash"] = (
+                    "success", f"Moved **{_cs_edit_dom}** to "
+                               f"**{_cs_flag(_cs_edit_ctry)} {_cs_edit_ctry}**.")
+                str_lit.rerun()
+    else:
+        str_lit.caption("No domains in this source to move.")
+
+    if _cs_map:
+        with str_lit.expander(f"📌 Taught domains ({len(_cs_map)})", expanded=False):
+            _cs_taught = [{"Domain": _d, "Country": f"{_cs_flag(_c)} {_c}"}
+                          for _d, _c in sorted(_cs_map.items())]
+            str_lit.dataframe(pd.DataFrame(_cs_taught), width="stretch",
+                              hide_index=True, height=240)
+    else:
+        str_lit.caption("Nothing taught yet - every country above came from the "
+                        "built-in hints and TLDs.")
+
 # --------------------------------------------------------------------------
 # INSPECTOR - v13.63, re-cut v13.76, v13.77
 #
@@ -13342,8 +14090,16 @@ def kw_drain(wait=0.0):
 # 3000 entries apiece for a panel nobody had opened. FIX INSPECT-4: the
 # `if not filter_category_choice:` branch was dead - a selectbox always returns
 # one of its options - so it is gone.
+#
+# v13.86 FIX CS-1: the sent Credentials Sorter section is a category here like
+# any other, but it is NOT a flat list - it is a header line per group followed
+# by that group's combos, which is exactly the shape asked for. A header has no
+# colon, so _combo_only() passes it through untouched and the same list feeds
+# the download.
 # --------------------------------------------------------------------------
 inspect_options = list(PREFILTER_LABELS) + [label for label, _ in BUCKETS]
+if _cs_label():
+    inspect_options.append(_cs_label())
 
 if "bb_inspect_cat" not in str_lit.session_state:
     str_lit.session_state["bb_inspect_cat"] = _read_text_file(_INSPECT_FILE, 200).strip()
@@ -13385,6 +14141,10 @@ if str_lit.checkbox("🔍 Inspect the contents of one category",
     }
     for _b_lbl, _b_key in BUCKETS:
         category_map[_b_lbl] = list(str_lit.session_state.get(_b_key, []))
+    # FIX CS-1: the sent sorter section, headers included.
+    _cs_lbl_now = _cs_label()
+    if _cs_lbl_now:
+        category_map[_cs_lbl_now] = _cs_selection_lines()
 
     if unfinished_runs:
         _r0 = unfinished_runs[0]
@@ -13398,17 +14158,18 @@ if str_lit.checkbox("🔍 Inspect the contents of one category",
     else:
         # FIX COMBO-2: combo only, on screen AND in the download.
         _clean_items = [_combo_only(i) for i in selected_list_items]
+        _cs_combo_n = sum(1 for _i in _clean_items if ":" in _i)
         _ih1, _ih2 = str_lit.columns([0.6, 0.4])
         with _ih1:
-            str_lit.info(f"Showing **{len(_clean_items)}** items for "
+            str_lit.info(f"Showing **{_cs_combo_n}** items for "
                          f"**{filter_category_choice}** - the box scrolls, the page "
                          f"does not grow.")
         with _ih2:
             _safe_cat = _insp_safe(filter_category_choice)
             str_lit.download_button(
-                f"⬇️ Download all {len(_clean_items)}",
+                f"⬇️ Download all {_cs_combo_n}",
                 data="\n".join(_clean_items).encode("utf-8"),
-                file_name=f"{_safe_cat}_{len(_clean_items)}.txt",
+                file_name=f"{_safe_cat}_{_cs_combo_n}.txt",
                 mime="text/plain", width="stretch", key=f"inspdl_{_safe_cat}")
         with str_lit.container(height=420):
             str_lit.code("\n".join(_clean_items), language="text")
@@ -15862,7 +16623,11 @@ if _AI is not None:
                          daemon=True, name="ai-drain").start()
 
 RESULT_ACTION_MODES = BUCKETS
-ACTION_OPTIONS = list(PREFILTER_LABELS) + [label for label, _ in BUCKETS]
+# v13.86 FIX CS-2: the sent Credentials Sorter section is ONE extra option, and
+# only while something is actually sent. _cs_label() rebuilds it from the keys
+# every run, so a bucket a new run emptied cannot leave a dead label behind.
+ACTION_OPTIONS = (list(PREFILTER_LABELS) + [label for label, _ in BUCKETS]
+                  + ([_cs_label()] if _cs_label() else []))
 
 # v13.71: THE SELECTOR SITS BETWEEN THE HEADING AND THE BUTTONS. It used to be
 # squeezed into a 0.35 column beside Start/Stop, so on a phone the thing that
@@ -15873,7 +16638,8 @@ engine_action_mode = str_lit.selectbox(
     "Engine Action Mode:", options=ACTION_OPTIONS,
     key="bb_action_mode",
     help="Pick a pre-filter bucket (SMTP Failed sits right after DNS Failed) or a "
-         "previous result bucket to re-run."
+         "previous result bucket to re-run. A section sent from the Credentials "
+         "Sorter appears here as ONE entry and runs exactly the accounts you sent."
 )
 if engine_action_mode == "Resume Unfinished":
     # runstate.summary() reads the watchdog record, so this is the truth about
@@ -16277,6 +17043,11 @@ if start_engine_btn:
         category_queue_map[engine_action_mode] = [
             _raw_of(x) for x in str_lit.session_state.get(_label_to_key[engine_action_mode], [])
         ]
+    # FIX CS-2: the sent sorter section, combos only - _cs_selection_combos()
+    # already cuts each line at "|" and drops the group headers.
+    _cs_run_lbl = _cs_label()
+    if _cs_run_lbl:
+        category_queue_map[_cs_run_lbl] = _cs_selection_combos()
 
     accounts_to_check = category_queue_map.get(engine_action_mode, [])
 
