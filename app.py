@@ -13739,6 +13739,27 @@ def _cs_source_lines(source):
     return []
 
 
+def _cs_source_count(source):
+    """How many lines a source holds, WITHOUT copying it.
+
+    Used only for the count on each option, so it must stay cheap - a 3000-line
+    bucket is len()'d in place rather than copied once per rerun.
+    """
+    _fn = _CS_PRE_MAP.get(source)
+    if _fn is not None:
+        try:
+            return len(_fn() or [])
+        except Exception:
+            return 0
+    _key = _CS_BUCKET_MAP.get(source)
+    if _key:
+        try:
+            return len(str_lit.session_state.get(_key) or [])
+        except Exception:
+            return 0
+    return 0
+
+
 def _cs_rows(source, mapping, ver):
     """(line, domain, country, region) for every combo in `source`.
 
@@ -13851,8 +13872,9 @@ def _cs_on_pick_change():
 _cs_owner = _cache_owner()
 if str_lit.session_state.get(_CS_OWNER_KEY) != _cs_owner:
     for _k in ("cs_mode", "cs_source", "cs_keys", "cs_sent", "cs_map", "cs_map_ver",
-               "cs_teach_dom", "cs_teach_ctry", "cs_map_open", "_cs_sel_loaded",
-               "_cs_rows_cache", "_cs_flash", "cs_hide_empty"):
+               "cs_teach_dom", "cs_teach_ctry", "cs_map_open", "cs_edit_dom",
+               "cs_edit_ctry", "_cs_edit_for", "_cs_sel_loaded", "_cs_rows_cache",
+               "_cs_flash", "cs_hide_empty"):
         str_lit.session_state.pop(_k, None)
     str_lit.session_state[_CS_OWNER_KEY] = _cs_owner
 if "cs_map" not in str_lit.session_state:
@@ -13911,18 +13933,21 @@ if _cs_kept != list(str_lit.session_state.get("cs_keys") or []):
 
 _cs_m1, _cs_m2 = str_lit.columns(2)
 with _cs_m1:
-    str_lit.selectbox("Group by", list(_CS_MODES), key="cs_mode",
+    str_lit.selectbox(f"Group by ({len(_CS_MODES)} modes)", list(_CS_MODES),
+                      key="cs_mode",
                       on_change=_cs_on_mode_change,
                       help="Domain groups by the part after the @. Country groups "
                            "by the country the domain is taught, hinted or TLD-"
                            "resolved to, with everything unresolved under Global. "
                            "Region groups those countries by continent.")
 with _cs_m2:
-    str_lit.selectbox("Sort credentials from", list(_CS_SOURCES), key="cs_source",
+    str_lit.selectbox(f"Sort credentials from ({len(_CS_SOURCES)} sources)",
+                      list(_CS_SOURCES), key="cs_source",
                       on_change=_cs_on_mode_change,
+                      format_func=lambda _s: "%s (%d)" % (_s, _cs_source_count(_s)),
                       help="Ready to Check is the queue a run would use. The other "
                            "entries let you sort a pre-filter bucket or a finished "
-                           "result bucket.")
+                           "result bucket. The number beside each is its line count.")
 
 _cs_total = len(_cs_all_rows)
 _cs_unresolved = sum(1 for _r in _cs_all_rows if _r[2] == _CS_GLOBAL)
@@ -13936,10 +13961,13 @@ if not _cs_total:
     str_lit.info("That source is empty. Paste combos above, or pick another source.")
 else:
     _cs_picked = str_lit.multiselect(
-        "Pick groups to send", _cs_options, key="cs_keys",
+        f"Pick groups to send ({len(_cs_options)} group(s) · {_cs_total} line(s))",
+        _cs_options, key="cs_keys",
         on_change=_cs_on_pick_change,
-        format_func=lambda _k, _m=_cs_mode: _cs_key_label(_k, _m),
-        help="Several are allowed. The sent section names them as one line, e.g. "
+        format_func=lambda _k, _m=_cs_mode: "%s (%d)"
+        % (_cs_key_label(_k, _m), len(_cs_groups_now.get(_k, []))),
+        help="Several are allowed. The number beside each group is how many "
+             "accounts it holds. The sent section names them as one line, e.g. "
              "US, CA, DE and Global, and runs exactly those accounts.")
     _cs_b1, _cs_b2, _cs_b3 = str_lit.columns(3)
     with _cs_b1:
@@ -14009,8 +14037,9 @@ with str_lit.expander("🏷 Teach a domain its country", expanded=False):
                                            key="cs_teach_dom",
                                            placeholder="example.com")
     with _cs_t2:
-        _cs_teach_ctry = str_lit.selectbox("Country", list(_CS_COUNTRY_NAMES),
-                                           key="cs_teach_ctry")
+        _cs_teach_ctry = str_lit.selectbox(
+            f"Country ({len(_CS_COUNTRY_NAMES)} options)",
+            list(_CS_COUNTRY_NAMES), key="cs_teach_ctry")
     _cs_tb1, _cs_tb2 = str_lit.columns(2)
     with _cs_tb1:
         if str_lit.button("💾 Save this domain's country", width="stretch"):
@@ -14047,7 +14076,10 @@ with str_lit.expander("🏷 Teach a domain its country", expanded=False):
             str_lit.rerun()
 
 # ---- the map ---------------------------------------------------------------
-if str_lit.checkbox("🗺 Show and edit the country map", key="cs_map_open"):
+_cs_map_on = str_lit.checkbox(
+    f"🗺 Show and edit the country map ({len(_cs_groups_now)} group(s) · "
+    f"{_cs_total} line(s))", key="cs_map_open")
+if _cs_map_on:
     _cs_counts = defaultdict(int)
     for _r in _cs_all_rows:
         _cs_counts[_r[2]] += 1
@@ -14060,10 +14092,21 @@ if str_lit.checkbox("🗺 Show and edit the country map", key="cs_map_open"):
                             "color": "#8b5cf6", "country": _ctry,
                             "lines": _n})
     if _cs_markers:
-        str_lit.map(pd.DataFrame(_cs_markers), latitude="lat", longitude="lon",
-                    color="color", size="size",
-                    help="One marker per country that has credentials in this "
-                         "source. Marker size is the line count.")
+        # FIX CS-MAP-1: st.map() has no help= keyword - passing one raised
+        # TypeError: MapMixin.map() got an unexpected keyword argument 'help' and
+        # took the whole panel down the instant it was ticked. The text is a
+        # caption now, and the call itself is guarded so a map failure degrades to
+        # the table below instead of a red page.
+        str_lit.caption("One marker per country that has credentials in this source. "
+                        "Marker size is the line count. The table below carries the "
+                        "same figures, and Global - which has no point on a map - is "
+                        "reported under it.")
+        try:
+            str_lit.map(pd.DataFrame(_cs_markers), latitude="lat", longitude="lon",
+                        color="color", size="size")
+        except Exception as _cs_map_err:
+            str_lit.caption(f"map unavailable ({_cs_map_err}) - the table below carries "
+                            f"the same figures.")
     else:
         str_lit.caption("No country has credentials in this source yet, so there is "
                         "nothing to place. Teach a domain below or press "
@@ -14084,19 +14127,35 @@ if str_lit.checkbox("🗺 Show and edit the country map", key="cs_map_open"):
     str_lit.markdown("##### ✏️ Edit the map")
     _cs_domains = sorted({_r[1] for _r in _cs_all_rows})
     if _cs_domains:
+        # FIX CS-MAP-2: A KEYED SELECTBOX RAISES IF ITS VALUE IS NOT AN OPTION.
+        # cs_edit_dom could hold a domain the current source no longer contains
+        # (switch source, or a run empties the bucket) and the panel died at
+        # creation. The key is made legal BEFORE the widget exists.
+        if str_lit.session_state.get("cs_edit_dom") not in _cs_domains:
+            str_lit.session_state["cs_edit_dom"] = _cs_domains[0]
         _cs_edit_dom = str_lit.selectbox(
-            "Domain to re-assign", _cs_domains, key="cs_edit_dom",
+            f"Domain to re-assign ({len(_cs_domains)})", _cs_domains,
+            key="cs_edit_dom",
             help="Every domain in the current source, with the country it "
                  "currently resolves to.")
+        _cs_edit_cur = _cs_country_of(_cs_edit_dom, _cs_map)
         str_lit.caption(f"That domain currently resolves to "
-                        f"**{_cs_flag(_cs_country_of(_cs_edit_dom, _cs_map))} "
-                        f"{_cs_country_of(_cs_edit_dom, _cs_map)}**.")
+                        f"**{_cs_flag(_cs_edit_cur)} {_cs_edit_cur}**.")
+        # FIX CS-MAP-3: the "Move it to" box used index= computed from the picked
+        # domain, and a keyed selectbox that ALSO gets a default keeps the value
+        # already in the key - so once it held one country it stopped following
+        # the domain and "Move it" wrote the wrong country. The key is seeded from
+        # the domain (and re-seeded whenever the domain changes or the stored
+        # value is not a real country), and the widget is created with key= only.
+        if (str_lit.session_state.get("_cs_edit_for") != _cs_edit_dom
+                or str_lit.session_state.get("cs_edit_ctry") not in _CS_COUNTRY_NAMES):
+            str_lit.session_state["cs_edit_ctry"] = _cs_edit_cur
+            str_lit.session_state["_cs_edit_for"] = _cs_edit_dom
         _cs_e1, _cs_e2 = str_lit.columns(2)
         with _cs_e1:
             _cs_edit_ctry = str_lit.selectbox(
-                "Move it to", list(_CS_COUNTRY_NAMES), key="cs_edit_ctry",
-                index=list(_CS_COUNTRY_NAMES).index(
-                    _cs_country_of(_cs_edit_dom, _cs_map)))
+                f"Move it to ({len(_CS_COUNTRY_NAMES)} options)",
+                list(_CS_COUNTRY_NAMES), key="cs_edit_ctry")
         with _cs_e2:
             str_lit.caption("")
             if str_lit.button("💾 Move it", width="stretch"):
@@ -14159,6 +14218,11 @@ if str_lit.checkbox("🗺 Show and edit the country map", key="cs_map_open"):
 # by that group's combos, which is exactly the shape asked for. A header has no
 # colon, so _combo_only() passes it through untouched and the same list feeds
 # the download.
+#
+# v13.86 FIX CS-3: THE CATEGORY COUNTS. The selectbox carries every category with
+# its item count in the dropdown, and the count of the CURRENT pick in its own
+# label, so the size of a category is visible before it is opened. That means the
+# map is built ABOVE the widget now, which is legal inside the checkbox.
 # --------------------------------------------------------------------------
 inspect_options = list(PREFILTER_LABELS) + [label for label, _ in BUCKETS]
 if _cs_label():
@@ -14179,10 +14243,6 @@ section_title("🔍", "Filter & Result Categories Inspector",
 
 if str_lit.checkbox("🔍 Inspect the contents of one category",
                     key="bb_inspect_open"):
-    filter_category_choice = str_lit.selectbox(
-        "Select category to inspect contents:", options=inspect_options,
-        key="bb_inspect_cat", on_change=_on_inspect_change)
-
     # FIX RS-3: the preview used to append a metadata line per run into the SAME
     # list as the account lines, so "Showing N items" counted headers too. The
     # metadata is a caption now and the list holds account lines only.
@@ -14208,6 +14268,16 @@ if str_lit.checkbox("🔍 Inspect the contents of one category",
     _cs_lbl_now = _cs_label()
     if _cs_lbl_now:
         category_map[_cs_lbl_now] = _cs_selection_lines()
+    # FIX CS-3: the count of every category, taken once, for the dropdown and the
+    # label. len() only - nothing is copied again here.
+    _insp_counts = {_l: len(_v or []) for _l, _v in category_map.items()}
+    _insp_cur_n = _insp_counts.get(str_lit.session_state.get("bb_inspect_cat"), 0)
+
+    filter_category_choice = str_lit.selectbox(
+        f"Select category to inspect contents: ({_insp_cur_n} item(s) in the "
+        f"current pick)", options=inspect_options,
+        key="bb_inspect_cat", on_change=_on_inspect_change,
+        format_func=lambda _l: "%s (%d)" % (_l, _insp_counts.get(_l, 0)))
 
     if unfinished_runs:
         _r0 = unfinished_runs[0]
