@@ -1421,31 +1421,297 @@ WEB_ONLY_HOSTS = {
     "secure.optimum.net",
 }
 
+# ==========================================================================
+# DOMAIN POSITIONING
+#
+# One row per domain and the country it belongs to. This table does TWO things:
+# it puts the domain under that country in the Credentials Sorter (block 087),
+# and it is what tld_country() answers for GEO_CALL (block 052) - so a row here
+# also lets GEO_CALL prefer a proxy in the account's own country.
+#
+# PRECEDENCE, highest first, and every step of it is deliberate:
+#   1. a domain TAUGHT in the sorter  (this user's domain_countries.json)
+#   2. a GENERIC provider root        (_CS_PROVIDERS, block 087) -> "Global providers"
+#   3. THIS TABLE
+#   4. the TLD                        (TLD_COUNTRY, block 052)
+#   5. Global
+#
+# Step 2 is why gmail.com, outlook.com, yahoo.com, aol.com, icloud.com, gmx.net,
+# mail.com, zoho.com and the rest are NOT positioned here: they are global
+# infrastructure and belong in the Global providers group, not under a country.
+# The COUNTRY-CODED variants of the same brands (gmx.ch, gmx.de, orange.net,
+# yahoo.co.uk) ARE here, because their root is not in the provider set and step 2
+# therefore cannot catch them - they keep their country and always will.
+#
+# A row is an EXACT domain, lower case. Subdomain matching is done by the root
+# matcher in block 087, so one row covers every host under it.
+# ==========================================================================
 DOMAIN_COUNTRY_HINTS = {
-    "windstream.net": "United States",
-    "kinetic.net": "United States",
-    "mediacombb.net": "United States",
-    "mchsi.com": "United States",
+    # --- Australia ---
+    "bigpond.com": "Australia",
+    "bigpond.net.au": "Australia",
+    "bigpond.com.au": "Australia",
+    "optusnet.com.au": "Australia",
+    "iinet.net.au": "Australia",
+    "internode.on.net": "Australia",
+    "tpg.com.au": "Australia",
+    "dodo.com.au": "Australia",
+    "adam.com.au": "Australia",
+    "westnet.com.au": "Australia",
+    "ozemail.com.au": "Australia",
+    # --- Austria ---
+    "aon.at": "Austria",
+    "chello.at": "Austria",
+    "inode.at": "Austria",
+    "magenta.at": "Austria",
+    "kabsi.at": "Austria",
+    # --- Belarus ---
+    "yandex.by": "Belarus",
+    # --- Belgium ---
+    "telenet.be": "Belgium",
+    "skynet.be": "Belgium",
+    "proximus.be": "Belgium",
+    "scarlet.be": "Belgium",
+    "voo.be": "Belgium",
+    "brutele.be": "Belgium",
+    # --- Brazil ---
+    "globo.com": "Brazil",
+    "globomail.com": "Brazil",
+    "uol.com.br": "Brazil",
+    "bol.com.br": "Brazil",
+    "ig.com.br": "Brazil",
+    "terra.com.br": "Brazil",
+    "r7.com": "Brazil",
+    "zipmail.com.br": "Brazil",
+    "oi.com.br": "Brazil",
+    # --- Canada ---
+    "rogers.com": "Canada",
+    "bell.net": "Canada",
+    "eastlink.ca": "Canada",
+    "shaw.ca": "Canada",
+    "sympatico.ca": "Canada",
+    "videotron.ca": "Canada",
+    "telus.net": "Canada",
+    "telusplanet.net": "Canada",
+    "cogeco.ca": "Canada",
+    "sasktel.net": "Canada",
+    "mts.net": "Canada",
+    # --- China ---
+    "qq.com": "China",
+    "foxmail.com": "China",
+    "163.com": "China",
+    "126.com": "China",
+    "yeah.net": "China",
+    "188.com": "China",
+    "sina.com": "China",
+    "sina.cn": "China",
+    "sohu.com": "China",
+    "aliyun.com": "China",
+    "189.cn": "China",
+    "139.com": "China",
+    "wo.cn": "China",
+    "tom.com": "China",
+    "21cn.com": "China",
+    # --- Czechia ---
+    "seznam.cz": "Czechia",
+    "email.cz": "Czechia",
+    "post.cz": "Czechia",
+    "centrum.cz": "Czechia",
+    "volny.cz": "Czechia",
+    "atlas.cz": "Czechia",
+    # --- Denmark ---
+    "tdcadsl.dk": "Denmark",
+    "mail.dk": "Denmark",
+    "stofanet.dk": "Denmark",
+    "youmail.dk": "Denmark",
+    # --- France ---
+    "laposte.net": "France",
+    "orange.fr": "France",
+    "wanadoo.fr": "France",
+    "free.fr": "France",
+    "sfr.fr": "France",
+    "voila.fr": "France",
+    "neuf.fr": "France",
+    "bbox.fr": "France",
+    "numericable.fr": "France",
+    "club-internet.fr": "France",
+    # --- Germany ---
+    "web.de": "Germany",
+    "t-online.de": "Germany",
+    "freenet.de": "Germany",
+    "arcor.de": "Germany",
+    "online.de": "Germany",
+    "gmx.de": "Germany",
+    # --- Hungary ---
+    "freemail.hu": "Hungary",
+    "citromail.hu": "Hungary",
+    "indamail.hu": "Hungary",
+    # --- India ---
+    "rediffmail.com": "India",
+    "rediff.com": "India",
+    # --- Italy ---
+    "libero.it": "Italy",
+    "virgilio.it": "Italy",
+    "tin.it": "Italy",
+    "alice.it": "Italy",
+    "tiscali.it": "Italy",
+    "email.it": "Italy",
+    "pec.it": "Italy",
+    # --- Japan ---
+    "docomo.ne.jp": "Japan",
+    "ezweb.ne.jp": "Japan",
+    "au.com": "Japan",
+    "softbank.ne.jp": "Japan",
+    "i.softbank.jp": "Japan",
+    "nifty.com": "Japan",
+    "biglobe.ne.jp": "Japan",
+    "ocn.ne.jp": "Japan",
+    "so-net.ne.jp": "Japan",
+    "excite.co.jp": "Japan",
+    "goo.ne.jp": "Japan",
+    # --- Kazakhstan ---
+    "yandex.kz": "Kazakhstan",
+    # --- Netherlands ---
+    "ziggo.nl": "Netherlands",
+    "kpnmail.nl": "Netherlands",
+    "kpnplanet.nl": "Netherlands",
+    "planet.nl": "Netherlands",
+    "hetnet.nl": "Netherlands",
+    "home.nl": "Netherlands",
+    "chello.nl": "Netherlands",
+    "zonnet.nl": "Netherlands",
+    "xs4all.nl": "Netherlands",
+    "casema.nl": "Netherlands",
+    "upcmail.nl": "Netherlands",
+    "quicknet.nl": "Netherlands",
+    # --- New Zealand ---
+    "xtra.co.nz": "New Zealand",
+    "spark.co.nz": "New Zealand",
+    "vodafone.co.nz": "New Zealand",
+    "clear.net.nz": "New Zealand",
+    "slingshot.co.nz": "New Zealand",
+    # --- Norway ---
+    "online.no": "Norway",
+    "broadpark.no": "Norway",
+    "getmail.no": "Norway",
+    # --- Poland ---
+    "wp.pl": "Poland",
+    "onet.pl": "Poland",
+    "op.pl": "Poland",
+    "interia.pl": "Poland",
+    "interia.eu": "Poland",
+    "o2.pl": "Poland",
+    "tlen.pl": "Poland",
+    "gazeta.pl": "Poland",
+    # --- Russia ---
+    "yandex.com": "Russia",
+    "yandex.ru": "Russia",
+    "ya.ru": "Russia",
+    "mail.ru": "Russia",
+    "inbox.ru": "Russia",
+    "bk.ru": "Russia",
+    "list.ru": "Russia",
+    "internet.ru": "Russia",
+    "rambler.ru": "Russia",
+    "lenta.ru": "Russia",
+    "autorambler.ru": "Russia",
+    "myrambler.ru": "Russia",
+    "ro.ru": "Russia",
+    # --- Slovakia ---
+    "centrum.sk": "Slovakia",
+    "azet.sk": "Slovakia",
+    "zoznam.sk": "Slovakia",
+    # --- South Africa ---
+    "mweb.co.za": "South Africa",
+    "telkomsa.net": "South Africa",
+    "vodamail.co.za": "South Africa",
+    "iafrica.com": "South Africa",
+    "absamail.co.za": "South Africa",
+    "webmail.co.za": "South Africa",
+    # --- South Korea ---
+    "naver.com": "South Korea",
+    "daum.net": "South Korea",
+    "hanmail.net": "South Korea",
+    "kakao.com": "South Korea",
+    "nate.com": "South Korea",
+    # --- Spain ---
+    "terra.es": "Spain",
+    "ya.com": "Spain",
+    "ozu.es": "Spain",
+    "telefonica.net": "Spain",
+    # --- Sweden ---
+    "telia.com": "Sweden",
+    "telia.se": "Sweden",
+    "bredband.net": "Sweden",
+    "comhem.se": "Sweden",
+    # --- Switzerland ---
+    "bluewin.ch": "Switzerland",
+    "hispeed.ch": "Switzerland",
+    "sunrise.ch": "Switzerland",
+    "swissonline.ch": "Switzerland",
+    "gmx.ch": "Switzerland",
+    # --- Taiwan ---
+    "pchome.com.tw": "Taiwan",
+    "hinet.net": "Taiwan",
+    "msa.hinet.net": "Taiwan",
+    # --- Ukraine ---
+    "ukr.net": "Ukraine",
+    "yandex.ua": "Ukraine",
+    # --- United Arab Emirates (pan-Arab portal) ---
+    "maktoob.com": "United Arab Emirates",
+    # --- United Kingdom ---
+    "btinternet.com": "United Kingdom",
+    "btopenworld.com": "United Kingdom",
+    "bt.com": "United Kingdom",
+    "sky.com": "United Kingdom",
+    "virginmedia.com": "United Kingdom",
+    "virgin.net": "United Kingdom",
+    "ntlworld.com": "United Kingdom",
+    "blueyonder.co.uk": "United Kingdom",
+    "talktalk.net": "United Kingdom",
+    "tiscali.co.uk": "United Kingdom",
+    "lineone.net": "United Kingdom",
+    "plus.com": "United Kingdom",
+    "plus.net": "United Kingdom",
+    "force9.co.uk": "United Kingdom",
+    "freeserve.co.uk": "United Kingdom",
+    "orange.net": "United Kingdom",
+    "ee.co.uk": "United Kingdom",
+    # --- United States ---
     "comcast.net": "United States",
-    "cox.net": "United States",
-    "charter.net": "United States",
-    "spectrum.net": "United States",
-    "suddenlink.net": "United States",
-    "optimum.net": "United States",
-    "optonline.net": "United States",
+    "verizon.net": "United States",
     "att.net": "United States",
     "sbcglobal.net": "United States",
     "bellsouth.net": "United States",
-    "verizon.net": "United States",
-    "frontier.com": "United States",
-    "centurylink.net": "United States",
-    "embarqmail.com": "United States",
+    "pacbell.net": "United States",
+    "ameritech.net": "United States",
+    "swbell.net": "United States",
+    "cox.net": "United States",
+    "charter.net": "United States",
+    "spectrum.net": "United States",
+    "rr.com": "United States",
+    "twc.com": "United States",
     "earthlink.net": "United States",
+    "mindspring.net": "United States",
+    "optonline.net": "United States",
+    "optimum.net": "United States",
+    "juno.com": "United States",
+    "netzero.net": "United States",
+    "centurylink.net": "United States",
+    "centurytel.net": "United States",
+    "q.com": "United States",
+    "embarqmail.com": "United States",
+    "windstream.net": "United States",
+    "kinetic.net": "United States",
+    "frontier.com": "United States",
+    "frontiernet.net": "United States",
+    "suddenlink.net": "United States",
+    "mediacombb.net": "United States",
+    "mchsi.com": "United States",
     "breezeline.net": "United States",
     "armstrong.net": "United States",
-    "gmail.com": "United States",
-    "outlook.com": "United States",
-    "yahoo.com": "United States",
+    "rcn.com": "United States",
+    "hughes.net": "United States",
 }
 
 APP_PASSWORD_DOMAINS = {
@@ -13729,21 +13995,40 @@ def kw_drain(wait=0.0):
 # section that then appears, as one entry, in BOTH the Engine Action Mode
 # dropdown and the Filter & Result Categories Inspector.
 #
-# THREE MODES, one control: group by DOMAIN, by COUNTRY or by REGION. A country
-# is resolved from a taught map first, then the built-in provider hints, then
-# the TLD table, and falls back to Global - never guessed beyond that.
+# THREE MODES, one control: group by DOMAIN, by COUNTRY or by REGION.
+#
+# HOW A COUNTRY IS DECIDED, highest precedence first:
+#   1. a domain TAUGHT in this section (this user's own domain_countries.json)
+#   2. a GENERIC PROVIDER ROOT -> the "Global providers" pseudo-group
+#   3. the built-in DOMAIN_COUNTRY_HINTS table (block 021)
+#   4. the TLD table (block 052)
+#   5. Global
+#
+# STEP 2, AND WHY IT IS A ROOT MATCH RATHER THAN A DOMAIN MATCH:
+#   gmail.com, outlook.com, yahoo.com, aol.com, icloud.com, gmx.net, mail.com,
+#   zoho.com and the rest are global infrastructure - they belong in ONE group,
+#   not scattered into whichever country their TLD or a hint happened to name.
+#   The match is on the REGISTRABLE ROOT (the last two labels, plus a short list
+#   of two-part suffixes such as co.uk and com.br), so:
+#       mail.yandex.ru      -> root yandex.ru   -> NOT a provider -> Russia
+#       anything.gmail.com  -> root gmail.com   -> provider       -> Global providers
+#       yahoo.com           -> root yahoo.com   -> provider       -> Global providers
+#       yahoo.co.uk         -> root yahoo.co.uk -> NOT a provider -> United Kingdom
+#       gmx.ch              -> root gmx.ch      -> NOT a provider -> Switzerland
+#   A country-coded variant therefore keeps its country and always will, while
+#   every subdomain of a generic provider lands in the one group.
 #
 # THE MAP IS TEACHABLE. "Teach a domain its country" writes to THIS user's own
 # domain_countries.json, "Auto-assign countries from the rows" fills every
-# domain the hints and TLDs can answer for, and the map panel draws one marker
-# per country that actually has credentials and lets you re-assign or forget any
-# domain. Nothing about it is shared with another user.
+# domain the provider set, the hints and the TLDs can answer for, and the map
+# panel draws one marker per country that actually has credentials and lets you
+# re-assign or forget any domain. Nothing about it is shared with another user.
 #
 # EVERY COUNTRY CARRIES ITS FLAG. The flag is DERIVED from the two-letter code
 # with the regional-indicator arithmetic, so a country can never be listed
 # without one and no emoji table can drift. The table below is every sovereign
 # state plus the dependent territories, so the picker is complete rather than a
-# convenient subset.
+# convenient subset. The two pseudo-groups carry their own fixed glyphs instead.
 #
 # ISOLATION, stated plainly, because this is credential data:
 #   * domain_countries.json and sorter_selection.json are per-user files,
@@ -13760,6 +14045,58 @@ _CS_SEL_NAME = "sorter_selection.json"
 _CS_GLOBAL_FLAG = "\U0001F310"
 _CS_MARK = "\U0001F5C2"
 _CS_OWNER_KEY = "_cs_owner"
+
+# ---- the Global providers pseudo-group -----------------------------------
+# A real group in every respect - its own flag, its own code, its own region and
+# its own rank - except that it has no point on the map, because it is not a
+# place. A taught domain may name it exactly like a country.
+_CS_PROVIDERS_GROUP = "Global providers"
+_CS_PROVIDERS_REGION = "Global providers"
+_CS_PROVIDERS_FLAG = "\U0001F4EC"
+_CS_PROVIDERS_CODE = "GLOBAL"
+
+# Two-part public suffixes. Without these, root("yahoo.co.uk") would be "co.uk"
+# and EVERY .co.uk domain would be tested against one shared root - so a UK ISP
+# domain could never match its own row, and any provider entry would swallow the
+# whole suffix.
+_CS_MULTI_SUFFIX = frozenset({
+    "co.uk", "org.uk", "me.uk", "ltd.uk", "plc.uk", "net.uk", "sch.uk", "ac.uk",
+    "com.au", "net.au", "org.au", "edu.au", "gov.au", "id.au", "asn.au",
+    "co.nz", "net.nz", "org.nz", "govt.nz", "ac.nz", "school.nz",
+    "co.za", "org.za", "net.za", "gov.za", "web.za", "ac.za",
+    "com.br", "net.br", "org.br", "gov.br", "art.br",
+    "co.jp", "ne.jp", "or.jp", "ac.jp", "go.jp", "gr.jp", "ed.jp", "ad.jp",
+    "com.tw", "net.tw", "org.tw", "idv.tw", "gov.tw", "edu.tw",
+    "com.cn", "net.cn", "org.cn", "gov.cn", "edu.cn", "ac.cn",
+    "co.kr", "or.kr", "ne.kr", "re.kr", "go.kr", "ac.kr",
+    "com.mx", "com.ar", "com.co", "com.pe", "com.ve", "com.ec", "com.uy",
+    "com.bo", "com.py", "com.do", "com.gt", "com.sv", "com.hn", "com.ni",
+    "co.in", "net.in", "org.in", "firm.in", "gen.in", "ind.in", "ac.in",
+    "com.sg", "com.hk", "com.my", "com.ph", "com.vn", "co.id", "or.id",
+    "com.tr", "com.ua", "co.il", "org.il", "com.sa", "com.eg", "com.ng",
+    "co.ke", "com.pk", "com.bd", "com.np", "com.lk", "co.th", "in.th",
+    "com.gh", "com.qa", "com.kw", "com.bh", "com.om", "com.jo", "com.lb",
+})
+
+# ---- the generic provider roots -----------------------------------------
+# A FROZEN set, so nothing at runtime can widen it by accident. These are the
+# providers whose mailboxes are hosted on one global platform: the account is
+# nowhere in particular, so it belongs in Global providers rather than under the
+# country its TLD happens to name. Country-coded variants of the SAME brands
+# (gmx.ch, gmx.de, orange.net, yahoo.co.uk, live.co.uk) are deliberately absent -
+# they are in block 021 and keep their country.
+_CS_PROVIDERS = frozenset({
+    "gmail.com", "googlemail.com",
+    "outlook.com", "hotmail.com", "hotmail.co.uk", "hotmail.fr", "hotmail.de",
+    "hotmail.it", "hotmail.es", "live.com", "live.co.uk", "live.fr", "live.de",
+    "live.it", "live.nl", "msn.com",
+    "yahoo.com", "ymail.com", "rocketmail.com", "aol.com",
+    "icloud.com", "me.com", "mac.com",
+    "proton.me", "protonmail.com", "pm.me",
+    "tuta.io", "tutanota.com", "tutamail.com", "tuta.com",
+    "fastmail.com", "hushmail.com",
+    "gmx.net", "gmx.com", "mail.com", "email.com", "zoho.com", "zohomail.com",
+})
 
 # code, name, region, latitude, longitude. The code is the flag AND the short
 # label; the coordinates are the country centroid the map marker sits on.
@@ -14015,8 +14352,14 @@ _CS_COUNTRIES = (
 )
 
 _CS_BY_NAME = {_c[1]: _c for _c in _CS_COUNTRIES}
-_CS_COUNTRY_NAMES = tuple(sorted(_CS_BY_NAME)) + (_CS_GLOBAL,)
-_CS_REGIONS = tuple(sorted({_c[2] for _c in _CS_COUNTRIES})) + (_CS_GLOBAL,)
+# The two pseudo-groups sort to the BOTTOM of every picker - after every real
+# country - and the providers group sits above Global, because Global is the
+# leftover bucket and providers is a real answer.
+_CS_COUNTRY_NAMES = (tuple(sorted(_CS_BY_NAME))
+                     + (_CS_PROVIDERS_GROUP, _CS_GLOBAL))
+_CS_REGIONS = (tuple(sorted({_c[2] for _c in _CS_COUNTRIES}
+                            | {_CS_PROVIDERS_REGION}))
+               + (_CS_GLOBAL,))
 _CS_PRE_SOURCES = ("Ready to Check", "Disposables", "Typos", "Skip previously valid",
                    "App-Skipped", "Custom Filtered", "DNS Failed", "SMTP Failed")
 _CS_SOURCES = tuple(_CS_PRE_SOURCES) + tuple(_lbl for _lbl, _k in BUCKETS)
@@ -14035,6 +14378,8 @@ _CS_PRE_MAP = {
 
 def _cs_flag(country):
     """The flag for a country, DERIVED from its code so none can be missing."""
+    if country == _CS_PROVIDERS_GROUP:
+        return _CS_PROVIDERS_FLAG
     _row = _CS_BY_NAME.get(country)
     if not _row:
         return _CS_GLOBAL_FLAG
@@ -14042,18 +14387,33 @@ def _cs_flag(country):
 
 
 def _cs_code(country):
+    if country == _CS_PROVIDERS_GROUP:
+        return _CS_PROVIDERS_CODE
     _row = _CS_BY_NAME.get(country)
     return _row[0] if _row else "GL"
 
 
 def _cs_region(country):
+    if country == _CS_PROVIDERS_GROUP:
+        return _CS_PROVIDERS_REGION
     _row = _CS_BY_NAME.get(country)
     return _row[2] if _row else _CS_GLOBAL
 
 
 def _cs_point(country):
+    """The map point, or None. Both pseudo-groups have none - a marker at 0,0 is
+    worse than no marker, because it lands in the Gulf of Guinea."""
     _row = _CS_BY_NAME.get(country)
     return (_row[3], _row[4]) if _row else None
+
+
+def _cs_group_rank(key):
+    """Order every group: real countries first, then Global providers, then Global."""
+    if key == _CS_GLOBAL:
+        return 2
+    if key == _CS_PROVIDERS_GROUP:
+        return 1
+    return 0
 
 
 def _cs_path():
@@ -14087,7 +14447,8 @@ def _cs_load_map():
         _k = str(_k or "").lower().strip()
         if not _k or not isinstance(_v, str):
             continue
-        if _v in _CS_BY_NAME or _v == _CS_GLOBAL:
+        # The providers group is a legal teaching target like any country.
+        if _v in _CS_BY_NAME or _v in (_CS_GLOBAL, _CS_PROVIDERS_GROUP):
             _out[_k] = _v
     return _out
 
@@ -14115,14 +14476,32 @@ def _cs_save_sel():
         warnings.warn(f"could not save {_CS_SEL_NAME}: {_e}")
 
 
+def _cs_provider_root(domain):
+    """The REGISTRABLE root of a domain: the last two labels, or the last three
+    when the last two are a known two-part suffix (co.uk, com.br, ...).
+
+    This is what makes the provider test both narrow and complete: every
+    subdomain of a generic provider collapses onto its root and matches, while a
+    country-coded variant keeps a DIFFERENT root and does not.
+    """
+    _labels = [p for p in str(domain or "").lower().strip().strip(".").split(".") if p]
+    if len(_labels) < 2:
+        return ""
+    if len(_labels) >= 3 and ".".join(_labels[-2:]) in _CS_MULTI_SUFFIX:
+        return ".".join(_labels[-3:])
+    return ".".join(_labels[-2:])
+
+
 def _cs_country_of(domain, mapping):
-    """taught map, then the provider hints, then the TLD, then Global."""
+    """taught map, then a provider root, then the hints, then the TLD, then Global."""
     _d = str(domain or "").lower().strip()
     if not _d:
         return _CS_GLOBAL
     _hit = (mapping or {}).get(_d)
     if _hit:
         return _hit
+    if _cs_provider_root(_d) in _CS_PROVIDERS:
+        return _CS_PROVIDERS_GROUP
     if _d in DOMAIN_COUNTRY_HINTS:
         return DOMAIN_COUNTRY_HINTS[_d]
     for _part in reversed(_d.split(".")):
@@ -14207,6 +14586,8 @@ def _cs_groups(rows, mode):
 
 def _cs_key_label(key, mode):
     _k = str(key or "")
+    if _k == _CS_PROVIDERS_GROUP:
+        return _CS_PROVIDERS_FLAG + " " + _CS_PROVIDERS_GROUP
     if mode == "Country":
         return _cs_flag(_k) + " " + _cs_code(_k)
     if mode == "Region":
@@ -14253,7 +14634,7 @@ def _cs_selection_lines():
     _groups = _cs_groups(_cs_rows(_source, _mapping, _ver), _mode)
     _keys = [str(_k) for _k in (str_lit.session_state.get("cs_keys") or []) if _k]
     _order = sorted((_k for _k in _keys if _k in _groups),
-                    key=lambda _k: (_k == _CS_GLOBAL, str(_k).lower()))
+                    key=lambda _k: (_cs_group_rank(_k), str(_k).lower()))
     _out = []
     for _k in _order:
         _out.append(("—" * 12) + str(_k) + ("—" * 12))
@@ -14332,7 +14713,7 @@ _cs_ver = int(str_lit.session_state.get("cs_map_ver") or 0)
 _cs_all_rows = _cs_rows(_cs_source, _cs_map, _cs_ver)
 _cs_groups_now = _cs_groups(_cs_all_rows, _cs_mode)
 _cs_options = sorted(_cs_groups_now,
-                     key=lambda _k: (_k == _CS_GLOBAL, str(_k).lower()))
+                     key=lambda _k: (_cs_group_rank(_k), str(_k).lower()))
 
 _cs_kept = [_k for _k in (str_lit.session_state.get("cs_keys") or [])
             if _k in _cs_groups_now]
@@ -14345,9 +14726,11 @@ with _cs_m1:
                       key="cs_mode",
                       on_change=_cs_on_mode_change,
                       help="Domain groups by the part after the @. Country groups "
-                           "by the country the domain is taught, hinted or TLD-"
-                           "resolved to, with everything unresolved under Global. "
-                           "Region groups those countries by continent.")
+                           "by the country the domain is taught, provider-matched, "
+                           "hinted or TLD-resolved to - generic providers such as "
+                           "gmail.com and outlook.com collect under Global providers, "
+                           "and everything unresolved falls under Global. Region "
+                           "groups those countries by continent.")
 with _cs_m2:
     str_lit.selectbox(f"Sort credentials from ({len(_CS_SOURCES)} sources)",
                       list(_CS_SOURCES), key="cs_source",
@@ -14359,11 +14742,19 @@ with _cs_m2:
 
 _cs_total = len(_cs_all_rows)
 _cs_unresolved = sum(1 for _r in _cs_all_rows if _r[2] == _CS_GLOBAL)
-str_lit.caption(
+_cs_prov_count = sum(1 for _r in _cs_all_rows if _r[2] == _CS_PROVIDERS_GROUP)
+_cs_summary = (
     f"**{_cs_total}** credential line(s) in *{_cs_source}* across "
-    f"**{len(_cs_groups_now)}** group(s). **{_cs_unresolved}** line(s) have no "
-    f"country yet and sit under **{_CS_GLOBAL_FLAG} Global** - teach them below or "
-    f"press auto-assign. Nothing here re-checks or re-filters an account.")
+    f"**{len(_cs_groups_now)}** group(s).")
+if _cs_mode == "Country" and _cs_prov_count:
+    _cs_summary += (f" **{_cs_prov_count}** line(s) are generic providers under "
+                    f"**{_CS_PROVIDERS_FLAG} {_CS_PROVIDERS_GROUP}**.")
+if _cs_unresolved:
+    _cs_summary += (f" **{_cs_unresolved}** line(s) have no country yet and sit under "
+                    f"**{_CS_GLOBAL_FLAG} Global** - teach them below or press "
+                    f"auto-assign.")
+_cs_summary += " Nothing here re-checks or re-filters an account."
+str_lit.caption(_cs_summary)
 
 if not _cs_total:
     str_lit.info("That source is empty. Paste combos above, or pick another source.")
@@ -14403,9 +14794,10 @@ else:
     with _cs_b3:
         if str_lit.button("🌍 Auto-assign from the rows", width="stretch",
                           help="Fills a country for every domain the built-in "
-                               "provider hints or the TLD table can answer for. "
-                               "Domains already taught are left alone; the rest "
-                               "stay under Global."):
+                               "provider set, the provider hints or the TLD table "
+                               "can answer for - generic providers get Global "
+                               "providers. Domains already taught are left alone; "
+                               "the rest stay under Global."):
             _m = dict(_cs_map)
             _added = 0
             for _dom in sorted({_r[1] for _r in _cs_all_rows}):
@@ -14420,9 +14812,9 @@ else:
                 str_lit.session_state["cs_map_ver"] = _cs_ver + 1
                 _cs_save_map(_m)
                 str_lit.session_state["_cs_flash"] = (
-                    "success", f"Assigned **{_added}** domain(s) from the hints and "
-                               f"TLDs. **{len(_cs_map)}** teaching(s) stored before, "
-                               f"**{len(_m)}** now.")
+                    "success", f"Assigned **{_added}** domain(s) from the provider "
+                               f"set, the hints and the TLDs. **{len(_cs_map)}** "
+                               f"teaching(s) stored before, **{len(_m)}** now.")
             else:
                 str_lit.session_state["_cs_flash"] = (
                     "warning", "Nothing new to assign - every answerable domain is "
@@ -14437,8 +14829,9 @@ else:
 # ---- teach one domain -------------------------------------------------------
 with str_lit.expander("🏷 Teach a domain its country", expanded=False):
     str_lit.caption("The domain is matched exactly, lower-cased, and only for THIS "
-                    "user. A taught domain always wins over the hints and the TLD, "
-                    "and Global is a real answer, not a blank.")
+                    "user. A taught domain always wins over the provider set, the "
+                    "hints and the TLD, and both Global and Global providers are "
+                    "real answers, not blanks.")
     _cs_t1, _cs_t2 = str_lit.columns([0.55, 0.45])
     with _cs_t1:
         _cs_teach_dom = str_lit.text_input("Domain (e.g. example.com)",
@@ -14447,7 +14840,8 @@ with str_lit.expander("🏷 Teach a domain its country", expanded=False):
     with _cs_t2:
         _cs_teach_ctry = str_lit.selectbox(
             f"Country ({len(_CS_COUNTRY_NAMES)} options)",
-            list(_CS_COUNTRY_NAMES), key="cs_teach_ctry")
+            list(_CS_COUNTRY_NAMES), key="cs_teach_ctry",
+            format_func=lambda _c: "%s %s" % (_cs_flag(_c), _c))
     _cs_tb1, _cs_tb2 = str_lit.columns(2)
     with _cs_tb1:
         if str_lit.button("💾 Save this domain's country", width="stretch"):
@@ -14468,7 +14862,7 @@ with str_lit.expander("🏷 Teach a domain its country", expanded=False):
     with _cs_tb2:
         if str_lit.button("🧽 Forget this domain", width="stretch",
                           help="Drops the teaching, so the domain falls back to the "
-                               "hints, the TLD and then Global."):
+                               "provider set, the hints, the TLD and then Global."):
             _dom = str(_cs_teach_dom or "").lower().strip().lstrip("@")
             _m = dict(_cs_map)
             if _dom in _m:
@@ -14507,8 +14901,8 @@ if _cs_map_on:
         # the table below instead of a red page.
         str_lit.caption("One marker per country that has credentials in this source. "
                         "Marker size is the line count. The table below carries the "
-                        "same figures, and Global - which has no point on a map - is "
-                        "reported under it.")
+                        "same figures, and the two groups with no point on a map - "
+                        "Global providers and Global - are reported under it.")
         try:
             str_lit.map(pd.DataFrame(_cs_markers), latitude="lat", longitude="lon",
                         color="color", size="size")
@@ -14519,6 +14913,10 @@ if _cs_map_on:
         str_lit.caption("No country has credentials in this source yet, so there is "
                         "nothing to place. Teach a domain below or press "
                         "auto-assign.")
+    if _cs_counts.get(_CS_PROVIDERS_GROUP):
+        str_lit.caption(f"{_CS_PROVIDERS_FLAG} **{_CS_PROVIDERS_GROUP}** holds **"
+                        f"{_cs_counts[_CS_PROVIDERS_GROUP]}** line(s) - generic "
+                        f"providers, so there is nowhere to put a marker.")
     if _cs_counts.get(_CS_GLOBAL):
         str_lit.caption(f"{_CS_GLOBAL_FLAG} **Global** holds **"
                         f"{_cs_counts[_CS_GLOBAL]}** line(s) and has no point on a "
@@ -14527,7 +14925,8 @@ if _cs_map_on:
     _cs_geo_rows = [{"Flag": _cs_flag(_c), "Country": _c, "Region": _cs_region(_c),
                      "Lines": _n}
                     for _c, _n in sorted(_cs_counts.items(),
-                                         key=lambda _kv: (-_kv[1], _kv[0]))]
+                                         key=lambda _kv: (_cs_group_rank(_kv[0]),
+                                                          -_kv[1], _kv[0]))]
     if _cs_geo_rows:
         str_lit.dataframe(pd.DataFrame(_cs_geo_rows), width="stretch",
                           hide_index=True)
@@ -14563,7 +14962,8 @@ if _cs_map_on:
         with _cs_e1:
             _cs_edit_ctry = str_lit.selectbox(
                 f"Move it to ({len(_CS_COUNTRY_NAMES)} options)",
-                list(_CS_COUNTRY_NAMES), key="cs_edit_ctry")
+                list(_CS_COUNTRY_NAMES), key="cs_edit_ctry",
+                format_func=lambda _c: "%s %s" % (_cs_flag(_c), _c))
         with _cs_e2:
             str_lit.caption("")
             if str_lit.button("💾 Move it", width="stretch"):
@@ -14587,7 +14987,7 @@ if _cs_map_on:
                               hide_index=True, height=240)
     else:
         str_lit.caption("Nothing taught yet - every country above came from the "
-                        "built-in hints and TLDs.")
+                        "built-in provider set, hints and TLDs.")
 
 # --------------------------------------------------------------------------
 # INSPECTOR - v13.63, re-cut v13.76, v13.77
