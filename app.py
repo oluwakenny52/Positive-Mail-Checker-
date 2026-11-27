@@ -14633,37 +14633,104 @@ _CS_TEXT_CUES = (
     ("united states", "United States"),
     ("u.s.a.", "United States"),
     ("usa", "United States"),
+    ("new york", "United States"),
+    ("san francisco", "United States"),
+    ("los angeles", "United States"),
+    ("seattle", "United States"),
+    ("chicago", "United States"),
+    ("austin", "United States"),
     ("united kingdom", "United Kingdom"),
     ("england", "United Kingdom"),
     ("scotland", "United Kingdom"),
+    ("wales", "United Kingdom"),
+    ("london", "United Kingdom"),
+    ("manchester", "United Kingdom"),
     ("canada", "Canada"),
+    ("toronto", "Canada"),
+    ("vancouver", "Canada"),
+    ("montreal", "Canada"),
     ("australia", "Australia"),
+    ("sydney", "Australia"),
+    ("melbourne", "Australia"),
     ("germany", "Germany"),
     ("deutschland", "Germany"),
+    ("berlin", "Germany"),
+    ("munich", "Germany"),
+    ("hamburg", "Germany"),
+    ("frankfurt", "Germany"),
     ("france", "France"),
+    ("paris", "France"),
     ("italy", "Italy"),
     ("italia", "Italy"),
+    ("milan", "Italy"),
+    ("rome", "Italy"),
     ("spain", "Spain"),
     ("espana", "Spain"),
+    ("madrid", "Spain"),
+    ("barcelona", "Spain"),
     ("brazil", "Brazil"),
     ("brasil", "Brazil"),
+    ("sao paulo", "Brazil"),
+    ("rio de janeiro", "Brazil"),
     ("india", "India"),
+    ("mumbai", "India"),
+    ("bengaluru", "India"),
+    ("bangalore", "India"),
+    ("new delhi", "India"),
     ("japan", "Japan"),
+    ("tokyo", "Japan"),
+    ("osaka", "Japan"),
     ("south korea", "South Korea"),
+    ("seoul", "South Korea"),
     ("china", "China"),
+    ("hangzhou", "China"),
+    ("shenzhen", "China"),
+    ("beijing", "China"),
+    ("shanghai", "China"),
+    ("guangzhou", "China"),
+    ("hong kong", "Hong Kong"),
     ("russia", "Russia"),
+    ("moscow", "Russia"),
     ("netherlands", "Netherlands"),
+    ("amsterdam", "Netherlands"),
     ("switzerland", "Switzerland"),
+    ("zurich", "Switzerland"),
+    ("geneva", "Switzerland"),
     ("sweden", "Sweden"),
+    ("stockholm", "Sweden"),
     ("norway", "Norway"),
+    ("oslo", "Norway"),
     ("denmark", "Denmark"),
+    ("copenhagen", "Denmark"),
     ("poland", "Poland"),
+    ("warsaw", "Poland"),
     ("south africa", "South Africa"),
+    ("johannesburg", "South Africa"),
+    ("cape town", "South Africa"),
     ("nigeria", "Nigeria"),
+    ("lagos", "Nigeria"),
+    ("abuja", "Nigeria"),
     ("mexico", "Mexico"),
+    ("mexico city", "Mexico"),
     ("singapore", "Singapore"),
     ("united arab emirates", "United Arab Emirates"),
     ("dubai", "United Arab Emirates"),
+    ("abu dhabi", "United Arab Emirates"),
+    ("indonesia", "Indonesia"),
+    ("jakarta", "Indonesia"),
+    ("bali", "Indonesia"),
+    ("colombia", "Colombia"),
+    ("bogota", "Colombia"),
+    ("medellin", "Colombia"),
+    ("turkey", "Turkey"),
+    ("istanbul", "Turkey"),
+    ("antalya", "Turkey"),
+    ("peru", "Peru"),
+    ("lima", "Peru"),
+    ("nepal", "Nepal"),
+    ("kathmandu", "Nepal"),
+    ("bangladesh", "Bangladesh"),
+    ("dhaka", "Bangladesh"),
 )
 # The two pseudo-groups sort to the BOTTOM of every picker - after every real
 # country - and the providers group sits above Global, because Global is the
@@ -14817,8 +14884,29 @@ def _cs_match_country_text(text):
     return ""
 
 
+def _cs_score_country_text(text):
+    """Score country mentions in cleaned text. Returns best matching country name or ''."""
+    _low = " " + re.sub(r"[^a-z0-9.]+", " ", str(text or "").lower()) + " "
+    _scores = {}
+    for _cue, _ctry in _CS_TEXT_CUES:
+        if _ctry not in _CS_BY_NAME:
+            continue
+        _hits = _low.count(f" {_cue} ")
+        if _hits:
+            _scores[_ctry] = _scores.get(_ctry, 0) + _hits
+    for _name in _CS_BY_NAME:
+        if len(_name) >= 5:
+            _nlow = _name.lower()
+            _hits = _low.count(f" {_nlow} ")
+            if _hits:
+                _scores[_name] = _scores.get(_name, 0) + _hits
+    if not _scores:
+        return ""
+    return max(_scores.items(), key=lambda _kv: (_kv[1], _kv[0]))[0]
+
+
 def _cs_extract_vcard_country(obj):
-    """Walk RDAP JSON vcardArray structures for country fields."""
+    """Walk RDAP JSON vcardArray structures for non-empty country fields."""
     if isinstance(obj, dict):
         if "country" in obj and isinstance(obj["country"], str):
             _c = obj["country"].strip().upper()
@@ -14848,8 +14936,67 @@ def _cs_extract_vcard_country(obj):
     return ""
 
 
+def _cs_registrant_country_from_entities(entities):
+    """Extract country ONLY from non-registrar (preferring 'registrant') RDAP entities."""
+    if not isinstance(entities, list):
+        return ""
+    _reg_entities = []
+    _other_entities = []
+    for _ent in entities:
+        if not isinstance(_ent, dict):
+            continue
+        _roles = {str(_r).lower().strip() for _r in (_ent.get("roles") or [])}
+        if "registrar" in _roles or "abuse" in _roles:
+            continue
+        if "registrant" in _roles:
+            _reg_entities.append(_ent)
+        else:
+            _other_entities.append(_ent)
+    for _group in (_reg_entities, _other_entities):
+        for _ent in _group:
+            _vc = _cs_extract_vcard_country(_ent.get("vcardArray"))
+            if _vc in _CS_BY_NAME:
+                return _vc
+            _nested = _cs_registrant_country_from_entities(_ent.get("entities"))
+            if _nested in _CS_BY_NAME:
+                return _nested
+    return ""
+
+
+def _cs_related_rdap_urls(parsed):
+    """Return up to 1 related RDAP JSON URL from domain links."""
+    _out = []
+    if not isinstance(parsed, dict):
+        return _out
+    for _lnk in (parsed.get("links") or []):
+        if not isinstance(_lnk, dict):
+            continue
+        _rel = str(_lnk.get("rel") or "").lower().strip()
+        _href = str(_lnk.get("href") or _lnk.get("value") or "").strip()
+        if _rel == "related" and _href.startswith(("http://", "https://")):
+            if _href not in _out:
+                _out.append(_href)
+    return _out[:1]
+
+
+def _cs_fetch_url(url, headers, timeout=4.0, proxy_str=None):
+    """Fetch URL directly or via an optional HTTP/SOCKS proxy string."""
+    _req = urllib.request.Request(url, headers=headers)
+    if proxy_str:
+        _p = str(proxy_str).strip()
+        if "://" not in _p:
+            _p = "http://" + _p
+        _opener = urllib.request.build_opener(
+            urllib.request.ProxyHandler({"http": _p, "https": _p})
+        )
+        with _opener.open(_req, timeout=timeout) as _resp:
+            return getattr(_resp, "status", 200), _resp.read(131072)
+    with urllib.request.urlopen(_req, timeout=timeout) as _resp:
+        return getattr(_resp, "status", 200), _resp.read(131072)
+
+
 def _cs_rdap_country(domain):
-    """Query RDAP for registrant country. Returns (country_name, status_note)."""
+    """Query RDAP for registrant country (ignoring registrar entities, following related)."""
     _dom = _cs_provider_root(domain) or str(domain or "").lower().strip()
     if not _dom:
         return "", "invalid domain"
@@ -14860,36 +15007,45 @@ def _cs_rdap_country(domain):
     elif _tld == "org":
         _urls.append(f"https://rdap.publicinterestregistry.org/rdap/domain/{_dom}")
     _urls.append(f"https://rdap.org/domain/{_dom}")
+
+    _headers = {
+        "User-Agent": "Mozilla/5.0 (compatible; DomainGeoLookup/1.0)",
+        "Accept": "application/rdap+json, application/json",
+    }
     _notes = []
-    for _u in _urls:
-        _host = _u.split("/")[2]
+    _visited = set()
+    _got_registry_200 = False
+    _idx = 0
+    while _idx < len(_urls) and len(_visited) < 4:
+        _u = _urls[_idx]
+        _idx += 1
+        if _u in _visited:
+            continue
+        _host = _u.split("/")[2] if len(_u.split("/")) > 2 else _u
+        # Skip redundant rdap.org if primary registry already returned HTTP 200
+        if _host == "rdap.org" and _got_registry_200:
+            continue
+        _visited.add(_u)
         try:
-            _req = urllib.request.Request(
-                _u,
-                headers={
-                    "User-Agent": "Mozilla/5.0 (compatible; DomainGeoLookup/1.0)",
-                    "Accept": "application/rdap+json, application/json",
-                },
-            )
-            with urllib.request.urlopen(_req, timeout=3.5) as _resp:
-                _code = getattr(_resp, "status", 200)
-                _raw = _resp.read(98304).decode("utf-8", errors="ignore")
+            _code, _raw_bytes = _cs_fetch_url(_u, _headers, timeout=3.5)
+            _raw = _raw_bytes.decode("utf-8", errors="ignore")
+            if _code == 200 and _host != "rdap.org":
+                _got_registry_200 = True
             try:
                 _parsed = json.loads(_raw)
-                _vc = _cs_extract_vcard_country(_parsed)
-                if _vc in _CS_BY_NAME:
-                    return _vc, f"RDAP({_host}) HTTP {_code} -> {_vc}"
             except Exception:
-                pass
-            for _m in re.finditer(r'"([A-Z]{2})"', _raw):
-                _cc = _m.group(1)
-                if _cc in _CS_BY_CODE:
-                    return _CS_BY_CODE[_cc], f"RDAP({_host}) code {_cc} -> {_CS_BY_CODE[_cc]}"
-            _by_txt = _cs_match_country_text(_raw)
-            if _by_txt:
-                return _by_txt, f"RDAP({_host}) text -> {_by_txt}"
-            _redacted = "redacted" in _raw.lower()
-            _notes.append(f"{_host}:HTTP {_code} ({'redacted' if _redacted else 'no country'})")
+                _parsed = None
+            if isinstance(_parsed, dict):
+                _vc = _cs_registrant_country_from_entities(_parsed.get("entities"))
+                if _vc in _CS_BY_NAME:
+                    return _vc, f"RDAP({_host}) HTTP {_code} registrant -> {_vc}"
+                for _rel_url in _cs_related_rdap_urls(_parsed):
+                    if _rel_url not in _visited:
+                        _urls.append(_rel_url)
+                _redacted = "redacted" in _raw.lower()
+                _notes.append(f"{_host}:HTTP {_code} ({'redacted' if _redacted else 'no registrant country'})")
+            else:
+                _notes.append(f"{_host}:HTTP {_code} (non-JSON)")
         except urllib.error.HTTPError as _he:
             _notes.append(f"{_host}:HTTP {_he.code}")
         except Exception as _ex:
@@ -14898,38 +15054,69 @@ def _cs_rdap_country(domain):
 
 
 def _cs_web_country(domain):
-    """Fallback web snippet lookup. Returns (country_name, status_note)."""
+    """Search Bing/DDG snippets for country mentions; retry via proxy only on 403/429."""
     _dom = _cs_provider_root(domain) or str(domain or "").lower().strip()
     if not _dom:
         return "", "invalid domain"
-    _q = urllib.parse.quote_plus(f'"{_dom}" country OR headquarters OR address OR contact')
+    _q = urllib.parse.quote_plus(f'"{_dom}" headquarters OR address OR country')
     _engines = (
-        ("ddg", f"https://html.duckduckgo.com/html/?q={_q}"),
         ("bing", f"https://www.bing.com/search?q={_q}"),
+        ("ddg", f"https://html.duckduckgo.com/html/?q={_q}"),
     )
+    _headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                      "AppleWebKit/537.36 (KHTML, like Gecko) "
+                      "Chrome/124.0.0.0 Safari/537.36",
+        "Accept-Language": "en-US,en;q=0.9",
+    }
+    _proxy_fn = globals().get("sample_alive_proxy")
     _notes = []
     for _eng, _url in _engines:
         try:
-            _req = urllib.request.Request(
-                _url,
-                headers={
-                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                                  "AppleWebKit/537.36 (KHTML, like Gecko) "
-                                  "Chrome/124.0.0.0 Safari/537.36",
-                    "Accept-Language": "en-US,en;q=0.9",
-                },
-            )
-            with urllib.request.urlopen(_req, timeout=4.0) as _resp:
-                _code = getattr(_resp, "status", 200)
-                _html = _resp.read(131072).decode("utf-8", errors="ignore")
-            _clean = re.sub(r"<script[^>]*>.*?</script>", " ", _html, flags=re.S | re.I)
-            _clean = re.sub(r"<style[^>]*>.*?</style>", " ", _clean, flags=re.S | re.I)
-            _clean = re.sub(r"<[^>]+>", " ", _clean)
-            _ctry = _cs_match_country_text(_clean)
+            _code, _raw_bytes = _cs_fetch_url(_url, _headers, timeout=4.0)
+            if _code == 202 and _eng == "ddg":
+                _notes.append("ddg:HTTP 202 (rate-limited)")
+                continue
+            if _code in (403, 429) and callable(_proxy_fn):
+                _px = _proxy_fn(domain=_dom)
+                if _px:
+                    _code, _raw_bytes = _cs_fetch_url(
+                        _url, _headers, timeout=5.0, proxy_str=_px
+                    )
+                    _eng = f"{_eng}+px"
+            _html = _raw_bytes.decode("utf-8", errors="ignore")
+            for _tag in ("script", "style", "nav", "header", "footer", "aside"):
+                _html = re.sub(
+                    rf"<{_tag}[^>]*>.*?</{_tag}>", " ", _html, flags=re.S | re.I
+                )
+            _clean = re.sub(r"<[^>]+>", " ", _html)
+            _ctry = _cs_score_country_text(_clean)
             if _ctry in _CS_BY_NAME:
                 return _ctry, f"WEB({_eng}) HTTP {_code} -> {_ctry}"
             _notes.append(f"{_eng}:HTTP {_code} ({len(_clean)} chars, no country)")
+            if _eng.startswith("bing"):
+                time.sleep(0.35)
         except urllib.error.HTTPError as _he:
+            if _he.code in (403, 429) and callable(_proxy_fn):
+                try:
+                    _px = _proxy_fn(domain=_dom)
+                    if _px:
+                        _code, _raw_bytes = _cs_fetch_url(
+                            _url, _headers, timeout=5.0, proxy_str=_px
+                        )
+                        _html = _raw_bytes.decode("utf-8", errors="ignore")
+                        for _tag in ("script", "style", "nav", "header", "footer", "aside"):
+                            _html = re.sub(
+                                rf"<{_tag}[^>]*>.*?</{_tag}>", " ", _html, flags=re.S | re.I
+                            )
+                        _clean = re.sub(r"<[^>]+>", " ", _html)
+                        _ctry = _cs_score_country_text(_clean)
+                        if _ctry in _CS_BY_NAME:
+                            return _ctry, f"WEB({_eng}+px) HTTP {_code} -> {_ctry}"
+                        _notes.append(f"{_eng}+px:HTTP {_code} (no country)")
+                        continue
+                except Exception as _px_ex:
+                    _notes.append(f"{_eng}+px:{type(_px_ex).__name__}")
             _notes.append(f"{_eng}:HTTP {_he.code}")
         except Exception as _ex:
             _notes.append(f"{_eng}:{type(_ex).__name__}")
@@ -14937,7 +15124,7 @@ def _cs_web_country(domain):
 
 
 def _cs_discover_country(domain):
-    """Try RDAP first, then web search. Returns (country_name, trace_line)."""
+    """Try RDAP (registrant + related) first, then scored web search."""
     _ts = datetime.now().strftime("%H:%M:%S")
     _ctry, _rdap_note = _cs_rdap_country(domain)
     if _ctry in _CS_BY_NAME:
