@@ -368,42 +368,93 @@ except Exception as _status_err:
     }
 
     # FIX P0-3: order mirrors status.py - WRONG_STRONG before the greedy APP
-    # tokens, and _RETRY no longer owns backend/upstream/downstream.
+    # tokens, and _FB_RETRY no longer owns backend/upstream/downstream.
+    #
+    # v13.86 FIX FALLBACK-1: THE TABLES HAD DRIFTED FROM status.py AND THE FILE
+    # SAYS THEY MUST NOT. status.py block 000 is explicit - "if that import ever
+    # fails the app falls back to an inline copy of the same tables, so the two
+    # must stay in lockstep" - and seven inputs classified differently depending
+    # only on whether status.py happened to import:
+    #
+    #   "DNS lookup failed"        status.py DNS_FAILED   fallback RETRY_LATER
+    #   "backend error"            status.py RETRY_LATER  fallback UNKNOWN
+    #   "upstream error"           status.py RETRY_LATER  fallback UNKNOWN
+    #   "too many simultaneous"    status.py RETRY_LATER  fallback RETRY_LATER (ok)
+    #   "maintenance window"       status.py RETRY_LATER  fallback UNKNOWN
+    #   "Proxy DNS lookup failed"  status.py CONNECTION   fallback RETRY_LATER
+    #   "blocked by proxy"         status.py CONNECTION   fallback RBL_BLOCKED
+    #
+    # The whole shape is status.py's now: the same tables in the same order,
+    # including the WRONG_USER and PROXY_BLOCKED tables the fallback never had,
+    # the bare "dns" token, the transient-server words in _FB_RETRY, and the
+    # rate-limit guard on the LOGIN_DROPPED decision. The extra APP tokens the
+    # fallback already carried (2fa / mfa / tenant / consent / less secure app /
+    # imap access is disabled) are kept: status.py folds NEED_APP_PASSWORD onto
+    # APP in block 067's _CANON_STATUS, so a wider APP table cannot change a
+    # verdict - it can only stop a real app-password signal falling to UNKNOWN.
+    _FB_BARE = ("login", "logon", "auth", "authenticate", "authentication",
+                "sign in", "signin", "sign-in", "credentials", "invalid")
     _FB_WRONG_STRONG = ("realmless login not allowed", "authenticationfailed",
                         "authentication failed", "invalid credentials",
                         "invalid user name or password", "login incorrect",
                         "wrong password", "authenticate error",
-                        "invalid login or password",
+                        "invalid login or password", "bad credentials",
                         "logowanie nie powiodlo sie",
                         "sprawdz dane logowania",
                         "nieprawidlowe haslo",
                         "bledne haslo")
+    _FB_WRONG_USER = ("user unknown", "no such user", "unknown user",
+                      "invalid user", "user not found", "mailbox not found",
+                      "no such mailbox", "does not exist", "account not found",
+                      "no mailbox", "recipient address rejected",
+                      "unknown account")
+    _FB_APP_HINT = {"outlook.com", "hotmail.com", "hotmail.co.uk", "live.com",
+                    "live.co.uk", "msn.com", "gmail.com", "googlemail.com",
+                    "yahoo.com", "aol.com", "icloud.com", "me.com", "mac.com"}
     _FB_APP = ("app password", "application specific password",
                "application-specific password", "app-specific password",
+               "app specific password", "application password",
+               "needs app password",
                "basic authentication is disabled", "basic auth is disabled",
                "basicauthenticationdisabled", "web login required",
-               "via your web browser", "less secure app", "lesssecureapp",
-               "oauth", "oauth2", "token required", "an app password is required",
-               "use an app password", "enable imap", "imap access is disabled",
+               "via your web browser", "log in via your web browser",
+               "web browser to log in",
+               "less secure app", "lesssecureapp",
+               "oauth", "oauth2", "xoauth2", "ms_oauth", "token required",
+               "an app password is required", "use an app password",
+               "enable imap", "activate imap", "imap access is disabled",
                "imap is disabled", "pop access is disabled", "enable pop",
                "2fa", "2-step", "2 step", "mfa", "multi-factor", "multi factor",
                "two-factor", "two factor", "modern authentication",
-               "sign in with", "log in with your browser", "consent", "tenant",
+               "sign in with", "consent", "tenant",
                "aadsts50076", "aadsts50079", "aadsts50074", "strongauth",
                "required new password",
                "aktywuj dostep przez imap")
+    _FB_PROXY_BLOCKED = ("blocked by proxy", "proxy blocked", "proxy is blocked",
+                         "proxy denied", "proxy dns", "proxy lookup",
+                         "proxy resolve")
     _FB_RBL = ("rbl restriction", "rbl", "abusix", "dnsbl", "spamhaus",
-               "blacklist", "blacklisted", "ip blocked")
-    _FB_DNS = ("does not resolve", "failed to resolve", "name or service not known",
+               "blacklist", "blacklisted", "blocklist", "blocklisted",
+               "blocked by", "ip blocked", "listed at", "listed in",
+               "reputation", "spam block")
+    _FB_DNS = ("does not resolve", "failed to resolve", "could not resolve",
+               "unable to resolve", "name or service not known",
                "nodename nor servname", "getaddrinfo", "gaierror",
                "no address associated", "temporary failure in name resolution",
-               "nxdomain", "servfail")
-    _FB_RETRY_HARD = ("too many", "limit", "quota", "busy", "throttle",
-                      "rate limit", "try again", "temporarily unavailable")
+               "no such host", "host not found", "nxdomain", "servfail",
+               "dns lookup", "dns resolution", "dns query", "dns")
+    _FB_RETRY_HARD = ("too many", "rate limit", "ratelimit", "throttl",
+                      "limit exceeded", "quota exceeded", "over quota",
+                      "try again later", "temporar", "service unavailable",
+                      "server busy", "too busy", "maintenance", "simultaneous",
+                      "resource temporarily unavailable")
     _FB_SERVER_DROP = ("terminating connection", "imap server terminating",
                        "server terminating", "* bye", " bye ", "bye ",
-                       "auth process broken", "connection is closed",
-                       "server closed the connection", "server dropped the connection")
+                       "connection closed", "closed by server",
+                       "server disconnected", "auth process broken",
+                       "server closed the connection", "server dropped the connection",
+                       "dropped connection", "imap4rev1 server dropping")
+    _FB_RATE_LIMIT = ("too many", "rate limit", "throttl", "simultaneous", "limit")
     _FB_CONN_STRONG = ("connection reset by peer", "connection reset", "reset by peer",
                        "connection refused", "connection aborted", "connection closed",
                        "connection dropped", "connection lost", "connection failure",
@@ -415,19 +466,24 @@ except Exception as _status_err:
                        "cert verify", "cannot connect", "unable to connect",
                        "failed to connect", "connect failed", "negotiation failure",
                        "not supported by server", "stls not supported",
-                       "starttls not supported", "tls not supported", "imap4rev1")
+                       "starttls not supported", "tls not supported", "imap4rev1",
+                       "connection error", "hostname mismatch")
     _FB_RETRY = ("lookup failed", "user could not be routed", "could not route",
                  "retry", "try again", "temporarily unavailable", "temporary failure",
                  "service unavailable", "server busy", "too many", "rate limit",
                  "ratelimit", "throttle", "throttled", "over quota", "quota exceeded",
                  "mailbox full", "system busy", "try later", "unavailable",
                  "authentication services unavailable", "greylist", "greylisted",
-                 "unexpected extra arguments")
+                 "unexpected extra arguments", "server error", "internal error",
+                 "greeting", "busy", "not ready", "come back later",
+                 "backend", "upstream", "downstream")
     _FB_CONN = ("407", "proxy authentication", "proxy auth", "proxyconnect",
-                "proxy connect", "proxy route", "bad proxy format", "proxy", "socks")
+                "proxy connect", "proxy route", "bad proxy format", "proxy", "socks",
+                "connect", "socket", "network", "reset", "eof", "pipe", "refused",
+                "unreachable")
     _FB_WRONG = ("authenticate failed", "authentication error", "auth failed",
                  "auth failure", "invalid credential", "invalid login",
-                 "invalid password", "invalid user", "invalid username",
+                 "invalid password", "invalid username",
                  "invalid user name", "invalid account", "login failed",
                  "login failure", "login returned non-ok", "login non-ok",
                  "login error", "password incorrect", "password invalid",
@@ -435,29 +491,53 @@ except Exception as _status_err:
                  "authentication", "not authenticated", "bad credentials",
                  "bad username", "bad password", "logon failure",
                  "username and password not accepted", "user rejected",
-                 "password rejected", "invalid token", "expired token",
-                 "internal server error", "535")
-    _FB_BARE = ("login", "logon", "auth", "authenticate", "authentication",
-                "sign in", "signin", "sign-in", "credentials", "invalid")
+                 "password rejected", "invalid token", "expired token", "535")
 
     def st_classify(raw, domain=""):
+        """The inline twin of status.classify_error(), step for step.
+
+        The ORDER is the contract, not the tables: a rate-limited * BYE must
+        reach RETRY_LATER before the LOGIN_DROPPED arm, a proxy refusal must
+        reach CONNECTION_FAILED before RBL claims "blocked by", and a
+        destination-scoped proxy DNS failure must not become a DNS verdict about
+        the mailbox.
+        """
         t = (raw or "").strip().lower()
         if not t:
             return UNKNOWN
         if t.strip().rstrip(".:!,;").strip() in _FB_BARE:
             return WRONG_PASSWORD
-        for table, val in ((_FB_WRONG_STRONG, WRONG_PASSWORD),
-                           (_FB_APP, NEED_APP_PASSWORD),
-                           (_FB_RBL, RBL_BLOCKED),
-                           (_FB_DNS, DNS_FAILED),
-                           (_FB_RETRY_HARD, RETRY_LATER),
-                           (_FB_SERVER_DROP, LOGIN_DROPPED),
-                           (_FB_CONN_STRONG, CONNECTION_FAILED),
-                           (_FB_RETRY, RETRY_LATER),
-                           (_FB_CONN, CONNECTION_FAILED),
-                           (_FB_WRONG, WRONG_PASSWORD)):
-            if any(n in t for n in table):
-                return val
+        if any(n in t for n in _FB_WRONG_STRONG):
+            return WRONG_PASSWORD
+        if any(n in t for n in _FB_WRONG_USER):
+            return WRONG
+        if any(n in t for n in _FB_APP):
+            d = (domain or "").split("@")[-1].strip().lower()
+            if d in _FB_APP_HINT or "app" in t:
+                return NEED_APP_PASSWORD
+            return APP
+        if any(n in t for n in _FB_PROXY_BLOCKED):
+            return CONNECTION_FAILED
+        if any(n in t for n in _FB_RBL):
+            if "blocked" in t:
+                return RBL_BLOCKED
+            return RBL
+        if any(n in t for n in _FB_DNS):
+            return DNS_FAILED
+        if any(n in t for n in _FB_RETRY_HARD):
+            return RETRY_LATER
+        if any(n in t for n in _FB_SERVER_DROP):
+            if any(n in t for n in _FB_RATE_LIMIT):
+                return RETRY_LATER
+            return LOGIN_DROPPED
+        if any(n in t for n in _FB_CONN_STRONG):
+            return CONNECTION_FAILED
+        if any(n in t for n in _FB_RETRY):
+            return RETRY_LATER
+        if any(n in t for n in _FB_CONN):
+            return CONNECTION_FAILED
+        if any(n in t for n in _FB_WRONG):
+            return WRONG_PASSWORD
         return UNKNOWN
 
     def st_proxy_level(raw):
@@ -526,7 +606,18 @@ import runstate
 
 # v13.48: the click/outcome ledger. page() runs BEFORE the gate so even the
 # Unlock press is attributed, and install() runs BEFORE require() too - see below.
-import audit_log
+#
+# v13.86 FIX AU-6: THE IMPORT ITSELF WAS UNGUARDED. The block below already
+# treats every audit_log CALL as optional - hasattr, reload, hasattr - and says
+# so twice, but `import audit_log` sat bare. A deployment that lost the file
+# therefore died here, before require(), before the hero, on a page whose own
+# comment promises it degrades to "no ledger". It is a try/except now and the
+# name is bound to None on failure, which every hasattr() below already answers
+# False for. importlib.reload(None) raises and is caught by the same guard.
+try:
+    import audit_log
+except Exception:
+    audit_log = None
 
 # FIX AU-1 (v13.49): audit_log gained page() at 02:25, two hours AFTER this
 # process had already imported it at 00:42, and the process was never restarted.
@@ -610,7 +701,10 @@ if _run_was_active:
 
 # Last-resort sweep for a record with no run_active behind it (a redeploy or a
 # full process restart), and it still respects the 60s staleness window.
-_rs_path = runstate.tick()
+# The return value is deliberately NOT bound: the sweep is the point, and block
+# 105's `_rs_path` is a different variable holding a different thing (the record
+# begin() just wrote).
+runstate.tick()
 # @@END 007 PAGE_CONFIG
 
 # @@BLOCK 008 BUILD_IDENTITY deps=-
@@ -641,8 +735,14 @@ READ_FLOOR_DEFAULT = 15.0
 # v13.72: CONNECT_FLOOR_MIN was here and is gone. It was 10.0 and identical to
 # CONNECT_FLOOR_DEFAULT, and nothing in app.py or engine.py read it - the connect
 # cap is written as min(CONNECT_FLOOR_DEFAULT, ...) at every site, never as a
-# separate floor. READ_FLOOR_MIN below IS read (blocks 065 and 066) and stays.
-READ_FLOOR_MIN = 15.0
+# separate floor.
+#
+# v13.86 FIX DEAD-1: READ_FLOOR_MIN went the same way, and with a worse alibi -
+# this comment used to claim it "IS read (blocks 065 and 066)". The v13.86
+# FLOOR-1 fix rewrote both of those blocks to max(3.0, float(to)) and the
+# constant has been unreferenced ever since, so a reader following the comment
+# found a live-looking floor that nothing consults. The read cap is
+# READ_FLOOR_DEFAULT, applied as a min() in blocks 060 and 061.
 ATTEMPT_TIMEOUT_NORMAL = 15
 ATTEMPT_TIMEOUT_FAST = 10
 ATTEMPT_TIMEOUT_DEEP = 20
@@ -784,7 +884,9 @@ PROBE_BATCH_BUDGET = 120.0
 # FIX NOLIMIT-1 (v13.59): a hard ceiling that a bigger pool could not grow past.
 # A 3000-line file gets 4s per line of budget, bounded only by this.
 PROBE_BATCH_MAX = 3600.0
-PROBE_BUDGET_START = 120.0
+# v13.86 FIX DEAD-2: PROBE_BUDGET_START = 120.0 stood here and nothing read it.
+# Every call site passes PROBE_BATCH_BUDGET, so the second 120 was a constant that
+# looked like the budget and was not: editing it changed nothing.
 UI_MIN_INTERVAL = 0.12
 # FIX NOLIMIT-2 (v13.63): 40 / 200 / 120 / 5000 were display and retention caps on
 # a pool and a queue of thousands, and every one of them was hit by a real run.
@@ -1287,14 +1389,19 @@ def default_cfg() -> dict:
         # domain_cache.json lived in the working directory, so every user on a
         # deployment read, overwrote and rescued every other user's pool. They
         # are per-user files now, named by the unlocked passkey prefix exactly
-        # like every result file.
+        # like every other result file.
         "PROXY_FILE": user_file("proxies.txt"),
         "PROXY_ALL_FILE": user_file("proxies_all.txt"),
         "PROXY_KEYMAP_FILE": user_file("proxy_key_map.json"),
         "RESULTS_DIR": user_file("mail_results"),
         "CACHE_FILE": user_file("domain_cache.json"),
         "PROXY_META_FILE": user_file("proxy_meta.json"),
-        "MAX_PROXY_TRIES": 2,
+        # v13.86 FIX DEAD-3: MAX_PROXY_TRIES = 2 stood here and in build_cfg(),
+        # and NOTHING reads either one - not app.py, not engine.py, not a page.
+        # The retry count that actually bites is RETRY_CONNECTION_FAILED above
+        # and SAME_HOST_RETRIES; the proxy hop count is MAX_ROTATIONS. It is
+        # removed from both sides so the reset target and the live dict stay
+        # identical (see the MAX_WORKERS_MAX note at the top of this block).
         "PROXY_CONNECT_TIMEOUT": 8.0,
         "FAST_MODE": False,
         "FAILURE_COOLDOWN": FAILURE_COOLDOWN_DEFAULT,
@@ -1347,8 +1454,14 @@ APP_PASSWORD_DOMAINS = {
     "yahoo.de", "yahoo.it", "yahoo.es", "yahoo.com.br",
     "aol.com",
 }
-_APP_PW_16 = re.compile(r"^[a-z]{16}$")
-_APP_PW_SPACED = re.compile(r"^(?:[a-z]{4}\s){3}[a-z]{4}$")
+# v13.86 FIX APPPW-1: BOTH PATTERNS WERE LOWERCASE-ONLY. _looks_like_app_password
+# (block 023) uses them to decide whether a WRONG verdict needs the honest
+# "(may be correct - provider needs an APP PASSWORD)" note. Google prints the
+# 16-character app password in UPPERCASE, so a pasted "ABCDEFGHIJKLMNOP" matched
+# neither pattern, the note was added to a password that was already right, and
+# the user was sent chasing an app password they had. re.I fixes both.
+_APP_PW_16 = re.compile(r"^[a-z]{16}$", re.I)
+_APP_PW_SPACED = re.compile(r"^(?:[a-z]{4}\s){3}[a-z]{4}$", re.I)
 # @@END 021 DOMAIN_TABLES
 
 # @@BLOCK 022 EXCEPTION_TYPES deps=-
@@ -1865,8 +1978,14 @@ def clear_tunnel_cache():
         probe_stats.clear()
     # v13.72: and drop the cached key set, or a re-probe immediately after a
     # proxies.txt change would filter against the pool that just went away.
+    #
+    # v13.86 FIX CACHE-SCOPE: it dropped the WHOLE probe_live_keys table, so one
+    # user's Re-probe / Fetch / source switch also evicted every other session's
+    # entry - and the next probe cycle in those sessions re-read their whole
+    # proxies.txt from disk for nothing. The table is keyed by scope; only this
+    # scope's entry goes.
     try:
-        STATE.setdefault("probe_live_keys", {}).clear()
+        STATE.setdefault("probe_live_keys", {}).pop(_gate_scope(), None)
     except Exception:
         pass
 # @@END 025 PROBE_TELEMETRY
@@ -2640,6 +2759,13 @@ def build_diagnostics_text():
 # Absence is the NORMAL state: load_theme() starts from default_theme(), which
 # builds its hero from BUILD_TAG, and the file is written on first load below.
 THEME_FILE = user_file("theme.json")
+# v13.86 FIX THEME-LOCK: this block executes BEFORE block 039 binds
+# file_write_lock, and save_theme() is called from module level right here - so a
+# bare file_write_lock in save_theme() would be a NameError on the first load of
+# a fresh clone. A private lock covers the only file this module writes, and it
+# is process-wide, so two tabs of the SAME user still serialise against each
+# other.
+_THEME_LOCK = threading.Lock()
 
 THEME_PRESETS = {
     "Aurora":    {"g1": "#667eea", "g2": "#764ba2", "accent": "#8b5cf6", "accent2": "#22d3ee", "bg": "#0b1020", "panel": "#141b30", "text": "#e6ebff"},
@@ -2723,9 +2849,25 @@ def load_theme() -> dict:
 
 
 def save_theme(th: dict):
+    """Write this user's theme atomically.
+
+    v13.86 FIX THEME-ATOMIC: this was a bare truncating write. theme.json is the
+    one per-user preference rewritten on every colour pick and every keystroke in
+    the Hero Title box, so a teardown mid-write left a half file - and load_theme()
+    swallows the JSONDecodeError and starts again from default_theme(), silently
+    resetting every colour the user had set. It goes through a .tmp and
+    os.replace, under _THEME_LOCK, so a reader sees the old file or the new one
+    and never half of either.
+
+    The lock is private because this block runs before block 039 binds
+    file_write_lock - see the note at _THEME_LOCK above.
+    """
+    tmp = THEME_FILE + ".tmp"
     try:
-        with open(THEME_FILE, "w", encoding="utf-8") as f:
-            json.dump(th, f, indent=2)
+        with _THEME_LOCK:
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(th, f, indent=2)
+            os.replace(tmp, THEME_FILE)
     except Exception:
         pass
 
