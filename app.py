@@ -15646,6 +15646,13 @@ def _cs_selection_combos():
     return [_combo_only(_l) for _l in _cs_selection_lines() if ":" in _l]
 
 
+def _cs_on_clear_click():
+    str_lit.session_state["cs_keys"] = []
+    str_lit.session_state["cs_sent"] = False
+    _cs_save_sel()
+    str_lit.session_state["_cs_flash"] = ("success", "Selection cleared.")
+
+
 def _cs_on_mode_change():
     str_lit.session_state["cs_keys"] = []
     str_lit.session_state["cs_sent"] = False
@@ -15784,12 +15791,8 @@ else:
                                f"Action Mode.")
             str_lit.rerun()
     with _cs_b2:
-        if str_lit.button("🧽 Clear selection", width="stretch"):
-            str_lit.session_state["cs_keys"] = []
-            str_lit.session_state["cs_sent"] = False
-            _cs_save_sel()
-            str_lit.session_state["_cs_flash"] = ("success", "Selection cleared.")
-            str_lit.rerun()
+        str_lit.button("🧽 Clear selection", width="stretch",
+                       on_click=_cs_on_clear_click)
     with _cs_b3:
         if str_lit.button("🌍 Auto-assign from the rows", width="stretch",
                           help="Fills a country for every domain the built-in "
