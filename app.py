@@ -14633,7 +14633,14 @@ _CS_BY_CODE = {_c[0]: _c[1] for _c in _CS_COUNTRIES}
 _CS_LOOKUP_CAP = 120
 _CS_LOOKUP_WORKERS = 6
 _CS_RDAP_HOST_SEMS = {}
+_CS_RDAP_HOST_NEXT = {}
 _CS_RDAP_HOST_LOCK = threading.Lock()
+_CS_LOCATION_CUES = (
+    "location", "headquarters", "headquartered", "hq", "address",
+    "based in", "located in", "country", "office", "offices",
+    "street", "city", "postal", "zip", "tel", "phone",
+    "inc", "llc", "ltd", "gmbh", "corp", "pty", "plc", "srl", "sarl",
+)
 _CS_USA_FALSE_FRIENDS = frozenset({
     "medusa", "hausa", "yakuza", "ragusa", "syracuse", "lampeduza",
     "lampedusa", "formosa", "tolosa", "osa", "rosa", "musa", "ausa",
@@ -14929,7 +14936,24 @@ def _cs_match_country_text(text):
     return ""
 
 
-def _cs_score_country_text(text, domain="", min_hits=1):
+def _cs_has_context_near(raw_low, norm_low, cue, domain=""):
+    """True when `domain` or a location/org marker sits within ~140 chars of `cue`."""
+    _pos = 0
+    while True:
+        _idx = raw_low.find(cue, _pos)
+        if _idx == -1:
+            break
+        _win = raw_low[max(0, _idx - 140):min(len(raw_low), _idx + len(cue) + 140)]
+        if domain and domain in _win:
+            return True
+        _wnorm = " " + re.sub(r"[^a-z0-9]+", " ", _win) + " "
+        if any(f" {_loc} " in _wnorm for _loc in _CS_LOCATION_CUES):
+            return True
+        _pos = _idx + len(cue)
+    return False
+
+
+def _cs_score_country_text(text, domain="", min_hits=1, require_context=False):
     """Score country mentions in cleaned text. Returns best matching country name or ''."""
     _raw_low = str(text or "").lower()
     _low = " " + re.sub(r"[^a-z0-9.]+", " ", _raw_low) + " "
@@ -14941,19 +14965,10 @@ def _cs_score_country_text(text, domain="", min_hits=1):
             continue
         _hits = _low.count(f" {_cue} ")
         if _hits:
-            _bonus = 0
-            if _dom and _cue in _raw_low:
-                _pos = 0
-                while True:
-                    _idx = _raw_low.find(_cue, _pos)
-                    if _idx == -1:
-                        break
-                    _win_start = max(0, _idx - 120)
-                    _win_end = min(len(_raw_low), _idx + len(_cue) + 120)
-                    if _dom in _raw_low[_win_start:_win_end]:
-                        _bonus = 2
-                        break
-                    _pos = _idx + len(_cue)
+            _has_ctx = _cs_has_context_near(_raw_low, _low, _cue, _dom)
+            if require_context and not _has_ctx:
+                continue
+            _bonus = 2 if _has_ctx else 0
             _scores[_ctry] = _scores.get(_ctry, 0) + _hits + _bonus
 
     for _name in _CS_BY_NAME:
@@ -14961,7 +14976,11 @@ def _cs_score_country_text(text, domain="", min_hits=1):
             _nlow = _name.lower()
             _hits = _low.count(f" {_nlow} ")
             if _hits:
-                _scores[_name] = _scores.get(_name, 0) + _hits
+                _has_ctx = _cs_has_context_near(_raw_low, _low, _nlow, _dom)
+                if require_context and not _has_ctx:
+                    continue
+                _bonus = 2 if _has_ctx else 0
+                _scores[_name] = _scores.get(_name, 0) + _hits + _bonus
 
     if not _scores:
         return ""
@@ -15073,6 +15092,28 @@ def _cs_rdap_host_sem(host):
         return _sem
 
 
+def _cs_rdap_wait_slot(host):
+    """Enforce per-host spacing/cooldown before issuing an RDAP request."""
+    if host == "rdap.verisign.com":
+        return
+    with _CS_RDAP_HOST_LOCK:
+        _now = time.time()
+        _due = float(_CS_RDAP_HOST_NEXT.get(host, 0.0))
+        _wait = max(0.0, _due - _now)
+        _CS_RDAP_HOST_NEXT[host] = max(_now, _due) + random.uniform(0.45, 0.85)
+    if _wait > 0:
+        time.sleep(min(_wait, 3.5))
+
+
+def _cs_rdap_backoff(host, seconds=2.5):
+    """Push next allowed query time forward when an RDAP host returns HTTP 429."""
+    with _CS_RDAP_HOST_LOCK:
+        _CS_RDAP_HOST_NEXT[host] = max(
+            float(_CS_RDAP_HOST_NEXT.get(host, 0.0)),
+            time.time() + float(seconds),
+        )
+
+
 def _cs_rdap_country(domain):
     """Query RDAP with minimal hops (initial registry + at most 1 related link)."""
     _dom = _cs_provider_root(domain) or str(domain or "").lower().strip()
@@ -15104,8 +15145,7 @@ def _cs_rdap_country(domain):
         _sem = _cs_rdap_host_sem(_host)
         try:
             with _sem:
-                if _host != "rdap.verisign.com":
-                    time.sleep(random.uniform(0.15, 0.35))
+                _cs_rdap_wait_slot(_host)
                 _code, _raw_bytes = _cs_fetch_url(_u, _headers, timeout=2.5)
             _raw = _raw_bytes.decode("utf-8", errors="ignore")
             try:
@@ -15125,6 +15165,8 @@ def _cs_rdap_country(domain):
             else:
                 _notes.append(f"{_host}:HTTP {_code} (non-JSON)")
         except urllib.error.HTTPError as _he:
+            if _he.code == 429:
+                _cs_rdap_backoff(_host, 2.5)
             _notes.append(f"{_host}:HTTP {_he.code}")
         except Exception as _ex:
             _notes.append(f"{_host}:{type(_ex).__name__}")
@@ -15189,7 +15231,7 @@ def _cs_extract_bing_organic_text(html, domain):
 
 
 def _cs_web_country(domain):
-    """Search Bing organic result cards for country mentions with min_hits=2 guardrail."""
+    """Search Bing organic result cards for contextual country mentions."""
     _dom = _cs_provider_root(domain) or str(domain or "").lower().strip()
     if not _dom:
         return "", "invalid domain"
@@ -15217,10 +15259,12 @@ def _cs_web_country(domain):
             _eng = "bing"
         _html = _raw_bytes.decode("utf-8", errors="ignore")
         _clean = _cs_extract_bing_organic_text(_html, _dom)
-        _ctry = _cs_score_country_text(_clean, domain=_dom, min_hits=2)
+        _ctry = _cs_score_country_text(
+            _clean, domain=_dom, min_hits=2, require_context=True
+        )
         if _ctry in _CS_BY_NAME:
             return _ctry, f"WEB({_eng}) HTTP {_code} -> {_ctry}"
-        return "", f"WEB({_eng}) HTTP {_code} ({len(_clean)} organic chars, <2 hits)"
+        return "", f"WEB({_eng}) HTTP {_code} ({len(_clean)} organic chars, <2 contextual hits)"
     except urllib.error.HTTPError as _he:
         if _he.code in (403, 429) and callable(_proxy_fn):
             try:
@@ -15231,10 +15275,12 @@ def _cs_web_country(domain):
                     )
                     _html = _raw_bytes.decode("utf-8", errors="ignore")
                     _clean = _cs_extract_bing_organic_text(_html, _dom)
-                    _ctry = _cs_score_country_text(_clean, domain=_dom, min_hits=2)
+                    _ctry = _cs_score_country_text(
+                        _clean, domain=_dom, min_hits=2, require_context=True
+                    )
                     if _ctry in _CS_BY_NAME:
                         return _ctry, f"WEB(bing+px) HTTP {_code} -> {_ctry}"
-                    return "", f"WEB(bing+px) HTTP {_code} (<2 hits)"
+                    return "", f"WEB(bing+px) HTTP {_code} (<2 contextual hits)"
             except Exception as _px_ex:
                 return "", f"WEB(bing+px):{type(_px_ex).__name__}"
         return "", f"WEB(bing):HTTP {_he.code}"
@@ -15254,7 +15300,7 @@ def _cs_label_country(domain):
 
 
 def _cs_discover_country(domain):
-    """Try RDAP (max 2 hops), Bing organic cards (min_hits=2), site check, then label heuristic."""
+    """Try RDAP (max 2 hops), Bing organic cards (contextual min_hits=2), site check, then label heuristic."""
     _ts = datetime.now().strftime("%H:%M:%S")
     _ctry, _rdap_note = _cs_rdap_country(domain)
     if _ctry in _CS_BY_NAME:
