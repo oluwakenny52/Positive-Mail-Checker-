@@ -14817,67 +14817,135 @@ def _cs_match_country_text(text):
     return ""
 
 
+def _cs_extract_vcard_country(obj):
+    """Walk RDAP JSON vcardArray structures for country fields."""
+    if isinstance(obj, dict):
+        if "country" in obj and isinstance(obj["country"], str):
+            _c = obj["country"].strip().upper()
+            if _c in _CS_BY_CODE:
+                return _CS_BY_CODE[_c]
+            _m = _cs_match_country_text(obj["country"])
+            if _m:
+                return _m
+        for _v in obj.values():
+            _found = _cs_extract_vcard_country(_v)
+            if _found:
+                return _found
+    elif isinstance(obj, list):
+        if (len(obj) >= 4 and obj[0] == "adr" and isinstance(obj[3], list)
+                and len(obj[3]) >= 7):
+            _ctry_cell = str(obj[3][6] or "").strip()
+            if _ctry_cell:
+                if _ctry_cell.upper() in _CS_BY_CODE:
+                    return _CS_BY_CODE[_ctry_cell.upper()]
+                _m = _cs_match_country_text(_ctry_cell)
+                if _m:
+                    return _m
+        for _item in obj:
+            _found = _cs_extract_vcard_country(_item)
+            if _found:
+                return _found
+    return ""
+
+
 def _cs_rdap_country(domain):
-    """Query RDAP for registrant country code (e.g. 'US' -> 'United States')."""
+    """Query RDAP for registrant country. Returns (country_name, status_note)."""
     _dom = _cs_provider_root(domain) or str(domain or "").lower().strip()
     if not _dom:
-        return ""
+        return "", "invalid domain"
     _tld = _dom.rsplit(".", 1)[-1]
     _urls = []
     if _tld in ("com", "net"):
         _urls.append(f"https://rdap.verisign.com/{_tld}/v1/domain/{_dom}")
+    elif _tld == "org":
+        _urls.append(f"https://rdap.publicinterestregistry.org/rdap/domain/{_dom}")
     _urls.append(f"https://rdap.org/domain/{_dom}")
+    _notes = []
     for _u in _urls:
+        _host = _u.split("/")[2]
         try:
             _req = urllib.request.Request(
-                _u, headers={"User-Agent": "Mozilla/5.0", "Accept": "application/rdap+json"}
+                _u,
+                headers={
+                    "User-Agent": "Mozilla/5.0 (compatible; DomainGeoLookup/1.0)",
+                    "Accept": "application/rdap+json, application/json",
+                },
             )
-            with urllib.request.urlopen(_req, timeout=3.0) as _resp:
-                _raw = _resp.read(65536).decode("utf-8", errors="ignore")
+            with urllib.request.urlopen(_req, timeout=3.5) as _resp:
+                _code = getattr(_resp, "status", 200)
+                _raw = _resp.read(98304).decode("utf-8", errors="ignore")
+            try:
+                _parsed = json.loads(_raw)
+                _vc = _cs_extract_vcard_country(_parsed)
+                if _vc in _CS_BY_NAME:
+                    return _vc, f"RDAP({_host}) HTTP {_code} -> {_vc}"
+            except Exception:
+                pass
             for _m in re.finditer(r'"([A-Z]{2})"', _raw):
-                _code = _m.group(1)
-                if _code in _CS_BY_CODE:
-                    return _CS_BY_CODE[_code]
+                _cc = _m.group(1)
+                if _cc in _CS_BY_CODE:
+                    return _CS_BY_CODE[_cc], f"RDAP({_host}) code {_cc} -> {_CS_BY_CODE[_cc]}"
             _by_txt = _cs_match_country_text(_raw)
             if _by_txt:
-                return _by_txt
-        except Exception:
-            continue
-    return ""
+                return _by_txt, f"RDAP({_host}) text -> {_by_txt}"
+            _redacted = "redacted" in _raw.lower()
+            _notes.append(f"{_host}:HTTP {_code} ({'redacted' if _redacted else 'no country'})")
+        except urllib.error.HTTPError as _he:
+            _notes.append(f"{_host}:HTTP {_he.code}")
+        except Exception as _ex:
+            _notes.append(f"{_host}:{type(_ex).__name__}")
+    return "", "; ".join(_notes)
 
 
 def _cs_web_country(domain):
-    """Fallback web snippet lookup for organizational .com/.net/.org domains."""
+    """Fallback web snippet lookup. Returns (country_name, status_note)."""
     _dom = _cs_provider_root(domain) or str(domain or "").lower().strip()
     if not _dom:
-        return ""
-    _q = urllib.parse.quote_plus(f'"{_dom}" headquarters OR address OR contact')
-    _url = f"https://html.duckduckgo.com/html/?q={_q}"
-    try:
-        _req = urllib.request.Request(
-            _url,
-            headers={
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-                "Accept-Language": "en-US,en;q=0.9",
-            },
-        )
-        with urllib.request.urlopen(_req, timeout=3.5) as _resp:
-            _html = _resp.read(98304).decode("utf-8", errors="ignore")
-        _clean = re.sub(r"<[^>]+>", " ", _html)
-        return _cs_match_country_text(_clean)
-    except Exception:
-        return ""
+        return "", "invalid domain"
+    _q = urllib.parse.quote_plus(f'"{_dom}" country OR headquarters OR address OR contact')
+    _engines = (
+        ("ddg", f"https://html.duckduckgo.com/html/?q={_q}"),
+        ("bing", f"https://www.bing.com/search?q={_q}"),
+    )
+    _notes = []
+    for _eng, _url in _engines:
+        try:
+            _req = urllib.request.Request(
+                _url,
+                headers={
+                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                                  "AppleWebKit/537.36 (KHTML, like Gecko) "
+                                  "Chrome/124.0.0.0 Safari/537.36",
+                    "Accept-Language": "en-US,en;q=0.9",
+                },
+            )
+            with urllib.request.urlopen(_req, timeout=4.0) as _resp:
+                _code = getattr(_resp, "status", 200)
+                _html = _resp.read(131072).decode("utf-8", errors="ignore")
+            _clean = re.sub(r"<script[^>]*>.*?</script>", " ", _html, flags=re.S | re.I)
+            _clean = re.sub(r"<style[^>]*>.*?</style>", " ", _clean, flags=re.S | re.I)
+            _clean = re.sub(r"<[^>]+>", " ", _clean)
+            _ctry = _cs_match_country_text(_clean)
+            if _ctry in _CS_BY_NAME:
+                return _ctry, f"WEB({_eng}) HTTP {_code} -> {_ctry}"
+            _notes.append(f"{_eng}:HTTP {_code} ({len(_clean)} chars, no country)")
+        except urllib.error.HTTPError as _he:
+            _notes.append(f"{_eng}:HTTP {_he.code}")
+        except Exception as _ex:
+            _notes.append(f"{_eng}:{type(_ex).__name__}")
+    return "", "; ".join(_notes)
 
 
 def _cs_discover_country(domain):
-    """Try RDAP first, then web snippet search. Returns a valid country name or ''."""
-    _ctry = _cs_rdap_country(domain)
+    """Try RDAP first, then web search. Returns (country_name, trace_line)."""
+    _ts = datetime.now().strftime("%H:%M:%S")
+    _ctry, _rdap_note = _cs_rdap_country(domain)
     if _ctry in _CS_BY_NAME:
-        return _ctry
-    _ctry = _cs_web_country(domain)
+        return _ctry, f"{_ts} MATCH {domain:<28} -> {_ctry} [{_rdap_note}]"
+    _ctry, _web_note = _cs_web_country(domain)
     if _ctry in _CS_BY_NAME:
-        return _ctry
-    return ""
+        return _ctry, f"{_ts} MATCH {domain:<28} -> {_ctry} [{_rdap_note} | {_web_note}]"
+    return "", f"{_ts} MISS  {domain:<28} -> Global [{_rdap_note} | {_web_note}]"
 
 
 def _cs_country_of(domain, mapping):
@@ -15055,7 +15123,7 @@ if str_lit.session_state.get(_CS_OWNER_KEY) != _cs_owner:
     for _k in ("cs_mode", "cs_source", "cs_keys", "cs_sent", "cs_map", "cs_map_ver",
                "cs_teach_dom", "cs_teach_ctry", "cs_map_open", "cs_edit_dom",
                "cs_edit_ctry", "_cs_edit_for", "_cs_sel_loaded", "_cs_rows_cache",
-               "_cs_flash", "cs_hide_empty"):
+               "_cs_flash", "cs_hide_empty", "cs_lookup_trace"):
         str_lit.session_state.pop(_k, None)
     str_lit.session_state[_CS_OWNER_KEY] = _cs_owner
 if "cs_map" not in str_lit.session_state:
@@ -15231,17 +15299,22 @@ else:
                 _batch = _global_unmapped[:_CS_LOOKUP_CAP]
                 _m = dict(_cs_map)
                 _found = 0
+                _new_traces = []
                 _bar = str_lit.progress(0.0, text=f"0/{len(_batch)} - searching Global domains...")
                 for _idx, _dom in enumerate(_batch, 1):
                     _bar.progress(
                         _idx / len(_batch),
                         text=f"{_idx}/{len(_batch)} - looking up {_dom}...",
                     )
-                    _ctry = _cs_discover_country(_dom)
+                    _ctry, _tline = _cs_discover_country(_dom)
+                    _new_traces.append(_tline)
                     if _ctry:
                         _m[_dom] = _ctry
                         _found += 1
                 _bar.empty()
+                _prev_trace = list(str_lit.session_state.get("cs_lookup_trace") or [])
+                _prev_trace.extend(_new_traces)
+                str_lit.session_state["cs_lookup_trace"] = _prev_trace[-250:]
                 if _found:
                     str_lit.session_state["cs_map"] = _m
                     str_lit.session_state["cs_map_ver"] = _cs_ver + 1
@@ -15257,9 +15330,31 @@ else:
                     str_lit.session_state["_cs_flash"] = (
                         "warning",
                         f"Searched **{len(_batch)}** {_CS_GLOBAL_FLAG} Global domain(s), "
-                        f"but none returned a clear country.",
+                        f"but none returned a clear country. See Global Search Trace Log below.",
                     )
             str_lit.rerun()
+
+    _cs_traces = list(str_lit.session_state.get("cs_lookup_trace") or [])
+    if _cs_traces:
+        _cs_match_n = sum(1 for _l in _cs_traces if " MATCH " in _l)
+        _cs_miss_n = sum(1 for _l in _cs_traces if " MISS " in _l)
+        with str_lit.expander(
+            f"📜 Global Search Trace Log ({len(_cs_traces)} checked · "
+            f"{_cs_match_n} matched · {_cs_miss_n} missed)",
+            expanded=True,
+        ):
+            _tl1, _tl2 = str_lit.columns([0.75, 0.25])
+            with _tl1:
+                str_lit.caption(
+                    "Shows RDAP and web fallback status for every domain queried by "
+                    "Search 🌐 Global."
+                )
+            with _tl2:
+                if str_lit.button("🧹 Clear trace", key="cs_clear_trace", width="stretch"):
+                    str_lit.session_state["cs_lookup_trace"] = []
+                    str_lit.rerun()
+            with str_lit.container(height=240):
+                str_lit.code("\n".join(reversed(_cs_traces)), language="text")
 
     if _cs_label():
         str_lit.caption(f"Sent section: **{_cs_label()}** - "
