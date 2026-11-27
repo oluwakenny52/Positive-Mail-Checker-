@@ -4148,13 +4148,20 @@ def _gated_tunnel(proxy_str, timeout=None, targets=None):
 # @@END 041 PROXY_407_PARK
 
 # @@BLOCK 042 CHECKER_CONFIG deps=009
+# v13.86 FIX DEAD-4: TWO FIELDS WERE WRITTEN BY EVERY CALL SITE AND READ BY
+# NOTHING. max_concurrent_checks carried a different value per mode and had no
+# reader anywhere - not app.py, not engine.py, not a page. The concurrency that
+# actually bites is CFG["MAX_WORKERS_START"], which block 106 reads, plus the
+# four gate ceilings in CFG. max_retries had exactly one reader,
+# CFG["MAX_PROXY_TRIES"] in block 054, and nothing read THAT either; the retry
+# counts that bite are RETRY_CONNECTION_FAILED and SAME_HOST_RETRIES. Both
+# fields, their three call sites in block 046 and the MAX_PROXY_TRIES key in 054
+# go together, so the dataclass holds only what is consumed.
 @dataclass
 class CheckerConfig:
     mode_name: str = "Normal"
     fast_mode: bool = False
-    max_concurrent_checks: int = 50
     connect_timeout: float = 8.0
-    max_retries: int = 2
     failure_cooldown: float = FAILURE_COOLDOWN_DEFAULT
 # @@END 042 CHECKER_CONFIG
 
@@ -4637,24 +4644,26 @@ for _k, (_lo, _hi), _dv in zip(("ui_workers", "ui_deadline", "ui_timeout"),
     str_lit.session_state[_k] = max(_lo, min(_hi, _v))
 
 if checker_mode == "Fast Mode":
-    engine_config = CheckerConfig(mode_name="Fast", fast_mode=True, max_concurrent_checks=100,
-                                  connect_timeout=5.0, max_retries=1, failure_cooldown=60.0)
+    # v13.86 FIX DEAD-4: max_concurrent_checks= and max_retries= are gone from
+    # every branch - see block 042. What is left is what block 054 reads.
+    engine_config = CheckerConfig(mode_name="Fast", fast_mode=True,
+                                  connect_timeout=5.0, failure_cooldown=60.0)
     workers = str_lit.sidebar.slider("Workers Start", 1, 100, step=1, key="ui_workers")
     deadline = str_lit.sidebar.slider("Deadline (Seconds)", 10, 300, step=5,
                                       key="ui_deadline")
     timeout = str_lit.sidebar.slider("Timeout", 3, 40, step=1, key="ui_timeout")
     default_hosts = 2
 elif checker_mode == "Deep / Aggressive Mode":
-    engine_config = CheckerConfig(mode_name="Deep", fast_mode=False, max_concurrent_checks=30,
-                                  connect_timeout=12.0, max_retries=4, failure_cooldown=20.0)
+    engine_config = CheckerConfig(mode_name="Deep", fast_mode=False,
+                                  connect_timeout=12.0, failure_cooldown=20.0)
     workers = str_lit.sidebar.slider("Workers Start", 1, 50, step=1, key="ui_workers")
     deadline = str_lit.sidebar.slider("Deadline (Seconds)", 15, 400, step=5,
                                       key="ui_deadline")
     timeout = str_lit.sidebar.slider("Timeout", 5, 60, step=1, key="ui_timeout")
     default_hosts = 4
 else:
-    engine_config = CheckerConfig(mode_name="Normal", fast_mode=False, max_concurrent_checks=50,
-                                  connect_timeout=8.0, max_retries=2,
+    engine_config = CheckerConfig(mode_name="Normal", fast_mode=False,
+                                  connect_timeout=8.0,
                                   failure_cooldown=FAILURE_COOLDOWN_DEFAULT)
     workers = str_lit.sidebar.slider("Workers Start", 1, 100, step=1, key="ui_workers")
     deadline = str_lit.sidebar.slider("Deadline (Seconds)", 10, 300, step=5,
@@ -4662,7 +4671,12 @@ else:
     timeout = str_lit.sidebar.slider("Timeout", 3, 40, step=1, key="ui_timeout")
     default_hosts = 3
 # v13.71: 0 IS NOW "ALL" AND IS THE DEFAULT. 5000 cut every longer list silently.
-max_acc = str_lit.sidebar.slider("Max Accounts (0 = all)", 0, 5000, step=100,
+# v13.86 FIX ACC-STEP: THE STEP WAS 100. A 250-line queue could only be run as
+# 200 or 300 - the ceiling either cut 50 accounts the user asked for or carried
+# 50 they did not - and the first notch off "0 = all" was a whole hundred. Step 1
+# so an exact count is settable; the key is seeded and clamped above, so the
+# slider still passes only step= and key=.
+max_acc = str_lit.sidebar.slider("Max Accounts (0 = all)", 0, 5000, step=1,
                                  key="ui_max_acc",
                                  help="The hard ceiling for one run. 0 means every account "
                                       "in the queue - the old 5000 default quietly dropped "
@@ -5050,24 +5064,37 @@ def _proxy_meta_path() -> str:
 
 
 def _load_proxy_meta_file() -> int:
-    """Restore scores, countries, counters, verdicts and parks. Once per scope."""
+    """Restore scores, countries, counters, verdicts and parks. Once per scope.
+
+    v13.86 FIX META-RETRY: THE SCOPE WAS MARKED DONE BEFORE THE READ. The set
+    exists so a second load in the same scope cannot restore twice, but adding
+    the scope on the way IN meant an unreadable, half-written or truncated
+    proxy_meta.json marked the scope loaded for ever: every later load skipped
+    the restore and the pool stayed cold - scores at the 50 default, no country,
+    no park clock, and block 069's tier gate blind - until the process restarted
+    or a Forget dropped the key. The mark is made only once the file has been
+    read AND understood now, so a failed read is retried on the next load. A
+    missing file still marks: there is nothing to restore and re-statting it
+    every rerun is waste.
+    """
     _scope = _gate_scope()
     _done = STATE.setdefault("proxy_meta_loaded", set())
     if _scope in _done:
         return 0
-    _done.add(_scope)
 
     _path = _proxy_meta_path()
     if not os.path.exists(_path):
+        _done.add(_scope)
         return 0
     try:
         with open(_path, encoding="utf-8") as f:
             data = json.load(f)
     except Exception as e:
         log_startup(f"WARNING: {os.path.basename(_path)} unreadable ({e}); "
-                    f"starting from a cold table.")
+                    f"starting from a cold table - it is retried on the next load.")
         return 0
     if not isinstance(data, dict):
+        _done.add(_scope)
         return 0
 
     # New envelope, or the legacy flat dict written by every build before this one.
@@ -5137,6 +5164,8 @@ def _load_proxy_meta_file() -> int:
             proxy_407_until[_p] = _u
             parks += 1
 
+    # The read AND the tables are both done - only now is the scope spent.
+    _done.add(_scope)
     log_startup(f"Restored {restored} node record(s), {seeded} probe verdict(s) and "
                 f"{parks} park(s) from {os.path.basename(_path)} "
                 f"(live values kept).", quiet=True)
@@ -6002,14 +6031,32 @@ else:
         _raw_for_scores = load_proxies() if choice == "mix" else []
         with str_lit.sidebar.form("pool_pick_form"):
             picked = []
+            # v13.86 FIX POOLCHK-1: EVERY CHECKBOX HERE PASSED value= BESIDE A
+            # key=. Block 045's own notes call that combination out: the widget
+            # is created with a default AND a session value, so Streamlit warns
+            # on every load - and the value= is IGNORED from the second render
+            # on. Re-opening the picker with a different pre-pick therefore kept
+            # showing the ticks of the previous pool, and a country the user had
+            # cleared came back ticked on its own. The key is seeded once from
+            # the saved pick and the widget is created with key= only.
+            #
+            # Keys of a country that is no longer listed are dropped BEFORE any
+            # widget is built, so switching pool mode cannot leave a dead
+            # poolchk_ key behind for the life of the session.
+            _pk_live = {f"poolchk_{choice}_{_c}" for _c in available_countries}
+            for _old in [k for k in list(str_lit.session_state.keys())
+                         if str(k).startswith("poolchk_") and k not in _pk_live]:
+                str_lit.session_state.pop(_old, None)
             for c in available_countries:
+                _pk = f"poolchk_{choice}_{c}"
+                if _pk not in str_lit.session_state:
+                    str_lit.session_state[_pk] = c in str_lit.session_state.picked_countries
                 label = c
                 if choice == "mix":
                     scores = [proxy_meta.get(p, {}).get("score", 0) for p in _raw_for_scores
                               if str(proxy_meta.get(p, {}).get("country", "")).upper() == c]
                     label = f"{c}  score={max(scores) if scores else 0}"
-                if str_lit.checkbox(label, value=c in str_lit.session_state.picked_countries,
-                                    key=f"poolchk_{choice}_{c}"):
+                if str_lit.checkbox(label, key=_pk):
                     picked.append(c)
             if str_lit.form_submit_button("Done"):
                 if not picked:
@@ -6148,7 +6195,10 @@ def build_cfg():
         "RESULTS_DIR": user_file("mail_results"),
         "CACHE_FILE": user_file("domain_cache.json"),
         "PROXY_META_FILE": user_file("proxy_meta.json"),
-        "MAX_PROXY_TRIES": engine_config.max_retries,
+        # v13.86 FIX DEAD-4: MAX_PROXY_TRIES was engine_config.max_retries and
+        # NOTHING read it - not app.py, not engine.py, not a page. Its dataclass
+        # field went with it (block 042). The retry counts that actually bite are
+        # RETRY_CONNECTION_FAILED above and SAME_HOST_RETRIES.
         "PROXY_CONNECT_TIMEOUT": engine_config.connect_timeout,
         "FAST_MODE": engine_config.fast_mode,
         "FAILURE_COOLDOWN": engine_config.failure_cooldown,
@@ -6478,9 +6528,25 @@ with str_lit.sidebar:
 # the gated auth-module reload needle, which must stay at one occurrence.
 #
 # A stale or broken notify degrades to "no bell", never to a dead page.
-import notify
+#
+# v13.86 FIX BELL-3: THE IMPORT ITSELF WAS BARE. Everything below already treats
+# every notify CALL as optional - hasattr, try/except, hasattr - but `import
+# notify` sat alone on its line, so a deployment that had lost the file died
+# here with ImportError, AFTER the hero, the whole sidebar and the bell row had
+# been painted. It is a try/except now and the name is bound to None, which every
+# hasattr() below answers False for; importlib.reload(None) raises and is caught
+# by the same guard, so the None check on the reload is belt and braces.
+try:
+    import notify
+except Exception:
+    notify = None
+    try:
+        log_startup("WARNING: notify.py unavailable; the bell is disabled.")
+    except Exception:
+        pass
 
-if not (hasattr(notify, "render_bell") and hasattr(notify, "system_tick")):
+if notify is not None and not (hasattr(notify, "render_bell")
+                               and hasattr(notify, "system_tick")):
     try:
         notify = importlib.reload(notify)
     except Exception:
@@ -6998,6 +7064,16 @@ def tls_connect(host, port, proxy_str=None, insecure=None, timeout=None):
 
     insecure=None means "read ALLOW_SELF_SIGNED from CFG", so every caller -
     including the Mailbox Reader - honours the checkbox.
+
+    v13.86 FIX SOCKLEAK-1: NEITHER ARM CLOSED THE VERIFIED SOCKET.
+    wrap_socket() does not take ownership of a socket it FAILS on - the caller
+    does - and both failure paths walked away from `raw`: the TLS_STRICT arm
+    raised with the socket still open, and the fallback arm opened a brand-new
+    socket and left the first one to the garbage collector. That is one leaked
+    fd per bad certificate on a pool where a mismatched-cert host is normal, and
+    the process runs for days. `raw` is closed before either arm decides what to
+    do, and a generic handshake failure (a timeout is the common one) closes it
+    too before it propagates.
     """
     if insecure is None:
         insecure = bool(live_cfg().get("ALLOW_SELF_SIGNED", True))
@@ -7009,6 +7085,10 @@ def tls_connect(host, port, proxy_str=None, insecure=None, timeout=None):
     try:
         return _tls_context(host, True).wrap_socket(raw, server_hostname=host)
     except ssl.SSLError as e:
+        try:
+            raw.close()
+        except Exception:
+            pass
         if live_cfg().get("TLS_STRICT", False):
             warnings.warn(f"Verified TLS failed for {host} ({e!r}); "
                           f"TLS_STRICT is ON so NOT falling back")
@@ -7017,6 +7097,14 @@ def tls_connect(host, port, proxy_str=None, insecure=None, timeout=None):
                       f"retrying unverified on a FRESH socket")
         return _tls_context(host, False).wrap_socket(
             _raw_socket(host, port, proxy_str, timeout), server_hostname=host)
+    except Exception:
+        # A handshake timeout or a reset is not an SSLError, so it never reached
+        # the arm above - the verified socket would have leaked on that path too.
+        try:
+            raw.close()
+        except Exception:
+            pass
+        raise
 # @@END 061 TLS_LAYER
 
 # @@BLOCK 062 PX_TAG deps=052
@@ -16852,6 +16940,39 @@ def _check_account_core(email, password, conf, domain, proxy_pool, thread_state,
     trace_logs.append(
         f"{_nf_n} host(s) failed at the transport level and DIRECT was never dialled -> "
         f"the proxy path is the suspect, not the password.")
+    # v13.86 FIX SMTP-1: smtp_failed_check() WAS DEFINED IN BLOCK 068 AND CALLED
+    # NOWHERE. It is the one control that can separate the two readings of this
+    # exact tail: it dials the SAME node at the domain's SMTP submission ports
+    # and reports whether the node's egress can reach this domain's mail at all.
+    # A 220 means the node is fine and the IMAP/POP host ladder is what failed; a
+    # total failure means the egress cannot reach the domain and no host name
+    # would have helped. Without it the tail printed the same sentence for both
+    # and the user had to guess. It is spent only here, on the last rung of the
+    # last branch, and it returns None (nothing attempted) for a domain with no
+    # SMTP candidate, which then keeps the original wording.
+    _smtp_ok = None
+    if px:
+        try:
+            _smtp_ok = smtp_failed_check(domain, px, trace_logs)
+        except Exception as _sfe:
+            trace_logs.append(f"SMTP failed check crashed: {_sfe}")
+            _smtp_ok = None
+    if _smtp_ok is True:
+        return None, FAILED, (
+            f"all hosts unreachable ({_nf_n} host(s) timed out or refused) and the DIRECT "
+            f"sweep never ran - but the SAME node DOES reach this domain's SMTP submission "
+            f"port, so the node's egress is fine and the IMAP/POP host ladder is what "
+            f"failed. Check the discovered host names for this domain, or retry from "
+            f"another egress, before discarding the combo."
+        ), None, trace_logs
+    if _smtp_ok is False:
+        return None, FAILED, (
+            f"all hosts unreachable ({_nf_n} host(s) timed out or refused) and the DIRECT "
+            f"sweep never ran. The SAME node also failed this domain's SMTP submission "
+            f"ports, so the proxy's egress cannot reach this domain's mail at all - retry "
+            f"from another egress (or with Proxy Mode Engine = off) before discarding the "
+            f"combo."
+        ), None, trace_logs
     return None, FAILED, (
         f"all hosts unreachable ({_nf_n} host(s) timed out or refused) and the DIRECT "
         f"sweep never ran, so this is the path rather than the mailbox. Retry from another "
