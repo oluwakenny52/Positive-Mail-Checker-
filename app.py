@@ -5521,7 +5521,7 @@ def is_proxy_alive(proxy_host, proxy_port, timeout=2):
 # ==========================================================================
 _PROXY_SCHEMES = ("socks5://", "socks4://", "sock5://", "socks://", "http://",
                   "https://", "socks5:", "sock5:", "socks4:", "http:", "https:")
-_PROXY_LABEL_RE = re.compile(r"^(?:[-*\u2022\u203a>\u2192]|\d{1,3}[.)])\s*")
+_PROXY_LABEL_RE = re.compile(r"^(?:[-*\u2022\u203a>\u2192]|\d{1,3}[.)](?!\d))\s*")
 _HOST_OK = re.compile(r"^[A-Za-z0-9]([A-Za-z0-9.\-]{0,252})$")
 _MASKED_RE = re.compile(r"^(\d{1,3}|[A-Za-z]{1,5})(\.(\d{1,3}|[A-Za-z]{1,5})){1,3}$")
 
