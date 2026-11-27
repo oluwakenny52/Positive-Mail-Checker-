@@ -12717,6 +12717,7 @@ except Exception:
 
 import urllib.parse
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # ---- single BUCKET table (was RESULT_INSPECT + RESULT_ACTION_MODES duplicated) ----
 PREFILTER_LABELS = [
@@ -14628,7 +14629,8 @@ _CS_COUNTRIES = (
 
 _CS_BY_NAME = {_c[1]: _c for _c in _CS_COUNTRIES}
 _CS_BY_CODE = {_c[0]: _c[1] for _c in _CS_COUNTRIES}
-_CS_LOOKUP_CAP = 35
+_CS_LOOKUP_CAP = 120
+_CS_LOOKUP_WORKERS = 6
 _CS_TEXT_CUES = (
     ("united states", "United States"),
     ("u.s.a.", "United States"),
@@ -14731,6 +14733,33 @@ _CS_TEXT_CUES = (
     ("kathmandu", "Nepal"),
     ("bangladesh", "Bangladesh"),
     ("dhaka", "Bangladesh"),
+    ("bonaire", "Caribbean Netherlands"),
+    ("curacao", "Curacao"),
+    ("aruba", "Aruba"),
+    ("puerto rico", "Puerto Rico"),
+    ("taiwan", "Taiwan"),
+    ("taipei", "Taiwan"),
+    ("kuala lumpur", "Malaysia"),
+    ("malaysia", "Malaysia"),
+    ("bangkok", "Thailand"),
+    ("thailand", "Thailand"),
+    ("manila", "Philippines"),
+    ("philippines", "Philippines"),
+    ("ho chi minh", "Vietnam"),
+    ("hanoi", "Vietnam"),
+    ("vietnam", "Vietnam"),
+    ("cairo", "Egypt"),
+    ("egypt", "Egypt"),
+    ("casablanca", "Morocco"),
+    ("morocco", "Morocco"),
+    ("nairobi", "Kenya"),
+    ("kenya", "Kenya"),
+    ("accra", "Ghana"),
+    ("ghana", "Ghana"),
+    ("buenos aires", "Argentina"),
+    ("argentina", "Argentina"),
+    ("santiago", "Chile"),
+    ("chile", "Chile"),
 )
 # The two pseudo-groups sort to the BOTTOM of every picker - after every real
 # country - and the providers group sits above Global, because Global is the
@@ -14979,7 +15008,7 @@ def _cs_related_rdap_urls(parsed):
     return _out[:1]
 
 
-def _cs_fetch_url(url, headers, timeout=4.0, proxy_str=None):
+def _cs_fetch_url(url, headers, timeout=3.0, proxy_str=None):
     """Fetch URL directly or via an optional HTTP/SOCKS proxy string."""
     _req = urllib.request.Request(url, headers=headers)
     if proxy_str:
@@ -15016,18 +15045,17 @@ def _cs_rdap_country(domain):
     _visited = set()
     _got_registry_200 = False
     _idx = 0
-    while _idx < len(_urls) and len(_visited) < 4:
+    while _idx < len(_urls) and len(_visited) < 3:
         _u = _urls[_idx]
         _idx += 1
         if _u in _visited:
             continue
         _host = _u.split("/")[2] if len(_u.split("/")) > 2 else _u
-        # Skip redundant rdap.org if primary registry already returned HTTP 200
         if _host == "rdap.org" and _got_registry_200:
             continue
         _visited.add(_u)
         try:
-            _code, _raw_bytes = _cs_fetch_url(_u, _headers, timeout=3.5)
+            _code, _raw_bytes = _cs_fetch_url(_u, _headers, timeout=2.5)
             _raw = _raw_bytes.decode("utf-8", errors="ignore")
             if _code == 200 and _host != "rdap.org":
                 _got_registry_200 = True
@@ -15053,16 +15081,48 @@ def _cs_rdap_country(domain):
     return "", "; ".join(_notes)
 
 
-def _cs_web_country(domain):
-    """Search Bing/DDG snippets for country mentions; retry via proxy only on 403/429."""
+def _cs_site_country(domain):
+    """Best-effort lightweight homepage fetch (2.0s) to catch country/address clues."""
     _dom = _cs_provider_root(domain) or str(domain or "").lower().strip()
     if not _dom:
         return "", "invalid domain"
-    _q = urllib.parse.quote_plus(f'"{_dom}" headquarters OR address OR country')
-    _engines = (
-        ("bing", f"https://www.bing.com/search?q={_q}"),
-        ("ddg", f"https://html.duckduckgo.com/html/?q={_q}"),
-    )
+    _headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                      "AppleWebKit/537.36 (KHTML, like Gecko) "
+                      "Chrome/124.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml;q=0.9,*/*;q=0.8",
+    }
+    for _scheme in ("https", "http"):
+        _url = f"{_scheme}://{_dom}/"
+        try:
+            _code, _raw_bytes = _cs_fetch_url(_url, _headers, timeout=2.0)
+            if _code == 200 and _raw_bytes:
+                _html = _raw_bytes[:65536].decode("utf-8", errors="ignore")
+                for _tag in ("script", "style", "nav", "aside"):
+                    _html = re.sub(
+                        rf"<{_tag}[^>]*>.*?</{_tag}>", " ", _html, flags=re.S | re.I
+                    )
+                _clean = re.sub(r"<[^>]+>", " ", _html)
+                _ctry = _cs_score_country_text(_clean)
+                if _ctry in _CS_BY_NAME:
+                    return _ctry, f"SITE({_scheme}) HTTP {_code} -> {_ctry}"
+                return "", f"SITE({_scheme}) HTTP {_code} (no country)"
+        except urllib.error.HTTPError as _he:
+            if _scheme == "http":
+                return "", f"SITE HTTP {_he.code}"
+        except Exception as _ex:
+            if _scheme == "http":
+                return "", f"SITE:{type(_ex).__name__}"
+    return "", "SITE:unreachable"
+
+
+def _cs_web_country(domain):
+    """Search Bing snippets for country mentions; retry via proxy only on 403/429."""
+    _dom = _cs_provider_root(domain) or str(domain or "").lower().strip()
+    if not _dom:
+        return "", "invalid domain"
+    _q = urllib.parse.quote_plus(f'"{_dom}"')
+    _url = f"https://www.bing.com/search?q={_q}"
     _headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                       "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -15070,61 +15130,56 @@ def _cs_web_country(domain):
         "Accept-Language": "en-US,en;q=0.9",
     }
     _proxy_fn = globals().get("sample_alive_proxy")
-    _notes = []
-    for _eng, _url in _engines:
-        try:
-            _code, _raw_bytes = _cs_fetch_url(_url, _headers, timeout=4.0)
-            if _code == 202 and _eng == "ddg":
-                _notes.append("ddg:HTTP 202 (rate-limited)")
-                continue
-            if _code in (403, 429) and callable(_proxy_fn):
+    try:
+        _code, _raw_bytes = _cs_fetch_url(_url, _headers, timeout=3.0)
+        if _code in (403, 429) and callable(_proxy_fn):
+            _px = _proxy_fn(domain=_dom)
+            if _px:
+                _code, _raw_bytes = _cs_fetch_url(
+                    _url, _headers, timeout=4.0, proxy_str=_px
+                )
+                _eng = "bing+px"
+            else:
+                _eng = "bing"
+        else:
+            _eng = "bing"
+        _html = _raw_bytes.decode("utf-8", errors="ignore")
+        for _tag in ("script", "style", "nav", "header", "footer", "aside"):
+            _html = re.sub(
+                rf"<{_tag}[^>]*>.*?</{_tag}>", " ", _html, flags=re.S | re.I
+            )
+        _clean = re.sub(r"<[^>]+>", " ", _html)
+        _ctry = _cs_score_country_text(_clean)
+        if _ctry in _CS_BY_NAME:
+            return _ctry, f"WEB({_eng}) HTTP {_code} -> {_ctry}"
+        return "", f"WEB({_eng}) HTTP {_code} ({len(_clean)} chars, no country)"
+    except urllib.error.HTTPError as _he:
+        if _he.code in (403, 429) and callable(_proxy_fn):
+            try:
                 _px = _proxy_fn(domain=_dom)
                 if _px:
                     _code, _raw_bytes = _cs_fetch_url(
-                        _url, _headers, timeout=5.0, proxy_str=_px
+                        _url, _headers, timeout=4.0, proxy_str=_px
                     )
-                    _eng = f"{_eng}+px"
-            _html = _raw_bytes.decode("utf-8", errors="ignore")
-            for _tag in ("script", "style", "nav", "header", "footer", "aside"):
-                _html = re.sub(
-                    rf"<{_tag}[^>]*>.*?</{_tag}>", " ", _html, flags=re.S | re.I
-                )
-            _clean = re.sub(r"<[^>]+>", " ", _html)
-            _ctry = _cs_score_country_text(_clean)
-            if _ctry in _CS_BY_NAME:
-                return _ctry, f"WEB({_eng}) HTTP {_code} -> {_ctry}"
-            _notes.append(f"{_eng}:HTTP {_code} ({len(_clean)} chars, no country)")
-            if _eng.startswith("bing"):
-                time.sleep(0.35)
-        except urllib.error.HTTPError as _he:
-            if _he.code in (403, 429) and callable(_proxy_fn):
-                try:
-                    _px = _proxy_fn(domain=_dom)
-                    if _px:
-                        _code, _raw_bytes = _cs_fetch_url(
-                            _url, _headers, timeout=5.0, proxy_str=_px
+                    _html = _raw_bytes.decode("utf-8", errors="ignore")
+                    for _tag in ("script", "style", "nav", "header", "footer", "aside"):
+                        _html = re.sub(
+                            rf"<{_tag}[^>]*>.*?</{_tag}>", " ", _html, flags=re.S | re.I
                         )
-                        _html = _raw_bytes.decode("utf-8", errors="ignore")
-                        for _tag in ("script", "style", "nav", "header", "footer", "aside"):
-                            _html = re.sub(
-                                rf"<{_tag}[^>]*>.*?</{_tag}>", " ", _html, flags=re.S | re.I
-                            )
-                        _clean = re.sub(r"<[^>]+>", " ", _html)
-                        _ctry = _cs_score_country_text(_clean)
-                        if _ctry in _CS_BY_NAME:
-                            return _ctry, f"WEB({_eng}+px) HTTP {_code} -> {_ctry}"
-                        _notes.append(f"{_eng}+px:HTTP {_code} (no country)")
-                        continue
-                except Exception as _px_ex:
-                    _notes.append(f"{_eng}+px:{type(_px_ex).__name__}")
-            _notes.append(f"{_eng}:HTTP {_he.code}")
-        except Exception as _ex:
-            _notes.append(f"{_eng}:{type(_ex).__name__}")
-    return "", "; ".join(_notes)
+                    _clean = re.sub(r"<[^>]+>", " ", _html)
+                    _ctry = _cs_score_country_text(_clean)
+                    if _ctry in _CS_BY_NAME:
+                        return _ctry, f"WEB(bing+px) HTTP {_code} -> {_ctry}"
+                    return "", f"WEB(bing+px) HTTP {_code} (no country)"
+            except Exception as _px_ex:
+                return "", f"WEB(bing+px):{type(_px_ex).__name__}"
+        return "", f"WEB(bing):HTTP {_he.code}"
+    except Exception as _ex:
+        return "", f"WEB(bing):{type(_ex).__name__}"
 
 
 def _cs_discover_country(domain):
-    """Try RDAP (registrant + related) first, then scored web search."""
+    """Try RDAP (registrant + related), then Bing search, then lightweight site check."""
     _ts = datetime.now().strftime("%H:%M:%S")
     _ctry, _rdap_note = _cs_rdap_country(domain)
     if _ctry in _CS_BY_NAME:
@@ -15132,7 +15187,49 @@ def _cs_discover_country(domain):
     _ctry, _web_note = _cs_web_country(domain)
     if _ctry in _CS_BY_NAME:
         return _ctry, f"{_ts} MATCH {domain:<28} -> {_ctry} [{_rdap_note} | {_web_note}]"
-    return "", f"{_ts} MISS  {domain:<28} -> Global [{_rdap_note} | {_web_note}]"
+    _ctry, _site_note = _cs_site_country(domain)
+    if _ctry in _CS_BY_NAME:
+        return _ctry, f"{_ts} MATCH {domain:<28} -> {_ctry} [{_rdap_note} | {_web_note} | {_site_note}]"
+    return "", f"{_ts} MISS  {domain:<28} -> Global [{_rdap_note} | {_web_note} | {_site_note}]"
+
+
+def _cs_discover_batch(domains, progress_cb=None, workers=_CS_LOOKUP_WORKERS):
+    """Run `_cs_discover_country` across `domains` concurrently while preserving order."""
+    _items = list(domains or [])
+    _total = len(_items)
+    if _total == 0:
+        return [], 0, []
+    _results = [("", "")] * _total
+    _done = 0
+    _found = 0
+    _cb_lock = threading.Lock()
+    _pool_n = max(1, min(int(workers or 1), _total))
+
+    def _job(idx, dom):
+        return idx, _cs_discover_country(dom)
+
+    with ThreadPoolExecutor(max_workers=_pool_n, thread_name_prefix="cs-geo") as _ex:
+        _futs = [_ex.submit(_job, _i, _d) for _i, _d in enumerate(_items)]
+        for _fut in as_completed(_futs):
+            try:
+                _idx, (_ctry, _tline) = _fut.result()
+            except Exception as _ex_err:
+                _idx = 0
+                _ctry = ""
+                _tline = f"{datetime.now().strftime('%H:%M:%S')} MISS  {'unknown':<28} -> Global [worker:{type(_ex_err).__name__}]"
+            with _cb_lock:
+                _results[_idx] = (_ctry, _tline)
+                _done += 1
+                if _ctry in _CS_BY_NAME:
+                    _found += 1
+                if callable(progress_cb):
+                    try:
+                        progress_cb(_done, _total, _items[_idx], _found)
+                    except Exception:
+                        pass
+
+    _traces = [_t for _, _t in _results if _t]
+    return _results, _found, _traces
 
 
 def _cs_country_of(domain, mapping):
@@ -15154,6 +15251,8 @@ def _cs_country_of(domain, mapping):
     for _part in reversed(_d.split(".")):
         if _part in TLD_COUNTRY:
             return TLD_COUNTRY[_part]
+        if _part.upper() in _CS_BY_CODE:
+            return _CS_BY_CODE[_part.upper()]
     return _CS_GLOBAL
 
 
@@ -15476,8 +15575,8 @@ else:
             f"🔍 Search {_CS_GLOBAL_FLAG} Global ({len(_global_unmapped)})",
             width="stretch",
             help=f"Looks up up to {_CS_LOOKUP_CAP} unique unresolved Global domains "
-                 f"via RDAP and web search, then saves any discovered countries to "
-                 f"your domain map so they never need to be searched again.",
+                 f"via RDAP, Bing search, and site check across {_CS_LOOKUP_WORKERS} "
+                 f"workers, then saves any discovered countries to your domain map.",
         ):
             if not _global_unmapped:
                 str_lit.session_state["_cs_flash"] = (
@@ -15485,19 +15584,20 @@ else:
             else:
                 _batch = _global_unmapped[:_CS_LOOKUP_CAP]
                 _m = dict(_cs_map)
-                _found = 0
-                _new_traces = []
                 _bar = str_lit.progress(0.0, text=f"0/{len(_batch)} - searching Global domains...")
-                for _idx, _dom in enumerate(_batch, 1):
+
+                def _on_geo_prog(_done, _total, _cur_dom, _cur_found):
                     _bar.progress(
-                        _idx / len(_batch),
-                        text=f"{_idx}/{len(_batch)} - looking up {_dom}...",
+                        min(1.0, _done / max(1, _total)),
+                        text=f"{_done}/{_total} - checked {_cur_dom} ({_cur_found} matched)...",
                     )
-                    _ctry, _tline = _cs_discover_country(_dom)
-                    _new_traces.append(_tline)
-                    if _ctry:
+
+                _results, _found, _new_traces = _cs_discover_batch(
+                    _batch, progress_cb=_on_geo_prog, workers=_CS_LOOKUP_WORKERS
+                )
+                for _dom, (_ctry, _) in zip(_batch, _results):
+                    if _ctry in _CS_BY_NAME:
                         _m[_dom] = _ctry
-                        _found += 1
                 _bar.empty()
                 _prev_trace = list(str_lit.session_state.get("cs_lookup_trace") or [])
                 _prev_trace.extend(_new_traces)
@@ -15533,8 +15633,8 @@ else:
             _tl1, _tl2 = str_lit.columns([0.75, 0.25])
             with _tl1:
                 str_lit.caption(
-                    "Shows RDAP and web fallback status for every domain queried by "
-                    "Search 🌐 Global."
+                    "Shows RDAP, Bing web search, and site check status for every "
+                    "domain queried by Search 🌐 Global."
                 )
             with _tl2:
                 if str_lit.button("🧹 Clear trace", key="cs_clear_trace", width="stretch"):
@@ -15838,6 +15938,7 @@ if str_lit.checkbox("🔍 Inspect the contents of one category",
         with str_lit.container(height=420):
             str_lit.code("\n".join(_clean_items), language="text")
 # @@END 087 INPUT_UI
+
 
 # @@BLOCK 088 PROVIDER_TABLES deps=002,052
 PROVIDER_MAP = {
