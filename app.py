@@ -12715,6 +12715,7 @@ try:
 except Exception:
     mailsearch = None
 
+import random
 import urllib.parse
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -14631,6 +14632,21 @@ _CS_BY_NAME = {_c[1]: _c for _c in _CS_COUNTRIES}
 _CS_BY_CODE = {_c[0]: _c[1] for _c in _CS_COUNTRIES}
 _CS_LOOKUP_CAP = 120
 _CS_LOOKUP_WORKERS = 6
+_CS_RDAP_HOST_SEMS = {}
+_CS_RDAP_HOST_LOCK = threading.Lock()
+_CS_USA_FALSE_FRIENDS = frozenset({
+    "medusa", "hausa", "yakuza", "ragusa", "syracuse", "lampeduza",
+    "lampedusa", "formosa", "tolosa", "osa", "rosa", "musa", "ausa",
+})
+_CS_SCRAPER_HOSTS = frozenset({
+    "whois.com", "who.is", "scamadviser.com", "urlvoid.com", "hypestat.com",
+    "similarweb.com", "builtwith.com", "robtex.com", "viewdns.info",
+    "domaintools.com", "whoisxmlapi.com", "easywhois.com", "siteprice.org",
+    "worthofweb.com", "cutestat.com", "statshow.com", "websiterating.com",
+    "myip.ms", "bgp.he.net", "dnslytics.com", "securitytrails.com",
+    "shodan.io", "censys.io", "virustotal.com", "talosintelligence.com",
+    "mxtoolbox.com", "intodns.com", "dnschecker.org", "whatsmydns.net",
+})
 _CS_TEXT_CUES = (
     ("united states", "United States"),
     ("u.s.a.", "United States"),
@@ -15047,6 +15063,16 @@ def _cs_fetch_url(url, headers, timeout=3.0, proxy_str=None):
         return getattr(_resp, "status", 200), _resp.read(131072)
 
 
+def _cs_rdap_host_sem(host):
+    """Per-RDAP-host semaphore (1 concurrent query per registrar) to avoid 429 bursts."""
+    with _CS_RDAP_HOST_LOCK:
+        _sem = _CS_RDAP_HOST_SEMS.get(host)
+        if _sem is None:
+            _sem = threading.BoundedSemaphore(1)
+            _CS_RDAP_HOST_SEMS[host] = _sem
+        return _sem
+
+
 def _cs_rdap_country(domain):
     """Query RDAP with minimal hops (initial registry + at most 1 related link)."""
     _dom = _cs_provider_root(domain) or str(domain or "").lower().strip()
@@ -15075,8 +15101,12 @@ def _cs_rdap_country(domain):
             continue
         _visited.add(_u)
         _host = _u.split("/")[2] if len(_u.split("/")) > 2 else _u
+        _sem = _cs_rdap_host_sem(_host)
         try:
-            _code, _raw_bytes = _cs_fetch_url(_u, _headers, timeout=2.5)
+            with _sem:
+                if _host != "rdap.verisign.com":
+                    time.sleep(random.uniform(0.15, 0.35))
+                _code, _raw_bytes = _cs_fetch_url(_u, _headers, timeout=2.5)
             _raw = _raw_bytes.decode("utf-8", errors="ignore")
             try:
                 _parsed = json.loads(_raw)
@@ -15136,13 +15166,35 @@ def _cs_site_country(domain):
     return "", "SITE:unreachable"
 
 
+def _cs_extract_bing_organic_text(html, domain):
+    """Extract text ONLY from Bing organic result cards (<li class="b_algo">),
+    skipping WHOIS/domain-stats scraper cards whose visitor-IP footers cause
+    false country matches on parked/low-content domains."""
+    _cards = re.findall(
+        r'<li\b[^>]*class=["\'][^"\']*\bb_algo\b[^"\']*["\'][^>]*>.*?</li>',
+        str(html or ""),
+        flags=re.S | re.I,
+    )
+    _kept = []
+    for _card in _cards:
+        _href_m = re.search(r'<a\b[^>]*href=["\']([^"\']+)["\']', _card, flags=re.I)
+        _href = (_href_m.group(1) if _href_m else "").lower()
+        if any(_sc in _href for _sc in _CS_SCRAPER_HOSTS):
+            continue
+        _txt = re.sub(r"<[^>]+>", " ", _card)
+        _txt = re.sub(r"\s+", " ", _txt).strip()
+        if _txt:
+            _kept.append(_txt)
+    return " \n ".join(_kept)
+
+
 def _cs_web_country(domain):
-    """Search Bing snippets for country mentions with min_hits=2 guardrail."""
+    """Search Bing organic result cards for country mentions with min_hits=2 guardrail."""
     _dom = _cs_provider_root(domain) or str(domain or "").lower().strip()
     if not _dom:
         return "", "invalid domain"
     _q = urllib.parse.quote_plus(f'"{_dom}"')
-    _url = f"https://www.bing.com/search?q={_q}"
+    _url = f"https://www.bing.com/search?q={_q}&setlang=en&cc=US"
     _headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                       "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -15164,15 +15216,11 @@ def _cs_web_country(domain):
         else:
             _eng = "bing"
         _html = _raw_bytes.decode("utf-8", errors="ignore")
-        for _tag in ("script", "style", "nav", "header", "footer", "aside"):
-            _html = re.sub(
-                rf"<{_tag}[^>]*>.*?</{_tag}>", " ", _html, flags=re.S | re.I
-            )
-        _clean = re.sub(r"<[^>]+>", " ", _html)
+        _clean = _cs_extract_bing_organic_text(_html, _dom)
         _ctry = _cs_score_country_text(_clean, domain=_dom, min_hits=2)
         if _ctry in _CS_BY_NAME:
             return _ctry, f"WEB({_eng}) HTTP {_code} -> {_ctry}"
-        return "", f"WEB({_eng}) HTTP {_code} ({len(_clean)} chars, <2 hits)"
+        return "", f"WEB({_eng}) HTTP {_code} ({len(_clean)} organic chars, <2 hits)"
     except urllib.error.HTTPError as _he:
         if _he.code in (403, 429) and callable(_proxy_fn):
             try:
@@ -15182,11 +15230,7 @@ def _cs_web_country(domain):
                         _url, _headers, timeout=4.0, proxy_str=_px
                     )
                     _html = _raw_bytes.decode("utf-8", errors="ignore")
-                    for _tag in ("script", "style", "nav", "header", "footer", "aside"):
-                        _html = re.sub(
-                            rf"<{_tag}[^>]*>.*?</{_tag}>", " ", _html, flags=re.S | re.I
-                        )
-                    _clean = re.sub(r"<[^>]+>", " ", _html)
+                    _clean = _cs_extract_bing_organic_text(_html, _dom)
                     _ctry = _cs_score_country_text(_clean, domain=_dom, min_hits=2)
                     if _ctry in _CS_BY_NAME:
                         return _ctry, f"WEB(bing+px) HTTP {_code} -> {_ctry}"
@@ -15198,8 +15242,19 @@ def _cs_web_country(domain):
         return "", f"WEB(bing):{type(_ex).__name__}"
 
 
+def _cs_label_country(domain):
+    """Conservative domain-label fallback (e.g. *usa.com -> United States) after network checks."""
+    _root = _cs_provider_root(domain) or str(domain or "").lower().strip()
+    if "." not in _root:
+        return ""
+    _sld = _root.split(".", 1)[0].strip("-")
+    if len(_sld) >= 5 and _sld.endswith("usa") and _sld not in _CS_USA_FALSE_FRIENDS:
+        return "United States"
+    return ""
+
+
 def _cs_discover_country(domain):
-    """Try RDAP (max 2 hops), then Bing search (min_hits=2), then lightweight site check."""
+    """Try RDAP (max 2 hops), Bing organic cards (min_hits=2), site check, then label heuristic."""
     _ts = datetime.now().strftime("%H:%M:%S")
     _ctry, _rdap_note = _cs_rdap_country(domain)
     if _ctry in _CS_BY_NAME:
@@ -15210,6 +15265,9 @@ def _cs_discover_country(domain):
     _ctry, _site_note = _cs_site_country(domain)
     if _ctry in _CS_BY_NAME:
         return _ctry, f"{_ts} MATCH {domain:<28} -> {_ctry} [{_rdap_note} | {_web_note} | {_site_note}]"
+    _lbl_ctry = _cs_label_country(domain)
+    if _lbl_ctry in _CS_BY_NAME:
+        return _lbl_ctry, f"{_ts} MATCH {domain:<28} -> {_lbl_ctry} [{_rdap_note} | {_web_note} | {_site_note} | LABEL(*usa)]"
     return "", f"{_ts} MISS  {domain:<28} -> Global [{_rdap_note} | {_web_note} | {_site_note}]"
 
 
@@ -15595,7 +15653,7 @@ else:
             f"🔍 Search {_CS_GLOBAL_FLAG} Global ({len(_global_unmapped)})",
             width="stretch",
             help=f"Looks up up to {_CS_LOOKUP_CAP} unique unresolved Global domains "
-                 f"via RDAP, Bing search, and site check across {_CS_LOOKUP_WORKERS} "
+                 f"via RDAP, Bing organic results, and site check across {_CS_LOOKUP_WORKERS} "
                  f"workers, then saves any discovered countries to your domain map.",
         ):
             if not _global_unmapped:
