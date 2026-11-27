@@ -297,6 +297,78 @@ def is_admin():
     return False
 
 
+# The unlock mark. Braille cells, so the SHAPE is the indentation: never reflow
+# these lines, never strip a leading space, never let an editor re-indent them.
+# Every glyph sits inside a string, so the non-ASCII gate stays quiet. Keep the
+# rows byte-for-byte - the art does not survive being retyped by eye.
+_GATE_ART = r"""             ⣠⣤⣤⣤⡤⢤⣤⣤⣤⣤⣤⣄⣀⣀⡀
+     ⣠⣿⡿⣟⠯⡒⢯⣽⣓⣒⢾⣯⣭⣿⣿⠿⠭⠭⣯⣷⣦⡀
+    ⣰⣿⣯⣞⣕⣽⠾⠿⠿⠿⢿⣏⣿⣿⣿⡗⣽⣿⣿⣷⡝⣿⣿⡆
+   ⣀⣛⠛⢿⣛⢝⢁⣀⣀⣀⠓⠶⠈⣿⣿⡿⠗⠉⠁⢀⣀⣹⣛⣛⣳⢄
+⡔⡾⢁⣴⡆⢦⣬⣙⣛⣋⣤⣿⣿⣷⣾⣿⣿⣿⡆⢿⣿⡟⠻⠛⡉⣍⣲⢱
+⣇⣇⢸⣉⡀⢦⣌⡙⠻⠿⣯⣭⣥⠡⡤⠿⢿⣿⣿⡆⠉⡻⢿⣿⠇⢻⣟⠼
+ ⠈⠪⣴⣿⣧⡀⢉⠛⠘⢶⣦⣬⠉⣀⠓⠿⠿⠯⢉⣴⠿⠿⠓⡁⡄ ⣿⠃
+   ⠙⣿⣿⣷⣌⠻⢠⣤⣀⠉⠐⠛⠿⠿⠰⠶⠦⠰⠶⠇⠘⠃⠁ ⣿
+    ⠘⢿⣿⣿⣷⣌⠻⢿⠇⣼⣶⣦⡄⣄⣀⡀⢀⡀⢀⡀⡀ ⢠⣿
+      ⠙⠯⣛⠭⣻⠶⣬⣉⣛⠛⠃⠿⠿⠃⠿⠃⠚⣀⣁⣤⣾⣿⡀
+         ⠙⠒⠯⣶⣋⡽⢛⣿⣯⣿⣭⣭⡿⢿⣿⣻⣾⢟⣿⡇
+             ⠉⠛⠿⠿⣶⣾⣿⣿⣿⣭⣭⣭⣶⣿⡿⠁
+                   ⠉⠙⠛⠛⠛⠛⠋⠁"""
+
+# Seconds the mark is held. One constant, so the hold and its gate agree.
+GATE_ART_HOLD = 3.0
+
+
+def _gate_art_html():
+    """The mark, wrapped in the styles that keep it ONE unbroken block.
+
+    `white-space:pre` plus `overflow-x:auto` is what stops a narrow phone from
+    wrapping the art and destroying the shape - it scrolls sideways instead.
+    `line-height:.95` is tight on purpose: a braille cell is two dots tall, and
+    any looser spacing pulls the picture apart vertically. The font size is
+    viewport-clamped so the whole width fits a phone, and the fade starts at
+    opacity 0 but lands back on 1, so a browser with animations off still ends
+    up showing it.
+    """
+    return (
+        '<div style="margin:1.05rem 0 .3rem;display:flex;justify-content:center;">'
+        '<pre aria-label="Unlocking" style="margin:0;padding:.5rem .6rem;'
+        'max-width:100%;overflow-x:auto;white-space:pre;text-align:left;'
+        "font-family:'DejaVu Sans Mono',Menlo,Consolas,'Courier New',monospace;"
+        "font-size:clamp(6px,2.35vw,11px);line-height:.95;letter-spacing:0;"
+        'color:inherit;opacity:1;animation:pmcGateMark .5s ease-out;">'
+        + _GATE_ART +
+        "</pre></div>"
+        "<style>@keyframes pmcGateMark{from{opacity:0}to{opacity:1}}</style>"
+    )
+
+
+def _gate_art(st, hold=GATE_ART_HOLD):
+    """Show the mark, hold it `hold` seconds, then return.
+
+    Streamlit flushes each element as it is produced, so the mark is on screen
+    for the whole sleep and the caller can carry on afterwards - either into the
+    session, or into the failure text that renders underneath it. The next run
+    replaces the mark, so nothing has to be cleared by hand.
+
+    Neither the element nor the sleep may raise: a decorative mark must never be
+    the reason an unlock fails. st.html first, the older markdown route second,
+    and the call is skipped outright if both are missing.
+    """
+    html = _gate_art_html()
+    try:
+        st.html(html)
+    except Exception:
+        try:
+            st.markdown(html, unsafe_allow_html=True)
+        except Exception:
+            pass
+    try:
+        time.sleep(hold)
+    except Exception:
+        pass
+
+
 def require(st, title="Unlock Positive Mail-Checker"):
     """Unlock, or create the first passkey. Sets session_state['user_key_hash']."""
     if st.session_state.get("user_key_hash"):
@@ -309,6 +381,15 @@ def require(st, title="Unlock Positive Mail-Checker"):
                "people on the same deployment never see each other's data.")
 
     if known:
+        # v13.86 GATE-MARK: the outcome of a press is COLLECTED here and acted
+        # on at the FOOT of the gate, not in the branch that saw it. The mark
+        # belongs in the empty space under the caption, and st.rerun() ends the
+        # run, so neither could happen from inside the submit branch.
+        pending = None          # the key dict to enter with
+        why = "Unlocked"
+        problem = None          # rendered as st.error, under the mark
+        hint = None             # rendered as st.caption, under the error
+
         with st.form("auth_unlock"):
             phrase = st.text_input("Passphrase", type="password", key="au_p1")
             ok = st.form_submit_button("Unlock", type="primary")
@@ -316,12 +397,11 @@ def require(st, title="Unlock Positive Mail-Checker"):
             hit = match_key_full(phrase)
             if hit:
                 st.session_state.pop("au_fails", None)
-                _enter(st, hit)
-                st.rerun()
+                pending = hit
             else:
                 fails = int(st.session_state.get("au_fails", 0)) + 1
                 st.session_state["au_fails"] = fails
-                st.error("Wrong passphrase.")
+                problem = "Wrong passphrase."
                 # v13.75: after a second miss, name the keys that exist. The
                 # "wrong passphrase" box used to be a dead end - the user could
                 # not tell a typo from having no key here at all, which is what a
@@ -329,9 +409,9 @@ def require(st, title="Unlock Positive Mail-Checker"):
                 if fails >= 2:
                     _labels = [r[0] for r in _key_rows()]
                     if _labels:
-                        st.caption("Keys on this device: %s. Case and spacing are "
-                                   "forgiven; a different word is not."
-                                   % ", ".join("`%s`" % x for x in _labels))
+                        hint = ("Keys on this device: %s. Case and spacing are "
+                                "forgiven; a different word is not."
+                                % ", ".join("`%s`" % x for x in _labels))
         with st.expander("Start fresh as a different user on this device"):
             st.caption("Adds a SECOND passkey. The existing ones keep working.")
             with st.form("auth_new"):
@@ -342,14 +422,14 @@ def require(st, title="Unlock Positive Mail-Checker"):
             if mk:
                 p2 = (p2 or "").strip()
                 if len(p2) < MIN_LEN:
-                    st.error("Use at least %d characters." % MIN_LEN)
+                    problem = "Use at least %d characters." % MIN_LEN
                 elif p2 != p3:
-                    st.error("The two passphrases differ.")
+                    problem = "The two passphrases differ."
                 else:
                     h = add_key(p2, lbl)
                     st.session_state.pop("au_fails", None)
-                    _enter(st, {"hash": h, "admin": False}, "Passkey created")
-                    st.rerun()
+                    pending = {"hash": h, "admin": False}
+                    why = "Passkey created"
 
         # v13.76 FIX ADMIN-1: the manager is NOT here any more. It lived below
         # this point, inside `if known:`, gated on session_state["is_admin"] -
@@ -359,10 +439,24 @@ def require(st, title="Unlock Positive Mail-Checker"):
         st.caption("Passkey management (including Forget) is on the page once you "
                    "are unlocked - the first passphrase created on a device is its "
                    "admin.")
+
+        # The mark, in the space under the caption, on EVERY press - correct or
+        # not - and it is held before anything is decided on screen.
+        if pending or problem:
+            _gate_art(st)
+        if problem:
+            st.error(problem)
+        if hint:
+            st.caption(hint)
+        if pending:
+            _enter(st, pending, why)
+            st.rerun()
         st.stop()
 
     st.caption("No passkey yet - create one. It is asked once per session. This one "
                "becomes the admin key.")
+    pending = None
+    problem = None
     with st.form("auth_create"):
         p1 = st.text_input("Choose a passphrase", type="password", key="au_c1")
         p2 = st.text_input("Repeat it", type="password", key="au_c2")
@@ -370,17 +464,23 @@ def require(st, title="Unlock Positive Mail-Checker"):
     if go:
         p1 = (p1 or "").strip()
         if len(p1) < MIN_LEN:
-            st.error("Use at least %d characters." % MIN_LEN)
+            problem = "Use at least %d characters." % MIN_LEN
         elif p1 != p2:
-            st.error("The two passphrases differ.")
+            problem = "The two passphrases differ."
         else:
             # v13.75: THIS ALWAYS PERSISTS NOW. With "Remember on this device"
             # unticked the old path hashed the phrase with a fresh random salt and
             # wrote nothing, so that passphrase could never match again - it worked
             # for the session and was "wrong" forever after.
             h = add_key(p1)
-            _enter(st, {"hash": h, "admin": True}, "Passkey created as admin")
-            st.rerun()
+            pending = {"hash": h, "admin": True}
+    if pending or problem:
+        _gate_art(st)
+    if problem:
+        st.error(problem)
+    if pending:
+        _enter(st, pending, "Passkey created as admin")
+        st.rerun()
     st.stop()
 
 
@@ -661,6 +761,13 @@ def fit_panel(scope=None):
 
 
 # @@BLOCK 005 SELFTEST deps=001,003,004
+class _NoSt:
+    """Absorbs any st.* call, so the gate mark can be driven with no runtime."""
+
+    def __getattr__(self, name):
+        return lambda *a, **k: None
+
+
 def _selftest() -> None:
     bad = []
 
@@ -684,6 +791,22 @@ def _selftest() -> None:
     check("user_file('') is not empty", lambda: bool(user_file("")))
     check("user_file('') has no separator", lambda: "_" not in user_file(""))
     check("user_dir is under data/", lambda: user_dir().startswith("data/"))
+
+    # ---- the unlock mark ------------------------------------------------
+    # Art, wrapper, hold and the render path are four separate facts, so a
+    # reflowed art or a lost wrapper is caught, not just a missing name.
+    check("gate art is a str", lambda: isinstance(_GATE_ART, str))
+    check("gate art starts on a braille cell",
+          lambda: "\u2800" <= _GATE_ART.strip()[0] <= "\u28ff")
+    check("gate art keeps its thirteen rows",
+          lambda: len(_GATE_ART.split("\n")) == 13)
+    check("gate art html is a pre", lambda: "<pre" in _gate_art_html())
+    check("gate art html carries row one",
+          lambda: _GATE_ART.split("\n")[0].strip() in _gate_art_html())
+    check("gate art html scrolls instead of wrapping",
+          lambda: "white-space:pre" in _gate_art_html())
+    check("gate hold is seconds", lambda: 1 <= GATE_ART_HOLD <= 10)
+    check("gate art renders headless", lambda: _gate_art(_NoSt(), hold=0) is None)
 
     # ---- Display Fit must work with no Streamlit and no script run ---------
     check("fit_css returns str", lambda: isinstance(fit_css(), str))
