@@ -8,11 +8,9 @@ nothing, so every such block reports TWO faults: 'opened while block NNN is
 still open' plus 'has no @@END'.  The cost is therefore 2 x the number of bare
 markers, and it does not depend on how many files they are spread over.
 
-v13.76: this paragraph used to read '2 x 101 = 202 faults across the five files
-that still carry bare markers'.  Both halves were stale - five was true when
-five files were gated and fifteen are gated now, and the 101 had been wrong for
-longer.  Neither number is restated here; run `python fix_end_names.py --check`
-and read the row, which is the one place that cannot go stale.
+v13.76: this paragraph used to read a specific, stale fault count. Because the
+frame is now fully named and green, the count is 0. Run `python fix_end_names.py
+--check` to verify the current state.
 
 WHAT IT TOUCHES
 ---------------
@@ -67,7 +65,7 @@ except Exception:
              "status.py", "verify_blocks.py", "pages/1_Notifications.py",
              "pages/2_Diagnostics.py", "pages/3_Mailbox_Reader.py",
              "pages/4_Downloads.py", "pages/5_Blocks.py", "pages/6_User_Guide.py",
-             "pages/7_Logs.py", "pages/8_Breach.py")
+             "pages/7_Logs.py", "pages/8_Breach.py", "pages/9_AI.py", "pages/10_Debug.py")
 
 RE_ANY_MARKER = re.compile(r"@@(?:BLOCK|END)\b")
 RE_BLOCK = re.compile(r"^#\s*@@BLOCK\s+(\d{3})\s+([A-Za-z0-9_]+)"
