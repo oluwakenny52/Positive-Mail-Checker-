@@ -14913,25 +14913,48 @@ def _cs_match_country_text(text):
     return ""
 
 
-def _cs_score_country_text(text):
+def _cs_score_country_text(text, domain="", min_hits=1):
     """Score country mentions in cleaned text. Returns best matching country name or ''."""
-    _low = " " + re.sub(r"[^a-z0-9.]+", " ", str(text or "").lower()) + " "
+    _raw_low = str(text or "").lower()
+    _low = " " + re.sub(r"[^a-z0-9.]+", " ", _raw_low) + " "
+    _dom = str(domain or "").lower().strip()
     _scores = {}
+
     for _cue, _ctry in _CS_TEXT_CUES:
         if _ctry not in _CS_BY_NAME:
             continue
         _hits = _low.count(f" {_cue} ")
         if _hits:
-            _scores[_ctry] = _scores.get(_ctry, 0) + _hits
+            _bonus = 0
+            if _dom and _cue in _raw_low:
+                _pos = 0
+                while True:
+                    _idx = _raw_low.find(_cue, _pos)
+                    if _idx == -1:
+                        break
+                    _win_start = max(0, _idx - 120)
+                    _win_end = min(len(_raw_low), _idx + len(_cue) + 120)
+                    if _dom in _raw_low[_win_start:_win_end]:
+                        _bonus = 2
+                        break
+                    _pos = _idx + len(_cue)
+            _scores[_ctry] = _scores.get(_ctry, 0) + _hits + _bonus
+
     for _name in _CS_BY_NAME:
         if len(_name) >= 5:
             _nlow = _name.lower()
             _hits = _low.count(f" {_nlow} ")
             if _hits:
                 _scores[_name] = _scores.get(_name, 0) + _hits
+
     if not _scores:
         return ""
-    return max(_scores.items(), key=lambda _kv: (_kv[1], _kv[0]))[0]
+    _best_ctry, _best_score = max(
+        _scores.items(), key=lambda _kv: (_kv[1], _kv[0])
+    )
+    if _best_score < max(1, int(min_hits or 1)):
+        return ""
+    return _best_ctry
 
 
 def _cs_extract_vcard_country(obj):
@@ -15025,40 +15048,36 @@ def _cs_fetch_url(url, headers, timeout=3.0, proxy_str=None):
 
 
 def _cs_rdap_country(domain):
-    """Query RDAP for registrant country (ignoring registrar entities, following related)."""
+    """Query RDAP with minimal hops (initial registry + at most 1 related link)."""
     _dom = _cs_provider_root(domain) or str(domain or "").lower().strip()
     if not _dom:
         return "", "invalid domain"
     _tld = _dom.rsplit(".", 1)[-1]
-    _urls = []
     if _tld in ("com", "net"):
-        _urls.append(f"https://rdap.verisign.com/{_tld}/v1/domain/{_dom}")
+        _first_url = f"https://rdap.verisign.com/{_tld}/v1/domain/{_dom}"
     elif _tld == "org":
-        _urls.append(f"https://rdap.publicinterestregistry.org/rdap/domain/{_dom}")
-    _urls.append(f"https://rdap.org/domain/{_dom}")
+        _first_url = f"https://rdap.publicinterestregistry.org/rdap/domain/{_dom}"
+    else:
+        _first_url = f"https://rdap.org/domain/{_dom}"
 
     _headers = {
         "User-Agent": "Mozilla/5.0 (compatible; DomainGeoLookup/1.0)",
         "Accept": "application/rdap+json, application/json",
     }
-    _notes = []
+    _urls = [_first_url]
     _visited = set()
-    _got_registry_200 = False
+    _notes = []
     _idx = 0
-    while _idx < len(_urls) and len(_visited) < 3:
+    while _idx < len(_urls) and len(_visited) < 2:
         _u = _urls[_idx]
         _idx += 1
         if _u in _visited:
             continue
-        _host = _u.split("/")[2] if len(_u.split("/")) > 2 else _u
-        if _host == "rdap.org" and _got_registry_200:
-            continue
         _visited.add(_u)
+        _host = _u.split("/")[2] if len(_u.split("/")) > 2 else _u
         try:
             _code, _raw_bytes = _cs_fetch_url(_u, _headers, timeout=2.5)
             _raw = _raw_bytes.decode("utf-8", errors="ignore")
-            if _code == 200 and _host != "rdap.org":
-                _got_registry_200 = True
             try:
                 _parsed = json.loads(_raw)
             except Exception:
@@ -15067,9 +15086,10 @@ def _cs_rdap_country(domain):
                 _vc = _cs_registrant_country_from_entities(_parsed.get("entities"))
                 if _vc in _CS_BY_NAME:
                     return _vc, f"RDAP({_host}) HTTP {_code} registrant -> {_vc}"
-                for _rel_url in _cs_related_rdap_urls(_parsed):
-                    if _rel_url not in _visited:
-                        _urls.append(_rel_url)
+                if len(_visited) < 2:
+                    for _rel_url in _cs_related_rdap_urls(_parsed)[:1]:
+                        if _rel_url not in _visited:
+                            _urls.append(_rel_url)
                 _redacted = "redacted" in _raw.lower()
                 _notes.append(f"{_host}:HTTP {_code} ({'redacted' if _redacted else 'no registrant country'})")
             else:
@@ -15103,7 +15123,7 @@ def _cs_site_country(domain):
                         rf"<{_tag}[^>]*>.*?</{_tag}>", " ", _html, flags=re.S | re.I
                     )
                 _clean = re.sub(r"<[^>]+>", " ", _html)
-                _ctry = _cs_score_country_text(_clean)
+                _ctry = _cs_score_country_text(_clean, domain=_dom, min_hits=1)
                 if _ctry in _CS_BY_NAME:
                     return _ctry, f"SITE({_scheme}) HTTP {_code} -> {_ctry}"
                 return "", f"SITE({_scheme}) HTTP {_code} (no country)"
@@ -15117,7 +15137,7 @@ def _cs_site_country(domain):
 
 
 def _cs_web_country(domain):
-    """Search Bing snippets for country mentions; retry via proxy only on 403/429."""
+    """Search Bing snippets for country mentions with min_hits=2 guardrail."""
     _dom = _cs_provider_root(domain) or str(domain or "").lower().strip()
     if not _dom:
         return "", "invalid domain"
@@ -15149,10 +15169,10 @@ def _cs_web_country(domain):
                 rf"<{_tag}[^>]*>.*?</{_tag}>", " ", _html, flags=re.S | re.I
             )
         _clean = re.sub(r"<[^>]+>", " ", _html)
-        _ctry = _cs_score_country_text(_clean)
+        _ctry = _cs_score_country_text(_clean, domain=_dom, min_hits=2)
         if _ctry in _CS_BY_NAME:
             return _ctry, f"WEB({_eng}) HTTP {_code} -> {_ctry}"
-        return "", f"WEB({_eng}) HTTP {_code} ({len(_clean)} chars, no country)"
+        return "", f"WEB({_eng}) HTTP {_code} ({len(_clean)} chars, <2 hits)"
     except urllib.error.HTTPError as _he:
         if _he.code in (403, 429) and callable(_proxy_fn):
             try:
@@ -15167,10 +15187,10 @@ def _cs_web_country(domain):
                             rf"<{_tag}[^>]*>.*?</{_tag}>", " ", _html, flags=re.S | re.I
                         )
                     _clean = re.sub(r"<[^>]+>", " ", _html)
-                    _ctry = _cs_score_country_text(_clean)
+                    _ctry = _cs_score_country_text(_clean, domain=_dom, min_hits=2)
                     if _ctry in _CS_BY_NAME:
                         return _ctry, f"WEB(bing+px) HTTP {_code} -> {_ctry}"
-                    return "", f"WEB(bing+px) HTTP {_code} (no country)"
+                    return "", f"WEB(bing+px) HTTP {_code} (<2 hits)"
             except Exception as _px_ex:
                 return "", f"WEB(bing+px):{type(_px_ex).__name__}"
         return "", f"WEB(bing):HTTP {_he.code}"
@@ -15179,7 +15199,7 @@ def _cs_web_country(domain):
 
 
 def _cs_discover_country(domain):
-    """Try RDAP (registrant + related), then Bing search, then lightweight site check."""
+    """Try RDAP (max 2 hops), then Bing search (min_hits=2), then lightweight site check."""
     _ts = datetime.now().strftime("%H:%M:%S")
     _ctry, _rdap_note = _cs_rdap_country(domain)
     if _ctry in _CS_BY_NAME:
@@ -15938,7 +15958,6 @@ if str_lit.checkbox("🔍 Inspect the contents of one category",
         with str_lit.container(height=420):
             str_lit.code("\n".join(_clean_items), language="text")
 # @@END 087 INPUT_UI
-
 
 # @@BLOCK 088 PROVIDER_TABLES deps=002,052
 PROVIDER_MAP = {
