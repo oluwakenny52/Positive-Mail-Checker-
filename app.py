@@ -646,7 +646,15 @@ if hasattr(audit_log, "page"):
 # magic-write, which routes it through st.help -> ast.parse and can raise
 # IndentationError on the enclosing `try:` - and it also dumps a help panel into
 # the page above the hero.
-if not hasattr(auth, "fit_panel"):
+#
+# v13.86 GATE-MARK: THE GUARD WAS KEYED ON THE WRONG NAME. `fit_panel` exists in
+# the pre-mark module too, so a process running one answered False here and kept
+# executing the OLD require() - no mark, no hold - with nothing on screen to say
+# so. The sentinel has to be a name only the NEW module carries: GATE_ART_HOLD.
+# Either name missing reloads. reload() re-executes into the SAME module object,
+# so this one caller repairs auth for every page in the process, and the rebound
+# user_file below picks the fresh function up.
+if not hasattr(auth, "fit_panel") or not hasattr(auth, "GATE_ART_HOLD"):
     auth = importlib.reload(auth)
 if not hasattr(runstate, "interrupt"):
     runstate = importlib.reload(runstate)
