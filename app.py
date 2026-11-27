@@ -12736,6 +12736,7 @@ try:
 except Exception:
     mailsearch = None
 
+import html as _html_mod
 import random
 import urllib.parse
 import urllib.request
@@ -14652,10 +14653,12 @@ _CS_COUNTRIES = (
 _CS_BY_NAME = {_c[1]: _c for _c in _CS_COUNTRIES}
 _CS_BY_CODE = {_c[0]: _c[1] for _c in _CS_COUNTRIES}
 _CS_LOOKUP_CAP = 120
-_CS_LOOKUP_WORKERS = 6
+_CS_LOOKUP_WORKERS = 4
 _CS_RDAP_HOST_SEMS = {}
 _CS_RDAP_HOST_NEXT = {}
 _CS_RDAP_HOST_LOCK = threading.Lock()
+_CS_DDG_LOCK = threading.Lock()
+_CS_DDG_NEXT = 0.0
 _CS_LOCATION_CUES = (
     "location", "headquarters", "headquartered", "hq", "address",
     "based in", "located in", "country", "office", "offices",
@@ -14682,6 +14685,21 @@ _CS_SCRAPER_HOSTS = frozenset({
     "shodan.io", "censys.io", "virustotal.com", "talosintelligence.com",
     "mxtoolbox.com", "intodns.com", "dnschecker.org", "whatsmydns.net",
 })
+_CS_NOISE_CARD_CUES = (
+    "domain is for sale",
+    "buy this domain",
+    "parked domain",
+    "whois lookup",
+    "registrar whois",
+    "name servers",
+    "dns records",
+)
+_CS_AUTOCORRECT_BANNERS = (
+    "including results for",
+    "showing results for",
+    "did you mean",
+    "search instead for",
+)
 _CS_TEXT_CUES = (
     ("united states", "United States"),
     ("u.s.a.", "United States"),
@@ -15259,42 +15277,220 @@ def _cs_cc_from_host(host):
     return ""
 
 
-def _cs_extract_bing_organic_text(html, domain):
-    """Extract text ONLY from Bing organic result cards (<li class="b_algo">),
-    skipping WHOIS/domain-stats scraper cards whose visitor-IP footers cause
-    false country matches on parked/low-content domains. Also returns any
-    exact-brand ccTLD sibling country (e.g. alditra.co.id -> Indonesia)."""
-    _cards = re.findall(
-        r'<li\b[^>]*class=["\'][^"\']*\bb_algo\b[^"\']*["\'][^>]*>.*?</li>',
-        str(html or ""),
-        flags=re.S | re.I,
-    )
-    _sld = (str(domain or "").lower().split(".", 1)[0]).strip("-")
+def _cs_unwrap_search_url(raw_href):
+    """Decode DuckDuckGo //duckduckgo.com/l/?uddg=... or Bing redirect URLs."""
+    _u = _html_mod.unescape(str(raw_href or "").strip())
+    if _u.startswith("//"):
+        _u = "https:" + _u
+    try:
+        _parsed = urllib.parse.urlparse(_u)
+        if "duckduckgo.com" in (_parsed.netloc or "") and _parsed.path.startswith("/l/"):
+            _qs = urllib.parse.parse_qs(_parsed.query)
+            if _qs.get("uddg"):
+                return urllib.parse.unquote(_qs["uddg"][0])
+    except Exception:
+        pass
+    return _u
+
+
+def _cs_host_of_url(url):
+    """Extract normalized hostname (without www.) from a URL or display_url."""
+    _u = str(url or "").strip().lower()
+    if not _u:
+        return ""
+    if "://" not in _u:
+        _u = "https://" + _u.lstrip("/")
+    try:
+        _h = (urllib.parse.urlparse(_u).hostname or "").strip(".")
+    except Exception:
+        _h = ""
+    if _h.startswith("www."):
+        _h = _h[4:]
+    return _h
+
+
+def _cs_card_matches_domain(card_text, card_url, display_url, domain):
+    """Verify a search result card actually belongs to `domain` or its exact brand
+    (rejecting search-engine autocorrect or fuzzy lookalikes like Adtran/Altria
+    for alditra.com, or alwitra.de for alditra).
+    Returns (is_match: bool, sibling_country: str)."""
+    _dom = str(domain or "").lower().strip()
+    _sld = (_dom.split(".", 1)[0]).strip("-")
+    _txt = str(card_text or "").lower()
+    _tlow = f"{_txt} {str(card_url or '').lower()} {str(display_url or '').lower()}"
+    if any(_nc in _txt for _nc in _CS_NOISE_CARD_CUES):
+        return False, ""
+
+    _sibling_ctry = ""
+    _cand_hosts = []
+    for _raw_u in (card_url, display_url):
+        _h = _cs_host_of_url(_raw_u)
+        if _h:
+            _cand_hosts.append(_h)
+    for _h in _cand_hosts:
+        if any(_h == _sc or _h.endswith("." + _sc) for _sc in _CS_SCRAPER_HOSTS):
+            return False, ""
+        if len(_sld) >= 4 and _h.startswith(_sld + "."):
+            _cc = _cs_cc_from_host(_h)
+            if _cc in _CS_BY_NAME:
+                _sibling_ctry = _cc
+
+    # 1) Exact domain match in URL host or text
+    for _h in _cand_hosts:
+        if _h == _dom or _h.endswith("." + _dom):
+            return True, _sibling_ctry
+    _norm_dots = " " + re.sub(r"[^a-z0-9.]+", " ", _tlow) + " "
+    if _dom and f" {_dom} " in _norm_dots:
+        return True, _sibling_ctry
+
+    # 2) Exact sibling ccTLD host (e.g. alditra.co.id for alditra.com)
+    if _sibling_ctry:
+        return True, _sibling_ctry
+
+    # 3) Exact brand token match (never fuzzy/substring) when brand is distinctive
+    if len(_sld) >= 4 and _sld not in _CS_GENERIC_BRAND_WORDS:
+        _norm_words = " " + re.sub(r"[^a-z0-9]+", " ", _tlow) + " "
+        if f" {_sld} " in _norm_words:
+            return True, _sibling_ctry
+
+    return False, ""
+
+
+def _cs_has_autocorrect_banner(html):
+    """Detect search-engine query rewrite / 'Showing results for' banners."""
+    _plain = re.sub(r"<[^>]+>", " ", str(html or ""))
+    _plain = re.sub(r"\s+", " ", _plain).lower()
+    return any(_b in _plain for _b in _CS_AUTOCORRECT_BANNERS)
+
+
+def _cs_extract_ddg_organic_text(html, domain):
+    """Parse DuckDuckGo static HTML (/html/) result cards (.result / .result__body)
+    and keep ONLY cards verified against `domain` or its exact brand."""
+    _raw_html = str(html or "")
+    _rewritten = _cs_has_autocorrect_banner(_raw_html)
+    # Split on DDG result blocks (<div class="result results_links ...">)
+    _chunks = re.split(r'<div\b[^>]*class=["\'][^"\']*\bresult\b[^"\']*["\'][^>]*>', _raw_html, flags=re.I)[1:]
     _kept = []
     _sibling_ctry = ""
+    _verified_cards = 0
+    for _chunk in _chunks[:15]:
+        # Skip sponsored ads
+        if "result--ad" in _chunk[:120].lower() or "badge--ad" in _chunk.lower():
+            continue
+        _a_m = re.search(
+            r'<a\b[^>]*class=["\'][^"\']*\bresult__a\b[^"\']*["\'][^>]*href=["\']([^"\']+)["\'][^>]*>(.*?)</a>',
+            _chunk,
+            flags=re.S | re.I,
+        )
+        _href = _cs_unwrap_search_url(_a_m.group(1)) if _a_m else ""
+        _title = re.sub(r"<[^>]+>", " ", _a_m.group(2)) if _a_m else ""
+        _disp_m = re.search(
+            r'class=["\'][^"\']*\bresult__url\b[^"\']*["\'][^>]*>(.*?)</',
+            _chunk,
+            flags=re.S | re.I,
+        )
+        _disp = re.sub(r"<[^>]+>", " ", _disp_m.group(1)) if _disp_m else ""
+        _snip_m = re.search(
+            r'class=["\'][^"\']*\bresult__snippet\b[^"\']*["\'][^>]*>(.*?)</(?:a|div|span)>',
+            _chunk,
+            flags=re.S | re.I,
+        )
+        _snip = re.sub(r"<[^>]+>", " ", _snip_m.group(1)) if _snip_m else ""
+        _card_txt = re.sub(r"\s+", " ", f"{_title} {_disp} {_snip}").strip()
+        if not _card_txt:
+            continue
+        _ok, _sib = _cs_card_matches_domain(_card_txt, _href, _disp, domain)
+        if not _ok:
+            continue
+        _verified_cards += 1
+        if _sib and not _sibling_ctry:
+            _sibling_ctry = _sib
+        _kept.append(_card_txt)
+    return " \n ".join(_kept), _sibling_ctry, _verified_cards, _rewritten
+
+
+def _cs_extract_bing_organic_text(html, domain):
+    """Extract text ONLY from Bing organic result cards (<li class="b_algo">)
+    verified against `domain` or its exact brand (rejecting autocorrect and
+    fuzzy spelling-fallback cards like Adtran/Altria for alditra.com)."""
+    _raw_html = str(html or "")
+    _rewritten = _cs_has_autocorrect_banner(_raw_html)
+    _cards = re.findall(
+        r'<li\b[^>]*class=["\'][^"\']*\bb_algo\b[^"\']*["\'][^>]*>.*?</li>',
+        _raw_html,
+        flags=re.S | re.I,
+    )
+    _kept = []
+    _sibling_ctry = ""
+    _verified_cards = 0
     for _card in _cards:
         _href_m = re.search(r'<a\b[^>]*href=["\']([^"\']+)["\']', _card, flags=re.I)
-        _href = (_href_m.group(1) if _href_m else "").lower()
-        if any(_sc in _href for _sc in _CS_SCRAPER_HOSTS):
-            continue
-        _host_m = re.search(r'^https?://([^/?#]+)', _href)
-        if _host_m and len(_sld) >= 5:
-            _h = _host_m.group(1)
-            if _h.startswith("www."):
-                _h = _h[4:]
-            if _h.startswith(_sld + "."):
-                _cc = _cs_cc_from_host(_h)
-                if _cc in _CS_BY_NAME:
-                    _sibling_ctry = _cc
+        _href = _cs_unwrap_search_url(_href_m.group(1)) if _href_m else ""
         _txt = re.sub(r"<[^>]+>", " ", _card)
         _txt = re.sub(r"\s+", " ", _txt).strip()
-        if _txt:
-            _kept.append(_txt)
-    return " \n ".join(_kept), _sibling_ctry
+        if not _txt:
+            continue
+        _ok, _sib = _cs_card_matches_domain(_txt, _href, "", domain)
+        if not _ok:
+            continue
+        _verified_cards += 1
+        if _sib and not _sibling_ctry:
+            _sibling_ctry = _sib
+        _kept.append(_txt)
+    return " \n ".join(_kept), _sibling_ctry, _verified_cards, _rewritten
+
+
+def _cs_ddg_wait_slot():
+    """Light spacing across workers so DuckDuckGo HTML doesn't rate-limit burst calls."""
+    global _CS_DDG_NEXT
+    with _CS_DDG_LOCK:
+        _now = time.time()
+        _wait = max(0.0, _CS_DDG_NEXT - _now)
+        _CS_DDG_NEXT = max(_now, _CS_DDG_NEXT) + random.uniform(0.35, 0.75)
+    if _wait > 0:
+        time.sleep(min(_wait, 2.5))
+
+
+def _cs_ddg_query(query_str, headers, proxy_fn, domain):
+    """Fetch DuckDuckGo static HTML SERP and return
+    (status_code, engine_label, verified_text, sibling_ctry, verified_cards, rewritten)."""
+    _q = urllib.parse.quote_plus(query_str)
+    _url = f"https://html.duckduckgo.com/html/?q={_q}"
+    _ddg_headers = dict(headers)
+    _ddg_headers["Referer"] = "https://html.duckduckgo.com/"
+    _cs_ddg_wait_slot()
+    try:
+        _code, _raw_bytes = _cs_fetch_url(_url, _ddg_headers, timeout=3.5)
+        _eng = "ddg"
+        _html = _raw_bytes.decode("utf-8", errors="ignore")
+        if (_code in (202, 403, 429) or "anomaly-modal" in _html.lower()) and callable(proxy_fn):
+            _px = proxy_fn(domain=domain)
+            if _px:
+                _code, _raw_bytes = _cs_fetch_url(
+                    _url, _ddg_headers, timeout=4.5, proxy_str=_px
+                )
+                _html = _raw_bytes.decode("utf-8", errors="ignore")
+                _eng = "ddg+px"
+        if _code in (202, 403, 429) or "anomaly-modal" in _html.lower():
+            return _code, _eng, "", "", 0, False
+        _clean, _sib, _vcards, _rew = _cs_extract_ddg_organic_text(_html, domain)
+        return _code, _eng, _clean, _sib, _vcards, _rew
+    except urllib.error.HTTPError as _he:
+        if _he.code in (202, 403, 429) and callable(proxy_fn):
+            _px = proxy_fn(domain=domain)
+            if _px:
+                _code, _raw_bytes = _cs_fetch_url(
+                    _url, _ddg_headers, timeout=4.5, proxy_str=_px
+                )
+                _html = _raw_bytes.decode("utf-8", errors="ignore")
+                _clean, _sib, _vcards, _rew = _cs_extract_ddg_organic_text(_html, domain)
+                return _code, "ddg+px", _clean, _sib, _vcards, _rew
+        raise
 
 
 def _cs_bing_query(query_str, headers, proxy_fn, domain):
-    """Fetch Bing SERP and return (status_code, engine_label, organic_text, sibling_ctry)."""
+    """Fetch Bing SERP and return
+    (status_code, engine_label, verified_text, sibling_ctry, verified_cards, rewritten)."""
     _q = urllib.parse.quote_plus(query_str)
     _url = f"https://www.bing.com/search?q={_q}&setlang=en&cc=US"
     try:
@@ -15308,8 +15504,8 @@ def _cs_bing_query(query_str, headers, proxy_fn, domain):
                 )
                 _eng = "bing+px"
         _html = _raw_bytes.decode("utf-8", errors="ignore")
-        _clean, _sib = _cs_extract_bing_organic_text(_html, domain)
-        return _code, _eng, _clean, _sib
+        _clean, _sib, _vcards, _rew = _cs_extract_bing_organic_text(_html, domain)
+        return _code, _eng, _clean, _sib, _vcards, _rew
     except urllib.error.HTTPError as _he:
         if _he.code in (403, 429) and callable(proxy_fn):
             _px = proxy_fn(domain=domain)
@@ -15318,14 +15514,15 @@ def _cs_bing_query(query_str, headers, proxy_fn, domain):
                     _url, headers, timeout=4.0, proxy_str=_px
                 )
                 _html = _raw_bytes.decode("utf-8", errors="ignore")
-                _clean, _sib = _cs_extract_bing_organic_text(_html, domain)
-                return _code, "bing+px", _clean, _sib
+                _clean, _sib, _vcards, _rew = _cs_extract_bing_organic_text(_html, domain)
+                return _code, "bing+px", _clean, _sib, _vcards, _rew
         raise
 
 
 def _cs_web_country(domain):
-    """Search Bing organic result cards for contextual country mentions, with a
-    strict brand-anchored fallback for hard domains blocked by WAF/RDAP."""
+    """Search DuckDuckGo HTML first (with Bing fallback), verifying every result
+    card against `domain`/brand so autocorrected or fuzzy lookalike SERPs are
+    rejected rather than misclassified."""
     _dom = _cs_provider_root(domain) or str(domain or "").lower().strip()
     if not _dom:
         return "", "invalid domain"
@@ -15336,48 +15533,63 @@ def _cs_web_country(domain):
         "Accept-Language": "en-US,en;q=0.9",
     }
     _proxy_fn = globals().get("sample_alive_proxy")
-    try:
-        _code, _eng, _clean, _sib = _cs_bing_query(
-            f'"{_dom}"', _headers, _proxy_fn, _dom
-        )
-        if _sib in _CS_BY_NAME:
-            return _sib, f"WEB({_eng}) sibling ccTLD -> {_sib}"
-        _ctry = _cs_score_country_text(
-            _clean, domain=_dom, min_hits=2, require_context=True
-        )
-        if _ctry in _CS_BY_NAME:
-            return _ctry, f"WEB({_eng}) HTTP {_code} -> {_ctry}"
+    _sld = _dom.split(".", 1)[0].strip("-")
+    _anchor = (
+        _sld
+        if (len(_sld) >= 4 and _sld.isalpha() and _sld not in _CS_GENERIC_BRAND_WORDS)
+        else ""
+    )
+    _notes = []
 
-        # Brand-anchored fallback when exact domain is unindexed/sparse
-        _sld = _dom.split(".", 1)[0].strip("-")
-        if (
-            len(_sld) >= 6
-            and _sld.isalpha()
-            and _sld not in _CS_GENERIC_BRAND_WORDS
-        ):
-            _bcode, _beng, _bclean, _bsib = _cs_bing_query(
-                f'"{_sld}" (country OR headquarters OR location OR address OR city)',
-                _headers,
-                _proxy_fn,
-                _dom,
+    for _eng_name, _q_fn in (("ddg", _cs_ddg_query), ("bing", _cs_bing_query)):
+        try:
+            _code, _eng, _clean, _sib, _vcards, _rew = _q_fn(
+                f'"{_dom}"', _headers, _proxy_fn, _dom
             )
-            if _bsib in _CS_BY_NAME:
-                return _bsib, f"WEB({_beng}:brand) sibling ccTLD -> {_bsib}"
-            _bctry = _cs_score_country_text(
-                _bclean,
-                domain=_dom,
-                min_hits=3,
-                require_context=True,
-                anchor_word=_sld,
-            )
-            if _bctry in _CS_BY_NAME:
-                return _bctry, f"WEB({_beng}:brand) HTTP {_bcode} -> {_bctry}"
+            if _sib in _CS_BY_NAME:
+                return _sib, f"WEB({_eng}) sibling ccTLD -> {_sib}"
+            if _vcards > 0:
+                _ctry = _cs_score_country_text(
+                    _clean,
+                    domain=_dom,
+                    min_hits=2,
+                    require_context=True,
+                    anchor_word=_anchor,
+                )
+                if _ctry in _CS_BY_NAME:
+                    return _ctry, f"WEB({_eng}) HTTP {_code} ({_vcards} verified) -> {_ctry}"
 
-        return "", f"WEB({_eng}) HTTP {_code} ({len(_clean)} organic chars, <2 contextual hits)"
-    except urllib.error.HTTPError as _he:
-        return "", f"WEB(bing):HTTP {_he.code}"
-    except Exception as _ex:
-        return "", f"WEB(bing):{type(_ex).__name__}"
+            # Brand-anchored query when exact domain returned 0 verified cards or no location
+            if _anchor:
+                _bcode, _beng, _bclean, _bsib, _bvcards, _brew = _q_fn(
+                    f'"{_sld}" (country OR headquarters OR location OR address OR city)',
+                    _headers,
+                    _proxy_fn,
+                    _dom,
+                )
+                if _bsib in _CS_BY_NAME:
+                    return _bsib, f"WEB({_beng}:brand) sibling ccTLD -> {_bsib}"
+                if _bvcards > 0:
+                    _bctry = _cs_score_country_text(
+                        _bclean,
+                        domain=_dom,
+                        min_hits=2,
+                        require_context=True,
+                        anchor_word=_sld,
+                    )
+                    if _bctry in _CS_BY_NAME:
+                        return _bctry, f"WEB({_beng}:brand) HTTP {_bcode} ({_bvcards} verified) -> {_bctry}"
+                _vcards = max(_vcards, _bvcards)
+                _rew = _rew or _brew
+
+            _tag = "autocorrect/0-verified" if (_rew and _vcards == 0) else f"{_vcards} verified cards"
+            _notes.append(f"WEB({_eng}):HTTP {_code} ({_tag})")
+        except urllib.error.HTTPError as _he:
+            _notes.append(f"WEB({_eng_name}):HTTP {_he.code}")
+        except Exception as _ex:
+            _notes.append(f"WEB({_eng_name}):{type(_ex).__name__}")
+
+    return "", "; ".join(_notes) if _notes else "WEB:no match"
 
 
 def _cs_infra_country(domain):
@@ -15426,7 +15638,7 @@ def _cs_label_country(domain):
 
 
 def _cs_discover_country(domain):
-    """Try RDAP (max 2 hops), Bing organic cards (exact + brand-anchored), site check, TLS/MX, then label heuristic."""
+    """Try RDAP (max 2 hops), DuckDuckGo + Bing verified cards, site check, TLS/MX, then label heuristic."""
     _ts = datetime.now().strftime("%H:%M:%S")
     _ctry, _rdap_note = _cs_rdap_country(domain)
     if _ctry in _CS_BY_NAME:
@@ -15831,8 +16043,8 @@ else:
             f"🔍 Search {_CS_GLOBAL_FLAG} Global ({len(_global_unmapped)})",
             width="stretch",
             help=f"Looks up up to {_CS_LOOKUP_CAP} unique unresolved Global domains "
-                 f"via RDAP, Bing organic results, site check, and TLS/MX across "
-                 f"{_CS_LOOKUP_WORKERS} workers, then saves any discovered countries.",
+                 f"via RDAP, DuckDuckGo + Bing verified results, site check, and TLS/MX "
+                 f"across {_CS_LOOKUP_WORKERS} workers, then saves any discovered countries.",
         ):
             if not _global_unmapped:
                 str_lit.session_state["_cs_flash"] = (
@@ -15889,8 +16101,8 @@ else:
             _tl1, _tl2 = str_lit.columns([0.75, 0.25])
             with _tl1:
                 str_lit.caption(
-                    "Shows RDAP, Bing web search, site check, and TLS/MX status for every "
-                    "domain queried by Search 🌐 Global."
+                    "Shows RDAP, DuckDuckGo/Bing verified search, site check, and TLS/MX "
+                    "status for every domain queried by Search 🌐 Global."
                 )
             with _tl2:
                 if str_lit.button("🧹 Clear trace", key="cs_clear_trace", width="stretch"):
