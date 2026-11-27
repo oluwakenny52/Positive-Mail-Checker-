@@ -11470,6 +11470,27 @@ with str_lit.sidebar:
         str_lit.button("⬆️ Import into my pasted list", width="stretch",
                        on_click=_on_import_custom)
 
+        str_lit.markdown("---")
+        _show_custom = str_lit.checkbox("👁 Show my current custom proxies", key="show_custom_saved")
+        if _show_custom:
+            _cur_custom = _read_lines(_src_path("custom"))
+            if _cur_custom:
+                str_lit.code("\n".join(_cur_custom), language="text")
+            else:
+                str_lit.caption("Your custom list is empty.")
+
+        _rc1, _rc2 = str_lit.columns(2)
+        with _rc1:
+            str_lit.button("🔁 Re-probe custom list only", width="stretch",
+                           on_click=_reprobe_source, args=("custom",),
+                           help="Tests ONLY the lines in your custom list. "
+                                "The provider list is left completely alone.")
+        with _rc2:
+            str_lit.button("🧽 Clear custom list", width="stretch",
+                           on_click=_on_clear_source, args=("custom",),
+                           help="Removes every line from your custom list. "
+                                "The provider list is untouched.")
+
     # FIX PERF-7: the blocking st.spinner is gone - block 077 now drives its own
     # progress bar in 24-line chunks, so the sidebar keeps painting instead of
     # freezing for the whole batch budget.
