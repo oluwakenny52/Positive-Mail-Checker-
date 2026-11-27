@@ -5979,21 +5979,64 @@ def enrich_proxy_geo(proxies, max_workers=8):
         log_startup(f"Proxy geo: resolved {fixed} of {len(todo)} node(s).", quiet=True)
 
 
+_COUNTRY_ENRICH_LOCK = STATE.setdefault("country_enrich_lock", threading.Lock())
+_COUNTRY_ENRICH = STATE.setdefault("country_enrich", {"ts": 0.0})
+
+
+def _kick_country_enrich(raw):
+    """Fill unknown countries OFF the script thread, at most once every 2 min.
+
+    v13.86 FIX COUNTRY-BLOCK: THE PICKER RESOLVED EVERY UNKNOWN NODE INLINE.
+    get_available_countries_with_scores() called geo_lookup() for each node with
+    no country, and geo_lookup is throttled to ip-api's 45/min tier - so tapping
+    "country" on a cold 200-node pool blocked the SIDEBAR, on the script thread,
+    for four to five minutes, and every rerun while the picker stayed open
+    re-entered the same walk. The list is drawn from what is already known now
+    and the gaps are filled in the background; save_proxy_meta() makes them stick
+    for the next load, and a node that is still unknown simply sits under
+    UNKNOWN until then.
+    """
+    now = time.time()
+    with _COUNTRY_ENRICH_LOCK:
+        if (now - float(_COUNTRY_ENRICH.get("ts") or 0.0)) < 120.0:
+            return
+        _COUNTRY_ENRICH["ts"] = now
+    _who = _gate_scope()
+
+    def _run():
+        try:
+            _pin_gate_scope(_who)
+            seed_task_cfg(_cfg_snapshot())
+            enrich_proxy_geo(raw)
+            _sv = globals().get("save_proxy_meta")
+            if _sv is not None:
+                _sv()
+            log_startup("country list: geo resolved in the background.", quiet=True)
+        except Exception as e:
+            log_startup(f"WARNING: background country resolve failed: {e}", quiet=True)
+
+    threading.Thread(target=_run, daemon=True, name="country-geo").start()
+
+
 def get_available_countries_with_scores():
+    """Countries present in the pool, by score. NEVER blocks on a geo lookup."""
     try:
         raw = load_proxies()
         country_scores = defaultdict(list)
+        _missing = 0
         for p in raw:
             meta = proxy_meta.get(p, {})
             c = str(meta.get("country", "Unknown")).upper()
-            if c == "UNKNOWN" or not c:
-                info = parse_proxy(p)
-                if info:
-                    c = geo_lookup(info["host"])[0].upper()
+            if not c or c == "UNKNOWN":
+                c = "UNKNOWN"
+                _missing += 1
             country_scores[c].append(meta.get("score", 50))
+        if _missing:
+            _kick_country_enrich(raw)
         ranked = sorted(((c, sum(s) / len(s)) for c, s in country_scores.items() if s),
                         key=lambda x: x[1], reverse=True)
-        return [c for c, _ in ranked if c != "UNKNOWN"] + (["UNKNOWN"] if "UNKNOWN" in country_scores else [])
+        return ([c for c, _ in ranked if c != "UNKNOWN"]
+                + (["UNKNOWN"] if "UNKNOWN" in country_scores else []))
     except Exception:
         return []
 
@@ -7866,6 +7909,14 @@ def sample_alive_proxy(exclude=None, domain=None, avoid=None):
     v13.71: THE CURSOR IS PER USER. rr_last / rr_index were process values, so
     the node user A had just used was excluded from user B's next pick as well -
     one user's traffic steering another's rotation.
+
+    v13.86 FIX TIERS-ONCE: _pool_tiers() WAS CALLED TWICE, AND EACH CALL COPIES
+    THE WHOLE probe_stats DICT UNDER ITS LOCK. This runs once per rung and again
+    per rotation, on worker threads, against a pool that can be thousands of
+    lines - so a 3000-node pool paid two 3000-entry dict copies for every single
+    pick, and the second copy could disagree with the first because a probe
+    finishing in between re-partitioned it. The tiers are computed once now and
+    both passes read the same three lists.
     """
     _rebind_scope()
     exclude = set(exclude or ())
@@ -7911,8 +7962,9 @@ def sample_alive_proxy(exclude=None, domain=None, avoid=None):
             pool = unparked
 
     # ---- QUALITY TIER: the best tier that still has a usable node ------------
+    _tiers = _pool_tiers(pool)
     cand = None
-    for _tier in _pool_tiers(pool):
+    for _tier in _tiers:
         if not _tier:
             continue
         _c = [p for p in _tier if p not in exclude and p not in avoid]
@@ -7920,7 +7972,7 @@ def sample_alive_proxy(exclude=None, domain=None, avoid=None):
             cand = _c
             break
     if cand is None:
-        for _tier in _pool_tiers(pool):
+        for _tier in _tiers:
             _c = [p for p in _tier if p not in exclude]
             if _c:
                 cand = _c
@@ -8525,6 +8577,22 @@ def refresh_alive_pool(force: bool = False, budget: float = None):
         except Exception:
             raw = []
         if not raw:
+            # v13.86 FIX POOL-EMPTY: THE POOL WAS WIPED ON A TRANSIENT EMPTY FILE.
+            # A fetch, an import, a source switch and every Restore rewrite
+            # proxies.txt through a .tmp and os.replace, and the prober can enter
+            # refresh_alive_pool() in the window around that - it read an empty or
+            # filtered-to-nothing file, cleared alive_pool and returned, and every
+            # account after it went DIRECT while the armed nodes were still
+            # sitting in memory. The 0-PASSED case far below already keeps the
+            # pool while a run is in flight; the 0-CANDIDATE case did not. It does
+            # now, and the log names which of the two happened.
+            if _any_run_active():
+                with alive_pool_lock:
+                    _kept = [p for p in alive_pool if p]
+                if _kept:
+                    log_probe_event(f"refresh: proxies.txt is empty but a run is live "
+                                    f"- kept the current {len(_kept)}-node pool")
+                    return
             with alive_pool_lock:
                 alive_pool[:] = []
             log_startup("Alive pool refreshed: proxies.txt is empty.", quiet=True)
@@ -15415,7 +15483,13 @@ def read_mailbox_messages(email, password, server, proxy_str=None, limit=10, pag
         typ, data = mail.search(None, "ALL")
         if typ != "OK":
             return False, [], "the INBOX could not be searched"
-        ids = data[0].split()
+        # v13.86 FIX SEARCH-NONE: AN EMPTY OR GARBLED SEARCH ANSWER IS NOT A LIST.
+        # An empty INBOX comes back as [b""] from most servers and as [None] from
+        # a few, and data[0].split() raised AttributeError on the second - swallowed
+        # by the generic except and reported to the user as "NoneType has no
+        # attribute split", which reads like a code fault rather than an empty
+        # mailbox. Both shapes are simply "no ids" now.
+        ids = (data[0].split() if data and data[0] else [])
         if not ids:
             return False, [], "the inbox is empty"
 
@@ -18388,7 +18462,16 @@ if start_engine_btn:
 # v13.79 WAVE 6: keyword hits are a bucket like the rest here. They are counted,
 # listed and downloadable, and the note under them says where the bodies are -
 # because a hit without its body is only half the answer.
-_DF_TAIL = REPORT_ENTRIES_MAX
+#
+# v13.86 FIX TABLE-CAP: v13.75 DERIVED THIS FROM THE WHOLE RING AND THE RING IS
+# NOW 3000. That was right when a row was a line; every row here also carries a
+# multi-line Under-The-Hood trace, so a finished run copied megabytes of strings
+# and handed a 3000-row frame to Arrow on EVERY load - on a phone, with the
+# page's own "building the results summary" line frozen above it. The live table
+# already caps at _DF_TAIL_LIVE (250). The summary shows the newest 500: the
+# caption says so, and the ZIP, the .txt exports and the Full Log page still
+# carry every row, so nothing is lost.
+_DF_TAIL = min(REPORT_ENTRIES_MAX, 500)
 
 try:
     status_text.text("Progress: complete - building the results summary...")
