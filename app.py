@@ -14624,6 +14624,44 @@ _CS_COUNTRIES = (
 )
 
 _CS_BY_NAME = {_c[1]: _c for _c in _CS_COUNTRIES}
+_CS_BY_CODE = {_c[0]: _c[1] for _c in _CS_COUNTRIES}
+_CS_LOOKUP_CAP = 35
+_CS_TEXT_CUES = (
+    ("united states", "United States"),
+    ("u.s.a.", "United States"),
+    ("usa", "United States"),
+    ("united kingdom", "United Kingdom"),
+    ("england", "United Kingdom"),
+    ("scotland", "United Kingdom"),
+    ("canada", "Canada"),
+    ("australia", "Australia"),
+    ("germany", "Germany"),
+    ("deutschland", "Germany"),
+    ("france", "France"),
+    ("italy", "Italy"),
+    ("italia", "Italy"),
+    ("spain", "Spain"),
+    ("espana", "Spain"),
+    ("brazil", "Brazil"),
+    ("brasil", "Brazil"),
+    ("india", "India"),
+    ("japan", "Japan"),
+    ("south korea", "South Korea"),
+    ("china", "China"),
+    ("russia", "Russia"),
+    ("netherlands", "Netherlands"),
+    ("switzerland", "Switzerland"),
+    ("sweden", "Sweden"),
+    ("norway", "Norway"),
+    ("denmark", "Denmark"),
+    ("poland", "Poland"),
+    ("south africa", "South Africa"),
+    ("nigeria", "Nigeria"),
+    ("mexico", "Mexico"),
+    ("singapore", "Singapore"),
+    ("united arab emirates", "United Arab Emirates"),
+    ("dubai", "United Arab Emirates"),
+)
 # The two pseudo-groups sort to the BOTTOM of every picker - after every real
 # country - and the providers group sits above Global, because Global is the
 # leftover bucket and providers is a real answer.
@@ -14762,6 +14800,81 @@ def _cs_provider_root(domain):
     if len(_labels) >= 3 and ".".join(_labels[-2:]) in _CS_MULTI_SUFFIX:
         return ".".join(_labels[-3:])
     return ".".join(_labels[-2:])
+
+
+def _cs_match_country_text(text):
+    """Extract an exact _CS_BY_NAME country from RDAP or search snippet text."""
+    _low = " " + re.sub(r"[^a-z0-9.]+", " ", str(text or "").lower()) + " "
+    for _cue, _ctry in _CS_TEXT_CUES:
+        if f" {_cue} " in _low and _ctry in _CS_BY_NAME:
+            return _ctry
+    for _name in _CS_BY_NAME:
+        if len(_name) >= 5 and f" {_name.lower()} " in _low:
+            return _name
+    return ""
+
+
+def _cs_rdap_country(domain):
+    """Query RDAP for registrant country code (e.g. 'US' -> 'United States')."""
+    _dom = _cs_provider_root(domain) or str(domain or "").lower().strip()
+    if not _dom:
+        return ""
+    _tld = _dom.rsplit(".", 1)[-1]
+    _urls = []
+    if _tld in ("com", "net"):
+        _urls.append(f"https://rdap.verisign.com/{_tld}/v1/domain/{_dom}")
+    _urls.append(f"https://rdap.org/domain/{_dom}")
+    for _u in _urls:
+        try:
+            _req = urllib.request.Request(
+                _u, headers={"User-Agent": "Mozilla/5.0", "Accept": "application/rdap+json"}
+            )
+            with urllib.request.urlopen(_req, timeout=3.0) as _resp:
+                _raw = _resp.read(65536).decode("utf-8", errors="ignore")
+            for _m in re.finditer(r'"([A-Z]{2})"', _raw):
+                _code = _m.group(1)
+                if _code in _CS_BY_CODE:
+                    return _CS_BY_CODE[_code]
+            _by_txt = _cs_match_country_text(_raw)
+            if _by_txt:
+                return _by_txt
+        except Exception:
+            continue
+    return ""
+
+
+def _cs_web_country(domain):
+    """Fallback web snippet lookup for organizational .com/.net/.org domains."""
+    _dom = _cs_provider_root(domain) or str(domain or "").lower().strip()
+    if not _dom:
+        return ""
+    _q = urllib.parse.quote_plus(f'"{_dom}" headquarters OR address OR contact')
+    _url = f"https://html.duckduckgo.com/html/?q={_q}"
+    try:
+        _req = urllib.request.Request(
+            _url,
+            headers={
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                "Accept-Language": "en-US,en;q=0.9",
+            },
+        )
+        with urllib.request.urlopen(_req, timeout=3.5) as _resp:
+            _html = _resp.read(98304).decode("utf-8", errors="ignore")
+        _clean = re.sub(r"<[^>]+>", " ", _html)
+        return _cs_match_country_text(_clean)
+    except Exception:
+        return ""
+
+
+def _cs_discover_country(domain):
+    """Try RDAP first, then web snippet search. Returns a valid country name or ''."""
+    _ctry = _cs_rdap_country(domain)
+    if _ctry in _CS_BY_NAME:
+        return _ctry
+    _ctry = _cs_web_country(domain)
+    if _ctry in _CS_BY_NAME:
+        return _ctry
+    return ""
 
 
 def _cs_country_of(domain, mapping):
@@ -15044,7 +15157,7 @@ else:
         help="Several are allowed. The number beside each group is how many "
              "accounts it holds. The sent section names them as one line, e.g. "
              "US, CA, DE and Global, and runs exactly those accounts.")
-    _cs_b1, _cs_b2, _cs_b3 = str_lit.columns(3)
+    _cs_b1, _cs_b2, _cs_b3, _cs_b4 = str_lit.columns(4)
     with _cs_b1:
         if str_lit.button("➡️ Send selection", width="stretch", type="primary"):
             if not _cs_picked:
@@ -15095,6 +15208,54 @@ else:
                 str_lit.session_state["_cs_flash"] = (
                     "warning", "Nothing new to assign - every answerable domain is "
                                "already taught.")
+            str_lit.rerun()
+    with _cs_b4:
+        _global_unmapped = sorted({
+            _r[1] for _r in _cs_all_rows
+            if _r[2] == _CS_GLOBAL and _r[1] not in _cs_map
+        })
+        if str_lit.button(
+            f"🔍 Search {_CS_GLOBAL_FLAG} Global ({len(_global_unmapped)})",
+            width="stretch",
+            help=f"Looks up up to {_CS_LOOKUP_CAP} unique unresolved Global domains "
+                 f"via RDAP and web search, then saves any discovered countries to "
+                 f"your domain map so they never need to be searched again.",
+        ):
+            if not _global_unmapped:
+                str_lit.session_state["_cs_flash"] = (
+                    "info", f"No unresolved {_CS_GLOBAL_FLAG} Global domains in this source.")
+            else:
+                _batch = _global_unmapped[:_CS_LOOKUP_CAP]
+                _m = dict(_cs_map)
+                _found = 0
+                _bar = str_lit.progress(0.0, text=f"0/{len(_batch)} - searching Global domains...")
+                for _idx, _dom in enumerate(_batch, 1):
+                    _bar.progress(
+                        _idx / len(_batch),
+                        text=f"{_idx}/{len(_batch)} - looking up {_dom}...",
+                    )
+                    _ctry = _cs_discover_country(_dom)
+                    if _ctry:
+                        _m[_dom] = _ctry
+                        _found += 1
+                _bar.empty()
+                if _found:
+                    str_lit.session_state["cs_map"] = _m
+                    str_lit.session_state["cs_map_ver"] = _cs_ver + 1
+                    _cs_save_map(_m)
+                    _rem = max(0, len(_global_unmapped) - len(_batch))
+                    _extra = f" ({_rem} remaining - click again for the next batch)" if _rem else ""
+                    str_lit.session_state["_cs_flash"] = (
+                        "success",
+                        f"Found countries for **{_found}** of **{len(_batch)}** "
+                        f"{_CS_GLOBAL_FLAG} Global domain(s) and saved them.{_extra}",
+                    )
+                else:
+                    str_lit.session_state["_cs_flash"] = (
+                        "warning",
+                        f"Searched **{len(_batch)}** {_CS_GLOBAL_FLAG} Global domain(s), "
+                        f"but none returned a clear country.",
+                    )
             str_lit.rerun()
 
     if _cs_label():
