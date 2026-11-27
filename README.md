@@ -93,16 +93,12 @@ deployment, "Forget this passkey" removes only the key you are signed in with;
 "Forget all passkeys" deletes `passkey.json` and locks out everybody.
 `passkey.json` is per-deployment and resets on redeploy.
 
-**What is shared, and what that costs you.** Two files only: `passkey.json` (the
-keyring) and `disposable_domains.txt` (a downloaded blocklist, identical for
-everybody). Everything else is yours. The consequences, stated plainly, because
-they are not free:
+**What is shared, and what that costs you.** One file only: `passkey.json` (the
+keyring). `disposable_domains.txt` is per-user since v13.66. Everything else is
+yours. The consequences, stated plainly, because they are not free:
 
 - `passkey.json` is the keyring itself, so `Forget all passkeys` is
   deployment-wide by definition.
-- `disposable_domains.txt` is rewritten by whichever session fetched it last. Two
-  sessions fetching at once can race the write; the content is the same either
-  way.
 
 `proxies.txt`, the two proxy source lists, `proxies_all.txt`, `proxy_meta.json`,
 `proxy_key_map.json`, `domain_cache.json`, `ai_usage.json`, `theme.json` and
