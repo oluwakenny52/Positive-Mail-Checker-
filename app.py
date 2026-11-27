@@ -14000,9 +14000,10 @@ def kw_drain(wait=0.0):
 # HOW A COUNTRY IS DECIDED, highest precedence first:
 #   1. a domain TAUGHT in this section (this user's own domain_countries.json)
 #   2. a GENERIC PROVIDER ROOT -> the "Global providers" pseudo-group
-#   3. the built-in DOMAIN_COUNTRY_HINTS table (block 021)
-#   4. the TLD table (block 052)
-#   5. Global
+#   3. built-in REGIONAL / ISP / WEBMAIL domain mappings (_CS_REGIONAL_ISP_COUNTRIES)
+#   4. the built-in DOMAIN_COUNTRY_HINTS table (block 021)
+#   5. the TLD table (block 052)
+#   6. Global
 #
 # STEP 2, AND WHY IT IS A ROOT MATCH RATHER THAN A DOMAIN MATCH:
 #   gmail.com, outlook.com, yahoo.com, aol.com, icloud.com, gmx.net, mail.com,
@@ -14020,9 +14021,10 @@ def kw_drain(wait=0.0):
 #
 # THE MAP IS TEACHABLE. "Teach a domain its country" writes to THIS user's own
 # domain_countries.json, "Auto-assign countries from the rows" fills every
-# domain the provider set, the hints and the TLDs can answer for, and the map
-# panel draws one marker per country that actually has credentials and lets you
-# re-assign or forget any domain. Nothing about it is shared with another user.
+# domain the provider set, regional/ISP map, hints and TLDs can answer for, and
+# the map panel draws one marker per country that actually has credentials and
+# lets you re-assign or forget any domain. Nothing about it is shared with another
+# user.
 #
 # EVERY COUNTRY CARRIES ITS FLAG. The flag is DERIVED from the two-letter code
 # with the regional-indicator arithmetic, so a country can never be listed
@@ -14083,13 +14085,11 @@ _CS_MULTI_SUFFIX = frozenset({
 # providers whose mailboxes are hosted on one global platform: the account is
 # nowhere in particular, so it belongs in Global providers rather than under the
 # country its TLD happens to name. Country-coded variants of the SAME brands
-# (gmx.ch, gmx.de, orange.net, yahoo.co.uk, live.co.uk) are deliberately absent -
-# they are in block 021 and keep their country.
+# (gmx.ch, gmx.de, orange.net, yahoo.co.uk, live.co.uk, hotmail.*) are
+# deliberately absent - they resolve to their countries instead.
 _CS_PROVIDERS = frozenset({
     "gmail.com", "googlemail.com",
-    "outlook.com", "hotmail.com", "hotmail.co.uk", "hotmail.fr", "hotmail.de",
-    "hotmail.it", "hotmail.es", "live.com", "live.co.uk", "live.fr", "live.de",
-    "live.it", "live.nl", "msn.com",
+    "outlook.com", "hotmail.com", "live.com", "msn.com",
     "yahoo.com", "ymail.com", "rocketmail.com", "aol.com",
     "icloud.com", "me.com", "mac.com",
     "proton.me", "protonmail.com", "pm.me",
@@ -14097,6 +14097,278 @@ _CS_PROVIDERS = frozenset({
     "fastmail.com", "hushmail.com",
     "gmx.net", "gmx.com", "mail.com", "email.com", "zoho.com", "zohomail.com",
 })
+
+# ---- built-in regional webmail & ISP domain -> country map --------------
+# Every entry maps to an exact country name from _CS_COUNTRIES so it resolves
+# automatically without manual teaching, while still allowing per-user
+# overrides in domain_countries.json.
+_CS_REGIONAL_ISP_COUNTRIES = {
+    # China (webmail + carriers/ISPs)
+    "qq.com": "China",
+    "foxmail.com": "China",
+    "163.com": "China",
+    "126.com": "China",
+    "yeah.net": "China",
+    "188.com": "China",
+    "sina.com": "China",
+    "sina.cn": "China",
+    "sohu.com": "China",
+    "aliyun.com": "China",
+    "189.cn": "China",
+    "139.com": "China",
+    "wo.cn": "China",
+    "tom.com": "China",
+    "21cn.com": "China",
+    # Russia & CIS
+    "yandex.com": "Russia",
+    "yandex.ru": "Russia",
+    "ya.ru": "Russia",
+    "yandex.by": "Belarus",
+    "yandex.kz": "Kazakhstan",
+    "yandex.ua": "Ukraine",
+    "mail.ru": "Russia",
+    "inbox.ru": "Russia",
+    "bk.ru": "Russia",
+    "list.ru": "Russia",
+    "internet.ru": "Russia",
+    "rambler.ru": "Russia",
+    "lenta.ru": "Russia",
+    "autorambler.ru": "Russia",
+    "myrambler.ru": "Russia",
+    "ro.ru": "Russia",
+    "ukr.net": "Ukraine",
+    # South Korea
+    "naver.com": "South Korea",
+    "daum.net": "South Korea",
+    "hanmail.net": "South Korea",
+    "kakao.com": "South Korea",
+    "nate.com": "South Korea",
+    # Brazil
+    "globo.com": "Brazil",
+    "globomail.com": "Brazil",
+    "uol.com.br": "Brazil",
+    "bol.com.br": "Brazil",
+    "ig.com.br": "Brazil",
+    "terra.com.br": "Brazil",
+    "r7.com": "Brazil",
+    "zipmail.com.br": "Brazil",
+    "oi.com.br": "Brazil",
+    # India
+    "rediffmail.com": "India",
+    "rediff.com": "India",
+    # France
+    "laposte.net": "France",
+    "orange.fr": "France",
+    "wanadoo.fr": "France",
+    "free.fr": "France",
+    "sfr.fr": "France",
+    "voila.fr": "France",
+    "neuf.fr": "France",
+    "bbox.fr": "France",
+    "numericable.fr": "France",
+    "club-internet.fr": "France",
+    "hotmail.fr": "France",
+    "live.fr": "France",
+    # Middle East / Pan-Arab (Maktoob originated in Jordan)
+    "maktoob.com": "Jordan",
+    # Germany
+    "web.de": "Germany",
+    "t-online.de": "Germany",
+    "freenet.de": "Germany",
+    "arcor.de": "Germany",
+    "online.de": "Germany",
+    "hotmail.de": "Germany",
+    "live.de": "Germany",
+    # Italy
+    "libero.it": "Italy",
+    "virgilio.it": "Italy",
+    "tin.it": "Italy",
+    "alice.it": "Italy",
+    "tiscali.it": "Italy",
+    "email.it": "Italy",
+    "pec.it": "Italy",
+    "hotmail.it": "Italy",
+    "live.it": "Italy",
+    # Spain
+    "terra.es": "Spain",
+    "ya.com": "Spain",
+    "ozu.es": "Spain",
+    "telefonica.net": "Spain",
+    "hotmail.es": "Spain",
+    # Poland
+    "wp.pl": "Poland",
+    "onet.pl": "Poland",
+    "op.pl": "Poland",
+    "interia.pl": "Poland",
+    "interia.eu": "Poland",
+    "o2.pl": "Poland",
+    "tlen.pl": "Poland",
+    "gazeta.pl": "Poland",
+    # Czechia & Slovakia
+    "seznam.cz": "Czechia",
+    "email.cz": "Czechia",
+    "post.cz": "Czechia",
+    "centrum.cz": "Czechia",
+    "volny.cz": "Czechia",
+    "atlas.cz": "Czechia",
+    "centrum.sk": "Slovakia",
+    "azet.sk": "Slovakia",
+    "zoznam.sk": "Slovakia",
+    # Hungary
+    "freemail.hu": "Hungary",
+    "citromail.hu": "Hungary",
+    "indamail.hu": "Hungary",
+    # Japan
+    "docomo.ne.jp": "Japan",
+    "ezweb.ne.jp": "Japan",
+    "au.com": "Japan",
+    "softbank.ne.jp": "Japan",
+    "i.softbank.jp": "Japan",
+    "nifty.com": "Japan",
+    "biglobe.ne.jp": "Japan",
+    "ocn.ne.jp": "Japan",
+    "so-net.ne.jp": "Japan",
+    "excite.co.jp": "Japan",
+    "goo.ne.jp": "Japan",
+    # Taiwan
+    "pchome.com.tw": "Taiwan",
+    "hinet.net": "Taiwan",
+    "msa.hinet.net": "Taiwan",
+    # United States ISPs & consumer domains
+    "comcast.net": "United States",
+    "verizon.net": "United States",
+    "att.net": "United States",
+    "sbcglobal.net": "United States",
+    "bellsouth.net": "United States",
+    "pacbell.net": "United States",
+    "ameritech.net": "United States",
+    "swbell.net": "United States",
+    "cox.net": "United States",
+    "charter.net": "United States",
+    "spectrum.net": "United States",
+    "rr.com": "United States",
+    "roadrunner.com": "United States",
+    "twc.com": "United States",
+    "earthlink.net": "United States",
+    "mindspring.com": "United States",
+    "optonline.net": "United States",
+    "optimum.net": "United States",
+    "juno.com": "United States",
+    "netzero.net": "United States",
+    "centurylink.net": "United States",
+    "centurytel.net": "United States",
+    "q.com": "United States",
+    "embarqmail.com": "United States",
+    "windstream.net": "United States",
+    "frontier.com": "United States",
+    "frontiernet.net": "United States",
+    "suddenlink.net": "United States",
+    "mediacombb.net": "United States",
+    "rcn.com": "United States",
+    "hughes.net": "United States",
+    # Canada ISPs
+    "rogers.com": "Canada",
+    "bell.net": "Canada",
+    "eastlink.ca": "Canada",
+    "shaw.ca": "Canada",
+    "sympatico.ca": "Canada",
+    "videotron.ca": "Canada",
+    "telus.net": "Canada",
+    "telusplanet.net": "Canada",
+    "cogeco.ca": "Canada",
+    "sasktel.net": "Canada",
+    "mts.net": "Canada",
+    # Australia ISPs
+    "bigpond.com": "Australia",
+    "bigpond.net.au": "Australia",
+    "bigpond.com.au": "Australia",
+    "optusnet.com.au": "Australia",
+    "iinet.net.au": "Australia",
+    "internode.on.net": "Australia",
+    "tpg.com.au": "Australia",
+    "dodo.com.au": "Australia",
+    "adam.com.au": "Australia",
+    "westnet.com.au": "Australia",
+    "ozemail.com.au": "Australia",
+    # United Kingdom ISPs
+    "btinternet.com": "United Kingdom",
+    "btopenworld.com": "United Kingdom",
+    "bt.com": "United Kingdom",
+    "sky.com": "United Kingdom",
+    "virginmedia.com": "United Kingdom",
+    "virgin.net": "United Kingdom",
+    "ntlworld.com": "United Kingdom",
+    "blueyonder.co.uk": "United Kingdom",
+    "talktalk.net": "United Kingdom",
+    "tiscali.co.uk": "United Kingdom",
+    "lineone.net": "United Kingdom",
+    "plus.com": "United Kingdom",
+    "plus.net": "United Kingdom",
+    "force9.co.uk": "United Kingdom",
+    "freeserve.co.uk": "United Kingdom",
+    "orange.net": "United Kingdom",
+    "ee.co.uk": "United Kingdom",
+    "hotmail.co.uk": "United Kingdom",
+    "live.co.uk": "United Kingdom",
+    # New Zealand ISPs
+    "xtra.co.nz": "New Zealand",
+    "spark.co.nz": "New Zealand",
+    "vodafone.co.nz": "New Zealand",
+    "clear.net.nz": "New Zealand",
+    "slingshot.co.nz": "New Zealand",
+    # Netherlands ISPs
+    "ziggo.nl": "Netherlands",
+    "kpnmail.nl": "Netherlands",
+    "kpnplanet.nl": "Netherlands",
+    "planet.nl": "Netherlands",
+    "hetnet.nl": "Netherlands",
+    "home.nl": "Netherlands",
+    "chello.nl": "Netherlands",
+    "zonnet.nl": "Netherlands",
+    "xs4all.nl": "Netherlands",
+    "casema.nl": "Netherlands",
+    "upcmail.nl": "Netherlands",
+    "quicknet.nl": "Netherlands",
+    "live.nl": "Netherlands",
+    # Belgium ISPs
+    "telenet.be": "Belgium",
+    "skynet.be": "Belgium",
+    "proximus.be": "Belgium",
+    "scarlet.be": "Belgium",
+    "voo.be": "Belgium",
+    "brutele.be": "Belgium",
+    # Switzerland ISPs
+    "bluewin.ch": "Switzerland",
+    "hispeed.ch": "Switzerland",
+    "sunrise.ch": "Switzerland",
+    "swissonline.ch": "Switzerland",
+    "gmx.ch": "Switzerland",
+    # Austria ISPs
+    "aon.at": "Austria",
+    "chello.at": "Austria",
+    "inode.at": "Austria",
+    "magenta.at": "Austria",
+    "kabsi.at": "Austria",
+    # Sweden, Norway & Denmark ISPs
+    "telia.com": "Sweden",
+    "telia.se": "Sweden",
+    "bredband.net": "Sweden",
+    "comhem.se": "Sweden",
+    "online.no": "Norway",
+    "broadpark.no": "Norway",
+    "getmail.no": "Norway",
+    "tdcadsl.dk": "Denmark",
+    "mail.dk": "Denmark",
+    "stofanet.dk": "Denmark",
+    "youmail.dk": "Denmark",
+    # South Africa ISPs
+    "mweb.co.za": "South Africa",
+    "telkomsa.net": "South Africa",
+    "vodamail.co.za": "South Africa",
+    "iafrica.com": "South Africa",
+    "absamail.co.za": "South Africa",
+    "webmail.co.za": "South Africa",
+}
 
 # code, name, region, latitude, longitude. The code is the flag AND the short
 # label; the coordinates are the country centroid the map marker sits on.
@@ -14493,15 +14765,19 @@ def _cs_provider_root(domain):
 
 
 def _cs_country_of(domain, mapping):
-    """taught map, then a provider root, then the hints, then the TLD, then Global."""
+    """taught map, then a provider root, then regional/ISP map, then hints, then TLD, then Global."""
     _d = str(domain or "").lower().strip()
     if not _d:
         return _CS_GLOBAL
     _hit = (mapping or {}).get(_d)
     if _hit:
         return _hit
-    if _cs_provider_root(_d) in _CS_PROVIDERS:
+    _root = _cs_provider_root(_d)
+    if _root in _CS_PROVIDERS:
         return _CS_PROVIDERS_GROUP
+    _reg_isp = _CS_REGIONAL_ISP_COUNTRIES.get(_d) or _CS_REGIONAL_ISP_COUNTRIES.get(_root)
+    if _reg_isp:
+        return _reg_isp
     if _d in DOMAIN_COUNTRY_HINTS:
         return DOMAIN_COUNTRY_HINTS[_d]
     for _part in reversed(_d.split(".")):
@@ -14727,10 +15003,10 @@ with _cs_m1:
                       on_change=_cs_on_mode_change,
                       help="Domain groups by the part after the @. Country groups "
                            "by the country the domain is taught, provider-matched, "
-                           "hinted or TLD-resolved to - generic providers such as "
-                           "gmail.com and outlook.com collect under Global providers, "
-                           "and everything unresolved falls under Global. Region "
-                           "groups those countries by continent.")
+                           "regional/ISP-mapped, hinted or TLD-resolved to - generic "
+                           "providers such as gmail.com and outlook.com collect under "
+                           "Global providers, and everything unresolved falls under "
+                           "Global. Region groups those countries by continent.")
 with _cs_m2:
     str_lit.selectbox(f"Sort credentials from ({len(_CS_SOURCES)} sources)",
                       list(_CS_SOURCES), key="cs_source",
@@ -14794,7 +15070,7 @@ else:
     with _cs_b3:
         if str_lit.button("🌍 Auto-assign from the rows", width="stretch",
                           help="Fills a country for every domain the built-in "
-                               "provider set, the provider hints or the TLD table "
+                               "provider set, regional/ISP map, hints or TLD table "
                                "can answer for - generic providers get Global "
                                "providers. Domains already taught are left alone; "
                                "the rest stay under Global."):
@@ -14813,7 +15089,7 @@ else:
                 _cs_save_map(_m)
                 str_lit.session_state["_cs_flash"] = (
                     "success", f"Assigned **{_added}** domain(s) from the provider "
-                               f"set, the hints and the TLDs. **{len(_cs_map)}** "
+                               f"set, regional/ISP map, hints and TLDs. **{len(_cs_map)}** "
                                f"teaching(s) stored before, **{len(_m)}** now.")
             else:
                 str_lit.session_state["_cs_flash"] = (
@@ -14829,9 +15105,9 @@ else:
 # ---- teach one domain -------------------------------------------------------
 with str_lit.expander("🏷 Teach a domain its country", expanded=False):
     str_lit.caption("The domain is matched exactly, lower-cased, and only for THIS "
-                    "user. A taught domain always wins over the provider set, the "
-                    "hints and the TLD, and both Global and Global providers are "
-                    "real answers, not blanks.")
+                    "user. A taught domain always wins over the provider set, "
+                    "regional/ISP map, hints and TLD, and both Global and Global "
+                    "providers are real answers, not blanks.")
     _cs_t1, _cs_t2 = str_lit.columns([0.55, 0.45])
     with _cs_t1:
         _cs_teach_dom = str_lit.text_input("Domain (e.g. example.com)",
@@ -14862,7 +15138,8 @@ with str_lit.expander("🏷 Teach a domain its country", expanded=False):
     with _cs_tb2:
         if str_lit.button("🧽 Forget this domain", width="stretch",
                           help="Drops the teaching, so the domain falls back to the "
-                               "provider set, the hints, the TLD and then Global."):
+                               "provider set, regional/ISP map, hints, TLD and then "
+                               "Global."):
             _dom = str(_cs_teach_dom or "").lower().strip().lstrip("@")
             _m = dict(_cs_map)
             if _dom in _m:
@@ -14987,7 +15264,7 @@ if _cs_map_on:
                               hide_index=True, height=240)
     else:
         str_lit.caption("Nothing taught yet - every country above came from the "
-                        "built-in provider set, hints and TLDs.")
+                        "built-in provider set, regional/ISP map, hints and TLDs.")
 
 # --------------------------------------------------------------------------
 # INSPECTOR - v13.63, re-cut v13.76, v13.77
