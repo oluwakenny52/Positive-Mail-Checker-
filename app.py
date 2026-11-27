@@ -13231,7 +13231,14 @@ def _kw_scan_pure(combo, cfg, out):
 
         if proto == "pop":
             trace("INFO", "proto", "POP3 session - there are no folders, INBOX only")
-            out["hits"], note = _kw_pop_scan(mail, words, body_scan, fields, trace)
+            # v13.86 FIX KW-14: THE WINDOW HERE WAS body_scan. On the IMAP path the
+            # header pass takes the whole `scan` window and only the body pass is
+            # capped at KW_BODY_SCAN_CAP, but POP3 has no separate header pass - it
+            # RETRs a message and matches headers and body in one go - so passing
+            # body_scan capped the entire POP3 window at 40 and a "Newest 100" scan
+            # silently read 40. The window is `scan`; there is no body cap to apply
+            # on this path, because every RETR already fetches the body.
+            out["hits"], note = _kw_pop_scan(mail, words, scan, fields, trace)
             if note:
                 trace("WARN", "note", note)
         else:
@@ -14418,8 +14425,8 @@ if str_lit.checkbox("🔍 Inspect the contents of one category",
     filter_category_choice = str_lit.selectbox(
         f"Select category to inspect contents: ({_insp_cur_n} item(s) in the "
         f"current pick)", options=inspect_options,
-        key="bb_inspect_cat", on_change=_on_inspect_change,
-        format_func=lambda _l: "%s (%d)" % (_l, _insp_counts.get(_l, 0)))
+        format_func=lambda _l: "%s (%d)" % (_l, _insp_counts.get(_l, 0)),
+        key="bb_inspect_cat", on_change=_on_inspect_change)
 
     if unfinished_runs:
         _r0 = unfinished_runs[0]
