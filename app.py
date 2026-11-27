@@ -12715,6 +12715,9 @@ try:
 except Exception:
     mailsearch = None
 
+import urllib.parse
+import urllib.request
+
 # ---- single BUCKET table (was RESULT_INSPECT + RESULT_ACTION_MODES duplicated) ----
 PREFILTER_LABELS = [
     "Ready to Check", "Resume Unfinished", "Disposables", "Typos",
