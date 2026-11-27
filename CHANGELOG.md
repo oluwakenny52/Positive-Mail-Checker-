@@ -65,8 +65,8 @@ ISOLATION
 Every per-user file - results, clean-valid, last account, session cache, presets,
 ZIP, resume record, proxy pool and metadata, domain cache, probe key map, theme,
 applied settings - is prefixed with the unlocked hash. `theme.json` is runtime-only
-and gitignored. `passkey.json` and `disposable_domains.txt` are the only shared
-files, and both are documented as shared.
+and gitignored. `passkey.json` is the only shared file; `disposable_domains.txt`
+became per-user in v13.66.
 
 FIXED DURING THE AUDIT
 ----------------------
