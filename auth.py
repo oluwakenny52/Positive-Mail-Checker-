@@ -315,28 +315,31 @@ _GATE_ART = r"""             ⣠⣤⣤⣤⡤⢤⣤⣤⣤⣤⣤⣄⣀⣀⡀
              ⠉⠛⠿⠿⣶⣾⣿⣿⣿⣭⣭⣭⣶⣿⡿⠁
                    ⠉⠙⠛⠛⠛⠛⠋⠁"""
 
-# Seconds the mark is held. One constant, so the hold and its gate agree.
+# Seconds the mark is held. One constant, so the hold and its gate agree, and so
+# app.py block 007 has a name to test the cached module against.
 GATE_ART_HOLD = 3.0
 
 
 def _gate_art_html():
     """The mark, wrapped in the styles that keep it ONE unbroken block.
 
-    `white-space:pre` plus `overflow-x:auto` is what stops a narrow phone from
-    wrapping the art and destroying the shape - it scrolls sideways instead.
-    `line-height:.95` is tight on purpose: a braille cell is two dots tall, and
-    any looser spacing pulls the picture apart vertically. The font size is
-    viewport-clamped so the whole width fits a phone, and the fade starts at
-    opacity 0 but lands back on 1, so a browser with animations off still ends
+    `white-space:pre` plus `width:max-content` is what stops a narrow phone from
+    wrapping the art and destroying the shape - the wrapper scrolls sideways
+    instead. `margin:0 auto` centres it while it fits and lets it scroll once it
+    does not, which `justify-content:center` alone gets wrong by clipping the
+    left edge. `line-height:.95` is tight on purpose: a braille cell is two dots
+    tall, and any looser spacing pulls the picture apart vertically. The font
+    size is viewport-clamped so the whole width fits a phone, and the fade starts
+    at opacity 0 but lands back on 1, so a browser with animations off still ends
     up showing it.
     """
     return (
-        '<div style="margin:1.05rem 0 .3rem;display:flex;justify-content:center;">'
-        '<pre aria-label="Unlocking" style="margin:0;padding:.5rem .6rem;'
-        'max-width:100%;overflow-x:auto;white-space:pre;text-align:left;'
+        '<div style="overflow-x:auto;margin:1.05rem 0 .15rem;">'
+        '<pre aria-label="Unlocking" style="width:max-content;margin:0 auto;'
+        'padding:.5rem .6rem;white-space:pre;text-align:left;'
         "font-family:'DejaVu Sans Mono',Menlo,Consolas,'Courier New',monospace;"
         "font-size:clamp(6px,2.35vw,11px);line-height:.95;letter-spacing:0;"
-        'color:inherit;opacity:1;animation:pmcGateMark .5s ease-out;">'
+        'color:inherit;animation:pmcGateMark .5s ease-out;">'
         + _GATE_ART +
         "</pre></div>"
         "<style>@keyframes pmcGateMark{from{opacity:0}to{opacity:1}}</style>"
@@ -354,6 +357,10 @@ def _gate_art(st, hold=GATE_ART_HOLD):
     Neither the element nor the sleep may raise: a decorative mark must never be
     the reason an unlock fails. st.html first, the older markdown route second,
     and the call is skipped outright if both are missing.
+
+    The plain caption under the mark is the safety net. A sanitizer can drop the
+    whole <pre>; it cannot drop a caption, so the hold is never a silent freeze
+    and there is always something on screen that says the app is working.
     """
     html = _gate_art_html()
     try:
@@ -363,6 +370,10 @@ def _gate_art(st, hold=GATE_ART_HOLD):
             st.markdown(html, unsafe_allow_html=True)
         except Exception:
             pass
+    try:
+        st.caption("Unlocking…")
+    except Exception:
+        pass
     try:
         time.sleep(hold)
     except Exception:
