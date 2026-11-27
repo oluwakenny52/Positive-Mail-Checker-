@@ -14662,6 +14662,13 @@ _CS_LOCATION_CUES = (
     "street", "city", "postal", "zip", "tel", "phone",
     "inc", "llc", "ltd", "gmbh", "corp", "pty", "plc", "srl", "sarl",
 )
+_CS_GENERIC_BRAND_WORDS = frozenset({
+    "online", "global", "digital", "mobile", "server", "hosting", "cloud",
+    "gaming", "games", "studio", "network", "system", "systems", "secure",
+    "official", "portal", "service", "services", "market", "direct", "express",
+    "simple", "smart", "active", "future", "modern", "vision", "energy",
+    "master", "expert", "united", "design", "center", "centre", "group",
+})
 _CS_USA_FALSE_FRIENDS = frozenset({
     "medusa", "hausa", "yakuza", "ragusa", "syracuse", "lampeduza",
     "lampedusa", "formosa", "tolosa", "osa", "rosa", "musa", "ausa",
@@ -14764,6 +14771,8 @@ _CS_TEXT_CUES = (
     ("abu dhabi", "United Arab Emirates"),
     ("indonesia", "Indonesia"),
     ("jakarta", "Indonesia"),
+    ("surabaya", "Indonesia"),
+    ("bandung", "Indonesia"),
     ("bali", "Indonesia"),
     ("colombia", "Colombia"),
     ("bogota", "Colombia"),
@@ -14957,28 +14966,33 @@ def _cs_match_country_text(text):
     return ""
 
 
-def _cs_has_context_near(raw_low, norm_low, cue, domain=""):
-    """True when `domain` or a location/org marker sits within ~140 chars of `cue`."""
+def _cs_has_context_near(raw_low, norm_low, cue, domain="", anchor_word=""):
+    """True when `anchor_word` (or `domain` / a location marker) sits within ~140 chars of `cue`."""
     _pos = 0
     while True:
         _idx = raw_low.find(cue, _pos)
         if _idx == -1:
             break
         _win = raw_low[max(0, _idx - 140):min(len(raw_low), _idx + len(cue) + 140)]
-        if domain and domain in _win:
-            return True
         _wnorm = " " + re.sub(r"[^a-z0-9]+", " ", _win) + " "
-        if any(f" {_loc} " in _wnorm for _loc in _CS_LOCATION_CUES):
-            return True
+        if anchor_word:
+            if f" {anchor_word} " in _wnorm:
+                return True
+        else:
+            if domain and domain in _win:
+                return True
+            if any(f" {_loc} " in _wnorm for _loc in _CS_LOCATION_CUES):
+                return True
         _pos = _idx + len(cue)
     return False
 
 
-def _cs_score_country_text(text, domain="", min_hits=1, require_context=False):
+def _cs_score_country_text(text, domain="", min_hits=1, require_context=False, anchor_word=""):
     """Score country mentions in cleaned text. Returns best matching country name or ''."""
     _raw_low = str(text or "").lower()
     _low = " " + re.sub(r"[^a-z0-9.]+", " ", _raw_low) + " "
     _dom = str(domain or "").lower().strip()
+    _anc = str(anchor_word or "").lower().strip()
     _scores = {}
 
     for _cue, _ctry in _CS_TEXT_CUES:
@@ -14986,7 +15000,7 @@ def _cs_score_country_text(text, domain="", min_hits=1, require_context=False):
             continue
         _hits = _low.count(f" {_cue} ")
         if _hits:
-            _has_ctx = _cs_has_context_near(_raw_low, _low, _cue, _dom)
+            _has_ctx = _cs_has_context_near(_raw_low, _low, _cue, _dom, _anc)
             if require_context and not _has_ctx:
                 continue
             _bonus = 2 if _has_ctx else 0
@@ -14997,7 +15011,7 @@ def _cs_score_country_text(text, domain="", min_hits=1, require_context=False):
             _nlow = _name.lower()
             _hits = _low.count(f" {_nlow} ")
             if _hits:
-                _has_ctx = _cs_has_context_near(_raw_low, _low, _nlow, _dom)
+                _has_ctx = _cs_has_context_near(_raw_low, _low, _nlow, _dom, _anc)
                 if require_context and not _has_ctx:
                     continue
                 _bonus = 2 if _has_ctx else 0
@@ -15229,35 +15243,92 @@ def _cs_site_country(domain):
     return "", "SITE:unreachable"
 
 
+def _cs_cc_from_host(host):
+    """Resolve a ccTLD suffix from a hostname (e.g. alditra.co.id -> Indonesia)."""
+    _h = str(host or "").lower().strip().strip(".")
+    if "." not in _h:
+        return ""
+    _parts = _h.split(".")
+    _last = _parts[-1]
+    if _last in ("com", "net", "org", "info", "biz", "io", "co", "me", "app", "dev", "xyz"):
+        return ""
+    if _last in TLD_COUNTRY:
+        return TLD_COUNTRY[_last]
+    if _last.upper() in _CS_BY_CODE:
+        return _CS_BY_CODE[_last.upper()]
+    return ""
+
+
 def _cs_extract_bing_organic_text(html, domain):
     """Extract text ONLY from Bing organic result cards (<li class="b_algo">),
     skipping WHOIS/domain-stats scraper cards whose visitor-IP footers cause
-    false country matches on parked/low-content domains."""
+    false country matches on parked/low-content domains. Also returns any
+    exact-brand ccTLD sibling country (e.g. alditra.co.id -> Indonesia)."""
     _cards = re.findall(
         r'<li\b[^>]*class=["\'][^"\']*\bb_algo\b[^"\']*["\'][^>]*>.*?</li>',
         str(html or ""),
         flags=re.S | re.I,
     )
+    _sld = (str(domain or "").lower().split(".", 1)[0]).strip("-")
     _kept = []
+    _sibling_ctry = ""
     for _card in _cards:
         _href_m = re.search(r'<a\b[^>]*href=["\']([^"\']+)["\']', _card, flags=re.I)
         _href = (_href_m.group(1) if _href_m else "").lower()
         if any(_sc in _href for _sc in _CS_SCRAPER_HOSTS):
             continue
+        _host_m = re.search(r'^https?://([^/?#]+)', _href)
+        if _host_m and len(_sld) >= 5:
+            _h = _host_m.group(1)
+            if _h.startswith("www."):
+                _h = _h[4:]
+            if _h.startswith(_sld + "."):
+                _cc = _cs_cc_from_host(_h)
+                if _cc in _CS_BY_NAME:
+                    _sibling_ctry = _cc
         _txt = re.sub(r"<[^>]+>", " ", _card)
         _txt = re.sub(r"\s+", " ", _txt).strip()
         if _txt:
             _kept.append(_txt)
-    return " \n ".join(_kept)
+    return " \n ".join(_kept), _sibling_ctry
+
+
+def _cs_bing_query(query_str, headers, proxy_fn, domain):
+    """Fetch Bing SERP and return (status_code, engine_label, organic_text, sibling_ctry)."""
+    _q = urllib.parse.quote_plus(query_str)
+    _url = f"https://www.bing.com/search?q={_q}&setlang=en&cc=US"
+    try:
+        _code, _raw_bytes = _cs_fetch_url(_url, headers, timeout=3.0)
+        _eng = "bing"
+        if _code in (403, 429) and callable(proxy_fn):
+            _px = proxy_fn(domain=domain)
+            if _px:
+                _code, _raw_bytes = _cs_fetch_url(
+                    _url, headers, timeout=4.0, proxy_str=_px
+                )
+                _eng = "bing+px"
+        _html = _raw_bytes.decode("utf-8", errors="ignore")
+        _clean, _sib = _cs_extract_bing_organic_text(_html, domain)
+        return _code, _eng, _clean, _sib
+    except urllib.error.HTTPError as _he:
+        if _he.code in (403, 429) and callable(proxy_fn):
+            _px = proxy_fn(domain=domain)
+            if _px:
+                _code, _raw_bytes = _cs_fetch_url(
+                    _url, headers, timeout=4.0, proxy_str=_px
+                )
+                _html = _raw_bytes.decode("utf-8", errors="ignore")
+                _clean, _sib = _cs_extract_bing_organic_text(_html, domain)
+                return _code, "bing+px", _clean, _sib
+        raise
 
 
 def _cs_web_country(domain):
-    """Search Bing organic result cards for contextual country mentions."""
+    """Search Bing organic result cards for contextual country mentions, with a
+    strict brand-anchored fallback for hard domains blocked by WAF/RDAP."""
     _dom = _cs_provider_root(domain) or str(domain or "").lower().strip()
     if not _dom:
         return "", "invalid domain"
-    _q = urllib.parse.quote_plus(f'"{_dom}"')
-    _url = f"https://www.bing.com/search?q={_q}&setlang=en&cc=US"
     _headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                       "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -15266,47 +15337,81 @@ def _cs_web_country(domain):
     }
     _proxy_fn = globals().get("sample_alive_proxy")
     try:
-        _code, _raw_bytes = _cs_fetch_url(_url, _headers, timeout=3.0)
-        if _code in (403, 429) and callable(_proxy_fn):
-            _px = _proxy_fn(domain=_dom)
-            if _px:
-                _code, _raw_bytes = _cs_fetch_url(
-                    _url, _headers, timeout=4.0, proxy_str=_px
-                )
-                _eng = "bing+px"
-            else:
-                _eng = "bing"
-        else:
-            _eng = "bing"
-        _html = _raw_bytes.decode("utf-8", errors="ignore")
-        _clean = _cs_extract_bing_organic_text(_html, _dom)
+        _code, _eng, _clean, _sib = _cs_bing_query(
+            f'"{_dom}"', _headers, _proxy_fn, _dom
+        )
+        if _sib in _CS_BY_NAME:
+            return _sib, f"WEB({_eng}) sibling ccTLD -> {_sib}"
         _ctry = _cs_score_country_text(
             _clean, domain=_dom, min_hits=2, require_context=True
         )
         if _ctry in _CS_BY_NAME:
             return _ctry, f"WEB({_eng}) HTTP {_code} -> {_ctry}"
+
+        # Brand-anchored fallback when exact domain is unindexed/sparse
+        _sld = _dom.split(".", 1)[0].strip("-")
+        if (
+            len(_sld) >= 6
+            and _sld.isalpha()
+            and _sld not in _CS_GENERIC_BRAND_WORDS
+        ):
+            _bcode, _beng, _bclean, _bsib = _cs_bing_query(
+                f'"{_sld}" (country OR headquarters OR location OR address OR city)',
+                _headers,
+                _proxy_fn,
+                _dom,
+            )
+            if _bsib in _CS_BY_NAME:
+                return _bsib, f"WEB({_beng}:brand) sibling ccTLD -> {_bsib}"
+            _bctry = _cs_score_country_text(
+                _bclean,
+                domain=_dom,
+                min_hits=3,
+                require_context=True,
+                anchor_word=_sld,
+            )
+            if _bctry in _CS_BY_NAME:
+                return _bctry, f"WEB({_beng}:brand) HTTP {_bcode} -> {_bctry}"
+
         return "", f"WEB({_eng}) HTTP {_code} ({len(_clean)} organic chars, <2 contextual hits)"
     except urllib.error.HTTPError as _he:
-        if _he.code in (403, 429) and callable(_proxy_fn):
-            try:
-                _px = _proxy_fn(domain=_dom)
-                if _px:
-                    _code, _raw_bytes = _cs_fetch_url(
-                        _url, _headers, timeout=4.0, proxy_str=_px
-                    )
-                    _html = _raw_bytes.decode("utf-8", errors="ignore")
-                    _clean = _cs_extract_bing_organic_text(_html, _dom)
-                    _ctry = _cs_score_country_text(
-                        _clean, domain=_dom, min_hits=2, require_context=True
-                    )
-                    if _ctry in _CS_BY_NAME:
-                        return _ctry, f"WEB(bing+px) HTTP {_code} -> {_ctry}"
-                    return "", f"WEB(bing+px) HTTP {_code} (<2 contextual hits)"
-            except Exception as _px_ex:
-                return "", f"WEB(bing+px):{type(_px_ex).__name__}"
         return "", f"WEB(bing):HTTP {_he.code}"
     except Exception as _ex:
         return "", f"WEB(bing):{type(_ex).__name__}"
+
+
+def _cs_infra_country(domain):
+    """Check TLS certificate subject country/org or MX host ccTLD when web/site miss."""
+    _dom = _cs_provider_root(domain) or str(domain or "").lower().strip()
+    if not _dom:
+        return "", ""
+    # 1) Check MX hostnames if get_servers / dns_mx helper is available
+    try:
+        _mx_fn = globals().get("_mx_hosts") or globals().get("resolve_mx")
+        if callable(_mx_fn):
+            for _mx in (_mx_fn(_dom) or [])[:3]:
+                _cc = _cs_cc_from_host(_mx)
+                if _cc in _CS_BY_NAME:
+                    return _cc, f"MX({_mx}) -> {_cc}"
+    except Exception:
+        pass
+    # 2) Check TLS certificate Subject countryName (C=) if not a shared CDN cert
+    try:
+        _ctx = ssl.create_default_context()
+        with socket.create_connection((_dom, 443), timeout=2.0) as _sock:
+            with _ctx.wrap_socket(_sock, server_hostname=_dom) as _ssock:
+                _cert = _ssock.getpeercert() or {}
+        _subj = dict(_pair[0] for _pair in (_cert.get("subject") or []) if _pair)
+        _org = str(_subj.get("organizationName") or "").lower()
+        _cc_code = str(_subj.get("countryName") or "").strip().upper()
+        if _cc_code in _CS_BY_CODE and not any(
+            _cdn in _org for _cdn in ("cloudflare", "amazon", "fastly", "akamai", "incapsula", "google")
+        ):
+            _ctry = _CS_BY_CODE[_cc_code]
+            return _ctry, f"TLS(C={_cc_code}) -> {_ctry}"
+    except Exception:
+        pass
+    return "", ""
 
 
 def _cs_label_country(domain):
@@ -15321,7 +15426,7 @@ def _cs_label_country(domain):
 
 
 def _cs_discover_country(domain):
-    """Try RDAP (max 2 hops), Bing organic cards (contextual min_hits=2), site check, then label heuristic."""
+    """Try RDAP (max 2 hops), Bing organic cards (exact + brand-anchored), site check, TLS/MX, then label heuristic."""
     _ts = datetime.now().strftime("%H:%M:%S")
     _ctry, _rdap_note = _cs_rdap_country(domain)
     if _ctry in _CS_BY_NAME:
@@ -15332,6 +15437,9 @@ def _cs_discover_country(domain):
     _ctry, _site_note = _cs_site_country(domain)
     if _ctry in _CS_BY_NAME:
         return _ctry, f"{_ts} MATCH {domain:<28} -> {_ctry} [{_rdap_note} | {_web_note} | {_site_note}]"
+    _ctry, _infra_note = _cs_infra_country(domain)
+    if _ctry in _CS_BY_NAME:
+        return _ctry, f"{_ts} MATCH {domain:<28} -> {_ctry} [{_rdap_note} | {_web_note} | {_site_note} | {_infra_note}]"
     _lbl_ctry = _cs_label_country(domain)
     if _lbl_ctry in _CS_BY_NAME:
         return _lbl_ctry, f"{_ts} MATCH {domain:<28} -> {_lbl_ctry} [{_rdap_note} | {_web_note} | {_site_note} | LABEL(*usa)]"
@@ -15720,8 +15828,8 @@ else:
             f"🔍 Search {_CS_GLOBAL_FLAG} Global ({len(_global_unmapped)})",
             width="stretch",
             help=f"Looks up up to {_CS_LOOKUP_CAP} unique unresolved Global domains "
-                 f"via RDAP, Bing organic results, and site check across {_CS_LOOKUP_WORKERS} "
-                 f"workers, then saves any discovered countries to your domain map.",
+                 f"via RDAP, Bing organic results, site check, and TLS/MX across "
+                 f"{_CS_LOOKUP_WORKERS} workers, then saves any discovered countries.",
         ):
             if not _global_unmapped:
                 str_lit.session_state["_cs_flash"] = (
@@ -15778,7 +15886,7 @@ else:
             _tl1, _tl2 = str_lit.columns([0.75, 0.25])
             with _tl1:
                 str_lit.caption(
-                    "Shows RDAP, Bing web search, and site check status for every "
+                    "Shows RDAP, Bing web search, site check, and TLS/MX status for every "
                     "domain queried by Search 🌐 Global."
                 )
             with _tl2:
