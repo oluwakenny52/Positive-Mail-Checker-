@@ -233,10 +233,10 @@ def main():
         print("app.py not found in %s" % os.getcwd())
         return 1
     src = read(SRC)
-    # v13.76: the fallback was "v13.40", thirty-six versions behind the header it
-    # reads.  It is only used when line 1 does not parse, so a stale value would
+    # v13.86: the fallback was "v13.40", forty-six versions behind the header it
+    # reads. It is only used when line 1 does not parse, so a stale value would
     # stamp an old version into BOTH rebuilt files and go unnoticed.
-    version = "v13.76"
+    version = "v13.86"
     first = src.splitlines()[0] if src.splitlines() else ""
     m = RE_FILE.match(first)
     if m:
