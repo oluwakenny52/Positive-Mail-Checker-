@@ -12746,9 +12746,288 @@ except Exception:
 
 import html as _html_mod
 import random
+import socket
+import ssl
 import urllib.parse
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from pathlib import Path
+from typing import Optional, Tuple
+from urllib.parse import parse_qs, unquote, urlparse
+
+try:
+    from bs4 import BeautifulSoup as _BeautifulSoup
+    _HAS_BS4 = True
+except ImportError:
+    _BeautifulSoup = None
+    _HAS_BS4 = False
+
+try:
+    from curl_cffi import requests as _cffi_requests
+    _HAS_CFFI = True
+except ImportError:
+    _cffi_requests = None
+    _HAS_CFFI = False
+
+# === START: GLOBAL_RESOLVER ===
+_GR_LAST_DDG_CALL = 0.0
+_GR_DDG_LOCK = threading.Lock()
+
+_GR_CCTLD_TO_COUNTRY = {
+    ".co.id": "Indonesia", ".id": "Indonesia",
+    ".co.jp": "Japan", ".jp": "Japan",
+    ".com.ng": "Nigeria", ".ng": "Nigeria",
+    ".co.uk": "United Kingdom", ".uk": "United Kingdom",
+    ".de": "Germany", ".fr": "France", ".it": "Italy", ".es": "Spain",
+    ".nl": "Netherlands", ".ch": "Switzerland", ".se": "Sweden",
+    ".com.au": "Australia", ".au": "Australia",
+    ".ca": "Canada", ".com.br": "Brazil", ".br": "Brazil",
+    ".in": "India", ".co.in": "India",
+    ".cn": "China", ".com.cn": "China", ".hk": "Hong Kong",
+    ".sg": "Singapore", ".com.sg": "Singapore",
+    ".my": "Malaysia", ".com.my": "Malaysia",
+    ".ph": "Philippines", ".com.ph": "Philippines",
+    ".th": "Thailand", ".co.th": "Thailand",
+    ".vn": "Vietnam", ".com.vn": "Vietnam",
+    ".kr": "South Korea", ".co.kr": "South Korea",
+    ".ae": "United Arab Emirates", ".sa": "Saudi Arabia",
+    ".za": "South Africa", ".co.za": "South Africa",
+    ".ke": "Kenya", ".co.ke": "Kenya",
+    ".gh": "Ghana", ".com.gh": "Ghana",
+    ".mx": "Mexico", ".com.mx": "Mexico",
+}
+
+_GR_TEXT_SIGNALS = [
+    (r"\b(?:jakarta|surabaya|bandung|indonesia|\+62[\s\-]?\d{2,4})\b", "Indonesia"),
+    (r"\b(?:tokyo|osaka|japan|\+81[\s\-]?\d{1,4})\b", "Japan"),
+    (r"\b(?:lagos|abuja|port harcourt|nigeria|\+234[\s\-]?\d{2,4})\b", "Nigeria"),
+    (r"\b(?:london|manchester|united kingdom|\+44[\s\-]?\d{2,4})\b", "United Kingdom"),
+    (r"\b(?:berlin|munich|hamburg|germany|gmbh|\+49[\s\-]?\d{2,4})\b", "Germany"),
+    (r"\b(?:paris|lyon|france|sarl|\+33[\s\-]?\d{1,3})\b", "France"),
+    (r"\b(?:singapore|\+65[\s\-]?\d{4})\b", "Singapore"),
+    (r"\b(?:kuala lumpur|malaysia|sdn bhd|\+60[\s\-]?\d{1,3})\b", "Malaysia"),
+    (r"\b(?:mumbai|bengaluru|new delhi|india|pvt ltd|\+91[\s\-]?\d{2,5})\b", "India"),
+    (r"\b(?:sydney|melbourne|australia|pty ltd|\+61[\s\-]?\d{1,3})\b", "Australia"),
+    (r"\b(?:toronto|vancouver|canada|\+1[\s\-]?(?:416|647|604|514))\b", "Canada"),
+    (r"\b(?:new york|california|texas|florida|united states|usa)\b", "United States"),
+    (r"\b(?:dubai|abu dhabi|united arab emirates|uae|\+971[\s\-]?\d{1,3})\b", "United Arab Emirates"),
+    (r"\b(?:johannesburg|cape town|south africa|\+27[\s\-]?\d{2,3})\b", "South Africa"),
+]
+
+
+def _gr_cache_path() -> Path:
+    try:
+        return Path(user_file("global_country_cache.json"))
+    except Exception:
+        return Path("data/global_country_cache.json")
+
+
+def _gr_load_cache() -> dict:
+    p = _gr_cache_path()
+    if p.exists():
+        try:
+            data = json.loads(p.read_text(encoding="utf-8"))
+            if isinstance(data, dict):
+                return data
+        except Exception:
+            pass
+    return {}
+
+
+def _gr_save_cache(cache: dict) -> None:
+    p = _gr_cache_path()
+    try:
+        with file_write_lock:
+            p.parent.mkdir(parents=True, exist_ok=True)
+            _atomic_write_text(str(p), json.dumps(cache or {}, indent=2, sort_keys=True))
+    except Exception:
+        pass
+
+
+def _gr_extract_country_from_text(text: str) -> Optional[str]:
+    if not text:
+        return None
+    low = str(text).lower()
+    for tld, country in sorted(_GR_CCTLD_TO_COUNTRY.items(), key=lambda x: -len(x[0])):
+        if re.search(rf"[a-z0-9\-]+{re.escape(tld)}\b", low):
+            return country
+    for pattern, country in _GR_TEXT_SIGNALS:
+        if re.search(pattern, low):
+            return country
+    return None
+
+
+def _gr_check_tls_sans(domain: str, timeout: float = 4.0) -> Tuple[Optional[str], str]:
+    """Zero-HTTP check: inspects TLS certificate SANs for regional ccTLD aliases."""
+    try:
+        ctx = ssl.create_default_context()
+        with socket.create_connection((domain, 443), timeout=timeout) as sock:
+            with ctx.wrap_socket(sock, server_hostname=domain) as ssock:
+                cert = ssock.getpeercert() or {}
+        sans = [val for kind, val in cert.get("subjectAltName", []) if kind == "DNS"]
+        for san in sans:
+            country = _gr_extract_country_from_text(san)
+            if country:
+                return country, f"TLS_SAN:{san}"
+        return None, f"TLS_OK({len(sans)} SANs)"
+    except Exception as exc:
+        return None, f"TLS_ERR:{type(exc).__name__}"
+
+
+def _gr_http_get(url: str, params: dict = None, timeout: float = 8.0):
+    headers = {
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Cache-Control": "no-cache",
+    }
+    if _HAS_CFFI and _cffi_requests is not None:
+        return _cffi_requests.get(
+            url,
+            params=params,
+            headers=headers,
+            impersonate="chrome",
+            timeout=timeout,
+            allow_redirects=True,
+        )
+    headers["User-Agent"] = (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+    )
+    return urllib.request.urlopen(
+        urllib.request.Request(
+            f"{url}?{urllib.parse.urlencode(params)}" if params else url,
+            headers=headers,
+        ),
+        timeout=timeout,
+    )
+
+
+def _gr_search_ddg_html(query: str) -> Tuple[Optional[str], str]:
+    """Uses html.duckduckgo.com/html/ with pacing so it never triggers vqd HTTP 202."""
+    global _GR_LAST_DDG_CALL
+    with _GR_DDG_LOCK:
+        elapsed = time.time() - _GR_LAST_DDG_CALL
+        min_gap = random.uniform(1.8, 3.2)
+        if elapsed < min_gap:
+            time.sleep(min_gap - elapsed)
+        _GR_LAST_DDG_CALL = time.time()
+
+    try:
+        resp = _gr_http_get("https://html.duckduckgo.com/html/", params={"q": query}, timeout=10.0)
+        with _GR_DDG_LOCK:
+            _GR_LAST_DDG_CALL = time.time()
+        status_code = getattr(resp, "status_code", None) or getattr(resp, "status", 200)
+        if status_code != 200:
+            return None, f"WEB(ddg_html):HTTP {status_code}"
+        raw_body = resp.text if hasattr(resp, "text") else resp.read(262144).decode("utf-8", errors="ignore")
+
+        snippets = []
+        if _HAS_BS4 and _BeautifulSoup is not None:
+            soup = _BeautifulSoup(raw_body, "html.parser")
+            for res in soup.select(".result")[:5]:
+                title_el = res.select_one(".result__a")
+                snip_el = res.select_one(".result__snippet")
+                href = title_el.get("href", "") if title_el else ""
+                if "uddg=" in href:
+                    real_url = unquote(parse_qs(urlparse(href).query).get("uddg", [""])[0])
+                else:
+                    real_url = href
+                snippets.append(
+                    f"{title_el.get_text(' ', strip=True) if title_el else ''} "
+                    f"{real_url} "
+                    f"{snip_el.get_text(' ', strip=True) if snip_el else ''}"
+                )
+        else:
+            for m in re.findall(r'<a\b[^>]*class=["\'][^"\']*\bresult__a\b[^"\']*["\'][^>]*>(.*?)</a>', raw_body, flags=re.S | re.I)[:5]:
+                snippets.append(re.sub(r"<[^>]+>", " ", m))
+
+        combined = " | ".join(snippets)
+        country = _gr_extract_country_from_text(combined)
+        if country:
+            return country, "WEB(ddg_html):HTTP 200 (matched)"
+        return None, f"WEB(ddg_html):HTTP 200 ({len(snippets)} results, 0 country signals)"
+    except Exception as exc:
+        with _GR_DDG_LOCK:
+            _GR_LAST_DDG_CALL = time.time()
+        return None, f"WEB(ddg_html):ERR {type(exc).__name__}"
+
+
+def _gr_probe_site_direct(domain: str) -> Tuple[Optional[str], str]:
+    """Single browser-impersonated probe; never retries 403s."""
+    last_err = "SITE:UNREACHABLE"
+    for url in (f"https://{domain}/", f"https://www.{domain}/"):
+        try:
+            resp = _gr_http_get(url, timeout=8.0)
+            status_code = getattr(resp, "status_code", None) or getattr(resp, "status", 200)
+            if status_code == 200:
+                html_txt = resp.text[:120_000] if hasattr(resp, "text") else resp.read(120_000).decode("utf-8", errors="ignore")
+                if _HAS_BS4 and _BeautifulSoup is not None:
+                    soup = _BeautifulSoup(html_txt, "html.parser")
+                    footer = soup.find("footer")
+                    focus_text = (
+                        (footer.get_text(" ", strip=True) if footer else "")
+                        + " "
+                        + soup.get_text(" ", strip=True)[:4000]
+                    )
+                else:
+                    focus_text = re.sub(r"<[^>]+>", " ", html_txt)[:4000]
+                country = _gr_extract_country_from_text(focus_text)
+                if country:
+                    return country, "SITE:HTTP 200 (matched)"
+                return None, "SITE:HTTP 200 (no country signal)"
+            if status_code == 403:
+                return None, "SITE:HTTP 403 (WAF skipped)"
+        except Exception as exc:
+            last_err = f"SITE:ERR {type(exc).__name__}"
+    return None, last_err
+
+
+def resolve_global_domain(domain: str, rdap_country: Optional[str] = None) -> Tuple[str, str]:
+    """
+    Drop-in resolver for Search Global.
+    Returns: (resolved_country_or_'Global', trace_log_line)
+    """
+    clean_domain = str(domain or "").strip().lower()
+    if clean_domain.startswith("www."):
+        clean_domain = clean_domain[4:]
+    traces = []
+
+    cache = _gr_load_cache()
+    if clean_domain in cache:
+        cached_country = cache[clean_domain]
+        return cached_country, f"HIT  {clean_domain:<28} -> {cached_country} [CACHE]"
+
+    if rdap_country:
+        cache[clean_domain] = rdap_country
+        _gr_save_cache(cache)
+        return rdap_country, f"HIT  {clean_domain:<28} -> {rdap_country} [RDAP]"
+    traces.append("RDAP:no country")
+
+    country, tls_note = _gr_check_tls_sans(clean_domain)
+    traces.append(tls_note)
+    if country:
+        cache[clean_domain] = country
+        _gr_save_cache(cache)
+        return country, f"HIT  {clean_domain:<28} -> {country} [{' | '.join(traces)}]"
+
+    country, site_note = _gr_probe_site_direct(clean_domain)
+    traces.append(site_note)
+    if country:
+        cache[clean_domain] = country
+        _gr_save_cache(cache)
+        return country, f"HIT  {clean_domain:<28} -> {country} [{' | '.join(traces)}]"
+
+    brand = clean_domain.split(".")[0]
+    query = f'"{clean_domain}" OR "{brand}" headquarters OR address OR contact'
+    country, ddg_note = _gr_search_ddg_html(query)
+    traces.append(ddg_note)
+    if country:
+        cache[clean_domain] = country
+        _gr_save_cache(cache)
+        return country, f"HIT  {clean_domain:<28} -> {country} [{' | '.join(traces)}]"
+
+    return "Global", f"MISS {clean_domain:<28} -> Global [{' | '.join(traces)}]"
+# === END: GLOBAL_RESOLVER ===
 
 # ---- single BUCKET table (was RESULT_INSPECT + RESULT_ACTION_MODES duplicated) ----
 PREFILTER_LABELS = [
@@ -12781,63 +13060,29 @@ BUCKET_TAGS = {
     "kw_hits_results": "KW_HITS",
 }
 
-# ==========================================================================
-# v13.63 - THE PASTE BOX AND THE INSPECTOR CHOICE NOW SURVIVE A REFRESH
-#
-# key="bb_raw_text" / key="bb_inspect_cat" only ever made the two widgets
-# survive a RERUN. A refresh, a tab close, a reaped session or a redeploy handed
-# both back at their defaults, and a 3000-line paste is the most expensive thing
-# on this page to retype.
-#
-# Both are per-user FILES now (the unlocked prefix, exactly like every other
-# per-user file), seeded BEFORE the widget is created and rewritten from an
-# on_change callback - a callback runs BEFORE the script body, so no widget key
-# is ever touched after the widget has been instantiated.
-#
-# v13.71: THE CAP WAS 2 MB AND THE WRITE WAS UNCONDITIONAL.
-#   * 2 MB is ~65,000 lines, and MAX_ACCOUNTS at 0 no longer cuts a long list,
-#     so a 5 MB paste is now a real thing to support: 5 MB is ~160,000 lines.
-#   * _on_paste_change() rewrote the WHOLE file on every commit, even when the
-#     text was byte-identical - so clicking into the box and straight back out
-#     wrote 5 MB to disk for nothing. The signature is compared first now and an
-#     unchanged commit costs one hash.
-#
-# THE COST, stated plainly: the restored text lives in session_state as one
-# string, so a full 5 MB paste holds 5 MB of the container. That is why the cap
-# exists at all and why the resource monitor's "my session payload" is the number
-# to watch. The truncation note below names the exact cap and the exact size.
-# ==========================================================================
-_PASTE_FILE = user_file("paste_accounts.txt")
-_INSPECT_FILE = user_file("inspect_cat.txt")
 _PASTE_MAX = 5 * 1024 * 1024
 _INPUT_OWNER_KEY = "_input_owner"
-_PASTE_LIMIT_NOTE = ""
+_PASTE_LIMIT_NOTES = {}
+_PASTE_LIMIT_LOCK = threading.Lock()
 
-# ==========================================================================
-# v13.75 FIX PASTE-1 - A PASTE FROM THE OUTSIDE IS NOT A COLON LIST
-#
-# process_accounts() split each line on ":" and took part 0 as the email, so a
-# list pasted out of a spreadsheet, a chat message, a note app or THIS APP'S OWN
-# bucket output was thrown away almost in full:
-#
-#   - a@b.com:pw          ok
-#   - a@b.com:pw          a bullet made the address "- a@b.com"
-#   1. a@b.com:pw         a numbered list made it "1. a@b.com"
-#   • a@b.com:pw          ditto, with a bullet glyph
-#   mailto:a@b.com:pw     a mailto: prefix made it "mailto:a@b.com"
-#   "a@b.com:pw"          quotes kept, so the address carried them
-#   a@b.com:pw | VALID    a re-pasted bucket line kept "pw | VALID" as the password
-#
-# The last one matters most: the app's own bucket lines are the obvious thing to
-# paste back in for a re-run, and block 105's _raw_of() already cuts them at "|"
-# on the RE-RUN path - the paste path had no equivalent, so the password carried
-# the whole verdict sentence and every account failed.
-#
-# The normaliser runs on the PREFILTER path only. The box itself keeps exactly
-# what was pasted, so nothing is silently rewritten under the user, and the
-# fingerprint is still taken from the raw text - a normalisation change cannot
-# make a cached result look stale.
-# ==========================================================================
+
+def _paste_file():
+    try:
+        return user_file("paste_accounts.txt")
+    except Exception:
+        return "paste_accounts.txt"
+
+
+def _inspect_file():
+    try:
+        return user_file("inspect_cat.txt")
+    except Exception:
+        return "inspect_cat.txt"
+
+
+_PASTE_FILE = _paste_file()
+_INSPECT_FILE = _inspect_file()
+
 _BULLET_RE = re.compile(r"^[\s\u2022\u00b7\u25cf\u2043\-\*>]+")
 _NUM_RE = re.compile(r"^\d{1,4}[.)]\s+")
 _MAILTO_RE = re.compile(r"^mailto:\s*", re.IGNORECASE)
@@ -12883,86 +13128,58 @@ def _write_text_file(path, text):
         warnings.warn(f"could not write {path}: {e}")
 
 
-def _read_paste():
-    global _PASTE_LIMIT_NOTE
-    # v13.91 FIX ISO-KW-4: this is a MODULE global, so a note left by one user
-    # rendered under another user's box. Reset on every read.
-    _PASTE_LIMIT_NOTE = ""
+def _set_paste_note(owner, note):
+    with _PASTE_LIMIT_LOCK:
+        if note:
+            _PASTE_LIMIT_NOTES[str(owner or "anon")] = str(note)
+        else:
+            _PASTE_LIMIT_NOTES.pop(str(owner or "anon"), None)
+
+
+def _get_paste_note(owner):
+    with _PASTE_LIMIT_LOCK:
+        return _PASTE_LIMIT_NOTES.get(str(owner or "anon"), "")
+
+
+def _read_paste(owner=None):
+    _own = str(owner if owner is not None else _cache_owner())
+    _set_paste_note(_own, "")
+    _pfile = _paste_file()
     try:
-        if os.path.exists(_PASTE_FILE):
-            _sz = os.path.getsize(_PASTE_FILE)
+        if os.path.exists(_pfile):
+            _sz = os.path.getsize(_pfile)
             if _sz > _PASTE_MAX:
-                _PASTE_LIMIT_NOTE = (f"Only the first {_PASTE_MAX // 1024} KB of a "
-                                     f"{_sz // 1024} KB paste was restored.")
+                _set_paste_note(
+                    _own,
+                    f"Only the first {_PASTE_MAX // 1024} KB of a "
+                    f"{_sz // 1024} KB paste was restored.",
+                )
     except Exception:
         pass
-    return _read_text_file(_PASTE_FILE, _PASTE_MAX)
+    return _read_text_file(_pfile, _PASTE_MAX)
 
 
 def _on_paste_change():
-    """Persist the box - but only when the text actually changed.
-
-    v13.71: the callback rewrote the entire file on every commit. A 5 MB paste
-    made every click into and out of the box a 5 MB disk write for no new
-    information. The (length, hash) signature is checked first, so an unchanged
-    commit is one hash and no write at all. The upload path below already uses
-    the same key, so an upload followed by a commit cannot double-write either.
-    """
     _txt = str_lit.session_state.get("bb_raw_text", "")
     _sig = (len(_txt), hash(_txt))
     if str_lit.session_state.get("_paste_saved_sig") == _sig:
         return
     str_lit.session_state["_paste_saved_sig"] = _sig
-    _write_text_file(_PASTE_FILE, _txt)
+    _write_text_file(_paste_file(), _txt)
 
 
 def _on_paste_clear():
     str_lit.session_state["bb_raw_text"] = ""
     str_lit.session_state["_paste_saved_sig"] = (0, hash(""))
-    _write_text_file(_PASTE_FILE, "")
+    _write_text_file(_paste_file(), "")
 
 
-# ==========================================================================
-# v13.77 FIX INSPECT-2 - THE INSPECTOR'S CALLBACK DID NOT EXIST
-#
-# Block 087 passed _on_inspect_change as on_change= on the category selectbox
-# and NO BLOCK IN app.py DEFINED IT. on_change= is evaluated when the widget is
-# created, so the panel died on that line itself - app.py:11111 in the deployed
-# traceback - with
-#
-#     NameError: name '_on_inspect_change' is not defined
-#
-# before a single item was listed. _INSPECT_FILE made it worse: it was READ at
-# every load and written by NOTHING, so the "restored" choice was always "" and
-# the panel always fell back to the first option. The persistence the v13.63
-# comment block above describes for this widget was half-built and never closed.
-#
-# WHY NO GATE CAUGHT IT: pages/5_Blocks.py counts the CALL SITE only, and
-# nothing counted the DEFINITION - and verify_v1337.py has no block-087 needle
-# at all. A green fix-check proved only that the call was still spelled that
-# way. The matching row is added to pages/5_Blocks.py with this fix.
-#
-# NOTE FOR THE NEXT EDITOR: that row is a raw substring count over app.py with
-# comments included, so the QUOTED form of the selectbox line must not be
-# repeated anywhere in a comment - it makes the row read got 2 want 1 on correct
-# code. That is exactly how this block failed its first gate run, and why the
-# quoted form is not used above.
-#
-# The function has to be defined ABOVE the selectbox - the module executes top
-# to bottom - and it must touch nothing but the file and the key it owns.
-# ==========================================================================
 def _on_inspect_change():
-    """Persist the chosen category.
-
-    A callback runs BEFORE the script body, so no widget key is touched after
-    its widget exists, and session_state already holds the NEW value here. The
-    file is compared first, so re-picking what is already stored costs one small
-    read and no write - the same shape _on_paste_change() uses.
-    """
     _val = str(str_lit.session_state.get("bb_inspect_cat") or "").strip()
-    if _read_text_file(_INSPECT_FILE, 200).strip() == _val:
+    _ifile = _inspect_file()
+    if _read_text_file(_ifile, 200).strip() == _val:
         return
-    _write_text_file(_INSPECT_FILE, _val)
+    _write_text_file(_ifile, _val)
 
 
 def _insp_safe(label):
@@ -12970,17 +13187,6 @@ def _insp_safe(label):
     return re.sub(r"[^a-z0-9]+", "_", str(label).lower()).strip("_") or "items"
 
 
-# ---- owner gate: a second unlock in this tab must not inherit the last one ----
-# v13.76 FIX ISO-8: _bb_prefilter_cache is NOT popped here before. The cached
-# data is derived from the previous owner's paste AND from the previous owner's
-# valid files, so the next unlock in the same tab rendered the last user's
-# Ready/Skip numbers. It is popped with the rest of the input state now, and the
-# fingerprint below carries the owner as well, so a stale entry can never be a
-# hit even if a future edit forgets the pop.
-#
-# v13.77: _INSPECT_FILE is resolved ABOVE this gate (the block runs after
-# auth.require() in 007), so the reseed two lines below already reads the NEW
-# owner's file. The pop and the reseed are therefore in the right order.
 _input_owner = _cache_owner()
 if str_lit.session_state.get(_INPUT_OWNER_KEY) != _input_owner:
     str_lit.session_state.pop("bb_raw_text", None)
@@ -12990,7 +13196,7 @@ if str_lit.session_state.get(_INPUT_OWNER_KEY) != _input_owner:
     str_lit.session_state.pop("_bb_prefilter_cache", None)
     str_lit.session_state[_INPUT_OWNER_KEY] = _input_owner
 if "bb_raw_text" not in str_lit.session_state:
-    str_lit.session_state["bb_raw_text"] = _read_paste()
+    str_lit.session_state["bb_raw_text"] = _read_paste(_input_owner)
 
 section_title("📥", "Accounts Input & Pre-Filtering",
               "paste combos or upload a file - junk is filtered before the engine runs")
@@ -13010,11 +13216,12 @@ with input_tab1:
         "Paste accounts here (email:password format):",
         placeholder="user@example.com:password123", height=260,
         key="bb_raw_text", on_change=_on_paste_change)
-    if _PASTE_LIMIT_NOTE:
-        str_lit.caption(_PASTE_LIMIT_NOTE)
+    _paste_note_now = _get_paste_note(_input_owner)
+    if _paste_note_now:
+        str_lit.caption(_paste_note_now)
 with input_tab2:
     uploaded_file = str_lit.file_uploader("Upload .txt combo file", type=["txt"],
-                                          key="bb_upload")   # FIX P1-2
+                                          key="bb_upload")
     if uploaded_file is not None:
         try:
             file_bytes = uploaded_file.getvalue()
@@ -13022,19 +13229,14 @@ with input_tab2:
                 str_lit.warning("Uploaded file is empty.")
                 raw_text = ""
             else:
-                # v13.76: decode under a spinner, so picking a big file answers
-                # before the prefilter bar below takes over.
                 with str_lit.spinner(f"Reading {uploaded_file.name}..."):
                     try:
                         raw_text = file_bytes.decode("utf-8", errors="ignore")
                     except Exception:
                         raw_text = file_bytes.decode("latin-1", errors="ignore")
-                # v13.63: the upload is written to the paste file too, so the
-                # numbers do not vanish on the next refresh. Guarded by a
-                # signature so a 3000-line file is not rewritten on every rerun.
                 _up_sig = (len(raw_text), hash(raw_text))
                 if str_lit.session_state.get("_paste_saved_sig") != _up_sig:
-                    _write_text_file(_PASTE_FILE, raw_text)
+                    _write_text_file(_paste_file(), raw_text)
                     str_lit.session_state["_paste_saved_sig"] = _up_sig
                 str_lit.success("File uploaded successfully - and saved, so it "
                                 "survives a refresh.")
@@ -13046,9 +13248,6 @@ with input_tab2:
 
 clean_lines = []
 disp, typo, resume, app_skip, custom_skipped, dns_skipped, smtp_skipped = [], [], [], [], [], [], []
-# v13.66: this checkbox had NO key, so it was re-created with value=True on
-# every rerun and unticking it was undone by the next click anywhere. Seeded,
-# then created with key= only.
 _seed_widget("bb_skip_prev", dflt=True)
 skip_previous = str_lit.checkbox(
     "Skip previously valid", key="bb_skip_prev",
@@ -13065,28 +13264,13 @@ if raw_text:
     )
     _pf_cache = str_lit.session_state.get("_bb_prefilter_cache") or {}
     _pf_data = _pf_cache.get("data") if _pf_cache.get("fp") == _pf_fp else None
-    # FIX PASTE-1: normalise ONCE, on the prefilter path, and feed every consumer
-    # from the normalised text - the counts, the SMTP domain scan and the queue.
     _pf_text = _normalise_paste(raw_text)
     if _pf_data is None:
-        # v13.76 FIX LOAD-1: a 5 MB paste is ~160,000 lines and this prefilter is
-        # the slowest thing on the page, but it ran behind a blank screen - a long
-        # list looked like a dead app until the metrics finally appeared. The bar
-        # is drawn BEFORE the work, is driven from inside process_accounts, and
-        # covers the SMTP pre-check, which is the phase that really hangs. It is
-        # created on a cache MISS only, so a rerun that changes nothing is silent.
         _pf_bar = str_lit.progress(0.0, text="0% - reading the paste...")
         _pf_t0 = time.time()
         _pf_throttle = {"t": 0.0}
 
         def _pf_progress(_phase, _done, _total):
-            """phase, done, total -> one throttled bar update. Never raises.
-
-            Throttled to ~8 updates a second: 160,000 lines at a tick every 25
-            is 6,400 updates, which is more websocket traffic than the bar can
-            show. The element is a per-run local, so two users in two tabs each
-            drive their own bar and neither can repaint the other's.
-            """
             try:
                 _now = time.time()
                 if _now - _pf_throttle["t"] < 0.12:
@@ -13129,10 +13313,6 @@ if raw_text:
     str_lit.session_state.pre_dns_failed = list(dns_skipped)
     str_lit.session_state.pre_smtp_failed = list(smtp_skipped)
 
-    # FIX RS-2: this counted FILES (there is only ever one) and read a glob that
-    # raised TypeError, so it read 0 no matter what was on disk. It now counts
-    # the resumable LINES, which is what the label promises and what the row of
-    # neighbouring account counts means.
     unfinished_count = unfinished_remaining_count()
     _pf_metrics = [
         ("Ready to Check", len(clean_lines)),
@@ -13148,120 +13328,6 @@ if raw_text:
     for _pc, (_pl, _pv) in zip(metric_grid(_pf_metrics, per_row=3), _pf_metrics):
         _pc.metric(_pl, _pv)
 
-# ==========================================================================
-# v13.86 - KEYWORD HITS, IN PLAIN SIGHT
-#
-# The input existed only inside the Mailbox Reader, three conditions deep, so
-# there was nowhere to type a keyword before a run. This is the top-level
-# control: switch, words, folder scope, depth. Hits land in the same
-# kw_hits_results bucket the reader fills and block 087's BUCKETS table already
-# carries, so a hit re-runs like any other combo.
-#
-# v13.86 FIX KW-5 - THE SCAN COULD NEVER RUN. keyword_hits_wanted() and
-# run_keyword_scan() below read the global name `mailsearch`, and mailsearch was
-# imported in block 109 - which executes AFTER block 106's run loop has already
-# finished. Every call therefore raised NameError inside keyword_hits_wanted()'s
-# own try, which answers False, so the run never scanned once, never wrote one
-# trace line, and the panel correctly said "No keyword scan yet this run" on an
-# account full of Amazon and Coinbase mail. The import is here now, above both
-# functions and long before any run. Block 109's copy stays as the second
-# binding for the rest of the page.
-#
-# v13.86 FIX KW-6 - FOLDER SCOPE IS A CHOICE, NOT A TYPED LIST. The old control
-# was a free-text box of folder names, so "scan my inbox" and "scan everything"
-# were both manual, and the second one meant typing every folder by hand.
-# bb_kw_run_folder is a two-option select now:
-#     Inbox       -> INBOX only. Cheap, and the case almost everybody wants.
-#     All Folders -> every selectable folder the server lists for the account,
-#                    capped at KW_FOLDER_CAP, each opened READ-ONLY in turn.
-# A stale value from an older build ("INBOX") is re-seeded to "Inbox" before the
-# widget exists, so an inherited key can never make the selectbox raise.
-#
-# v13.88 FIX KW-8 - THE SCAN WAS IMAP-ONLY, AND HALF THE VALID ACCOUNTS ARE NOT.
-# This is what the run export proved. Of three VALID accounts in that run, one
-# (dmci.net) had every IMAP rung time out and was only ever VALID because
-# pop.dmci.net:995 accepted the login. run_keyword_scan() re-connected through
-# verify_and_connect(), which speaks IMAP and nothing else, so on that account
-# the mailbox could never be opened at all - no folder, no search, no hits, and
-# the only trace line was "did not connect". The scan now opens the mailbox
-# itself: IMAP first on a short leash, then POP3, and it reads POP3 with
-# RETR-based header/body matching when IMAP is what is broken. POP3 has no
-# folders, so the folder scope simply becomes INBOX for that path and says so.
-#
-# v13.88 FIX KW-9 - THE WINDOW WAS 20 MESSAGES. "Newest N" defaulted to 20, so
-# an Amazon or Coinbase receipt three weeks down the inbox was outside the scan
-# and read as a clean zero. The default is 100 and the widget still goes to 2000.
-#
-# v13.88 FIX KW-10 - THE TRACE WENT NOWHERE THE USER WAS LOOKING. Every line was
-# written to the keyword panel only. It is ALSO spliced into the account's own
-# row in the Live Report Log & Analytics "Under-The-Hood Background Trace" now,
-# because that is where a run's reasoning is read.
-#
-# v13.89 FIX KW-11 - THE SCAN WAS BLOCKING THE RUN. It ran on the SCRIPT THREAD
-# inside the loop, so while one VALID account was being scanned no other future
-# could be consumed and every VALID account serialised the whole run - and the
-# body pass (up to `body_scan` single-message fetches, one at a time) was the
-# worst of it. Scans now run on their own 3-thread pool: the loop only SUBMITS,
-# and finished scans are DRAINED on the UI tick. The loop never waits for a
-# scan. Two things make the work itself smaller as well - the body pass is
-# capped at KW_BODY_SCAN_CAP while the header pass keeps the whole window
-# (sender/subject is what a Coinbase or Amazon hit actually is, and the header
-# pass is chunked at 25 messages a round trip), and the queue is capped so a
-# 5000-account run cannot pile up thousands of pending scans.
-#
-# ALL Streamlit interaction stays on the script thread: the worker threads only
-# do network work and disk writes and hand back a finished dict through a queue,
-# and kw_drain() does every session_state write and the repaint.
-#
-# v13.89 FIX KW-12 - AND THE HITS DID NOT SURVIVE A RELOAD. Nothing wrote the
-# bucket to a file that reload rehydration reads. kw_hits_{stamp}.txt is already
-# written by the export block; it is now READ BACK on a fresh session, gated on a
-# real run record so a cold load does not invent one.
-#
-# v13.90 FIX KW-13 - THE QUEUE CARRIED FULL MESSAGE BODIES. mailsearch hands back
-# a hit with up to 200 KB of readable body, and up to 200 hits per account sat in
-# the handover queue at that size until drained - the single largest new memory
-# consumer, and on a 1 GB container an OOM kill looks exactly like an automatic
-# restart (no traceback, "Your app is in the oven", a fresh clone). The body is
-# truncated to KW_QUEUE_BODY before it is queued; the FULL body has already been
-# written to disk by save_bodies() by then, and the panel only ever showed 2000
-# characters anyway. The bucket also gets a ceiling now, because it was the one
-# list in the run with no cap at all.
-#
-# v13.91 FIX MEM-KW-1 - THE SCAN HELD 300 FULL BODIES PER ACCOUNT, IN MEMORY, ON
-# THREE THREADS AT ONCE. mailsearch.search() defaults to hit_limit=MAX_HITS (300)
-# and BODY_SHOW is 200,000 characters, so a single scan peaked at ~60 MB before
-# the 4000-character queue trim ever ran - three workers, 180 MB worst case, on a
-# 1 GB container. KW_HIT_LIVE is passed down as hit_limit now: 60 hits is a real
-# result set for ONE mailbox, the full text of every one of them still goes to
-# disk in save_bodies() before the queue copy is cut, and the detail ring comes
-# down to match.
-#
-# v13.91 FIX ISO-KW-1 - AND THE SCAN POOL WAS NOT ISOLATED. Three process-wide
-# structures, none of them per user:
-#
-#   _kw_done     ONE deque for every scope. kw_drain() popped whatever was at the
-#                head and _kw_apply() wrote it into the CALLER's session_state,
-#                so user B's finished scan - full email:password included -
-#                landed in user A's keyword bucket. Nothing checked the owner.
-#   _KW_ST       ONE dict, so `run_mark` was a single process value: user B
-#                pressing Start CLEARED user A's pending handover queue and A's
-#                in-flight scans vanished with no trace. `inflight` was shared
-#                too, so the 300-scan queue cap and the 25s tail drain were both
-#                measured against other people's work.
-#   the worker   ran with NO scope pin and NO config snapshot, so
-#                sample_alive_proxy() inside it called _rebind_scope(), which
-#                resolved _gate_scope() to whichever session reran LAST - and
-#                sampled a proxy from THAT user's pool, read THEIR quarantine and
-#                rotation settings, and wrote score updates into THEIR
-#                proxy_meta.json.
-#
-# Both structures are keyed by _gate_scope() now, the scope and the config are
-# captured on the script thread in kw_scan_submit and PINNED on the worker, the
-# run-mark reset only clears its own scope, and idle scopes are evicted past
-# _KW_SCOPE_MAX so a forgotten key cannot hold a queue for the life of the
-# process.
-# ==========================================================================
 KW_SCOPES = ("Inbox", "All Folders")
 KW_SCOPE_INBOX = KW_SCOPES[0]
 KW_SCOPE_ALL = KW_SCOPES[1]
@@ -13272,32 +13338,19 @@ KW_FOLDER_INBOX = "INBOX"
 KW_FOLDER_CAP = 12
 KW_HIT_CAP = 200
 KW_WINDOW_ALL = 200
-# v13.88: connect budget. 8s per attempt, 25s for the whole open, and the POP
-# path gets its own short budget, so one dead host cannot hold a worker.
 KW_CONNECT_TIMEOUT = 8
 KW_OPEN_BUDGET = 25.0
 KW_POP_BUDGET = 18.0
-# v13.89: the pool and the body cap. 3 workers is enough to overlap scans with a
-# 12-account run without doubling the connection count; 40 bodies per account is
-# where the returns flatten out.
 KW_SCAN_WORKERS = 3
 KW_SCAN_QUEUE_MAX = 300
 KW_BODY_SCAN_CAP = 40
-# v13.90: what a QUEUED hit keeps. The full body is on disk already.
 KW_QUEUE_BODY = 4000
-# v13.90: and the bucket gets the ceiling it never had.
 KW_BUCKET_MAX = 5000
-# v13.91: hits held in memory per account, passed to mailsearch as hit_limit.
 KW_HIT_LIVE = 60
 
 section_title("🔎", "Keyword Hits",
               "find words you care about in every valid inbox, as the run goes")
 
-# ---- owner gate: a second unlock must not inherit the last user's words ----
-# The run keys are NOT in block 037's pop list and NOT in block 109's, because
-# both run before this widget set exists and popping a live widget key after the
-# widget is built makes the value read by the run one run stale. This gate runs
-# before every widget below, so popping here is legal and complete.
 _kw_run_owner = _cache_owner()
 if str_lit.session_state.get("_kw_run_owner") != _kw_run_owner:
     for _k in ("bb_kw_run_on", "bb_kw_run_words", "bb_kw_run_folder",
@@ -13306,10 +13359,6 @@ if str_lit.session_state.get("_kw_run_owner") != _kw_run_owner:
         str_lit.session_state.pop(_k, None)
     str_lit.session_state["_kw_run_owner"] = _kw_run_owner
 
-# ---- FIX KW-12: the hits come back after a reload ----------------------
-# One attempt per session, only when the bucket is empty AND a run record was
-# rehydrated, so a cold load cannot invent hits. The newest kw_hits_*.txt is the
-# one the export block wrote for the newest run stamp.
 if not str_lit.session_state.get("_kw_rehydrated"):
     str_lit.session_state["_kw_rehydrated"] = True
     if (not (str_lit.session_state.get("kw_hits_results") or [])
@@ -13328,8 +13377,6 @@ if not str_lit.session_state.get("_kw_rehydrated"):
         except Exception as _kwre:
             warnings.warn(f"keyword hits not restored: {_kwre}")
 
-# Seeded, never defaulted: every widget below is created with key= ONLY, so a
-# saved value survives and Streamlit does not warn about a default plus a state.
 for _k, _v in (("bb_kw_run_on", False), ("bb_kw_run_words", ""),
                ("bb_kw_run_folder", KW_SCOPE_INBOX),
                ("bb_kw_run_fields", list(KW_FIELD_LABELS)),
@@ -13338,8 +13385,6 @@ for _k, _v in (("bb_kw_run_on", False), ("bb_kw_run_words", ""),
     if _k not in str_lit.session_state:
         str_lit.session_state[_k] = list(_v) if isinstance(_v, list) else _v
 
-# A key restored from an older build, or from a build that renamed an option,
-# must be legal before its widget is created.
 if str_lit.session_state.get("bb_kw_run_folder") not in KW_SCOPES:
     str_lit.session_state["bb_kw_run_folder"] = KW_SCOPE_INBOX
 if str_lit.session_state.get("bb_kw_run_scope") not in KW_DEPTHS:
@@ -13399,48 +13444,17 @@ if _kw_run_on:
         str_lit.caption("Hits land in the 🔎 Keyword Hits bucket and in the ZIP under "
                         "`keyword_bodies/`, with an occurrence count per keyword.")
 
-# ==========================================================================
-# v13.86 FIX KW-1 - THE PANEL WAS PAINTED BEFORE IT EXISTED
-#
-# This block ended with render_kw_panel(), and BOTH halves of the panel live in
-# block 105: the function, and the slot it draws into. Block 087 executes first,
-# so the call reached a name that had not been bound yet and the page died on
-# this line with
-#
-#     NameError: name 'render_kw_panel' is not defined
-#
-# before the inspector or the engine were drawn at all.
-#
-# The slot is reserved HERE, which is where the panel belongs - immediately under
-# the keyword controls it reports on - and the function paints into that slot on
-# its way past its own definition in block 105, then repaints it from block 106
-# as hits land. One element, created once per load, at a fixed position.
-#
-# _kw_live is created in exactly one place now. A second str_lit.empty() in 105
-# would make a SECOND element lower down the page and the first would stay blank
-# for ever.
-# ==========================================================================
 _kw_live = str_lit.empty()
-
 
 KW_TRACE_MAX = 400
 KW_COUNT_MAX = 60
-# v13.86 FIX KW-3: the detail list had NO writer and NO cap. It is written by
-# kw_drain() below now, and bounded, because each entry carries a slice of a
-# message body and an unbounded run would hold megabytes in the session.
-# v13.91: 300 -> 120, to match the 60 hits a scan can now produce and to keep the
-# list from being copied whole on every batch.
 KW_DETAIL_MAX = 120
 KW_DETAIL_BODY = 2000
 
-# v13.89: pool state. A plain dict for the counter so the worker can decrement it
-# without a `global`; _kw_done is the handover queue.
-# v13.91: BOTH ARE KEYED BY SCOPE now - see ISO-KW-1 above. One lock covers the
-# pair and the pool handle, because all three are read and written together.
 _kw_pool = None
 _kw_lock = threading.Lock()
-_kw_done = {}       # scope -> deque of finished scans
-_KW_ST = {}         # scope -> {"inflight": int, "run_mark": str}
+_kw_done = {}
+_KW_ST = {}
 _KW_SCOPE_MAX = 32
 
 
@@ -13472,13 +13486,6 @@ def _kw_scope() -> str:
 
 
 def _kw_dq(scope):
-    """This scope's handover deque, created on demand. Call under _kw_lock.
-
-    Eviction is oldest-first over scopes OTHER than the one asking, so the
-    caller's own queue can never be dropped by its own allocation. A forgotten
-    passkey or a reaped tab therefore cannot hold a deque for the life of the
-    process.
-    """
     d = _kw_done.get(scope)
     if d is None:
         d = deque()
@@ -13492,7 +13499,6 @@ def _kw_dq(scope):
 
 
 def _kw_st(scope):
-    """This scope's counters, created on demand. Call under _kw_lock."""
     s = _KW_ST.get(scope)
     if s is None:
         s = {"inflight": 0, "run_mark": ""}
@@ -13501,9 +13507,6 @@ def _kw_st(scope):
 
 
 def keyword_hits_wanted() -> bool:
-    """True when the run should SUBMIT a scan: the switch is on and the module
-    loaded. Whether any KEYWORD was typed is decided inside the worker, so an
-    empty box still leaves a trace line instead of silence."""
     try:
         return bool(str_lit.session_state.get("bb_kw_run_on")) and mailsearch is not None
     except Exception:
@@ -13511,11 +13514,6 @@ def keyword_hits_wanted() -> bool:
 
 
 def _kw_pool_get():
-    """The scan pool, created once per process. Never raises.
-
-    The POOL is deliberately process-wide - it is three threads and its work is
-    already scoped by the queue - but every handle it hands back is keyed.
-    """
     global _kw_pool
     with _kw_lock:
         if _kw_pool is None:
@@ -13525,14 +13523,11 @@ def _kw_pool_get():
 
 
 def kw_pending(scope=None) -> int:
-    """How many of THIS scope's scans are still in flight. Cheap, lock-guarded."""
     with _kw_lock:
         return int((_KW_ST.get(scope or _kw_scope()) or {}).get("inflight", 0))
 
 
 def _kw_scan_window() -> int:
-    """The per-folder window from the controls, honouring Whole folder and the
-    All Folders cap. Script thread - it reads widget keys."""
     try:
         limit = int(str_lit.session_state.get("bb_kw_run_limit") or 100)
     except Exception:
@@ -13545,12 +13540,6 @@ def _kw_scan_window() -> int:
 
 
 def _kw_folders_for(mail, mode):
-    """(folders, note) for this scan. Never raises.
-
-    All Folders asks the SERVER, so it can only ever name a folder that exists
-    on this account - there is no guessed list. A server that will not list
-    falls back to INBOX rather than scanning nothing.
-    """
     if mode != KW_SCOPE_ALL:
         return [KW_FOLDER_INBOX], ""
     try:
@@ -13566,14 +13555,6 @@ def _kw_folders_for(mail, mode):
 
 
 def _kw_imap_open(email, password, hosts, proxy, trace, ins):
-    """One authenticated IMAP session for the scan -> (mail, note).
-
-    Bounded on purpose: one attempt per host and mode, KW_CONNECT_TIMEOUT each,
-    KW_OPEN_BUDGET for the whole thing. verify_and_connect() is not used here
-    because it walks every mode x every host x every username candidate with a
-    fixed 10s timeout and no ceiling - on a host whose 993 is firewalled that is
-    minutes.
-    """
     deadline = time.time() + KW_OPEN_BUDGET
     for host in [h for h in (hosts or []) if h][:3]:
         for mode, port in (("ssl", 993), ("starttls", 143)):
@@ -13603,13 +13584,6 @@ def _kw_imap_open(email, password, hosts, proxy, trace, ins):
 
 
 def _kw_pop_open(email, password, hosts, proxy, trace, ins):
-    """One authenticated POP3 session for the scan -> (mail, note).
-
-    The fallback that matters: an account can be perfectly VALID and still have
-    no working IMAP - that is exactly what the run export showed for dmci.net,
-    where every 993 rung timed out and only 995 answered. Without this path the
-    scan simply cannot read such a mailbox.
-    """
     deadline = time.time() + KW_POP_BUDGET
     for host in [h for h in (hosts or []) if h][:2]:
         if time.time() > deadline:
@@ -13639,12 +13613,6 @@ def _kw_pop_open(email, password, hosts, proxy, trace, ins):
 
 
 def _kw_pop_scan(mail, words, limit, fields, trace):
-    """POP3 has no folders and no SEARCH: RETR the newest `limit` messages.
-
-    Matching is done with mailsearch's own helpers (_heads_from_bytes, _blob,
-    _readable, _counts), so a POP3 hit is the same dict shape as an IMAP hit and
-    every renderer, counter and body file works unchanged.
-    """
     hits = []
     kws = mailsearch._keywords(words)
     if not kws:
@@ -13715,12 +13683,6 @@ def _kw_pop_scan(mail, words, limit, fields, trace):
 
 
 def _kw_scan_pure(combo, cfg, out):
-    """The whole scan, on a WORKER thread. Touches no session_state.
-
-    Everything it needs was captured on the script thread into `cfg`, and it
-    fills `out` with the trace lines and the hits. Body files are written here
-    because that is disk work, not UI work.
-    """
     def trace(level, step, detail=""):
         out["trace"].append(_kw_fmt(level, step, detail))
 
@@ -13791,13 +13753,6 @@ def _kw_scan_pure(combo, cfg, out):
 
         if proto == "pop":
             trace("INFO", "proto", "POP3 session - there are no folders, INBOX only")
-            # v13.86 FIX KW-14: THE WINDOW HERE WAS body_scan. On the IMAP path the
-            # header pass takes the whole `scan` window and only the body pass is
-            # capped at KW_BODY_SCAN_CAP, but POP3 has no separate header pass - it
-            # RETRs a message and matches headers and body in one go - so passing
-            # body_scan capped the entire POP3 window at 40 and a "Newest 100" scan
-            # silently read 40. The window is `scan`; there is no body cap to apply
-            # on this path, because every RETR already fetches the body.
             out["hits"], note = _kw_pop_scan(mail, words, scan, fields, trace)
             if note:
                 trace("WARN", "note", note)
@@ -13837,8 +13792,6 @@ def _kw_scan_pure(combo, cfg, out):
         mailsearch.save_bodies(kdir, stamp, out["hits"])
     except Exception:
         pass
-    # FIX KW-13: the FULL body is on disk now, so the queued copy is cut down.
-    # This is the memory that made an OOM kill likely on a 1 GB container.
     for h in out["hits"]:
         h["body"] = str(h.get("body") or "")[:KW_QUEUE_BODY]
     trace("INFO", "hit", "%d hit(s) for %s in %s"
@@ -13850,16 +13803,6 @@ def _kw_scan_pure(combo, cfg, out):
 
 
 def _kw_scan_worker(combo, cfg, entry, scope, task_cfg):
-    """Pool body: pin the OWNER, run the scan, hand the result over, decrement.
-
-    FIX ISO-KW-1: the pin is the whole point. _gate_scope() is thread-local, so
-    without it every _rebind_scope() inside the scan resolved to whichever
-    session reran last - and the scan sampled a proxy from that user's pool, read
-    their quarantine and rotation settings and wrote scores into their
-    proxy_meta. seed_task_cfg() does the same for the config: live_cfg() reads
-    the thread snapshot first, and STATE["cfg"] is whatever the last rerun of ANY
-    session left behind.
-    """
     res = {"email": "", "hits": [], "trace": [], "entry": entry, "scope": scope}
     try:
         _pin_gate_scope(scope)
@@ -13877,12 +13820,6 @@ def _kw_scan_worker(combo, cfg, entry, scope, task_cfg):
 
 
 def kw_scan_submit(combo, entry=None):
-    """Queue one scan. SCRIPT THREAD. Returns True when it was queued.
-
-    The config AND the owner are captured HERE, from the live widgets and the
-    calling thread, so the worker never has to read session_state from another
-    thread and can never resolve to another user.
-    """
     if not keyword_hits_wanted():
         return False
     scope = _kw_scope()
@@ -13890,9 +13827,6 @@ def kw_scan_submit(combo, entry=None):
     with _kw_lock:
         _st = _kw_st(scope)
         if _st.get("run_mark") != _mark:
-            # FIX ISO-KW-1: THIS SCOPE's queue only. It used to clear the single
-            # shared deque, so one user pressing Start wiped another's pending
-            # hits before they could be drained.
             _st["run_mark"] = _mark
             _kw_dq(scope).clear()
         pending = int(_st.get("inflight", 0))
@@ -13928,7 +13862,6 @@ def kw_scan_submit(combo, entry=None):
 
 
 def _kw_apply(item):
-    """Move ONE finished scan into the session. SCRIPT THREAD. Never raises."""
     hits = item.get("hits") or []
     lines = item.get("trace") or []
     entry = item.get("entry")
@@ -13939,9 +13872,6 @@ def _kw_apply(item):
             str_lit.session_state["kw_trace"] = rows[-KW_TRACE_MAX:]
     except Exception:
         pass
-    # The Under-The-Hood row for THIS account. `entry` is the dict block 106
-    # appended just before the submit, so it is the right row even if other
-    # accounts have finished in the meantime.
     if entry is not None and lines:
         try:
             prev = entry.get("Under-The-Hood Background Trace") or ""
@@ -13980,7 +13910,6 @@ def _kw_apply(item):
             ln = mailsearch.hit_line(h)
             if ln not in cur_l:
                 cur_l.append(ln)
-        # FIX KW-13: the bucket had no ceiling at all.
         if len(cur_l) > KW_BUCKET_MAX:
             cur_l = cur_l[-KW_BUCKET_MAX:]
         str_lit.session_state["kw_hits_results"] = cur_l
@@ -13989,15 +13918,6 @@ def _kw_apply(item):
 
 
 def kw_drain(wait=0.0):
-    """Take every finished scan of THIS SCOPE into the session. SCRIPT THREAD ONLY.
-
-    FIX ISO-KW-1: it drains its own queue now. It used to pop the head of one
-    shared deque, so it applied other users' hits into the caller's buckets and
-    left its own behind.
-
-    `wait` seconds lets the tail of a run collect its last scans before the
-    report is finalised. Repaints once per batch, not once per hit.
-    """
     scope = _kw_scope()
     deadline = time.time() + float(wait or 0)
     moved = 0
@@ -14022,58 +13942,6 @@ def kw_drain(wait=0.0):
 
 # ==========================================================================
 # v13.86 - THE CREDENTIALS SORTER
-#
-# WHAT IT IS FOR: the queue you paste is one flat list. Some runs want a whole
-# domain, some want a whole country, some want a region - and the engine can
-# only run what the Engine Action Mode dropdown names. This section turns the
-# queue into named groups, lets you tick several of them, and SEND them as ONE
-# section that then appears, as one entry, in BOTH the Engine Action Mode
-# dropdown and the Filter & Result Categories Inspector.
-#
-# THREE MODES, one control: group by DOMAIN, by COUNTRY or by REGION.
-#
-# HOW A COUNTRY IS DECIDED, highest precedence first:
-#   1. a domain TAUGHT in this section (this user's own domain_countries.json)
-#   2. a GENERIC PROVIDER ROOT -> the "Global providers" pseudo-group
-#   3. built-in REGIONAL / ISP / WEBMAIL domain mappings (_CS_REGIONAL_ISP_COUNTRIES)
-#   4. the built-in DOMAIN_COUNTRY_HINTS table (block 021)
-#   5. the TLD table (block 052)
-#   6. Global
-#
-# STEP 2, AND WHY IT IS A ROOT MATCH RATHER THAN A DOMAIN MATCH:
-#   gmail.com, outlook.com, yahoo.com, aol.com, icloud.com, gmx.net, mail.com,
-#   zoho.com and the rest are global infrastructure - they belong in ONE group,
-#   not scattered into whichever country their TLD or a hint happened to name.
-#   The match is on the REGISTRABLE ROOT (the last two labels, plus a short list
-#   of two-part suffixes such as co.uk and com.br), so:
-#       mail.yandex.ru      -> root yandex.ru   -> NOT a provider -> Russia
-#       anything.gmail.com  -> root gmail.com   -> provider       -> Global providers
-#       yahoo.com           -> root yahoo.com   -> provider       -> Global providers
-#       yahoo.co.uk         -> root yahoo.co.uk -> NOT a provider -> United Kingdom
-#       gmx.ch              -> root gmx.ch      -> NOT a provider -> Switzerland
-#   A country-coded variant therefore keeps its country and always will, while
-#   every subdomain of a generic provider lands in the one group.
-#
-# THE MAP IS TEACHABLE. "Teach a domain its country" writes to THIS user's own
-# domain_countries.json, "Auto-assign countries from the rows" fills every
-# domain the provider set, regional/ISP map, hints and TLDs can answer for, and
-# the map panel draws one marker per country that actually has credentials and
-# lets you re-assign or forget any domain. Nothing about it is shared with another
-# user.
-#
-# EVERY COUNTRY CARRIES ITS FLAG. The flag is DERIVED from the two-letter code
-# with the regional-indicator arithmetic, so a country can never be listed
-# without one and no emoji table can drift. The table below is every sovereign
-# state plus the dependent territories, so the picker is complete rather than a
-# convenient subset. The two pseudo-groups carry their own fixed glyphs instead.
-#
-# ISOLATION, stated plainly, because this is credential data:
-#   * domain_countries.json and sorter_selection.json are per-user files,
-#     named through user_file() like every other per-user path.
-#   * Every widget key is cs_*, every value is cs_*, and the owner gate below
-#     drops all of it on an owner change in this tab.
-#   * The sent section is rebuilt from the keys every run, so a bucket that a
-#     new run emptied can never leave a stale label in either dropdown.
 # ==========================================================================
 _CS_GLOBAL = "Global"
 _CS_MODES = ("Domain", "Country", "Region")
@@ -14083,19 +13951,11 @@ _CS_GLOBAL_FLAG = "\U0001F310"
 _CS_MARK = "\U0001F5C2"
 _CS_OWNER_KEY = "_cs_owner"
 
-# ---- the Global providers pseudo-group -----------------------------------
-# A real group in every respect - its own flag, its own code, its own region and
-# its own rank - except that it has no point on the map, because it is not a
-# place. A taught domain may name it exactly like a country.
 _CS_PROVIDERS_GROUP = "Global providers"
 _CS_PROVIDERS_REGION = "Global providers"
 _CS_PROVIDERS_FLAG = "\U0001F4EC"
 _CS_PROVIDERS_CODE = "GLOBAL"
 
-# Two-part public suffixes. Without these, root("yahoo.co.uk") would be "co.uk"
-# and EVERY .co.uk domain would be tested against one shared root - so a UK ISP
-# domain could never match its own row, and any provider entry would swallow the
-# whole suffix.
 _CS_MULTI_SUFFIX = frozenset({
     "co.uk", "org.uk", "me.uk", "ltd.uk", "plc.uk", "net.uk", "sch.uk", "ac.uk",
     "com.au", "net.au", "org.au", "edu.au", "gov.au", "id.au", "asn.au",
@@ -14115,13 +13975,6 @@ _CS_MULTI_SUFFIX = frozenset({
     "com.gh", "com.qa", "com.kw", "com.bh", "com.om", "com.jo", "com.lb",
 })
 
-# ---- the generic provider roots -----------------------------------------
-# A FROZEN set, so nothing at runtime can widen it by accident. These are the
-# providers whose mailboxes are hosted on one global platform: the account is
-# nowhere in particular, so it belongs in Global providers rather than under the
-# country its TLD happens to name. Country-coded variants of the SAME brands
-# (gmx.ch, gmx.de, orange.net, yahoo.co.uk, live.co.uk, hotmail.*) are
-# deliberately absent - they resolve to their countries instead.
 _CS_PROVIDERS = frozenset({
     "gmail.com", "googlemail.com",
     "outlook.com", "hotmail.com", "live.com", "msn.com",
@@ -14133,280 +13986,92 @@ _CS_PROVIDERS = frozenset({
     "gmx.net", "gmx.com", "mail.com", "email.com", "zoho.com", "zohomail.com",
 })
 
-# ---- built-in regional webmail & ISP domain -> country map --------------
-# Every entry maps to an exact country name from _CS_COUNTRIES so it resolves
-# automatically without manual teaching, while still allowing per-user
-# overrides in domain_countries.json.
 _CS_REGIONAL_ISP_COUNTRIES = {
-    # China (webmail + carriers/ISPs)
-    "qq.com": "China",
-    "foxmail.com": "China",
-    "163.com": "China",
-    "126.com": "China",
-    "yeah.net": "China",
-    "188.com": "China",
-    "sina.com": "China",
-    "sina.cn": "China",
-    "sohu.com": "China",
-    "aliyun.com": "China",
-    "189.cn": "China",
-    "139.com": "China",
-    "wo.cn": "China",
-    "tom.com": "China",
-    "21cn.com": "China",
-    # Russia & CIS
-    "yandex.com": "Russia",
-    "yandex.ru": "Russia",
-    "ya.ru": "Russia",
-    "yandex.by": "Belarus",
-    "yandex.kz": "Kazakhstan",
-    "yandex.ua": "Ukraine",
-    "mail.ru": "Russia",
-    "inbox.ru": "Russia",
-    "bk.ru": "Russia",
-    "list.ru": "Russia",
-    "internet.ru": "Russia",
-    "rambler.ru": "Russia",
-    "lenta.ru": "Russia",
-    "autorambler.ru": "Russia",
-    "myrambler.ru": "Russia",
-    "ro.ru": "Russia",
+    "qq.com": "China", "foxmail.com": "China", "163.com": "China", "126.com": "China",
+    "yeah.net": "China", "188.com": "China", "sina.com": "China", "sina.cn": "China",
+    "sohu.com": "China", "aliyun.com": "China", "189.cn": "China", "139.com": "China",
+    "wo.cn": "China", "tom.com": "China", "21cn.com": "China",
+    "yandex.com": "Russia", "yandex.ru": "Russia", "ya.ru": "Russia",
+    "yandex.by": "Belarus", "yandex.kz": "Kazakhstan", "yandex.ua": "Ukraine",
+    "mail.ru": "Russia", "inbox.ru": "Russia", "bk.ru": "Russia", "list.ru": "Russia",
+    "internet.ru": "Russia", "rambler.ru": "Russia", "lenta.ru": "Russia",
+    "autorambler.ru": "Russia", "myrambler.ru": "Russia", "ro.ru": "Russia",
     "ukr.net": "Ukraine",
-    # South Korea
-    "naver.com": "South Korea",
-    "daum.net": "South Korea",
-    "hanmail.net": "South Korea",
-    "kakao.com": "South Korea",
-    "nate.com": "South Korea",
-    # Brazil
-    "globo.com": "Brazil",
-    "globomail.com": "Brazil",
-    "uol.com.br": "Brazil",
-    "bol.com.br": "Brazil",
-    "ig.com.br": "Brazil",
-    "terra.com.br": "Brazil",
-    "r7.com": "Brazil",
-    "zipmail.com.br": "Brazil",
-    "oi.com.br": "Brazil",
-    # India
-    "rediffmail.com": "India",
-    "rediff.com": "India",
-    # France
-    "laposte.net": "France",
-    "orange.fr": "France",
-    "wanadoo.fr": "France",
-    "free.fr": "France",
-    "sfr.fr": "France",
-    "voila.fr": "France",
-    "neuf.fr": "France",
-    "bbox.fr": "France",
-    "numericable.fr": "France",
-    "club-internet.fr": "France",
-    "hotmail.fr": "France",
-    "live.fr": "France",
-    # Middle East / Pan-Arab (Maktoob originated in Jordan)
+    "naver.com": "South Korea", "daum.net": "South Korea", "hanmail.net": "South Korea",
+    "kakao.com": "South Korea", "nate.com": "South Korea",
+    "globo.com": "Brazil", "globomail.com": "Brazil", "uol.com.br": "Brazil",
+    "bol.com.br": "Brazil", "ig.com.br": "Brazil", "terra.com.br": "Brazil",
+    "r7.com": "Brazil", "zipmail.com.br": "Brazil", "oi.com.br": "Brazil",
+    "rediffmail.com": "India", "rediff.com": "India",
+    "laposte.net": "France", "orange.fr": "France", "wanadoo.fr": "France",
+    "free.fr": "France", "sfr.fr": "France", "voila.fr": "France", "neuf.fr": "France",
+    "bbox.fr": "France", "numericable.fr": "France", "club-internet.fr": "France",
+    "hotmail.fr": "France", "live.fr": "France",
     "maktoob.com": "Jordan",
-    # Germany
-    "web.de": "Germany",
-    "t-online.de": "Germany",
-    "freenet.de": "Germany",
-    "arcor.de": "Germany",
-    "online.de": "Germany",
-    "hotmail.de": "Germany",
-    "live.de": "Germany",
-    # Italy
-    "libero.it": "Italy",
-    "virgilio.it": "Italy",
-    "tin.it": "Italy",
-    "alice.it": "Italy",
-    "tiscali.it": "Italy",
-    "email.it": "Italy",
-    "pec.it": "Italy",
-    "hotmail.it": "Italy",
-    "live.it": "Italy",
-    # Spain
-    "terra.es": "Spain",
-    "ya.com": "Spain",
-    "ozu.es": "Spain",
-    "telefonica.net": "Spain",
-    "hotmail.es": "Spain",
-    # Poland
-    "wp.pl": "Poland",
-    "onet.pl": "Poland",
-    "op.pl": "Poland",
-    "interia.pl": "Poland",
-    "interia.eu": "Poland",
-    "o2.pl": "Poland",
-    "tlen.pl": "Poland",
-    "gazeta.pl": "Poland",
-    # Czechia & Slovakia
-    "seznam.cz": "Czechia",
-    "email.cz": "Czechia",
-    "post.cz": "Czechia",
-    "centrum.cz": "Czechia",
-    "volny.cz": "Czechia",
-    "atlas.cz": "Czechia",
-    "centrum.sk": "Slovakia",
-    "azet.sk": "Slovakia",
-    "zoznam.sk": "Slovakia",
-    # Hungary
-    "freemail.hu": "Hungary",
-    "citromail.hu": "Hungary",
-    "indamail.hu": "Hungary",
-    # Japan
-    "docomo.ne.jp": "Japan",
-    "ezweb.ne.jp": "Japan",
-    "au.com": "Japan",
-    "softbank.ne.jp": "Japan",
-    "i.softbank.jp": "Japan",
-    "nifty.com": "Japan",
-    "biglobe.ne.jp": "Japan",
-    "ocn.ne.jp": "Japan",
-    "so-net.ne.jp": "Japan",
-    "excite.co.jp": "Japan",
-    "goo.ne.jp": "Japan",
-    # Taiwan
-    "pchome.com.tw": "Taiwan",
-    "hinet.net": "Taiwan",
-    "msa.hinet.net": "Taiwan",
-    # United States ISPs & consumer domains
-    "comcast.net": "United States",
-    "verizon.net": "United States",
-    "att.net": "United States",
-    "sbcglobal.net": "United States",
-    "bellsouth.net": "United States",
-    "pacbell.net": "United States",
-    "ameritech.net": "United States",
-    "swbell.net": "United States",
-    "cox.net": "United States",
-    "charter.net": "United States",
-    "spectrum.net": "United States",
-    "rr.com": "United States",
-    "roadrunner.com": "United States",
-    "twc.com": "United States",
-    "earthlink.net": "United States",
-    "mindspring.com": "United States",
-    "optonline.net": "United States",
-    "optimum.net": "United States",
-    "juno.com": "United States",
-    "netzero.net": "United States",
-    "centurylink.net": "United States",
-    "centurytel.net": "United States",
-    "q.com": "United States",
-    "embarqmail.com": "United States",
-    "windstream.net": "United States",
-    "frontier.com": "United States",
-    "frontiernet.net": "United States",
-    "suddenlink.net": "United States",
-    "mediacombb.net": "United States",
-    "rcn.com": "United States",
+    "web.de": "Germany", "t-online.de": "Germany", "freenet.de": "Germany",
+    "arcor.de": "Germany", "online.de": "Germany", "hotmail.de": "Germany", "live.de": "Germany",
+    "libero.it": "Italy", "virgilio.it": "Italy", "tin.it": "Italy", "alice.it": "Italy",
+    "tiscali.it": "Italy", "email.it": "Italy", "pec.it": "Italy",
+    "hotmail.it": "Italy", "live.it": "Italy",
+    "terra.es": "Spain", "ya.com": "Spain", "ozu.es": "Spain",
+    "telefonica.net": "Spain", "hotmail.es": "Spain",
+    "wp.pl": "Poland", "onet.pl": "Poland", "op.pl": "Poland", "interia.pl": "Poland",
+    "interia.eu": "Poland", "o2.pl": "Poland", "tlen.pl": "Poland", "gazeta.pl": "Poland",
+    "seznam.cz": "Czechia", "email.cz": "Czechia", "post.cz": "Czechia",
+    "centrum.cz": "Czechia", "volny.cz": "Czechia", "atlas.cz": "Czechia",
+    "centrum.sk": "Slovakia", "azet.sk": "Slovakia", "zoznam.sk": "Slovakia",
+    "freemail.hu": "Hungary", "citromail.hu": "Hungary", "indamail.hu": "Hungary",
+    "docomo.ne.jp": "Japan", "ezweb.ne.jp": "Japan", "au.com": "Japan",
+    "softbank.ne.jp": "Japan", "i.softbank.jp": "Japan", "nifty.com": "Japan",
+    "biglobe.ne.jp": "Japan", "ocn.ne.jp": "Japan", "so-net.ne.jp": "Japan",
+    "excite.co.jp": "Japan", "goo.ne.jp": "Japan",
+    "pchome.com.tw": "Taiwan", "hinet.net": "Taiwan", "msa.hinet.net": "Taiwan",
+    "comcast.net": "United States", "verizon.net": "United States", "att.net": "United States",
+    "sbcglobal.net": "United States", "bellsouth.net": "United States", "pacbell.net": "United States",
+    "ameritech.net": "United States", "swbell.net": "United States", "cox.net": "United States",
+    "charter.net": "United States", "spectrum.net": "United States", "rr.com": "United States",
+    "roadrunner.com": "United States", "twc.com": "United States", "earthlink.net": "United States",
+    "mindspring.com": "United States", "optonline.net": "United States", "optimum.net": "United States",
+    "juno.com": "United States", "netzero.net": "United States", "centurylink.net": "United States",
+    "centurytel.net": "United States", "q.com": "United States", "embarqmail.com": "United States",
+    "windstream.net": "United States", "frontier.com": "United States", "frontiernet.net": "United States",
+    "suddenlink.net": "United States", "mediacombb.net": "United States", "rcn.com": "United States",
     "hughes.net": "United States",
-    # Canada ISPs
-    "rogers.com": "Canada",
-    "bell.net": "Canada",
-    "eastlink.ca": "Canada",
-    "shaw.ca": "Canada",
-    "sympatico.ca": "Canada",
-    "videotron.ca": "Canada",
-    "telus.net": "Canada",
-    "telusplanet.net": "Canada",
-    "cogeco.ca": "Canada",
-    "sasktel.net": "Canada",
-    "mts.net": "Canada",
-    # Australia ISPs
-    "bigpond.com": "Australia",
-    "bigpond.net.au": "Australia",
-    "bigpond.com.au": "Australia",
-    "optusnet.com.au": "Australia",
-    "iinet.net.au": "Australia",
-    "internode.on.net": "Australia",
-    "tpg.com.au": "Australia",
-    "dodo.com.au": "Australia",
-    "adam.com.au": "Australia",
-    "westnet.com.au": "Australia",
-    "ozemail.com.au": "Australia",
-    # United Kingdom ISPs
-    "btinternet.com": "United Kingdom",
-    "btopenworld.com": "United Kingdom",
-    "bt.com": "United Kingdom",
-    "sky.com": "United Kingdom",
-    "virginmedia.com": "United Kingdom",
-    "virgin.net": "United Kingdom",
-    "ntlworld.com": "United Kingdom",
-    "blueyonder.co.uk": "United Kingdom",
-    "talktalk.net": "United Kingdom",
-    "tiscali.co.uk": "United Kingdom",
-    "lineone.net": "United Kingdom",
-    "plus.com": "United Kingdom",
-    "plus.net": "United Kingdom",
-    "force9.co.uk": "United Kingdom",
-    "freeserve.co.uk": "United Kingdom",
-    "orange.net": "United Kingdom",
-    "ee.co.uk": "United Kingdom",
-    "hotmail.co.uk": "United Kingdom",
-    "live.co.uk": "United Kingdom",
-    # New Zealand ISPs
-    "xtra.co.nz": "New Zealand",
-    "spark.co.nz": "New Zealand",
-    "vodafone.co.nz": "New Zealand",
-    "clear.net.nz": "New Zealand",
-    "slingshot.co.nz": "New Zealand",
-    # Netherlands ISPs
-    "ziggo.nl": "Netherlands",
-    "kpnmail.nl": "Netherlands",
-    "kpnplanet.nl": "Netherlands",
-    "planet.nl": "Netherlands",
-    "hetnet.nl": "Netherlands",
-    "home.nl": "Netherlands",
-    "chello.nl": "Netherlands",
-    "zonnet.nl": "Netherlands",
-    "xs4all.nl": "Netherlands",
-    "casema.nl": "Netherlands",
-    "upcmail.nl": "Netherlands",
-    "quicknet.nl": "Netherlands",
+    "rogers.com": "Canada", "bell.net": "Canada", "eastlink.ca": "Canada",
+    "shaw.ca": "Canada", "sympatico.ca": "Canada", "videotron.ca": "Canada",
+    "telus.net": "Canada", "telusplanet.net": "Canada", "cogeco.ca": "Canada",
+    "sasktel.net": "Canada", "mts.net": "Canada",
+    "bigpond.com": "Australia", "bigpond.net.au": "Australia", "bigpond.com.au": "Australia",
+    "optusnet.com.au": "Australia", "iinet.net.au": "Australia", "internode.on.net": "Australia",
+    "tpg.com.au": "Australia", "dodo.com.au": "Australia", "adam.com.au": "Australia",
+    "westnet.com.au": "Australia", "ozemail.com.au": "Australia",
+    "btinternet.com": "United Kingdom", "btopenworld.com": "United Kingdom", "bt.com": "United Kingdom",
+    "sky.com": "United Kingdom", "virginmedia.com": "United Kingdom", "virgin.net": "United Kingdom",
+    "ntlworld.com": "United Kingdom", "blueyonder.co.uk": "United Kingdom",
+    "talktalk.net": "United Kingdom", "tiscali.co.uk": "United Kingdom", "lineone.net": "United Kingdom",
+    "plus.com": "United Kingdom", "plus.net": "United Kingdom", "force9.co.uk": "United Kingdom",
+    "freeserve.co.uk": "United Kingdom", "orange.net": "United Kingdom", "ee.co.uk": "United Kingdom",
+    "hotmail.co.uk": "United Kingdom", "live.co.uk": "United Kingdom",
+    "xtra.co.nz": "New Zealand", "spark.co.nz": "New Zealand", "vodafone.co.nz": "New Zealand",
+    "clear.net.nz": "New Zealand", "slingshot.co.nz": "New Zealand",
+    "ziggo.nl": "Netherlands", "kpnmail.nl": "Netherlands", "kpnplanet.nl": "Netherlands",
+    "planet.nl": "Netherlands", "hetnet.nl": "Netherlands", "home.nl": "Netherlands",
+    "chello.nl": "Netherlands", "zonnet.nl": "Netherlands", "xs4all.nl": "Netherlands",
+    "casema.nl": "Netherlands", "upcmail.nl": "Netherlands", "quicknet.nl": "Netherlands",
     "live.nl": "Netherlands",
-    # Belgium ISPs
-    "telenet.be": "Belgium",
-    "skynet.be": "Belgium",
-    "proximus.be": "Belgium",
-    "scarlet.be": "Belgium",
-    "voo.be": "Belgium",
-    "brutele.be": "Belgium",
-    # Switzerland ISPs
-    "bluewin.ch": "Switzerland",
-    "hispeed.ch": "Switzerland",
-    "sunrise.ch": "Switzerland",
-    "swissonline.ch": "Switzerland",
-    "gmx.ch": "Switzerland",
-    # Austria ISPs
-    "aon.at": "Austria",
-    "chello.at": "Austria",
-    "inode.at": "Austria",
-    "magenta.at": "Austria",
-    "kabsi.at": "Austria",
-    # Sweden, Norway & Denmark ISPs
-    "telia.com": "Sweden",
-    "telia.se": "Sweden",
-    "bredband.net": "Sweden",
-    "comhem.se": "Sweden",
-    "online.no": "Norway",
-    "broadpark.no": "Norway",
-    "getmail.no": "Norway",
-    "tdcadsl.dk": "Denmark",
-    "mail.dk": "Denmark",
-    "stofanet.dk": "Denmark",
-    "youmail.dk": "Denmark",
-    # South Africa ISPs
-    "mweb.co.za": "South Africa",
-    "telkomsa.net": "South Africa",
-    "vodamail.co.za": "South Africa",
-    "iafrica.com": "South Africa",
-    "absamail.co.za": "South Africa",
-    "webmail.co.za": "South Africa",
+    "telenet.be": "Belgium", "skynet.be": "Belgium", "proximus.be": "Belgium",
+    "scarlet.be": "Belgium", "voo.be": "Belgium", "brutele.be": "Belgium",
+    "bluewin.ch": "Switzerland", "hispeed.ch": "Switzerland", "sunrise.ch": "Switzerland",
+    "swissonline.ch": "Switzerland", "gmx.ch": "Switzerland",
+    "aon.at": "Austria", "chello.at": "Austria", "inode.at": "Austria",
+    "magenta.at": "Austria", "kabsi.at": "Austria",
+    "telia.com": "Sweden", "telia.se": "Sweden", "bredband.net": "Sweden", "comhem.se": "Sweden",
+    "online.no": "Norway", "broadpark.no": "Norway", "getmail.no": "Norway",
+    "tdcadsl.dk": "Denmark", "mail.dk": "Denmark", "stofanet.dk": "Denmark", "youmail.dk": "Denmark",
+    "mweb.co.za": "South Africa", "telkomsa.net": "South Africa", "vodamail.co.za": "South Africa",
+    "iafrica.com": "South Africa", "absamail.co.za": "South Africa", "webmail.co.za": "South Africa",
 }
 
-# code, name, region, latitude, longitude. The code is the flag AND the short
-# label; the coordinates are the country centroid the map marker sits on.
 _CS_COUNTRIES = (
     ("AF", "Afghanistan", "Asia", 33.9, 67.7),
     ("AX", "Aland Islands", "Europe", 60.2, 20.0),
@@ -14662,187 +14327,6 @@ _CS_BY_NAME = {_c[1]: _c for _c in _CS_COUNTRIES}
 _CS_BY_CODE = {_c[0]: _c[1] for _c in _CS_COUNTRIES}
 _CS_LOOKUP_CAP = 120
 _CS_LOOKUP_WORKERS = 4
-_CS_RDAP_HOST_SEMS = {}
-_CS_RDAP_HOST_NEXT = {}
-_CS_RDAP_HOST_LOCK = threading.Lock()
-_CS_DDG_LOCK = threading.Lock()
-_CS_DDG_NEXT = 0.0
-_CS_LOCATION_CUES = (
-    "location", "headquarters", "headquartered", "hq", "address",
-    "based in", "located in", "country", "office", "offices",
-    "street", "city", "postal", "zip", "tel", "phone",
-    "inc", "llc", "ltd", "gmbh", "corp", "pty", "plc", "srl", "sarl",
-)
-_CS_GENERIC_BRAND_WORDS = frozenset({
-    "online", "global", "digital", "mobile", "server", "hosting", "cloud",
-    "gaming", "games", "studio", "network", "system", "systems", "secure",
-    "official", "portal", "service", "services", "market", "direct", "express",
-    "simple", "smart", "active", "future", "modern", "vision", "energy",
-    "master", "expert", "united", "design", "center", "centre", "group",
-})
-_CS_USA_FALSE_FRIENDS = frozenset({
-    "medusa", "hausa", "yakuza", "ragusa", "syracuse", "lampeduza",
-    "lampedusa", "formosa", "tolosa", "osa", "rosa", "musa", "ausa",
-})
-_CS_SCRAPER_HOSTS = frozenset({
-    "whois.com", "who.is", "scamadviser.com", "urlvoid.com", "hypestat.com",
-    "similarweb.com", "builtwith.com", "robtex.com", "viewdns.info",
-    "domaintools.com", "whoisxmlapi.com", "easywhois.com", "siteprice.org",
-    "worthofweb.com", "cutestat.com", "statshow.com", "websiterating.com",
-    "myip.ms", "bgp.he.net", "dnslytics.com", "securitytrails.com",
-    "shodan.io", "censys.io", "virustotal.com", "talosintelligence.com",
-    "mxtoolbox.com", "intodns.com", "dnschecker.org", "whatsmydns.net",
-})
-_CS_NOISE_CARD_CUES = (
-    "domain is for sale",
-    "buy this domain",
-    "parked domain",
-    "whois lookup",
-    "registrar whois",
-    "name servers",
-    "dns records",
-)
-_CS_AUTOCORRECT_BANNERS = (
-    "including results for",
-    "showing results for",
-    "did you mean",
-    "search instead for",
-)
-_CS_TEXT_CUES = (
-    ("united states", "United States"),
-    ("u.s.a.", "United States"),
-    ("usa", "United States"),
-    ("new york", "United States"),
-    ("san francisco", "United States"),
-    ("los angeles", "United States"),
-    ("seattle", "United States"),
-    ("chicago", "United States"),
-    ("austin", "United States"),
-    ("united kingdom", "United Kingdom"),
-    ("england", "United Kingdom"),
-    ("scotland", "United Kingdom"),
-    ("wales", "United Kingdom"),
-    ("london", "United Kingdom"),
-    ("manchester", "United Kingdom"),
-    ("canada", "Canada"),
-    ("toronto", "Canada"),
-    ("vancouver", "Canada"),
-    ("montreal", "Canada"),
-    ("australia", "Australia"),
-    ("sydney", "Australia"),
-    ("melbourne", "Australia"),
-    ("germany", "Germany"),
-    ("deutschland", "Germany"),
-    ("berlin", "Germany"),
-    ("munich", "Germany"),
-    ("hamburg", "Germany"),
-    ("frankfurt", "Germany"),
-    ("france", "France"),
-    ("paris", "France"),
-    ("italy", "Italy"),
-    ("italia", "Italy"),
-    ("milan", "Italy"),
-    ("rome", "Italy"),
-    ("spain", "Spain"),
-    ("espana", "Spain"),
-    ("madrid", "Spain"),
-    ("barcelona", "Spain"),
-    ("brazil", "Brazil"),
-    ("brasil", "Brazil"),
-    ("sao paulo", "Brazil"),
-    ("rio de janeiro", "Brazil"),
-    ("india", "India"),
-    ("mumbai", "India"),
-    ("bengaluru", "India"),
-    ("bangalore", "India"),
-    ("new delhi", "India"),
-    ("japan", "Japan"),
-    ("tokyo", "Japan"),
-    ("osaka", "Japan"),
-    ("south korea", "South Korea"),
-    ("seoul", "South Korea"),
-    ("china", "China"),
-    ("hangzhou", "China"),
-    ("shenzhen", "China"),
-    ("beijing", "China"),
-    ("shanghai", "China"),
-    ("guangzhou", "China"),
-    ("hong kong", "Hong Kong"),
-    ("russia", "Russia"),
-    ("moscow", "Russia"),
-    ("netherlands", "Netherlands"),
-    ("amsterdam", "Netherlands"),
-    ("switzerland", "Switzerland"),
-    ("zurich", "Switzerland"),
-    ("geneva", "Switzerland"),
-    ("sweden", "Sweden"),
-    ("stockholm", "Sweden"),
-    ("norway", "Norway"),
-    ("oslo", "Norway"),
-    ("denmark", "Denmark"),
-    ("copenhagen", "Denmark"),
-    ("poland", "Poland"),
-    ("warsaw", "Poland"),
-    ("south africa", "South Africa"),
-    ("johannesburg", "South Africa"),
-    ("cape town", "South Africa"),
-    ("nigeria", "Nigeria"),
-    ("lagos", "Nigeria"),
-    ("abuja", "Nigeria"),
-    ("mexico", "Mexico"),
-    ("mexico city", "Mexico"),
-    ("singapore", "Singapore"),
-    ("united arab emirates", "United Arab Emirates"),
-    ("dubai", "United Arab Emirates"),
-    ("abu dhabi", "United Arab Emirates"),
-    ("indonesia", "Indonesia"),
-    ("jakarta", "Indonesia"),
-    ("surabaya", "Indonesia"),
-    ("bandung", "Indonesia"),
-    ("bali", "Indonesia"),
-    ("colombia", "Colombia"),
-    ("bogota", "Colombia"),
-    ("medellin", "Colombia"),
-    ("turkey", "Turkey"),
-    ("istanbul", "Turkey"),
-    ("antalya", "Turkey"),
-    ("peru", "Peru"),
-    ("lima", "Peru"),
-    ("nepal", "Nepal"),
-    ("kathmandu", "Nepal"),
-    ("bangladesh", "Bangladesh"),
-    ("dhaka", "Bangladesh"),
-    ("bonaire", "Caribbean Netherlands"),
-    ("curacao", "Curacao"),
-    ("aruba", "Aruba"),
-    ("puerto rico", "Puerto Rico"),
-    ("taiwan", "Taiwan"),
-    ("taipei", "Taiwan"),
-    ("kuala lumpur", "Malaysia"),
-    ("malaysia", "Malaysia"),
-    ("bangkok", "Thailand"),
-    ("thailand", "Thailand"),
-    ("manila", "Philippines"),
-    ("philippines", "Philippines"),
-    ("ho chi minh", "Vietnam"),
-    ("hanoi", "Vietnam"),
-    ("vietnam", "Vietnam"),
-    ("cairo", "Egypt"),
-    ("egypt", "Egypt"),
-    ("casablanca", "Morocco"),
-    ("morocco", "Morocco"),
-    ("nairobi", "Kenya"),
-    ("kenya", "Kenya"),
-    ("accra", "Ghana"),
-    ("ghana", "Ghana"),
-    ("buenos aires", "Argentina"),
-    ("argentina", "Argentina"),
-    ("santiago", "Chile"),
-    ("chile", "Chile"),
-)
-# The two pseudo-groups sort to the BOTTOM of every picker - after every real
-# country - and the providers group sits above Global, because Global is the
-# leftover bucket and providers is a real answer.
 _CS_COUNTRY_NAMES = (tuple(sorted(_CS_BY_NAME))
                      + (_CS_PROVIDERS_GROUP, _CS_GLOBAL))
 _CS_REGIONS = (tuple(sorted({_c[2] for _c in _CS_COUNTRIES}
@@ -14865,7 +14349,6 @@ _CS_PRE_MAP = {
 
 
 def _cs_flag(country):
-    """The flag for a country, DERIVED from its code so none can be missing."""
     if country == _CS_PROVIDERS_GROUP:
         return _CS_PROVIDERS_FLAG
     _row = _CS_BY_NAME.get(country)
@@ -14889,14 +14372,11 @@ def _cs_region(country):
 
 
 def _cs_point(country):
-    """The map point, or None. Both pseudo-groups have none - a marker at 0,0 is
-    worse than no marker, because it lands in the Gulf of Guinea."""
     _row = _CS_BY_NAME.get(country)
     return (_row[3], _row[4]) if _row else None
 
 
 def _cs_group_rank(key):
-    """Order every group: real countries first, then Global providers, then Global."""
     if key == _CS_GLOBAL:
         return 2
     if key == _CS_PROVIDERS_GROUP:
@@ -14919,7 +14399,6 @@ def _cs_sel_path():
 
 
 def _cs_load_map():
-    """This user's taught map, cleaned. Anything unusable is dropped, not kept."""
     _p = _cs_path()
     if not os.path.exists(_p):
         return {}
@@ -14935,7 +14414,6 @@ def _cs_load_map():
         _k = str(_k or "").lower().strip()
         if not _k or not isinstance(_v, str):
             continue
-        # The providers group is a legal teaching target like any country.
         if _v in _CS_BY_NAME or _v in (_CS_GLOBAL, _CS_PROVIDERS_GROUP):
             _out[_k] = _v
     return _out
@@ -14965,13 +14443,6 @@ def _cs_save_sel():
 
 
 def _cs_provider_root(domain):
-    """The REGISTRABLE root of a domain: the last two labels, or the last three
-    when the last two are a known two-part suffix (co.uk, com.br, ...).
-
-    This is what makes the provider test both narrow and complete: every
-    subdomain of a generic provider collapses onto its root and matches, while a
-    country-coded variant keeps a DIFFERENT root and does not.
-    """
     _labels = [p for p in str(domain or "").lower().strip().strip(".").split(".") if p]
     if len(_labels) < 2:
         return ""
@@ -14980,694 +14451,15 @@ def _cs_provider_root(domain):
     return ".".join(_labels[-2:])
 
 
-def _cs_match_country_text(text):
-    """Extract an exact _CS_BY_NAME country from RDAP or search snippet text."""
-    _low = " " + re.sub(r"[^a-z0-9.]+", " ", str(text or "").lower()) + " "
-    for _cue, _ctry in _CS_TEXT_CUES:
-        if f" {_cue} " in _low and _ctry in _CS_BY_NAME:
-            return _ctry
-    for _name in _CS_BY_NAME:
-        if len(_name) >= 5 and f" {_name.lower()} " in _low:
-            return _name
-    return ""
-
-
-def _cs_has_context_near(raw_low, norm_low, cue, domain="", anchor_word=""):
-    """True when `anchor_word` (or `domain` / a location marker) sits within ~140 chars of `cue`."""
-    _pos = 0
-    while True:
-        _idx = raw_low.find(cue, _pos)
-        if _idx == -1:
-            break
-        _win = raw_low[max(0, _idx - 140):min(len(raw_low), _idx + len(cue) + 140)]
-        _wnorm = " " + re.sub(r"[^a-z0-9]+", " ", _win) + " "
-        if anchor_word:
-            if f" {anchor_word} " in _wnorm:
-                return True
-        else:
-            if domain and domain in _win:
-                return True
-            if any(f" {_loc} " in _wnorm for _loc in _CS_LOCATION_CUES):
-                return True
-        _pos = _idx + len(cue)
-    return False
-
-
-def _cs_score_country_text(text, domain="", min_hits=1, require_context=False, anchor_word=""):
-    """Score country mentions in cleaned text. Returns best matching country name or ''."""
-    _raw_low = str(text or "").lower()
-    _low = " " + re.sub(r"[^a-z0-9.]+", " ", _raw_low) + " "
-    _dom = str(domain or "").lower().strip()
-    _anc = str(anchor_word or "").lower().strip()
-    _scores = {}
-
-    for _cue, _ctry in _CS_TEXT_CUES:
-        if _ctry not in _CS_BY_NAME:
-            continue
-        _hits = _low.count(f" {_cue} ")
-        if _hits:
-            _has_ctx = _cs_has_context_near(_raw_low, _low, _cue, _dom, _anc)
-            if require_context and not _has_ctx:
-                continue
-            _bonus = 2 if _has_ctx else 0
-            _scores[_ctry] = _scores.get(_ctry, 0) + _hits + _bonus
-
-    for _name in _CS_BY_NAME:
-        if len(_name) >= 5:
-            _nlow = _name.lower()
-            _hits = _low.count(f" {_nlow} ")
-            if _hits:
-                _has_ctx = _cs_has_context_near(_raw_low, _low, _nlow, _dom, _anc)
-                if require_context and not _has_ctx:
-                    continue
-                _bonus = 2 if _has_ctx else 0
-                _scores[_name] = _scores.get(_name, 0) + _hits + _bonus
-
-    if not _scores:
-        return ""
-    _best_ctry, _best_score = max(
-        _scores.items(), key=lambda _kv: (_kv[1], _kv[0])
-    )
-    if _best_score < max(1, int(min_hits or 1)):
-        return ""
-    return _best_ctry
-
-
-def _cs_extract_vcard_country(obj):
-    """Walk RDAP JSON vcardArray structures for non-empty country fields."""
-    if isinstance(obj, dict):
-        if "country" in obj and isinstance(obj["country"], str):
-            _c = obj["country"].strip().upper()
-            if _c in _CS_BY_CODE:
-                return _CS_BY_CODE[_c]
-            _m = _cs_match_country_text(obj["country"])
-            if _m:
-                return _m
-        for _v in obj.values():
-            _found = _cs_extract_vcard_country(_v)
-            if _found:
-                return _found
-    elif isinstance(obj, list):
-        if (len(obj) >= 4 and obj[0] == "adr" and isinstance(obj[3], list)
-                and len(obj[3]) >= 7):
-            _ctry_cell = str(obj[3][6] or "").strip()
-            if _ctry_cell:
-                if _ctry_cell.upper() in _CS_BY_CODE:
-                    return _CS_BY_CODE[_ctry_cell.upper()]
-                _m = _cs_match_country_text(_ctry_cell)
-                if _m:
-                    return _m
-        for _item in obj:
-            _found = _cs_extract_vcard_country(_item)
-            if _found:
-                return _found
-    return ""
-
-
-def _cs_registrant_country_from_entities(entities):
-    """Extract country ONLY from non-registrar (preferring 'registrant') RDAP entities."""
-    if not isinstance(entities, list):
-        return ""
-    _reg_entities = []
-    _other_entities = []
-    for _ent in entities:
-        if not isinstance(_ent, dict):
-            continue
-        _roles = {str(_r).lower().strip() for _r in (_ent.get("roles") or [])}
-        if "registrar" in _roles or "abuse" in _roles:
-            continue
-        if "registrant" in _roles:
-            _reg_entities.append(_ent)
-        else:
-            _other_entities.append(_ent)
-    for _group in (_reg_entities, _other_entities):
-        for _ent in _group:
-            _vc = _cs_extract_vcard_country(_ent.get("vcardArray"))
-            if _vc in _CS_BY_NAME:
-                return _vc
-            _nested = _cs_registrant_country_from_entities(_ent.get("entities"))
-            if _nested in _CS_BY_NAME:
-                return _nested
-    return ""
-
-
-def _cs_related_rdap_urls(parsed):
-    """Return up to 1 related RDAP JSON URL from domain links."""
-    _out = []
-    if not isinstance(parsed, dict):
-        return _out
-    for _lnk in (parsed.get("links") or []):
-        if not isinstance(_lnk, dict):
-            continue
-        _rel = str(_lnk.get("rel") or "").lower().strip()
-        _href = str(_lnk.get("href") or _lnk.get("value") or "").strip()
-        if _rel == "related" and _href.startswith(("http://", "https://")):
-            if _href not in _out:
-                _out.append(_href)
-    return _out[:1]
-
-
-def _cs_fetch_url(url, headers, timeout=3.0, proxy_str=None):
-    """Fetch URL directly or via an optional HTTP/SOCKS proxy string."""
-    _req = urllib.request.Request(url, headers=headers)
-    if proxy_str:
-        _p = str(proxy_str).strip()
-        if "://" not in _p:
-            _p = "http://" + _p
-        _opener = urllib.request.build_opener(
-            urllib.request.ProxyHandler({"http": _p, "https": _p})
-        )
-        with _opener.open(_req, timeout=timeout) as _resp:
-            return getattr(_resp, "status", 200), _resp.read(131072)
-    with urllib.request.urlopen(_req, timeout=timeout) as _resp:
-        return getattr(_resp, "status", 200), _resp.read(131072)
-
-
-def _cs_rdap_host_sem(host):
-    """Per-RDAP-host semaphore (1 concurrent query per registrar) to avoid 429 bursts."""
-    with _CS_RDAP_HOST_LOCK:
-        _sem = _CS_RDAP_HOST_SEMS.get(host)
-        if _sem is None:
-            _sem = threading.BoundedSemaphore(1)
-            _CS_RDAP_HOST_SEMS[host] = _sem
-        return _sem
-
-
-def _cs_rdap_wait_slot(host):
-    """Enforce per-host spacing/cooldown before issuing an RDAP request."""
-    if host == "rdap.verisign.com":
-        return
-    with _CS_RDAP_HOST_LOCK:
-        _now = time.time()
-        _due = float(_CS_RDAP_HOST_NEXT.get(host, 0.0))
-        _wait = max(0.0, _due - _now)
-        _CS_RDAP_HOST_NEXT[host] = max(_now, _due) + random.uniform(0.45, 0.85)
-    if _wait > 0:
-        time.sleep(min(_wait, 3.5))
-
-
-def _cs_rdap_backoff(host, seconds=2.5):
-    """Push next allowed query time forward when an RDAP host returns HTTP 429."""
-    with _CS_RDAP_HOST_LOCK:
-        _CS_RDAP_HOST_NEXT[host] = max(
-            float(_CS_RDAP_HOST_NEXT.get(host, 0.0)),
-            time.time() + float(seconds),
-        )
-
-
-def _cs_rdap_country(domain):
-    """Query RDAP with minimal hops (initial registry + at most 1 related link)."""
-    _dom = _cs_provider_root(domain) or str(domain or "").lower().strip()
-    if not _dom:
-        return "", "invalid domain"
-    _tld = _dom.rsplit(".", 1)[-1]
-    if _tld in ("com", "net"):
-        _first_url = f"https://rdap.verisign.com/{_tld}/v1/domain/{_dom}"
-    elif _tld == "org":
-        _first_url = f"https://rdap.publicinterestregistry.org/rdap/domain/{_dom}"
-    else:
-        _first_url = f"https://rdap.org/domain/{_dom}"
-
-    _headers = {
-        "User-Agent": "Mozilla/5.0 (compatible; DomainGeoLookup/1.0)",
-        "Accept": "application/rdap+json, application/json",
-    }
-    _urls = [_first_url]
-    _visited = set()
-    _notes = []
-    _idx = 0
-    while _idx < len(_urls) and len(_visited) < 2:
-        _u = _urls[_idx]
-        _idx += 1
-        if _u in _visited:
-            continue
-        _visited.add(_u)
-        _host = _u.split("/")[2] if len(_u.split("/")) > 2 else _u
-        _sem = _cs_rdap_host_sem(_host)
-        try:
-            with _sem:
-                _cs_rdap_wait_slot(_host)
-                _code, _raw_bytes = _cs_fetch_url(_u, _headers, timeout=2.5)
-            _raw = _raw_bytes.decode("utf-8", errors="ignore")
-            try:
-                _parsed = json.loads(_raw)
-            except Exception:
-                _parsed = None
-            if isinstance(_parsed, dict):
-                _vc = _cs_registrant_country_from_entities(_parsed.get("entities"))
-                if _vc in _CS_BY_NAME:
-                    return _vc, f"RDAP({_host}) HTTP {_code} registrant -> {_vc}"
-                if len(_visited) < 2:
-                    for _rel_url in _cs_related_rdap_urls(_parsed)[:1]:
-                        if _rel_url not in _visited:
-                            _urls.append(_rel_url)
-                _redacted = "redacted" in _raw.lower()
-                _notes.append(f"{_host}:HTTP {_code} ({'redacted' if _redacted else 'no registrant country'})")
-            else:
-                _notes.append(f"{_host}:HTTP {_code} (non-JSON)")
-        except urllib.error.HTTPError as _he:
-            if _he.code == 429:
-                _cs_rdap_backoff(_host, 2.5)
-            _notes.append(f"{_host}:HTTP {_he.code}")
-        except Exception as _ex:
-            _notes.append(f"{_host}:{type(_ex).__name__}")
-    return "", "; ".join(_notes)
-
-
-def _cs_site_country(domain):
-    """Best-effort lightweight homepage fetch (2.0s) to catch country/address clues."""
-    _dom = _cs_provider_root(domain) or str(domain or "").lower().strip()
-    if not _dom:
-        return "", "invalid domain"
-    _headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                      "AppleWebKit/537.36 (KHTML, like Gecko) "
-                      "Chrome/124.0.0.0 Safari/537.36",
-        "Accept": "text/html,application/xhtml+xml;q=0.9,*/*;q=0.8",
-    }
-    for _scheme in ("https", "http"):
-        _url = f"{_scheme}://{_dom}/"
-        try:
-            _code, _raw_bytes = _cs_fetch_url(_url, _headers, timeout=2.0)
-            if _code == 200 and _raw_bytes:
-                _html = _raw_bytes[:65536].decode("utf-8", errors="ignore")
-                for _tag in ("script", "style", "nav", "aside"):
-                    _html = re.sub(
-                        rf"<{_tag}[^>]*>.*?</{_tag}>", " ", _html, flags=re.S | re.I
-                    )
-                _clean = re.sub(r"<[^>]+>", " ", _html)
-                _ctry = _cs_score_country_text(_clean, domain=_dom, min_hits=1)
-                if _ctry in _CS_BY_NAME:
-                    return _ctry, f"SITE({_scheme}) HTTP {_code} -> {_ctry}"
-                return "", f"SITE({_scheme}) HTTP {_code} (no country)"
-        except urllib.error.HTTPError as _he:
-            if _scheme == "http":
-                return "", f"SITE HTTP {_he.code}"
-        except Exception as _ex:
-            if _scheme == "http":
-                return "", f"SITE:{type(_ex).__name__}"
-    return "", "SITE:unreachable"
-
-
-def _cs_cc_from_host(host):
-    """Resolve a ccTLD suffix from a hostname (e.g. alditra.co.id -> Indonesia)."""
-    _h = str(host or "").lower().strip().strip(".")
-    if "." not in _h:
-        return ""
-    _parts = _h.split(".")
-    _last = _parts[-1]
-    if _last in ("com", "net", "org", "info", "biz", "io", "co", "me", "app", "dev", "xyz"):
-        return ""
-    if _last in TLD_COUNTRY:
-        return TLD_COUNTRY[_last]
-    if _last.upper() in _CS_BY_CODE:
-        return _CS_BY_CODE[_last.upper()]
-    return ""
-
-
-def _cs_unwrap_search_url(raw_href):
-    """Decode DuckDuckGo //duckduckgo.com/l/?uddg=... or Bing redirect URLs."""
-    _u = _html_mod.unescape(str(raw_href or "").strip())
-    if _u.startswith("//"):
-        _u = "https:" + _u
-    try:
-        _parsed = urllib.parse.urlparse(_u)
-        if "duckduckgo.com" in (_parsed.netloc or "") and _parsed.path.startswith("/l/"):
-            _qs = urllib.parse.parse_qs(_parsed.query)
-            if _qs.get("uddg"):
-                return urllib.parse.unquote(_qs["uddg"][0])
-    except Exception:
-        pass
-    return _u
-
-
-def _cs_host_of_url(url):
-    """Extract normalized hostname (without www.) from a URL or display_url."""
-    _u = str(url or "").strip().lower()
-    if not _u:
-        return ""
-    if "://" not in _u:
-        _u = "https://" + _u.lstrip("/")
-    try:
-        _h = (urllib.parse.urlparse(_u).hostname or "").strip(".")
-    except Exception:
-        _h = ""
-    if _h.startswith("www."):
-        _h = _h[4:]
-    return _h
-
-
-def _cs_card_matches_domain(card_text, card_url, display_url, domain):
-    """Verify a search result card actually belongs to `domain` or its exact brand
-    (rejecting search-engine autocorrect or fuzzy lookalikes like Adtran/Altria
-    for alditra.com, or alwitra.de for alditra).
-    Returns (is_match: bool, sibling_country: str)."""
-    _dom = str(domain or "").lower().strip()
-    _sld = (_dom.split(".", 1)[0]).strip("-")
-    _txt = str(card_text or "").lower()
-    _tlow = f"{_txt} {str(card_url or '').lower()} {str(display_url or '').lower()}"
-    if any(_nc in _txt for _nc in _CS_NOISE_CARD_CUES):
-        return False, ""
-
-    _sibling_ctry = ""
-    _cand_hosts = []
-    for _raw_u in (card_url, display_url):
-        _h = _cs_host_of_url(_raw_u)
-        if _h:
-            _cand_hosts.append(_h)
-    for _h in _cand_hosts:
-        if any(_h == _sc or _h.endswith("." + _sc) for _sc in _CS_SCRAPER_HOSTS):
-            return False, ""
-        if len(_sld) >= 4 and _h.startswith(_sld + "."):
-            _cc = _cs_cc_from_host(_h)
-            if _cc in _CS_BY_NAME:
-                _sibling_ctry = _cc
-
-    # 1) Exact domain match in URL host or text
-    for _h in _cand_hosts:
-        if _h == _dom or _h.endswith("." + _dom):
-            return True, _sibling_ctry
-    _norm_dots = " " + re.sub(r"[^a-z0-9.]+", " ", _tlow) + " "
-    if _dom and f" {_dom} " in _norm_dots:
-        return True, _sibling_ctry
-
-    # 2) Exact sibling ccTLD host (e.g. alditra.co.id for alditra.com)
-    if _sibling_ctry:
-        return True, _sibling_ctry
-
-    # 3) Exact brand token match (never fuzzy/substring) when brand is distinctive
-    if len(_sld) >= 4 and _sld not in _CS_GENERIC_BRAND_WORDS:
-        _norm_words = " " + re.sub(r"[^a-z0-9]+", " ", _tlow) + " "
-        if f" {_sld} " in _norm_words:
-            return True, _sibling_ctry
-
-    return False, ""
-
-
-def _cs_has_autocorrect_banner(html):
-    """Detect search-engine query rewrite / 'Showing results for' banners."""
-    _plain = re.sub(r"<[^>]+>", " ", str(html or ""))
-    _plain = re.sub(r"\s+", " ", _plain).lower()
-    return any(_b in _plain for _b in _CS_AUTOCORRECT_BANNERS)
-
-
-def _cs_extract_ddg_organic_text(html, domain):
-    """Parse DuckDuckGo static HTML (/html/) result cards (.result / .result__body)
-    and keep ONLY cards verified against `domain` or its exact brand."""
-    _raw_html = str(html or "")
-    _rewritten = _cs_has_autocorrect_banner(_raw_html)
-    # Split on DDG result blocks (<div class="result results_links ...">)
-    _chunks = re.split(r'<div\b[^>]*class=["\'][^"\']*\bresult\b[^"\']*["\'][^>]*>', _raw_html, flags=re.I)[1:]
-    _kept = []
-    _sibling_ctry = ""
-    _verified_cards = 0
-    for _chunk in _chunks[:15]:
-        # Skip sponsored ads
-        if "result--ad" in _chunk[:120].lower() or "badge--ad" in _chunk.lower():
-            continue
-        _a_m = re.search(
-            r'<a\b[^>]*class=["\'][^"\']*\bresult__a\b[^"\']*["\'][^>]*href=["\']([^"\']+)["\'][^>]*>(.*?)</a>',
-            _chunk,
-            flags=re.S | re.I,
-        )
-        _href = _cs_unwrap_search_url(_a_m.group(1)) if _a_m else ""
-        _title = re.sub(r"<[^>]+>", " ", _a_m.group(2)) if _a_m else ""
-        _disp_m = re.search(
-            r'class=["\'][^"\']*\bresult__url\b[^"\']*["\'][^>]*>(.*?)</',
-            _chunk,
-            flags=re.S | re.I,
-        )
-        _disp = re.sub(r"<[^>]+>", " ", _disp_m.group(1)) if _disp_m else ""
-        _snip_m = re.search(
-            r'class=["\'][^"\']*\bresult__snippet\b[^"\']*["\'][^>]*>(.*?)</(?:a|div|span)>',
-            _chunk,
-            flags=re.S | re.I,
-        )
-        _snip = re.sub(r"<[^>]+>", " ", _snip_m.group(1)) if _snip_m else ""
-        _card_txt = re.sub(r"\s+", " ", f"{_title} {_disp} {_snip}").strip()
-        if not _card_txt:
-            continue
-        _ok, _sib = _cs_card_matches_domain(_card_txt, _href, _disp, domain)
-        if not _ok:
-            continue
-        _verified_cards += 1
-        if _sib and not _sibling_ctry:
-            _sibling_ctry = _sib
-        _kept.append(_card_txt)
-    return " \n ".join(_kept), _sibling_ctry, _verified_cards, _rewritten
-
-
-def _cs_extract_bing_organic_text(html, domain):
-    """Extract text ONLY from Bing organic result cards (<li class="b_algo">)
-    verified against `domain` or its exact brand (rejecting autocorrect and
-    fuzzy spelling-fallback cards like Adtran/Altria for alditra.com)."""
-    _raw_html = str(html or "")
-    _rewritten = _cs_has_autocorrect_banner(_raw_html)
-    _cards = re.findall(
-        r'<li\b[^>]*class=["\'][^"\']*\bb_algo\b[^"\']*["\'][^>]*>.*?</li>',
-        _raw_html,
-        flags=re.S | re.I,
-    )
-    _kept = []
-    _sibling_ctry = ""
-    _verified_cards = 0
-    for _card in _cards:
-        _href_m = re.search(r'<a\b[^>]*href=["\']([^"\']+)["\']', _card, flags=re.I)
-        _href = _cs_unwrap_search_url(_href_m.group(1)) if _href_m else ""
-        _txt = re.sub(r"<[^>]+>", " ", _card)
-        _txt = re.sub(r"\s+", " ", _txt).strip()
-        if not _txt:
-            continue
-        _ok, _sib = _cs_card_matches_domain(_txt, _href, "", domain)
-        if not _ok:
-            continue
-        _verified_cards += 1
-        if _sib and not _sibling_ctry:
-            _sibling_ctry = _sib
-        _kept.append(_txt)
-    return " \n ".join(_kept), _sibling_ctry, _verified_cards, _rewritten
-
-
-def _cs_ddg_wait_slot():
-    """Light spacing across workers so DuckDuckGo HTML doesn't rate-limit burst calls."""
-    global _CS_DDG_NEXT
-    with _CS_DDG_LOCK:
-        _now = time.time()
-        _wait = max(0.0, _CS_DDG_NEXT - _now)
-        _CS_DDG_NEXT = max(_now, _CS_DDG_NEXT) + random.uniform(0.35, 0.75)
-    if _wait > 0:
-        time.sleep(min(_wait, 2.5))
-
-
-def _cs_ddg_query(query_str, headers, proxy_fn, domain):
-    """Fetch DuckDuckGo static HTML SERP and return
-    (status_code, engine_label, verified_text, sibling_ctry, verified_cards, rewritten)."""
-    _q = urllib.parse.quote_plus(query_str)
-    _url = f"https://html.duckduckgo.com/html/?q={_q}"
-    _ddg_headers = dict(headers)
-    _ddg_headers["Referer"] = "https://html.duckduckgo.com/"
-    _cs_ddg_wait_slot()
-    try:
-        _code, _raw_bytes = _cs_fetch_url(_url, _ddg_headers, timeout=3.5)
-        _eng = "ddg"
-        _html = _raw_bytes.decode("utf-8", errors="ignore")
-        if (_code in (202, 403, 429) or "anomaly-modal" in _html.lower()) and callable(proxy_fn):
-            _px = proxy_fn(domain=domain)
-            if _px:
-                _code, _raw_bytes = _cs_fetch_url(
-                    _url, _ddg_headers, timeout=4.5, proxy_str=_px
-                )
-                _html = _raw_bytes.decode("utf-8", errors="ignore")
-                _eng = "ddg+px"
-        if _code in (202, 403, 429) or "anomaly-modal" in _html.lower():
-            return _code, _eng, "", "", 0, False
-        _clean, _sib, _vcards, _rew = _cs_extract_ddg_organic_text(_html, domain)
-        return _code, _eng, _clean, _sib, _vcards, _rew
-    except urllib.error.HTTPError as _he:
-        if _he.code in (202, 403, 429) and callable(proxy_fn):
-            _px = proxy_fn(domain=domain)
-            if _px:
-                _code, _raw_bytes = _cs_fetch_url(
-                    _url, _ddg_headers, timeout=4.5, proxy_str=_px
-                )
-                _html = _raw_bytes.decode("utf-8", errors="ignore")
-                _clean, _sib, _vcards, _rew = _cs_extract_ddg_organic_text(_html, domain)
-                return _code, "ddg+px", _clean, _sib, _vcards, _rew
-        raise
-
-
-def _cs_bing_query(query_str, headers, proxy_fn, domain):
-    """Fetch Bing SERP and return
-    (status_code, engine_label, verified_text, sibling_ctry, verified_cards, rewritten)."""
-    _q = urllib.parse.quote_plus(query_str)
-    _url = f"https://www.bing.com/search?q={_q}&setlang=en&cc=US"
-    try:
-        _code, _raw_bytes = _cs_fetch_url(_url, headers, timeout=3.0)
-        _eng = "bing"
-        if _code in (403, 429) and callable(proxy_fn):
-            _px = proxy_fn(domain=domain)
-            if _px:
-                _code, _raw_bytes = _cs_fetch_url(
-                    _url, headers, timeout=4.0, proxy_str=_px
-                )
-                _eng = "bing+px"
-        _html = _raw_bytes.decode("utf-8", errors="ignore")
-        _clean, _sib, _vcards, _rew = _cs_extract_bing_organic_text(_html, domain)
-        return _code, _eng, _clean, _sib, _vcards, _rew
-    except urllib.error.HTTPError as _he:
-        if _he.code in (403, 429) and callable(proxy_fn):
-            _px = proxy_fn(domain=domain)
-            if _px:
-                _code, _raw_bytes = _cs_fetch_url(
-                    _url, headers, timeout=4.0, proxy_str=_px
-                )
-                _html = _raw_bytes.decode("utf-8", errors="ignore")
-                _clean, _sib, _vcards, _rew = _cs_extract_bing_organic_text(_html, domain)
-                return _code, "bing+px", _clean, _sib, _vcards, _rew
-        raise
-
-
-def _cs_web_country(domain):
-    """Search DuckDuckGo HTML first (with Bing fallback), verifying every result
-    card against `domain`/brand so autocorrected or fuzzy lookalike SERPs are
-    rejected rather than misclassified."""
-    _dom = _cs_provider_root(domain) or str(domain or "").lower().strip()
-    if not _dom:
-        return "", "invalid domain"
-    _headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                      "AppleWebKit/537.36 (KHTML, like Gecko) "
-                      "Chrome/124.0.0.0 Safari/537.36",
-        "Accept-Language": "en-US,en;q=0.9",
-    }
-    _proxy_fn = globals().get("sample_alive_proxy")
-    _sld = _dom.split(".", 1)[0].strip("-")
-    _anchor = (
-        _sld
-        if (len(_sld) >= 4 and _sld.isalpha() and _sld not in _CS_GENERIC_BRAND_WORDS)
-        else ""
-    )
-    _notes = []
-
-    for _eng_name, _q_fn in (("ddg", _cs_ddg_query), ("bing", _cs_bing_query)):
-        try:
-            _code, _eng, _clean, _sib, _vcards, _rew = _q_fn(
-                f'"{_dom}"', _headers, _proxy_fn, _dom
-            )
-            if _sib in _CS_BY_NAME:
-                return _sib, f"WEB({_eng}) sibling ccTLD -> {_sib}"
-            if _vcards > 0:
-                _ctry = _cs_score_country_text(
-                    _clean,
-                    domain=_dom,
-                    min_hits=2,
-                    require_context=True,
-                    anchor_word=_anchor,
-                )
-                if _ctry in _CS_BY_NAME:
-                    return _ctry, f"WEB({_eng}) HTTP {_code} ({_vcards} verified) -> {_ctry}"
-
-            # Brand-anchored query when exact domain returned 0 verified cards or no location
-            if _anchor:
-                _bcode, _beng, _bclean, _bsib, _bvcards, _brew = _q_fn(
-                    f'"{_sld}" (country OR headquarters OR location OR address OR city)',
-                    _headers,
-                    _proxy_fn,
-                    _dom,
-                )
-                if _bsib in _CS_BY_NAME:
-                    return _bsib, f"WEB({_beng}:brand) sibling ccTLD -> {_bsib}"
-                if _bvcards > 0:
-                    _bctry = _cs_score_country_text(
-                        _bclean,
-                        domain=_dom,
-                        min_hits=2,
-                        require_context=True,
-                        anchor_word=_sld,
-                    )
-                    if _bctry in _CS_BY_NAME:
-                        return _bctry, f"WEB({_beng}:brand) HTTP {_bcode} ({_bvcards} verified) -> {_bctry}"
-                _vcards = max(_vcards, _bvcards)
-                _rew = _rew or _brew
-
-            _tag = "autocorrect/0-verified" if (_rew and _vcards == 0) else f"{_vcards} verified cards"
-            _notes.append(f"WEB({_eng}):HTTP {_code} ({_tag})")
-        except urllib.error.HTTPError as _he:
-            _notes.append(f"WEB({_eng_name}):HTTP {_he.code}")
-        except Exception as _ex:
-            _notes.append(f"WEB({_eng_name}):{type(_ex).__name__}")
-
-    return "", "; ".join(_notes) if _notes else "WEB:no match"
-
-
-def _cs_infra_country(domain):
-    """Check TLS certificate subject country/org or MX host ccTLD when web/site miss."""
-    _dom = _cs_provider_root(domain) or str(domain or "").lower().strip()
-    if not _dom:
-        return "", ""
-    # 1) Check MX hostnames if get_servers / dns_mx helper is available
-    try:
-        _mx_fn = globals().get("_mx_hosts") or globals().get("resolve_mx")
-        if callable(_mx_fn):
-            for _mx in (_mx_fn(_dom) or [])[:3]:
-                _cc = _cs_cc_from_host(_mx)
-                if _cc in _CS_BY_NAME:
-                    return _cc, f"MX({_mx}) -> {_cc}"
-    except Exception:
-        pass
-    # 2) Check TLS certificate Subject countryName (C=) if not a shared CDN cert
-    try:
-        _ctx = ssl.create_default_context()
-        with socket.create_connection((_dom, 443), timeout=2.0) as _sock:
-            with _ctx.wrap_socket(_sock, server_hostname=_dom) as _ssock:
-                _cert = _ssock.getpeercert() or {}
-        _subj = dict(_pair[0] for _pair in (_cert.get("subject") or []) if _pair)
-        _org = str(_subj.get("organizationName") or "").lower()
-        _cc_code = str(_subj.get("countryName") or "").strip().upper()
-        if _cc_code in _CS_BY_CODE and not any(
-            _cdn in _org for _cdn in ("cloudflare", "amazon", "fastly", "akamai", "incapsula", "google")
-        ):
-            _ctry = _CS_BY_CODE[_cc_code]
-            return _ctry, f"TLS(C={_cc_code}) -> {_ctry}"
-    except Exception:
-        pass
-    return "", ""
-
-
-def _cs_label_country(domain):
-    """Conservative domain-label fallback (e.g. *usa.com -> United States) after network checks."""
-    _root = _cs_provider_root(domain) or str(domain or "").lower().strip()
-    if "." not in _root:
-        return ""
-    _sld = _root.split(".", 1)[0].strip("-")
-    if len(_sld) >= 5 and _sld.endswith("usa") and _sld not in _CS_USA_FALSE_FRIENDS:
-        return "United States"
-    return ""
-
-
 def _cs_discover_country(domain):
-    """Try RDAP (max 2 hops), DuckDuckGo + Bing verified cards, site check, TLS/MX, then label heuristic."""
     _ts = datetime.now().strftime("%H:%M:%S")
-    _ctry, _rdap_note = _cs_rdap_country(domain)
+    _ctry, _trace = resolve_global_domain(domain)
     if _ctry in _CS_BY_NAME:
-        return _ctry, f"{_ts} MATCH {domain:<28} -> {_ctry} [{_rdap_note}]"
-    _ctry, _web_note = _cs_web_country(domain)
-    if _ctry in _CS_BY_NAME:
-        return _ctry, f"{_ts} MATCH {domain:<28} -> {_ctry} [{_rdap_note} | {_web_note}]"
-    _ctry, _site_note = _cs_site_country(domain)
-    if _ctry in _CS_BY_NAME:
-        return _ctry, f"{_ts} MATCH {domain:<28} -> {_ctry} [{_rdap_note} | {_web_note} | {_site_note}]"
-    _ctry, _infra_note = _cs_infra_country(domain)
-    if _ctry in _CS_BY_NAME:
-        return _ctry, f"{_ts} MATCH {domain:<28} -> {_ctry} [{_rdap_note} | {_web_note} | {_site_note} | {_infra_note}]"
-    _lbl_ctry = _cs_label_country(domain)
-    if _lbl_ctry in _CS_BY_NAME:
-        return _lbl_ctry, f"{_ts} MATCH {domain:<28} -> {_lbl_ctry} [{_rdap_note} | {_web_note} | {_site_note} | LABEL(*usa)]"
-    return "", f"{_ts} MISS  {domain:<28} -> Global [{_rdap_note} | {_web_note} | {_site_note}]"
+        return _ctry, f"{_ts} MATCH {domain:<28} -> {_ctry} [{_trace}]"
+    return "", f"{_ts} MISS  {domain:<28} -> Global [{_trace}]"
 
 
 def _cs_discover_batch(domains, progress_cb=None, workers=_CS_LOOKUP_WORKERS):
-    """Run `_cs_discover_country` across `domains` concurrently while preserving order."""
     _items = list(domains or [])
     _total = len(_items)
     if _total == 0:
@@ -15706,7 +14498,6 @@ def _cs_discover_batch(domains, progress_cb=None, workers=_CS_LOOKUP_WORKERS):
 
 
 def _cs_country_of(domain, mapping):
-    """taught map, then a provider root, then regional/ISP map, then hints, then TLD, then Global."""
     _d = str(domain or "").lower().strip()
     if not _d:
         return _CS_GLOBAL
@@ -15746,11 +14537,6 @@ def _cs_source_lines(source):
 
 
 def _cs_source_count(source):
-    """How many lines a source holds, WITHOUT copying it.
-
-    Used only for the count on each option, so it must stay cheap - a 3000-line
-    bucket is len()'d in place rather than copied once per rerun.
-    """
     _fn = _CS_PRE_MAP.get(source)
     if _fn is not None:
         try:
@@ -15767,12 +14553,6 @@ def _cs_source_count(source):
 
 
 def _cs_rows(source, mapping, ver):
-    """(line, domain, country, region) for every combo in `source`.
-
-    Cached on (source, line count, map version, owner): a 100,000-line Ready
-    list would otherwise be re-parsed on every rerun, and every slider tick is a
-    rerun.
-    """
     _lines = _cs_source_lines(source)
     _key = (source, len(_lines), int(ver), _input_owner)
     _cache = str_lit.session_state.get("_cs_rows_cache") or {}
@@ -15824,11 +14604,6 @@ def _cs_build_label(keys, mode):
 
 
 def _cs_label():
-    """The ONE section label, or "" when nothing has been sent.
-
-    Rebuilt from the keys every run, so a bucket a new run emptied cannot leave
-    a dead label sitting in either dropdown.
-    """
     try:
         if not str_lit.session_state.get("cs_sent"):
             return ""
@@ -15842,7 +14617,6 @@ def _cs_label():
 
 
 def _cs_selection_lines():
-    """The sent section as display lines: a header per group, then its combos."""
     _lbl = _cs_label()
     if not _lbl:
         return []
@@ -15862,7 +14636,6 @@ def _cs_selection_lines():
 
 
 def _cs_selection_combos():
-    """The same section, combos only - what the engine actually runs."""
     return [_combo_only(_l) for _l in _cs_selection_lines() if ":" in _l]
 
 
@@ -15883,7 +14656,6 @@ def _cs_on_pick_change():
     str_lit.session_state["cs_sent"] = False
 
 
-# ---- owner gate, one-time load, and the map in the session -------------------
 _cs_owner = _cache_owner()
 if str_lit.session_state.get(_CS_OWNER_KEY) != _cs_owner:
     for _k in ("cs_mode", "cs_source", "cs_keys", "cs_sent", "cs_map", "cs_map_ver",
@@ -16051,7 +14823,7 @@ else:
             f"🔍 Search {_CS_GLOBAL_FLAG} Global ({len(_global_unmapped)})",
             width="stretch",
             help=f"Looks up up to {_CS_LOOKUP_CAP} unique unresolved Global domains "
-                 f"via RDAP, DuckDuckGo + Bing verified results, site check, and TLS/MX "
+                 f"via TLS SANs, browser-impersonated site probe, and paced DDG HTML "
                  f"across {_CS_LOOKUP_WORKERS} workers, then saves any discovered countries.",
         ):
             if not _global_unmapped:
@@ -16109,7 +14881,7 @@ else:
             _tl1, _tl2 = str_lit.columns([0.75, 0.25])
             with _tl1:
                 str_lit.caption(
-                    "Shows RDAP, DuckDuckGo/Bing verified search, site check, and TLS/MX "
+                    "Shows TLS SAN, browser-impersonated site check, and paced DDG HTML "
                     "status for every domain queried by Search 🌐 Global."
                 )
             with _tl2:
@@ -16124,7 +14896,6 @@ else:
                         f"**{len(_cs_selection_combos())}** account(s). It is listed "
                         f"in the Inspector below and in the Engine Action Mode.")
 
-# ---- teach one domain -------------------------------------------------------
 with str_lit.expander("🏷 Teach a domain its country", expanded=False):
     str_lit.caption("The domain is matched exactly, lower-cased, and only for THIS "
                     "user. A taught domain always wins over the provider set, "
@@ -16176,7 +14947,6 @@ with str_lit.expander("🏷 Teach a domain its country", expanded=False):
                     "warning", f"**{_dom or '(no domain)'}** had no teaching.")
             str_lit.rerun()
 
-# ---- the map ---------------------------------------------------------------
 _cs_map_on = str_lit.checkbox(
     f"🗺 Show and edit the country map ({len(_cs_groups_now)} group(s) · "
     f"{_cs_total} line(s))", key="cs_map_open")
@@ -16193,11 +14963,6 @@ if _cs_map_on:
                             "color": "#8b5cf6", "country": _ctry,
                             "lines": _n})
     if _cs_markers:
-        # FIX CS-MAP-1: st.map() has no help= keyword - passing one raised
-        # TypeError: MapMixin.map() got an unexpected keyword argument 'help' and
-        # took the whole panel down the instant it was ticked. The text is a
-        # caption now, and the call itself is guarded so a map failure degrades to
-        # the table below instead of a red page.
         str_lit.caption("One marker per country that has credentials in this source. "
                         "Marker size is the line count. The table below carries the "
                         "same figures, and the two groups with no point on a map - "
@@ -16233,10 +14998,6 @@ if _cs_map_on:
     str_lit.markdown("##### ✏️ Edit the map")
     _cs_domains = sorted({_r[1] for _r in _cs_all_rows})
     if _cs_domains:
-        # FIX CS-MAP-2: A KEYED SELECTBOX RAISES IF ITS VALUE IS NOT AN OPTION.
-        # cs_edit_dom could hold a domain the current source no longer contains
-        # (switch source, or a run empties the bucket) and the panel died at
-        # creation. The key is made legal BEFORE the widget exists.
         if str_lit.session_state.get("cs_edit_dom") not in _cs_domains:
             str_lit.session_state["cs_edit_dom"] = _cs_domains[0]
         _cs_edit_dom = str_lit.selectbox(
@@ -16247,12 +15008,6 @@ if _cs_map_on:
         _cs_edit_cur = _cs_country_of(_cs_edit_dom, _cs_map)
         str_lit.caption(f"That domain currently resolves to "
                         f"**{_cs_flag(_cs_edit_cur)} {_cs_edit_cur}**.")
-        # FIX CS-MAP-3: the "Move it to" box used index= computed from the picked
-        # domain, and a keyed selectbox that ALSO gets a default keeps the value
-        # already in the key - so once it held one country it stopped following
-        # the domain and "Move it" wrote the wrong country. The key is seeded from
-        # the domain (and re-seeded whenever the domain changes or the stored
-        # value is not a real country), and the widget is created with key= only.
         if (str_lit.session_state.get("_cs_edit_for") != _cs_edit_dom
                 or str_lit.session_state.get("cs_edit_ctry") not in _CS_COUNTRY_NAMES):
             str_lit.session_state["cs_edit_ctry"] = _cs_edit_cur
@@ -16288,71 +15043,22 @@ if _cs_map_on:
         str_lit.caption("Nothing taught yet - every country above came from the "
                         "built-in provider set, regional/ISP map, hints and TLDs.")
 
-# --------------------------------------------------------------------------
-# INSPECTOR - v13.63, re-cut v13.76, v13.77
-#
-#   * it lived inside `if raw_text:`, so with an empty paste box the result
-#     buckets could not be inspected at all. It is module level now.
-#   * the list was an uncapped st.code, so 3445 rows pushed the selectbox off
-#     the top of the screen. It is a fixed-height scroller (420px) now.
-#   * the choice was session-only. It is a per-user file, validated against the
-#     CURRENT option list so a retired value can never raise.
-#
-# v13.76 FIX INSPECT-1: THE PANEL KEPT SHUTTING. It was an expander, and an
-# expander collapses on every rerun - a tick anywhere, a download, a slider, the
-# refresh of the panel above, and it was gone; the category then had to be
-# re-opened and re-picked before the next look. The opener is a keyed CHECKBOX
-# now, which is a widget with its own state: it stays ticked until it is
-# unticked, and nothing but unticking it can close the panel. The CATEGORY
-# inside it is still a plain selectbox - that part was never the problem.
-#
-# v13.76 FIX COMBO-2: THE PANEL PRINTED THE WHOLE LINE. The list showed
-# "email:pass | direct | 35.185.209.55 | Oregon | United States | VPN OFF (auto)
-# IMAP | Host: ... | Port: 993", so the password sat in the middle of a
-# sentence. Display and download are _combo_only() now.
-#
-# v13.77 FIX INSPECT-2: the callback existed nowhere - see the note above
-# _on_inspect_change(). FIX INSPECT-3: the per-rerun work moved inside the
-# checkbox. list_unfinished_runs() is a glob plus a json.load() per record, and
-# the category_map copied all twelve buckets, and BOTH ran on every rerun of
-# every load whether the panel was open or not - twelve list copies of up to
-# 3000 entries apiece for a panel nobody had opened. FIX INSPECT-4: the
-# `if not filter_category_choice:` branch was dead - a selectbox always returns
-# one of its options - so it is gone.
-#
-# v13.86 FIX CS-1: the sent Credentials Sorter section is a category here like
-# any other, but it is NOT a flat list - it is a header line per group followed
-# by that group's combos, which is exactly the shape asked for. A header has no
-# colon, so _combo_only() passes it through untouched and the same list feeds
-# the download.
-#
-# v13.86 FIX CS-3: THE CATEGORY COUNTS. The selectbox carries every category with
-# its item count in the dropdown, and the count of the CURRENT pick in its own
-# label, so the size of a category is visible before it is opened. That means the
-# map is built ABOVE the widget now, which is legal inside the checkbox.
-# --------------------------------------------------------------------------
 inspect_options = list(PREFILTER_LABELS) + [label for label, _ in BUCKETS]
 if _cs_label():
     inspect_options.append(_cs_label())
+if not inspect_options:
+    inspect_options = ["Ready to Check"]
 
 if "bb_inspect_cat" not in str_lit.session_state:
-    str_lit.session_state["bb_inspect_cat"] = _read_text_file(_INSPECT_FILE, 200).strip()
-# A keyed selectbox raises if its value is not one of its options, and the file
-# can hold a label a later version no longer ships. The checkbox row allowed ""
-# as a resting value; a selectbox does not, so the resting value is the first
-# category instead.
+    str_lit.session_state["bb_inspect_cat"] = _read_text_file(_inspect_file(), 200).strip()
 if str_lit.session_state.get("bb_inspect_cat") not in inspect_options:
     str_lit.session_state["bb_inspect_cat"] = inspect_options[0]
-
 
 section_title("🔍", "Filter & Result Categories Inspector",
               "pick ONE category - the list scrolls in place")
 
 if str_lit.checkbox("🔍 Inspect the contents of one category",
                     key="bb_inspect_open"):
-    # FIX RS-3: the preview used to append a metadata line per run into the SAME
-    # list as the account lines, so "Showing N items" counted headers too. The
-    # metadata is a caption now and the list holds account lines only.
     unfinished_runs = list_unfinished_runs()
     unfinished_preview = []
     for run in unfinished_runs:
@@ -16371,12 +15077,9 @@ if str_lit.checkbox("🔍 Inspect the contents of one category",
     }
     for _b_lbl, _b_key in BUCKETS:
         category_map[_b_lbl] = list(str_lit.session_state.get(_b_key, []))
-    # FIX CS-1: the sent sorter section, headers included.
     _cs_lbl_now = _cs_label()
     if _cs_lbl_now:
         category_map[_cs_lbl_now] = _cs_selection_lines()
-    # FIX CS-3: the count of every category, taken once, for the dropdown and the
-    # label. len() only - nothing is copied again here.
     _insp_counts = {_l: len(_v or []) for _l, _v in category_map.items()}
     _insp_cur_n = _insp_counts.get(str_lit.session_state.get("bb_inspect_cat"), 0)
 
@@ -16396,7 +15099,6 @@ if str_lit.checkbox("🔍 Inspect the contents of one category",
     if not selected_list_items:
         str_lit.info(f"No items in **{filter_category_choice}**.")
     else:
-        # FIX COMBO-2: combo only, on screen AND in the download.
         _clean_items = [_combo_only(i) for i in selected_list_items]
         _cs_combo_n = sum(1 for _i in _clean_items if ":" in _i)
         _ih1, _ih2 = str_lit.columns([0.6, 0.4])
