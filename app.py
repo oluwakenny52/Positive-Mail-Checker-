@@ -12778,6 +12778,23 @@ _GR_DDG_202_STREAK = 0
 _GR_DDG_COOLDOWN_UNTIL = 0.0
 _GR_DDG_COOLDOWN_SECS = 60.0
 
+_GR_PROXY_LOCK = threading.Lock()
+_GR_IP_FAIL_COUNTS = {}
+_GR_SKIPPED_IPS = {}
+_GR_STICKY_PROXY = None
+_GR_ACTIVE_RUN_ID = None
+
+_GR_DEFAULT_SETTINGS = {
+    "proxy_tries": 5,
+    "max_ip_fails": 2,
+    "proxy_sources": "all",
+    "reuse_skipped": "on",
+    "reuse_wait_value": 30.0,
+    "reuse_wait_unit": "sec",
+    "default_scheme": "http",
+    "direct_fallback": True,
+}
+
 _GR_CCTLD_TO_COUNTRY = {
     ".co.id": "Indonesia", ".id": "Indonesia",
     ".co.jp": "Japan", ".jp": "Japan",
@@ -12820,6 +12837,43 @@ _GR_TEXT_SIGNALS = [
 ]
 
 
+def _gr_get_settings() -> dict:
+    cfg = dict(_GR_DEFAULT_SETTINGS)
+    try:
+        ss = getattr(globals().get("str_lit"), "session_state", None)
+        if ss is not None:
+            saved = ss.get("cs_gr_settings")
+            if isinstance(saved, dict):
+                cfg.update(saved)
+    except Exception:
+        pass
+    cfg["proxy_tries"] = max(1, min(25, int(cfg.get("proxy_tries") or 5)))
+    cfg["max_ip_fails"] = max(1, min(15, int(cfg.get("max_ip_fails") or 2)))
+    cfg["proxy_sources"] = str(cfg.get("proxy_sources") or "all").strip().lower()
+    cfg["reuse_skipped"] = "on" if str(cfg.get("reuse_skipped") or "on").strip().lower() == "on" else "off"
+    cfg["reuse_wait_unit"] = "min" if str(cfg.get("reuse_wait_unit") or "sec").strip().lower() == "min" else "sec"
+    try:
+        cfg["reuse_wait_value"] = max(0.0, float(cfg.get("reuse_wait_value", 30.0)))
+    except Exception:
+        cfg["reuse_wait_value"] = 30.0
+    cfg["reuse_wait_seconds"] = (
+        cfg["reuse_wait_value"] * 60.0 if cfg["reuse_wait_unit"] == "min" else cfg["reuse_wait_value"]
+    )
+    cfg["default_scheme"] = "socks5" if str(cfg.get("default_scheme") or "http").strip().lower() == "socks5" else "http"
+    cfg["direct_fallback"] = bool(cfg.get("direct_fallback", True))
+    return cfg
+
+
+def gr_begin_run(run_id: Optional[str] = None) -> None:
+    """Resets per-run proxy failure counts and skip list at the start of a Global search batch."""
+    global _GR_IP_FAIL_COUNTS, _GR_SKIPPED_IPS, _GR_STICKY_PROXY, _GR_ACTIVE_RUN_ID
+    with _GR_PROXY_LOCK:
+        _GR_IP_FAIL_COUNTS = {}
+        _GR_SKIPPED_IPS = {}
+        _GR_STICKY_PROXY = None
+        _GR_ACTIVE_RUN_ID = run_id or f"run_{time.monotonic():.3f}"
+
+
 def _gr_cache_path() -> Path:
     try:
         return Path(user_file("global_country_cache.json"))
@@ -12847,6 +12901,22 @@ def _gr_save_cache(cache: dict) -> None:
             _atomic_write_text(str(p), json.dumps(cache or {}, indent=2, sort_keys=True))
     except Exception:
         pass
+
+
+def _gr_sync_cache_entry(domain: str, country: Optional[str]) -> None:
+    clean_dom = str(domain or "").strip().lower().lstrip("@")
+    if clean_dom.startswith("www."):
+        clean_dom = clean_dom[4:]
+    if not clean_dom:
+        return
+    cache = _gr_load_cache()
+    if country and country in _CS_BY_NAME:
+        if cache.get(clean_dom) != country:
+            cache[clean_dom] = country
+            _gr_save_cache(cache)
+    elif clean_dom in cache:
+        cache.pop(clean_dom, None)
+        _gr_save_cache(cache)
 
 
 def _gr_extract_country_from_text(text: str) -> Optional[str]:
@@ -12879,41 +12949,205 @@ def _gr_check_tls_sans(domain: str, timeout: float = 4.0) -> Tuple[Optional[str]
         return None, f"TLS_ERR:{type(exc).__name__}"
 
 
-def _gr_resolve_proxy_url(domain: str = "") -> Optional[str]:
-    """Returns a proxy URL from sample_alive_proxy() if available and enabled."""
-    try:
-        if not globals().get("use_proxy"):
-            return None
-        sampler = globals().get("sample_alive_proxy")
-        if not callable(sampler):
-            return None
-        px = sampler(domain=domain) if domain else sampler()
-        if not px:
-            return None
-        if isinstance(px, str):
-            return px.strip() or None
-        url_fn = globals().get("px_url")
-        if callable(url_fn):
-            u = url_fn(px)
-            if u:
-                return str(u).strip()
-        if isinstance(px, dict):
-            for key in ("url", "proxy_url", "proxy", "http", "https"):
-                if px.get(key):
-                    return str(px[key]).strip()
-    except Exception:
-        pass
-    return None
+def _gr_infer_scheme(raw: str, default_scheme: str = "http") -> str:
+    low = str(raw or "").strip().lower()
+    if low.startswith(("socks5h://", "socks5://", "socks4://")):
+        return "socks5"
+    if low.startswith("https://"):
+        return "https"
+    if low.startswith("http://"):
+        return "http"
+    if re.search(r"\b(socks5|socks)\b", low):
+        return "socks5"
+    if re.search(r"\b(http|https)\b", low):
+        return "http"
+    return "socks5" if str(default_scheme).lower() in {"socks5", "socks5h", "socks"} else "http"
 
 
-def _gr_http_request(
+def _gr_normalize_proxy_url(raw_url: Optional[str], default_scheme: str = "http") -> Optional[str]:
+    u = str(raw_url or "").strip()
+    if not u:
+        return None
+    scheme = _gr_infer_scheme(u, default_scheme=default_scheme)
+    body = u
+    if "://" in u:
+        _, rest = u.split("://", 1)
+        body = rest.strip()
+    if not body:
+        return None
+    req_scheme = "socks5h" if scheme == "socks5" else scheme
+    return f"{req_scheme}://{body}"
+
+
+def _gr_mask_proxy_url(proxy_url: Optional[str]) -> str:
+    u = str(proxy_url or "").strip()
+    if not u:
+        return ""
+    return re.sub(r"^([a-zA-Z0-9+.-]+://)?[^/@]+@", r"\1***@", u)
+
+
+def _gr_matches_proxy_source(raw_entry: str, source_filter: str) -> bool:
+    src = (source_filter or "all").strip().lower()
+    if src in {"", "all"}:
+        return True
+    s = str(raw_entry or "").lower()
+    is_oxy = "oxylabs.io" in s
+    is_p001 = "proxy001.com" in s or "proxy001" in s
+    is_ws = "webshare" in s
+    is_custom = not (is_oxy or is_p001 or is_ws)
+    if src == "oxylabs only":
+        return is_oxy
+    if src == "proxy001 only":
+        return is_p001
+    if src == "webshare only":
+        return is_ws
+    if src == "custom only":
+        return is_custom
+    if src == "webshare + custom":
+        return is_ws or is_custom
+    if src == "oxylabs + custom":
+        return is_oxy or is_custom
+    return True
+
+
+def _gr_collect_proxy_candidates(domain: str = "", source_filter: str = "all", default_scheme: str = "http") -> list:
+    candidates = []
+    seen = set()
+
+    def _add(val):
+        if not val:
+            return
+        if isinstance(val, str):
+            raw_str = val.strip()
+        else:
+            url_fn = globals().get("px_url")
+            raw_str = ""
+            if callable(url_fn):
+                try:
+                    raw_str = str(url_fn(val) or "").strip()
+                except Exception:
+                    raw_str = ""
+            if not raw_str and isinstance(val, dict):
+                for k in ("url", "proxy_url", "proxy", "http", "https"):
+                    if val.get(k):
+                        raw_str = str(val[k]).strip()
+                        break
+        if not raw_str or not _gr_matches_proxy_source(raw_str, source_filter):
+            return
+        norm = _gr_normalize_proxy_url(raw_str, default_scheme=default_scheme)
+        if norm and norm not in seen:
+            seen.add(norm)
+            candidates.append(norm)
+
+    sampler = globals().get("sample_alive_proxy")
+    if callable(sampler):
+        for _ in range(8):
+            try:
+                px = sampler(domain=domain) if domain else sampler()
+            except TypeError:
+                try:
+                    px = sampler()
+                except Exception:
+                    px = None
+            except Exception:
+                px = None
+            _add(px)
+
+    for pool_name in ("live", "alive_proxies", "proxy_pool", "proxies"):
+        pool_obj = globals().get(pool_name)
+        if isinstance(pool_obj, (list, tuple, set)):
+            for item in list(pool_obj)[:30]:
+                _add(item)
+
+    return candidates
+
+
+def _gr_pick_proxy_for_attempt(
+    domain: str,
+    tried: set,
+    cfg: dict,
+) -> Tuple[Optional[str], bool, str]:
+    """
+    Selects next proxy using sticky preference -> non-skipped eligible -> timed reuse (♻️).
+    Returns: (proxy_url_or_None, reused_from_skip, note)
+    """
+    if not globals().get("use_proxy"):
+        return None, False, "proxy disabled"
+
+    candidates = _gr_collect_proxy_candidates(
+        domain=domain,
+        source_filter=cfg["proxy_sources"],
+        default_scheme=cfg["default_scheme"],
+    )
+    if not candidates:
+        return None, False, f"no candidates for source='{cfg['proxy_sources']}'"
+
+    now = time.monotonic()
+    wait_secs = cfg["reuse_wait_seconds"]
+    reuse_on = cfg["reuse_skipped"] == "on"
+
+    with _GR_PROXY_LOCK:
+        active = [c for c in candidates if c not in tried]
+        if not active:
+            active = list(candidates)
+
+        eligible = []
+        cooldown_ready = []
+        for c in active:
+            skip_ts = _GR_SKIPPED_IPS.get(c)
+            if skip_ts is None:
+                eligible.append(c)
+            elif reuse_on and (now - skip_ts) >= wait_secs:
+                cooldown_ready.append(c)
+
+        if _GR_STICKY_PROXY and _GR_STICKY_PROXY in eligible:
+            return _GR_STICKY_PROXY, False, "sticky"
+        if eligible:
+            return random.choice(eligible), False, f"pool({len(eligible)} alive)"
+        if cooldown_ready:
+            chosen = random.choice(cooldown_ready)
+            _GR_SKIPPED_IPS.pop(chosen, None)
+            _GR_IP_FAIL_COUNTS[chosen] = 0
+            return chosen, True, f"♻️reused after {cfg['reuse_wait_value']:g}{cfg['reuse_wait_unit']}"
+
+        return None, False, f"all {len(candidates)} candidate(s) skipped"
+
+
+def _gr_record_proxy_outcome(proxy_url: Optional[str], succeeded: bool, cfg: dict) -> str:
+    global _GR_STICKY_PROXY
+    if not proxy_url:
+        return ""
+    max_fails = cfg["max_ip_fails"]
+    with _GR_PROXY_LOCK:
+        if succeeded:
+            _GR_IP_FAIL_COUNTS[proxy_url] = 0
+            _GR_SKIPPED_IPS.pop(proxy_url, None)
+            _GR_STICKY_PROXY = proxy_url
+            return "ok(sticky)"
+
+        fails = _GR_IP_FAIL_COUNTS.get(proxy_url, 0) + 1
+        _GR_IP_FAIL_COUNTS[proxy_url] = fails
+        if _GR_STICKY_PROXY == proxy_url:
+            _GR_STICKY_PROXY = None
+        if fails >= max_fails:
+            _GR_SKIPPED_IPS[proxy_url] = time.monotonic()
+            reuse_note = (
+                f"reuse in {cfg['reuse_wait_value']:g}{cfg['reuse_wait_unit']}"
+                if cfg["reuse_skipped"] == "on"
+                else "no-reuse"
+            )
+            return f"skip({fails}/{max_fails}, {reuse_note})"
+        return f"fail({fails}/{max_fails})"
+
+
+def _gr_single_http_call(
     method: str,
     url: str,
     params: dict = None,
     data: dict = None,
     extra_headers: dict = None,
     timeout: float = 8.0,
-    domain: str = "",
+    proxy_url: Optional[str] = None,
 ):
     verb = str(method or "GET").upper()
     headers = {
@@ -12923,8 +13157,6 @@ def _gr_http_request(
     }
     if extra_headers:
         headers.update(extra_headers)
-
-    proxy_url = _gr_resolve_proxy_url(domain=domain)
 
     if _HAS_CFFI and _cffi_requests is not None:
         kwargs = {
@@ -12960,6 +13192,68 @@ def _gr_http_request(
         )
         return opener.open(req, timeout=timeout)
     return urllib.request.urlopen(req, timeout=timeout)
+
+
+def _gr_http_request(
+    method: str,
+    url: str,
+    params: dict = None,
+    data: dict = None,
+    extra_headers: dict = None,
+    timeout: float = 8.0,
+    domain: str = "",
+):
+    """
+    Executes an HTTP request using up to `proxy_tries` proxy attempts with fail-counting,
+    temporary skipping, timed reuse, and optional direct fallback.
+    """
+    cfg = _gr_get_settings()
+    use_px = bool(globals().get("use_proxy"))
+    last_exc = None
+
+    if use_px:
+        tried = set()
+        max_tries = cfg["proxy_tries"]
+        for _ in range(max_tries):
+            px_url, reused, _ = _gr_pick_proxy_for_attempt(domain=domain, tried=tried, cfg=cfg)
+            if not px_url:
+                break
+            tried.add(px_url)
+            try:
+                resp = _gr_single_http_call(
+                    method=method,
+                    url=url,
+                    params=params,
+                    data=data,
+                    extra_headers=extra_headers,
+                    timeout=timeout,
+                    proxy_url=px_url,
+                )
+                code, _ = _gr_extract_resp_code_and_body(resp, max_bytes=1024)
+                if code in (401, 403, 407, 429) or code >= 500:
+                    _gr_record_proxy_outcome(px_url, succeeded=False, cfg=cfg)
+                    last_exc = RuntimeError(f"HTTP_{code}_via_{_gr_mask_proxy_url(px_url)}")
+                    continue
+                _gr_record_proxy_outcome(px_url, succeeded=True, cfg=cfg)
+                return resp
+            except Exception as exc:
+                last_exc = exc
+                _gr_record_proxy_outcome(px_url, succeeded=False, cfg=cfg)
+
+        if not cfg["direct_fallback"]:
+            if last_exc is not None:
+                raise last_exc
+            raise RuntimeError("All proxy attempts exhausted and direct fallback is disabled")
+
+    return _gr_single_http_call(
+        method=method,
+        url=url,
+        params=params,
+        data=data,
+        extra_headers=extra_headers,
+        timeout=timeout,
+        proxy_url=None,
+    )
 
 
 def _gr_http_get(
@@ -13119,7 +13413,7 @@ def _gr_search_ddg_lite(query: str, domain: str = "") -> Tuple[Optional[str], st
 
 
 def _gr_search_ddg_html(query: str, domain: str = "") -> Tuple[Optional[str], str]:
-    """Uses POST + Referer on html.duckduckgo.com/html/ with fallback to lite.duckduckgo.com/lite/."""
+    """Uses POST + Referer on html.duckduckgo.com/html/ with optional lite fallback on 200-miss."""
     ok, skip_note = _gr_pace_ddg_locked()
     if not ok:
         return None, f"WEB(ddg_html):{skip_note}"
@@ -13146,11 +13440,9 @@ def _gr_search_ddg_html(query: str, domain: str = "") -> Tuple[Optional[str], st
         status_code, raw_body = _gr_extract_resp_code_and_body(resp, max_bytes=262144)
         streak_note = _gr_record_ddg_status(status_code)
         if streak_note:
-            lite_c, lite_n = _gr_search_ddg_lite(query, domain=domain)
-            return lite_c, f"WEB(ddg_html):{streak_note} -> {lite_n}"
+            return None, f"WEB(ddg_html):{streak_note} (skipped ddg_lite)"
         if status_code != 200:
-            lite_c, lite_n = _gr_search_ddg_lite(query, domain=domain)
-            return lite_c, f"WEB(ddg_html):HTTP {status_code} -> {lite_n}"
+            return None, f"WEB(ddg_html):HTTP {status_code} (skipped ddg_lite)"
 
         snippets = _gr_parse_ddg_snippets(raw_body, limit=5)
         combined = " | ".join(snippets)
@@ -13168,8 +13460,7 @@ def _gr_search_ddg_html(query: str, domain: str = "") -> Tuple[Optional[str], st
     except Exception as exc:
         with _GR_DDG_LOCK:
             _GR_LAST_DDG_CALL = time.time()
-        lite_c, lite_n = _gr_search_ddg_lite(query, domain=domain)
-        return lite_c, f"WEB(ddg_html):ERR {type(exc).__name__} -> {lite_n}"
+        return None, f"WEB(ddg_html):ERR {type(exc).__name__} (skipped ddg_lite)"
 
 
 def _gr_search_bing_html(query: str, domain: str = "") -> Tuple[Optional[str], str]:
@@ -13288,6 +13579,7 @@ def resolve_global_domain(
     if clean_domain.startswith("www."):
         clean_domain = clean_domain[4:]
     traces = []
+    cfg = _gr_get_settings()
 
     cache = _gr_load_cache()
     if not force_refresh and clean_domain in cache:
@@ -13302,12 +13594,17 @@ def resolve_global_domain(
         return rdap_country, f"HIT  {clean_domain:<28} -> {rdap_country} [RDAP]"
     traces.append("RDAP:no country")
 
-    proxy_url = _gr_resolve_proxy_url(domain=clean_domain)
-    if proxy_url:
-        _px_masked = re.sub(r"://[^@]+@", "://***@", proxy_url)
-        traces.append(f"PROXY:{_px_masked}")
+    chosen_px, reused_px, pick_note = _gr_pick_proxy_for_attempt(domain=clean_domain, tried=set(), cfg=cfg)
+    if chosen_px:
+        prefix_tag = "♻️" if reused_px else ""
+        traces.append(
+            f"PROXY:{prefix_tag}{_gr_mask_proxy_url(chosen_px)} "
+            f"(tries={cfg['proxy_tries']}, max_fails={cfg['max_ip_fails']}, "
+            f"src={cfg['proxy_sources']}, scheme={cfg['default_scheme']}, {pick_note})"
+        )
     else:
-        traces.append(f"DIRECT(use_proxy={bool(globals().get('use_proxy'))})")
+        fb_tag = "direct_fb=on" if cfg["direct_fallback"] else "direct_fb=off"
+        traces.append(f"DIRECT(use_proxy={bool(globals().get('use_proxy'))}, {fb_tag}, {pick_note})")
 
     country, tls_note = _gr_check_tls_sans(clean_domain)
     traces.append(tls_note)
@@ -14987,7 +15284,7 @@ if str_lit.session_state.get(_CS_OWNER_KEY) != _cs_owner:
     for _k in ("cs_mode", "cs_source", "cs_keys", "cs_sent", "cs_map", "cs_map_ver",
                "cs_teach_dom", "cs_teach_ctry", "cs_map_open", "cs_edit_dom",
                "cs_edit_ctry", "_cs_edit_for", "_cs_sel_loaded", "_cs_rows_cache",
-               "_cs_flash", "cs_hide_empty", "cs_lookup_trace"):
+               "_cs_flash", "cs_hide_empty", "cs_lookup_trace", "cs_gr_settings"):
         str_lit.session_state.pop(_k, None)
     str_lit.session_state[_CS_OWNER_KEY] = _cs_owner
 if "cs_map" not in str_lit.session_state:
@@ -15092,6 +15389,79 @@ else:
         help="Several are allowed. The number beside each group is how many "
              "accounts it holds. The sent section names them as one line, e.g. "
              "US, CA, DE and Global, and runs exactly those accounts.")
+
+    with str_lit.expander("⚙️ Global Resolver Proxy & Retry Settings", expanded=False):
+        _cur_gr = dict(_GR_DEFAULT_SETTINGS)
+        if isinstance(str_lit.session_state.get("cs_gr_settings"), dict):
+            _cur_gr.update(str_lit.session_state["cs_gr_settings"])
+
+        _gr_c1, _gr_c2, _gr_c3 = str_lit.columns(3)
+        with _gr_c1:
+            _gr_tries = str_lit.number_input(
+                "Proxy tries per lookup", min_value=1, max_value=25,
+                value=int(_cur_gr["proxy_tries"]), key="cs_gr_tries",
+                help="How many proxies to try per HTTP request before falling back."
+            )
+        with _gr_c2:
+            _gr_max_fails = str_lit.number_input(
+                "Max IP fails in run", min_value=1, max_value=15,
+                value=int(_cur_gr["max_ip_fails"]), key="cs_gr_max_fails",
+                help="Temporarily skip a proxy after this many failures in the current Global search run."
+            )
+        with _gr_c3:
+            _gr_src_opts = [
+                "all", "proxy001 only", "webshare only", "oxylabs only",
+                "custom only", "webshare + custom", "oxylabs + custom",
+            ]
+            _gr_sources = str_lit.selectbox(
+                "Proxy sources",
+                _gr_src_opts,
+                index=_gr_src_opts.index(_cur_gr["proxy_sources"]) if _cur_gr["proxy_sources"] in _gr_src_opts else 0,
+                key="cs_gr_sources",
+            )
+
+        _gr_d1, _gr_d2, _gr_d3, _gr_d4 = str_lit.columns(4)
+        with _gr_d1:
+            _gr_reuse = str_lit.selectbox(
+                "Reuse skipped IPs", ["on", "off"],
+                index=0 if _cur_gr["reuse_skipped"] == "on" else 1,
+                key="cs_gr_reuse",
+            )
+        with _gr_d2:
+            _gr_wait_val = str_lit.number_input(
+                "Skip wait value", min_value=0.0, max_value=3600.0, step=1.0,
+                value=float(_cur_gr["reuse_wait_value"]), key="cs_gr_wait_val",
+            )
+        with _gr_d3:
+            _gr_wait_unit = str_lit.selectbox(
+                "Skip wait unit", ["sec", "min"],
+                index=0 if _cur_gr["reuse_wait_unit"] == "sec" else 1,
+                key="cs_gr_wait_unit",
+            )
+        with _gr_d4:
+            _gr_scheme = str_lit.selectbox(
+                "Default proxy scheme", ["http", "socks5"],
+                index=0 if _cur_gr["default_scheme"] == "http" else 1,
+                key="cs_gr_scheme",
+            )
+
+        _gr_direct_fb = str_lit.checkbox(
+            "Allow direct fallback if proxies fail/exhausted",
+            value=bool(_cur_gr["direct_fallback"]),
+            key="cs_gr_direct_fb",
+        )
+
+        str_lit.session_state["cs_gr_settings"] = {
+            "proxy_tries": int(_gr_tries),
+            "max_ip_fails": int(_gr_max_fails),
+            "proxy_sources": str(_gr_sources),
+            "reuse_skipped": str(_gr_reuse),
+            "reuse_wait_value": float(_gr_wait_val),
+            "reuse_wait_unit": str(_gr_wait_unit),
+            "default_scheme": str(_gr_scheme),
+            "direct_fallback": bool(_gr_direct_fb),
+        }
+
     _cs_b1, _cs_b2, _cs_b3, _cs_b4 = str_lit.columns(4)
     with _cs_b1:
         if str_lit.button("➡️ Send selection", width="stretch", type="primary"):
@@ -15157,6 +15527,7 @@ else:
                 str_lit.session_state["_cs_flash"] = (
                     "info", f"No unresolved {_CS_GLOBAL_FLAG} Global domains in this source.")
             else:
+                gr_begin_run()
                 _batch = _global_unmapped[:_CS_LOOKUP_CAP]
                 _m = dict(_cs_map)
                 _gr_cache = _gr_load_cache()
