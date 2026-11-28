@@ -13106,6 +13106,10 @@ def resolve_global_domain(domain: str, rdap_country: Optional[str] = None) -> Tu
     # Fallback to Bing HTML whenever DDG is rate-limited (HTTP 202), non-200, errors, or misses
     country, bing_note = _gr_search_bing_html(query)
     traces.append(bing_note)
+    if not country and "(0 country signals)" in bing_note:
+        domain_query = f'site:{clean_domain} OR "{clean_domain}" location OR country OR address'
+        country, bing_retry_note = _gr_search_bing_html(domain_query)
+        traces.append(f"retry:{bing_retry_note}")
     if country:
         cache[clean_domain] = country
         _gr_save_cache(cache)
@@ -14539,9 +14543,10 @@ def _cs_provider_root(domain):
 def _cs_discover_country(domain):
     _ts = datetime.now().strftime("%H:%M:%S")
     _ctry, _trace = resolve_global_domain(domain)
+    _clean_trace = re.sub(r"^(?:HIT|MISS)\s+\S+\s*->\s*\S+\s*\[(.*)\]$", r"\1", str(_trace or "").strip())
     if _ctry in _CS_BY_NAME:
-        return _ctry, f"{_ts} MATCH {domain:<28} -> {_ctry} [{_trace}]"
-    return "", f"{_ts} MISS  {domain:<28} -> Global [{_trace}]"
+        return _ctry, f"{_ts} MATCH {domain:<28} -> {_ctry} [{_clean_trace}]"
+    return "", f"{_ts} MISS  {domain:<28} -> Global [{_clean_trace}]"
 
 
 def _cs_discover_batch(domains, progress_cb=None, workers=_CS_LOOKUP_WORKERS):
