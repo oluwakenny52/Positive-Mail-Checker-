@@ -13275,7 +13275,11 @@ def _gr_probe_site_direct(domain: str) -> Tuple[Optional[str], str]:
     return None, "SITE[" + ", ".join(notes) + "]"
 
 
-def resolve_global_domain(domain: str, rdap_country: Optional[str] = None) -> Tuple[str, str]:
+def resolve_global_domain(
+    domain: str,
+    rdap_country: Optional[str] = None,
+    force_refresh: bool = False,
+) -> Tuple[str, str]:
     """
     Drop-in resolver for Search Global.
     Returns: (resolved_country_or_'Global', trace_log_line)
@@ -13286,9 +13290,11 @@ def resolve_global_domain(domain: str, rdap_country: Optional[str] = None) -> Tu
     traces = []
 
     cache = _gr_load_cache()
-    if clean_domain in cache:
+    if not force_refresh and clean_domain in cache:
         cached_country = cache[clean_domain]
         return cached_country, f"HIT  {clean_domain:<28} -> {cached_country} [CACHE]"
+    if force_refresh and clean_domain in cache:
+        traces.append(f"CACHE:bypassed({cache[clean_domain]})")
 
     if rdap_country:
         cache[clean_domain] = rdap_country
@@ -14756,16 +14762,20 @@ def _cs_provider_root(domain):
     return ".".join(_labels[-2:])
 
 
-def _cs_discover_country(domain):
+def _cs_discover_country(domain, force_refresh=False):
     _ts = datetime.now().strftime("%H:%M:%S")
-    _ctry, _trace = resolve_global_domain(domain)
-    _clean_trace = re.sub(r"^(?:HIT|MISS)\s+\S+\s*->\s*\S+\s*\[(.*)\]$", r"\1", str(_trace or "").strip())
+    _ctry, _trace = resolve_global_domain(domain, force_refresh=force_refresh)
+    _clean_trace = re.sub(
+        r"^(?:HIT|MISS)\s+\S+\s*->\s*\S+\s*\[(.*)\]$",
+        r"\1",
+        str(_trace or "").strip(),
+    )
     if _ctry in _CS_BY_NAME:
         return _ctry, f"{_ts} MATCH {domain:<28} -> {_ctry} [{_clean_trace}]"
     return "", f"{_ts} MISS  {domain:<28} -> Global [{_clean_trace}]"
 
 
-def _cs_discover_batch(domains, progress_cb=None, workers=_CS_LOOKUP_WORKERS):
+def _cs_discover_batch(domains, progress_cb=None, workers=_CS_LOOKUP_WORKERS, force_refresh=False):
     _items = list(domains or [])
     _total = len(_items)
     if _total == 0:
@@ -14777,7 +14787,7 @@ def _cs_discover_batch(domains, progress_cb=None, workers=_CS_LOOKUP_WORKERS):
     _pool_n = max(1, min(int(workers or 1), _total))
 
     def _job(idx, dom):
-        return idx, _cs_discover_country(dom)
+        return idx, _cs_discover_country(dom, force_refresh=force_refresh)
 
     with ThreadPoolExecutor(max_workers=_pool_n, thread_name_prefix="cs-geo") as _ex:
         _futs = [_ex.submit(_job, _i, _d) for _i, _d in enumerate(_items)]
@@ -14787,7 +14797,10 @@ def _cs_discover_batch(domains, progress_cb=None, workers=_CS_LOOKUP_WORKERS):
             except Exception as _ex_err:
                 _idx = 0
                 _ctry = ""
-                _tline = f"{datetime.now().strftime('%H:%M:%S')} MISS  {'unknown':<28} -> Global [worker:{type(_ex_err).__name__}]"
+                _tline = (
+                    f"{datetime.now().strftime('%H:%M:%S')} MISS  "
+                    f"{'unknown':<28} -> Global [worker:{type(_ex_err).__name__}]"
+                )
             with _cb_lock:
                 _results[_idx] = (_ctry, _tline)
                 _done += 1
@@ -15129,8 +15142,9 @@ else:
             f"🔍 Search {_CS_GLOBAL_FLAG} Global ({len(_global_unmapped)})",
             width="stretch",
             help=f"Looks up up to {_CS_LOOKUP_CAP} unique unresolved Global domains "
-                 f"via TLS SANs, browser-impersonated site probe, and paced DDG HTML "
-                 f"across {_CS_LOOKUP_WORKERS} workers, then saves any discovered countries.",
+                 f"via TLS SANs, browser-impersonated site probe, and paced DDG HTML/Lite "
+                 f"+ Bing across {_CS_LOOKUP_WORKERS} workers, bypassing stale cache "
+                 f"for re-searched domains and syncing both cache files.",
         ):
             if not _global_unmapped:
                 str_lit.session_state["_cs_flash"] = (
@@ -15138,6 +15152,7 @@ else:
             else:
                 _batch = _global_unmapped[:_CS_LOOKUP_CAP]
                 _m = dict(_cs_map)
+                _gr_cache = _gr_load_cache()
                 _bar = str_lit.progress(0.0, text=f"0/{len(_batch)} - searching Global domains...")
 
                 def _on_geo_prog(_done, _total, _cur_dom, _cur_found):
@@ -15147,16 +15162,24 @@ else:
                     )
 
                 _results, _found, _new_traces = _cs_discover_batch(
-                    _batch, progress_cb=_on_geo_prog, workers=_CS_LOOKUP_WORKERS
+                    _batch,
+                    progress_cb=_on_geo_prog,
+                    workers=_CS_LOOKUP_WORKERS,
+                    force_refresh=True,
                 )
                 for _dom, (_ctry, _) in zip(_batch, _results):
+                    _clean_dom = str(_dom or "").strip().lower()
+                    if _clean_dom.startswith("www."):
+                        _clean_dom = _clean_dom[4:]
                     if _ctry in _CS_BY_NAME:
-                        _m[_dom] = _ctry
+                        _m[_clean_dom] = _ctry
+                        _gr_cache[_clean_dom] = _ctry
                 _bar.empty()
                 _prev_trace = list(str_lit.session_state.get("cs_lookup_trace") or [])
                 _prev_trace.extend(_new_traces)
                 str_lit.session_state["cs_lookup_trace"] = _prev_trace[-250:]
                 if _found:
+                    _gr_save_cache(_gr_cache)
                     str_lit.session_state["cs_map"] = _m
                     str_lit.session_state["cs_map_ver"] = _cs_ver + 1
                     _cs_save_map(_m)
@@ -15165,7 +15188,7 @@ else:
                     str_lit.session_state["_cs_flash"] = (
                         "success",
                         f"Found countries for **{_found}** of **{len(_batch)}** "
-                        f"{_CS_GLOBAL_FLAG} Global domain(s) and saved them.{_extra}",
+                        f"{_CS_GLOBAL_FLAG} Global domain(s) and synced both caches.{_extra}",
                     )
                 else:
                     str_lit.session_state["_cs_flash"] = (
@@ -15187,8 +15210,8 @@ else:
             _tl1, _tl2 = str_lit.columns([0.75, 0.25])
             with _tl1:
                 str_lit.caption(
-                    "Shows TLS SAN, browser-impersonated site check, and paced DDG HTML "
-                    "status for every domain queried by Search 🌐 Global."
+                    "Shows TLS SAN, browser-impersonated site check, and paced DDG HTML/Lite "
+                    "+ Bing status for every domain queried by Search 🌐 Global."
                 )
             with _tl2:
                 if str_lit.button("🧹 Clear trace", key="cs_clear_trace", width="stretch"):
