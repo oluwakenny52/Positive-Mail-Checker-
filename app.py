@@ -12776,7 +12776,7 @@ _GR_DDG_LOCK = threading.Lock()
 _GR_BING_LOCK = threading.Lock()
 _GR_DDG_202_STREAK = 0
 _GR_DDG_COOLDOWN_UNTIL = 0.0
-_GR_DDG_COOLDOWN_SECS = 60.0
+_GR_DDG_COOLDOWN_SECS = 45.0
 
 _GR_PROXY_LOCK = threading.Lock()
 _GR_IP_FAIL_COUNTS = {}
@@ -12784,6 +12784,7 @@ _GR_SKIPPED_IPS = {}
 _GR_STICKY_PROXY = None
 _GR_ACTIVE_RUN_ID = None
 _GR_SNAPSHOT_SETTINGS = None
+_GR_SETTINGS_FILE = "gr_settings.json"
 
 _GR_DEFAULT_SETTINGS = {
     "proxy_tries": 5,
@@ -12841,6 +12842,35 @@ _GR_TEXT_SIGNALS = [
 ]
 
 
+def _gr_settings_path() -> Path:
+    try:
+        return Path(user_file(_GR_SETTINGS_FILE))
+    except Exception:
+        return Path(_GR_SETTINGS_FILE)
+
+
+def _gr_load_saved_settings() -> dict:
+    p = _gr_settings_path()
+    if p.exists():
+        try:
+            data = json.loads(p.read_text(encoding="utf-8"))
+            if isinstance(data, dict):
+                return data
+        except Exception:
+            pass
+    return {}
+
+
+def _gr_save_settings(cfg: dict) -> None:
+    p = _gr_settings_path()
+    try:
+        with file_write_lock:
+            p.parent.mkdir(parents=True, exist_ok=True)
+            _atomic_write_text(str(p), json.dumps(cfg or {}, indent=2, sort_keys=True))
+    except Exception:
+        pass
+
+
 def _gr_normalize_cfg(raw_cfg: Optional[dict]) -> dict:
     cfg = dict(_GR_DEFAULT_SETTINGS)
     if isinstance(raw_cfg, dict):
@@ -12857,7 +12887,7 @@ def _gr_normalize_cfg(raw_cfg: Optional[dict]) -> dict:
     cfg["reuse_wait_seconds"] = (
         cfg["reuse_wait_value"] * 60.0 if cfg["reuse_wait_unit"] == "min" else cfg["reuse_wait_value"]
     )
-    cfg["default_scheme"] = "socks5" if str(cfg.get("default_scheme") or "http").strip().lower() == "socks5" else "http"
+    cfg["default_scheme"] = "http"
     cfg["direct_fallback"] = bool(cfg.get("direct_fallback", True))
     cfg["cache_mode"] = "off" if str(cfg.get("cache_mode") or "on").strip().lower() == "off" else "on"
     cfg["use_ddg"] = "off" if str(cfg.get("use_ddg") or "on").strip().lower() == "off" else "on"
@@ -12868,13 +12898,13 @@ def _gr_normalize_cfg(raw_cfg: Optional[dict]) -> dict:
 def _gr_snapshot_settings() -> dict:
     """Captures current GR settings on the main script thread for worker threads."""
     global _GR_SNAPSHOT_SETTINGS
-    raw = {}
+    raw = _gr_load_saved_settings()
     try:
         ss = getattr(globals().get("str_lit"), "session_state", None)
         if ss is not None:
             saved = ss.get("cs_gr_settings")
             if isinstance(saved, dict):
-                raw = dict(saved)
+                raw.update(saved)
     except Exception:
         pass
     cfg = _gr_normalize_cfg(raw)
@@ -12888,27 +12918,28 @@ def _gr_get_settings() -> dict:
         snap = dict(_GR_SNAPSHOT_SETTINGS) if isinstance(_GR_SNAPSHOT_SETTINGS, dict) else None
     if snap is not None:
         return _gr_normalize_cfg(snap)
-    raw = {}
+    raw = _gr_load_saved_settings()
     try:
         ss = getattr(globals().get("str_lit"), "session_state", None)
         if ss is not None:
             saved = ss.get("cs_gr_settings")
             if isinstance(saved, dict):
-                raw = dict(saved)
+                raw.update(saved)
     except Exception:
         pass
     return _gr_normalize_cfg(raw)
 
 
-def gr_begin_run(run_id: Optional[str] = None) -> None:
+def gr_begin_run(run_id: Optional[str] = None) -> dict:
     """Resets per-run proxy failure counts and skip list at the start of a Global search batch."""
     global _GR_IP_FAIL_COUNTS, _GR_SKIPPED_IPS, _GR_STICKY_PROXY, _GR_ACTIVE_RUN_ID
-    _gr_snapshot_settings()
+    snap = _gr_snapshot_settings()
     with _GR_PROXY_LOCK:
         _GR_IP_FAIL_COUNTS = {}
         _GR_SKIPPED_IPS = {}
         _GR_STICKY_PROXY = None
         _GR_ACTIVE_RUN_ID = run_id or f"run_{time.monotonic():.3f}"
+    return snap
 
 
 def _gr_cache_path() -> Path:
@@ -12991,32 +13022,20 @@ def _gr_check_tls_sans(domain: str, timeout: float = 4.0) -> Tuple[Optional[str]
 
 def _gr_infer_scheme(raw: str, default_scheme: str = "http") -> str:
     low = str(raw or "").strip().lower()
-    if low.startswith(("socks5h://", "socks5://", "socks4://")):
-        return "socks5"
     if low.startswith("https://"):
         return "https"
-    if low.startswith("http://"):
-        return "http"
-    if re.search(r"\b(socks5|socks)\b", low):
-        return "socks5"
-    if re.search(r"\b(http|https)\b", low):
-        return "http"
-    return "socks5" if str(default_scheme).lower() in {"socks5", "socks5h", "socks"} else "http"
+    return "http"
 
 
 def _gr_normalize_proxy_url(raw_url: Optional[str], default_scheme: str = "http") -> Optional[str]:
     u = str(raw_url or "").strip()
     if not u:
         return None
-    scheme = _gr_infer_scheme(u, default_scheme=default_scheme)
-    body = u
-    if "://" in u:
-        _, rest = u.split("://", 1)
-        body = rest.strip()
+    scheme = _gr_infer_scheme(u, default_scheme="http")
+    body = u.split("://", 1)[1].strip() if "://" in u else u
     if not body:
         return None
-    req_scheme = "socks5h" if scheme == "socks5" else scheme
-    return f"{req_scheme}://{body}"
+    return f"{scheme}://{body}"
 
 
 def _gr_mask_proxy_url(proxy_url: Optional[str]) -> str:
@@ -13074,7 +13093,7 @@ def _gr_collect_proxy_candidates(domain: str = "", source_filter: str = "all", d
                         break
         if not raw_str or not _gr_matches_proxy_source(raw_str, source_filter):
             return
-        norm = _gr_normalize_proxy_url(raw_str, default_scheme=default_scheme)
+        norm = _gr_normalize_proxy_url(raw_str, default_scheme="http")
         if norm and norm not in seen:
             seen.add(norm)
             candidates.append(norm)
@@ -13108,7 +13127,7 @@ def _gr_pick_proxy_for_attempt(
     cfg: dict,
 ) -> Tuple[Optional[str], bool, str]:
     """
-    Selects next proxy using sticky preference -> non-skipped eligible -> timed reuse (♻️).
+    Selects next proxy using sticky preference -> non-skipped eligible -> timed reuse.
     Returns: (proxy_url_or_None, reused_from_skip, note)
     """
     if not globals().get("use_proxy"):
@@ -13117,7 +13136,7 @@ def _gr_pick_proxy_for_attempt(
     candidates = _gr_collect_proxy_candidates(
         domain=domain,
         source_filter=cfg["proxy_sources"],
-        default_scheme=cfg["default_scheme"],
+        default_scheme="http",
     )
     if not candidates:
         return None, False, f"no candidates for source='{cfg['proxy_sources']}'"
@@ -13148,7 +13167,7 @@ def _gr_pick_proxy_for_attempt(
             chosen = random.choice(cooldown_ready)
             _GR_SKIPPED_IPS.pop(chosen, None)
             _GR_IP_FAIL_COUNTS[chosen] = 0
-            return chosen, True, f"♻️reused after {cfg['reuse_wait_value']:g}{cfg['reuse_wait_unit']}"
+            return chosen, True, f"reused after {cfg['reuse_wait_value']:g}{cfg['reuse_wait_unit']}"
 
         return None, False, f"all {len(candidates)} candidate(s) skipped"
 
@@ -13191,9 +13210,14 @@ def _gr_single_http_call(
 ):
     verb = str(method or "GET").upper()
     headers = {
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+        ),
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
         "Accept-Language": "en-US,en;q=0.9",
-        "Cache-Control": "no-cache",
+        "DNT": "1",
+        "Connection": "keep-alive",
     }
     if extra_headers:
         headers.update(extra_headers)
@@ -13214,11 +13238,6 @@ def _gr_single_http_call(
             return _cffi_requests.post(url, **kwargs)
         return _cffi_requests.get(url, **kwargs)
 
-    headers.setdefault(
-        "User-Agent",
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-    )
     target_url = f"{url}?{urllib.parse.urlencode(params)}" if params else url
     encoded_body = None
     if verb == "POST":
@@ -13243,6 +13262,7 @@ def _gr_http_request(
     timeout: float = 8.0,
     domain: str = "",
     is_site_probe: bool = False,
+    fail_on_codes: Tuple[int, ...] = (401, 403, 407, 429),
 ):
     """
     Executes an HTTP request using up to `proxy_tries` proxy attempts with fail-counting,
@@ -13256,7 +13276,7 @@ def _gr_http_request(
         tried = set()
         max_tries = min(2, cfg["proxy_tries"]) if is_site_probe else cfg["proxy_tries"]
         for _ in range(max_tries):
-            px_url, reused, _ = _gr_pick_proxy_for_attempt(domain=domain, tried=tried, cfg=cfg)
+            px_url, _, _ = _gr_pick_proxy_for_attempt(domain=domain, tried=tried, cfg=cfg)
             if not px_url:
                 break
             tried.add(px_url)
@@ -13271,7 +13291,7 @@ def _gr_http_request(
                     proxy_url=px_url,
                 )
                 code, _ = _gr_extract_resp_code_and_body(resp, max_bytes=1024)
-                if code in (401, 403, 407, 429) or code >= 500:
+                if code in fail_on_codes or code >= 500:
                     if not (is_site_probe and code in (401, 403)):
                         _gr_record_proxy_outcome(px_url, succeeded=False, cfg=cfg)
                     last_exc = RuntimeError(f"HTTP_{code}_via_{_gr_mask_proxy_url(px_url)}")
@@ -13336,7 +13356,7 @@ def _gr_extract_resp_code_and_body(resp, max_bytes: int = 262144) -> Tuple[int, 
     return status_code, body
 
 
-def _gr_parse_ddg_snippets(raw_body: str, limit: int = 5) -> list:
+def _gr_parse_ddg_snippets(raw_body: str, limit: int = 6) -> list:
     snippets = []
     if _HAS_BS4 and _BeautifulSoup is not None:
         soup = _BeautifulSoup(raw_body, "html.parser")
@@ -13363,7 +13383,7 @@ def _gr_parse_ddg_snippets(raw_body: str, limit: int = 5) -> list:
     return snippets
 
 
-def _gr_parse_ddg_lite_snippets(raw_body: str, limit: int = 6) -> list:
+def _gr_parse_ddg_lite_snippets(raw_body: str, limit: int = 8) -> list:
     snippets = []
     if _HAS_BS4 and _BeautifulSoup is not None:
         soup = _BeautifulSoup(raw_body, "html.parser")
@@ -13395,7 +13415,7 @@ def _gr_pace_ddg_locked() -> Tuple[bool, str]:
             rem = int(round(_GR_DDG_COOLDOWN_UNTIL - now))
             return False, f"SKIP cooldown ({rem}s left after 202s)"
         elapsed = now - _GR_LAST_DDG_CALL
-        min_gap = random.uniform(1.8, 3.2)
+        min_gap = random.uniform(1.6, 2.8)
         if elapsed < min_gap:
             time.sleep(min_gap - elapsed)
         _GR_LAST_DDG_CALL = time.time()
@@ -13406,22 +13426,18 @@ def _gr_record_ddg_status(status_code: int) -> Optional[str]:
     global _GR_LAST_DDG_CALL, _GR_DDG_202_STREAK, _GR_DDG_COOLDOWN_UNTIL
     with _GR_DDG_LOCK:
         _GR_LAST_DDG_CALL = time.time()
-        if status_code == 202:
+        if status_code in (202, 403, 429):
             _GR_DDG_202_STREAK += 1
-            if _GR_DDG_202_STREAK >= 2:
+            if _GR_DDG_202_STREAK >= 3:
                 _GR_DDG_COOLDOWN_UNTIL = time.time() + _GR_DDG_COOLDOWN_SECS
-                return f"HTTP 202 (cooldown {int(_GR_DDG_COOLDOWN_SECS)}s)"
-            return "HTTP 202 (streak 1/2)"
+                return f"HTTP {status_code} (cooldown {int(_GR_DDG_COOLDOWN_SECS)}s)"
+            return f"HTTP {status_code} (streak {_GR_DDG_202_STREAK}/3)"
         _GR_DDG_202_STREAK = 0
     return None
 
 
 def _gr_search_ddg_lite(query: str, domain: str = "") -> Tuple[Optional[str], str]:
     """Fallback DDG endpoint via lite.duckduckgo.com/lite/."""
-    ok, skip_note = _gr_pace_ddg_locked()
-    if not ok:
-        return None, f"WEB(ddg_lite):{skip_note}"
-
     lite_headers = {
         "Origin": "https://lite.duckduckgo.com",
         "Referer": "https://lite.duckduckgo.com/lite/",
@@ -13438,6 +13454,7 @@ def _gr_search_ddg_lite(query: str, domain: str = "") -> Tuple[Optional[str], st
             extra_headers=lite_headers,
             timeout=10.0,
             domain=domain,
+            fail_on_codes=(202, 401, 403, 407, 429),
         )
         status_code, raw_body = _gr_extract_resp_code_and_body(resp, max_bytes=262144)
         streak_note = _gr_record_ddg_status(status_code)
@@ -13446,7 +13463,7 @@ def _gr_search_ddg_lite(query: str, domain: str = "") -> Tuple[Optional[str], st
         if status_code != 200:
             return None, f"WEB(ddg_lite):HTTP {status_code}"
 
-        snippets = _gr_parse_ddg_lite_snippets(raw_body, limit=6)
+        snippets = _gr_parse_ddg_lite_snippets(raw_body, limit=8)
         combined = " | ".join(snippets)
         country = _gr_extract_country_from_text(combined)
         if country:
@@ -13459,10 +13476,13 @@ def _gr_search_ddg_lite(query: str, domain: str = "") -> Tuple[Optional[str], st
 
 
 def _gr_search_ddg_html(query: str, domain: str = "") -> Tuple[Optional[str], str]:
-    """Uses POST + Referer on html.duckduckgo.com/html/ with optional lite fallback on 200-miss."""
+    """Uses POST + Referer on html.duckduckgo.com/html/ and falls through to ddg_lite on 202/403/429 or 0-signal."""
     ok, skip_note = _gr_pace_ddg_locked()
     if not ok:
-        return None, f"WEB(ddg_html):{skip_note}"
+        lite_c, lite_n = _gr_search_ddg_lite(query, domain=domain)
+        if lite_c:
+            return lite_c, f"WEB(ddg_html):{skip_note} -> {lite_n}"
+        return None, f"WEB(ddg_html):{skip_note} -> {lite_n}"
 
     ddg_headers = {
         "Origin": "https://html.duckduckgo.com",
@@ -13482,15 +13502,24 @@ def _gr_search_ddg_html(query: str, domain: str = "") -> Tuple[Optional[str], st
             extra_headers=ddg_headers,
             timeout=10.0,
             domain=domain,
+            fail_on_codes=(202, 401, 403, 407, 429),
         )
         status_code, raw_body = _gr_extract_resp_code_and_body(resp, max_bytes=262144)
         streak_note = _gr_record_ddg_status(status_code)
-        if streak_note:
-            return None, f"WEB(ddg_html):{streak_note} (skipped ddg_lite)"
-        if status_code != 200:
-            return None, f"WEB(ddg_html):HTTP {status_code} (skipped ddg_lite)"
+        if status_code in (202, 403, 429):
+            base_note = f"WEB(ddg_html):{streak_note or f'HTTP {status_code}'}"
+            lite_c, lite_n = _gr_search_ddg_lite(query, domain=domain)
+            if lite_c:
+                return lite_c, f"{base_note} -> {lite_n}"
+            return None, f"{base_note} -> {lite_n}"
 
-        snippets = _gr_parse_ddg_snippets(raw_body, limit=5)
+        if status_code != 200:
+            lite_c, lite_n = _gr_search_ddg_lite(query, domain=domain)
+            if lite_c:
+                return lite_c, f"WEB(ddg_html):HTTP {status_code} -> {lite_n}"
+            return None, f"WEB(ddg_html):HTTP {status_code} -> {lite_n}"
+
+        snippets = _gr_parse_ddg_snippets(raw_body, limit=6)
         combined = " | ".join(snippets)
         country = _gr_extract_country_from_text(combined)
         if country:
@@ -13506,11 +13535,14 @@ def _gr_search_ddg_html(query: str, domain: str = "") -> Tuple[Optional[str], st
     except Exception as exc:
         with _GR_DDG_LOCK:
             _GR_LAST_DDG_CALL = time.time()
-        return None, f"WEB(ddg_html):ERR {type(exc).__name__} (skipped ddg_lite)"
+        lite_c, lite_n = _gr_search_ddg_lite(query, domain=domain)
+        if lite_c:
+            return lite_c, f"WEB(ddg_html):ERR {type(exc).__name__} -> {lite_n}"
+        return None, f"WEB(ddg_html):ERR {type(exc).__name__} -> {lite_n}"
 
 
 def _gr_search_bing_html(query: str, domain: str = "") -> Tuple[Optional[str], str]:
-    """Fallback web search via www.bing.com/search when DDG rate-limits (HTTP 202) or misses."""
+    """Fallback web search via www.bing.com/search when DDG rate-limits or misses."""
     global _GR_LAST_BING_CALL
     with _GR_BING_LOCK:
         elapsed = time.time() - _GR_LAST_BING_CALL
@@ -13652,7 +13684,7 @@ def resolve_global_domain(
         traces.append(
             f"PROXY:{prefix_tag}{_gr_mask_proxy_url(chosen_px)} "
             f"(tries={cfg['proxy_tries']}, max_fails={cfg['max_ip_fails']}, "
-            f"src={cfg['proxy_sources']}, scheme={cfg['default_scheme']}, {pick_note})"
+            f"src={cfg['proxy_sources']}, scheme=http, {pick_note})"
         )
     else:
         fb_tag = "direct_fb=on" if cfg["direct_fallback"] else "direct_fb=off"
@@ -13675,7 +13707,7 @@ def resolve_global_domain(
         return country, f"HIT  {clean_domain:<28} -> {country} [{' | '.join(traces)}]"
 
     brand = clean_domain.split(".")[0]
-    query = f'"{clean_domain}" OR "{brand}" headquarters OR address OR contact'
+    query = f'"{clean_domain}" OR "{brand}" country OR headquarters OR address'
 
     if ddg_enabled:
         country, ddg_note = _gr_search_ddg_html(query, domain=clean_domain)
@@ -15119,9 +15151,14 @@ if str_lit.session_state.get(_CS_OWNER_KEY) != _cs_owner:
     for _k in ("cs_mode", "cs_source", "cs_keys", "cs_sent", "cs_map", "cs_map_ver",
                "cs_teach_dom", "cs_teach_ctry", "cs_map_open", "cs_edit_dom",
                "cs_edit_ctry", "_cs_edit_for", "_cs_sel_loaded", "_cs_rows_cache",
-               "_cs_flash", "cs_hide_empty", "cs_lookup_trace", "cs_gr_settings"):
+               "_cs_flash", "cs_hide_empty", "cs_lookup_trace", "cs_gr_settings",
+               "cs_gr_tries", "cs_gr_max_fails", "cs_gr_sources", "cs_gr_reuse",
+               "cs_gr_wait_val", "cs_gr_wait_unit", "cs_gr_scheme",
+               "cs_gr_cache_mode", "cs_gr_use_ddg", "cs_gr_use_bing", "cs_gr_direct_fb"):
         str_lit.session_state.pop(_k, None)
     str_lit.session_state[_CS_OWNER_KEY] = _cs_owner
+if "cs_gr_settings" not in str_lit.session_state:
+    str_lit.session_state["cs_gr_settings"] = _gr_normalize_cfg(_gr_load_saved_settings())
 if "cs_map" not in str_lit.session_state:
     str_lit.session_state["cs_map"] = _cs_load_map()
 if "cs_map_ver" not in str_lit.session_state:
@@ -15226,7 +15263,10 @@ else:
              "US, CA, DE and Global, and runs exactly those accounts.")
 
     with str_lit.expander("⚙️ Global Resolver Proxy, Search & Cache Settings", expanded=False):
-        _cur_gr = _gr_normalize_cfg(str_lit.session_state.get("cs_gr_settings"))
+        _cur_gr = _gr_normalize_cfg({
+            **_gr_load_saved_settings(),
+            **(str_lit.session_state.get("cs_gr_settings") or {}),
+        })
 
         _gr_c1, _gr_c2, _gr_c3 = str_lit.columns(3)
         with _gr_c1:
@@ -15273,9 +15313,10 @@ else:
             )
         with _gr_d4:
             _gr_scheme = str_lit.selectbox(
-                "Default proxy scheme", ["http", "socks5"],
-                index=0 if _cur_gr["default_scheme"] == "http" else 1,
+                "Default proxy scheme", ["http"],
+                index=0,
                 key="cs_gr_scheme",
+                help="HTTP-only proxy scheme enforced.",
             )
 
         _gr_e1, _gr_e2, _gr_e3 = str_lit.columns(3)
@@ -15307,19 +15348,23 @@ else:
             key="cs_gr_direct_fb",
         )
 
-        str_lit.session_state["cs_gr_settings"] = {
+        _new_gr = _gr_normalize_cfg({
             "proxy_tries": int(_gr_tries),
             "max_ip_fails": int(_gr_max_fails),
             "proxy_sources": str(_gr_sources),
             "reuse_skipped": str(_gr_reuse),
             "reuse_wait_value": float(_gr_wait_val),
             "reuse_wait_unit": str(_gr_wait_unit),
-            "default_scheme": str(_gr_scheme),
+            "default_scheme": "http",
             "cache_mode": str(_gr_cache_mode),
             "use_ddg": str(_gr_use_ddg),
             "use_bing": str(_gr_use_bing),
             "direct_fallback": bool(_gr_direct_fb),
-        }
+        })
+        if _new_gr != _gr_normalize_cfg(str_lit.session_state.get("cs_gr_settings")):
+            str_lit.session_state["cs_gr_settings"] = _new_gr
+            _gr_save_settings(_new_gr)
+            _gr_snapshot_settings()
 
     _cs_b1, _cs_b2, _cs_b3, _cs_b4 = str_lit.columns(4)
     with _cs_b1:
