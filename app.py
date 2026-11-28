@@ -15123,7 +15123,7 @@ else:
     with _cs_b4:
         _global_unmapped = sorted({
             _r[1] for _r in _cs_all_rows
-            if _r[2] == _CS_GLOBAL and _r[1] not in _cs_map
+            if _r[2] == _CS_GLOBAL and _cs_map.get(_r[1], _CS_GLOBAL) == _CS_GLOBAL
         })
         if str_lit.button(
             f"🔍 Search {_CS_GLOBAL_FLAG} Global ({len(_global_unmapped)})",
