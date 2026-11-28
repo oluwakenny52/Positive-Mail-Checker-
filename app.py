@@ -13302,6 +13302,13 @@ def resolve_global_domain(
         return rdap_country, f"HIT  {clean_domain:<28} -> {rdap_country} [RDAP]"
     traces.append("RDAP:no country")
 
+    proxy_url = _gr_resolve_proxy_url(domain=clean_domain)
+    if proxy_url:
+        _px_masked = re.sub(r"://[^@]+@", "://***@", proxy_url)
+        traces.append(f"PROXY:{_px_masked}")
+    else:
+        traces.append(f"DIRECT(use_proxy={bool(globals().get('use_proxy'))})")
+
     country, tls_note = _gr_check_tls_sans(clean_domain)
     traces.append(tls_note)
     if country:
