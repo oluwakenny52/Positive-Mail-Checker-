@@ -12774,6 +12774,9 @@ _GR_LAST_DDG_CALL = 0.0
 _GR_LAST_BING_CALL = 0.0
 _GR_DDG_LOCK = threading.Lock()
 _GR_BING_LOCK = threading.Lock()
+_GR_DDG_202_STREAK = 0
+_GR_DDG_COOLDOWN_UNTIL = 0.0
+_GR_DDG_COOLDOWN_SECS = 60.0
 
 _GR_CCTLD_TO_COUNTRY = {
     ".co.id": "Indonesia", ".id": "Indonesia",
@@ -12876,31 +12879,103 @@ def _gr_check_tls_sans(domain: str, timeout: float = 4.0) -> Tuple[Optional[str]
         return None, f"TLS_ERR:{type(exc).__name__}"
 
 
-def _gr_http_get(url: str, params: dict = None, timeout: float = 8.0):
+def _gr_resolve_proxy_url(domain: str = "") -> Optional[str]:
+    """Returns a proxy URL from sample_alive_proxy() if available and enabled."""
+    try:
+        if not globals().get("use_proxy"):
+            return None
+        sampler = globals().get("sample_alive_proxy")
+        if not callable(sampler):
+            return None
+        px = sampler(domain=domain) if domain else sampler()
+        if not px:
+            return None
+        if isinstance(px, str):
+            return px.strip() or None
+        url_fn = globals().get("px_url")
+        if callable(url_fn):
+            u = url_fn(px)
+            if u:
+                return str(u).strip()
+        if isinstance(px, dict):
+            for key in ("url", "proxy_url", "proxy", "http", "https"):
+                if px.get(key):
+                    return str(px[key]).strip()
+    except Exception:
+        pass
+    return None
+
+
+def _gr_http_request(
+    method: str,
+    url: str,
+    params: dict = None,
+    data: dict = None,
+    extra_headers: dict = None,
+    timeout: float = 8.0,
+    domain: str = "",
+):
+    verb = str(method or "GET").upper()
     headers = {
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         "Accept-Language": "en-US,en;q=0.9",
         "Cache-Control": "no-cache",
     }
+    if extra_headers:
+        headers.update(extra_headers)
+
+    proxy_url = _gr_resolve_proxy_url(domain=domain)
+
     if _HAS_CFFI and _cffi_requests is not None:
-        return _cffi_requests.get(
-            url,
-            params=params,
-            headers=headers,
-            impersonate="chrome",
-            timeout=timeout,
-            allow_redirects=True,
-        )
-    headers["User-Agent"] = (
+        kwargs = {
+            "params": params,
+            "headers": headers,
+            "impersonate": "chrome",
+            "timeout": timeout,
+            "allow_redirects": True,
+        }
+        if verb == "POST":
+            kwargs["data"] = data or {}
+        if proxy_url:
+            kwargs["proxies"] = {"http": proxy_url, "https": proxy_url}
+        if verb == "POST":
+            return _cffi_requests.post(url, **kwargs)
+        return _cffi_requests.get(url, **kwargs)
+
+    headers.setdefault(
+        "User-Agent",
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
     )
-    return urllib.request.urlopen(
-        urllib.request.Request(
-            f"{url}?{urllib.parse.urlencode(params)}" if params else url,
-            headers=headers,
-        ),
+    target_url = f"{url}?{urllib.parse.urlencode(params)}" if params else url
+    encoded_body = None
+    if verb == "POST":
+        encoded_body = urllib.parse.urlencode(data or {}).encode("utf-8")
+        headers.setdefault("Content-Type", "application/x-www-form-urlencoded")
+
+    req = urllib.request.Request(target_url, data=encoded_body, headers=headers, method=verb)
+    if proxy_url:
+        opener = urllib.request.build_opener(
+            urllib.request.ProxyHandler({"http": proxy_url, "https": proxy_url})
+        )
+        return opener.open(req, timeout=timeout)
+    return urllib.request.urlopen(req, timeout=timeout)
+
+
+def _gr_http_get(
+    url: str,
+    params: dict = None,
+    extra_headers: dict = None,
+    timeout: float = 8.0,
+    domain: str = "",
+):
+    return _gr_http_request(
+        "GET",
+        url,
+        params=params,
+        extra_headers=extra_headers,
         timeout=timeout,
+        domain=domain,
     )
 
 
@@ -12921,56 +12996,183 @@ def _gr_extract_resp_code_and_body(resp, max_bytes: int = 262144) -> Tuple[int, 
     return status_code, body
 
 
-def _gr_search_ddg_html(query: str) -> Tuple[Optional[str], str]:
-    """Uses html.duckduckgo.com/html/ with pacing so it never triggers vqd HTTP 202."""
-    global _GR_LAST_DDG_CALL
+def _gr_parse_ddg_snippets(raw_body: str, limit: int = 5) -> list:
+    snippets = []
+    if _HAS_BS4 and _BeautifulSoup is not None:
+        soup = _BeautifulSoup(raw_body, "html.parser")
+        for res in soup.select(".result")[:limit]:
+            title_el = res.select_one(".result__a")
+            snip_el = res.select_one(".result__snippet")
+            href = title_el.get("href", "") if title_el else ""
+            if "uddg=" in href:
+                real_url = unquote(parse_qs(urlparse(href).query).get("uddg", [""])[0])
+            else:
+                real_url = href
+            snippets.append(
+                f"{title_el.get_text(' ', strip=True) if title_el else ''} "
+                f"{real_url} "
+                f"{snip_el.get_text(' ', strip=True) if snip_el else ''}"
+            )
+    else:
+        for m in re.findall(
+            r'<a\b[^>]*class=["\'][^"\']*\bresult__a\b[^"\']*["\'][^>]*>(.*?)</a>',
+            raw_body,
+            flags=re.S | re.I,
+        )[:limit]:
+            snippets.append(re.sub(r"<[^>]+>", " ", m))
+    return snippets
+
+
+def _gr_parse_ddg_lite_snippets(raw_body: str, limit: int = 6) -> list:
+    snippets = []
+    if _HAS_BS4 and _BeautifulSoup is not None:
+        soup = _BeautifulSoup(raw_body, "html.parser")
+        for link in soup.select("a.result-link")[:limit]:
+            href = link.get("href", "")
+            if "uddg=" in href:
+                real_url = unquote(parse_qs(urlparse(href).query).get("uddg", [""])[0])
+            else:
+                real_url = href
+            tr = link.find_parent("tr")
+            next_tr = tr.find_next_sibling("tr") if tr else None
+            snip_txt = next_tr.get_text(" ", strip=True) if next_tr else ""
+            snippets.append(f"{link.get_text(' ', strip=True)} {real_url} {snip_txt}")
+    else:
+        for m in re.findall(
+            r'<a\b[^>]*class=["\'][^"\']*\bresult-link\b[^"\']*["\'][^>]*>(.*?)</a>',
+            raw_body,
+            flags=re.S | re.I,
+        )[:limit]:
+            snippets.append(re.sub(r"<[^>]+>", " ", m))
+    return snippets
+
+
+def _gr_pace_ddg_locked() -> Tuple[bool, str]:
+    global _GR_LAST_DDG_CALL, _GR_DDG_COOLDOWN_UNTIL
     with _GR_DDG_LOCK:
-        elapsed = time.time() - _GR_LAST_DDG_CALL
+        now = time.time()
+        if now < _GR_DDG_COOLDOWN_UNTIL:
+            rem = int(round(_GR_DDG_COOLDOWN_UNTIL - now))
+            return False, f"SKIP cooldown ({rem}s left after 202s)"
+        elapsed = now - _GR_LAST_DDG_CALL
         min_gap = random.uniform(1.8, 3.2)
         if elapsed < min_gap:
             time.sleep(min_gap - elapsed)
         _GR_LAST_DDG_CALL = time.time()
+    return True, ""
 
+
+def _gr_record_ddg_status(status_code: int) -> Optional[str]:
+    global _GR_LAST_DDG_CALL, _GR_DDG_202_STREAK, _GR_DDG_COOLDOWN_UNTIL
+    with _GR_DDG_LOCK:
+        _GR_LAST_DDG_CALL = time.time()
+        if status_code == 202:
+            _GR_DDG_202_STREAK += 1
+            if _GR_DDG_202_STREAK >= 2:
+                _GR_DDG_COOLDOWN_UNTIL = time.time() + _GR_DDG_COOLDOWN_SECS
+                return f"HTTP 202 (cooldown {int(_GR_DDG_COOLDOWN_SECS)}s)"
+            return "HTTP 202 (streak 1/2)"
+        _GR_DDG_202_STREAK = 0
+    return None
+
+
+def _gr_search_ddg_lite(query: str, domain: str = "") -> Tuple[Optional[str], str]:
+    """Fallback DDG endpoint via lite.duckduckgo.com/lite/."""
+    ok, skip_note = _gr_pace_ddg_locked()
+    if not ok:
+        return None, f"WEB(ddg_lite):{skip_note}"
+
+    lite_headers = {
+        "Origin": "https://lite.duckduckgo.com",
+        "Referer": "https://lite.duckduckgo.com/lite/",
+        "Sec-Fetch-Dest": "document",
+        "Sec-Fetch-Mode": "navigate",
+        "Sec-Fetch-Site": "same-origin",
+        "Upgrade-Insecure-Requests": "1",
+    }
     try:
-        resp = _gr_http_get("https://html.duckduckgo.com/html/", params={"q": query}, timeout=10.0)
+        resp = _gr_http_request(
+            "POST",
+            "https://lite.duckduckgo.com/lite/",
+            data={"q": query},
+            extra_headers=lite_headers,
+            timeout=10.0,
+            domain=domain,
+        )
+        status_code, raw_body = _gr_extract_resp_code_and_body(resp, max_bytes=262144)
+        streak_note = _gr_record_ddg_status(status_code)
+        if streak_note:
+            return None, f"WEB(ddg_lite):{streak_note}"
+        if status_code != 200:
+            return None, f"WEB(ddg_lite):HTTP {status_code}"
+
+        snippets = _gr_parse_ddg_lite_snippets(raw_body, limit=6)
+        combined = " | ".join(snippets)
+        country = _gr_extract_country_from_text(combined)
+        if country:
+            return country, "WEB(ddg_lite):HTTP 200 (matched)"
+        return None, f"WEB(ddg_lite):HTTP 200 ({len(snippets)} results, 0 country signals)"
+    except Exception as exc:
         with _GR_DDG_LOCK:
             _GR_LAST_DDG_CALL = time.time()
+        return None, f"WEB(ddg_lite):ERR {type(exc).__name__}"
+
+
+def _gr_search_ddg_html(query: str, domain: str = "") -> Tuple[Optional[str], str]:
+    """Uses POST + Referer on html.duckduckgo.com/html/ with fallback to lite.duckduckgo.com/lite/."""
+    ok, skip_note = _gr_pace_ddg_locked()
+    if not ok:
+        return None, f"WEB(ddg_html):{skip_note}"
+
+    ddg_headers = {
+        "Origin": "https://html.duckduckgo.com",
+        "Referer": "https://html.duckduckgo.com/",
+        "Sec-Fetch-Dest": "document",
+        "Sec-Fetch-Mode": "navigate",
+        "Sec-Fetch-Site": "same-origin",
+        "Sec-Fetch-User": "?1",
+        "Upgrade-Insecure-Requests": "1",
+    }
+
+    try:
+        resp = _gr_http_request(
+            "POST",
+            "https://html.duckduckgo.com/html/",
+            data={"q": query, "b": ""},
+            extra_headers=ddg_headers,
+            timeout=10.0,
+            domain=domain,
+        )
         status_code, raw_body = _gr_extract_resp_code_and_body(resp, max_bytes=262144)
+        streak_note = _gr_record_ddg_status(status_code)
+        if streak_note:
+            lite_c, lite_n = _gr_search_ddg_lite(query, domain=domain)
+            return lite_c, f"WEB(ddg_html):{streak_note} -> {lite_n}"
         if status_code != 200:
-            return None, f"WEB(ddg_html):HTTP {status_code}"
+            lite_c, lite_n = _gr_search_ddg_lite(query, domain=domain)
+            return lite_c, f"WEB(ddg_html):HTTP {status_code} -> {lite_n}"
 
-        snippets = []
-        if _HAS_BS4 and _BeautifulSoup is not None:
-            soup = _BeautifulSoup(raw_body, "html.parser")
-            for res in soup.select(".result")[:5]:
-                title_el = res.select_one(".result__a")
-                snip_el = res.select_one(".result__snippet")
-                href = title_el.get("href", "") if title_el else ""
-                if "uddg=" in href:
-                    real_url = unquote(parse_qs(urlparse(href).query).get("uddg", [""])[0])
-                else:
-                    real_url = href
-                snippets.append(
-                    f"{title_el.get_text(' ', strip=True) if title_el else ''} "
-                    f"{real_url} "
-                    f"{snip_el.get_text(' ', strip=True) if snip_el else ''}"
-                )
-        else:
-            for m in re.findall(r'<a\b[^>]*class=["\'][^"\']*\bresult__a\b[^"\']*["\'][^>]*>(.*?)</a>', raw_body, flags=re.S | re.I)[:5]:
-                snippets.append(re.sub(r"<[^>]+>", " ", m))
-
+        snippets = _gr_parse_ddg_snippets(raw_body, limit=5)
         combined = " | ".join(snippets)
         country = _gr_extract_country_from_text(combined)
         if country:
             return country, "WEB(ddg_html):HTTP 200 (matched)"
-        return None, f"WEB(ddg_html):HTTP 200 ({len(snippets)} results, 0 country signals)"
+
+        lite_c, lite_n = _gr_search_ddg_lite(query, domain=domain)
+        if lite_c:
+            return lite_c, f"WEB(ddg_html):HTTP 200 (0 signals) -> {lite_n}"
+        return None, (
+            f"WEB(ddg_html):HTTP 200 ({len(snippets)} results, 0 country signals) "
+            f"-> {lite_n}"
+        )
     except Exception as exc:
         with _GR_DDG_LOCK:
             _GR_LAST_DDG_CALL = time.time()
-        return None, f"WEB(ddg_html):ERR {type(exc).__name__}"
+        lite_c, lite_n = _gr_search_ddg_lite(query, domain=domain)
+        return lite_c, f"WEB(ddg_html):ERR {type(exc).__name__} -> {lite_n}"
 
 
-def _gr_search_bing_html(query: str) -> Tuple[Optional[str], str]:
+def _gr_search_bing_html(query: str, domain: str = "") -> Tuple[Optional[str], str]:
     """Fallback web search via www.bing.com/search when DDG rate-limits (HTTP 202) or misses."""
     global _GR_LAST_BING_CALL
     with _GR_BING_LOCK:
@@ -12980,8 +13182,22 @@ def _gr_search_bing_html(query: str) -> Tuple[Optional[str], str]:
             time.sleep(min_gap - elapsed)
         _GR_LAST_BING_CALL = time.time()
 
+    bing_headers = {
+        "Referer": "https://www.bing.com/",
+        "Sec-Fetch-Dest": "document",
+        "Sec-Fetch-Mode": "navigate",
+        "Sec-Fetch-Site": "same-origin",
+        "Upgrade-Insecure-Requests": "1",
+    }
+
     try:
-        resp = _gr_http_get("https://www.bing.com/search", params={"q": query, "count": "8"}, timeout=10.0)
+        resp = _gr_http_get(
+            "https://www.bing.com/search",
+            params={"q": query, "count": "8"},
+            extra_headers=bing_headers,
+            timeout=10.0,
+            domain=domain,
+        )
         with _GR_BING_LOCK:
             _GR_LAST_BING_CALL = time.time()
         status_code, raw_body = _gr_extract_resp_code_and_body(resp, max_bytes=262144)
@@ -13021,7 +13237,7 @@ def _gr_probe_site_direct(domain: str) -> Tuple[Optional[str], str]:
     for url in (f"https://{domain}/", f"https://www.{domain}/"):
         short_host = url.split("://", 1)[1].rstrip("/")
         try:
-            resp = _gr_http_get(url, timeout=8.0)
+            resp = _gr_http_get(url, timeout=8.0, domain=domain)
             status_code, html_txt = _gr_extract_resp_code_and_body(resp, max_bytes=120_000)
             if status_code == 200:
                 if _HAS_BS4 and _BeautifulSoup is not None:
@@ -13096,7 +13312,7 @@ def resolve_global_domain(domain: str, rdap_country: Optional[str] = None) -> Tu
 
     brand = clean_domain.split(".")[0]
     query = f'"{clean_domain}" OR "{brand}" headquarters OR address OR contact'
-    country, ddg_note = _gr_search_ddg_html(query)
+    country, ddg_note = _gr_search_ddg_html(query, domain=clean_domain)
     traces.append(ddg_note)
     if country:
         cache[clean_domain] = country
@@ -13104,11 +13320,11 @@ def resolve_global_domain(domain: str, rdap_country: Optional[str] = None) -> Tu
         return country, f"HIT  {clean_domain:<28} -> {country} [{' | '.join(traces)}]"
 
     # Fallback to Bing HTML whenever DDG is rate-limited (HTTP 202), non-200, errors, or misses
-    country, bing_note = _gr_search_bing_html(query)
+    country, bing_note = _gr_search_bing_html(query, domain=clean_domain)
     traces.append(bing_note)
     if not country and "(0 country signals)" in bing_note:
         domain_query = f'site:{clean_domain} OR "{clean_domain}" location OR country OR address'
-        country, bing_retry_note = _gr_search_bing_html(domain_query)
+        country, bing_retry_note = _gr_search_bing_html(domain_query, domain=clean_domain)
         traces.append(f"retry:{bing_retry_note}")
     if country:
         cache[clean_domain] = country
