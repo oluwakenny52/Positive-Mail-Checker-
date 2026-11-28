@@ -12771,7 +12771,9 @@ except ImportError:
 
 # === START: GLOBAL_RESOLVER ===
 _GR_LAST_DDG_CALL = 0.0
+_GR_LAST_BING_CALL = 0.0
 _GR_DDG_LOCK = threading.Lock()
+_GR_BING_LOCK = threading.Lock()
 
 _GR_CCTLD_TO_COUNTRY = {
     ".co.id": "Indonesia", ".id": "Indonesia",
@@ -12902,6 +12904,23 @@ def _gr_http_get(url: str, params: dict = None, timeout: float = 8.0):
     )
 
 
+def _gr_extract_resp_code_and_body(resp, max_bytes: int = 262144) -> Tuple[int, str]:
+    code = getattr(resp, "status_code", None)
+    if code is None:
+        code = getattr(resp, "status", None)
+    if code is None and hasattr(resp, "getcode"):
+        try:
+            code = resp.getcode()
+        except Exception:
+            code = 200
+    status_code = int(code or 200)
+    if hasattr(resp, "text"):
+        body = str(resp.text or "")[:max_bytes]
+    else:
+        body = resp.read(max_bytes).decode("utf-8", errors="ignore")
+    return status_code, body
+
+
 def _gr_search_ddg_html(query: str) -> Tuple[Optional[str], str]:
     """Uses html.duckduckgo.com/html/ with pacing so it never triggers vqd HTTP 202."""
     global _GR_LAST_DDG_CALL
@@ -12916,10 +12935,9 @@ def _gr_search_ddg_html(query: str) -> Tuple[Optional[str], str]:
         resp = _gr_http_get("https://html.duckduckgo.com/html/", params={"q": query}, timeout=10.0)
         with _GR_DDG_LOCK:
             _GR_LAST_DDG_CALL = time.time()
-        status_code = getattr(resp, "status_code", None) or getattr(resp, "status", 200)
+        status_code, raw_body = _gr_extract_resp_code_and_body(resp, max_bytes=262144)
         if status_code != 200:
             return None, f"WEB(ddg_html):HTTP {status_code}"
-        raw_body = resp.text if hasattr(resp, "text") else resp.read(262144).decode("utf-8", errors="ignore")
 
         snippets = []
         if _HAS_BS4 and _BeautifulSoup is not None:
@@ -12952,15 +12970,60 @@ def _gr_search_ddg_html(query: str) -> Tuple[Optional[str], str]:
         return None, f"WEB(ddg_html):ERR {type(exc).__name__}"
 
 
+def _gr_search_bing_html(query: str) -> Tuple[Optional[str], str]:
+    """Fallback web search via www.bing.com/search when DDG rate-limits (HTTP 202) or misses."""
+    global _GR_LAST_BING_CALL
+    with _GR_BING_LOCK:
+        elapsed = time.time() - _GR_LAST_BING_CALL
+        min_gap = random.uniform(1.5, 2.8)
+        if elapsed < min_gap:
+            time.sleep(min_gap - elapsed)
+        _GR_LAST_BING_CALL = time.time()
+
+    try:
+        resp = _gr_http_get("https://www.bing.com/search", params={"q": query, "count": "8"}, timeout=10.0)
+        with _GR_BING_LOCK:
+            _GR_LAST_BING_CALL = time.time()
+        status_code, raw_body = _gr_extract_resp_code_and_body(resp, max_bytes=262144)
+        if status_code != 200:
+            return None, f"WEB(bing):HTTP {status_code}"
+
+        snippets = []
+        if _HAS_BS4 and _BeautifulSoup is not None:
+            soup = _BeautifulSoup(raw_body, "html.parser")
+            for res in soup.select("li.b_algo")[:6]:
+                title_el = res.select_one("h2 a")
+                snip_el = res.select_one(".b_caption p") or res.select_one("p")
+                href = title_el.get("href", "") if title_el else ""
+                snippets.append(
+                    f"{title_el.get_text(' ', strip=True) if title_el else ''} "
+                    f"{href} "
+                    f"{snip_el.get_text(' ', strip=True) if snip_el else ''}"
+                )
+        else:
+            for m in re.findall(r'<li\b[^>]*class=["\'][^"\']*\bb_algo\b[^"\']*["\'][^>]*>(.*?)</li>', raw_body, flags=re.S | re.I)[:6]:
+                snippets.append(re.sub(r"<[^>]+>", " ", m))
+
+        combined = " | ".join(snippets)
+        country = _gr_extract_country_from_text(combined)
+        if country:
+            return country, "WEB(bing):HTTP 200 (matched)"
+        return None, f"WEB(bing):HTTP 200 ({len(snippets)} results, 0 country signals)"
+    except Exception as exc:
+        with _GR_BING_LOCK:
+            _GR_LAST_BING_CALL = time.time()
+        return None, f"WEB(bing):ERR {type(exc).__name__}"
+
+
 def _gr_probe_site_direct(domain: str) -> Tuple[Optional[str], str]:
-    """Single browser-impersonated probe; never retries 403s."""
-    last_err = "SITE:UNREACHABLE"
+    """Single browser-impersonated probe per candidate URL with explicit HTTP status reporting."""
+    notes = []
     for url in (f"https://{domain}/", f"https://www.{domain}/"):
+        short_host = url.split("://", 1)[1].rstrip("/")
         try:
             resp = _gr_http_get(url, timeout=8.0)
-            status_code = getattr(resp, "status_code", None) or getattr(resp, "status", 200)
+            status_code, html_txt = _gr_extract_resp_code_and_body(resp, max_bytes=120_000)
             if status_code == 200:
-                html_txt = resp.text[:120_000] if hasattr(resp, "text") else resp.read(120_000).decode("utf-8", errors="ignore")
                 if _HAS_BS4 and _BeautifulSoup is not None:
                     soup = _BeautifulSoup(html_txt, "html.parser")
                     footer = soup.find("footer")
@@ -12973,13 +13036,27 @@ def _gr_probe_site_direct(domain: str) -> Tuple[Optional[str], str]:
                     focus_text = re.sub(r"<[^>]+>", " ", html_txt)[:4000]
                 country = _gr_extract_country_from_text(focus_text)
                 if country:
-                    return country, "SITE:HTTP 200 (matched)"
-                return None, "SITE:HTTP 200 (no country signal)"
-            if status_code == 403:
-                return None, "SITE:HTTP 403 (WAF skipped)"
+                    return country, f"SITE({short_host}):HTTP 200 (matched)"
+                notes.append(f"{short_host}:HTTP 200 (no signal)")
+            elif status_code in (301, 302, 307, 308):
+                notes.append(f"{short_host}:HTTP {status_code} (redirect)")
+            elif status_code == 403:
+                notes.append(f"{short_host}:HTTP 403 (WAF/forbidden)")
+            elif status_code == 404:
+                notes.append(f"{short_host}:HTTP 404 (not found)")
+            elif status_code == 429:
+                notes.append(f"{short_host}:HTTP 429 (rate limited)")
+            elif status_code >= 500:
+                notes.append(f"{short_host}:HTTP {status_code} (server error)")
+            else:
+                notes.append(f"{short_host}:HTTP {status_code}")
         except Exception as exc:
-            last_err = f"SITE:ERR {type(exc).__name__}"
-    return None, last_err
+            err_code = getattr(exc, "code", None)
+            if err_code is not None:
+                notes.append(f"{short_host}:HTTP {err_code} ({type(exc).__name__})")
+            else:
+                notes.append(f"{short_host}:ERR {type(exc).__name__}")
+    return None, "SITE[" + ", ".join(notes) + "]"
 
 
 def resolve_global_domain(domain: str, rdap_country: Optional[str] = None) -> Tuple[str, str]:
@@ -13021,6 +13098,14 @@ def resolve_global_domain(domain: str, rdap_country: Optional[str] = None) -> Tu
     query = f'"{clean_domain}" OR "{brand}" headquarters OR address OR contact'
     country, ddg_note = _gr_search_ddg_html(query)
     traces.append(ddg_note)
+    if country:
+        cache[clean_domain] = country
+        _gr_save_cache(cache)
+        return country, f"HIT  {clean_domain:<28} -> {country} [{' | '.join(traces)}]"
+
+    # Fallback to Bing HTML whenever DDG is rate-limited (HTTP 202), non-200, errors, or misses
+    country, bing_note = _gr_search_bing_html(query)
+    traces.append(bing_note)
     if country:
         cache[clean_domain] = country
         _gr_save_cache(cache)
