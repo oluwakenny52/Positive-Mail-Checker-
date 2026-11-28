@@ -12783,6 +12783,7 @@ _GR_IP_FAIL_COUNTS = {}
 _GR_SKIPPED_IPS = {}
 _GR_STICKY_PROXY = None
 _GR_ACTIVE_RUN_ID = None
+_GR_SNAPSHOT_SETTINGS = None
 
 _GR_DEFAULT_SETTINGS = {
     "proxy_tries": 5,
@@ -12793,6 +12794,9 @@ _GR_DEFAULT_SETTINGS = {
     "reuse_wait_unit": "sec",
     "default_scheme": "http",
     "direct_fallback": True,
+    "cache_mode": "on",
+    "use_ddg": "on",
+    "use_bing": "on",
 }
 
 _GR_CCTLD_TO_COUNTRY = {
@@ -12837,16 +12841,10 @@ _GR_TEXT_SIGNALS = [
 ]
 
 
-def _gr_get_settings() -> dict:
+def _gr_normalize_cfg(raw_cfg: Optional[dict]) -> dict:
     cfg = dict(_GR_DEFAULT_SETTINGS)
-    try:
-        ss = getattr(globals().get("str_lit"), "session_state", None)
-        if ss is not None:
-            saved = ss.get("cs_gr_settings")
-            if isinstance(saved, dict):
-                cfg.update(saved)
-    except Exception:
-        pass
+    if isinstance(raw_cfg, dict):
+        cfg.update(raw_cfg)
     cfg["proxy_tries"] = max(1, min(25, int(cfg.get("proxy_tries") or 5)))
     cfg["max_ip_fails"] = max(1, min(15, int(cfg.get("max_ip_fails") or 2)))
     cfg["proxy_sources"] = str(cfg.get("proxy_sources") or "all").strip().lower()
@@ -12861,12 +12859,51 @@ def _gr_get_settings() -> dict:
     )
     cfg["default_scheme"] = "socks5" if str(cfg.get("default_scheme") or "http").strip().lower() == "socks5" else "http"
     cfg["direct_fallback"] = bool(cfg.get("direct_fallback", True))
+    cfg["cache_mode"] = "off" if str(cfg.get("cache_mode") or "on").strip().lower() == "off" else "on"
+    cfg["use_ddg"] = "off" if str(cfg.get("use_ddg") or "on").strip().lower() == "off" else "on"
+    cfg["use_bing"] = "off" if str(cfg.get("use_bing") or "on").strip().lower() == "off" else "on"
     return cfg
+
+
+def _gr_snapshot_settings() -> dict:
+    """Captures current GR settings on the main script thread for worker threads."""
+    global _GR_SNAPSHOT_SETTINGS
+    raw = {}
+    try:
+        ss = getattr(globals().get("str_lit"), "session_state", None)
+        if ss is not None:
+            saved = ss.get("cs_gr_settings")
+            if isinstance(saved, dict):
+                raw = dict(saved)
+    except Exception:
+        pass
+    cfg = _gr_normalize_cfg(raw)
+    with _GR_PROXY_LOCK:
+        _GR_SNAPSHOT_SETTINGS = dict(cfg)
+    return dict(cfg)
+
+
+def _gr_get_settings() -> dict:
+    with _GR_PROXY_LOCK:
+        snap = dict(_GR_SNAPSHOT_SETTINGS) if isinstance(_GR_SNAPSHOT_SETTINGS, dict) else None
+    if snap is not None:
+        return _gr_normalize_cfg(snap)
+    raw = {}
+    try:
+        ss = getattr(globals().get("str_lit"), "session_state", None)
+        if ss is not None:
+            saved = ss.get("cs_gr_settings")
+            if isinstance(saved, dict):
+                raw = dict(saved)
+    except Exception:
+        pass
+    return _gr_normalize_cfg(raw)
 
 
 def gr_begin_run(run_id: Optional[str] = None) -> None:
     """Resets per-run proxy failure counts and skip list at the start of a Global search batch."""
     global _GR_IP_FAIL_COUNTS, _GR_SKIPPED_IPS, _GR_STICKY_PROXY, _GR_ACTIVE_RUN_ID
+    _gr_snapshot_settings()
     with _GR_PROXY_LOCK:
         _GR_IP_FAIL_COUNTS = {}
         _GR_SKIPPED_IPS = {}
@@ -13589,17 +13626,23 @@ def resolve_global_domain(
         clean_domain = clean_domain[4:]
     traces = []
     cfg = _gr_get_settings()
+    cache_enabled = cfg.get("cache_mode", "on") == "on"
+    ddg_enabled = cfg.get("use_ddg", "on") == "on"
+    bing_enabled = cfg.get("use_bing", "on") == "on"
 
-    cache = _gr_load_cache()
-    prior_cached = cache.get(clean_domain)
-    if not force_refresh and prior_cached:
+    cache = _gr_load_cache() if cache_enabled else {}
+    prior_cached = cache.get(clean_domain) if cache_enabled else None
+    if not cache_enabled:
+        traces.append("CACHE:off")
+    elif not force_refresh and prior_cached:
         return prior_cached, f"HIT  {clean_domain:<28} -> {prior_cached} [CACHE]"
-    if force_refresh and prior_cached:
+    elif force_refresh and prior_cached:
         traces.append(f"CACHE:bypassed({prior_cached})")
 
     if rdap_country:
-        cache[clean_domain] = rdap_country
-        _gr_save_cache(cache)
+        if cache_enabled:
+            cache[clean_domain] = rdap_country
+            _gr_save_cache(cache)
         return rdap_country, f"HIT  {clean_domain:<28} -> {rdap_country} [RDAP]"
     traces.append("RDAP:no country")
 
@@ -13618,39 +13661,49 @@ def resolve_global_domain(
     country, tls_note = _gr_check_tls_sans(clean_domain)
     traces.append(tls_note)
     if country:
-        cache[clean_domain] = country
-        _gr_save_cache(cache)
+        if cache_enabled:
+            cache[clean_domain] = country
+            _gr_save_cache(cache)
         return country, f"HIT  {clean_domain:<28} -> {country} [{' | '.join(traces)}]"
 
     country, site_note = _gr_probe_site_direct(clean_domain)
     traces.append(site_note)
     if country:
-        cache[clean_domain] = country
-        _gr_save_cache(cache)
+        if cache_enabled:
+            cache[clean_domain] = country
+            _gr_save_cache(cache)
         return country, f"HIT  {clean_domain:<28} -> {country} [{' | '.join(traces)}]"
 
     brand = clean_domain.split(".")[0]
     query = f'"{clean_domain}" OR "{brand}" headquarters OR address OR contact'
-    country, ddg_note = _gr_search_ddg_html(query, domain=clean_domain)
-    traces.append(ddg_note)
-    if country:
-        cache[clean_domain] = country
-        _gr_save_cache(cache)
-        return country, f"HIT  {clean_domain:<28} -> {country} [{' | '.join(traces)}]"
 
-    # Fallback to Bing HTML whenever DDG is rate-limited (HTTP 202), non-200, errors, or misses
-    country, bing_note = _gr_search_bing_html(query, domain=clean_domain)
-    traces.append(bing_note)
-    if not country and "(0 country signals)" in bing_note:
-        domain_query = f'site:{clean_domain} OR "{clean_domain}" location OR country OR address'
-        country, bing_retry_note = _gr_search_bing_html(domain_query, domain=clean_domain)
-        traces.append(f"retry:{bing_retry_note}")
-    if country:
-        cache[clean_domain] = country
-        _gr_save_cache(cache)
-        return country, f"HIT  {clean_domain:<28} -> {country} [{' | '.join(traces)}]"
+    if ddg_enabled:
+        country, ddg_note = _gr_search_ddg_html(query, domain=clean_domain)
+        traces.append(ddg_note)
+        if country:
+            if cache_enabled:
+                cache[clean_domain] = country
+                _gr_save_cache(cache)
+            return country, f"HIT  {clean_domain:<28} -> {country} [{' | '.join(traces)}]"
+    else:
+        traces.append("WEB(ddg):off")
 
-    if force_refresh and prior_cached and prior_cached in _CS_BY_NAME:
+    if bing_enabled:
+        country, bing_note = _gr_search_bing_html(query, domain=clean_domain)
+        traces.append(bing_note)
+        if not country and "(0 country signals)" in bing_note:
+            domain_query = f'site:{clean_domain} OR "{clean_domain}" location OR country OR address'
+            country, bing_retry_note = _gr_search_bing_html(domain_query, domain=clean_domain)
+            traces.append(f"retry:{bing_retry_note}")
+        if country:
+            if cache_enabled:
+                cache[clean_domain] = country
+                _gr_save_cache(cache)
+            return country, f"HIT  {clean_domain:<28} -> {country} [{' | '.join(traces)}]"
+    else:
+        traces.append("WEB(bing):off")
+
+    if cache_enabled and force_refresh and prior_cached and prior_cached in _CS_BY_NAME:
         traces.append(f"CACHE:preserved({prior_cached})")
         return prior_cached, f"HIT  {clean_domain:<28} -> {prior_cached} [{' | '.join(traces)}]"
 
@@ -14571,384 +14624,154 @@ def kw_drain(wait=0.0):
 # ==========================================================================
 # v13.86 - THE CREDENTIALS SORTER
 # ==========================================================================
-_CS_GLOBAL = "Global"
-_CS_MODES = ("Domain", "Country", "Region")
-_CS_FILE_NAME = "domain_countries.json"
-_CS_SEL_NAME = "sorter_selection.json"
-_CS_GLOBAL_FLAG = "\U0001F310"
-_CS_MARK = "\U0001F5C2"
-_CS_OWNER_KEY = "_cs_owner"
+_CS_GLOBAL, _CS_MODES, _CS_OWNER_KEY = "Global", ("Domain", "Country", "Region"), "_cs_owner"
+_CS_FILE_NAME, _CS_SEL_NAME = "domain_countries.json", "sorter_selection.json"
+_CS_GLOBAL_FLAG, _CS_MARK = "\U0001F310", "\U0001F5C2"
 
-_CS_PROVIDERS_GROUP = "Global providers"
-_CS_PROVIDERS_REGION = "Global providers"
-_CS_PROVIDERS_FLAG = "\U0001F4EC"
-_CS_PROVIDERS_CODE = "GLOBAL"
+_CS_PROVIDERS_GROUP = _CS_PROVIDERS_REGION = "Global providers"
+_CS_PROVIDERS_FLAG, _CS_PROVIDERS_CODE = "\U0001F4EC", "GLOBAL"
 
-_CS_MULTI_SUFFIX = frozenset({
-    "co.uk", "org.uk", "me.uk", "ltd.uk", "plc.uk", "net.uk", "sch.uk", "ac.uk",
-    "com.au", "net.au", "org.au", "edu.au", "gov.au", "id.au", "asn.au",
-    "co.nz", "net.nz", "org.nz", "govt.nz", "ac.nz", "school.nz",
-    "co.za", "org.za", "net.za", "gov.za", "web.za", "ac.za",
-    "com.br", "net.br", "org.br", "gov.br", "art.br",
-    "co.jp", "ne.jp", "or.jp", "ac.jp", "go.jp", "gr.jp", "ed.jp", "ad.jp",
-    "com.tw", "net.tw", "org.tw", "idv.tw", "gov.tw", "edu.tw",
-    "com.cn", "net.cn", "org.cn", "gov.cn", "edu.cn", "ac.cn",
-    "co.kr", "or.kr", "ne.kr", "re.kr", "go.kr", "ac.kr",
-    "com.mx", "com.ar", "com.co", "com.pe", "com.ve", "com.ec", "com.uy",
-    "com.bo", "com.py", "com.do", "com.gt", "com.sv", "com.hn", "com.ni",
-    "co.in", "net.in", "org.in", "firm.in", "gen.in", "ind.in", "ac.in",
-    "com.sg", "com.hk", "com.my", "com.ph", "com.vn", "co.id", "or.id",
-    "com.tr", "com.ua", "co.il", "org.il", "com.sa", "com.eg", "com.ng",
-    "co.ke", "com.pk", "com.bd", "com.np", "com.lk", "co.th", "in.th",
-    "com.gh", "com.qa", "com.kw", "com.bh", "com.om", "com.jo", "com.lb",
-})
+_CS_MULTI_SUFFIX = frozenset("""
+co.uk org.uk me.uk ltd.uk plc.uk net.uk sch.uk ac.uk com.au net.au org.au edu.au gov.au id.au asn.au
+co.nz net.nz org.nz govt.nz ac.nz school.nz co.za org.za net.za gov.za web.za ac.za com.br net.br
+org.br gov.br art.br co.jp ne.jp or.jp ac.jp go.jp gr.jp ed.jp ad.jp com.tw net.tw org.tw idv.tw
+gov.tw edu.tw com.cn net.cn org.cn gov.cn edu.cn ac.cn co.kr or.kr ne.kr re.kr go.kr ac.kr com.mx
+com.ar com.co com.pe com.ve com.ec com.uy com.bo com.py com.do com.gt com.sv com.hn com.ni co.in
+net.in org.in firm.in gen.in ind.in ac.in com.sg com.hk com.my com.ph com.vn co.id or.id com.tr
+com.ua co.il org.il com.sa com.eg com.ng co.ke com.pk com.bd com.np com.lk co.th in.th com.gh
+com.qa com.kw com.bh com.om com.jo com.lb
+""".split())
 
-_CS_PROVIDERS = frozenset({
-    "gmail.com", "googlemail.com",
-    "outlook.com", "hotmail.com", "live.com", "msn.com",
-    "yahoo.com", "ymail.com", "rocketmail.com", "aol.com",
-    "icloud.com", "me.com", "mac.com",
-    "proton.me", "protonmail.com", "pm.me",
-    "tuta.io", "tutanota.com", "tutamail.com", "tuta.com",
-    "fastmail.com", "hushmail.com",
-    "gmx.net", "gmx.com", "mail.com", "email.com", "zoho.com", "zohomail.com",
-})
+_CS_PROVIDERS = frozenset("""
+gmail.com googlemail.com outlook.com hotmail.com live.com msn.com yahoo.com ymail.com rocketmail.com
+aol.com icloud.com me.com mac.com proton.me protonmail.com pm.me tuta.io tutanota.com tutamail.com
+tuta.com fastmail.com hushmail.com gmx.net gmx.com mail.com email.com zoho.com zohomail.com
+""".split())
 
 _CS_REGIONAL_ISP_COUNTRIES = {
-    "qq.com": "China", "foxmail.com": "China", "163.com": "China", "126.com": "China",
-    "yeah.net": "China", "188.com": "China", "sina.com": "China", "sina.cn": "China",
-    "sohu.com": "China", "aliyun.com": "China", "189.cn": "China", "139.com": "China",
-    "wo.cn": "China", "tom.com": "China", "21cn.com": "China",
-    "yandex.com": "Russia", "yandex.ru": "Russia", "ya.ru": "Russia",
-    "yandex.by": "Belarus", "yandex.kz": "Kazakhstan", "yandex.ua": "Ukraine",
-    "mail.ru": "Russia", "inbox.ru": "Russia", "bk.ru": "Russia", "list.ru": "Russia",
-    "internet.ru": "Russia", "rambler.ru": "Russia", "lenta.ru": "Russia",
-    "autorambler.ru": "Russia", "myrambler.ru": "Russia", "ro.ru": "Russia",
-    "ukr.net": "Ukraine",
-    "naver.com": "South Korea", "daum.net": "South Korea", "hanmail.net": "South Korea",
-    "kakao.com": "South Korea", "nate.com": "South Korea",
-    "globo.com": "Brazil", "globomail.com": "Brazil", "uol.com.br": "Brazil",
-    "bol.com.br": "Brazil", "ig.com.br": "Brazil", "terra.com.br": "Brazil",
-    "r7.com": "Brazil", "zipmail.com.br": "Brazil", "oi.com.br": "Brazil",
-    "rediffmail.com": "India", "rediff.com": "India",
-    "laposte.net": "France", "orange.fr": "France", "wanadoo.fr": "France",
-    "free.fr": "France", "sfr.fr": "France", "voila.fr": "France", "neuf.fr": "France",
-    "bbox.fr": "France", "numericable.fr": "France", "club-internet.fr": "France",
-    "hotmail.fr": "France", "live.fr": "France",
-    "maktoob.com": "Jordan",
-    "web.de": "Germany", "t-online.de": "Germany", "freenet.de": "Germany",
-    "arcor.de": "Germany", "online.de": "Germany", "hotmail.de": "Germany", "live.de": "Germany",
-    "libero.it": "Italy", "virgilio.it": "Italy", "tin.it": "Italy", "alice.it": "Italy",
-    "tiscali.it": "Italy", "email.it": "Italy", "pec.it": "Italy",
-    "hotmail.it": "Italy", "live.it": "Italy",
-    "terra.es": "Spain", "ya.com": "Spain", "ozu.es": "Spain",
-    "telefonica.net": "Spain", "hotmail.es": "Spain",
-    "wp.pl": "Poland", "onet.pl": "Poland", "op.pl": "Poland", "interia.pl": "Poland",
-    "interia.eu": "Poland", "o2.pl": "Poland", "tlen.pl": "Poland", "gazeta.pl": "Poland",
-    "seznam.cz": "Czechia", "email.cz": "Czechia", "post.cz": "Czechia",
-    "centrum.cz": "Czechia", "volny.cz": "Czechia", "atlas.cz": "Czechia",
-    "centrum.sk": "Slovakia", "azet.sk": "Slovakia", "zoznam.sk": "Slovakia",
-    "freemail.hu": "Hungary", "citromail.hu": "Hungary", "indamail.hu": "Hungary",
-    "docomo.ne.jp": "Japan", "ezweb.ne.jp": "Japan", "au.com": "Japan",
-    "softbank.ne.jp": "Japan", "i.softbank.jp": "Japan", "nifty.com": "Japan",
-    "biglobe.ne.jp": "Japan", "ocn.ne.jp": "Japan", "so-net.ne.jp": "Japan",
-    "excite.co.jp": "Japan", "goo.ne.jp": "Japan",
-    "pchome.com.tw": "Taiwan", "hinet.net": "Taiwan", "msa.hinet.net": "Taiwan",
-    "comcast.net": "United States", "verizon.net": "United States", "att.net": "United States",
-    "sbcglobal.net": "United States", "bellsouth.net": "United States", "pacbell.net": "United States",
-    "ameritech.net": "United States", "swbell.net": "United States", "cox.net": "United States",
-    "charter.net": "United States", "spectrum.net": "United States", "rr.com": "United States",
-    "roadrunner.com": "United States", "twc.com": "United States", "earthlink.net": "United States",
-    "mindspring.com": "United States", "optonline.net": "United States", "optimum.net": "United States",
-    "juno.com": "United States", "netzero.net": "United States", "centurylink.net": "United States",
-    "centurytel.net": "United States", "q.com": "United States", "embarqmail.com": "United States",
-    "windstream.net": "United States", "frontier.com": "United States", "frontiernet.net": "United States",
-    "suddenlink.net": "United States", "mediacombb.net": "United States", "rcn.com": "United States",
-    "hughes.net": "United States",
-    "rogers.com": "Canada", "bell.net": "Canada", "eastlink.ca": "Canada",
-    "shaw.ca": "Canada", "sympatico.ca": "Canada", "videotron.ca": "Canada",
-    "telus.net": "Canada", "telusplanet.net": "Canada", "cogeco.ca": "Canada",
-    "sasktel.net": "Canada", "mts.net": "Canada",
-    "bigpond.com": "Australia", "bigpond.net.au": "Australia", "bigpond.com.au": "Australia",
-    "optusnet.com.au": "Australia", "iinet.net.au": "Australia", "internode.on.net": "Australia",
-    "tpg.com.au": "Australia", "dodo.com.au": "Australia", "adam.com.au": "Australia",
-    "westnet.com.au": "Australia", "ozemail.com.au": "Australia",
-    "btinternet.com": "United Kingdom", "btopenworld.com": "United Kingdom", "bt.com": "United Kingdom",
-    "sky.com": "United Kingdom", "virginmedia.com": "United Kingdom", "virgin.net": "United Kingdom",
-    "ntlworld.com": "United Kingdom", "blueyonder.co.uk": "United Kingdom",
-    "talktalk.net": "United Kingdom", "tiscali.co.uk": "United Kingdom", "lineone.net": "United Kingdom",
-    "plus.com": "United Kingdom", "plus.net": "United Kingdom", "force9.co.uk": "United Kingdom",
-    "freeserve.co.uk": "United Kingdom", "orange.net": "United Kingdom", "ee.co.uk": "United Kingdom",
-    "hotmail.co.uk": "United Kingdom", "live.co.uk": "United Kingdom",
-    "xtra.co.nz": "New Zealand", "spark.co.nz": "New Zealand", "vodafone.co.nz": "New Zealand",
-    "clear.net.nz": "New Zealand", "slingshot.co.nz": "New Zealand",
-    "ziggo.nl": "Netherlands", "kpnmail.nl": "Netherlands", "kpnplanet.nl": "Netherlands",
-    "planet.nl": "Netherlands", "hetnet.nl": "Netherlands", "home.nl": "Netherlands",
-    "chello.nl": "Netherlands", "zonnet.nl": "Netherlands", "xs4all.nl": "Netherlands",
-    "casema.nl": "Netherlands", "upcmail.nl": "Netherlands", "quicknet.nl": "Netherlands",
-    "live.nl": "Netherlands",
-    "telenet.be": "Belgium", "skynet.be": "Belgium", "proximus.be": "Belgium",
-    "scarlet.be": "Belgium", "voo.be": "Belgium", "brutele.be": "Belgium",
-    "bluewin.ch": "Switzerland", "hispeed.ch": "Switzerland", "sunrise.ch": "Switzerland",
-    "swissonline.ch": "Switzerland", "gmx.ch": "Switzerland",
-    "aon.at": "Austria", "chello.at": "Austria", "inode.at": "Austria",
-    "magenta.at": "Austria", "kabsi.at": "Austria",
-    "telia.com": "Sweden", "telia.se": "Sweden", "bredband.net": "Sweden", "comhem.se": "Sweden",
-    "online.no": "Norway", "broadpark.no": "Norway", "getmail.no": "Norway",
-    "tdcadsl.dk": "Denmark", "mail.dk": "Denmark", "stofanet.dk": "Denmark", "youmail.dk": "Denmark",
-    "mweb.co.za": "South Africa", "telkomsa.net": "South Africa", "vodamail.co.za": "South Africa",
-    "iafrica.com": "South Africa", "absamail.co.za": "South Africa", "webmail.co.za": "South Africa",
+    dom: ctry
+    for ctry, doms in {
+        "China": "qq.com foxmail.com 163.com 126.com yeah.net 188.com sina.com sina.cn sohu.com aliyun.com 189.cn 139.com wo.cn tom.com 21cn.com",
+        "Russia": "yandex.com yandex.ru ya.ru mail.ru inbox.ru bk.ru list.ru internet.ru rambler.ru lenta.ru autorambler.ru myrambler.ru ro.ru",
+        "Belarus": "yandex.by", "Kazakhstan": "yandex.kz", "Ukraine": "yandex.ua ukr.net",
+        "South Korea": "naver.com daum.net hanmail.net kakao.com nate.com",
+        "Brazil": "globo.com globomail.com uol.com.br bol.com.br ig.com.br terra.com.br r7.com zipmail.com.br oi.com.br",
+        "India": "rediffmail.com rediff.com",
+        "France": "laposte.net orange.fr wanadoo.fr free.fr sfr.fr voila.fr neuf.fr bbox.fr numericable.fr club-internet.fr hotmail.fr live.fr",
+        "Jordan": "maktoob.com",
+        "Germany": "web.de t-online.de freenet.de arcor.de online.de hotmail.de live.de",
+        "Italy": "libero.it virgilio.it tin.it alice.it tiscali.it email.it pec.it hotmail.it live.it",
+        "Spain": "terra.es ya.com ozu.es telefonica.net hotmail.es",
+        "Poland": "wp.pl onet.pl op.pl interia.pl interia.eu o2.pl tlen.pl gazeta.pl",
+        "Czechia": "seznam.cz email.cz post.cz centrum.cz volny.cz atlas.cz",
+        "Slovakia": "centrum.sk azet.sk zoznam.sk", "Hungary": "freemail.hu citromail.hu indamail.hu",
+        "Japan": "docomo.ne.jp ezweb.ne.jp au.com softbank.ne.jp i.softbank.jp nifty.com biglobe.ne.jp ocn.ne.jp so-net.ne.jp excite.co.jp goo.ne.jp",
+        "Taiwan": "pchome.com.tw hinet.net msa.hinet.net",
+        "United States": "comcast.net verizon.net att.net sbcglobal.net bellsouth.net pacbell.net ameritech.net swbell.net cox.net charter.net spectrum.net rr.com roadrunner.com twc.com earthlink.net mindspring.com optonline.net optimum.net juno.com netzero.net centurylink.net centurytel.net q.com embarqmail.com windstream.net frontier.com frontiernet.net suddenlink.net mediacombb.net rcn.com hughes.net",
+        "Canada": "rogers.com bell.net eastlink.ca shaw.ca sympatico.ca videotron.ca telus.net telusplanet.net cogeco.ca sasktel.net mts.net",
+        "Australia": "bigpond.com bigpond.net.au bigpond.com.au optusnet.com.au iinet.net.au internode.on.net tpg.com.au dodo.com.au adam.com.au westnet.com.au ozemail.com.au",
+        "United Kingdom": "btinternet.com btopenworld.com bt.com sky.com virginmedia.com virgin.net ntlworld.com blueyonder.co.uk talktalk.net tiscali.co.uk lineone.net plus.com plus.net force9.co.uk freeserve.co.uk orange.net ee.co.uk hotmail.co.uk live.co.uk",
+        "New Zealand": "xtra.co.nz spark.co.nz vodafone.co.nz clear.net.nz slingshot.co.nz",
+        "Netherlands": "ziggo.nl kpnmail.nl kpnplanet.nl planet.nl hetnet.nl home.nl chello.nl zonnet.nl xs4all.nl casema.nl upcmail.nl quicknet.nl live.nl",
+        "Belgium": "telenet.be skynet.be proximus.be scarlet.be voo.be brutele.be",
+        "Switzerland": "bluewin.ch hispeed.ch sunrise.ch swissonline.ch gmx.ch",
+        "Austria": "aon.at chello.at inode.at magenta.at kabsi.at",
+        "Sweden": "telia.com telia.se bredband.net comhem.se",
+        "Norway": "online.no broadpark.no getmail.no",
+        "Denmark": "tdcadsl.dk mail.dk stofanet.dk youmail.dk",
+        "South Africa": "mweb.co.za telkomsa.net vodamail.co.za iafrica.com absamail.co.za webmail.co.za",
+    }.items()
+    for dom in doms.split()
 }
 
-_CS_COUNTRIES = (
-    ("AF", "Afghanistan", "Asia", 33.9, 67.7),
-    ("AX", "Aland Islands", "Europe", 60.2, 20.0),
-    ("AL", "Albania", "Europe", 41.2, 20.2),
-    ("DZ", "Algeria", "Africa", 28.0, 1.7),
-    ("AD", "Andorra", "Europe", 42.5, 1.6),
-    ("AO", "Angola", "Africa", -11.2, 17.9),
-    ("AI", "Anguilla", "Caribbean", 18.2, -63.1),
-    ("AQ", "Antarctica", "Antarctica", -75.0, 0.0),
-    ("AG", "Antigua and Barbuda", "Caribbean", 17.1, -61.8),
-    ("AR", "Argentina", "South America", -38.4, -63.6),
-    ("AM", "Armenia", "Asia", 40.1, 45.0),
-    ("AW", "Aruba", "Caribbean", 12.5, -69.9),
-    ("AU", "Australia", "Oceania", -25.3, 133.8),
-    ("AT", "Austria", "Europe", 47.5, 14.6),
-    ("AZ", "Azerbaijan", "Asia", 40.1, 47.6),
-    ("BS", "Bahamas", "Caribbean", 25.0, -77.4),
-    ("BH", "Bahrain", "Middle East", 26.0, 50.6),
-    ("BD", "Bangladesh", "Asia", 23.7, 90.4),
-    ("BB", "Barbados", "Caribbean", 13.2, -59.5),
-    ("BY", "Belarus", "Europe", 53.7, 27.9),
-    ("BE", "Belgium", "Europe", 50.5, 4.5),
-    ("BZ", "Belize", "Central America", 17.2, -88.5),
-    ("BJ", "Benin", "Africa", 9.3, 2.3),
-    ("BM", "Bermuda", "North America", 32.3, -64.8),
-    ("BT", "Bhutan", "Asia", 27.5, 90.4),
-    ("BO", "Bolivia", "South America", -16.3, -63.6),
-    ("BA", "Bosnia and Herzegovina", "Europe", 43.9, 17.7),
-    ("BW", "Botswana", "Africa", -22.3, 24.7),
-    ("BV", "Bouvet Island", "Antarctica", -54.4, 3.4),
-    ("BR", "Brazil", "South America", -14.2, -51.9),
-    ("VG", "British Virgin Islands", "Caribbean", 18.4, -64.6),
-    ("BN", "Brunei", "Asia", 4.5, 114.7),
-    ("BG", "Bulgaria", "Europe", 42.7, 25.5),
-    ("BF", "Burkina Faso", "Africa", 12.2, -1.6),
-    ("BI", "Burundi", "Africa", -3.4, 29.9),
-    ("KH", "Cambodia", "Asia", 12.6, 104.9),
-    ("CM", "Cameroon", "Africa", 7.4, 12.4),
-    ("CA", "Canada", "North America", 56.1, -106.3),
-    ("CV", "Cape Verde", "Africa", 16.0, -24.0),
-    ("BQ", "Caribbean Netherlands", "Caribbean", 12.2, -68.2),
-    ("KY", "Cayman Islands", "Caribbean", 19.3, -81.3),
-    ("CF", "Central African Republic", "Africa", 6.6, 20.9),
-    ("TD", "Chad", "Africa", 15.5, 18.7),
-    ("CL", "Chile", "South America", -35.7, -71.5),
-    ("CN", "China", "Asia", 35.9, 104.2),
-    ("CX", "Christmas Island", "Oceania", -10.5, 105.7),
-    ("CC", "Cocos (Keeling) Islands", "Oceania", -12.2, 96.8),
-    ("CO", "Colombia", "South America", 4.6, -74.3),
-    ("KM", "Comoros", "Africa", -11.6, 43.3),
-    ("CG", "Congo (Brazzaville)", "Africa", -0.2, 15.8),
-    ("CD", "Congo (Kinshasa)", "Africa", -4.0, 21.8),
-    ("CK", "Cook Islands", "Oceania", -21.2, -159.8),
-    ("CR", "Costa Rica", "Central America", 9.7, -83.8),
-    ("HR", "Croatia", "Europe", 45.1, 15.2),
-    ("CU", "Cuba", "Caribbean", 21.5, -77.8),
-    ("CW", "Curacao", "Caribbean", 12.2, -69.0),
-    ("CY", "Cyprus", "Europe", 35.1, 33.4),
-    ("CZ", "Czechia", "Europe", 49.8, 15.5),
-    ("DK", "Denmark", "Europe", 56.3, 9.5),
-    ("DJ", "Djibouti", "Africa", 11.8, 42.6),
-    ("DM", "Dominica", "Caribbean", 15.4, -61.4),
-    ("DO", "Dominican Republic", "Caribbean", 18.7, -70.2),
-    ("EC", "Ecuador", "South America", -1.8, -78.2),
-    ("EG", "Egypt", "Africa", 26.8, 30.8),
-    ("SV", "El Salvador", "Central America", 13.8, -88.9),
-    ("GQ", "Equatorial Guinea", "Africa", 1.7, 10.3),
-    ("ER", "Eritrea", "Africa", 15.2, 39.8),
-    ("EE", "Estonia", "Europe", 58.6, 25.0),
-    ("SZ", "Eswatini", "Africa", -26.5, 31.5),
-    ("ET", "Ethiopia", "Africa", 9.1, 40.5),
-    ("FK", "Falkland Islands", "South America", -51.8, -59.0),
-    ("FO", "Faroe Islands", "Europe", 62.0, -6.8),
-    ("FJ", "Fiji", "Oceania", -17.7, 178.1),
-    ("FI", "Finland", "Europe", 61.9, 25.7),
-    ("FR", "France", "Europe", 46.2, 2.2),
-    ("GF", "French Guiana", "South America", 4.0, -53.0),
-    ("PF", "French Polynesia", "Oceania", -17.7, -149.4),
-    ("TF", "French Southern Territories", "Antarctica", -49.3, 69.2),
-    ("GA", "Gabon", "Africa", -0.8, 11.6),
-    ("GM", "Gambia", "Africa", 13.4, -15.4),
-    ("GE", "Georgia", "Asia", 42.3, 43.4),
-    ("DE", "Germany", "Europe", 51.2, 10.5),
-    ("GH", "Ghana", "Africa", 7.9, -1.0),
-    ("GI", "Gibraltar", "Europe", 36.1, -5.4),
-    ("GR", "Greece", "Europe", 39.1, 21.8),
-    ("GL", "Greenland", "North America", 72.0, -40.0),
-    ("GD", "Grenada", "Caribbean", 12.1, -61.7),
-    ("GP", "Guadeloupe", "Caribbean", 16.3, -61.6),
-    ("GU", "Guam", "Oceania", 13.4, 144.8),
-    ("GT", "Guatemala", "Central America", 15.8, -90.2),
-    ("GG", "Guernsey", "Europe", 49.5, -2.6),
-    ("GN", "Guinea", "Africa", 9.9, -9.6),
-    ("GW", "Guinea-Bissau", "Africa", 11.8, -15.2),
-    ("GY", "Guyana", "South America", 4.9, -58.9),
-    ("HT", "Haiti", "Caribbean", 18.9, -72.3),
-    ("HM", "Heard Island and McDonald Islands", "Antarctica", -53.1, 73.5),
-    ("HN", "Honduras", "Central America", 15.2, -86.2),
-    ("HK", "Hong Kong", "Asia", 22.3, 114.2),
-    ("HU", "Hungary", "Europe", 47.2, 19.5),
-    ("IS", "Iceland", "Europe", 65.0, -18.6),
-    ("IN", "India", "Asia", 20.6, 79.0),
-    ("ID", "Indonesia", "Asia", -0.8, 113.9),
-    ("IR", "Iran", "Middle East", 32.4, 53.7),
-    ("IQ", "Iraq", "Middle East", 33.2, 43.7),
-    ("IE", "Ireland", "Europe", 53.4, -8.2),
-    ("IM", "Isle of Man", "Europe", 54.2, -4.5),
-    ("IL", "Israel", "Middle East", 31.0, 34.9),
-    ("IT", "Italy", "Europe", 41.9, 12.6),
-    ("CI", "Ivory Coast", "Africa", 7.5, -5.5),
-    ("JM", "Jamaica", "Caribbean", 18.1, -77.3),
-    ("JP", "Japan", "Asia", 36.2, 138.3),
-    ("JE", "Jersey", "Europe", 49.2, -2.1),
-    ("JO", "Jordan", "Middle East", 30.6, 36.2),
-    ("KZ", "Kazakhstan", "Asia", 48.0, 66.9),
-    ("KE", "Kenya", "Africa", -0.0, 37.9),
-    ("KI", "Kiribati", "Oceania", 1.9, -157.4),
-    ("XK", "Kosovo", "Europe", 42.6, 20.9),
-    ("KW", "Kuwait", "Middle East", 29.3, 47.5),
-    ("KG", "Kyrgyzstan", "Asia", 41.2, 74.8),
-    ("LA", "Laos", "Asia", 19.9, 102.5),
-    ("LV", "Latvia", "Europe", 56.9, 24.6),
-    ("LB", "Lebanon", "Middle East", 33.9, 35.9),
-    ("LS", "Lesotho", "Africa", -29.6, 28.2),
-    ("LR", "Liberia", "Africa", 6.4, -9.4),
-    ("LY", "Libya", "Africa", 26.3, 17.2),
-    ("LI", "Liechtenstein", "Europe", 47.2, 9.6),
-    ("LT", "Lithuania", "Europe", 55.2, 23.9),
-    ("LU", "Luxembourg", "Europe", 49.8, 6.1),
-    ("MO", "Macau", "Asia", 22.2, 113.5),
-    ("MG", "Madagascar", "Africa", -18.8, 46.9),
-    ("MW", "Malawi", "Africa", -13.3, 34.3),
-    ("MY", "Malaysia", "Asia", 4.2, 101.9),
-    ("MV", "Maldives", "Asia", 3.2, 73.2),
-    ("ML", "Mali", "Africa", 17.6, -4.0),
-    ("MT", "Malta", "Europe", 35.9, 14.4),
-    ("MH", "Marshall Islands", "Oceania", 7.1, 171.2),
-    ("MQ", "Martinique", "Caribbean", 14.6, -61.0),
-    ("MR", "Mauritania", "Africa", 21.0, -10.9),
-    ("MU", "Mauritius", "Africa", -20.3, 57.6),
-    ("YT", "Mayotte", "Africa", -12.8, 45.2),
-    ("MX", "Mexico", "North America", 23.6, -102.6),
-    ("FM", "Micronesia", "Oceania", 6.9, 158.2),
-    ("MD", "Moldova", "Europe", 47.4, 28.4),
-    ("MC", "Monaco", "Europe", 43.7, 7.4),
-    ("MN", "Mongolia", "Asia", 46.9, 103.8),
-    ("ME", "Montenegro", "Europe", 42.7, 19.4),
-    ("MS", "Montserrat", "Caribbean", 16.7, -62.2),
-    ("MA", "Morocco", "Africa", 31.8, -7.1),
-    ("MZ", "Mozambique", "Africa", -18.7, 35.5),
-    ("MM", "Myanmar", "Asia", 21.9, 95.9),
-    ("NA", "Namibia", "Africa", -22.9, 18.5),
-    ("NR", "Nauru", "Oceania", -0.5, 166.9),
-    ("NP", "Nepal", "Asia", 28.4, 84.1),
-    ("NL", "Netherlands", "Europe", 52.1, 5.3),
-    ("NC", "New Caledonia", "Oceania", -21.3, 165.5),
-    ("NZ", "New Zealand", "Oceania", -40.9, 174.9),
-    ("NI", "Nicaragua", "Central America", 12.9, -85.2),
-    ("NE", "Niger", "Africa", 17.6, 8.1),
-    ("NG", "Nigeria", "Africa", 9.1, 8.7),
-    ("NU", "Niue", "Oceania", -19.1, -169.9),
-    ("NF", "Norfolk Island", "Oceania", -29.0, 168.0),
-    ("KP", "North Korea", "Asia", 40.3, 127.5),
-    ("MK", "North Macedonia", "Europe", 41.6, 21.7),
-    ("MP", "Northern Mariana Islands", "Oceania", 15.2, 145.8),
-    ("NO", "Norway", "Europe", 60.5, 8.5),
-    ("OM", "Oman", "Middle East", 21.5, 55.9),
-    ("PK", "Pakistan", "Asia", 30.4, 69.3),
-    ("PW", "Palau", "Oceania", 7.5, 134.6),
-    ("PS", "Palestine", "Middle East", 31.9, 35.2),
-    ("PA", "Panama", "Central America", 8.5, -80.8),
-    ("PG", "Papua New Guinea", "Oceania", -6.3, 143.9),
-    ("PY", "Paraguay", "South America", -23.4, -58.4),
-    ("PE", "Peru", "South America", -9.2, -75.0),
-    ("PH", "Philippines", "Asia", 12.9, 121.8),
-    ("PN", "Pitcairn", "Oceania", -25.1, -130.1),
-    ("PL", "Poland", "Europe", 51.9, 19.1),
-    ("PT", "Portugal", "Europe", 39.4, -8.2),
-    ("PR", "Puerto Rico", "Caribbean", 18.2, -66.6),
-    ("QA", "Qatar", "Middle East", 25.4, 51.2),
-    ("RE", "Reunion", "Africa", -21.1, 55.5),
-    ("RO", "Romania", "Europe", 45.9, 24.9),
-    ("RU", "Russia", "Europe", 61.5, 105.3),
-    ("RW", "Rwanda", "Africa", -1.9, 29.9),
-    ("BL", "Saint Barthelemy", "Caribbean", 17.9, -62.8),
-    ("SH", "Saint Helena", "Africa", -15.9, -5.7),
-    ("KN", "Saint Kitts and Nevis", "Caribbean", 17.4, -62.8),
-    ("LC", "Saint Lucia", "Caribbean", 13.9, -61.0),
-    ("MF", "Saint Martin", "Caribbean", 18.1, -63.1),
-    ("PM", "Saint Pierre and Miquelon", "North America", 46.9, -56.3),
-    ("VC", "Saint Vincent and the Grenadines", "Caribbean", 13.3, -61.2),
-    ("WS", "Samoa", "Oceania", -13.8, -172.1),
-    ("SM", "San Marino", "Europe", 43.9, 12.5),
-    ("ST", "Sao Tome and Principe", "Africa", 0.2, 6.6),
-    ("SA", "Saudi Arabia", "Middle East", 23.9, 45.1),
-    ("SN", "Senegal", "Africa", 14.5, -14.5),
-    ("RS", "Serbia", "Europe", 44.0, 21.0),
-    ("SC", "Seychelles", "Africa", -4.7, 55.5),
-    ("SL", "Sierra Leone", "Africa", 8.5, -11.8),
-    ("SG", "Singapore", "Asia", 1.4, 103.8),
-    ("SX", "Sint Maarten", "Caribbean", 18.0, -63.1),
-    ("SK", "Slovakia", "Europe", 48.7, 19.7),
-    ("SI", "Slovenia", "Europe", 46.2, 15.0),
-    ("SB", "Solomon Islands", "Oceania", -9.6, 160.2),
-    ("SO", "Somalia", "Africa", 5.2, 46.2),
-    ("ZA", "South Africa", "Africa", -30.6, 22.9),
-    ("GS", "South Georgia", "South America", -54.4, -36.6),
-    ("KR", "South Korea", "Asia", 35.9, 127.8),
-    ("SS", "South Sudan", "Africa", 7.0, 30.9),
-    ("ES", "Spain", "Europe", 40.5, -3.7),
-    ("LK", "Sri Lanka", "Asia", 7.9, 80.8),
-    ("SD", "Sudan", "Africa", 15.5, 30.2),
-    ("SR", "Suriname", "South America", 3.9, -56.0),
-    ("SJ", "Svalbard and Jan Mayen", "Europe", 78.2, 15.6),
-    ("SE", "Sweden", "Europe", 60.1, 18.6),
-    ("CH", "Switzerland", "Europe", 46.8, 8.2),
-    ("SY", "Syria", "Middle East", 34.8, 39.0),
-    ("TW", "Taiwan", "Asia", 23.7, 121.0),
-    ("TJ", "Tajikistan", "Asia", 38.9, 71.3),
-    ("TZ", "Tanzania", "Africa", -6.4, 34.9),
-    ("TH", "Thailand", "Asia", 15.9, 101.0),
-    ("TL", "Timor-Leste", "Asia", -8.9, 125.7),
-    ("TG", "Togo", "Africa", 8.6, 0.8),
-    ("TK", "Tokelau", "Oceania", -9.2, -171.8),
-    ("TO", "Tonga", "Oceania", -21.2, -175.2),
-    ("TT", "Trinidad and Tobago", "Caribbean", 10.7, -61.2),
-    ("TN", "Tunisia", "Africa", 33.9, 9.5),
-    ("TR", "Turkey", "Middle East", 39.0, 35.2),
-    ("TM", "Turkmenistan", "Asia", 38.9, 59.6),
-    ("TC", "Turks and Caicos Islands", "Caribbean", 21.7, -71.8),
-    ("TV", "Tuvalu", "Oceania", -7.5, 178.7),
-    ("UM", "US Minor Outlying Islands", "Oceania", 19.3, 166.6),
-    ("VI", "US Virgin Islands", "Caribbean", 18.3, -64.9),
-    ("UG", "Uganda", "Africa", 1.4, 32.3),
-    ("UA", "Ukraine", "Europe", 48.4, 31.2),
-    ("AE", "United Arab Emirates", "Middle East", 23.4, 53.8),
-    ("GB", "United Kingdom", "Europe", 55.4, -3.4),
-    ("US", "United States", "North America", 39.8, -98.6),
-    ("UY", "Uruguay", "South America", -32.5, -55.8),
-    ("UZ", "Uzbekistan", "Asia", 41.4, 64.6),
-    ("VU", "Vanuatu", "Oceania", -15.4, 166.9),
-    ("VA", "Vatican City", "Europe", 41.9, 12.5),
-    ("VE", "Venezuela", "South America", 6.4, -66.6),
-    ("VN", "Vietnam", "Asia", 14.1, 108.3),
-    ("WF", "Wallis and Futuna", "Oceania", -13.3, -176.2),
-    ("EH", "Western Sahara", "Africa", 24.2, -12.9),
-    ("YE", "Yemen", "Middle East", 15.6, 48.5),
-    ("ZM", "Zambia", "Africa", -13.1, 27.9),
-    ("ZW", "Zimbabwe", "Africa", -19.0, 29.2),
+_CS_COUNTRIES = tuple(
+    (c, n, r, float(la), float(lo))
+    for ln in """
+AF|Afghanistan|Asia|33.9|67.7;AX|Aland Islands|Europe|60.2|20.0;AL|Albania|Europe|41.2|20.2
+DZ|Algeria|Africa|28.0|1.7;AD|Andorra|Europe|42.5|1.6;AO|Angola|Africa|-11.2|17.9
+AI|Anguilla|Caribbean|18.2|-63.1;AQ|Antarctica|Antarctica|-75.0|0.0;AG|Antigua and Barbuda|Caribbean|17.1|-61.8
+AR|Argentina|South America|-38.4|-63.6;AM|Armenia|Asia|40.1|45.0;AW|Aruba|Caribbean|12.5|-69.9
+AU|Australia|Oceania|-25.3|133.8;AT|Austria|Europe|47.5|14.6;AZ|Azerbaijan|Asia|40.1|47.6
+BS|Bahamas|Caribbean|25.0|-77.4;BH|Bahrain|Middle East|26.0|50.6;BD|Bangladesh|Asia|23.7|90.4
+BB|Barbados|Caribbean|13.2|-59.5;BY|Belarus|Europe|53.7|27.9;BE|Belgium|Europe|50.5|4.5
+BZ|Belize|Central America|17.2|-88.5;BJ|Benin|Africa|9.3|2.3;BM|Bermuda|North America|32.3|-64.8
+BT|Bhutan|Asia|27.5|90.4;BO|Bolivia|South America|-16.3|-63.6;BA|Bosnia and Herzegovina|Europe|43.9|17.7
+BW|Botswana|Africa|-22.3|24.7;BV|Bouvet Island|Antarctica|-54.4|3.4;BR|Brazil|South America|-14.2|-51.9
+VG|British Virgin Islands|Caribbean|18.4|-64.6;BN|Brunei|Asia|4.5|114.7;BG|Bulgaria|Europe|42.7|25.5
+BF|Burkina Faso|Africa|12.2|-1.6;BI|Burundi|Africa|-3.4|29.9;KH|Cambodia|Asia|12.6|104.9
+CM|Cameroon|Africa|7.4|12.4;CA|Canada|North America|56.1|-106.3;CV|Cape Verde|Africa|16.0|-24.0
+BQ|Caribbean Netherlands|Caribbean|12.2|-68.2;KY|Cayman Islands|Caribbean|19.3|-81.3;CF|Central African Republic|Africa|6.6|20.9
+TD|Chad|Africa|15.5|18.7;CL|Chile|South America|-35.7|-71.5;CN|China|Asia|35.9|104.2
+CX|Christmas Island|Oceania|-10.5|105.7;CC|Cocos (Keeling) Islands|Oceania|-12.2|96.8;CO|Colombia|South America|4.6|-74.3
+KM|Comoros|Africa|-11.6|43.3;CG|Congo (Brazzaville)|Africa|-0.2|15.8;CD|Congo (Kinshasa)|Africa|-4.0|21.8
+CK|Cook Islands|Oceania|-21.2|-159.8;CR|Costa Rica|Central America|9.7|-83.8;HR|Croatia|Europe|45.1|15.2
+CU|Cuba|Caribbean|21.5|-77.8;CW|Curacao|Caribbean|12.2|-69.0;CY|Cyprus|Europe|35.1|33.4
+CZ|Czechia|Europe|49.8|15.5;DK|Denmark|Europe|56.3|9.5;DJ|Djibouti|Africa|11.8|42.6
+DM|Dominica|Caribbean|15.4|-61.4;DO|Dominican Republic|Caribbean|18.7|-70.2;EC|Ecuador|South America|-1.8|-78.2
+EG|Egypt|Africa|26.8|30.8;SV|El Salvador|Central America|13.8|-88.9;GQ|Equatorial Guinea|Africa|1.7|10.3
+ER|Eritrea|Africa|15.2|39.8;EE|Estonia|Europe|58.6|25.0;SZ|Eswatini|Africa|-26.5|31.5
+ET|Ethiopia|Africa|9.1|40.5;FK|Falkland Islands|South America|-51.8|-59.0;FO|Faroe Islands|Europe|62.0|-6.8
+FJ|Fiji|Oceania|-17.7|178.1;FI|Finland|Europe|61.9|25.7;FR|France|Europe|46.2|2.2
+GF|French Guiana|South America|4.0|-53.0;PF|French Polynesia|Oceania|-17.7|-149.4;TF|French Southern Territories|Antarctica|-49.3|69.2
+GA|Gabon|Africa|-0.8|11.6;GM|Gambia|Africa|13.4|-15.4;GE|Georgia|Asia|42.3|43.4
+DE|Germany|Europe|51.2|10.5;GH|Ghana|Africa|7.9|-1.0;GI|Gibraltar|Europe|36.1|-5.4
+GR|Greece|Europe|39.1|21.8;GL|Greenland|North America|72.0|-40.0;GD|Grenada|Caribbean|12.1|-61.7
+GP|Guadeloupe|Caribbean|16.3|-61.6;GU|Guam|Oceania|13.4|144.8;GT|Guatemala|Central America|15.8|-90.2
+GG|Guernsey|Europe|49.5|-2.6;GN|Guinea|Africa|9.9|-9.6;GW|Guinea-Bissau|Africa|11.8|-15.2
+GY|Guyana|South America|4.9|-58.9;HT|Haiti|Caribbean|18.9|-72.3;HM|Heard Island and McDonald Islands|Antarctica|-53.1|73.5
+HN|Honduras|Central America|15.2|-86.2;HK|Hong Kong|Asia|22.3|114.2;HU|Hungary|Europe|47.2|19.5
+IS|Iceland|Europe|65.0|-18.6;IN|India|Asia|20.6|79.0;ID|Indonesia|Asia|-0.8|113.9
+IR|Iran|Middle East|32.4|53.7;IQ|Iraq|Middle East|33.2|43.7;IE|Ireland|Europe|53.4|-8.2
+IM|Isle of Man|Europe|54.2|-4.5;IL|Israel|Middle East|31.0|34.9;IT|Italy|Europe|41.9|12.6
+CI|Ivory Coast|Africa|7.5|-5.5;JM|Jamaica|Caribbean|18.1|-77.3;JP|Japan|Asia|36.2|138.3
+JE|Jersey|Europe|49.2|-2.1;JO|Jordan|Middle East|30.6|36.2;KZ|Kazakhstan|Asia|48.0|66.9
+KE|Kenya|Africa|-0.0|37.9;KI|Kiribati|Oceania|1.9|-157.4;XK|Kosovo|Europe|42.6|20.9
+KW|Kuwait|Middle East|29.3|47.5;KG|Kyrgyzstan|Asia|41.2|74.8;LA|Laos|Asia|19.9|102.5
+LV|Latvia|Europe|56.9|24.6;LB|Lebanon|Middle East|33.9|35.9;LS|Lesotho|Africa|-29.6|28.2
+LR|Liberia|Africa|6.4|-9.4;LY|Libya|Africa|26.3|17.2;LI|Liechtenstein|Europe|47.2|9.6
+LT|Lithuania|Europe|55.2|23.9;LU|Luxembourg|Europe|49.8|6.1;MO|Macau|Asia|22.2|113.5
+MG|Madagascar|Africa|-18.8|46.9;MW|Malawi|Africa|-13.3|34.3;MY|Malaysia|Asia|4.2|101.9
+MV|Maldives|Asia|3.2|73.2;ML|Mali|Africa|17.6|-4.0;MT|Malta|Europe|35.9|14.4
+MH|Marshall Islands|Oceania|7.1|171.2;MQ|Martinique|Caribbean|14.6|-61.0;MR|Mauritania|Africa|21.0|-10.9
+MU|Mauritius|Africa|-20.3|57.6;YT|Mayotte|Africa|-12.8|45.2;MX|Mexico|North America|23.6|-102.6
+FM|Micronesia|Oceania|6.9|158.2;MD|Moldova|Europe|47.4|28.4;MC|Monaco|Europe|43.7|7.4
+MN|Mongolia|Asia|46.9|103.8;ME|Montenegro|Europe|42.7|19.4;MS|Montserrat|Caribbean|16.7|-62.2
+MA|Morocco|Africa|31.8|-7.1;MZ|Mozambique|Africa|-18.7|35.5;MM|Myanmar|Asia|21.9|95.9
+NA|Namibia|Africa|-22.9|18.5;NR|Nauru|Oceania|-0.5|166.9;NP|Nepal|Asia|28.4|84.1
+NL|Netherlands|Europe|52.1|5.3;NC|New Caledonia|Oceania|-21.3|165.5;NZ|New Zealand|Oceania|-40.9|174.9
+NI|Nicaragua|Central America|12.9|-85.2;NE|Niger|Africa|17.6|8.1;NG|Nigeria|Africa|9.1|8.7
+NU|Niue|Oceania|-19.1|-169.9;NF|Norfolk Island|Oceania|-29.0|168.0;KP|North Korea|Asia|40.3|127.5
+MK|North Macedonia|Europe|41.6|21.7;MP|Northern Mariana Islands|Oceania|15.2|145.8;NO|Norway|Europe|60.5|8.5
+OM|Oman|Middle East|21.5|55.9;PK|Pakistan|Asia|30.4|69.3;PW|Palau|Oceania|7.5|134.6
+PS|Palestine|Middle East|31.9|35.2;PA|Panama|Central America|8.5|-80.8;PG|Papua New Guinea|Oceania|-6.3|143.9
+PY|Paraguay|South America|-23.4|-58.4;PE|Peru|South America|-9.2|-75.0;PH|Philippines|Asia|12.9|121.8
+PN|Pitcairn|Oceania|-25.1|-130.1;PL|Poland|Europe|51.9|19.1;PT|Portugal|Europe|39.4|-8.2
+PR|Puerto Rico|Caribbean|18.2|-66.6;QA|Qatar|Middle East|25.4|51.2;RE|Reunion|Africa|-21.1|55.5
+RO|Romania|Europe|45.9|24.9;RU|Russia|Europe|61.5|105.3;RW|Rwanda|Africa|-1.9|29.9
+BL|Saint Barthelemy|Caribbean|17.9|-62.8;SH|Saint Helena|Africa|-15.9|-5.7;KN|Saint Kitts and Nevis|Caribbean|17.4|-62.8
+LC|Saint Lucia|Caribbean|13.9|-61.0;MF|Saint Martin|Caribbean|18.1|-63.1;PM|Saint Pierre and Miquelon|North America|46.9|-56.3
+VC|Saint Vincent and the Grenadines|Caribbean|13.3|-61.2;WS|Samoa|Oceania|-13.8|-172.1;SM|San Marino|Europe|43.9|12.5
+ST|Sao Tome and Principe|Africa|0.2|6.6;SA|Saudi Arabia|Middle East|23.9|45.1;SN|Senegal|Africa|14.5|-14.5
+RS|Serbia|Europe|44.0|21.0;SC|Seychelles|Africa|-4.7|55.5;SL|Sierra Leone|Africa|8.5|-11.8
+SG|Singapore|Asia|1.4|103.8;SX|Sint Maarten|Caribbean|18.0|-63.1;SK|Slovakia|Europe|48.7|19.7
+SI|Slovenia|Europe|46.2|15.0;SB|Solomon Islands|Oceania|-9.6|160.2;SO|Somalia|Africa|5.2|46.2
+ZA|South Africa|Africa|-30.6|22.9;GS|South Georgia|South America|-54.4|-36.6;KR|South Korea|Asia|35.9|127.8
+SS|South Sudan|Africa|7.0|30.9;ES|Spain|Europe|40.5|-3.7;LK|Sri Lanka|Asia|7.9|80.8
+SD|Sudan|Africa|15.5|30.2;SR|Suriname|South America|3.9|-56.0;SJ|Svalbard and Jan Mayen|Europe|78.2|15.6
+SE|Sweden|Europe|60.1|18.6;CH|Switzerland|Europe|46.8|8.2;SY|Syria|Middle East|34.8|39.0
+TW|Taiwan|Asia|23.7|121.0;TJ|Tajikistan|Asia|38.9|71.3;TZ|Tanzania|Africa|-6.4|34.9
+TH|Thailand|Asia|15.9|101.0;TL|Timor-Leste|Asia|-8.9|125.7;TG|Togo|Africa|8.6|0.8
+TK|Tokelau|Oceania|-9.2|-171.8;TO|Tonga|Oceania|-21.2|-175.2;TT|Trinidad and Tobago|Caribbean|10.7|-61.2
+TN|Tunisia|Africa|33.9|9.5;TR|Turkey|Middle East|39.0|35.2;TM|Turkmenistan|Asia|38.9|59.6
+TC|Turks and Caicos Islands|Caribbean|21.7|-71.8;TV|Tuvalu|Oceania|-7.5|178.7;UM|US Minor Outlying Islands|Oceania|19.3|166.6
+VI|US Virgin Islands|Caribbean|18.3|-64.9;UG|Uganda|Africa|1.4|32.3;UA|Ukraine|Europe|48.4|31.2
+AE|United Arab Emirates|Middle East|23.4|53.8;GB|United Kingdom|Europe|55.4|-3.4;US|United States|North America|39.8|-98.6
+UY|Uruguay|South America|-32.5|-55.8;UZ|Uzbekistan|Asia|41.4|64.6;VU|Vanuatu|Oceania|-15.4|166.9
+VA|Vatican City|Europe|41.9|12.5;VE|Venezuela|South America|6.4|-66.6;VN|Vietnam|Asia|14.1|108.3
+WF|Wallis and Futuna|Oceania|-13.3|-176.2;EH|Western Sahara|Africa|24.2|-12.9;YE|Yemen|Middle East|15.6|48.5
+ZM|Zambia|Africa|-13.1|27.9;ZW|Zimbabwe|Africa|-19.0|29.2
+""".strip().replace("\n", ";").split(";")
+    for c, n, r, la, lo in (ln.split("|"),)
 )
 
 _CS_BY_NAME = {_c[1]: _c for _c in _CS_COUNTRIES}
@@ -15082,17 +14905,16 @@ def _cs_provider_root(domain):
 def _cs_discover_country(domain, force_refresh=False):
     _ts = datetime.now().strftime("%H:%M:%S")
     _ctry, _trace = resolve_global_domain(domain, force_refresh=force_refresh)
-    _clean_trace = re.sub(
-        r"^(?:HIT|MISS)\s+\S+\s*->\s*\S+\s*\[(.*)\]$",
-        r"\1",
-        str(_trace or "").strip(),
-    )
+    _raw_trace = str(_trace or "").strip()
+    _m = re.match(r"^(?:HIT|MISS)\s+\S+\s*->\s*\S+\s*\[(.*)\]$", _raw_trace)
+    _clean_trace = _m.group(1) if _m else _raw_trace
     if _ctry in _CS_BY_NAME:
         return _ctry, f"{_ts} MATCH {domain:<28} -> {_ctry} [{_clean_trace}]"
     return "", f"{_ts} MISS  {domain:<28} -> Global [{_clean_trace}]"
 
 
 def _cs_discover_batch(domains, progress_cb=None, workers=_CS_LOOKUP_WORKERS, force_refresh=False):
+    _gr_snapshot_settings()
     _items = list(domains or [])
     _total = len(_items)
     if _total == 0:
@@ -15403,10 +15225,8 @@ else:
              "accounts it holds. The sent section names them as one line, e.g. "
              "US, CA, DE and Global, and runs exactly those accounts.")
 
-    with str_lit.expander("⚙️ Global Resolver Proxy & Retry Settings", expanded=False):
-        _cur_gr = dict(_GR_DEFAULT_SETTINGS)
-        if isinstance(str_lit.session_state.get("cs_gr_settings"), dict):
-            _cur_gr.update(str_lit.session_state["cs_gr_settings"])
+    with str_lit.expander("⚙️ Global Resolver Proxy, Search & Cache Settings", expanded=False):
+        _cur_gr = _gr_normalize_cfg(str_lit.session_state.get("cs_gr_settings"))
 
         _gr_c1, _gr_c2, _gr_c3 = str_lit.columns(3)
         with _gr_c1:
@@ -15458,6 +15278,29 @@ else:
                 key="cs_gr_scheme",
             )
 
+        _gr_e1, _gr_e2, _gr_e3 = str_lit.columns(3)
+        with _gr_e1:
+            _gr_cache_mode = str_lit.selectbox(
+                "Cache", ["on", "off"],
+                index=0 if _cur_gr["cache_mode"] == "on" else 1,
+                key="cs_gr_cache_mode",
+                help="On: read/write/preserve global_country_cache.json. Off: ignore and do not write the cache.",
+            )
+        with _gr_e2:
+            _gr_use_ddg = str_lit.selectbox(
+                "DuckDuckGo", ["on", "off"],
+                index=0 if _cur_gr["use_ddg"] == "on" else 1,
+                key="cs_gr_use_ddg",
+                help="On: query DuckDuckGo HTML/Lite fallback. Off: skip DuckDuckGo.",
+            )
+        with _gr_e3:
+            _gr_use_bing = str_lit.selectbox(
+                "Bing", ["on", "off"],
+                index=0 if _cur_gr["use_bing"] == "on" else 1,
+                key="cs_gr_use_bing",
+                help="On: query Bing search fallback. Off: skip Bing.",
+            )
+
         _gr_direct_fb = str_lit.checkbox(
             "Allow direct fallback if proxies fail/exhausted",
             value=bool(_cur_gr["direct_fallback"]),
@@ -15472,6 +15315,9 @@ else:
             "reuse_wait_value": float(_gr_wait_val),
             "reuse_wait_unit": str(_gr_wait_unit),
             "default_scheme": str(_gr_scheme),
+            "cache_mode": str(_gr_cache_mode),
+            "use_ddg": str(_gr_use_ddg),
+            "use_bing": str(_gr_use_bing),
             "direct_fallback": bool(_gr_direct_fb),
         }
 
@@ -15540,10 +15386,11 @@ else:
                 str_lit.session_state["_cs_flash"] = (
                     "info", f"No unresolved {_CS_GLOBAL_FLAG} Global domains in this source.")
             else:
-                gr_begin_run()
+                _run_cfg = gr_begin_run()
+                _run_cache_on = (_run_cfg or _gr_get_settings()).get("cache_mode", "on") == "on"
                 _batch = _global_unmapped[:_CS_LOOKUP_CAP]
                 _m = dict(_cs_map)
-                _gr_cache = _gr_load_cache()
+                _gr_cache = _gr_load_cache() if _run_cache_on else {}
                 _bar = str_lit.progress(0.0, text=f"0/{len(_batch)} - searching Global domains...")
 
                 def _on_geo_prog(_done, _total, _cur_dom, _cur_found):
@@ -15564,13 +15411,15 @@ else:
                         _clean_dom = _clean_dom[4:]
                     if _ctry in _CS_BY_NAME:
                         _m[_clean_dom] = _ctry
-                        _gr_cache[_clean_dom] = _ctry
+                        if _run_cache_on:
+                            _gr_cache[_clean_dom] = _ctry
                 _bar.empty()
                 _prev_trace = list(str_lit.session_state.get("cs_lookup_trace") or [])
                 _prev_trace.extend(_new_traces)
                 str_lit.session_state["cs_lookup_trace"] = _prev_trace[-250:]
                 if _found:
-                    _gr_save_cache(_gr_cache)
+                    if _run_cache_on:
+                        _gr_save_cache(_gr_cache)
                     str_lit.session_state["cs_map"] = _m
                     str_lit.session_state["cs_map_ver"] = _cs_ver + 1
                     _cs_save_map(_m)
@@ -15579,7 +15428,8 @@ else:
                     str_lit.session_state["_cs_flash"] = (
                         "success",
                         f"Found countries for **{_found}** of **{len(_batch)}** "
-                        f"{_CS_GLOBAL_FLAG} Global domain(s) and synced both caches.{_extra}",
+                        f"{_CS_GLOBAL_FLAG} Global domain(s)"
+                        f"{' and synced both caches' if _run_cache_on else ''}.{_extra}",
                     )
                 else:
                     str_lit.session_state["_cs_flash"] = (
