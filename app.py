@@ -12799,7 +12799,7 @@ _GR_CCTLD_TO_COUNTRY = {
     ".co.id": "Indonesia", ".id": "Indonesia",
     ".co.jp": "Japan", ".jp": "Japan",
     ".com.ng": "Nigeria", ".ng": "Nigeria",
-    ".co.uk": "United Kingdom", ".uk": "United Kingdom",
+    ".co.uk": "United Kingdom", ".org.uk": "United Kingdom", ".uk": "United Kingdom",
     ".de": "Germany", ".fr": "France", ".it": "Italy", ".es": "Spain",
     ".nl": "Netherlands", ".ch": "Switzerland", ".se": "Sweden",
     ".com.au": "Australia", ".au": "Australia",
@@ -12823,17 +12823,17 @@ _GR_TEXT_SIGNALS = [
     (r"\b(?:jakarta|surabaya|bandung|indonesia|\+62[\s\-]?\d{2,4})\b", "Indonesia"),
     (r"\b(?:tokyo|osaka|japan|\+81[\s\-]?\d{1,4})\b", "Japan"),
     (r"\b(?:lagos|abuja|port harcourt|nigeria|\+234[\s\-]?\d{2,4})\b", "Nigeria"),
-    (r"\b(?:london|manchester|united kingdom|\+44[\s\-]?\d{2,4})\b", "United Kingdom"),
-    (r"\b(?:berlin|munich|hamburg|germany|gmbh|\+49[\s\-]?\d{2,4})\b", "Germany"),
-    (r"\b(?:paris|lyon|france|sarl|\+33[\s\-]?\d{1,3})\b", "France"),
+    (r"\b(?:london|manchester|birmingham|leeds|glasgow|edinburgh|bristol|liverpool|united kingdom|england|scotland|wales|companies house|registered in england|\+44[\s\-]?\d{2,4})\b", "United Kingdom"),
+    (r"\b(?:berlin|munich|hamburg|frankfurt|germany|gmbh|\+49[\s\-]?\d{2,4})\b", "Germany"),
+    (r"\b(?:paris|lyon|marseille|france|sarl|\+33[\s\-]?\d{1,3})\b", "France"),
     (r"\b(?:singapore|\+65[\s\-]?\d{4})\b", "Singapore"),
     (r"\b(?:kuala lumpur|malaysia|sdn bhd|\+60[\s\-]?\d{1,3})\b", "Malaysia"),
-    (r"\b(?:mumbai|bengaluru|new delhi|india|pvt ltd|\+91[\s\-]?\d{2,5})\b", "India"),
-    (r"\b(?:sydney|melbourne|australia|pty ltd|\+61[\s\-]?\d{1,3})\b", "Australia"),
-    (r"\b(?:toronto|vancouver|canada|\+1[\s\-]?(?:416|647|604|514))\b", "Canada"),
-    (r"\b(?:new york|california|texas|florida|united states|usa)\b", "United States"),
+    (r"\b(?:mumbai|bengaluru|bangalore|new delhi|india|pvt ltd|\+91[\s\-]?\d{2,5})\b", "India"),
+    (r"\b(?:sydney|melbourne|brisbane|perth|australia|pty ltd|\+61[\s\-]?\d{1,3})\b", "Australia"),
+    (r"\b(?:toronto|vancouver|montreal|calgary|canada|\+1[\s\-]?(?:416|647|604|514|403|613))\b", "Canada"),
+    (r"\b(?:new york|california|texas|florida|illinois|delaware|united states|usa)\b", "United States"),
     (r"\b(?:dubai|abu dhabi|united arab emirates|uae|\+971[\s\-]?\d{1,3})\b", "United Arab Emirates"),
-    (r"\b(?:johannesburg|cape town|south africa|\+27[\s\-]?\d{2,3})\b", "South Africa"),
+    (r"\b(?:johannesburg|cape town|pretoria|durban|south africa|\+27[\s\-]?\d{2,3})\b", "South Africa"),
 ]
 
 
@@ -12922,13 +12922,16 @@ def _gr_sync_cache_entry(domain: str, country: Optional[str]) -> None:
 def _gr_extract_country_from_text(text: str) -> Optional[str]:
     if not text:
         return None
-    low = str(text).lower()
+    raw = str(text)
+    low = raw.lower()
     for tld, country in sorted(_GR_CCTLD_TO_COUNTRY.items(), key=lambda x: -len(x[0])):
         if re.search(rf"[a-z0-9\-]+{re.escape(tld)}\b", low):
             return country
     for pattern, country in _GR_TEXT_SIGNALS:
         if re.search(pattern, low):
             return country
+    if re.search(r"\b(?:EC1|EC2|EC3|EC4|WC1|WC2|SW1|SE1|W1|NW1|N1|E1|M1|B1|LS1|G1|EH1)\d?[A-Z]?\s*\d[A-Z]{2}\b", raw):
+        return "United Kingdom"
     return None
 
 
@@ -13202,6 +13205,7 @@ def _gr_http_request(
     extra_headers: dict = None,
     timeout: float = 8.0,
     domain: str = "",
+    is_site_probe: bool = False,
 ):
     """
     Executes an HTTP request using up to `proxy_tries` proxy attempts with fail-counting,
@@ -13213,7 +13217,7 @@ def _gr_http_request(
 
     if use_px:
         tried = set()
-        max_tries = cfg["proxy_tries"]
+        max_tries = min(2, cfg["proxy_tries"]) if is_site_probe else cfg["proxy_tries"]
         for _ in range(max_tries):
             px_url, reused, _ = _gr_pick_proxy_for_attempt(domain=domain, tried=tried, cfg=cfg)
             if not px_url:
@@ -13231,14 +13235,17 @@ def _gr_http_request(
                 )
                 code, _ = _gr_extract_resp_code_and_body(resp, max_bytes=1024)
                 if code in (401, 403, 407, 429) or code >= 500:
-                    _gr_record_proxy_outcome(px_url, succeeded=False, cfg=cfg)
+                    if not (is_site_probe and code in (401, 403)):
+                        _gr_record_proxy_outcome(px_url, succeeded=False, cfg=cfg)
                     last_exc = RuntimeError(f"HTTP_{code}_via_{_gr_mask_proxy_url(px_url)}")
                     continue
                 _gr_record_proxy_outcome(px_url, succeeded=True, cfg=cfg)
                 return resp
             except Exception as exc:
+                err_code = getattr(exc, "code", None)
                 last_exc = exc
-                _gr_record_proxy_outcome(px_url, succeeded=False, cfg=cfg)
+                if not (is_site_probe and err_code in (401, 403)):
+                    _gr_record_proxy_outcome(px_url, succeeded=False, cfg=cfg)
 
         if not cfg["direct_fallback"]:
             if last_exc is not None:
@@ -13262,6 +13269,7 @@ def _gr_http_get(
     extra_headers: dict = None,
     timeout: float = 8.0,
     domain: str = "",
+    is_site_probe: bool = False,
 ):
     return _gr_http_request(
         "GET",
@@ -13270,6 +13278,7 @@ def _gr_http_get(
         extra_headers=extra_headers,
         timeout=timeout,
         domain=domain,
+        is_site_probe=is_site_probe,
     )
 
 
@@ -13528,7 +13537,7 @@ def _gr_probe_site_direct(domain: str) -> Tuple[Optional[str], str]:
     for url in (f"https://{domain}/", f"https://www.{domain}/"):
         short_host = url.split("://", 1)[1].rstrip("/")
         try:
-            resp = _gr_http_get(url, timeout=8.0, domain=domain)
+            resp = _gr_http_get(url, timeout=8.0, domain=domain, is_site_probe=True)
             status_code, html_txt = _gr_extract_resp_code_and_body(resp, max_bytes=120_000)
             if status_code == 200:
                 if _HAS_BS4 and _BeautifulSoup is not None:
@@ -13582,11 +13591,11 @@ def resolve_global_domain(
     cfg = _gr_get_settings()
 
     cache = _gr_load_cache()
-    if not force_refresh and clean_domain in cache:
-        cached_country = cache[clean_domain]
-        return cached_country, f"HIT  {clean_domain:<28} -> {cached_country} [CACHE]"
-    if force_refresh and clean_domain in cache:
-        traces.append(f"CACHE:bypassed({cache[clean_domain]})")
+    prior_cached = cache.get(clean_domain)
+    if not force_refresh and prior_cached:
+        return prior_cached, f"HIT  {clean_domain:<28} -> {prior_cached} [CACHE]"
+    if force_refresh and prior_cached:
+        traces.append(f"CACHE:bypassed({prior_cached})")
 
     if rdap_country:
         cache[clean_domain] = rdap_country
@@ -13640,6 +13649,10 @@ def resolve_global_domain(
         cache[clean_domain] = country
         _gr_save_cache(cache)
         return country, f"HIT  {clean_domain:<28} -> {country} [{' | '.join(traces)}]"
+
+    if force_refresh and prior_cached and prior_cached in _CS_BY_NAME:
+        traces.append(f"CACHE:preserved({prior_cached})")
+        return prior_cached, f"HIT  {clean_domain:<28} -> {prior_cached} [{' | '.join(traces)}]"
 
     return "Global", f"MISS {clean_domain:<28} -> Global [{' | '.join(traces)}]"
 # === END: GLOBAL_RESOLVER ===
